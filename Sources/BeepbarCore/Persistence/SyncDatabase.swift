@@ -662,10 +662,10 @@ public actor SyncDatabase {
                 try bind(move.newFolder, to: statement, index: 1); try bind(move.oldFolder, to: statement, index: 2); try bind(move.rootID.uuidString, to: statement, index: 3)
                 try bind(move.oldFolder, to: statement, index: 4); try bind(move.oldFolder, to: statement, index: 5); try bind(move.oldFolder, to: statement, index: 6); try stepDone(statement)
             }
-            // Entries about the course's files follow the folder too, or their actions would find
-            // the file gone and the entry would only come back at the next sync.
-            for column in ["relative_path", "target_path"] {
-                try withStatement("UPDATE remote_changes SET \(column) = ? || substr(\(column), length(?) + 1) WHERE root_id = ? AND (\(column) = ? OR substr(\(column), 1, length(?) + 1) = ? || '/')") { statement in
+            // Entries and journaled moves about the course's files follow the folder too: an entry's
+            // action would find the file gone, and a journaled move could no longer be recovered.
+            for (table, column) in [("remote_changes", "relative_path"), ("remote_changes", "target_path"), ("pending_remote_moves", "from_path"), ("pending_remote_moves", "to_path")] {
+                try withStatement("UPDATE \(table) SET \(column) = ? || substr(\(column), length(?) + 1) WHERE root_id = ? AND (\(column) = ? OR substr(\(column), 1, length(?) + 1) = ? || '/')") { statement in
                     try bind(move.newFolder, to: statement, index: 1); try bind(move.oldFolder, to: statement, index: 2); try bind(move.rootID.uuidString, to: statement, index: 3)
                     try bind(move.oldFolder, to: statement, index: 4); try bind(move.oldFolder, to: statement, index: 5); try bind(move.oldFolder, to: statement, index: 6); try stepDone(statement)
                 }

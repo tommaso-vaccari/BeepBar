@@ -1041,6 +1041,31 @@ import Testing
         #expect(fixture.contents("Course 1/Lab 0/Esercizi/es.txt") == "my solution")
     }
 
+    @Test(arguments: [false, true])
+    func aFileUploadedAgainInTheSamePlaceKeepsItsCopy(edited: Bool) async throws {
+        let fixture = try await Fixture()
+        defer { fixture.remove() }
+        let target = fixture.targets[0]
+        let hash = String(repeating: "c", count: 40)
+        fixture.upstream.addFile(course: 1, file: 500, filename: "es.txt", value: "exercise", revision: "1", contentHash: hash)
+        _ = try await fixture.synchronize(targets: [target])
+        if edited { try fixture.write("my solution", to: "Course 1/Lezioni/es.txt") }
+        // The teacher deleted the module and made a new one with the same name, in the same section.
+        fixture.upstream.removeFile(course: 1, file: 500)
+        fixture.upstream.addModule(course: 1, id: 150, section: "Materiali", name: "Lezioni")
+        fixture.upstream.addFile(course: 1, file: 501, filename: "es.txt", value: "exercise", revision: "1", module: 150, contentHash: hash)
+
+        fixture.upstream.resetDownloadCount()
+        let result = try await fixture.synchronize(targets: [target])
+
+        #expect(fixture.upstream.downloadCount == 0)
+        #expect(result.conflicts == 0 && result.moved == 0)
+        #expect(fixture.contents("Course 1/Lezioni/es.txt") == (edited ? "my solution" : "exercise"))
+        #expect(fixture.contents("Course 1/Lezioni/es (1).txt") == nil)
+        #expect(try await fixture.database.baseline(rootID: fixture.rootID, remoteID: fixture.remoteID(course: 1, file: 501, module: 150, filename: "es.txt"))?.relativePath.value == "Course 1/Lezioni/es.txt")
+        #expect(try await fixture.changes().isEmpty)
+    }
+
     @Test func keepBothLeavesBothCopies() async throws {
         let fixture = try await Fixture()
         defer { fixture.remove() }

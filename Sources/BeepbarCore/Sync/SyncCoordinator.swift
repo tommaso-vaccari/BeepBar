@@ -287,12 +287,17 @@ public actor SyncCoordinator {
                         let preferred = try LocalPathPolicy.destination(courseFolder: targets[index].localFolder, file: file, moduleFolderOverride: override)
                         let reupload = vanished.reuploads[file.id]
                         if let reupload, preferred.comparisonKey == reupload.ghost.relativePath.comparisonKey {
-                            // Uploaded again in the very same place: the file already there is it.
+                            // Uploaded again in the very same place: the file already there is it,
+                            // edited or not, so it just changes identity. Downloading the new copy
+                            // onto an edited one would open a conflict about contents that did not
+                            // change on Moodle.
                             destination = reupload.ghost.relativePath
-                        } else {
+                            if let adopted = try await adoptReupload(file, ghost: reupload.ghost, snapshot: nil, at: destination) {
+                                currentBaselines.removeValue(forKey: reupload.ghost.remoteID)
+                                currentBaselines[file.id] = adopted
+                            }
+                        } else if let reupload {
                             destination = try LocalPathPolicy.uniqueDestination(preferred, reserving: &reservedPaths)
-                        }
-                        if let reupload {
                             if reupload.isModified {
                                 // The new copy is downloaded; the user's edited copy waits in Conflicts.
                                 changes.append(RemoteChange(rootID: rootID, courseID: file.courseID, remoteID: reupload.ghost.remoteID, kind: .reuploaded, relativePath: reupload.ghost.relativePath, targetPath: destination, newRemoteID: file.id, localSHA256: reupload.localSHA256, isLocallyModified: true))
@@ -307,6 +312,8 @@ public actor SyncCoordinator {
                                 // treated as removed from Moodle.
                                 changes.append(RemoteChange(rootID: rootID, courseID: file.courseID, remoteID: reupload.ghost.remoteID, kind: .removed, relativePath: reupload.ghost.relativePath, localSHA256: reupload.localSHA256, isLocallyModified: false))
                             }
+                        } else {
+                            destination = try LocalPathPolicy.uniqueDestination(preferred, reserving: &reservedPaths)
                         }
                     }
                     items.append(PreparedSyncItem(remote: file, destination: destination))
@@ -555,8 +562,11 @@ public actor SyncCoordinator {
         var changes: [RemoteChange] = []
         var candidates: [Baseline] = []
         for baseline in baselines.values.sorted(by: { $0.remoteID < $1.remoteID }) {
+            // Ids in the old download-URL format belong to baselines the current rules have not
+            // matched yet (see `isLegacyRemoteID`): absent from the listing by construction.
             guard let courseID = baseline.courseID, let listing = listings[courseID],
-                  !listing.remoteIDs.contains(baseline.remoteID), !excluding.contains(baseline.remoteID) else { continue }
+                  !listing.remoteIDs.contains(baseline.remoteID), !excluding.contains(baseline.remoteID),
+                  !baseline.remoteID.contains(":/webservice/pluginfile.php/"), !baseline.remoteID.contains(":/pluginfile.php/") else { continue }
             guard listing.isComplete, let moduleID = baseline.moduleID, !listing.modulesWithDroppedEntries.contains(moduleID) else {
                 // Not knowable this run: whatever the user was asked stays as it was.
                 if let open = openChanges[baseline.remoteID], open.kind != .moved { changes.append(open) }
@@ -616,10 +626,11 @@ public actor SyncCoordinator {
     ///
     /// No journal is needed: after a crash between the rename and the baseline update, the next
     /// run downloads the new file onto the moved copy, finds identical contents and adopts it.
+    /// `snapshot` is required to move the file; it may be nil when `destination` is where the file
+    /// already is.
     private func adoptReupload(_ file: RemoteFileCandidate, ghost: Baseline, snapshot: FileSnapshot?, at destination: RelativePath) async throws -> Baseline? {
-        guard let snapshot else { return nil }
         if destination != ghost.relativePath {
-            guard try await fileStore.migrationDestinationIsOccupied(destination) == false else { return nil }
+            guard let snapshot, try await fileStore.migrationDestinationIsOccupied(destination) == false else { return nil }
             do { try await fileStore.moveRegularFilePreservingCurrentContents(from: ghost.relativePath, to: destination, expected: snapshot) }
             catch { return nil }
         }

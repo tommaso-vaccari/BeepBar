@@ -10,7 +10,7 @@ These hold in every case described below.
 
 1. **No local file is overwritten or deleted without your choice.** When BeepBar cannot know what you would prefer, it leaves the file where it is and asks.
 2. **Only what Moodle actually showed is evaluated.** A course that did not load in that sync (not accessible, server error, no network), a course you turned off, or one you are no longer enrolled in causes no change to its files.
-3. **Every action re-checks the state at the moment it runs.** If the file changed or the destination got taken in the meantime, the action does nothing and stays pending.
+3. **Every action re-checks the state at the moment it runs.** If the file changed in the meantime, the action does nothing and stays pending. If the destination got taken, nothing is overwritten: a file moved to follow Moodle arrives with a number (section 4.1), any other action does nothing. **[PR #54]**
 4. **An app update never reorganizes anything on its own.** New rules apply to what happens on Moodle from then on.
 
 ## Terms

@@ -10,7 +10,7 @@ Valgono in ogni caso descritto sotto.
 
 1. **Nessun file locale viene sovrascritto o cancellato senza una tua scelta.** Quando BeepBar non può sapere cosa preferisci, lascia il file dov'è e ti chiede.
 2. **Si valuta solo ciò che Moodle ha mostrato davvero.** Un corso che in quella sincronizzazione non si è caricato (non accessibile, errore del server, rete assente), un corso disattivato o da cui sei stato disiscritto non produce cambiamenti sui suoi file.
-3. **Ogni azione ricontrolla lo stato al momento in cui avviene.** Se nel frattempo il file è cambiato o la destinazione si è occupata, l'azione non fa nulla e resta da decidere.
+3. **Ogni azione ricontrolla lo stato al momento in cui avviene.** Se nel frattempo il file è cambiato, l'azione non fa nulla e resta da decidere. Se la destinazione si è occupata, niente viene sovrascritto: un file spostato per seguire Moodle arriva con un numero (sezione 4.1), le altre azioni non fanno nulla. **[PR #54]**
 4. **Un aggiornamento dell'app non riorganizza niente da solo.** Le nuove regole valgono per ciò che succede su Moodle da quel momento in poi.
 
 ## Termini

@@ -1156,6 +1156,26 @@ import Testing
         #expect(again.perCourse.isEmpty)
     }
 
+    @Test func aDeletedFileInASwapIsDownloadedAtItsOwnName() async throws {
+        let fixture = try await Fixture()
+        defer { fixture.remove() }
+        let target = fixture.targets[0]
+        fixture.upstream.addModule(course: 1, id: 150, section: "Lab 1", name: "Esercizi")
+        fixture.upstream.addModule(course: 1, id: 160, section: "Lab 2", name: "Esercizi")
+        fixture.upstream.addFile(course: 1, file: 600, filename: "testo.txt", value: "one", revision: "1", module: 150, contentHash: String(repeating: "d", count: 40))
+        fixture.upstream.addFile(course: 1, file: 601, filename: "testo.txt", value: "two", revision: "1", module: 160, contentHash: String(repeating: "e", count: 40))
+        _ = try await fixture.synchronize(targets: [target])
+        try FileManager.default.removeItem(at: fixture.root.appending(path: "Course 1/Lab 1/Esercizi/testo.txt"))
+
+        fixture.upstream.setModuleSection(course: 1, id: 150, section: "Lab 2")
+        fixture.upstream.setModuleSection(course: 1, id: 160, section: "Lab 1")
+        _ = try await fixture.synchronize(targets: [target])
+
+        #expect(fixture.contents("Course 1/Lab 1/Esercizi/testo.txt") == "two")
+        #expect(fixture.contents("Course 1/Lab 2/Esercizi/testo.txt") == "one")
+        #expect(fixture.contents("Course 1/Lab 2/Esercizi/testo (1).txt") == nil)
+    }
+
     @Test func aSwapInterruptedBeforeItsBaselinesFollowIsCompleted() async throws {
         let fixture = try await Fixture()
         defer { fixture.remove() }

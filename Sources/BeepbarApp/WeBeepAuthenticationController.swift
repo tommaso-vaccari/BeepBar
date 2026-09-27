@@ -171,7 +171,8 @@ struct SyncCompletionSummary: Codable, Equatable {
         var parts: [String] = []
         if added > 0 { parts.append(added == 1 ? tr("1 nuovo", "1 new") : tr("\(added) nuovi", "\(added) new")) }
         if updated > 0 { parts.append(updated == 1 ? tr("1 aggiornato", "1 updated") : tr("\(updated) aggiornati", "\(updated) updated")) }
-        if moved > 0 { parts.append(moved == 1 ? tr("1 spostato", "1 moved") : tr("\(moved) spostati", "\(moved) moved")) }
+        // Moves are left out on purpose: this text is the menu bar's, and the sync behavior document
+        // (section 7) keeps moves and removals out of the menu bar.
         return parts.isEmpty ? tr("Nessuna novità", "Nothing new") : parts.joined(separator: " · ")
     }
 
@@ -1042,7 +1043,7 @@ struct MenuBarSnapshot: Sendable {
                 let outcome = try await resolver.perform(action, on: change.id, rootID: rootID)
                 self.status = SyncCopy.remoteChangeStatus(outcome, action: action)
             } catch {
-                self?.status = tr("Impossibile completare la scelta: nessun file è stato toccato.", "Couldn't carry out the choice: no file was touched.")
+                self?.status = tr("Impossibile completare la scelta. Nessun file è stato sovrascritto o cancellato definitivamente.", "Couldn't carry out the choice. No file was overwritten or permanently deleted.")
             }
             self?.refreshConflicts()
         }

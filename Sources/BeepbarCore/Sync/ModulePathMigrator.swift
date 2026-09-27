@@ -91,7 +91,10 @@ public actor ModulePathMigrator {
 
     public func preview(courseID: Int64, moduleID: Int64, courseFolder: String, action: ModuleMoveAction, folder: String?, contents: RemoteCourseContents) async throws -> ModuleMovePreview {
         try await gate.withLease(.movingModule(courseID, moduleID)) {
-            try await self.makePreview(courseID: courseID, moduleID: moduleID, courseFolder: courseFolder, action: action, folder: folder, contents: contents)
+            // A move made to follow Moodle and interrupted by a crash is settled first, or the
+            // preview would plan from a baseline that no longer matches the disk.
+            try await RemoteMoveJournal.recover(rootID: self.rootID, database: self.database, fileStore: self.fileStore)
+            return try await self.makePreview(courseID: courseID, moduleID: moduleID, courseFolder: courseFolder, action: action, folder: folder, contents: contents)
         }
     }
 
@@ -99,6 +102,7 @@ public actor ModulePathMigrator {
         guard preview.rootID == rootID else { throw ModulePathMigrationError.planChanged }
         try await gate.withLease(.movingModule(preview.courseID, preview.moduleID)) {
             guard try await self.database.hasPendingModuleMoves(rootID: self.rootID) == false else { throw ModulePathMigrationError.pendingRecovery }
+            try await RemoteMoveJournal.recover(rootID: self.rootID, database: self.database, fileStore: self.fileStore)
             let contents = try await self.apiClient.fetchContents(courseID: preview.courseID, token: token)
             let fresh = try await self.makePreview(courseID: preview.courseID, moduleID: preview.moduleID, courseFolder: courseFolder, action: preview.action, folder: preview.newFolder, contents: contents)
             guard fresh.fingerprint == preview.fingerprint else { throw ModulePathMigrationError.planChanged }

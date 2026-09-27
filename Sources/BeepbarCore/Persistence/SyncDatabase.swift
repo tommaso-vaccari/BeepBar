@@ -366,6 +366,10 @@ public actor SyncDatabase {
         let existingByRemoteID = Dictionary(existing.map { ($0.remoteID, $0) }, uniquingKeysWith: { first, _ in first })
         let desiredIDs = Set(desired.map(\.remoteID))
         var created: [RemoteChange] = []
+        // A sync with nothing new must not write: skip the transaction when every entry stands.
+        let unchanged = existing.allSatisfy { desiredIDs.contains($0.remoteID) }
+            && desired.allSatisfy { change in existingByRemoteID[change.remoteID].map { $0.describesSameChange(as: change) } ?? false }
+        guard !unchanged else { return [] }
         try execute("BEGIN IMMEDIATE")
         do {
             for change in existing where !desiredIDs.contains(change.remoteID) {
@@ -513,6 +517,8 @@ public actor SyncDatabase {
                     try stepDone(statement)
                     guard sqlite3_changes(database) == 1 else { throw SyncDatabaseError.execution }
                 }
+                // An entry about the file names its old path; the next sync asks again if needed.
+                try deleteRows("remote_changes", rootID: move.rootID, remoteID: file.remoteID)
             }
             switch move.action {
             case .set:
@@ -542,6 +548,7 @@ public actor SyncDatabase {
         do {
             for file in move.files {
                 guard let actual = actualPaths[file.remoteID] else { continue }
+                try deleteRows("remote_changes", rootID: move.rootID, remoteID: file.remoteID)
                 if let actual {
                     guard actual != file.oldPath else { continue }
                     try withStatement("UPDATE items SET relative_path = ? WHERE root_id = ? AND remote_id = ? AND relative_path = ?") { statement in

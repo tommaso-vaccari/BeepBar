@@ -83,6 +83,8 @@ Per Moodle è un file nuovo; BeepBar lo riconosce perché il contenuto è identi
 | Non modificato | Lo sposta nella nuova posizione invece di scaricarne una seconda copia | "Spostati" |
 | Modificato | Scarica la copia nuova nella nuova posizione e non tocca la tua | Voce in Conflitti: **Sostituisci la copia nuova con la mia versione** / **Tieni entrambe** / **Sposta la mia nel Cestino** |
 
+Se il file viene ricaricato esattamente nello stesso posto, BeepBar continua a seguire la copia che hai, modificata o no: non la riscarica e non chiede niente, perché su Moodle il contenuto non è cambiato.
+
 "Sostituisci" mette nel Cestino la copia appena scaricata (che non hai mai toccato) e porta la tua al suo posto; da lì in poi un aggiornamento del professore diventa un conflitto.
 
 BeepBar riconosce solo un file ricaricato nello stesso corso, e solo quando Moodle fornisce l'impronta del contenuto del file. Se lo stesso contenuto compare in più posti, BeepBar non indovina: la copia nuova si scarica normalmente e il vecchio file viene trattato come rimosso (4.3). Succede lo stesso se la copia non modificata non si può spostare (per esempio perché nel frattempo qualcos'altro ha preso il suo nuovo posto).

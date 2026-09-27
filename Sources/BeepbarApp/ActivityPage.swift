@@ -144,7 +144,8 @@ private extension MovedSyncItem {
         case .moved:
             return tr("Spostato \(place), come su \(platform)", "Moved \(place), as on \(platform)")
         case .keptEdited:
-            return tr("Su \(platform) ora è \(place). L’hai modificato: scegli in Conflitti se spostarlo", "Now \(place) on \(platform). You edited it: choose in Conflicts whether to move it")
+            let location = folder.isEmpty ? tr("nella cartella del corso", "in the course folder") : tr("in “\(folder)”", "in “\(folder)”")
+            return tr("Su \(platform) ora è \(location). L’hai modificato: scegli in Conflitti se spostarlo", "Now \(location) on \(platform). You edited it: choose in Conflicts whether to move it")
         }
     }
 }

@@ -386,20 +386,27 @@ public actor SyncCoordinator {
                     continue
                 }
                 let source: FileSnapshotState
-                do { source = try await fileStore.snapshotRegularFile(old) } catch { changedPlacements[id] = placement; continue }
+                // Unreadable right now (permissions, an evicted cloud file, an I/O error): nothing
+                // is recorded, so the move is tried again next run instead of being forgotten.
+                do { source = try await fileStore.snapshotRegularFile(old) } catch { continue }
                 switch source {
                 case .missing:
                     // Nothing to move: the user deleted it, and it is downloaded again in its new
-                    // place. Only the baseline follows, and only when that place is free or already
-                    // holds exactly the downloaded contents (a move finished before a crash).
-                    if case .present(let there)? = try? await fileStore.snapshotRegularFile(plan.target) {
-                        guard there.sha256 == plan.baseline.sha256 else { changedPlacements[id] = placement; continue }
-                    } else {
-                        let heldByAnother = state.owners[plan.target.comparisonKey].map { $0 != id } ?? false
-                        let occupied = try await fileStore.migrationDestinationIsOccupied(plan.target)
-                        if heldByAnother || occupied { changedPlacements[id] = placement; continue }
+                    // place. Only the baseline follows: to that place when it is free, or already
+                    // holds exactly the downloaded contents untracked (a move finished before a
+                    // crash), and otherwise to a numbered name, as a download would. Never onto a
+                    // path another tracked file owns, even with identical contents: two baselines
+                    // on one path would make every later run fail its collision check.
+                    let heldByAnother = state.owners[plan.target.comparisonKey].map { $0 != id } ?? false
+                    var destination = plan.target
+                    if heldByAnother {
+                        destination = try await numberedFreePath(for: plan.target, owners: state.owners)
+                    } else if case .present(let there)? = try? await fileStore.snapshotRegularFile(plan.target) {
+                        if there.sha256 != plan.baseline.sha256 { destination = try await numberedFreePath(for: plan.target, owners: state.owners) }
+                    } else if try await fileStore.migrationDestinationIsOccupied(plan.target) {
+                        destination = try await numberedFreePath(for: plan.target, owners: state.owners)
                     }
-                    let step = PendingRemoteMove(batchID: UUID(), remoteID: id, from: old, to: plan.target, sha256: plan.baseline.sha256, placement: placement)
+                    let step = PendingRemoteMove(batchID: UUID(), remoteID: id, from: old, to: destination, sha256: plan.baseline.sha256, placement: placement)
                     guard (try? await database.commitRemoteMoves(rootID: rootID, [step])) != nil else { continue }
                     state.record(step, baseline: plan.baseline)
                 case .present(let snapshot):
@@ -569,7 +576,7 @@ public actor SyncCoordinator {
                   !baseline.remoteID.contains(":/webservice/pluginfile.php/"), !baseline.remoteID.contains(":/pluginfile.php/") else { continue }
             guard listing.isComplete, let moduleID = baseline.moduleID, !listing.modulesWithDroppedEntries.contains(moduleID) else {
                 // Not knowable this run: whatever the user was asked stays as it was.
-                if let open = openChanges[baseline.remoteID], open.kind != .moved { changes.append(open) }
+                if let open = openChanges[baseline.remoteID] { changes.append(open) }
                 continue
             }
             candidates.append(baseline)

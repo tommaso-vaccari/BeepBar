@@ -83,6 +83,8 @@ To Moodle this is a new file; BeepBar recognizes it because the contents are ide
 | Not edited | Moves it to the new place instead of downloading a second copy | "Moved" |
 | Edited | Downloads the new copy at the new place and leaves yours alone | Entry in Conflicts: **Replace the new copy with my version** / **Keep both** / **Move mine to the Trash** |
 
+If the file is uploaded again in exactly the same place, BeepBar keeps tracking the copy you have, edited or not: it does not download it again and asks nothing, since its contents did not change on Moodle.
+
 "Replace" moves the freshly downloaded copy (which you never touched) to the Trash and puts yours in its place; from then on an update by the teacher becomes a conflict.
 
 BeepBar only recognizes a file uploaded again in the same course, and only when Moodle reports the file's content fingerprint. If the same contents appear in more than one place, BeepBar does not guess: the new copy downloads normally and the old file is treated as removed (4.3). The same happens if the unedited copy cannot be moved (for example because something else took its new place in the meantime).

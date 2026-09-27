@@ -679,6 +679,42 @@ import Testing
         #expect(result.perCourse.first?.movedItems.first { $0.id == fixture.remoteID(course: 1, file: 0) }?.name == "0 (1).txt")
     }
 
+    @Test func aDeletedFileMovedOntoAnotherTrackedFileGetsANumberInsteadOfSharingItsPath() async throws {
+        let fixture = try await Fixture()
+        defer { fixture.remove() }
+        let target = fixture.targets[0]
+        // Another tracked file, with the same contents, already sits where Moodle will move 0.txt.
+        fixture.upstream.addModule(course: 1, id: 150, section: "Lab 1", name: "Lezioni")
+        fixture.upstream.addFile(course: 1, file: 700, filename: "0.txt", value: "x", revision: "1", module: 150)
+        _ = try await fixture.synchronize(targets: [target])
+        try FileManager.default.removeItem(at: fixture.root.appending(path: "Course 1/Lezioni/0.txt"))
+
+        fixture.upstream.setSection(course: 1, name: "Lab 1")
+        _ = try await fixture.synchronize(targets: [target])
+        let again = try await fixture.synchronize(targets: [target])
+
+        #expect(again.failures == 0)
+        #expect(try await fixture.database.baseline(rootID: fixture.rootID, remoteID: fixture.remoteID(course: 1, file: 0))?.relativePath.value == "Course 1/Lab 1/Lezioni/0 (1).txt")
+        #expect(try await fixture.database.baseline(rootID: fixture.rootID, remoteID: fixture.remoteID(course: 1, file: 700, module: 150, filename: "0.txt"))?.relativePath.value == "Course 1/Lab 1/Lezioni/0.txt")
+        #expect(fixture.contents("Course 1/Lab 1/Lezioni/0 (1).txt") == "x")
+    }
+
+    @Test func aDeletedFileWhoseNewPlaceIsTakenIsDownloadedThereWithANumber() async throws {
+        let fixture = try await Fixture()
+        defer { fixture.remove() }
+        let target = fixture.targets[0]
+        _ = try await fixture.synchronize(targets: [target])
+        try FileManager.default.removeItem(at: fixture.root.appending(path: "Course 1/Lezioni/0.txt"))
+        try fixture.write("someone else's file", to: "Course 1/Lab 1/Lezioni/0.txt")
+
+        fixture.upstream.setSection(course: 1, name: "Lab 1")
+        _ = try await fixture.synchronize(targets: [target])
+
+        #expect(fixture.contents("Course 1/Lab 1/Lezioni/0.txt") == "someone else's file")
+        #expect(fixture.contents("Course 1/Lab 1/Lezioni/0 (1).txt") == "x")
+        #expect(fixture.contents("Course 1/Lezioni/0.txt") == nil)
+    }
+
     @Test func filesTrackedByAnOlderVersionAreNotMovedRetroactively() async throws {
         let fixture = try await Fixture()
         defer { fixture.remove() }

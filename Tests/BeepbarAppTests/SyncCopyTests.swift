@@ -32,7 +32,7 @@ struct SyncCopyTests {
         let course = CourseSyncCount(courseID: 1, courseFolder: "Analisi", added: 0, updated: 0, movedItems: moved + [kept])
         let summary = SyncCompletionSummary(completedAt: Date(), added: 0, updated: 0, unchanged: 0, preservedLocal: 0, conflicts: 0, failures: 0, perCourse: [course])
         #expect(summary.moved == 3)
-        #expect(summary.compactDetail == "3 spostati")
+        #expect(summary.compactDetail == "Nessuna novità")
         #expect(summary.detail == "Nessun nuovo materiale. 3 file spostati nella loro nuova cartella.")
         #expect(summary.affectedCourses.map(\.courseID) == [1])
         #expect(course.movedLabel == "3 spostati")

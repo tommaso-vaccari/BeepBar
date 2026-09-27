@@ -37,6 +37,18 @@ struct LocalPathPolicyTests {
             courseID: 31,
             currentDefaultFolder: "tesi-di-laurea-31"
         ) == nil)
+        // One-word and hyphenated names read the same as their legacy spelling, ignoring case:
+        // the current-scheme folder must still be kept.
+        for (name, folder) in [("Tirocinio", "tirocinio"), ("Fisica", "Fisica"), ("Analisi-1", "analisi-1"),
+                               ("054221 - Tirocinio (2025-26)", "054221-tirocinio-2025-26"), ("054221 - Tirocinio (2025-26)", "tirocinio")] {
+            #expect(LocalPathPolicy.generatedCourseFolderReplacement(
+                storedFolder: folder,
+                storedCourseName: name,
+                currentCourseName: name,
+                courseID: 31,
+                currentDefaultFolder: LocalPathPolicy.courseFolder(LocalPathPolicy.courseFolderSlug(name), disambiguatedBy: 31)
+            ) == nil, "\(folder) was renamed")
+        }
         // A folder from the old naming scheme still moves to the (now distinct) default.
         #expect(LocalPathPolicy.generatedCourseFolderReplacement(
             storedFolder: "Tesi di laurea (31)",

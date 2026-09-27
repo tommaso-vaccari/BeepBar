@@ -70,6 +70,12 @@ public enum LocalPathPolicy {
     ) -> String? {
         let currentDefault = currentDefaultFolder ?? defaultCourseFolder(currentCourseName)
         guard !equivalent(storedFolder, currentDefault) else { return nil }
+        // A folder already in the current naming scheme is kept, even when the default has since
+        // moved on (a same-named course appeared and the default gained the course ID). A
+        // one-word name like "Tirocinio" is otherwise indistinguishable, ignoring case, from its
+        // legacy spelling, and the user's "tirocinio" folder was renamed behind their back.
+        guard !equivalent(storedFolder, defaultCourseFolder(currentCourseName)),
+              !equivalent(storedFolder, courseFolderSlug(currentCourseName)) else { return nil }
         let storedDefault = legacyCourseFolder(storedCourseName)
         let currentLegacyDefault = legacyCourseFolder(currentCourseName)
         let legacyDefaults = [storedDefault, "\(storedDefault) (\(courseID))", currentLegacyDefault, "\(currentLegacyDefault) (\(courseID))"]

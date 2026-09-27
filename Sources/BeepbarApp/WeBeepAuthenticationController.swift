@@ -1357,7 +1357,8 @@ struct MenuBarSnapshot: Sendable {
 
     /// Pure and independently testable: a distinct default folder for each course. Courses whose
     /// short folder collides fall back to their full name; courses that still collide (identical
-    /// names, e.g. two "Tesi di laurea") also get their Moodle ID. A collision is with another
+    /// names, e.g. two "Tesi di laurea") also get their Moodle ID, then a counter if even that
+    /// name is taken by a folder saved for another course. A collision is with another
     /// course's default or with a folder already `saved` for another course (a user may have
     /// renamed one onto a name another course would get). Every result must differ on disk: a
     /// scope's folder is unique per root, so two courses sharing one left the second impossible
@@ -1370,18 +1371,32 @@ struct MenuBarSnapshot: Sendable {
             switch level {
             case 0: LocalPathPolicy.defaultCourseFolder(course.displayName)
             case 1: LocalPathPolicy.courseFolderSlug(course.displayName)
-            default: LocalPathPolicy.courseFolder(LocalPathPolicy.courseFolderSlug(course.displayName), disambiguatedBy: course.id)
+            case 2: LocalPathPolicy.courseFolder(LocalPathPolicy.courseFolderSlug(course.displayName), disambiguatedBy: course.id)
+            default: LocalPathPolicy.courseFolder(LocalPathPolicy.courseFolder(LocalPathPolicy.courseFolderSlug(course.displayName), disambiguatedBy: course.id), disambiguatedBy: Int64(level - 1))
             }
         }
+        // From level 2 on, every candidate of a course is distinct from its others and from other
+        // courses' (the ID differs), so only the finitely many saved folders can keep a course
+        // climbing: past this level one of its candidates must be free.
+        let maximumLevel = 3 + saved.count + uniqueCourses.count
         var levels = uniqueCourses.mapValues { _ in 0 }
         while true {
             let folders = Dictionary(uniqueKeysWithValues: levels.map { id, level in (id, candidate(uniqueCourses[id]!, level: level)) })
             let groups = Dictionary(grouping: folders.keys, by: { PathKey.of(folders[$0]!) })
             let colliding = folders.keys.filter { id in
                 let key = PathKey.of(folders[id]!)
-                return groups[key]!.count > 1 || !(savedOwners[key] ?? []).subtracting([id]).isEmpty
-            }.filter { levels[$0]! < 2 }
-            // Terminates: every pass raises at least one level, and levels stop at 2.
+                if !(savedOwners[key] ?? []).subtracting([id]).isEmpty { return true }
+                let group = groups[key]!
+                guard group.count > 1 else { return false }
+                // A course already carrying its ID keeps its name against a name-derived one,
+                // which moves aside. Between two ID-carrying names (only possible through the
+                // counter, e.g. "a-5" + counter 2 against a course called "A 5" with ID 2) the
+                // lowest ID keeps it, so every pass still makes progress.
+                if levels[id]! < 2 { return true }
+                let named = group.filter { levels[$0]! < 2 }
+                return named.isEmpty && id != group.min()!
+            }.filter { levels[$0]! < maximumLevel }
+            // Terminates: every pass raises at least one level, and levels stop at `maximumLevel`.
             guard !colliding.isEmpty else { return folders }
             for id in colliding { levels[id]! += 1 }
         }

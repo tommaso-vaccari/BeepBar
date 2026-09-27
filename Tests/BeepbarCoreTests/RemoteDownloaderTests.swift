@@ -92,10 +92,11 @@ import Testing
     @Test func cancellingTheSyncIsStillACancellationNotARejectedFile() async throws {
         StreamingProtocol.reset(chunks: 10_000, chunkSize: 16)
         let downloader = RemoteDownloader(session: Self.session(StreamingProtocol.self))
+        // Taken before the transfer starts, so the partial body it writes counts as a leak.
+        let before = Self.downloadTemporaryFiles()
         let task = Task { try await downloader.download(Self.file(size: 160_000), token: "token", access: .unrestricted) }
         while StreamingProtocol.deliveredChunks < 5 { await Task.yield() }
         task.cancel()
-        let before = Self.downloadTemporaryFiles()
         await #expect(throws: CancellationError.self) { try await task.value }
         #expect(Self.downloadTemporaries(since: before, startingWith: StreamingProtocol.marker).isEmpty)
     }

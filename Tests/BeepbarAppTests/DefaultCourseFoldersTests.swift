@@ -117,6 +117,24 @@ struct DefaultCourseFoldersTests {
         #expect(Set(all).count == all.count)
     }
 
+    @Test func aCounterIsAddedWhenEvenTheIDNameIsSavedForAnotherCourse() {
+        // The user renamed other courses' folders onto the names course 47 would fall back to.
+        let saved: [Int64: String] = [1: "Tesi-di-laurea-47", 2: "tesi-di-laurea-47-2", 3: "tesi-di-laurea"]
+        let folders = WeBeepAuthenticationController.defaultFolders(for: [course(47, "Tesi di laurea")], saved: saved)
+        #expect(folders[47] == "tesi-di-laurea-47-3")
+    }
+
+    @Test func twoIDCarryingNamesThatCoincideAreStillSeparated() {
+        // Course 5 "A" climbs to "a-5-2" (its "a-5" is saved elsewhere); course 2, really
+        // called "A 5", climbs to "a-5-2" as well because "a-5" is saved.
+        let folders = WeBeepAuthenticationController.defaultFolders(
+            for: [course(5, "A"), course(6, "A"), course(2, "A 5")],
+            saved: [100: "a-5", 101: "a"]
+        )
+        let values = folders.values.map(PathKey.of) + ["a-5", "a"]
+        #expect(Set(values).count == values.count)
+    }
+
     @Test func emptyCourseListYieldsEmptyMap() {
         #expect(WeBeepAuthenticationController.defaultFolders(for: []).isEmpty)
     }

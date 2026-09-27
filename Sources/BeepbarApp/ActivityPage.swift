@@ -144,9 +144,7 @@ private extension MovedSyncItem {
         case .moved:
             return tr("Spostato \(place), come su \(platform)", "Moved \(place), as on \(platform)")
         case .keptEdited:
-            return tr("Su \(platform) ora è \(place). Lasciato qui perché l’hai modificato", "Now \(place) on \(platform). Left here because you edited it")
-        case .keptOccupied:
-            return tr("Su \(platform) ora è \(place), ma lì c’è già un altro file. Lasciato qui", "Now \(place) on \(platform), but another file is already there. Left here")
+            return tr("Su \(platform) ora è \(place). L’hai modificato: scegli in Conflitti se spostarlo", "Now \(place) on \(platform). You edited it: choose in Conflicts whether to move it")
         }
     }
 }

@@ -36,7 +36,7 @@ struct SyncCopyTests {
         #expect(summary.detail == "Nessun nuovo materiale. 3 file spostati nella loro nuova cartella.")
         #expect(summary.affectedCourses.map(\.courseID) == [1])
         #expect(course.movedLabel == "3 spostati")
-        #expect(course.keptInPlaceLabel == "1 lasciato al suo posto")
+        #expect(course.keptInPlaceLabel == "1 da scegliere in Conflitti")
     }
 
     @Test func summarySavedByAnOlderVersionStillDecodes() throws {

@@ -39,14 +39,13 @@ public struct FailedSyncItem: Sendable, Equatable, Codable, Identifiable, Hashab
 }
 
 /// A tracked file whose place changed on Moodle during a sync: either moved to follow it, or left
-/// where it was because moving it could have cost the user something.
+/// where it was because the user edited it (it then waits in Conflicts, see `RemoteChange`).
 public struct MovedSyncItem: Sendable, Equatable, Codable, Identifiable, Hashable {
     public enum Outcome: String, Sendable, Equatable, Codable {
         case moved
-        /// Edited locally since it was downloaded, so it stays where the user left it.
+        /// Edited locally since it was downloaded, so it stays where the user left it until the
+        /// user chooses in Conflicts. Reported by the sync that first finds the move.
         case keptEdited
-        /// Something else already occupies the place Moodle now puts it.
-        case keptOccupied
     }
 
     public let id: String

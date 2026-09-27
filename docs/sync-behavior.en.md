@@ -71,7 +71,7 @@ Renaming a section or a module counts as a move: every file in it follows the ne
 
 If a file with the same name already sits at the new place, nothing is overwritten:
 
-- If that file is itself moving in the same sync (for example the teacher swapped the names of two sections), BeepBar moves the files in the right order; in a circular swap it uses a hidden temporary name. In the end every file is in its place with its own name.
+- If that file is itself moving in the same sync (for example the teacher swapped the names of two sections), BeepBar moves the files in the right order, and exchanges files that swapped places in a single step, with no temporary names. In the end every file is in its place with its own name. Only on a disk that cannot exchange two files in one step (some network or external drives) does one of them arrive with a number.
 - If it is a different file (another material with the same name, or a file of yours), the download rule applies: the moved file arrives with a number, e.g. `text (1).pdf`. This also applies to "Move my version to the new folder".
 
 ### 4.2 The file is deleted and uploaded again elsewhere with the same contents
@@ -85,7 +85,7 @@ To Moodle this is a new file; BeepBar recognizes it because the contents are ide
 
 "Replace" moves the freshly downloaded copy (which you never touched) to the Trash and puts yours in its place; from then on an update by the teacher becomes a conflict.
 
-If the same contents appear in more than one place, BeepBar does not guess: the new copy downloads normally and the old file is treated as removed (4.3).
+BeepBar only recognizes a file uploaded again in the same course, and only when Moodle reports the file's content fingerprint. If the same contents appear in more than one place, BeepBar does not guess: the new copy downloads normally and the old file is treated as removed (4.3). The same happens if the unedited copy cannot be moved (for example because something else took its new place in the meantime).
 
 ### 4.3 The file is removed from Moodle
 
@@ -97,12 +97,15 @@ If the same contents appear in more than one place, BeepBar does not guess: the 
 - **Move to the Trash**: the file goes to the macOS Trash, where it can be recovered.
 - A file still visible on Moodle but no longer downloadable is not considered removed.
 - A temporarily hidden module looks removed; if it becomes visible again before you choose, the entry disappears.
+- A file counts as removed only when Moodle showed its course in full: if a section, a module or an entry of that module could not be read in that sync, nothing in it is considered removed, and entries already open stay as they are.
 
 ### 4.4 What never moves anything
 
 - Changes, in a new app version, to the rules BeepBar uses to build paths.
 - Renaming a course folder, and "Organizza cartelle" rules (section 5).
 - The first sync after updating: BeepBar records where every file is and only follows later moves. Files already in an old folder stay where they are; they join the other files of their module only if that module is moved again on Moodle.
+
+On the first sync after updating, the files the teacher removed from Moodle before the update, and that are still on your Mac, appear in Conflicts as removed, all at once: nothing is deleted, and you choose file by file. Files tracked by very old versions of BeepBar, which did not record their course, are never reported as removed.
 
 ## 5. Folders and organization
 
@@ -122,7 +125,8 @@ If the same contents appear in more than one place, BeepBar does not guess: the 
 
 | Place | Contents |
 |---|---|
-| **Activity** | The last sync only: new, updated, your changes, not updated, moved **[PR #54]** |
+| **Home** | A notice leading to Conflicts while something waits for your choice, including **[PR #54]** files moved or removed on Moodle |
+| **Activity** | The last sync only: new, updated, your changes, not updated, moved, and edited files moved on Moodle that now wait in Conflicts **[PR #54]** |
 | **Conflicts** | Everything waiting for your choice, until you choose: conflicts and **[PR #54]** files moved or removed on Moodle |
 | **Menu bar** | The status of the last sync. No new text for moves and removals |
 | **Notifications** | As today (new materials, conflicts). No new notifications for moves and removals |

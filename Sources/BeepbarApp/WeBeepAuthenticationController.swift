@@ -192,6 +192,26 @@ struct SyncCompletionSummary: Codable, Equatable {
 
 /// User-facing counts, with Italian singular and plural forms.
 enum SyncCopy {
+    /// What happened after a choice about a file Moodle moved or removed.
+    static func remoteChangeStatus(_ outcome: RemoteChangeOutcome, action: RemoteChangeAction) -> String {
+        switch outcome {
+        case .done:
+            switch action {
+            case .moveMine: tr("File spostato nella nuova cartella.", "File moved to the new folder.")
+            case .leaveHere: tr("Il file resta dov’è e continua a essere sincronizzato lì.", "The file stays where it is and keeps syncing there.")
+            case .keep, .keepBoth: tr("Il file resta sul Mac ed esce dalla sincronizzazione.", "The file stays on your Mac and is no longer synced.")
+            case .trash: tr("File spostato nel Cestino.", "File moved to the Trash.")
+            case .replaceNewCopy: tr("La tua versione ha preso il posto della copia nuova, che è nel Cestino.", "Your version took the new copy’s place; the new copy is in the Trash.")
+            }
+        case .fileChanged:
+            tr("Il file è cambiato nel frattempo: non è stato toccato. Controlla e scegli di nuovo.", "The file changed in the meantime and was not touched. Check it and choose again.")
+        case .gone:
+            tr("Il file non è più dove era: non c’è più niente da scegliere.", "The file is no longer where it was: there is nothing left to choose.")
+        case .newCopyNotReplaceable:
+            tr("La copia nuova non è ancora scaricata o è stata modificata: non è stata sostituita.", "The new copy isn’t downloaded yet or was edited, so it wasn’t replaced.")
+        }
+    }
+
     static func conflictsTitle(_ count: Int) -> String {
         count == 1 ? tr("1 conflitto da risolvere", "1 conflict to resolve") : tr("\(count) conflitti da risolvere", "\(count) conflicts to resolve")
     }
@@ -221,7 +241,7 @@ extension CourseSyncCount {
     var updatedLabel: String { updated == 1 ? tr("1 aggiornato", "1 updated") : tr("\(updated) aggiornati", "\(updated) updated") }
     var movedLabel: String { moved == 1 ? tr("1 spostato", "1 moved") : tr("\(moved) spostati", "\(moved) moved") }
     var keptInPlace: Int { movedItems.count - moved }
-    var keptInPlaceLabel: String { keptInPlace == 1 ? tr("1 lasciato al suo posto", "1 left in place") : tr("\(keptInPlace) lasciati al loro posto", "\(keptInPlace) left in place") }
+    var keptInPlaceLabel: String { keptInPlace == 1 ? tr("1 da scegliere in Conflitti", "1 to decide in Conflicts") : tr("\(keptInPlace) da scegliere in Conflitti", "\(keptInPlace) to decide in Conflicts") }
 }
 
 enum AccountState: Equatable {
@@ -314,6 +334,10 @@ struct MenuBarSnapshot: Sendable {
         didSet { refreshMenuBarSnapshot() }
     }
     @Published private(set) var resolvingConflictID: UUID?
+    /// Files Moodle moved or removed that wait for the user's choice in Conflicts. Not shown in the
+    /// menu bar or in notifications (sync behavior document, section 7), so no menu bar refresh.
+    @Published private(set) var remoteChanges: [RemoteChange] = []
+    @Published private(set) var resolvingRemoteChangeID: UUID?
     /// A module move left half done that recovery cannot finish; the user can abandon it.
     @Published private(set) var hasPendingModuleMoves = false
     // Default folder name per course id, derived from `courses` and rebuilt only when that list
@@ -667,6 +691,7 @@ struct MenuBarSnapshot: Sendable {
         guard rootURL != nil, let rootID else { setSyncState(.needsFolder); return }
         let open = (try? await database?.conflicts(rootID: rootID)) ?? []
         conflicts = open
+        remoteChanges = (try? await database?.remoteChanges(rootID: rootID)) ?? []
         if !open.isEmpty { setSyncState(.conflicts(open.count, nil)); return }
         if let data = Self.defaults.data(forKey: Self.lastSuccessfulSummaryKey + rootID.uuidString),
            let summary = try? JSONDecoder().decode(SyncCompletionSummary.self, from: data) {
@@ -754,7 +779,7 @@ struct MenuBarSnapshot: Sendable {
                 }
                 guard report.unresolved.isEmpty else { throw SyncDatabaseError.execution }
                 rootURL = selectedURL; rootID = selectedID; recoveryBlocked = false; hasPendingModuleMoves = false
-                courseFolders = [:]; conflicts = []
+                courseFolders = [:]; conflicts = []; remoteChanges = []
                 await restoreScopes(for: courses)
                 Self.defaults.set(selectedURL.path, forKey: Self.rootKey)
                 Self.defaults.set(selectedID.uuidString, forKey: Self.rootIDKey)
@@ -969,6 +994,7 @@ struct MenuBarSnapshot: Sendable {
             guard let self else { return }
             let found = (try? await database.conflicts(rootID: rootID)) ?? []
             self.conflicts = found
+            self.remoteChanges = (try? await database.remoteChanges(rootID: rootID)) ?? []
             if !found.isEmpty { self.setSyncState(.conflicts(found.count, nil)) }
             else if case .conflicts = self.syncState { await self.restorePersistedSyncState() }
         }
@@ -1000,6 +1026,25 @@ struct MenuBarSnapshot: Sendable {
                 self?.status = tr("Impossibile risolvere il conflitto: nessun file locale è stato scartato.", "Couldn't resolve the conflict: no local file was discarded.")
                 self?.refreshConflicts()
             }
+        }
+    }
+
+    /// Carries out a choice about a file Moodle moved or removed. The file is re-checked first, so a
+    /// stale entry never moves or trashes anything (see `RemoteChangeResolver`).
+    func resolve(_ change: RemoteChange, with action: RemoteChangeAction) {
+        guard resolvingRemoteChangeID == nil, resolvingConflictID == nil, let rootURL, let rootID, let database, !recoveryBlocked, !isSyncActive else { return }
+        resolvingRemoteChangeID = change.id
+        Task { [weak self] in
+            defer { self?.resolvingRemoteChangeID = nil }
+            do {
+                guard let self else { return }
+                let resolver = RemoteChangeResolver(database: database, fileStore: try FileStore(root: rootURL), gate: self.operationGate)
+                let outcome = try await resolver.perform(action, on: change.id, rootID: rootID)
+                self.status = SyncCopy.remoteChangeStatus(outcome, action: action)
+            } catch {
+                self?.status = tr("Impossibile completare la scelta: nessun file è stato toccato.", "Couldn't carry out the choice: no file was touched.")
+            }
+            self?.refreshConflicts()
         }
     }
 
@@ -1418,6 +1463,7 @@ struct MenuBarSnapshot: Sendable {
         guard let database, let rootID else { return }
         let open = (try? await database.conflicts(rootID: rootID)) ?? []
         conflicts = open
+        remoteChanges = (try? await database.remoteChanges(rootID: rootID)) ?? []
         courses = Self.orderedForDisplay(courses, enabledCourseIDs: enabledCourseIDs)
         let summary = SyncCompletionSummary(progress: progress)
         if progress.failures > 0 {

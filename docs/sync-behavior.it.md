@@ -71,7 +71,7 @@ Rinominare una sezione o un modulo conta come spostamento: tutti i file che cont
 
 Se nella nuova posizione c'è già un file con lo stesso nome, niente viene sovrascritto:
 
-- Se quel file si sta spostando anche lui nello stesso sync (per esempio il professore ha scambiato i nomi di due sezioni), BeepBar sposta i file nell'ordine giusto; in uno scambio circolare usa un nome temporaneo nascosto. Alla fine ogni file è al suo posto con il suo nome.
+- Se quel file si sta spostando anche lui nello stesso sync (per esempio il professore ha scambiato i nomi di due sezioni), BeepBar sposta i file nell'ordine giusto e scambia in un solo passaggio i file che si sono scambiati di posto, senza nomi temporanei. Alla fine ogni file è al suo posto con il suo nome. Solo su un disco che non sa scambiare due file in un passaggio (alcuni dischi di rete o esterni) uno dei due arriva con un numero.
 - Se è un file diverso (un altro materiale con lo stesso nome, o un tuo file), vale la stessa regola dei download: il file spostato arriva con un numero, per esempio `testo (1).pdf`. Vale anche per "Sposta la mia versione nella nuova cartella".
 
 ### 4.2 Il file viene cancellato e ricaricato altrove con lo stesso contenuto
@@ -85,7 +85,7 @@ Per Moodle è un file nuovo; BeepBar lo riconosce perché il contenuto è identi
 
 "Sostituisci" mette nel Cestino la copia appena scaricata (che non hai mai toccato) e porta la tua al suo posto; da lì in poi un aggiornamento del professore diventa un conflitto.
 
-Se lo stesso contenuto compare in più posti, BeepBar non indovina: la copia nuova si scarica normalmente e il vecchio file viene trattato come rimosso (4.3).
+BeepBar riconosce solo un file ricaricato nello stesso corso, e solo quando Moodle fornisce l'impronta del contenuto del file. Se lo stesso contenuto compare in più posti, BeepBar non indovina: la copia nuova si scarica normalmente e il vecchio file viene trattato come rimosso (4.3). Succede lo stesso se la copia non modificata non si può spostare (per esempio perché nel frattempo qualcos'altro ha preso il suo nuovo posto).
 
 ### 4.3 Il file viene rimosso da Moodle
 
@@ -97,12 +97,15 @@ Se lo stesso contenuto compare in più posti, BeepBar non indovina: la copia nuo
 - **Sposta nel Cestino**: il file va nel Cestino di macOS, da cui si può recuperare.
 - Un file ancora visibile su Moodle ma diventato non scaricabile non è considerato rimosso.
 - Un modulo nascosto temporaneamente appare come rimosso; se torna visibile prima che tu scelga, la voce sparisce.
+- Un file conta come rimosso solo se Moodle ha mostrato il suo corso per intero: se in quel sync una sezione, un modulo o una voce di quel modulo non si è potuta leggere, niente lì dentro viene considerato rimosso, e le voci già aperte restano come sono.
 
 ### 4.4 Cosa non fa spostare niente
 
 - Le modifiche alle regole con cui BeepBar costruisce i percorsi in una nuova versione dell'app.
 - La rinomina della cartella di un corso e le regole di "Organizza cartelle" (sezione 5).
 - Il primo sync dopo l'aggiornamento: BeepBar registra dove si trova ogni file e segue solo gli spostamenti successivi. I file già in una cartella vecchia restano dove sono; raggiungono gli altri file del loro modulo solo se su Moodle quel modulo viene spostato di nuovo.
+
+Al primo sync dopo l'aggiornamento, i file che il professore aveva rimosso da Moodle prima dell'aggiornamento, e che sono ancora sul Mac, compaiono tutti insieme in Conflitti come rimossi: non viene cancellato niente, e scegli tu file per file. I file seguiti da versioni molto vecchie di BeepBar, che non registravano il corso, non vengono mai segnalati come rimossi.
 
 ## 5. Cartelle e organizzazione
 
@@ -122,7 +125,8 @@ Se lo stesso contenuto compare in più posti, BeepBar non indovina: la copia nuo
 
 | Posto | Contenuto |
 |---|---|
-| **Attività** | Solo l'ultima sincronizzazione: nuovi, aggiornati, modifiche tue, non aggiornati, spostati **[PR #54]** |
+| **Home** | Un avviso che porta a Conflitti finché qualcosa aspetta una tua scelta, compresi **[PR #54]** i file spostati o rimossi su Moodle |
+| **Attività** | Solo l'ultima sincronizzazione: nuovi, aggiornati, modifiche tue, non aggiornati, spostati, e i file modificati spostati su Moodle che ora aspettano in Conflitti **[PR #54]** |
 | **Conflitti** | Tutto ciò che aspetta una tua scelta, finché non scegli: conflitti e **[PR #54]** file spostati o rimossi su Moodle |
 | **Menu bar** | Lo stato dell'ultimo sync. Nessun testo nuovo per spostamenti e rimozioni |
 | **Notifiche** | Come oggi (nuovi materiali, conflitti). Nessuna notifica nuova per spostamenti e rimozioni |

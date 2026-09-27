@@ -2,7 +2,7 @@ import CryptoKit
 import Darwin
 import Foundation
 
-public enum FileStoreError: Error, Sendable, Equatable { case invalidRoot, symbolicLink, invalidStage, localChanged, destinationExists, sizeMismatch, tooLarge, ioFailure }
+public enum FileStoreError: Error, Sendable, Equatable { case invalidRoot, symbolicLink, invalidStage, localChanged, destinationExists, sizeMismatch, tooLarge, ioFailure, unsupported }
 
 private struct FileIdentity: Sendable, Equatable {
     let device: Int64
@@ -42,15 +42,20 @@ enum MigrationDirectoryEntryMatch: Equatable { case missing, exact, differentSpe
 
 public actor FileStore {
     private let rootFD: Int32
+    private let rootURL: URL
+    private let trash: @Sendable (URL) throws -> Void
     /// Number of times a file's full contents were read to compute a SHA-256 digest.
     /// Test instrumentation: lets tests prove that unchanged files are not re-read on every sync.
     private(set) var hashCount = 0
 
-    public init(root: URL) throws {
+    /// `trash` moves a file to the Trash; tests replace it so they never touch the user's Trash.
+    public init(root: URL, trash: @escaping @Sendable (URL) throws -> Void = { try FileManager.default.trashItem(at: $0, resultingItemURL: nil) }) throws {
         let fd = open(root.standardizedFileURL.path, O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW)
         guard fd >= 0 else { throw FileStoreError.invalidRoot }
         guard (try? Self.identity(of: fd)) != nil else { close(fd); throw FileStoreError.invalidRoot }
         rootFD = fd
+        rootURL = root.standardizedFileURL
+        self.trash = trash
     }
 
     deinit { close(rootFD) }
@@ -199,6 +204,36 @@ public actor FileStore {
             throw fileStoreError()
         }
         guard fsync(sourceParent) == 0, fsync(destinationParent) == 0 else { throw fileStoreError() }
+    }
+
+    /// Exchanges two regular files in one atomic rename (`RENAME_SWAP`), each checked to still be
+    /// the file that was hashed. Used when Moodle swaps two files' places, so neither ever needs a
+    /// temporary name that a crash could strand. Throws `unsupported` on a volume that cannot swap.
+    public func swapRegularFiles(_ first: RelativePath, expected firstSnapshot: FileSnapshot, with second: RelativePath, expected secondSnapshot: FileSnapshot) throws {
+        try requireMovablePath(first)
+        try requireMovablePath(second)
+        let (firstParent, firstName) = try parentDirectory(for: first, create: false)
+        defer { close(firstParent) }
+        let (secondParent, secondName) = try parentDirectory(for: second, create: false)
+        defer { close(secondParent) }
+        for (parent, name, snapshot) in [(firstParent, firstName, firstSnapshot), (secondParent, secondName, secondSnapshot)] {
+            var current = stat()
+            guard fstatat(parent, name, &current, AT_SYMLINK_NOFOLLOW) == 0, (current.st_mode & S_IFMT) == S_IFREG,
+                  Int64(current.st_dev) == snapshot.device, UInt64(current.st_ino) == snapshot.inode else { throw FileStoreError.localChanged }
+        }
+        guard renameatx_np(firstParent, firstName, secondParent, secondName, UInt32(RENAME_SWAP)) == 0 else {
+            if errno == ENOTSUP || errno == EINVAL { throw FileStoreError.unsupported }
+            throw fileStoreError()
+        }
+        guard fsync(firstParent) == 0, fsync(secondParent) == 0 else { throw fileStoreError() }
+    }
+
+    /// Moves a regular file to the Trash, where the user can still recover it, provided it is
+    /// still the file that was hashed (`expected`).
+    public func trashRegularFile(_ path: RelativePath, expected: FileSnapshot) throws {
+        guard case .present(let current) = try snapshotRegularFile(path), current == expected else { throw FileStoreError.localChanged }
+        do { try trash(rootURL.appending(path: path.value, directoryHint: .notDirectory)) }
+        catch { throw FileStoreError.ioFailure }
     }
 
     /// Removes the directories that held `path` while they are empty, deepest first, stopping at the

@@ -192,14 +192,6 @@ public actor SyncDatabase {
         }
     }
 
-    public func rootUnattributedBaselineCount(rootID: UUID) throws -> Int {
-        try withStatement("SELECT COUNT(*) FROM items WHERE root_id = ? AND (course_id IS NULL OR module_id IS NULL)") { statement in
-            try bind(rootID.uuidString, to: statement, index: 1)
-            guard try stepRow(statement) else { throw SyncDatabaseError.execution }
-            return Int(sqlite3_column_int(statement, 0))
-        }
-    }
-
     public func beginModuleMove(_ move: PendingModuleMove) throws {
         try execute("BEGIN IMMEDIATE")
         do {
@@ -656,6 +648,9 @@ public actor SyncDatabase {
         try execute(database, "CREATE TABLE IF NOT EXISTS schema_migrations (version INTEGER PRIMARY KEY)")
         try execute(database, "CREATE TABLE IF NOT EXISTS roots (id TEXT PRIMARY KEY, canonical_path TEXT NOT NULL UNIQUE, security_bookmark BLOB, settings_json TEXT NOT NULL DEFAULT '{}')")
         try execute(database, "CREATE TABLE IF NOT EXISTS sync_scopes (root_id TEXT NOT NULL REFERENCES roots(id) ON DELETE CASCADE, course_id INTEGER NOT NULL, display_name TEXT NOT NULL, local_folder TEXT NOT NULL DEFAULT '', enabled INTEGER NOT NULL CHECK(enabled IN (0, 1)), auto_sync INTEGER NOT NULL DEFAULT 0 CHECK(auto_sync IN (0, 1)), managed_directory INTEGER NOT NULL DEFAULT 0 CHECK(managed_directory IN (0, 1)), directory_device INTEGER, directory_inode INTEGER, PRIMARY KEY(root_id, course_id), UNIQUE(root_id, local_folder))")
+        // `auto_sync` is unused: automatic sync is one app-wide setting, not per course. The
+        // column stays because installed databases already have it and dropping a column means
+        // rebuilding the table; nothing reads it, and new rows get the default.
         if try !columnExists(database, table: "sync_scopes", column: "auto_sync") { try execute(database, "ALTER TABLE sync_scopes ADD COLUMN auto_sync INTEGER NOT NULL DEFAULT 0") }
         try execute(database, "CREATE TABLE IF NOT EXISTS remote_observations (root_id TEXT NOT NULL REFERENCES roots(id) ON DELETE CASCADE, course_id INTEGER NOT NULL, remote_id TEXT NOT NULL, observed_revision TEXT NOT NULL, observed_sha256 TEXT, relative_path TEXT NOT NULL, size INTEGER NOT NULL, first_seen_at REAL NOT NULL, last_seen_at REAL NOT NULL, last_notified_revision TEXT, PRIMARY KEY(root_id, remote_id))")
         try execute(database, "CREATE TABLE IF NOT EXISTS items (root_id TEXT NOT NULL REFERENCES roots(id) ON DELETE CASCADE, remote_id TEXT NOT NULL, relative_path TEXT NOT NULL, base_sha256 TEXT NOT NULL, remote_revision TEXT NOT NULL, last_seen_at REAL, course_id INTEGER, module_id INTEGER, PRIMARY KEY(root_id, remote_id), CHECK((course_id IS NULL AND module_id IS NULL) OR (course_id IS NOT NULL AND module_id IS NOT NULL)))")

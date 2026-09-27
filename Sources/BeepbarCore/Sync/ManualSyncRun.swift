@@ -145,7 +145,7 @@ public actor ManualSyncRun {
     }
 
     public func startWithinLease(items: [PreparedSyncItem], token: String, progress: @escaping @Sendable (SyncProgress) async -> Void) async throws -> SyncProgress {
-        let normalizedDestinations = items.map { $0.destination.value.precomposedStringWithCanonicalMapping.lowercased() }
+        let normalizedDestinations = items.map(\.destination.comparisonKey)
         guard Set(items.map(\.id)).count == items.count, Set(normalizedDestinations).count == items.count else { throw SyncDatabaseError.execution }
         return try await execute(items: items, token: token, progress: progress)
     }

@@ -32,6 +32,9 @@
 - A scheduled check with no selected courses no longer replaces the last synchronization result with "Pronto".
 - Choosing the sync folder through a symbolic link now uses the real folder, so the same folder is never tracked twice.
 - Typing the name of a new folder in the "Scegli cartella" panel works again. Beepbar lives in the menu bar, and the panel could appear without receiving the keyboard; while the panel is open Beepbar now briefly shows in the Dock so the panel gets focus.
+- Two courses with exactly the same name (for example two "Tesi di laurea") can now both be selected. They used to get the same folder, so the second one could never be turned on; it now gets its own folder, named after the course with its number added. Folders you already have are not renamed.
+- The preview in "Organizza cartelle" no longer expires just because an automatic synchronization of another course ran in the meantime; confirming it used to fail with "I contenuti o i file locali sono cambiati dopo l'anteprima". The count of older files that are not moved now only covers the course you are organizing.
+- A download that turns out larger than WeBeep announced is now stopped as soon as it goes over, instead of being written to disk in full and only then refused.
 
 ### Performance
 

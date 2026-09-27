@@ -22,6 +22,14 @@ public enum LocalPathPolicy {
         courseSlug(courseName)
     }
 
+    /// `folder` made unique by the course's Moodle ID, for when two courses would otherwise
+    /// get the same folder (identical names, or a name matching another course's folder).
+    /// Only the ID is guaranteed to differ between two courses, so nothing derived from the
+    /// name alone can separate them (ultrareview finding on `defaultFolders`).
+    public static func courseFolder(_ folder: String, disambiguatedBy courseID: Int64) -> String {
+        limited("\(folder)-\(courseID)")
+    }
+
     private static func courseLabel(_ courseName: String) -> String {
         let range = NSRange(courseName.startIndex..., in: courseName)
         if let match = forkStyleCourseName?.firstMatch(in: courseName, range: range), let captured = Range(match.range(at: 1), in: courseName) {
@@ -106,7 +114,7 @@ public enum LocalPathPolicy {
     public static func uniqueDestination(_ destination: RelativePath, reserving paths: inout Set<String>) throws -> RelativePath {
         var candidate = destination
         var suffix = 1
-        while !paths.insert(normalized(candidate)).inserted {
+        while !paths.insert(candidate.comparisonKey).inserted {
             candidate = try destinationByAddingSuffix(suffix, to: destination)
             suffix += 1
         }
@@ -139,10 +147,6 @@ public enum LocalPathPolicy {
 
     private static func fileComponent(_ input: String) -> String {
         component(input.replacingOccurrences(of: "/", with: "_").replacingOccurrences(of: "\\", with: "_"))
-    }
-
-    private static func normalized(_ path: RelativePath) -> String {
-        path.value.precomposedStringWithCanonicalMapping.lowercased()
     }
 
     private static func equivalent(_ lhs: String, _ rhs: String) -> Bool {

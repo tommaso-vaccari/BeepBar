@@ -200,13 +200,13 @@ public actor SyncCoordinator {
             var ghostPaths: [RelativePath] = []
             for (remoteID, baseline) in currentBaselines {
                 if claimedIDs.contains(remoteID) {
-                    reservedPaths.insert(Self.pathKey(baseline.relativePath))
+                    reservedPaths.insert(baseline.relativePath.comparisonKey)
                 } else {
                     ghostPaths.append(baseline.relativePath)
                 }
             }
             for path in try await fileStore.existingRegularFiles(ghostPaths) {
-                reservedPaths.insert(Self.pathKey(path))
+                reservedPaths.insert(path.comparisonKey)
             }
             for (index, files) in fetched.sorted(by: { $0.0 < $1.0 }) {
                 for file in files where !deferredIDs.contains(file.id) {
@@ -238,7 +238,7 @@ public actor SyncCoordinator {
     private func validateNoDestinationCollisions(_ items: [PreparedSyncItem]) throws {
         var identifiersByPath: [String: [String]] = [:]
         for item in items {
-            identifiersByPath[Self.pathKey(item.destination), default: []].append(item.remote.id)
+            identifiersByPath[item.destination.comparisonKey, default: []].append(item.remote.id)
         }
         guard identifiersByPath.values.allSatisfy({ $0.count == 1 }) else { throw SyncDatabaseError.execution }
     }
@@ -265,10 +265,6 @@ public actor SyncCoordinator {
 
     static func validateUniqueRemoteIDs(_ files: [RemoteFileCandidate]) throws {
         guard Set(files.map(\.id)).count == files.count else { throw SyncDatabaseError.execution }
-    }
-
-    private static func pathKey(_ path: RelativePath) -> String {
-        path.value.precomposedStringWithCanonicalMapping.lowercased()
     }
 
     private static func isLegacyRemoteID(_ remoteID: String, for file: RemoteFileCandidate) -> Bool {

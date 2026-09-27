@@ -26,6 +26,19 @@ struct SyncCopyTests {
         #expect(SyncCopy.partialDetail(failedFiles: 0, failedCourses: 2) == "2 corsi non accessibili. I file esistenti sono al sicuro.")
     }
 
+    @Test func filesMovedToFollowMoodleAreCountedButKeptOnesAreNot() {
+        let moved = (0..<3).map { MovedSyncItem(id: "m\($0)", name: "\($0).pdf", folder: "Lab 0", outcome: .moved) }
+        let kept = MovedSyncItem(id: "k", name: "k.pdf", folder: "Lab 0", outcome: .keptEdited)
+        let course = CourseSyncCount(courseID: 1, courseFolder: "Analisi", added: 0, updated: 0, movedItems: moved + [kept])
+        let summary = SyncCompletionSummary(completedAt: Date(), added: 0, updated: 0, unchanged: 0, preservedLocal: 0, conflicts: 0, failures: 0, perCourse: [course])
+        #expect(summary.moved == 3)
+        #expect(summary.compactDetail == "Nessuna novità")
+        #expect(summary.detail == "Nessun nuovo materiale. 3 file spostati nella loro nuova cartella.")
+        #expect(summary.affectedCourses.map(\.courseID) == [1])
+        #expect(course.movedLabel == "3 spostati")
+        #expect(course.keptInPlaceLabel == "1 da scegliere in Conflitti")
+    }
+
     @Test func summarySavedByAnOlderVersionStillDecodes() throws {
         let json = #"{"completedAt":0,"added":1,"updated":0,"unchanged":0,"preservedLocal":0,"conflicts":0,"failures":0,"perCourse":[{"courseID":1,"courseFolder":"A","added":1,"updated":0}]}"#
         let summary = try JSONDecoder().decode(SyncCompletionSummary.self, from: Data(json.utf8))

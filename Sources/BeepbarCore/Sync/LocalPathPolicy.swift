@@ -161,7 +161,7 @@ public enum LocalPathPolicy {
         ) == .orderedSame
     }
 
-    private static func destinationByAddingSuffix(_ suffix: Int, to path: RelativePath) throws -> RelativePath {
+    static func destinationByAddingSuffix(_ suffix: Int, to path: RelativePath) throws -> RelativePath {
         let value = path.value as NSString
         let directory = value.deletingLastPathComponent
         let filename = value.lastPathComponent as NSString

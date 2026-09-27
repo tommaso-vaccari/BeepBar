@@ -27,6 +27,20 @@ public struct RemoteCourseSummary: Sendable, Equatable, Identifiable {
 public struct RemoteCourseContents: Sendable, Equatable {
     public let sections: [RemoteContentSection]
     public let issueCount: Int
+    /// Modules with an entry that was left out as unreadable (or a module type whose contents are
+    /// never files). A file missing from one of them may still be on Moodle, so it is never
+    /// reported as removed.
+    public let modulesWithDroppedEntries: Set<Int64>
+    /// False when a whole section or module was unreadable: then no file of the course can be
+    /// reported as removed, since any of them could have been in it.
+    public let isComplete: Bool
+
+    public init(sections: [RemoteContentSection], issueCount: Int, modulesWithDroppedEntries: Set<Int64> = [], isComplete: Bool = true) {
+        self.sections = sections
+        self.issueCount = issueCount
+        self.modulesWithDroppedEntries = modulesWithDroppedEntries
+        self.isComplete = isComplete
+    }
 }
 
 public struct RemoteContentSection: Sendable, Equatable, Identifiable {
@@ -238,16 +252,21 @@ public final class WeBeepAPIClient: @unchecked Sendable {
         guard sections.count <= 1_000 else { throw WeBeepAPIError.responseTooLarge }
         var issueCount = 0
         var identityCounts: [String: Int] = [:]
+        var modulesWithDroppedEntries: Set<Int64> = []
+        var isComplete = true
         let mapped = sections.compactMap { section -> RemoteContentSection? in
-            guard section.id > 0 else { issueCount += 1; return nil }
+            guard section.id > 0 else { issueCount += 1; isComplete = false; return nil }
             let sectionName = MoodleText.normalized(section.name) ?? ""
             issueCount += section.modules?.discardedCount ?? 0
+            if (section.modules?.discardedCount ?? 0) > 0 { isComplete = false }
             let modules = (section.modules?.elements ?? []).compactMap { module -> RemoteContentModule? in
-                guard module.id > 0 else { issueCount += 1; return nil }
+                guard module.id > 0 else { issueCount += 1; isComplete = false; return nil }
                 let name = MoodleText.normalized(module.name) ?? ""
                 issueCount += module.contents?.discardedCount ?? 0
+                if (module.contents?.discardedCount ?? 0) > 0 { modulesWithDroppedEntries.insert(module.id) }
                 if let modname = module.modname?.lowercased(), ["forum", "url", "page", "label", "choice", "feedback", "lesson", "wooclap"].contains(modname) {
                     issueCount += module.contents?.elements.count ?? 0
+                    modulesWithDroppedEntries.insert(module.id)
                     return nil
                 }
                 let moduleContents = module.contents?.elements ?? []
@@ -262,7 +281,7 @@ public final class WeBeepAPIClient: @unchecked Sendable {
                           // An out-of-range (or NaN) timestamp would trap when narrowed to Int64 for the
                           // revision fallback below, so it is treated as a malformed entry instead.
                           let modifiedSeconds = Int64(exactly: timemodified.rounded(.towardZero)),
-                          let urlText = content.fileurl, let url = URL(string: urlText), let canonicalPath = canonicalPluginPath(url, policy: policy) else { issueCount += 1; return nil }
+                          let urlText = content.fileurl, let url = URL(string: urlText), let canonicalPath = canonicalPluginPath(url, policy: policy) else { issueCount += 1; modulesWithDroppedEntries.insert(module.id); return nil }
                     let identity = "\(courseID):\(module.id):\(remoteFilePath):\(filename)"
                     identityCounts[identity, default: 0] += 1
                     let hasCredentialQuery = URLComponents(url: url, resolvingAgainstBaseURL: false)?.queryItems?.contains { $0.name.caseInsensitiveCompare("token") == .orderedSame || $0.name.caseInsensitiveCompare("wstoken") == .orderedSame } == true
@@ -299,7 +318,7 @@ public final class WeBeepAPIClient: @unchecked Sendable {
                 })
             })
         }
-        return RemoteCourseContents(sections: resolved, issueCount: issueCount)
+        return RemoteCourseContents(sections: resolved, issueCount: issueCount, modulesWithDroppedEntries: modulesWithDroppedEntries, isComplete: isComplete)
     }
 
     private func request(_ function: AllowedFunction, token: String, fields: [String: String], limit: Int) async throws -> Data {

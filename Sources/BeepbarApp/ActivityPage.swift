@@ -26,6 +26,7 @@ struct ActivityPage: View {
                             ForEach(summary.affectedCourses) { course in
                                 CourseActivityCard(
                                     course: course,
+                                    platformName: authentication.selectedSite.platformName,
                                     folderURL: authentication.rootURL?.appending(path: course.courseFolder, directoryHint: .isDirectory)
                                 )
                             }
@@ -46,6 +47,7 @@ struct ActivityPage: View {
 
 private struct CourseActivityCard: View {
     let course: CourseSyncCount
+    let platformName: String
     let folderURL: URL?
     @State private var isExpanded = false
 
@@ -60,6 +62,8 @@ private struct CourseActivityCard: View {
                     Spacer(minLength: 8)
                     if course.added > 0 { CountPill(text: course.addedLabel, tint: .green) }
                     if course.updated > 0 { CountPill(text: course.updatedLabel, tint: .blue) }
+                    if course.moved > 0 { CountPill(text: course.movedLabel, tint: .teal) }
+                    if course.keptInPlace > 0 { CountPill(text: course.keptInPlaceLabel, tint: .purple) }
                     if course.courseFailure != nil { CountPill(text: tr("non sincronizzato", "not synced"), tint: .orange) }
                     if !course.failedItems.isEmpty { CountPill(text: tr("\(course.failedItems.count) non aggiornati", "\(course.failedItems.count) not updated"), tint: .orange) }
                     Image(systemName: "chevron.right")
@@ -92,6 +96,17 @@ private struct CourseActivityCard: View {
                                 .foregroundStyle(item.kind == .added ? .green : .blue)
                         }
                     }
+                    ForEach(course.movedItems) { item in
+                        Label {
+                            VStack(alignment: .leading, spacing: 1) {
+                                Text(item.name).font(.callout).lineLimit(1)
+                                Text(item.explanation(platform: platformName)).font(.caption).foregroundStyle(.secondary)
+                            }
+                        } icon: {
+                            Image(systemName: item.outcome == .moved ? "arrow.right.circle.fill" : "lock.circle.fill")
+                                .foregroundStyle(item.outcome == .moved ? .teal : .purple)
+                        }
+                    }
                     ForEach(course.failedItems) { item in
                         Label {
                             VStack(alignment: .leading, spacing: 1) {
@@ -118,5 +133,19 @@ private struct CourseActivityCard: View {
         }
         .card(padding: 0)
         .clipShape(RoundedRectangle(cornerRadius: BeepbarStyle.cardRadius, style: .continuous))
+    }
+}
+
+private extension MovedSyncItem {
+    /// Where the file went, or why it stayed. Built at display time so it follows a language switch.
+    func explanation(platform: String) -> String {
+        let place = folder.isEmpty ? tr("nella cartella del corso", "in the course folder") : tr("in “\(folder)”", "to “\(folder)”")
+        switch outcome {
+        case .moved:
+            return tr("Spostato \(place), come su \(platform)", "Moved \(place), as on \(platform)")
+        case .keptEdited:
+            let location = folder.isEmpty ? tr("nella cartella del corso", "in the course folder") : tr("in “\(folder)”", "in “\(folder)”")
+            return tr("Su \(platform) ora è \(location). L’hai modificato: scegli in Conflitti se spostarlo", "Now \(location) on \(platform). You edited it: choose in Conflicts whether to move it")
+        }
     }
 }

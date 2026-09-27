@@ -192,6 +192,284 @@ public actor SyncDatabase {
         }
     }
 
+    /// Where Moodle placed each tracked file when it was last seen, keyed by remote id. Rows
+    /// written before this was recorded (every baseline from an older version) have no entry.
+    public func remotePlacements(rootID: UUID) throws -> [String: RemotePlacement] {
+        try withStatement("SELECT remote_id, placement_section, placement_module, placement_single FROM items WHERE root_id = ? AND placement_section IS NOT NULL AND placement_module IS NOT NULL AND placement_single IS NOT NULL") { statement in
+            try bind(rootID.uuidString, to: statement, index: 1)
+            var values: [String: RemotePlacement] = [:]
+            while try stepRow(statement) {
+                guard let remoteID = text(statement, 0), let section = text(statement, 1), let module = text(statement, 2) else { throw SyncDatabaseError.execution }
+                values[remoteID] = RemotePlacement(sectionName: section, moduleName: module, isSingleFileResource: sqlite3_column_int64(statement, 3) != 0)
+            }
+            return values
+        }
+    }
+
+    /// Stores the Moodle placement of tracked files in one transaction. With `onlyIfMissing`, a
+    /// placement already recorded is kept: that is how files downloaded by this run, and every
+    /// baseline from an older version, get their first placement without hiding a move.
+    public func recordRemotePlacements(rootID: UUID, _ placements: [String: RemotePlacement], onlyIfMissing: Bool) throws {
+        guard !placements.isEmpty else { return }
+        let sql = "UPDATE items SET placement_section = ?, placement_module = ?, placement_single = ? WHERE root_id = ? AND remote_id = ?" + (onlyIfMissing ? " AND placement_section IS NULL" : "")
+        try execute("BEGIN IMMEDIATE")
+        do {
+            for (remoteID, placement) in placements {
+                try withStatement(sql) { statement in
+                    try bindPlacement(placement, to: statement, from: 1)
+                    try bind(rootID.uuidString, to: statement, index: 4)
+                    try bind(remoteID, to: statement, index: 5)
+                    try stepDone(statement)
+                }
+            }
+            try execute("COMMIT")
+        } catch { try? execute("ROLLBACK"); throw error }
+    }
+
+    private func bindPlacement(_ placement: RemotePlacement?, to statement: OpaquePointer, from index: Int32) throws {
+        guard let placement else {
+            sqlite3_bind_null(statement, index); sqlite3_bind_null(statement, index + 1); sqlite3_bind_null(statement, index + 2)
+            return
+        }
+        try bind(placement.sectionName, to: statement, index: index)
+        try bind(placement.moduleName, to: statement, index: index + 1)
+        guard sqlite3_bind_int64(statement, index + 2, placement.isSingleFileResource ? 1 : 0) == SQLITE_OK else { throw SyncDatabaseError.execution }
+    }
+
+    private func placement(_ statement: OpaquePointer, from column: Int32) -> RemotePlacement? {
+        guard let section = text(statement, column), let module = text(statement, column + 1), sqlite3_column_type(statement, column + 2) != SQLITE_NULL else { return nil }
+        return RemotePlacement(sectionName: section, moduleName: module, isSingleFileResource: sqlite3_column_int64(statement, column + 2) != 0)
+    }
+
+    // MARK: Moves made to follow Moodle
+
+    /// Journals moves before their files are renamed (see `PendingRemoteMove`).
+    public func beginRemoteMoves(rootID: UUID, _ moves: [PendingRemoteMove]) throws {
+        try execute("BEGIN IMMEDIATE")
+        do {
+            for move in moves {
+                try withStatement("INSERT OR REPLACE INTO pending_remote_moves(root_id, remote_id, batch_id, from_path, to_path, sha256, placement_section, placement_module, placement_single) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)") { statement in
+                    try bind(rootID.uuidString, to: statement, index: 1); try bind(move.remoteID, to: statement, index: 2)
+                    try bind(move.batchID.uuidString, to: statement, index: 3)
+                    try bind(move.from.value, to: statement, index: 4); try bind(move.to.value, to: statement, index: 5)
+                    try bind(move.sha256, to: statement, index: 6)
+                    try bindPlacement(move.placement, to: statement, from: 7)
+                    try stepDone(statement)
+                }
+            }
+            try execute("COMMIT")
+        } catch { try? execute("ROLLBACK"); throw error }
+    }
+
+    public func pendingRemoteMoves(rootID: UUID) throws -> [PendingRemoteMove] {
+        try withStatement("SELECT remote_id, batch_id, from_path, to_path, sha256, placement_section, placement_module, placement_single FROM pending_remote_moves WHERE root_id = ? ORDER BY batch_id, remote_id") { statement in
+            try bind(rootID.uuidString, to: statement, index: 1)
+            var moves: [PendingRemoteMove] = []
+            while try stepRow(statement) {
+                guard let remoteID = text(statement, 0), let batch = uuid(statement, 1), let from = text(statement, 2), let to = text(statement, 3), let sha = text(statement, 4) else { throw SyncDatabaseError.execution }
+                moves.append(PendingRemoteMove(batchID: batch, remoteID: remoteID, from: try RelativePath(from), to: try RelativePath(to), sha256: sha, placement: placement(statement, from: 5)))
+            }
+            return moves
+        }
+    }
+
+    /// Points each baseline at the place its file was moved to, records the placement that caused
+    /// the move, and closes the journal rows and any entry about those files, all in one
+    /// transaction. Throws, changing nothing, when a baseline is no longer at the path it was
+    /// moved from.
+    public func commitRemoteMoves(rootID: UUID, _ moves: [PendingRemoteMove]) throws {
+        guard !moves.isEmpty else { return }
+        try execute("BEGIN IMMEDIATE")
+        do {
+            for move in moves {
+                let sql = move.placement == nil
+                    ? "UPDATE items SET relative_path = ? WHERE root_id = ? AND remote_id = ? AND relative_path = ?"
+                    : "UPDATE items SET relative_path = ?, placement_section = ?, placement_module = ?, placement_single = ? WHERE root_id = ? AND remote_id = ? AND relative_path = ?"
+                try withStatement(sql) { statement in
+                    try bind(move.to.value, to: statement, index: 1)
+                    var index: Int32 = 2
+                    if move.placement != nil { try bindPlacement(move.placement, to: statement, from: 2); index = 5 }
+                    try bind(rootID.uuidString, to: statement, index: index); try bind(move.remoteID, to: statement, index: index + 1)
+                    try bind(move.from.value, to: statement, index: index + 2)
+                    try stepDone(statement)
+                    guard sqlite3_changes(database) == 1 else { throw SyncDatabaseError.execution }
+                }
+                try deleteRows("pending_remote_moves", rootID: rootID, remoteID: move.remoteID)
+                if move.placement != nil { try deleteRows("remote_changes", rootID: rootID, remoteID: move.remoteID) }
+            }
+            try execute("COMMIT")
+        } catch { try? execute("ROLLBACK"); throw error }
+    }
+
+    /// Drops journal rows for moves that did not happen.
+    public func discardRemoteMoves(rootID: UUID, remoteIDs: [String]) throws {
+        for remoteID in remoteIDs { try deleteRows("pending_remote_moves", rootID: rootID, remoteID: remoteID) }
+    }
+
+    /// Hands a tracked file's baseline over to the new remote item Moodle uploaded with the same
+    /// contents, at `baseline.relativePath`. Returns false, changing nothing, when the old baseline
+    /// is no longer at `oldPath` or the new item already has a baseline.
+    public func transferBaseline(rootID: UUID, from oldRemoteID: String, at oldPath: RelativePath, to baseline: Baseline, placement: RemotePlacement) throws -> Bool {
+        try execute("BEGIN IMMEDIATE")
+        do {
+            guard try self.baseline(rootID: rootID, remoteID: baseline.remoteID) == nil,
+                  try self.baseline(rootID: rootID, remoteID: oldRemoteID)?.relativePath == oldPath else {
+                try execute("COMMIT")
+                return false
+            }
+            try deleteRows("items", rootID: rootID, remoteID: oldRemoteID)
+            try deleteRows("remote_changes", rootID: rootID, remoteID: oldRemoteID)
+            try upsertBaseline(rootID: rootID, baseline: baseline)
+            try withStatement("UPDATE items SET placement_section = ?, placement_module = ?, placement_single = ? WHERE root_id = ? AND remote_id = ?") { statement in
+                try bindPlacement(placement, to: statement, from: 1)
+                try bind(rootID.uuidString, to: statement, index: 4); try bind(baseline.remoteID, to: statement, index: 5)
+                try stepDone(statement)
+            }
+            try execute("COMMIT")
+            return true
+        } catch { try? execute("ROLLBACK"); throw error }
+    }
+
+    // MARK: Changes waiting for the user's choice
+
+    private static let remoteChangeColumns = "id, course_id, remote_id, kind, relative_path, target_path, new_remote_id, placement_section, placement_module, placement_single, local_sha256, locally_modified, detected_at"
+
+    public func remoteChanges(rootID: UUID) throws -> [RemoteChange] {
+        try withStatement("SELECT \(Self.remoteChangeColumns) FROM remote_changes WHERE root_id = ? ORDER BY detected_at DESC, relative_path") { statement in
+            try bind(rootID.uuidString, to: statement, index: 1)
+            var changes: [RemoteChange] = []
+            while try stepRow(statement) { changes.append(try remoteChange(statement, rootID: rootID)) }
+            return changes
+        }
+    }
+
+    public func remoteChange(rootID: UUID, id: UUID) throws -> RemoteChange? {
+        try withStatement("SELECT \(Self.remoteChangeColumns) FROM remote_changes WHERE root_id = ? AND id = ?") { statement in
+            try bind(rootID.uuidString, to: statement, index: 1); try bind(id.uuidString, to: statement, index: 2)
+            guard try stepRow(statement) else { return nil }
+            return try remoteChange(statement, rootID: rootID)
+        }
+    }
+
+    private func remoteChange(_ statement: OpaquePointer, rootID: UUID) throws -> RemoteChange {
+        guard let id = uuid(statement, 0), let remoteID = text(statement, 2), let kindText = text(statement, 3), let kind = RemoteChange.Kind(rawValue: kindText),
+              let path = text(statement, 4), let sha = text(statement, 10) else { throw SyncDatabaseError.execution }
+        return RemoteChange(id: id, rootID: rootID, courseID: sqlite3_column_int64(statement, 1), remoteID: remoteID, kind: kind, relativePath: try RelativePath(path), targetPath: try text(statement, 5).map { try RelativePath($0) }, newRemoteID: text(statement, 6), placement: placement(statement, from: 7), localSHA256: sha, isLocallyModified: sqlite3_column_int(statement, 11) != 0, detectedAt: Date(timeIntervalSince1970: sqlite3_column_double(statement, 12)))
+    }
+
+    /// Replaces the entries of `courseIDs` with `desired`, in one transaction: an entry that asks
+    /// the same question as before is kept as it is, one no longer needed is closed. Entries of
+    /// other courses (not read by this sync) are left alone. Returns the entries that are new.
+    @discardableResult
+    public func reconcileRemoteChanges(rootID: UUID, courseIDs: Set<Int64>, desired: [RemoteChange]) throws -> [RemoteChange] {
+        let existing = try remoteChanges(rootID: rootID).filter { courseIDs.contains($0.courseID) }
+        let existingByRemoteID = Dictionary(existing.map { ($0.remoteID, $0) }, uniquingKeysWith: { first, _ in first })
+        let desiredIDs = Set(desired.map(\.remoteID))
+        var created: [RemoteChange] = []
+        // A sync with nothing new must not write: skip the transaction when every entry stands.
+        let unchanged = existing.allSatisfy { desiredIDs.contains($0.remoteID) }
+            && desired.allSatisfy { change in existingByRemoteID[change.remoteID].map { $0.describesSameChange(as: change) } ?? false }
+        guard !unchanged else { return [] }
+        try execute("BEGIN IMMEDIATE")
+        do {
+            for change in existing where !desiredIDs.contains(change.remoteID) {
+                try deleteRows("remote_changes", rootID: rootID, remoteID: change.remoteID)
+            }
+            for change in desired {
+                if let current = existingByRemoteID[change.remoteID], current.describesSameChange(as: change) { continue }
+                try withStatement("INSERT OR REPLACE INTO remote_changes(root_id, \(Self.remoteChangeColumns)) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)") { statement in
+                    try bind(rootID.uuidString, to: statement, index: 1); try bind(change.id.uuidString, to: statement, index: 2)
+                    guard sqlite3_bind_int64(statement, 3, change.courseID) == SQLITE_OK else { throw SyncDatabaseError.execution }
+                    try bind(change.remoteID, to: statement, index: 4); try bind(change.kind.rawValue, to: statement, index: 5)
+                    try bind(change.relativePath.value, to: statement, index: 6); try bind(change.targetPath?.value, to: statement, index: 7)
+                    try bind(change.newRemoteID, to: statement, index: 8)
+                    try bindPlacement(change.placement, to: statement, from: 9)
+                    try bind(change.localSHA256, to: statement, index: 12)
+                    guard sqlite3_bind_int(statement, 13, change.isLocallyModified ? 1 : 0) == SQLITE_OK else { throw SyncDatabaseError.execution }
+                    sqlite3_bind_double(statement, 14, change.detectedAt.timeIntervalSince1970)
+                    try stepDone(statement)
+                }
+                created.append(change)
+            }
+            try execute("COMMIT")
+            return created
+        } catch { try? execute("ROLLBACK"); throw error }
+    }
+
+    /// Records what the user's file contains now, after an action refused to run because it changed.
+    public func updateRemoteChangeContents(rootID: UUID, id: UUID, sha256: String, isLocallyModified: Bool) throws {
+        try withStatement("UPDATE remote_changes SET local_sha256 = ?, locally_modified = ? WHERE root_id = ? AND id = ?") { statement in
+            try bind(sha256, to: statement, index: 1)
+            guard sqlite3_bind_int(statement, 2, isLocallyModified ? 1 : 0) == SQLITE_OK else { throw SyncDatabaseError.execution }
+            try bind(rootID.uuidString, to: statement, index: 3); try bind(id.uuidString, to: statement, index: 4)
+            try stepDone(statement)
+        }
+    }
+
+    public func deleteRemoteChange(rootID: UUID, id: UUID) throws {
+        try withStatement("DELETE FROM remote_changes WHERE root_id = ? AND id = ?") { statement in
+            try bind(rootID.uuidString, to: statement, index: 1); try bind(id.uuidString, to: statement, index: 2)
+            try stepDone(statement)
+        }
+    }
+
+    /// "Lascia qui": the file stays where it is and Moodle's new placement is recorded, so the
+    /// move is not proposed again.
+    public func keepInPlace(_ change: RemoteChange) throws {
+        guard let placement = change.placement else { throw SyncDatabaseError.execution }
+        try execute("BEGIN IMMEDIATE")
+        do {
+            try withStatement("UPDATE items SET placement_section = ?, placement_module = ?, placement_single = ? WHERE root_id = ? AND remote_id = ? AND relative_path = ?") { statement in
+                try bindPlacement(placement, to: statement, from: 1)
+                try bind(change.rootID.uuidString, to: statement, index: 4); try bind(change.remoteID, to: statement, index: 5)
+                try bind(change.relativePath.value, to: statement, index: 6)
+                try stepDone(statement)
+                guard sqlite3_changes(database) == 1 else { throw SyncDatabaseError.execution }
+            }
+            try deleteRemoteChange(rootID: change.rootID, id: change.id)
+            try execute("COMMIT")
+        } catch { try? execute("ROLLBACK"); throw error }
+    }
+
+    /// Stops tracking the file the entry is about ("Tieni", "Tieni entrambe", or once it went to
+    /// the Trash) and closes the entry. The file, if still there, becomes an ordinary file of the
+    /// user's; nothing on disk is touched.
+    public func stopTracking(_ change: RemoteChange) throws {
+        try execute("BEGIN IMMEDIATE")
+        do {
+            try withStatement("DELETE FROM items WHERE root_id = ? AND remote_id = ? AND relative_path = ?") { statement in
+                try bind(change.rootID.uuidString, to: statement, index: 1); try bind(change.remoteID, to: statement, index: 2)
+                try bind(change.relativePath.value, to: statement, index: 3)
+                try stepDone(statement)
+                guard sqlite3_changes(database) == 1 else { throw SyncDatabaseError.execution }
+            }
+            try deleteRemoteChange(rootID: change.rootID, id: change.id)
+            try execute("COMMIT")
+        } catch { try? execute("ROLLBACK"); throw error }
+    }
+
+    /// Drops the baseline of a file the user deleted, if it is still at `path`, together with any
+    /// entry about it: the file is then downloaded again as a new one.
+    public func forgetBaseline(rootID: UUID, remoteID: String, at path: RelativePath) throws {
+        try execute("BEGIN IMMEDIATE")
+        do {
+            try withStatement("DELETE FROM items WHERE root_id = ? AND remote_id = ? AND relative_path = ?") { statement in
+                try bind(rootID.uuidString, to: statement, index: 1); try bind(remoteID, to: statement, index: 2)
+                try bind(path.value, to: statement, index: 3)
+                try stepDone(statement)
+            }
+            try deleteRows("remote_changes", rootID: rootID, remoteID: remoteID)
+            try execute("COMMIT")
+        } catch { try? execute("ROLLBACK"); throw error }
+    }
+
+    private func deleteRows(_ table: String, rootID: UUID, remoteID: String) throws {
+        try withStatement("DELETE FROM \(table) WHERE root_id = ? AND remote_id = ?") { statement in
+            try bind(rootID.uuidString, to: statement, index: 1); try bind(remoteID, to: statement, index: 2)
+            try stepDone(statement)
+        }
+    }
+
     public func beginModuleMove(_ move: PendingModuleMove) throws {
         try execute("BEGIN IMMEDIATE")
         do {
@@ -254,6 +532,8 @@ public actor SyncDatabase {
                     try stepDone(statement)
                     guard sqlite3_changes(database) == 1 else { throw SyncDatabaseError.execution }
                 }
+                // An entry about the file names its old path; the next sync asks again if needed.
+                try deleteRows("remote_changes", rootID: move.rootID, remoteID: file.remoteID)
             }
             switch move.action {
             case .set:
@@ -283,6 +563,7 @@ public actor SyncDatabase {
         do {
             for file in move.files {
                 guard let actual = actualPaths[file.remoteID] else { continue }
+                try deleteRows("remote_changes", rootID: move.rootID, remoteID: file.remoteID)
                 if let actual {
                     guard actual != file.oldPath else { continue }
                     try withStatement("UPDATE items SET relative_path = ? WHERE root_id = ? AND remote_id = ? AND relative_path = ?") { statement in
@@ -402,6 +683,14 @@ public actor SyncDatabase {
             try withStatement("UPDATE items SET relative_path = ? || substr(relative_path, length(?) + 1) WHERE root_id = ? AND (relative_path = ? OR substr(relative_path, 1, length(?) + 1) = ? || '/')") { statement in
                 try bind(move.newFolder, to: statement, index: 1); try bind(move.oldFolder, to: statement, index: 2); try bind(move.rootID.uuidString, to: statement, index: 3)
                 try bind(move.oldFolder, to: statement, index: 4); try bind(move.oldFolder, to: statement, index: 5); try bind(move.oldFolder, to: statement, index: 6); try stepDone(statement)
+            }
+            // Entries and journaled moves about the course's files follow the folder too: an entry's
+            // action would find the file gone, and a journaled move could no longer be recovered.
+            for (table, column) in [("remote_changes", "relative_path"), ("remote_changes", "target_path"), ("pending_remote_moves", "from_path"), ("pending_remote_moves", "to_path")] {
+                try withStatement("UPDATE \(table) SET \(column) = ? || substr(\(column), length(?) + 1) WHERE root_id = ? AND (\(column) = ? OR substr(\(column), 1, length(?) + 1) = ? || '/')") { statement in
+                    try bind(move.newFolder, to: statement, index: 1); try bind(move.oldFolder, to: statement, index: 2); try bind(move.rootID.uuidString, to: statement, index: 3)
+                    try bind(move.oldFolder, to: statement, index: 4); try bind(move.oldFolder, to: statement, index: 5); try bind(move.oldFolder, to: statement, index: 6); try stepDone(statement)
+                }
             }
             try withStatement("DELETE FROM pending_scope_moves WHERE id = ?") { statement in try bind(move.id.uuidString, to: statement, index: 1); try stepDone(statement) }
             try execute("COMMIT")
@@ -657,6 +946,17 @@ public actor SyncDatabase {
         if try !columnExists(database, table: "items", column: "course_id") { try execute(database, "ALTER TABLE items ADD COLUMN course_id INTEGER") }
         if try !columnExists(database, table: "items", column: "module_id") { try execute(database, "ALTER TABLE items ADD COLUMN module_id INTEGER") }
         try execute(database, "UPDATE items SET course_id = NULL, module_id = NULL WHERE (course_id IS NULL) != (module_id IS NULL)")
+        // Where Moodle placed each file when it was last seen, so a later sync can tell a move made
+        // on Moodle from a change in Beepbar's own path rules. Existing rows start empty and are
+        // filled on their next sync without moving anything (see `RemoteMovePolicy`).
+        if try !columnExists(database, table: "items", column: "placement_section") { try execute(database, "ALTER TABLE items ADD COLUMN placement_section TEXT") }
+        if try !columnExists(database, table: "items", column: "placement_module") { try execute(database, "ALTER TABLE items ADD COLUMN placement_module TEXT") }
+        if try !columnExists(database, table: "items", column: "placement_single") { try execute(database, "ALTER TABLE items ADD COLUMN placement_single INTEGER") }
+        // Entries waiting for the user's choice about files Moodle moved or removed (see
+        // `RemoteChange`), and moves journaled before their rename (see `PendingRemoteMove`). An
+        // older version ignores both tables.
+        try execute(database, "CREATE TABLE IF NOT EXISTS remote_changes (root_id TEXT NOT NULL REFERENCES roots(id) ON DELETE CASCADE, id TEXT PRIMARY KEY, course_id INTEGER NOT NULL, remote_id TEXT NOT NULL, kind TEXT NOT NULL CHECK(kind IN ('moved', 'removed', 'reuploaded')), relative_path TEXT NOT NULL, target_path TEXT, new_remote_id TEXT, placement_section TEXT, placement_module TEXT, placement_single INTEGER, local_sha256 TEXT NOT NULL, locally_modified INTEGER NOT NULL CHECK(locally_modified IN (0, 1)), detected_at REAL NOT NULL, UNIQUE(root_id, remote_id))")
+        try execute(database, "CREATE TABLE IF NOT EXISTS pending_remote_moves (root_id TEXT NOT NULL REFERENCES roots(id) ON DELETE CASCADE, remote_id TEXT NOT NULL, batch_id TEXT NOT NULL, from_path TEXT NOT NULL, to_path TEXT NOT NULL, sha256 TEXT NOT NULL, placement_section TEXT, placement_module TEXT, placement_single INTEGER, PRIMARY KEY(root_id, remote_id))")
         try execute(database, "CREATE TABLE IF NOT EXISTS conflicts (id TEXT PRIMARY KEY, root_id TEXT NOT NULL REFERENCES roots(id) ON DELETE CASCADE, remote_id TEXT NOT NULL, relative_path TEXT NOT NULL, incoming_path TEXT NOT NULL, base_sha256 TEXT, local_sha256 TEXT, remote_sha256 TEXT NOT NULL, remote_revision TEXT NOT NULL, detected_at REAL NOT NULL, status TEXT NOT NULL CHECK(status IN ('open', 'resolved')))")
         try execute(database, "CREATE TABLE IF NOT EXISTS pending_operations (id TEXT PRIMARY KEY, root_id TEXT NOT NULL REFERENCES roots(id) ON DELETE CASCADE, remote_id TEXT NOT NULL, destination_path TEXT NOT NULL, stage_path TEXT NOT NULL, expected_local_kind TEXT NOT NULL DEFAULT 'unknown' CHECK(expected_local_kind IN ('missing', 'present', 'unknown')), expected_local_sha256 TEXT, remote_sha256 TEXT NOT NULL DEFAULT '', remote_revision TEXT NOT NULL DEFAULT '', phase TEXT NOT NULL DEFAULT 'prepared' CHECK(phase IN ('prepared', 'committed')), course_id INTEGER, module_id INTEGER, UNIQUE(root_id, remote_id), UNIQUE(root_id, destination_path))")
         if try !columnExists(database, table: "pending_operations", column: "course_id") { try execute(database, "ALTER TABLE pending_operations ADD COLUMN course_id INTEGER") }
@@ -688,6 +988,8 @@ public actor SyncDatabase {
         try execute(database, "INSERT OR IGNORE INTO schema_migrations(version) VALUES (2)")
         try execute(database, "INSERT OR IGNORE INTO schema_migrations(version) VALUES (3)")
         try execute(database, "INSERT OR IGNORE INTO schema_migrations(version) VALUES (4)")
+        try execute(database, "INSERT OR IGNORE INTO schema_migrations(version) VALUES (5)")
+        try execute(database, "INSERT OR IGNORE INTO schema_migrations(version) VALUES (6)")
     }
 
     private static func execute(_ database: OpaquePointer?, _ sql: String) throws {

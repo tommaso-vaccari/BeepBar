@@ -38,6 +38,31 @@ public struct FailedSyncItem: Sendable, Equatable, Codable, Identifiable, Hashab
     }
 }
 
+/// A tracked file whose place changed on Moodle during a sync: either moved to follow it, or left
+/// where it was because the user edited it (it then waits in Conflicts, see `RemoteChange`).
+public struct MovedSyncItem: Sendable, Equatable, Codable, Identifiable, Hashable {
+    public enum Outcome: String, Sendable, Equatable, Codable {
+        case moved
+        /// Edited locally since it was downloaded, so it stays where the user left it until the
+        /// user chooses in Conflicts. Reported by the sync that first finds the move.
+        case keptEdited
+    }
+
+    public let id: String
+    public let name: String
+    /// The folder, relative to the course folder, where Moodle now puts the file ("" for the
+    /// course folder itself).
+    public let folder: String
+    public let outcome: Outcome
+
+    public init(id: String, name: String, folder: String, outcome: Outcome) {
+        self.id = id
+        self.name = name
+        self.folder = folder
+        self.outcome = outcome
+    }
+}
+
 public struct CourseSyncCount: Sendable, Equatable, Codable, Identifiable {
     public let courseID: Int64
     public let courseFolder: String
@@ -47,11 +72,14 @@ public struct CourseSyncCount: Sendable, Equatable, Codable, Identifiable {
     public let failedItems: [FailedSyncItem]
     /// Set when the course's contents could not be read at all, so none of its files were checked.
     public let courseFailure: String?
+    /// Files whose place changed on Moodle, moved or left in place.
+    public let movedItems: [MovedSyncItem]
 
     public var id: Int64 { courseID }
-    public var total: Int { added + updated + failedItems.count + (courseFailure == nil ? 0 : 1) }
+    public var moved: Int { movedItems.filter { $0.outcome == .moved }.count }
+    public var total: Int { added + updated + movedItems.count + failedItems.count + (courseFailure == nil ? 0 : 1) }
 
-    public init(courseID: Int64, courseFolder: String, added: Int, updated: Int, items: [SyncedItem] = [], failedItems: [FailedSyncItem] = [], courseFailure: String? = nil) {
+    public init(courseID: Int64, courseFolder: String, added: Int, updated: Int, items: [SyncedItem] = [], failedItems: [FailedSyncItem] = [], courseFailure: String? = nil, movedItems: [MovedSyncItem] = []) {
         self.courseID = courseID
         self.courseFolder = courseFolder
         self.added = added
@@ -59,9 +87,16 @@ public struct CourseSyncCount: Sendable, Equatable, Codable, Identifiable {
         self.items = items
         self.failedItems = failedItems
         self.courseFailure = courseFailure
+        self.movedItems = movedItems
     }
 
-    private enum CodingKeys: String, CodingKey { case courseID, courseFolder, added, updated, items, failedItems, courseFailure }
+    /// The same course with `moved` added to its moved items.
+    func addingMovedItems(_ moved: [MovedSyncItem]) -> CourseSyncCount {
+        let merged = (movedItems + moved).sorted { $0.name.localizedStandardCompare($1.name) == .orderedAscending }
+        return CourseSyncCount(courseID: courseID, courseFolder: courseFolder, added: added, updated: updated, items: items, failedItems: failedItems, courseFailure: courseFailure, movedItems: merged)
+    }
+
+    private enum CodingKeys: String, CodingKey { case courseID, courseFolder, added, updated, items, failedItems, courseFailure, movedItems }
 
     public init(from decoder: Decoder) throws {
         let values = try decoder.container(keyedBy: CodingKeys.self)
@@ -72,6 +107,9 @@ public struct CourseSyncCount: Sendable, Equatable, Codable, Identifiable {
         items = try values.decodeIfPresent([SyncedItem].self, forKey: .items) ?? []
         failedItems = try values.decodeIfPresent([FailedSyncItem].self, forKey: .failedItems) ?? []
         courseFailure = try values.decodeIfPresent(String.self, forKey: .courseFailure)
+        // Tolerant on purpose: a summary saved by a newer version with an outcome this one does not
+        // know must not make the whole saved summary unreadable after a downgrade.
+        movedItems = (try? values.decodeIfPresent([MovedSyncItem].self, forKey: .movedItems)) ?? []
     }
 }
 
@@ -89,6 +127,21 @@ public struct SyncProgress: Sendable, Equatable {
     public var installed: Int { added + updated }
     /// Courses whose contents could not be read; each one also counts as one failure.
     public var failedCourses: Int { perCourse.filter { $0.courseFailure != nil }.count }
+    /// Files moved to follow a move made on Moodle.
+    public var moved: Int { perCourse.reduce(0) { $0 + $1.moved } }
+
+    /// The same run with the files whose place changed on Moodle folded in, keyed by course id.
+    /// `folders` names the course folder of a course that has no other entry yet.
+    func addingMovedItems(_ moved: [Int64: [MovedSyncItem]], folders: [Int64: String]) -> SyncProgress {
+        guard !moved.isEmpty else { return self }
+        var byCourse = Dictionary(perCourse.map { ($0.courseID, $0) }, uniquingKeysWith: { first, _ in first })
+        for (courseID, items) in moved where !items.isEmpty {
+            let course = byCourse[courseID] ?? CourseSyncCount(courseID: courseID, courseFolder: folders[courseID] ?? "", added: 0, updated: 0)
+            byCourse[courseID] = course.addingMovedItems(items)
+        }
+        let merged = byCourse.values.sorted { $0.courseFolder.localizedStandardCompare($1.courseFolder) == .orderedAscending }
+        return SyncProgress(completed: completed, total: total, added: added, updated: updated, preservedLocal: preservedLocal, unchanged: unchanged, conflicts: conflicts, failures: failures, perCourse: merged)
+    }
 
     /// The same run with `failures` courses that could not be read at all folded in.
     func addingCourseFailures(_ failures: [CourseSyncCount]) -> SyncProgress {

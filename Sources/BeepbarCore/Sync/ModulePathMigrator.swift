@@ -175,7 +175,7 @@ public actor ModulePathMigrator {
         var targetIDsByPath: [String: Set<String>] = [:]
         for id in candidateIDs {
             guard let target = targetByID[id] else { continue }
-            targetIDsByPath[Self.pathKey(target), default: []].insert(id)
+            targetIDsByPath[target.comparisonKey, default: []].insert(id)
         }
         for (path, ids) in targetIDsByPath where ids.count > 1 {
             throw ModulePathMigrationError.normalizedPathCollision(path)
@@ -187,11 +187,11 @@ public actor ModulePathMigrator {
                 guard baseline.courseID == courseID, baseline.moduleID == moduleID else { throw ModulePathMigrationError.ownershipMismatch }
             }
             guard let target = targetByID[candidate.id] else { throw ModulePathMigrationError.ownershipMismatch }
-            let targetKey = Self.pathKey(target)
-            if openConflicts.contains(where: { $0.remoteID != candidate.id && Self.pathKey($0.relativePath) == targetKey }) {
+            let targetKey = target.comparisonKey
+            if openConflicts.contains(where: { $0.remoteID != candidate.id && $0.relativePath.comparisonKey == targetKey }) {
                 throw ModulePathMigrationError.trackedPathCollision(target.value)
             }
-            let trackedOwner = baselines.values.first { $0.remoteID != candidate.id && Self.pathKey($0.relativePath) == targetKey }
+            let trackedOwner = baselines.values.first { $0.remoteID != candidate.id && $0.relativePath.comparisonKey == targetKey }
             guard trackedOwner == nil else { throw ModulePathMigrationError.trackedPathCollision(target.value) }
             if baseline?.relativePath != target, try await fileStore.migrationDestinationIsOccupied(target) {
                 throw ModulePathMigrationError.destinationOccupied(target.value)
@@ -201,10 +201,23 @@ public actor ModulePathMigrator {
             snapshots[candidate.id] = source
             files.append(ModuleMoveFile(remoteID: candidate.id, oldPath: baseline.relativePath, newPath: target, source: source, baselineSHA256: baseline.sha256, baselineRevision: baseline.remoteRevision, observedRevision: candidate.observedRevision))
         }
-        let matchedOwnerless = candidateIDs.filter { id in baselines[id]?.courseID == nil && baselines[id]?.moduleID == nil }.count
-        let ownerlessCount = max(0, try await database.rootUnattributedBaselineCount(rootID: rootID) - matchedOwnerless)
+        let ownerlessCount = Self.ownerlessBaselineCount(baselines: baselines, courseFolder: courseFolder, excluding: candidateIDs)
         let fingerprint = Self.fingerprint(rootID: rootID, courseID: courseID, moduleID: moduleID, courseFolder: courseFolder, action: action, oldFolder: override?.localFolder, newFolder: desiredFolder, moduleName: module.name, candidates: module.files, baselines: baselines, files: files, excluded: excluded, ownerlessCount: ownerlessCount, snapshots: snapshots)
             return ModuleMovePreview(rootID: rootID, courseID: courseID, moduleID: moduleID, action: action, oldFolder: override?.localFolder, newFolder: desiredFolder, lastKnownName: module.name, files: files, excludedRemoteIDs: excluded, ownerlessBaselineCount: ownerlessCount, fingerprint: fingerprint)
+    }
+
+    /// Older files of this course that no sync has attributed to a module yet, so the move
+    /// leaves them where they are; the preview tells the user how many. Counted inside the
+    /// course folder only: the count is part of the fingerprint, and a root-wide count changed
+    /// whenever a sync of any other course attributed its own older files, so `apply` rejected
+    /// an untouched preview with `planChanged` (ultrareview finding on `rootUnattributedBaselineCount`).
+    static func ownerlessBaselineCount(baselines: [String: Baseline], courseFolder: String, excluding candidateIDs: Set<String>) -> Int {
+        let prefix = PathKey.of(LocalPathPolicy.component(courseFolder)) + "/"
+        return baselines.values.filter { baseline in
+            baseline.courseID == nil && baseline.moduleID == nil
+                && !candidateIDs.contains(baseline.remoteID)
+                && baseline.relativePath.comparisonKey.hasPrefix(prefix)
+        }.count
     }
 
     private static func fingerprint(rootID: UUID, courseID: Int64, moduleID: Int64, courseFolder: String, action: ModuleMoveAction, oldFolder: String?, newFolder: String?, moduleName: String, candidates: [RemoteFileCandidate], baselines: [String: Baseline], files: [ModuleMoveFile], excluded: [String], ownerlessCount: Int, snapshots: [String: FileSnapshotState]) -> String {
@@ -239,9 +252,5 @@ public actor ModulePathMigrator {
             append(file.remoteID); append(file.oldPath.value); append(file.newPath.value); append(file.observedRevision)
         }
         return SHA256.hash(data: data).map { String(format: "%02x", $0) }.joined()
-    }
-
-    private static func pathKey(_ path: RelativePath) -> String {
-        path.value.precomposedStringWithCanonicalMapping.lowercased()
     }
 }

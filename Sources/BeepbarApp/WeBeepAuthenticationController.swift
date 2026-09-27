@@ -281,7 +281,7 @@ struct MenuBarSnapshot: Sendable {
     @Published private(set) var isLoadingCourses = false
     @Published private(set) var courseLoadError: BilingualText?
     @Published private(set) var courses: [RemoteCourseSummary] = [] {
-        didSet { defaultCourseFolders = Self.defaultFolders(for: courses) }
+        didSet { defaultCourseFolders = Self.defaultFolders(for: courses, saved: courseFolders) }
     }
     @Published private(set) var hasStoredCredential: Bool {
         didSet { refreshMenuBarSnapshot() }
@@ -1237,7 +1237,7 @@ struct MenuBarSnapshot: Sendable {
         guard let scopes = try? await database.scopes(rootID: rootID) else { return }
         let remoteIDs = Set(courses.map(\.id))
         let scopesByCourse = Dictionary(scopes.map { ($0.courseID, $0) }, uniquingKeysWith: { first, _ in first })
-        let defaults = Self.defaultFolders(for: courses)
+        let defaults = Self.defaultFolders(for: courses, saved: Dictionary(scopes.map { ($0.courseID, $0.localFolder) }, uniquingKeysWith: { first, _ in first }))
         enabledCourseIDs = Self.restoredEnabledCourseIDs(scopes: scopes, current: enabledCourseIDs, remoteIDs: remoteIDs)
         for course in courses {
             if let scope = scopesByCourse[course.id], !scope.localFolder.isEmpty {
@@ -1366,15 +1366,52 @@ struct MenuBarSnapshot: Sendable {
         return Set(scopes.lazy.filter { $0.enabled && remoteIDs.contains($0.courseID) }.map(\.courseID))
     }
 
-    // Pure and independently testable: the default folder for each course, falling back to the
-    // full course name when two courses would otherwise share the same folder.
-    nonisolated static func defaultFolders(for courses: [RemoteCourseSummary]) -> [Int64: String] {
-        let names = Dictionary(grouping: courses, by: { LocalPathPolicy.defaultCourseFolder($0.displayName).precomposedStringWithCanonicalMapping.lowercased() })
-        return Dictionary(courses.map { course -> (Int64, String) in
-            let base = LocalPathPolicy.defaultCourseFolder(course.displayName)
-            let duplicate = (names[base.precomposedStringWithCanonicalMapping.lowercased()]?.count ?? 0) > 1
-            return (course.id, duplicate ? LocalPathPolicy.courseFolderSlug(course.displayName) : base)
-        }, uniquingKeysWith: { first, _ in first })
+    /// Pure and independently testable: a distinct default folder for each course. Courses whose
+    /// short folder collides fall back to their full name; courses that still collide (identical
+    /// names, e.g. two "Tesi di laurea") also get their Moodle ID, then a counter if even that
+    /// name is taken by a folder saved for another course. A collision is with another
+    /// course's default or with a folder already `saved` for another course (a user may have
+    /// renamed one onto a name another course would get). Every result must differ on disk: a
+    /// scope's folder is unique per root, so two courses sharing one left the second impossible
+    /// to enable, forever (ultrareview finding).
+    nonisolated static func defaultFolders(for courses: [RemoteCourseSummary], saved: [Int64: String] = [:]) -> [Int64: String] {
+        let uniqueCourses = Dictionary(courses.map { ($0.id, $0) }, uniquingKeysWith: { first, _ in first })
+        let savedOwners = Dictionary(grouping: saved.keys, by: { PathKey.of(saved[$0]!) }).mapValues(Set.init)
+        // Each course climbs these levels only while its folder collides with another course's.
+        func candidate(_ course: RemoteCourseSummary, level: Int) -> String {
+            switch level {
+            case 0: LocalPathPolicy.defaultCourseFolder(course.displayName)
+            case 1: LocalPathPolicy.courseFolderSlug(course.displayName)
+            case 2: LocalPathPolicy.courseFolder(LocalPathPolicy.courseFolderSlug(course.displayName), disambiguatedBy: course.id)
+            default: LocalPathPolicy.courseFolder(LocalPathPolicy.courseFolder(LocalPathPolicy.courseFolderSlug(course.displayName), disambiguatedBy: course.id), disambiguatedBy: Int64(level - 1))
+            }
+        }
+        // From level 2 on, a course's candidates all differ from one another, and it climbs only
+        // when a folder saved for another course takes its name or when it loses the tie-break
+        // between two ID-carrying names below. The bound leaves room for both: one level per
+        // saved folder and one per course, past which one of its candidates must be free.
+        let maximumLevel = 3 + saved.count + uniqueCourses.count
+        var levels = uniqueCourses.mapValues { _ in 0 }
+        while true {
+            let folders = Dictionary(uniqueKeysWithValues: levels.map { id, level in (id, candidate(uniqueCourses[id]!, level: level)) })
+            let groups = Dictionary(grouping: folders.keys, by: { PathKey.of(folders[$0]!) })
+            let colliding = folders.keys.filter { id in
+                let key = PathKey.of(folders[id]!)
+                if !(savedOwners[key] ?? []).subtracting([id]).isEmpty { return true }
+                let group = groups[key]!
+                guard group.count > 1 else { return false }
+                // A course already carrying its ID keeps its name against a name-derived one,
+                // which moves aside. Between two ID-carrying names (only possible through the
+                // counter, e.g. "a-5" + counter 2 against a course called "A 5" with ID 2) the
+                // lowest ID keeps it, so every pass still makes progress.
+                if levels[id]! < 2 { return true }
+                let named = group.filter { levels[$0]! < 2 }
+                return named.isEmpty && id != group.min()!
+            }.filter { levels[$0]! < maximumLevel }
+            // Terminates: every pass raises at least one level, and levels stop at `maximumLevel`.
+            guard !colliding.isEmpty else { return folders }
+            for id in colliding { levels[id]! += 1 }
+        }
     }
 
     private func finishReconciliation(progress: SyncProgress) async {

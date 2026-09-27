@@ -218,13 +218,13 @@ public actor SyncCoordinator {
             var ghostPaths: [RelativePath] = []
             for (remoteID, baseline) in currentBaselines {
                 if claimedIDs.contains(remoteID) {
-                    reservedPaths.insert(Self.pathKey(baseline.relativePath))
+                    reservedPaths.insert(baseline.relativePath.comparisonKey)
                 } else {
                     ghostPaths.append(baseline.relativePath)
                 }
             }
             for path in try await fileStore.existingRegularFiles(ghostPaths) {
-                reservedPaths.insert(Self.pathKey(path))
+                reservedPaths.insert(path.comparisonKey)
             }
             for (index, files) in fetched.sorted(by: { $0.0 < $1.0 }) {
                 for file in files where !deferredIDs.contains(file.id) {
@@ -287,8 +287,8 @@ public actor SyncCoordinator {
             let unsettled = Set(conflicts.map(\.remoteID)).union(try await database.pendingOperations(rootID: rootID).map(\.remoteID))
             // Who owns each path, so a file never moves onto another tracked file or an open conflict.
             var owners: [String: String] = [:]
-            for (remoteID, baseline) in current { owners[Self.pathKey(baseline.relativePath)] = remoteID }
-            for conflict in conflicts where owners[Self.pathKey(conflict.relativePath)] == nil { owners[Self.pathKey(conflict.relativePath)] = conflict.remoteID }
+            for (remoteID, baseline) in current { owners[baseline.relativePath.comparisonKey] = remoteID }
+            for conflict in conflicts where owners[conflict.relativePath.comparisonKey] == nil { owners[conflict.relativePath.comparisonKey] = conflict.remoteID }
             for plan in planned.sorted(by: { $0.file.id < $1.file.id }) {
                 try Task.checkCancellation()
                 let id = plan.file.id
@@ -300,8 +300,8 @@ public actor SyncCoordinator {
                     moved[plan.file.courseID, default: []].append(MovedSyncItem(id: id, name: plan.target.components.last ?? plan.target.value, folder: folder, outcome: outcome))
                 }
                 // Only the letter case changed: on a case-insensitive disk it is the same place.
-                if Self.pathKey(plan.target) == Self.pathKey(old) { changedPlacements[id] = placement; continue }
-                if let owner = owners[Self.pathKey(plan.target)], owner != id {
+                if plan.target.comparisonKey == old.comparisonKey { changedPlacements[id] = placement; continue }
+                if let owner = owners[plan.target.comparisonKey], owner != id {
                     changedPlacements[id] = placement
                     report(.keptOccupied)
                     continue
@@ -346,8 +346,8 @@ public actor SyncCoordinator {
                 }
                 guard try await database.commitRemoteMove(rootID: rootID, remoteID: id, from: old, to: plan.target, placement: placement) else { continue }
                 current[id] = Baseline(remoteID: id, relativePath: plan.target, sha256: plan.baseline.sha256, remoteRevision: plan.baseline.remoteRevision, courseID: plan.baseline.courseID, moduleID: plan.baseline.moduleID)
-                owners.removeValue(forKey: Self.pathKey(old))
-                owners[Self.pathKey(plan.target)] = id
+                owners.removeValue(forKey: old.comparisonKey)
+                owners[plan.target.comparisonKey] = id
                 if movedFile {
                     // Tidying up is best effort; the move is already recorded.
                     try? await fileStore.removeEmptyParentDirectories(of: old)
@@ -371,7 +371,7 @@ public actor SyncCoordinator {
     private func validateNoDestinationCollisions(_ items: [PreparedSyncItem]) throws {
         var identifiersByPath: [String: [String]] = [:]
         for item in items {
-            identifiersByPath[Self.pathKey(item.destination), default: []].append(item.remote.id)
+            identifiersByPath[item.destination.comparisonKey, default: []].append(item.remote.id)
         }
         guard identifiersByPath.values.allSatisfy({ $0.count == 1 }) else { throw SyncDatabaseError.execution }
     }
@@ -398,10 +398,6 @@ public actor SyncCoordinator {
 
     static func validateUniqueRemoteIDs(_ files: [RemoteFileCandidate]) throws {
         guard Set(files.map(\.id)).count == files.count else { throw SyncDatabaseError.execution }
-    }
-
-    private static func pathKey(_ path: RelativePath) -> String {
-        path.value.precomposedStringWithCanonicalMapping.lowercased()
     }
 
     private static func isLegacyRemoteID(_ remoteID: String, for file: RemoteFileCandidate) -> Bool {

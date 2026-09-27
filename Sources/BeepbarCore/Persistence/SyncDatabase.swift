@@ -448,6 +448,21 @@ public actor SyncDatabase {
         } catch { try? execute("ROLLBACK"); throw error }
     }
 
+    /// Drops the baseline of a file the user deleted, if it is still at `path`, together with any
+    /// entry about it: the file is then downloaded again as a new one.
+    public func forgetBaseline(rootID: UUID, remoteID: String, at path: RelativePath) throws {
+        try execute("BEGIN IMMEDIATE")
+        do {
+            try withStatement("DELETE FROM items WHERE root_id = ? AND remote_id = ? AND relative_path = ?") { statement in
+                try bind(rootID.uuidString, to: statement, index: 1); try bind(remoteID, to: statement, index: 2)
+                try bind(path.value, to: statement, index: 3)
+                try stepDone(statement)
+            }
+            try deleteRows("remote_changes", rootID: rootID, remoteID: remoteID)
+            try execute("COMMIT")
+        } catch { try? execute("ROLLBACK"); throw error }
+    }
+
     private func deleteRows(_ table: String, rootID: UUID, remoteID: String) throws {
         try withStatement("DELETE FROM \(table) WHERE root_id = ? AND remote_id = ?") { statement in
             try bind(rootID.uuidString, to: statement, index: 1); try bind(remoteID, to: statement, index: 2)

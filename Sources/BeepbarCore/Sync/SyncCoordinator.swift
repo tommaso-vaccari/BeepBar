@@ -370,7 +370,6 @@ public actor SyncCoordinator {
                 state.owners[conflict.relativePath.comparisonKey] = conflict.remoteID
             }
             var movers: [Mover] = []
-            var deleted: [(baseline: Baseline, target: RelativePath, placement: RemotePlacement)] = []
             for plan in planned.sorted(by: { $0.file.id < $1.file.id }) {
                 try Task.checkCancellation()
                 let id = plan.file.id
@@ -392,8 +391,32 @@ public actor SyncCoordinator {
                 do { source = try await fileStore.snapshotRegularFile(old) } catch { continue }
                 switch source {
                 case .missing:
-                    // Settled after the moves below, once the files leaving their places have left.
-                    deleted.append((plan.baseline, plan.target, placement))
+                    // Nothing to move: the user deleted it, and it is downloaded again in its new
+                    // place. Only the baseline follows: to that place when it is free, or already
+                    // holds exactly the downloaded contents untracked (a move finished before a
+                    // crash), and otherwise to a numbered name, as a download would. Never onto a
+                    // path another tracked file owns, even with identical contents: two baselines
+                    // on one path would make every later run fail its collision check.
+                    if state.owners[plan.target.comparisonKey].map({ $0 != id }) ?? false {
+                        // Another tracked file holds the place, possibly one about to leave it (two
+                        // sections swapped). There is no local copy to keep, so the baseline is
+                        // dropped and the file is downloaded as new once the moves are done: it gets
+                        // its own name if the place was freed, a number otherwise. One statement, so
+                        // no crash or cancel can leave two baselines on one path.
+                        try await database.forgetBaseline(rootID: rootID, remoteID: id, at: old)
+                        state.current.removeValue(forKey: id)
+                        if state.owners[old.comparisonKey] == id { state.owners.removeValue(forKey: old.comparisonKey) }
+                        continue
+                    }
+                    var destination = plan.target
+                    if case .present(let there)? = try? await fileStore.snapshotRegularFile(plan.target) {
+                        if there.sha256 != plan.baseline.sha256 { destination = try await numberedFreePath(for: plan.target, owners: state.owners) }
+                    } else if try await fileStore.migrationDestinationIsOccupied(plan.target) {
+                        destination = try await numberedFreePath(for: plan.target, owners: state.owners)
+                    }
+                    let step = PendingRemoteMove(batchID: UUID(), remoteID: id, from: old, to: destination, sha256: plan.baseline.sha256, placement: placement)
+                    guard (try? await database.commitRemoteMoves(rootID: rootID, [step])) != nil else { continue }
+                    state.record(step, baseline: plan.baseline)
                 case .present(let snapshot):
                     guard snapshot.sha256 == plan.baseline.sha256 else {
                         changes.append(RemoteChange(rootID: rootID, courseID: plan.file.courseID, remoteID: id, kind: .moved, relativePath: old, targetPath: plan.target, placement: placement, localSHA256: snapshot.sha256, isLocallyModified: true))
@@ -402,34 +425,7 @@ public actor SyncCoordinator {
                     movers.append(Mover(id: id, courseID: plan.file.courseID, baseline: plan.baseline, from: old, target: plan.target, snapshot: snapshot, placement: placement))
                 }
             }
-            // A deleted file's old path is free for the moves: its baseline leaves it below, in
-            // the same run (the commit throws rather than leave two baselines on one path).
-            for (baseline, _, _) in deleted where state.owners[baseline.relativePath.comparisonKey] == baseline.remoteID {
-                state.owners.removeValue(forKey: baseline.relativePath.comparisonKey)
-            }
             try await perform(movers, state: &state)
-            for (baseline, target, placement) in deleted {
-                try Task.checkCancellation()
-                let id = baseline.remoteID
-                // Nothing to move: the user deleted it, and it is downloaded again in its new
-                // place. Only the baseline follows: to that place when it is free, or already
-                // holds exactly the downloaded contents untracked (a move finished before a
-                // crash), and otherwise to a numbered name, as a download would. Never onto a
-                // path another tracked file owns, even with identical contents: two baselines
-                // on one path would make every later run fail its collision check. Handled after
-                // the moves, so a place a moving file just left counts as free (a swap).
-                var destination = target
-                if state.owners[target.comparisonKey].map({ $0 != id }) ?? false {
-                    destination = try await numberedFreePath(for: target, owners: state.owners)
-                } else if case .present(let there)? = try? await fileStore.snapshotRegularFile(target) {
-                    if there.sha256 != baseline.sha256 { destination = try await numberedFreePath(for: target, owners: state.owners) }
-                } else if try await fileStore.migrationDestinationIsOccupied(target) {
-                    destination = try await numberedFreePath(for: target, owners: state.owners)
-                }
-                let step = PendingRemoteMove(batchID: UUID(), remoteID: id, from: baseline.relativePath, to: destination, sha256: baseline.sha256, placement: placement)
-                try await database.commitRemoteMoves(rootID: rootID, [step])
-                state.record(step, baseline: baseline)
-            }
         }
         try await database.recordRemotePlacements(rootID: rootID, firstPlacements, onlyIfMissing: true)
         try await database.recordRemotePlacements(rootID: rootID, changedPlacements, onlyIfMissing: false)

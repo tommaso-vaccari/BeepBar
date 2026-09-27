@@ -1375,9 +1375,10 @@ struct MenuBarSnapshot: Sendable {
             default: LocalPathPolicy.courseFolder(LocalPathPolicy.courseFolder(LocalPathPolicy.courseFolderSlug(course.displayName), disambiguatedBy: course.id), disambiguatedBy: Int64(level - 1))
             }
         }
-        // From level 2 on, every candidate of a course is distinct from its others and from other
-        // courses' (the ID differs), so only the finitely many saved folders can keep a course
-        // climbing: past this level one of its candidates must be free.
+        // From level 2 on, a course's candidates all differ from one another, and it climbs only
+        // when a folder saved for another course takes its name or when it loses the tie-break
+        // between two ID-carrying names below. The bound leaves room for both: one level per
+        // saved folder and one per course, past which one of its candidates must be free.
         let maximumLevel = 3 + saved.count + uniqueCourses.count
         var levels = uniqueCourses.mapValues { _ in 0 }
         while true {

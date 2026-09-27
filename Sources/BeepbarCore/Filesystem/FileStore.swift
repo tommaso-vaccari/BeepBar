@@ -154,8 +154,8 @@ public actor FileStore {
     }
 
     static func migrationDirectoryEntryMatch(_ component: String, entries: [String]) -> MigrationDirectoryEntryMatch {
-        let key = component.precomposedStringWithCanonicalMapping.lowercased()
-        let matches = entries.filter { $0.precomposedStringWithCanonicalMapping.lowercased() == key }
+        let key = PathKey.of(component)
+        let matches = entries.filter { PathKey.of($0) == key }
         guard matches.count == 1 else { return matches.isEmpty ? .missing : .ambiguous }
         return matches[0].utf8.elementsEqual(component.utf8) ? .exact : .differentSpelling
     }

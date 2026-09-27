@@ -45,7 +45,7 @@ public actor ManualSyncEngine {
         // The import copies the body out of the temporary file, so nothing else ever removes it.
         defer { try? FileManager.default.removeItem(at: downloaded.temporaryURL) }
         try Task.checkCancellation()
-        let artifact = try await fileStore.importDownloadedFile(at: downloaded.temporaryURL, expectedSize: downloaded.expectedSize, maximumSize: 1_073_741_824)
+        let artifact = try await fileStore.importDownloadedFile(at: downloaded.temporaryURL, expectedSize: downloaded.expectedSize, maximumSize: downloader.maximumSize)
         let remote = RemoteState(sha256: artifact.sha256, revision: file.observedRevision)
         do {
             try Task.checkCancellation()

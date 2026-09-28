@@ -377,6 +377,10 @@ struct MenuBarSnapshot: Sendable {
     private var automaticOutcome: AutomaticSyncOutcome = .finished
     private var rootID: UUID?
     private var scheduledConfiguration: BackgroundScheduleConfiguration?
+#if DEBUG
+    private var beforeReconciliationStateForTesting: (@MainActor () async -> Void)?
+    private var beforeScopeRestoreForTesting: (@MainActor () -> Void)?
+#endif
 
     // Pure and independently testable: whether onboarding should show depends only on these two
     // inputs. An existing root always wins, regardless of the persisted flag — this is what makes
@@ -482,7 +486,7 @@ struct MenuBarSnapshot: Sendable {
     }
 
 #if DEBUG
-    init(testRootURL: URL) {
+    init(testRootURL: URL, database: SyncDatabase? = nil, rootID: UUID? = nil) {
         let site = MoodleSite.site(id: nil)
         selectedSite = site
         hasStoredCredential = true
@@ -495,6 +499,8 @@ struct MenuBarSnapshot: Sendable {
         automaticSyncInterval = 28_800
         apiClient = WeBeepAPIClient(policy: site.serverPolicy)
         downloader = RemoteDownloader(policy: apiClient.policy)
+        self.database = database
+        self.rootID = rootID
         super.init()
         accountState = .connected
         refreshMenuBarSnapshot()
@@ -506,6 +512,38 @@ struct MenuBarSnapshot: Sendable {
 
     func setSyncStateForTesting(_ state: AppSyncState) {
         setSyncState(state)
+    }
+
+    func setLoadingCoursesForTesting(_ loading: Bool) {
+        isLoadingCourses = loading
+    }
+
+    func setScopeWriteTaskForTesting(_ task: Task<Void, Never>) {
+        scopeWriteTask = task
+    }
+
+    func setBeforeScopeRestoreForTesting(_ action: @escaping @MainActor () -> Void) {
+        beforeScopeRestoreForTesting = action
+    }
+
+    func restoreScopesForTesting(_ courses: [RemoteCourseSummary]) async {
+        await restoreScopes(for: courses)
+    }
+
+    func setBeforeNotificationForTesting(_ action: @escaping @MainActor () async -> Void) {
+        notificationCoordinator.beforeNotificationForTesting = action
+    }
+
+    func completeSyncForTesting(_ operationID: UUID, summary: SyncProgress) async {
+        await completeSync(operationID, summary: summary, automatic: false)
+    }
+
+    func setBeforeReconciliationStateForTesting(_ action: @escaping @MainActor () async -> Void) {
+        beforeReconciliationStateForTesting = action
+    }
+
+    func failSyncForTesting(_ operationID: UUID) async {
+        await failedSync(operationID, error: nil, automatic: true)
     }
 #endif
 
@@ -855,7 +893,7 @@ struct MenuBarSnapshot: Sendable {
     }
 
     func setCourse(_ course: RemoteCourseSummary, enabled: Bool) {
-        guard !isSyncActive else { return }
+        guard !isSyncActive, !isLoadingCourses else { return }
         if enabled { enabledCourseIDs.insert(course.id) }
         else { enabledCourseIDs.remove(course.id) }
         Self.defaults.set(enabledCourseIDs.map(String.init).sorted(), forKey: Self.enabledCoursesKey)
@@ -1321,6 +1359,10 @@ struct MenuBarSnapshot: Sendable {
     }
 
     private func restoreScopes(for courses: [RemoteCourseSummary]) async {
+#if DEBUG
+        beforeScopeRestoreForTesting?()
+#endif
+        await scopeWriteTask?.value
         guard let database, let rootID else { return }
         guard let scopes = try? await database.scopes(rootID: rootID) else { return }
         let remoteIDs = Set(courses.map(\.id))
@@ -1502,11 +1544,16 @@ struct MenuBarSnapshot: Sendable {
         }
     }
 
-    private func finishReconciliation(progress: SyncProgress) async {
+    private func finishReconciliation(progress: SyncProgress, operationID: UUID) async {
         guard let database, let rootID else { return }
         let open = (try? await database.conflicts(rootID: rootID)) ?? []
+        let changes = (try? await database.remoteChanges(rootID: rootID)) ?? []
+#if DEBUG
+        await beforeReconciliationStateForTesting?()
+#endif
+        guard activeOperationID == operationID else { return }
         conflicts = open
-        remoteChanges = (try? await database.remoteChanges(rootID: rootID)) ?? []
+        remoteChanges = changes
         courses = Self.orderedForDisplay(courses, enabledCourseIDs: enabledCourseIDs)
         let summary = SyncCompletionSummary(progress: progress)
         if progress.failures > 0 {
@@ -1641,7 +1688,8 @@ struct MenuBarSnapshot: Sendable {
 
     private func completeSync(_ operationID: UUID, summary: SyncProgress, automatic: Bool) async {
         guard activeOperationID == operationID else { return }
-        await finishReconciliation(progress: summary)
+        await finishReconciliation(progress: summary, operationID: operationID)
+        guard activeOperationID == operationID else { return }
         if summary.failures == 0 { notificationCoordinator.clearFailure() }
         BeepbarLog.sync.notice("Synchronization completed automatic=\(automatic, privacy: .public) total=\(summary.total, privacy: .public) installed=\(summary.installed, privacy: .public) conflicts=\(summary.conflicts, privacy: .public) failures=\(summary.failures, privacy: .public)")
         configureBackgroundScheduler()
@@ -1858,6 +1906,9 @@ private enum AutomaticNotificationIssue: String {
 @MainActor private final class SyncNotificationCoordinator {
     private static let prefix = "io.github.tvaccari.beepbar.notification.v2"
     private let deduplication: NotificationDeduplicationStore
+#if DEBUG
+    var beforeNotificationForTesting: (@MainActor () async -> Void)?
+#endif
 
     init(defaults: UserDefaults = .standard) {
         deduplication = NotificationDeduplicationStore(defaults: defaults, prefix: Self.prefix)
@@ -1895,6 +1946,9 @@ private enum AutomaticNotificationIssue: String {
     /// materials arrived. Nothing new stays silent: the icon returning to normal is enough.
     /// Without a notification delegate, macOS drops the banner while Beepbar's window is in front.
     func notifyManualRun(added: Int) async {
+#if DEBUG
+        if let beforeNotificationForTesting { await beforeNotificationForTesting(); return }
+#endif
         guard added > 0 else { return }
         let center = UNUserNotificationCenter.current()
         let settings = await center.notificationSettings()
@@ -1903,6 +1957,9 @@ private enum AutomaticNotificationIssue: String {
     }
 
     func notify(issue: AutomaticNotificationIssue) async {
+#if DEBUG
+        if let beforeNotificationForTesting { await beforeNotificationForTesting(); return }
+#endif
         let center = UNUserNotificationCenter.current()
         let settings = await center.notificationSettings()
         guard settings.authorizationStatus == .authorized else { return }

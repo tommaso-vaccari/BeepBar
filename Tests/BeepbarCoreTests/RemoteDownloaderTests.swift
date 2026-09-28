@@ -1,4 +1,5 @@
 import Foundation
+import Darwin
 import Testing
 @testable import BeepbarCore
 
@@ -70,6 +71,18 @@ import Testing
             try await downloader.download(Self.file(size: Int64(RedirectingProtocol.body.count)), token: "token", access: .unrestricted)
         }
         #expect(Self.leakedDownloadTemporaries(since: before, body: RedirectingProtocol.body).isEmpty)
+    }
+
+    @Test func anHTTPRedirectIsRefusedBeforeTheSecondRequest() async throws {
+        let server = try LocalRedirectServer()
+        defer { server.stop() }
+        let policy = WeBeepServerPolicy(endpoint: server.url, siteURL: server.url, scheme: "http", host: "127.0.0.1", port: server.port)
+        let downloader = RemoteDownloader(policy: policy)
+        let file = RemoteFileCandidate(id: "file", courseID: 1, sectionID: 1, moduleID: 1, sectionName: "", moduleName: "", filename: "file.txt", remoteFilePath: "/", canonicalPluginPath: "/pluginfile.php/file", downloadURL: server.url, size: 1, modifiedAt: nil, observedRevision: "1", isSupported: true)
+        await #expect(throws: RemoteDownloadError.transport(302)) {
+            try await downloader.download(file, token: "token", access: .unrestricted)
+        }
+        #expect(server.requestCount == 1)
     }
 
     @Test func aMismatchedContentLengthIsRejectedBeforeAnythingIsWritten() async throws {
@@ -228,6 +241,47 @@ private final class RedirectingProtocol: URLProtocol, @unchecked Sendable {
         client?.urlProtocolDidFinishLoading(self)
     }
     override func stopLoading() {}
+}
+
+private final class LocalRedirectServer: @unchecked Sendable {
+    let port: Int
+    let url: URL
+    private let fd: Int32
+    private let lock = NSLock()
+    private var requests = 0
+    var requestCount: Int { lock.withLock { requests } }
+
+    init() throws {
+        let listeningFD = socket(AF_INET, SOCK_STREAM, 0)
+        guard listeningFD >= 0 else { throw CocoaError(.fileReadUnknown) }
+        var address = sockaddr_in(sin_len: UInt8(MemoryLayout<sockaddr_in>.size), sin_family: sa_family_t(AF_INET), sin_port: 0, sin_addr: in_addr(s_addr: inet_addr("127.0.0.1")), sin_zero: (0, 0, 0, 0, 0, 0, 0, 0))
+        let bound = withUnsafePointer(to: &address) { $0.withMemoryRebound(to: sockaddr.self, capacity: 1) { bind(listeningFD, $0, socklen_t(MemoryLayout<sockaddr_in>.size)) } }
+        guard bound == 0, listen(listeningFD, 2) == 0 else { close(listeningFD); throw CocoaError(.fileReadUnknown) }
+        var size = socklen_t(MemoryLayout<sockaddr_in>.size)
+        let named = withUnsafeMutablePointer(to: &address) { $0.withMemoryRebound(to: sockaddr.self, capacity: 1) { getsockname(listeningFD, $0, &size) } }
+        guard named == 0 else { close(listeningFD); throw CocoaError(.fileReadUnknown) }
+        port = Int(UInt16(bigEndian: address.sin_port))
+        url = URL(string: "http://127.0.0.1:\(port)/pluginfile.php/file")!
+        fd = listeningFD
+        DispatchQueue.global().async { [self] in serve() }
+    }
+
+    func stop() { shutdown(fd, SHUT_RDWR); close(fd) }
+
+    private func serve() {
+        while true {
+            let client = accept(fd, nil, nil)
+            guard client >= 0 else { return }
+            let count = lock.withLock { requests += 1; return requests }
+            var buffer = [UInt8](repeating: 0, count: 4096)
+            _ = recv(client, &buffer, buffer.count, 0)
+            let response = count == 1
+                ? "HTTP/1.1 302 Found\r\nLocation: http://127.0.0.1:\(port)/pluginfile.php/elsewhere\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                : "HTTP/1.1 200 OK\r\nContent-Length: 1\r\nConnection: close\r\n\r\nx"
+            _ = response.withCString { send(client, $0, strlen($0), 0) }
+            close(client)
+        }
+    }
 }
 
 private final class WrongLengthProtocol: URLProtocol, @unchecked Sendable {

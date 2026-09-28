@@ -323,7 +323,8 @@ struct MenuBarSnapshot: Sendable {
     private var bootstrapTask: Task<Void, Never>?
     private var syncTask: Task<Void, Never>?
     private var scopeWriteTask: Task<Void, Never>?
-    private var activeOperationID: UUID? {
+    // A window redraw must follow the operation's end even if the final notification suspends.
+    @Published private var activeOperationID: UUID? {
         didSet { refreshMenuBarSnapshot() }
     }
     private var automaticOutcome: AutomaticSyncOutcome = .finished
@@ -432,6 +433,34 @@ struct MenuBarSnapshot: Sendable {
             }
         }
     }
+
+#if DEBUG
+    init(testRootURL: URL) {
+        let site = MoodleSite.site(id: nil)
+        selectedSite = site
+        hasStoredCredential = true
+        notificationCoordinator = SyncNotificationCoordinator(defaults: UserDefaults(suiteName: UUID().uuidString)!)
+        rootURL = testRootURL
+        needsOnboarding = false
+        language = .italian
+        enabledCourseIDs = [1]
+        automaticSyncEnabled = false
+        automaticSyncInterval = 28_800
+        apiClient = WeBeepAPIClient(policy: site.serverPolicy)
+        downloader = RemoteDownloader(policy: apiClient.policy)
+        super.init()
+        accountState = .connected
+        refreshMenuBarSnapshot()
+    }
+
+    func setOperationForTesting(_ operationID: UUID?) {
+        activeOperationID = operationID
+    }
+
+    func setSyncStateForTesting(_ state: AppSyncState) {
+        setSyncState(state)
+    }
+#endif
 
     /// Applies the outcome of the launch bootstrap or of a recovery retry. A blocked recovery keeps
     /// every root operation gated; otherwise the account and the persisted sync state are restored.

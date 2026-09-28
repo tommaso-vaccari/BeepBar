@@ -4,6 +4,7 @@
 
 ### Fixed
 
+- When a synchronization finishes, the window returns from “Annulla” to “Sincronizza ora” instead of leaving an inactive Cancel button on screen.
 - Automatic update checks now start when Beepbar launches, even if Settings is never opened.
 - A scheduled daily synchronization delayed by Low Power Mode or another active operation is now retried instead of skipped until the next day.
 - UI preview runs no longer write notification deduplication state into the installed app's preferences.

@@ -8,6 +8,8 @@
 
 ### Fixed
 
+- An interrupted database upgrade no longer leaves synchronization unable to start on later launches; Beepbar completes the remaining schema changes when reopened.
+- Disconnecting now removes any token left in a temporary file by an interrupted save. If the token cannot be removed, Beepbar keeps the account connected and shows an error so you can retry.
 - When a teacher moves material to another section on WeBeep, renames it, or deletes it and uploads it again elsewhere, Beepbar now moves your copy to the matching folder instead of leaving it behind, without downloading it again. If the name is already taken there, it arrives with a number, as downloads do. A file you edited is never moved on its own: Conflicts asks whether to move your version or leave it where it is. Moves are followed from now on: after updating, files already sitting in an old folder stay where they are.
 - When a synchronization finishes, the window returns from “Annulla” to “Sincronizza ora” instead of leaving an inactive Cancel button on screen.
 - Automatic update checks now start when Beepbar launches, even if Settings is never opened.

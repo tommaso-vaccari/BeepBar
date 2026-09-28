@@ -297,6 +297,13 @@ struct MenuBarSnapshot: Sendable {
     var onMenuBarSymbolChange: (@MainActor (String) -> Void)?
     private var lastMenuBarSymbol: String?
 
+    // Invariant for the window: every stored property a view reads, directly or through a
+    // computed property (`isSyncActive`, `canSynchronize`, `lastSyncSummary`…), must be
+    // `@Published` or derived synchronously from one (like `defaultCourseFolders` from `courses`).
+    // A plain `var` redraws nothing on its own and only looks right while some other published
+    // change happens to follow it; see `activeOperationID` for the stuck "Annulla" this caused.
+    // A property feeding both the menu bar and the window needs `@Published` and the
+    // `refreshMenuBarSnapshot()` `didSet` described above.
     @Published private(set) var isAuthenticating = false
     @Published private(set) var isVerifying = false
     @Published private(set) var isLoadingCourses = false
@@ -674,10 +681,7 @@ struct MenuBarSnapshot: Sendable {
         )
     }
 
-    /// Whether a sync is running. Invariant: every stored property a view reads, directly or
-    /// through a computed property like this one or `canSynchronize`, must be `@Published`.
-    /// A plain `var` only redraws when some other published change happens to follow it,
-    /// which is how "Annulla" stayed on screen after a finished sync.
+    /// Whether a sync is running; picks "Annulla" over "Sincronizza ora" in the window.
     var isSyncActive: Bool {
         activeOperationID != nil
     }

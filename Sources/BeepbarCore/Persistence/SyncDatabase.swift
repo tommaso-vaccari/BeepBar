@@ -934,6 +934,9 @@ public actor SyncDatabase {
     }
 
     private static func migrate(_ database: OpaquePointer?) throws {
+        try execute(database, "BEGIN IMMEDIATE")
+        var committed = false
+        defer { if !committed { try? execute(database, "ROLLBACK") } }
         try execute(database, "CREATE TABLE IF NOT EXISTS schema_migrations (version INTEGER PRIMARY KEY)")
         try execute(database, "CREATE TABLE IF NOT EXISTS roots (id TEXT PRIMARY KEY, canonical_path TEXT NOT NULL UNIQUE, security_bookmark BLOB, settings_json TEXT NOT NULL DEFAULT '{}')")
         try execute(database, "CREATE TABLE IF NOT EXISTS sync_scopes (root_id TEXT NOT NULL REFERENCES roots(id) ON DELETE CASCADE, course_id INTEGER NOT NULL, display_name TEXT NOT NULL, local_folder TEXT NOT NULL DEFAULT '', enabled INTEGER NOT NULL CHECK(enabled IN (0, 1)), auto_sync INTEGER NOT NULL DEFAULT 0 CHECK(auto_sync IN (0, 1)), managed_directory INTEGER NOT NULL DEFAULT 0 CHECK(managed_directory IN (0, 1)), directory_device INTEGER, directory_inode INTEGER, PRIMARY KEY(root_id, course_id), UNIQUE(root_id, local_folder))")
@@ -965,21 +968,17 @@ public actor SyncDatabase {
         try execute(database, "CREATE TABLE IF NOT EXISTS module_path_overrides (root_id TEXT NOT NULL REFERENCES roots(id) ON DELETE CASCADE, course_id INTEGER NOT NULL, module_id INTEGER NOT NULL, local_folder TEXT NOT NULL, last_known_name TEXT NOT NULL, PRIMARY KEY(root_id, course_id, module_id))")
         try execute(database, "CREATE TABLE IF NOT EXISTS pending_module_moves (id TEXT PRIMARY KEY, root_id TEXT NOT NULL REFERENCES roots(id) ON DELETE CASCADE, course_id INTEGER NOT NULL, module_id INTEGER NOT NULL, action TEXT NOT NULL CHECK(action IN ('set', 'remove')), old_folder TEXT, new_folder TEXT, last_known_name TEXT NOT NULL, phase TEXT NOT NULL CHECK(phase = 'prepared'), UNIQUE(root_id, course_id, module_id))")
         try execute(database, "CREATE TABLE IF NOT EXISTS pending_module_move_files (move_id TEXT NOT NULL REFERENCES pending_module_moves(id) ON DELETE CASCADE, remote_id TEXT NOT NULL, old_path TEXT NOT NULL, new_path TEXT NOT NULL, source_kind TEXT NOT NULL CHECK(source_kind IN ('MISSING', 'PRESENT')), source_device INTEGER, source_inode INTEGER, source_sha256 TEXT, PRIMARY KEY(move_id, remote_id), CHECK((source_kind = 'MISSING' AND source_device IS NULL AND source_inode IS NULL AND source_sha256 IS NULL) OR (source_kind = 'PRESENT' AND source_device IS NOT NULL AND source_inode IS NOT NULL AND source_sha256 IS NOT NULL)))")
-        if try !columnExists(database, table: "pending_operations", column: "expected_local_kind") {
-            try execute(database, "ALTER TABLE pending_operations ADD COLUMN expected_local_kind TEXT NOT NULL DEFAULT 'unknown'")
-            try execute(database, "ALTER TABLE pending_operations ADD COLUMN expected_local_sha256 TEXT")
-            try execute(database, "ALTER TABLE pending_operations ADD COLUMN remote_sha256 TEXT NOT NULL DEFAULT ''")
-            try execute(database, "ALTER TABLE pending_operations ADD COLUMN remote_revision TEXT NOT NULL DEFAULT ''")
-            try execute(database, "ALTER TABLE pending_operations ADD COLUMN phase TEXT NOT NULL DEFAULT 'prepared'")
-        }
+        if try !columnExists(database, table: "pending_operations", column: "expected_local_kind") { try execute(database, "ALTER TABLE pending_operations ADD COLUMN expected_local_kind TEXT NOT NULL DEFAULT 'unknown'") }
+        if try !columnExists(database, table: "pending_operations", column: "expected_local_sha256") { try execute(database, "ALTER TABLE pending_operations ADD COLUMN expected_local_sha256 TEXT") }
+        if try !columnExists(database, table: "pending_operations", column: "remote_sha256") { try execute(database, "ALTER TABLE pending_operations ADD COLUMN remote_sha256 TEXT NOT NULL DEFAULT ''") }
+        if try !columnExists(database, table: "pending_operations", column: "remote_revision") { try execute(database, "ALTER TABLE pending_operations ADD COLUMN remote_revision TEXT NOT NULL DEFAULT ''") }
+        if try !columnExists(database, table: "pending_operations", column: "phase") { try execute(database, "ALTER TABLE pending_operations ADD COLUMN phase TEXT NOT NULL DEFAULT 'prepared'") }
         if try !columnExists(database, table: "sync_scopes", column: "local_folder") {
             try execute(database, "ALTER TABLE sync_scopes ADD COLUMN local_folder TEXT NOT NULL DEFAULT ''")
         }
-        if try !columnExists(database, table: "sync_scopes", column: "managed_directory") {
-            try execute(database, "ALTER TABLE sync_scopes ADD COLUMN managed_directory INTEGER NOT NULL DEFAULT 0")
-            try execute(database, "ALTER TABLE sync_scopes ADD COLUMN directory_device INTEGER")
-            try execute(database, "ALTER TABLE sync_scopes ADD COLUMN directory_inode INTEGER")
-        }
+        if try !columnExists(database, table: "sync_scopes", column: "managed_directory") { try execute(database, "ALTER TABLE sync_scopes ADD COLUMN managed_directory INTEGER NOT NULL DEFAULT 0") }
+        if try !columnExists(database, table: "sync_scopes", column: "directory_device") { try execute(database, "ALTER TABLE sync_scopes ADD COLUMN directory_device INTEGER") }
+        if try !columnExists(database, table: "sync_scopes", column: "directory_inode") { try execute(database, "ALTER TABLE sync_scopes ADD COLUMN directory_inode INTEGER") }
         try execute(database, "CREATE UNIQUE INDEX IF NOT EXISTS pending_operations_root_remote ON pending_operations(root_id, remote_id)")
         try execute(database, "CREATE UNIQUE INDEX IF NOT EXISTS pending_operations_root_destination ON pending_operations(root_id, destination_path)")
         try execute(database, "CREATE INDEX IF NOT EXISTS conflicts_root_remote_status ON conflicts(root_id, remote_id, status)")
@@ -990,6 +989,8 @@ public actor SyncDatabase {
         try execute(database, "INSERT OR IGNORE INTO schema_migrations(version) VALUES (4)")
         try execute(database, "INSERT OR IGNORE INTO schema_migrations(version) VALUES (5)")
         try execute(database, "INSERT OR IGNORE INTO schema_migrations(version) VALUES (6)")
+        try execute(database, "COMMIT")
+        committed = true
     }
 
     private static func execute(_ database: OpaquePointer?, _ sql: String) throws {

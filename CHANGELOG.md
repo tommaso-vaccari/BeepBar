@@ -8,6 +8,7 @@
 
 ### Fixed
 
+- An interrupted database upgrade no longer leaves synchronization unable to start on later launches; Beepbar completes the remaining schema changes when reopened.
 - When a teacher moves material to another section on WeBeep, renames it, or deletes it and uploads it again elsewhere, Beepbar now moves your copy to the matching folder instead of leaving it behind, without downloading it again. If the name is already taken there, it arrives with a number, as downloads do. A file you edited is never moved on its own: Conflicts asks whether to move your version or leave it where it is. Moves are followed from now on: after updating, files already sitting in an old folder stay where they are.
 
 - When a synchronization ends, the window no longer stays stuck on "Annulla" with a button that does nothing: it goes back to "Sincronizza ora" straight away. It happened after a sync that downloaded new materials, and after an automatic check that ran with the window open.

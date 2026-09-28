@@ -1139,7 +1139,7 @@ struct MenuBarSnapshot: Sendable {
                 self.setSyncState(self.rootURL == nil ? .needsFolder : .readyUnchecked)
                 self.configureBackgroundScheduler()
             } catch let error as WeBeepAPIError {
-                await self?.handleServiceFailure(error, automatic: false)
+                _ = await self?.handleServiceFailure(error, automatic: false)
             } catch let error as CredentialStorageError {
                 await self?.handleCredentialStorageError(error)
             } catch {
@@ -1642,15 +1642,21 @@ struct MenuBarSnapshot: Sendable {
     private func completeSync(_ operationID: UUID, summary: SyncProgress, automatic: Bool) async {
         guard activeOperationID == operationID else { return }
         await finishReconciliation(progress: summary)
-        if automatic {
-            await notificationCoordinator.notifyAutomaticRun(installed: summary.installed, conflicts: conflicts, failures: summary.failures)
-        } else {
-            await notificationCoordinator.notifyManualRun(added: summary.added)
-        }
         if summary.failures == 0 { notificationCoordinator.clearFailure() }
         BeepbarLog.sync.notice("Synchronization completed automatic=\(automatic, privacy: .public) total=\(summary.total, privacy: .public) installed=\(summary.installed, privacy: .public) conflicts=\(summary.conflicts, privacy: .public) failures=\(summary.failures, privacy: .public)")
         configureBackgroundScheduler()
+        await finishOperationBeforeNotification(operationID) {
+            if automatic {
+                await notificationCoordinator.notifyAutomaticRun(installed: summary.installed, conflicts: conflicts, failures: summary.failures)
+            } else {
+                await notificationCoordinator.notifyManualRun(added: summary.added)
+            }
+        }
+    }
+
+    func finishOperationBeforeNotification(_ operationID: UUID, notify: () async -> Void) async {
         endOperation(operationID)
+        await notify()
     }
 
     private func cancelledSync(_ operationID: UUID) {
@@ -1677,36 +1683,40 @@ struct MenuBarSnapshot: Sendable {
     private func failedSync(_ operationID: UUID, error: WeBeepAPIError?, automatic: Bool) async {
         guard activeOperationID == operationID else { return }
         BeepbarLog.sync.error("Synchronization failed automatic=\(automatic, privacy: .public) errorType=\(error.map { String(reflecting: type(of: $0)) } ?? "unknown", privacy: .public)")
+        let issue: AutomaticNotificationIssue?
         if let error {
-            await handleServiceFailure(error, automatic: automatic)
+            issue = await handleServiceFailure(error, automatic: automatic)
         } else {
             setSyncState(.failed(.partialSync))
-            if automatic { await notificationCoordinator.notify(issue: .partialSync) }
+            issue = automatic ? .partialSync : nil
         }
-        endOperation(operationID)
+        await finishOperationBeforeNotification(operationID) {
+            if let issue { await notificationCoordinator.notify(issue: issue) }
+        }
     }
 
-    private func handleServiceFailure(_ error: WeBeepAPIError, automatic: Bool) async {
+    private func handleServiceFailure(_ error: WeBeepAPIError, automatic: Bool) async -> AutomaticNotificationIssue? {
         switch SyncServiceFailure(error) {
         case .authenticationExpired:
-            await expireCredential(notify: automatic)
+            await expireCredential()
+            return automatic ? .authenticationExpired : nil
         case .connectivity:
             setSyncState(.failed(.connectivity))
+            return nil
         case .serviceUnavailable:
             setSyncState(.failed(.serviceUnavailable))
-            if automatic { await notificationCoordinator.notify(issue: .serviceUnavailable) }
+            return automatic ? .serviceUnavailable : nil
         case .incompatibleResponse:
             setSyncState(.failed(.incompatibleResponse))
-            if automatic { await notificationCoordinator.notify(issue: .incompatibleResponse) }
+            return automatic ? .incompatibleResponse : nil
         }
     }
 
-    private func expireCredential(notify: Bool = false) async {
+    private func expireCredential() async {
         await credentialVault.invalidate()
         Self.defaults.set(true, forKey: Self.credentialExpiredKey)
         accountState = .expired
         setSyncState(.failed(.authenticationExpired))
-        if notify { await notificationCoordinator.notify(issue: .authenticationExpired) }
         configureBackgroundScheduler()
     }
 

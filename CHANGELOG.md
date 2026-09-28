@@ -10,6 +10,7 @@
 
 - When a teacher moves material to another section on WeBeep, renames it, or deletes it and uploads it again elsewhere, Beepbar now moves your copy to the matching folder instead of leaving it behind, without downloading it again. If the name is already taken there, it arrives with a number, as downloads do. A file you edited is never moved on its own: Conflicts asks whether to move your version or leave it where it is. Moves are followed from now on: after updating, files already sitting in an old folder stay where they are.
 
+- After a synchronization that downloads new materials, the window no longer stays stuck on "Annulla": it goes back to "Sincronizza ora" as soon as the run ends.
 - Automatic update checks now start when Beepbar launches, even if Settings is never opened.
 - A scheduled daily synchronization delayed by Low Power Mode or another active operation is now retried instead of skipped until the next day.
 - UI preview runs no longer write notification deduplication state into the installed app's preferences.

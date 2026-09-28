@@ -359,7 +359,12 @@ struct MenuBarSnapshot: Sendable {
     private var bootstrapTask: Task<Void, Never>?
     private var syncTask: Task<Void, Never>?
     private var scopeWriteTask: Task<Void, Never>?
-    private var activeOperationID: UUID? {
+    // Published because views read it through `isSyncActive` / `canSynchronize` (Annulla vs
+    // Sincronizza ora). An operation often ends after a suspension (the new-materials notification,
+    // a failure notice) with no other published change following it: when this was a plain `var`,
+    // clearing it redrew nothing and the window stayed on "Annulla" after a sync that downloaded
+    // new files, with a button that no longer did anything.
+    @Published private var activeOperationID: UUID? {
         didSet { refreshMenuBarSnapshot() }
     }
     private var automaticOutcome: AutomaticSyncOutcome = .finished
@@ -669,6 +674,10 @@ struct MenuBarSnapshot: Sendable {
         )
     }
 
+    /// Whether a sync is running. Invariant: every stored property a view reads, directly or
+    /// through a computed property like this one or `canSynchronize`, must be `@Published`.
+    /// A plain `var` only redraws when some other published change happens to follow it,
+    /// which is how "Annulla" stayed on screen after a finished sync.
     var isSyncActive: Bool {
         activeOperationID != nil
     }

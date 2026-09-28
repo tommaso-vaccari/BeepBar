@@ -146,6 +146,8 @@ import Testing
         let contents = try await WeBeepAPIClient(session: session).fetchContents(courseID: 9, token: "token")
 
         #expect(contents.issueCount == 2)
+        #expect(!contents.isComplete)
+        #expect(contents.modulesWithDroppedEntries == [4])
         #expect(contents.sections[0].modules.map(\.id) == [4])
         #expect(contents.sections[0].modules[0].files.map(\.filename) == ["intro.pdf"])
     }

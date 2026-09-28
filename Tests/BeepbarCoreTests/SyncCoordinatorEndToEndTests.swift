@@ -1077,6 +1077,28 @@ import Testing
         #expect(fixture.contents("Course 1/Lab 0/Esercizi/es.txt") == "my solution")
     }
 
+    @Test func anEditedNewCopyCannotBeReplacedOrTrashed() async throws {
+        let fixture = try await Fixture()
+        defer { fixture.remove() }
+        let target = fixture.targets[0]
+        let hash = String(repeating: "c", count: 40)
+        fixture.upstream.addModule(course: 1, id: 150, section: "Lab 0", name: "Esercizi")
+        fixture.upstream.addFile(course: 1, file: 500, filename: "es.txt", value: "exercise", revision: "1", contentHash: hash)
+        _ = try await fixture.synchronize(targets: [target])
+        try fixture.write("my solution", to: "Course 1/Lezioni/es.txt")
+        fixture.upstream.removeFile(course: 1, file: 500)
+        fixture.upstream.addFile(course: 1, file: 501, filename: "es.txt", value: "exercise", revision: "1", module: 150, contentHash: hash)
+        _ = try await fixture.synchronize(targets: [target])
+        let change = try #require(try await fixture.change(for: fixture.remoteID(course: 1, file: 500, filename: "es.txt")))
+        try fixture.write("new copy edited too", to: "Course 1/Lab 0/Esercizi/es.txt")
+
+        #expect(try await fixture.resolve(change, .replaceNewCopy) == .newCopyNotReplaceable)
+        #expect(fixture.contents("Course 1/Lezioni/es.txt") == "my solution")
+        #expect(fixture.contents("Course 1/Lab 0/Esercizi/es.txt") == "new copy edited too")
+        #expect(fixture.trashedFiles().isEmpty)
+        #expect(try await fixture.change(for: change.remoteID)?.id == change.id)
+    }
+
     @Test(arguments: [false, true])
     func aFileUploadedAgainInTheSamePlaceKeepsItsCopy(edited: Bool) async throws {
         let fixture = try await Fixture()

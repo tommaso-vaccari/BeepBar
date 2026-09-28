@@ -481,6 +481,34 @@ struct MenuBarSnapshot: Sendable {
         }
     }
 
+#if DEBUG
+    init(testRootURL: URL) {
+        let site = MoodleSite.site(id: nil)
+        selectedSite = site
+        hasStoredCredential = true
+        notificationCoordinator = SyncNotificationCoordinator(defaults: UserDefaults(suiteName: UUID().uuidString)!)
+        rootURL = testRootURL
+        needsOnboarding = false
+        language = .italian
+        enabledCourseIDs = [1]
+        automaticSyncEnabled = false
+        automaticSyncInterval = 28_800
+        apiClient = WeBeepAPIClient(policy: site.serverPolicy)
+        downloader = RemoteDownloader(policy: apiClient.policy)
+        super.init()
+        accountState = .connected
+        refreshMenuBarSnapshot()
+    }
+
+    func setOperationForTesting(_ operationID: UUID?) {
+        activeOperationID = operationID
+    }
+
+    func setSyncStateForTesting(_ state: AppSyncState) {
+        setSyncState(state)
+    }
+#endif
+
     /// Applies the outcome of the launch bootstrap or of a recovery retry. A blocked recovery keeps
     /// every root operation gated; otherwise the account and the persisted sync state are restored.
     private func applyBootstrap(_ result: BootstrapService.Result) async {
@@ -971,12 +999,13 @@ struct MenuBarSnapshot: Sendable {
             }
             let cancelled = Task.isCancelled
             self.syncTask = nil
-            self.activeOperationID = nil
             if cancelled, let previous {
                 self.setSyncState(.synced(previous))
             } else {
                 self.setSyncState(.synced(SyncCompletionSummary(completedAt: Date(), added: 5, updated: 2, unchanged: 93, preservedLocal: 0, conflicts: 0, failures: 0, perCourse: previous?.perCourse ?? [])))
             }
+            await Task.yield()
+            self.activeOperationID = nil
         }
     }
 #endif

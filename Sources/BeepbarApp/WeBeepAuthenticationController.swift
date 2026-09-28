@@ -591,9 +591,14 @@ struct MenuBarSnapshot: Sendable {
 
     /// Forgets the stored token so another account, or another university, can be connected.
     /// The sync folder, its files and the course selection stay as they are.
-    func signOut() {
+    func signOut(removeFile: (URL) throws -> Void = { try FileManager.default.removeItem(at: $0) }) {
         guard hasStoredCredential, !isSyncActive, !isAuthenticating, !isLoadingCourses else { return }
-        FileTokenStore.delete()
+        do {
+            try FileTokenStore.delete(removeFile: removeFile)
+        } catch {
+            setSyncState(.failed(.local(BilingualText("Impossibile eliminare il token salvato. Riprova a disconnetterti.", "Couldn't remove the stored token. Try disconnecting again."))))
+            return
+        }
         Task { await credentialVault.invalidate() }
         Self.defaults.removeObject(forKey: Self.credentialExpiredKey)
         notificationCoordinator.clearFailure()

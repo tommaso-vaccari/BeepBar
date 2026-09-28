@@ -13,7 +13,7 @@ enum FileTokenStore {
     static func save(_ token: String) throws {
         let url = try fileURL()
         guard let data = token.data(using: .utf8) else { throw CredentialStorageError.write }
-        cleanUpOrphanedTempFiles(in: url.deletingLastPathComponent())
+        try? cleanUpOrphanedTempFiles(in: url.deletingLastPathComponent())
         // Written with 0600 permissions from the moment the file is created (rather than
         // written-then-chmod'd), and moved into place atomically, so there is never a window
         // where the token sits on disk under the default, more permissive umask.
@@ -49,16 +49,17 @@ enum FileTokenStore {
 
     /// A crash or force-quit between creating the temp file and replacing the destination in
     /// `save()` leaves a stray `.tmp` behind; sweep those up before writing a new one.
-    private static func cleanUpOrphanedTempFiles(in directory: URL) {
-        guard let contents = try? FileManager.default.contentsOfDirectory(at: directory, includingPropertiesForKeys: nil) else { return }
+    private static func cleanUpOrphanedTempFiles(in directory: URL) throws {
+        let contents = try FileManager.default.contentsOfDirectory(at: directory, includingPropertiesForKeys: nil)
         for item in contents where item.lastPathComponent.hasPrefix(tempFilePrefix) && item.lastPathComponent.hasSuffix(tempFileSuffix) {
-            try? FileManager.default.removeItem(at: item)
+            try FileManager.default.removeItem(at: item)
         }
     }
 
-    static func delete() {
-        guard let url = try? fileURL() else { return }
-        try? FileManager.default.removeItem(at: url)
+    static func delete(removeFile: (URL) throws -> Void = { try FileManager.default.removeItem(at: $0) }) throws {
+        let url = try fileURL()
+        try cleanUpOrphanedTempFiles(in: url.deletingLastPathComponent())
+        if FileManager.default.fileExists(atPath: url.path) { try removeFile(url) }
     }
 
     private static func fileURL() throws -> URL {

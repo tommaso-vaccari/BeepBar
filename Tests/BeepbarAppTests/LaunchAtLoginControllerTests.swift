@@ -205,8 +205,9 @@ private final class FakeLoginItemService: LoginItemService, @unchecked Sendable 
         #expect(service.registerCalls == 0)
     }
 
-    /// While a change is in flight the switch is disabled and a second tap is ignored, so a quick
-    /// on-off cannot leave macOS and the switch disagreeing.
+    /// While a change is in flight the switch is disabled and a second tap is ignored. The switch
+    /// still shows the old value until macOS answers, so the second tap asks for the same change
+    /// again: without the guard it would register twice, racing the first call.
     @Test func aSecondTapWhileAChangeIsInFlightIsIgnored() async {
         let gate = DispatchSemaphore(value: 0)
         let service = FakeLoginItemService(status: .notRegistered, registerGate: gate)
@@ -218,11 +219,17 @@ private final class FakeLoginItemService: LoginItemService, @unchecked Sendable 
         #expect(controller.isUpdating)
         #expect(!controller.canChange)
 
-        await controller.setEnabled(false)
+        let second = Task { await controller.setEnabled(true) }
+        try? await Task.sleep(for: .milliseconds(50))
+        #expect(service.registerCalls == 1, "the second tap must not start another registration")
         #expect(service.unregisterCalls == 0)
 
+        // Two signals so that a regression (a second, blocked register call) fails instead of hanging.
+        gate.signal()
         gate.signal()
         await first.value
+        await second.value
+        #expect(service.registerCalls == 1)
         #expect(controller.isOn)
         #expect(!controller.isUpdating)
         #expect(controller.canChange)

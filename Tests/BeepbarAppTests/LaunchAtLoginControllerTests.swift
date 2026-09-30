@@ -48,7 +48,9 @@ private final class FakeLoginItemService: LoginItemService, @unchecked Sendable 
     func register() throws {
         let onMain = Thread.isMainThread
         state.withLock { $0.registerCalls += 1; if onMain { $0.mainThreadCalls += 1 } }
-        registerGate?.wait()
+        // Bounded, so a regression that calls `register()` on the main thread (where the test
+        // would signal the gate) fails the main-thread check instead of deadlocking the suite.
+        _ = registerGate?.wait(timeout: .now() + 2)
         let (status, outcome) = state.withLock { ($0.status, $0.registerOutcome) }
         if status == .requiresApproval || status == .enabled { throw CocoaError(.featureUnsupported) }
         switch outcome {

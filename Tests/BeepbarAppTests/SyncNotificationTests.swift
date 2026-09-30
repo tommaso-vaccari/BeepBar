@@ -206,8 +206,17 @@ private final class FakeNotificationCenter: NotificationCenterClient, @unchecked
 }
 
 /// Removes a suite made by `throwawayDefaultsSuite()`: its temporary folder, property list included.
+/// It deletes a folder, so it only ever deletes one shaped like those: a direct child of the
+/// temporary directory named `BeepbarTestDefaults-…`. Anything else is left alone. (An unchecked
+/// version once deleted the whole checkout when handed a relative path, whose parent is the
+/// current directory.)
 func removeTestDefaults(_ suitePath: String) {
-    try? FileManager.default.removeItem(at: URL(fileURLWithPath: suitePath).deletingLastPathComponent())
+    let temporary = FileManager.default.temporaryDirectory.standardizedFileURL.resolvingSymlinksInPath()
+    guard suitePath.hasPrefix("/") else { return }
+    let folder = URL(fileURLWithPath: suitePath).deletingLastPathComponent().standardizedFileURL.resolvingSymlinksInPath()
+    guard folder.deletingLastPathComponent().path == temporary.path,
+          folder.lastPathComponent.hasPrefix("BeepbarTestDefaults-") else { return }
+    try? FileManager.default.removeItem(at: folder)
 }
 
 /// Test defaults must not pile up in the user's ~/Library/Preferences, where a named suite leaves
@@ -225,6 +234,30 @@ struct ThrowawayDefaultsTests {
         let preferences = FileManager.default.homeDirectoryForCurrentUser.appending(path: "Library/Preferences")
         let leaked = try FileManager.default.contentsOfDirectory(atPath: preferences.path).filter { $0.contains("BeepbarTestDefaults") }
         #expect(leaked.isEmpty)
+    }
+
+    /// Cleanup deletes a throwaway suite's folder and nothing else: a folder that isn't one
+    /// (wrong name, or not directly in the temporary directory) survives. Only decoys inside the
+    /// temporary directory are used, so even a broken guard can't reach anything real.
+    @Test func cleanupOnlyDeletesThrowawaySuiteFolders() throws {
+        let fm = FileManager.default
+        let ours = WeBeepAuthenticationController.throwawayDefaultsSuite()
+        let ourFolder = URL(fileURLWithPath: ours).deletingLastPathComponent()
+        let decoy = fm.temporaryDirectory.appending(path: "NotBeepbarTestDefaults-\(UUID().uuidString)", directoryHint: .isDirectory)
+        let nested = fm.temporaryDirectory.appending(path: "Decoy-\(UUID().uuidString)/BeepbarTestDefaults-\(UUID().uuidString)", directoryHint: .isDirectory)
+        try fm.createDirectory(at: decoy, withIntermediateDirectories: true)
+        try fm.createDirectory(at: nested, withIntermediateDirectories: true)
+        defer {
+            try? fm.removeItem(at: decoy)
+            try? fm.removeItem(at: nested.deletingLastPathComponent())
+        }
+
+        removeTestDefaults(decoy.appending(path: "defaults").path)
+        removeTestDefaults(nested.appending(path: "defaults").path)
+        removeTestDefaults(ours)
+        #expect(fm.fileExists(atPath: decoy.path), "wrong name: must survive")
+        #expect(fm.fileExists(atPath: nested.path), "not directly in the temporary directory: must survive")
+        #expect(!fm.fileExists(atPath: ourFolder.path), "a throwaway suite's own folder is removed")
     }
 }
 

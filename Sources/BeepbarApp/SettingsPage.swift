@@ -161,7 +161,7 @@ struct SettingsPage: View {
                     .buttonStyle(.link)
             }
         } else {
-            Text(tr("BeepBar si apre da sola quando accedi al Mac, così la sincronizzazione automatica riprende anche dopo un riavvio.", "BeepBar opens by itself when you log in to your Mac, so automatic sync resumes after a restart too."))
+            Text(tr("Quando è attiva, BeepBar si apre da sola all'accesso al Mac, così la sincronizzazione automatica riprende anche dopo un riavvio.", "When it's on, BeepBar opens by itself when you log in to your Mac, so automatic sync resumes after a restart too."))
         }
     }
 

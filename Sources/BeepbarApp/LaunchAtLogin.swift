@@ -64,12 +64,15 @@ final class InMemoryLoginItemService: LoginItemService, @unchecked Sendable {
     /// switch themselves. Its absence is what makes the default apply, so it must never be reset.
     nonisolated static let defaultAppliedKey = "launchAtLoginDefaultApplied"
 
-    @Published private(set) var status: LoginItemStatus
+    /// macOS's status, `nil` until it has been read off the main actor: the read is a blocking XPC
+    /// call and the first one happens at launch, where the main thread must stay free.
+    @Published private(set) var status: LoginItemStatus?
     /// Shown under the switch after a change the user asked for failed. Launch failures stay silent:
     /// the user did nothing, and the next launch retries.
     @Published private(set) var errorMessage: BilingualText?
-    /// True while a register/unregister call is running; the switch is disabled meanwhile so two
-    /// quick taps cannot race each other.
+    /// True while BeepBar is registering or unregistering, including the default at launch. The
+    /// switch is disabled meanwhile, so a tap cannot race a call already in flight (a second
+    /// `register()` would fail with `kSMErrorAlreadyRegistered` and show a false error).
     @Published private(set) var isUpdating = false
     let location: AppLocation
 
@@ -80,30 +83,36 @@ final class InMemoryLoginItemService: LoginItemService, @unchecked Sendable {
         self.service = service
         self.defaults = defaults
         self.location = location
-        status = service.status
     }
 
-    var isOn: Bool { LaunchAtLoginPolicy.isOn(status) }
-    var canChange: Bool { !isUpdating && LaunchAtLoginPolicy.canChange(status: status, location: location) }
+    var isOn: Bool { status.map(LaunchAtLoginPolicy.isOn) ?? false }
+    var canChange: Bool {
+        guard let status, !isUpdating else { return false }
+        return LaunchAtLoginPolicy.canChange(status: status, location: location)
+    }
 
     /// Applies the on-by-default setting once. Called at every launch; it registers only on the
     /// first launch from Applications, and never after the user turned it off.
     func applyDefaultOnLaunch() async {
-        let defaultApplied = defaults.bool(forKey: Self.defaultAppliedKey)
-        let service = service
-        let current = await Task.detached { service.status }.value
+        guard !isUpdating else { return }
+        isUpdating = true
+        defer { isUpdating = false }
+        let current = await readStatus()
         status = current
-        guard !defaultApplied else { return }
-        if LaunchAtLoginPolicy.shouldRegisterOnLaunch(defaultApplied: defaultApplied, status: current, location: location) {
+        guard !defaults.bool(forKey: Self.defaultAppliedKey) else { return }
+        var registered = false
+        if LaunchAtLoginPolicy.shouldRegisterOnLaunch(defaultApplied: false, status: current, location: location) {
+            let service = service
             do {
                 try await Task.detached { try service.register() }.value
+                registered = true
                 BeepbarLog.lifecycle.notice("Registered as login item by default")
             } catch {
                 BeepbarLog.lifecycle.error("Default login item registration failed: \(error.localizedDescription, privacy: .public)")
             }
-            status = await Task.detached { service.status }.value
+            status = await readStatus()
         }
-        if LaunchAtLoginPolicy.defaultAppliedAfterLaunch(location: location, statusAfterLaunch: status) {
+        if LaunchAtLoginPolicy.defaultAppliedAfterLaunch(location: location, registrationSucceeded: registered, statusAfterLaunch: status ?? current) {
             defaults.set(true, forKey: Self.defaultAppliedKey)
         }
     }
@@ -111,31 +120,47 @@ final class InMemoryLoginItemService: LoginItemService, @unchecked Sendable {
     /// The user flipped the switch. Their choice always counts as "default applied", so a later
     /// launch never registers again behind their back.
     func setEnabled(_ enabled: Bool) async {
-        guard !isUpdating, enabled != isOn else { return }
-        guard !enabled || location == .applications else { return }
+        guard let current = status, !isUpdating, enabled != LaunchAtLoginPolicy.isOn(current),
+              LaunchAtLoginPolicy.canChange(status: current, location: location) else { return }
         isUpdating = true
         defer { isUpdating = false }
         errorMessage = nil
         defaults.set(true, forKey: Self.defaultAppliedKey)
+        if enabled, LaunchAtLoginPolicy.needsSystemSettings(current) {
+            service.openSystemSettings()
+            return
+        }
         let service = service
+        var failure: Error?
         do {
             try await Task.detached { enabled ? try service.register() : try service.unregister() }.value
         } catch {
-            BeepbarLog.lifecycle.error("Login item change failed enabled=\(enabled, privacy: .public): \(error.localizedDescription, privacy: .public)")
+            failure = error
+        }
+        let after = await readStatus()
+        status = after
+        if LaunchAtLoginPolicy.changeFailed(enabling: enabled, statusAfter: after) {
+            BeepbarLog.lifecycle.error("Login item change failed enabled=\(enabled, privacy: .public): \(failure?.localizedDescription ?? "no error, status unchanged", privacy: .public)")
             errorMessage = enabled
                 ? BilingualText("Non è stato possibile aggiungere BeepBar agli elementi di login.", "Couldn't add BeepBar to your login items.")
                 : BilingualText("Non è stato possibile rimuovere BeepBar dagli elementi di login.", "Couldn't remove BeepBar from your login items.")
-        }
-        status = await Task.detached { service.status }.value
-        if enabled, LaunchAtLoginPolicy.needsSystemSettings(afterEnablingStatus: status) {
+        } else if enabled, LaunchAtLoginPolicy.needsSystemSettings(after) {
             service.openSystemSettings()
         }
     }
 
-    /// Re-reads macOS's status, e.g. after the user changed it in System Settings.
+    /// Re-reads macOS's status, e.g. after the user changed it in System Settings. A status that
+    /// moved on also retires an earlier error, which described a state that no longer holds.
     func refresh() async {
+        let previous = status
+        let now = await readStatus()
+        status = now
+        if previous != now { errorMessage = nil }
+    }
+
+    private func readStatus() async -> LoginItemStatus {
         let service = service
-        status = await Task.detached { service.status }.value
+        return await Task.detached { service.status }.value
     }
 
     func openSystemSettings() {

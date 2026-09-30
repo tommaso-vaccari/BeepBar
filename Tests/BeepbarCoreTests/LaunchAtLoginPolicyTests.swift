@@ -42,7 +42,7 @@ struct LaunchAtLoginPolicyTests {
     @Test(arguments: [LoginItemStatus.enabled, .requiresApproval])
     func doesNotRegisterWhatMacOSAlreadyKnows(status: LoginItemStatus) {
         #expect(!LaunchAtLoginPolicy.shouldRegisterOnLaunch(defaultApplied: false, status: status, location: .applications))
-        #expect(LaunchAtLoginPolicy.defaultAppliedAfterLaunch(location: .applications, statusAfterLaunch: status))
+        #expect(LaunchAtLoginPolicy.defaultAppliedAfterLaunch(location: .applications, registrationSucceeded: false, statusAfterLaunch: status))
     }
 
     /// A copy run from Downloads, the DMG or a translocated path registers nothing and does not
@@ -50,15 +50,23 @@ struct LaunchAtLoginPolicyTests {
     @Test(arguments: [AppLocation.elsewhere, .translocated])
     func unstableLocationsNeitherRegisterNorUseUpTheDefault(location: AppLocation) {
         #expect(!LaunchAtLoginPolicy.shouldRegisterOnLaunch(defaultApplied: false, status: .notRegistered, location: location))
-        #expect(!LaunchAtLoginPolicy.defaultAppliedAfterLaunch(location: location, statusAfterLaunch: .notRegistered))
-        #expect(!LaunchAtLoginPolicy.defaultAppliedAfterLaunch(location: location, statusAfterLaunch: .enabled))
+        #expect(!LaunchAtLoginPolicy.defaultAppliedAfterLaunch(location: location, registrationSucceeded: false, statusAfterLaunch: .notRegistered))
+        #expect(!LaunchAtLoginPolicy.defaultAppliedAfterLaunch(location: location, registrationSucceeded: true, statusAfterLaunch: .enabled))
     }
 
     /// A registration that failed leaves macOS without a login item; the default stays pending so
     /// the next launch retries instead of silently giving up.
     @Test(arguments: [LoginItemStatus.notRegistered, .notFound])
     func failedRegistrationIsRetriedAtNextLaunch(status: LoginItemStatus) {
-        #expect(!LaunchAtLoginPolicy.defaultAppliedAfterLaunch(location: .applications, statusAfterLaunch: status))
+        #expect(!LaunchAtLoginPolicy.defaultAppliedAfterLaunch(location: .applications, registrationSucceeded: false, statusAfterLaunch: status))
+    }
+
+    /// A registration that returned without error uses up the default even if the status read
+    /// right after it still lags: otherwise a user who later removes BeepBar from Login Items
+    /// would have it re-added at the next launch.
+    @Test(arguments: [LoginItemStatus.notRegistered, .notFound])
+    func successfulRegistrationUsesUpTheDefaultEvenIfTheStatusLags(status: LoginItemStatus) {
+        #expect(LaunchAtLoginPolicy.defaultAppliedAfterLaunch(location: .applications, registrationSucceeded: true, statusAfterLaunch: status))
     }
 
     /// The switch shows on only when BeepBar will really open at login: an item switched off in
@@ -78,10 +86,24 @@ struct LaunchAtLoginPolicyTests {
         #expect(LaunchAtLoginPolicy.canChange(status: .enabled, location: .elsewhere))
     }
 
-    /// Only System Settings can re-enable an item the user switched off there.
-    @Test func turningOnAnItemHeldForApprovalSendsTheUserToSystemSettings() {
-        #expect(LaunchAtLoginPolicy.needsSystemSettings(afterEnablingStatus: .requiresApproval))
-        #expect(!LaunchAtLoginPolicy.needsSystemSettings(afterEnablingStatus: .enabled))
-        #expect(!LaunchAtLoginPolicy.needsSystemSettings(afterEnablingStatus: .notRegistered))
+    /// Only System Settings can re-enable an item whose approval the user revoked there.
+    @Test func onlyAnItemHeldForApprovalNeedsSystemSettings() {
+        #expect(LaunchAtLoginPolicy.needsSystemSettings(.requiresApproval))
+        #expect(!LaunchAtLoginPolicy.needsSystemSettings(.enabled))
+        #expect(!LaunchAtLoginPolicy.needsSystemSettings(.notRegistered))
+        #expect(!LaunchAtLoginPolicy.needsSystemSettings(.notFound))
+    }
+
+    /// A change counts as failed only if macOS did not end up where the user asked, so the
+    /// "already registered" / "not found" errors macOS throws for a no-op don't show as failures.
+    @Test func aChangeFailsOnlyWhenMacOSDidNotEndUpWhereAsked() {
+        #expect(!LaunchAtLoginPolicy.changeFailed(enabling: true, statusAfter: .enabled))
+        #expect(!LaunchAtLoginPolicy.changeFailed(enabling: true, statusAfter: .requiresApproval), "held for approval is handled by opening System Settings")
+        #expect(LaunchAtLoginPolicy.changeFailed(enabling: true, statusAfter: .notRegistered))
+        #expect(LaunchAtLoginPolicy.changeFailed(enabling: true, statusAfter: .notFound))
+        #expect(!LaunchAtLoginPolicy.changeFailed(enabling: false, statusAfter: .notRegistered))
+        #expect(!LaunchAtLoginPolicy.changeFailed(enabling: false, statusAfter: .notFound))
+        #expect(!LaunchAtLoginPolicy.changeFailed(enabling: false, statusAfter: .requiresApproval))
+        #expect(LaunchAtLoginPolicy.changeFailed(enabling: false, statusAfter: .enabled))
     }
 }

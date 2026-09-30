@@ -38,6 +38,8 @@ struct BeepbarApp: App {
         let build = Bundle.main.object(forInfoDictionaryKey: "CFBundleVersion") as? String ?? "unknown"
         BeepbarLog.lifecycle.notice("Application launched version=\(version, privacy: .public) build=\(build, privacy: .public)")
         _ = UpdaterController.shared
+        // Once per install: on by default, never re-applied after the user turns it off.
+        Task { await LaunchAtLoginController.shared.applyDefaultOnLaunch() }
         statusItemController = StatusItemController(authentication: authentication)
 #if DEBUG
         if ProcessInfo.processInfo.arguments.contains("--ui-preview") {

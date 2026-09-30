@@ -85,9 +85,11 @@ Per Moodle è un file nuovo; BeepBar lo riconosce perché il contenuto è identi
 
 Se il file viene ricaricato esattamente nello stesso posto, BeepBar continua a seguire la copia che hai, modificata o no: non la riscarica e non chiede niente, perché su Moodle il contenuto non è cambiato.
 
-"Sostituisci" mette nel Cestino la copia appena scaricata (che non hai mai toccato) e porta la tua al suo posto; da lì in poi un aggiornamento del professore diventa un conflitto.
+"Sostituisci" mette nel Cestino la copia appena scaricata (che non hai mai toccato) e porta la tua al suo posto; da lì in poi un aggiornamento del professore diventa un conflitto. Se durante questa azione il tuo file cambia o la destinazione si occupa, il tuo file resta dov’è e la scelta resta aperta. La copia scaricata resta recuperabile nel Cestino; il sync successivo la ripristina se la sua posizione è ancora libera.
 
 BeepBar riconosce solo un file ricaricato nello stesso corso, e solo quando Moodle fornisce l'impronta del contenuto del file. Se lo stesso contenuto compare in più posti, BeepBar non indovina: la copia nuova si scarica normalmente e il vecchio file viene trattato come rimosso (4.3). Succede lo stesso se la copia non modificata non si può spostare (per esempio perché nel frattempo qualcos'altro ha preso il suo nuovo posto).
+
+Se il download della copia nuova non è riuscito, riprova la sincronizzazione prima di spostare quella vecchia nel Cestino. BeepBar consente questa scelta solo quando esiste una copia scaricata separata; puoi conservarla anche se l'hai modificata.
 
 ### 4.3 Il file viene rimosso da Moodle
 
@@ -99,7 +101,7 @@ BeepBar riconosce solo un file ricaricato nello stesso corso, e solo quando Mood
 - **Sposta nel Cestino**: il file va nel Cestino di macOS, da cui si può recuperare.
 - Un file ancora visibile su Moodle ma diventato non scaricabile non è considerato rimosso.
 - Un modulo nascosto temporaneamente appare come rimosso; se torna visibile prima che tu scelga, la voce sparisce.
-- Un file conta come rimosso solo se Moodle ha mostrato il suo corso per intero: se in quel sync una sezione, un modulo o una voce di quel modulo non si è potuta leggere, niente lì dentro viene considerato rimosso, e le voci già aperte restano come sono.
+- Un file conta come rimosso solo se Moodle ha mostrato il suo corso per intero: se in quel sync una sezione, un modulo o una voce di quel modulo è stata omessa o non si è potuta leggere, niente lì dentro viene considerato rimosso, e le voci già aperte restano come sono.
 
 ### 4.4 Cosa non fa spostare niente
 

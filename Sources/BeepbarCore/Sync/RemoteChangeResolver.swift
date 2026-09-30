@@ -34,6 +34,8 @@ public enum RemoteChangeOutcome: Sendable, Equatable {
     case gone
     /// `replaceNewCopy`: the new copy is not downloaded yet, or was edited, so it is not replaced.
     case newCopyNotReplaceable
+    /// `trash`: no separate downloaded regular copy survives, so the user’s copy stays.
+    case newCopyUnavailable
 }
 
 /// Carries out the user's choice about a file Moodle moved or removed. Every action runs under the
@@ -72,7 +74,7 @@ public actor RemoteChangeResolver {
         case .keep, .keepBoth:
             // Nothing on disk changes, so there is nothing to re-check: the file just stops being
             // tracked and becomes the user's own.
-            try await database.stopTracking(change)
+            try await database.stopTracking(change, rememberingPath: true)
             return .done(nil)
         case .moveMine, .trash, .replaceNewCopy:
             break
@@ -87,25 +89,36 @@ public actor RemoteChangeResolver {
         }
         switch action {
         case .trash:
+            if change.kind == .reuploaded {
+                guard let newID = change.newRemoteID,
+                      let twin = try await database.baseline(rootID: rootID, remoteID: newID),
+                      twin.relativePath.comparisonKey != change.relativePath.comparisonKey,
+                      (try? await fileStore.containsRegularFile(twin.relativePath)) == true else { return .newCopyUnavailable }
+            }
             do { try await fileStore.trashRegularFile(change.relativePath, expected: snapshot) }
             catch FileStoreError.localChanged { return .fileChanged }
             try await database.stopTracking(change)
             return .done(nil)
         case .moveMine:
             guard let target = change.targetPath else { throw SyncDatabaseError.execution }
-            let destination = try await freePath(for: target, excluding: change.remoteID, rootID: rootID, database: database, fileStore: fileStore)
-            let step = PendingRemoteMove(batchID: UUID(), remoteID: change.remoteID, from: change.relativePath, to: destination, sha256: snapshot.sha256, placement: change.placement)
-            try await database.beginRemoteMoves(rootID: rootID, [step])
-            do {
-                try await fileStore.moveRegularFilePreservingCurrentContents(from: change.relativePath, to: destination, expected: snapshot)
-            } catch {
-                try await database.discardRemoteMoves(rootID: rootID, remoteIDs: [change.remoteID])
-                if case FileStoreError.localChanged = error { return .fileChanged }
-                throw error
+            for _ in 0..<1000 {
+                try Task.checkCancellation()
+                let destination = try await freePath(for: target, excluding: change.remoteID, rootID: rootID, database: database, fileStore: fileStore)
+                let step = PendingRemoteMove(batchID: UUID(), remoteID: change.remoteID, from: change.relativePath, to: destination, sha256: snapshot.sha256, placement: change.placement)
+                try await database.beginRemoteMoves(rootID: rootID, [step])
+                do {
+                    try await fileStore.moveRegularFile(from: change.relativePath, to: destination, expected: snapshot)
+                } catch {
+                    try await database.discardRemoteMoves(rootID: rootID, remoteIDs: [change.remoteID])
+                    if case FileStoreError.destinationExists = error { continue }
+                    if case FileStoreError.localChanged = error { return .fileChanged }
+                    throw error
+                }
+                try await database.commitRemoteMoves(rootID: rootID, [step])
+                try? await fileStore.removeEmptyParentDirectories(of: change.relativePath)
+                return .done(destination)
             }
-            try await database.commitRemoteMoves(rootID: rootID, [step])
-            try? await fileStore.removeEmptyParentDirectories(of: change.relativePath)
-            return .done(destination)
+            throw FileStoreError.destinationExists
         case .replaceNewCopy:
             // The new copy is only ever replaced while it is exactly what was downloaded, so the
             // one file that goes to the Trash is one the user never touched.
@@ -115,9 +128,11 @@ public actor RemoteChangeResolver {
             }
             do { try await fileStore.trashRegularFile(newBaseline.relativePath, expected: newCopy) }
             catch FileStoreError.localChanged { return .newCopyNotReplaceable }
-            // If this fails the user's file stays where it was and the new copy is downloaded again
-            // by the next sync; nothing is lost.
-            try await fileStore.moveRegularFilePreservingCurrentContents(from: change.relativePath, to: newBaseline.relativePath, expected: snapshot)
+            // A changed source stays at its original path. The downloaded copy is restored by
+            // the next sync if the move cannot finish after it goes to the Trash.
+            do { try await fileStore.moveRegularFile(from: change.relativePath, to: newBaseline.relativePath, expected: snapshot) }
+            catch FileStoreError.localChanged { return .fileChanged }
+            catch FileStoreError.destinationExists { return .newCopyNotReplaceable }
             // The new file's baseline stays as downloaded, so the user's version counts as their
             // edit of it: a later update by the teacher becomes a conflict, never an overwrite.
             try await database.stopTracking(RemoteChange(id: change.id, rootID: rootID, courseID: change.courseID, remoteID: change.remoteID, kind: change.kind, relativePath: change.relativePath, localSHA256: change.localSHA256, isLocallyModified: true))
@@ -135,7 +150,7 @@ public actor RemoteChangeResolver {
         taken.formUnion(try await database.conflicts(rootID: rootID).map(\.relativePath.comparisonKey))
         var candidate = target
         for suffix in 1...1000 {
-            if !taken.contains(candidate.comparisonKey), !(try await fileStore.migrationDestinationIsOccupied(candidate)) { return candidate }
+            if !taken.contains(candidate.comparisonKey), !(try await fileStore.downloadDestinationIsOccupied(candidate)) { return candidate }
             candidate = try LocalPathPolicy.destinationByAddingSuffix(suffix, to: target)
         }
         throw SyncDatabaseError.execution

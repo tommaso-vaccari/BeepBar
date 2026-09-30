@@ -208,6 +208,8 @@ enum SyncCopy {
             tr("Il file è cambiato nel frattempo: non è stato toccato. Controlla e scegli di nuovo.", "The file changed in the meantime and was not touched. Check it and choose again.")
         case .gone:
             tr("Il file non è più dove era: non c’è più niente da scegliere.", "The file is no longer where it was: there is nothing left to choose.")
+        case .newCopyUnavailable:
+            tr("La copia nuova non è disponibile. Riprova la sincronizzazione prima di spostare la tua nel Cestino.", "The new copy is unavailable. Retry synchronization before moving yours to the Trash.")
         case .newCopyNotReplaceable:
             tr("La copia nuova non è ancora scaricata o è stata modificata: non è stata sostituita.", "The new copy isn’t downloaded yet or was edited, so it wasn’t replaced.")
         }

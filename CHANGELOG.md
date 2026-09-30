@@ -8,7 +8,7 @@
 
 ### Improved
 
-- The app now spells its name BeepBar: in the window, the menu, notifications, onboarding, messages and update prompts. Your sign-in, sync folder and settings carry over unchanged.
+- The app now spells its name BeepBar in the window, the menu, onboarding, messages and notification text, and in update prompts after this update. Your sign-in, sync folder and settings carry over unchanged.
 
 ### Fixed
 

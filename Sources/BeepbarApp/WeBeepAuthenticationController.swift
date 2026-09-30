@@ -1415,6 +1415,8 @@ struct MenuBarSnapshot: Sendable {
         Self.defaults.string(forKey: rootIDKey).flatMap(UUID.init(uuidString:))
     }
 
+    /// The installed path must go through `installedDatabaseDirectory(applicationSupport:)`, which
+    /// is what `ProductNameTests` pins: a literal here would escape that test (#56).
     private static func databaseDirectory() throws -> URL {
         guard !isUIPreview, !isUIPreviewOnboarding else {
             // Same reasoning as `defaults`: don't let a manual preview run touch the real

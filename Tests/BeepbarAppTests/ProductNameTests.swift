@@ -19,7 +19,8 @@ struct ProductNameTests {
     /// On the default case-insensitive APFS volume a folder renamed to `BeepBar` would still be
     /// found, so the mistake would pass every manual test; on a case-sensitive volume it would
     /// make every existing install start signed out with an empty sync database. This pins the
-    /// constant and the database path built from it; the token store's default folder is pinned
+    /// constant and the helper the app builds the database path with (`databaseDirectory()` must
+    /// keep going through it, as its comment says); the token store's default folder is pinned
     /// against the same constant in `FileTokenStoreTests`, which owns `directoryName` while it
     /// runs.
     @Test func applicationSupportFolderKeepsItsOriginalSpelling() {
@@ -67,17 +68,32 @@ struct ProductNameTests {
     }
 }
 
-/// The bundle's display name is what Sparkle's update dialogs and macOS show for the app, while
-/// `CFBundleName` stays `$(PRODUCT_NAME)` (`Beepbar`), which `Beepbar.app` and existing installs
-/// rely on (#56).
+/// `CFBundleDisplayName` is the name Sparkle's update dialogs show (Sparkle's `SUHost.name`
+/// prefers it over `CFBundleName`). The bundle itself keeps its name: `PRODUCT_NAME = Beepbar`
+/// is what produces `Beepbar.app`, the file Sparkle replaces on update and the one existing
+/// installs, the DMG script and CI refer to (#56).
 struct BundleDisplayNameTests {
-    @Test func infoPlistShowsBeepBarWithoutRenamingTheBundle() throws {
-        let plistURL = URL(fileURLWithPath: #filePath)
-            .deletingLastPathComponent().deletingLastPathComponent().deletingLastPathComponent()
-            .appendingPathComponent("App/Info.plist")
+    private static let repositoryRoot = URL(fileURLWithPath: #filePath)
+        .deletingLastPathComponent().deletingLastPathComponent().deletingLastPathComponent()
+
+    /// Proves the display name is BeepBar while name and identifier still come from build settings.
+    @Test func infoPlistShowsBeepBarWithoutOverridingNameOrIdentifier() throws {
+        let plistURL = Self.repositoryRoot.appendingPathComponent("App/Info.plist")
         let plist = try #require(NSDictionary(contentsOf: plistURL) as? [String: Any], "App/Info.plist not found or unreadable")
         #expect(plist["CFBundleDisplayName"] as? String == "BeepBar")
         #expect(plist["CFBundleName"] as? String == "$(PRODUCT_NAME)")
         #expect(plist["CFBundleIdentifier"] as? String == "$(PRODUCT_BUNDLE_IDENTIFIER)")
+    }
+
+    /// Proves the build settings behind those placeholders still produce `Beepbar.app`. Guards
+    /// against "finishing the rename" with `PRODUCT_NAME = BeepBar`, which CI's case-insensitive
+    /// runner volume would not notice.
+    @Test func everyBuildConfigurationStillProducesBeepbarApp() throws {
+        let project = try String(contentsOf: Self.repositoryRoot.appendingPathComponent("Beepbar.xcodeproj/project.pbxproj"), encoding: .utf8)
+        let productNames = project.components(separatedBy: "\n")
+            .map { $0.trimmingCharacters(in: .whitespaces) }
+            .filter { $0.hasPrefix("PRODUCT_NAME = ") }
+        #expect(!productNames.isEmpty, "No PRODUCT_NAME found: the check would pass vacuously")
+        #expect(productNames.allSatisfy { $0 == "PRODUCT_NAME = Beepbar;" }, "\(productNames)")
     }
 }

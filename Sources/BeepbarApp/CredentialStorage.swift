@@ -3,9 +3,14 @@ import BeepbarCore
 
 /// File-backed storage for the revocable Moodle mobile token.
 enum FileTokenStore {
+    /// BeepBar's folder in Application Support, holding the token and `sync.sqlite`.
+    /// It keeps the old `Beepbar` spelling on purpose even though the product name is now
+    /// `BeepBar` (#56): every existing install stores its token and sync database here, and a
+    /// renamed folder would make BeepBar start signed out, with an empty database, on update.
+    static let applicationSupportDirectoryName = "Beepbar"
     /// Overridable only from tests (`@testable import`) so they can point at an isolated,
     /// throwaway subdirectory instead of the developer's real Application Support folder.
-    nonisolated(unsafe) static var directoryName = "Beepbar"
+    nonisolated(unsafe) static var directoryName = applicationSupportDirectoryName
     private static let fileName = "credential.token"
     private static let tempFilePrefix = ".credential-"
     private static let tempFileSuffix = ".tmp"

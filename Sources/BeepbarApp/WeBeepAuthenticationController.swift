@@ -35,17 +35,17 @@ enum AppFailure: Equatable {
         case .incompatibleResponse: tr("Risposta inattesa, riprova più tardi", "Unexpected response, try again later")
         case .credentialUnavailable: tr("Credenziale non leggibile", "Credential unreadable")
         case .partialSync: tr("Alcuni materiali non aggiornati", "Some materials not updated")
-        case .local: tr("Apri Beepbar per i dettagli", "Open Beepbar for details")
+        case .local: tr("Apri BeepBar per i dettagli", "Open BeepBar for details")
         }
     }
 
     var detail: String {
         switch self {
         case .authenticationExpired: tr("Accedi di nuovo per riprendere la sincronizzazione.", "Sign in again to resume syncing.")
-        case .connectivity: tr("Controlla la connessione. Beepbar riproverà automaticamente.", "Check your connection. Beepbar will retry automatically.")
+        case .connectivity: tr("Controlla la connessione. BeepBar riproverà automaticamente.", "Check your connection. BeepBar will retry automatically.")
         case .serviceUnavailable: tr("La piattaforma non risponde. I materiali locali restano disponibili.", "The platform isn't responding. Your local materials remain available.")
         case .incompatibleResponse: tr("La piattaforma ha restituito una risposta inattesa. Riprova più tardi.", "The platform returned an unexpected response. Try again later.")
-        case .credentialUnavailable: tr("Beepbar non riesce a salvare o leggere la credenziale locale. Riprova più tardi.", "Beepbar can't save or read the local credential. Try again later.")
+        case .credentialUnavailable: tr("BeepBar non riesce a salvare o leggere la credenziale locale. Riprova più tardi.", "BeepBar can't save or read the local credential. Try again later.")
         case .partialSync: tr("Alcuni materiali non sono stati aggiornati. I file esistenti sono al sicuro.", "Some materials weren't updated. Your existing files are safe.")
         case .local(let message): message.text
         }
@@ -221,14 +221,14 @@ enum SyncCopy {
 
     static func conflictNotificationBody(_ count: Int) -> String {
         count == 1
-            ? tr("Beepbar ha conservato separatamente 1 versione remota.", "Beepbar kept 1 remote version separately.")
-            : tr("Beepbar ha conservato separatamente \(count) versioni remote.", "Beepbar kept \(count) remote versions separately.")
+            ? tr("BeepBar ha conservato separatamente 1 versione remota.", "BeepBar kept 1 remote version separately.")
+            : tr("BeepBar ha conservato separatamente \(count) versioni remote.", "BeepBar kept \(count) remote versions separately.")
     }
 
     static func newMaterialsNotificationBody(_ count: Int) -> String {
         count == 1
-            ? tr("Beepbar ha aggiunto 1 materiale nella cartella scelta.", "Beepbar added 1 material to your chosen folder.")
-            : tr("Beepbar ha aggiunto \(count) materiali nella cartella scelta.", "Beepbar added \(count) materials to your chosen folder.")
+            ? tr("BeepBar ha aggiunto 1 materiale nella cartella scelta.", "BeepBar added 1 material to your chosen folder.")
+            : tr("BeepBar ha aggiunto \(count) materiali nella cartella scelta.", "BeepBar added \(count) materials to your chosen folder.")
     }
 
     static func partialDetail(failedFiles: Int, failedCourses: Int) -> String {
@@ -316,7 +316,7 @@ struct MenuBarSnapshot: Sendable {
     @Published private(set) var hasStoredCredential: Bool {
         didSet { refreshMenuBarSnapshot() }
     }
-    @Published private(set) var status = tr("Avvio Beepbar…", "Starting Beepbar…")
+    @Published private(set) var status = tr("Avvio BeepBar…", "Starting BeepBar…")
     @Published private(set) var syncState: AppSyncState = .starting {
         didSet { refreshMenuBarSnapshot() }
     }
@@ -418,7 +418,7 @@ struct MenuBarSnapshot: Sendable {
         language = resolvedLanguage
         AppLanguage.current = resolvedLanguage
         Self.defaults.set(resolvedLanguage.rawValue, forKey: Self.languageKey)
-        status = tr("Avvio Beepbar…", "Starting Beepbar…")
+        status = tr("Avvio BeepBar…", "Starting BeepBar…")
         enabledCourseIDs = Set(Self.defaults.stringArray(forKey: Self.enabledCoursesKey)?.compactMap(Int64.init) ?? [])
         automaticSyncEnabled = Self.defaults.bool(forKey: Self.autoSyncKey)
         let storedAutomaticSyncInterval = Self.validatedAutomaticInterval(Self.defaults.object(forKey: Self.autoSyncIntervalKey) as? Int)
@@ -727,8 +727,8 @@ struct MenuBarSnapshot: Sendable {
             title: menuBarTitle,
             detail: menuBarDetail,
             actionTitle: menuBarActionTitle,
-            openTitle: tr("Apri Beepbar…", "Open Beepbar…"),
-            quitTitle: tr("Esci da Beepbar", "Quit Beepbar")
+            openTitle: tr("Apri BeepBar…", "Open BeepBar…"),
+            quitTitle: tr("Esci da BeepBar", "Quit BeepBar")
         )
         let symbol = menuBarSymbol
         if symbol != lastMenuBarSymbol {
@@ -858,8 +858,8 @@ struct MenuBarSnapshot: Sendable {
 
     func chooseRoot() {
         let panel = NSOpenPanel()
-        panel.title = tr("Scegli la cartella dei materiali Beepbar", "Choose the Beepbar materials folder")
-        panel.message = tr("Beepbar creerà una sottocartella per ogni corso abilitato.", "Beepbar will create a subfolder for each enabled course.")
+        panel.title = tr("Scegli la cartella dei materiali BeepBar", "Choose the BeepBar materials folder")
+        panel.message = tr("BeepBar creerà una sottocartella per ogni corso abilitato.", "BeepBar will create a subfolder for each enabled course.")
         panel.canChooseFiles = false
         panel.canChooseDirectories = true
         panel.canCreateDirectories = true
@@ -1424,8 +1424,14 @@ struct MenuBarSnapshot: Sendable {
             try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
             return directory
         }
-        return try FileManager.default.url(for: .applicationSupportDirectory, in: .userDomainMask, appropriateFor: nil, create: false)
-            .appendingPathComponent("Beepbar", isDirectory: true)
+        return installedDatabaseDirectory(applicationSupport: try FileManager.default.url(for: .applicationSupportDirectory, in: .userDomainMask, appropriateFor: nil, create: false))
+    }
+
+    /// Where an installed BeepBar keeps `sync.sqlite`: the same Application Support folder as the
+    /// token, under a name that must never change with the product's spelling (see
+    /// `FileTokenStore.applicationSupportDirectoryName`).
+    nonisolated static func installedDatabaseDirectory(applicationSupport: URL) -> URL {
+        applicationSupport.appendingPathComponent(FileTokenStore.applicationSupportDirectoryName, isDirectory: true)
     }
 
     private func restoreScopes(for courses: [RemoteCourseSummary]) async throws {
@@ -1988,10 +1994,10 @@ private enum AutomaticNotificationIssue: String {
 
     var body: String {
         switch self {
-        case .authenticationExpired: tr("Apri Beepbar e accedi di nuovo per riprendere la sincronizzazione.", "Open Beepbar and sign in again to resume syncing.")
+        case .authenticationExpired: tr("Apri BeepBar e accedi di nuovo per riprendere la sincronizzazione.", "Open BeepBar and sign in again to resume syncing.")
         case .serviceUnavailable: tr("La piattaforma non risponde. I materiali locali restano disponibili.", "The platform isn't responding. Your local materials remain available.")
-        case .incompatibleResponse: tr("La piattaforma ha restituito una risposta inattesa. Apri Beepbar per i dettagli.", "The platform returned an unexpected response. Open Beepbar for details.")
-        case .partialSync: tr("Alcuni materiali non sono stati aggiornati. Apri Beepbar per i dettagli.", "Some materials weren't updated. Open Beepbar for details.")
+        case .incompatibleResponse: tr("La piattaforma ha restituito una risposta inattesa. Apri BeepBar per i dettagli.", "The platform returned an unexpected response. Open BeepBar for details.")
+        case .partialSync: tr("Alcuni materiali non sono stati aggiornati. Apri BeepBar per i dettagli.", "Some materials weren't updated. Open BeepBar for details.")
         }
     }
 }

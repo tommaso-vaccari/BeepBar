@@ -204,7 +204,7 @@ struct BeepbarLogo: View {
     var badge: String?
     var badgeTint: Color = .green
     /// Spoken instead of the image; the badge itself is decorative.
-    var accessibilityLabel = "Beepbar"
+    var accessibilityLabel = "BeepBar"
 
     private static let hasAsset = NSImage(named: "BeepbarLogo") != nil
 

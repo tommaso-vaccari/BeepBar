@@ -55,7 +55,7 @@ struct ConflictsPage: View {
                         Text(tr("Spostati o rimossi su \(authentication.selectedSite.platformName)", "Moved or removed on \(authentication.selectedSite.platformName)"))
                             .font(.headline)
                             .padding(.top, authentication.conflicts.isEmpty ? 0 : 8)
-                        Text(tr("Beepbar non sposta né cancella un file che hai modificato, e non cancella mai niente da solo: scegli tu.", "Beepbar never moves a file you edited or deletes anything by itself: you choose."))
+                        Text(tr("BeepBar non sposta né cancella un file che hai modificato, e non cancella mai niente da solo: scegli tu.", "BeepBar never moves a file you edited or deletes anything by itself: you choose."))
                             .font(.callout)
                             .foregroundStyle(.secondary)
                             .fixedSize(horizontal: false, vertical: true)
@@ -189,7 +189,7 @@ private struct RemoteChangeCard: View {
                 ? tr("Non è più su \(platformName). L’hai modificato.", "It is no longer on \(platformName). You edited it.")
                 : tr("Non è più su \(platformName).", "It is no longer on \(platformName).")
         case .reuploaded:
-            tr("Su \(platformName) è stato ricaricato in “\(targetFolder)”. La tua copia è modificata. Prima di spostarla nel Cestino o sostituire quella nuova, Beepbar verifica che il download sia disponibile.", "On \(platformName) it was uploaded again to “\(targetFolder)”. Your copy is edited. Before moving it to the Trash or replacing the new copy, Beepbar checks that the download is available.")
+            tr("Su \(platformName) è stato ricaricato in “\(targetFolder)”. La tua copia è modificata. Prima di spostarla nel Cestino o sostituire quella nuova, BeepBar verifica che il download sia disponibile.", "On \(platformName) it was uploaded again to “\(targetFolder)”. Your copy is edited. Before moving it to the Trash or replacing the new copy, BeepBar checks that the download is available.")
         }
     }
 

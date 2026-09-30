@@ -11,10 +11,10 @@ struct SyncCopyTests {
     }
 
     @Test func notificationBodiesUseSingularAndPlural() {
-        #expect(SyncCopy.conflictNotificationBody(1) == "Beepbar ha conservato separatamente 1 versione remota.")
-        #expect(SyncCopy.conflictNotificationBody(2) == "Beepbar ha conservato separatamente 2 versioni remote.")
-        #expect(SyncCopy.newMaterialsNotificationBody(1) == "Beepbar ha aggiunto 1 materiale nella cartella scelta.")
-        #expect(SyncCopy.newMaterialsNotificationBody(4) == "Beepbar ha aggiunto 4 materiali nella cartella scelta.")
+        #expect(SyncCopy.conflictNotificationBody(1) == "BeepBar ha conservato separatamente 1 versione remota.")
+        #expect(SyncCopy.conflictNotificationBody(2) == "BeepBar ha conservato separatamente 2 versioni remote.")
+        #expect(SyncCopy.newMaterialsNotificationBody(1) == "BeepBar ha aggiunto 1 materiale nella cartella scelta.")
+        #expect(SyncCopy.newMaterialsNotificationBody(4) == "BeepBar ha aggiunto 4 materiali nella cartella scelta.")
     }
 
     @Test func partialDetailSeparatesInaccessibleCoursesFromFailedFiles() {

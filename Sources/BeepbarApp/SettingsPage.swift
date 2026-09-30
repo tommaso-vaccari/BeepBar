@@ -6,12 +6,14 @@ struct SettingsPage: View {
     // Sparkle's setting isn't observable; mirror it so the toggle reflects changes immediately.
     @State private var checksForUpdates = UpdaterController.shared.automaticallyChecksForUpdates
     @State private var showSignOutConfirmation = false
+    @ObservedObject private var launchAtLogin = LaunchAtLoginController.shared
 
     var body: some View {
         Form {
             languageSection
             accountSection
             folderSection
+            startupSection
             automaticSection
             updatesSection
         }
@@ -120,6 +122,46 @@ struct SettingsPage: View {
             Text(tr("Ogni corso abilitato viene salvato direttamente qui, nella propria cartella.", "Each enabled course is saved right here, in its own folder."))
                 .font(.caption)
                 .foregroundStyle(.secondary)
+        }
+    }
+
+    // MARK: Startup
+
+    /// "Apri BeepBar al login". The switch shows macOS's real status, re-read whenever Settings
+    /// appears or BeepBar becomes active, because the user can also change it in System Settings.
+    private var startupSection: some View {
+        Section {
+            Toggle(tr("Apri BeepBar al login", "Open BeepBar at login"), isOn: Binding(
+                get: { launchAtLogin.isOn },
+                set: { enabled in Task { await launchAtLogin.setEnabled(enabled) } }
+            ))
+            .disabled(!launchAtLogin.canChange)
+        } header: {
+            Text(tr("Avvio", "Startup"))
+        } footer: {
+            startupFooter
+                .font(.caption)
+                .foregroundStyle(.secondary)
+        }
+        .task { await launchAtLogin.refresh() }
+        .onReceive(NotificationCenter.default.publisher(for: NSApplication.didBecomeActiveNotification)) { _ in
+            Task { await launchAtLogin.refresh() }
+        }
+    }
+
+    @ViewBuilder private var startupFooter: some View {
+        if let error = launchAtLogin.errorMessage {
+            Text(error.text)
+        } else if launchAtLogin.location != .applications && !launchAtLogin.isOn {
+            Text(tr("Sposta BeepBar nella cartella Applicazioni per aprirla al login.", "Move BeepBar to the Applications folder to open it at login."))
+        } else if launchAtLogin.status == .requiresApproval {
+            VStack(alignment: .leading, spacing: 6) {
+                Text(tr("È disattivata in Impostazioni di Sistema, dove puoi riattivarla.", "It's turned off in System Settings, where you can turn it back on."))
+                Button(tr("Apri Elementi di login…", "Open Login Items…")) { launchAtLogin.openSystemSettings() }
+                    .buttonStyle(.link)
+            }
+        } else {
+            Text(tr("BeepBar si apre da sola quando accedi al Mac, così la sincronizzazione automatica riprende anche dopo un riavvio.", "BeepBar opens by itself when you log in to your Mac, so automatic sync resumes after a restart too."))
         }
     }
 

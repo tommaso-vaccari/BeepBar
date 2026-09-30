@@ -54,6 +54,7 @@ In a preliminary local measurement of the Release build, with automatic sync dis
 - Menu-bar app with clear sync status and contextual actions
 - Browser-based login for supported university platforms, with the token stored locally in a permissions-locked file (not the macOS Keychain, so it isn't tied to build-to-build signature changes)
 - Manual or configurable automatic sync
+- Opens at login by default, so scheduled syncs resume after a restart (switch it off in Impostazioni)
 - Controlled parallel downloads, byte-level progress, and real cancellation
 - Selectable sync root and editable course-folder names
 - [Three-way sync](#how-the-three-way-sync-works) backed by SQLite, atomic staging, and explicit conflict resolution

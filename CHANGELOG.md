@@ -6,6 +6,8 @@
 
 - Files a teacher removes from WeBeep are no longer left behind without a word. They appear in Conflicts, under "Spostati o rimossi su WeBeep", where you choose "Tieni" or "Sposta nel Cestino"; BeepBar never deletes anything by itself. On the first sync after updating, files removed from WeBeep in the past that are still on your Mac show up there too, all at once.
 
+- BeepBar now opens by itself when you log in to your Mac, so automatic sync picks up again after a restart. It's on by default: on the first launch after updating, macOS shows a notice that BeepBar was added to your login items. Turn it off anytime with "Apri BeepBar al login" in Impostazioni, or in System Settings → Login Items; BeepBar won't turn it back on.
+
 ### Improved
 
 - The app now spells its name BeepBar in the window, the menu, onboarding, messages and notification text, and in update prompts after this update. Your sign-in, sync folder and settings carry over unchanged.

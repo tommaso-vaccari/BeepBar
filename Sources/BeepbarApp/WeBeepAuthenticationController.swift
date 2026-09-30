@@ -411,8 +411,10 @@ struct MenuBarSnapshot: Sendable {
         let selectedSite = MoodleSite.site(id: Self.defaults.string(forKey: Self.selectedSiteKey))
         self.selectedSite = selectedSite
         hasStoredCredential = false
-        notificationCoordinator = SyncNotificationCoordinator(defaults: Self.defaults)
-        notificationsEnabled = NotificationPolicy.isEnabled(storedValue: Self.defaults.object(forKey: NotificationPolicy.enabledKey))
+        // A preview build shares the installed app's bundle identifier, and macOS keeps the
+        // notification permission per bundle: a preview must never prompt or post for real.
+        notificationCoordinator = SyncNotificationCoordinator(defaults: Self.defaults, center: Self.isUIPreview || Self.isUIPreviewOnboarding ? InertNotificationCenter() : SystemNotificationCenter())
+        notificationsEnabled = Self.storedNotificationsEnabled(in: Self.defaults)
         let resolvedRootURL = Self.storedRootURL()
         rootURL = resolvedRootURL
         let resolvedNeedsOnboarding = Self.resolveNeedsOnboarding(existingRootURL: resolvedRootURL, onboardingAlreadyCompleted: Self.defaults.bool(forKey: Self.onboardingCompletedKey))
@@ -503,7 +505,7 @@ struct MenuBarSnapshot: Sendable {
         let isolatedDefaults = UserDefaults(suiteName: UUID().uuidString)!
         testDefaults = isolatedDefaults
         notificationCoordinator = SyncNotificationCoordinator(defaults: isolatedDefaults, center: notificationCenter)
-        notificationsEnabled = NotificationPolicy.isEnabled(storedValue: isolatedDefaults.object(forKey: NotificationPolicy.enabledKey))
+        notificationsEnabled = Self.storedNotificationsEnabled(in: isolatedDefaults)
         rootURL = testRootURL
         needsOnboarding = false
         language = .italian
@@ -978,18 +980,30 @@ struct MenuBarSnapshot: Sendable {
         if enabled && !wasEnabled { Task { await notificationCoordinator.requestAuthorizationIfNeeded() } }
         configureBackgroundScheduler()
     }
+    /// What the switch shows at launch: the stored choice, on when never set.
+    nonisolated static func storedNotificationsEnabled(in defaults: UserDefaults) -> Bool {
+        NotificationPolicy.isEnabled(storedValue: defaults.object(forKey: NotificationPolicy.enabledKey))
+    }
+
     /// The "Notifiche" switch. Turning it on asks macOS for permission if it never asked; turning it
     /// off stops every notification before it reaches macOS, and never prompts (#64).
     func setNotifications(enabled: Bool) async {
         notificationsEnabled = enabled
         operationDefaults.set(enabled, forKey: NotificationPolicy.enabledKey)
-        if enabled { await notificationCoordinator.requestAuthorizationIfNeeded() }
+        guard enabled else { return }
+        await notificationCoordinator.requestAuthorizationIfNeeded()
         await refreshNotificationAuthorization()
     }
 
-    /// Re-reads macOS's permission, e.g. after the user changed it in System Settings.
+    /// Re-reads macOS's permission, e.g. after the user changed it in System Settings. Only while
+    /// the switch is on: with it off BeepBar doesn't contact the notification center at all, and
+    /// the footer that shows the permission is only shown when on. Published only on change, so
+    /// each app activation doesn't redraw the window.
     func refreshNotificationAuthorization() async {
-        notificationAuthorization = await notificationCoordinator.authorization()
+        guard notificationsEnabled else { return }
+        let authorization = await notificationCoordinator.authorization()
+        guard notificationsEnabled, authorization != notificationAuthorization else { return }
+        notificationAuthorization = authorization
     }
 
     func setAutomaticSyncInterval(_ seconds: Int) { guard !isSyncActive else { return }; automaticSyncInterval = Self.validatedAutomaticInterval(seconds); Self.defaults.set(automaticSyncInterval, forKey: Self.autoSyncIntervalKey); configureBackgroundScheduler() }

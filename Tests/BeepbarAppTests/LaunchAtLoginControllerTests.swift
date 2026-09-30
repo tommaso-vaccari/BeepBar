@@ -102,7 +102,7 @@ private final class FakeLoginItemService: LoginItemService, @unchecked Sendable 
     }
 
     deinit {
-        UserDefaults().removePersistentDomain(forName: suiteName)
+        removeTestDefaults(suiteName)
     }
 
     private func launch(_ service: FakeLoginItemService, from location: AppLocation = .applications) async -> LaunchAtLoginController {

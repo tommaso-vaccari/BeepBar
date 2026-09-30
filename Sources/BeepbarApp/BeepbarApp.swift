@@ -39,7 +39,9 @@ struct BeepbarApp: App {
     }
 
     /// Set before launch finishes so a click on a notification that launched BeepBar is delivered.
+    /// Not in a UI preview, which must not touch the installed app's notifications.
     func applicationWillFinishLaunching(_ notification: Notification) {
+        guard !PreviewMode.isActive else { return }
         UNUserNotificationCenter.current().delegate = notificationResponder
     }
     private var terminationPending = false

@@ -2,6 +2,7 @@
 import Foundation
 import Testing
 import os
+import UserNotifications
 @testable import BeepbarApp
 
 /// Stands in for macOS's notification center and records everything that reaches it, so tests
@@ -16,9 +17,13 @@ private final class FakeNotificationCenter: NotificationCenterClient, @unchecked
         var authorizationReads = 0
     }
     private let state: OSAllocatedUnfairLock<State>
+    /// Runs inside every permission read, before it answers: lets a test change the switch while
+    /// the read is pending.
+    private let onAuthorizationRead: (@Sendable () -> Void)?
 
-    init(authorization: NotificationAuthorization = .allowed, afterRequest: NotificationAuthorization = .allowed) {
+    init(authorization: NotificationAuthorization = .allowed, afterRequest: NotificationAuthorization = .allowed, onAuthorizationRead: (@Sendable () -> Void)? = nil) {
         state = OSAllocatedUnfairLock(initialState: State(authorization: authorization, authorizationAfterRequest: afterRequest))
+        self.onAuthorizationRead = onAuthorizationRead
     }
 
     var sent: [Sent] { state.withLock { $0.sent } }
@@ -27,7 +32,10 @@ private final class FakeNotificationCenter: NotificationCenterClient, @unchecked
     var contacts: Int { state.withLock { $0.authorizationReads + $0.requests + $0.sent.count } }
     func setAuthorization(_ value: NotificationAuthorization) { state.withLock { $0.authorization = value } }
 
-    func authorization() async -> NotificationAuthorization { state.withLock { $0.authorizationReads += 1; return $0.authorization } }
+    func authorization() async -> NotificationAuthorization {
+        onAuthorizationRead?()
+        return state.withLock { $0.authorizationReads += 1; return $0.authorization }
+    }
     func requestAuthorization() async { state.withLock { $0.requests += 1; $0.authorization = $0.authorizationAfterRequest } }
     func send(identifier: String, title: String, body: String, destination: NotificationDestination) async {
         state.withLock { $0.sent.append(Sent(identifier: identifier, title: title, destination: destination)) }
@@ -40,7 +48,7 @@ private final class FakeNotificationCenter: NotificationCenterClient, @unchecked
     private let defaults: UserDefaults
 
     init() { defaults = UserDefaults(suiteName: suiteName)! }
-    deinit { UserDefaults().removePersistentDomain(forName: suiteName) }
+    deinit { removeTestDefaults(suiteName) }
 
     private func conflict(_ remoteID: String) throws -> ConflictRecord {
         ConflictRecord(id: UUID(), rootID: UUID(uuidString: "00000000-0000-0000-0000-000000000001")!, remoteID: remoteID,
@@ -109,6 +117,26 @@ private final class FakeNotificationCenter: NotificationCenterClient, @unchecked
         #expect(center.sent.map(\.identifier) == ["beepbar-serviceUnavailable"])
     }
 
+    /// If the user turns the switch off while the permission read is pending, macOS's prompt must
+    /// not appear afterwards: the switch is checked again once the read answers.
+    @Test func turningOffDuringThePermissionReadPreventsThePrompt() async {
+        let suite = suiteName   // UserDefaults isn't Sendable; a second handle on the same suite is.
+        let center = FakeNotificationCenter(authorization: .notDetermined, onAuthorizationRead: {
+            UserDefaults(suiteName: suite)?.set(false, forKey: NotificationPolicy.enabledKey)
+        })
+        await SyncNotificationCoordinator(defaults: defaults, center: center).requestAuthorizationIfNeeded()
+        #expect(center.requests == 0)
+    }
+
+    /// An automatic run with failures reports the incomplete sync (to Courses) instead of the new
+    /// materials, which may be incomplete.
+    @Test func anAutomaticRunWithFailuresReportsTheIncompleteSync() async {
+        let center = FakeNotificationCenter()
+        let coordinator = SyncNotificationCoordinator(defaults: defaults, center: center)
+        await coordinator.notifyAutomaticRun(installed: 2, conflicts: [], failures: 1)
+        #expect(center.sent == [.init(identifier: "beepbar-partialSync", title: "Sincronizzazione incompleta", destination: .home)])
+    }
+
     /// Permission is asked only while on and never asked before.
     @Test func permissionIsRequestedOnlyWhenOnAndNeverAsked() async {
         let never = FakeNotificationCenter(authorization: .notDetermined)
@@ -131,6 +159,44 @@ private final class FakeNotificationCenter: NotificationCenterClient, @unchecked
         center.setAuthorization(.allowed)
         await coordinator.notifyAutomaticRun(installed: 0, conflicts: open, failures: 0)
         #expect(center.sent.map(\.destination) == [.conflicts])
+    }
+}
+
+/// Test suites leave their property list behind even after `removePersistentDomain`, so it is
+/// deleted too; otherwise every run adds a file to ~/Library/Preferences.
+func removeTestDefaults(_ suiteName: String) {
+    UserDefaults().removePersistentDomain(forName: suiteName)
+    let file = FileManager.default.homeDirectoryForCurrentUser.appending(path: "Library/Preferences/\(suiteName).plist")
+    try? FileManager.default.removeItem(at: file)
+}
+
+/// Pure mappings behind the notification center and the click routing.
+struct NotificationMappingTests {
+    /// Every macOS permission status maps to what BeepBar does with it; provisional delivers.
+    @Test func macOSPermissionStatusesMapToBeepBarsView() {
+        #expect(SystemNotificationCenter.authorization(from: .notDetermined) == .notDetermined)
+        #expect(SystemNotificationCenter.authorization(from: .authorized) == .allowed)
+        #expect(SystemNotificationCenter.authorization(from: .provisional) == .allowed)
+        #expect(SystemNotificationCenter.authorization(from: .denied) == .denied)
+    }
+
+    /// Each destination opens its page: swapping two would send the user to the wrong place.
+    @Test func eachDestinationOpensItsPage() {
+        #expect(ShellPage(NotificationDestination.conflicts) == .conflicts)
+        #expect(ShellPage(NotificationDestination.activity) == .activity)
+        #expect(ShellPage(NotificationDestination.home) == .home)
+    }
+
+    /// The switch shows the stored choice at launch; never set means on.
+    @Test func theSwitchShowsTheStoredChoiceAtLaunch() {
+        let suiteName = "NotificationMappingTests-\(UUID().uuidString)"
+        defer { removeTestDefaults(suiteName) }
+        let defaults = UserDefaults(suiteName: suiteName)!
+        #expect(WeBeepAuthenticationController.storedNotificationsEnabled(in: defaults))
+        defaults.set(false, forKey: NotificationPolicy.enabledKey)
+        #expect(!WeBeepAuthenticationController.storedNotificationsEnabled(in: defaults))
+        defaults.set(true, forKey: NotificationPolicy.enabledKey)
+        #expect(WeBeepAuthenticationController.storedNotificationsEnabled(in: defaults))
     }
 }
 
@@ -165,6 +231,17 @@ private final class FakeNotificationCenter: NotificationCenterClient, @unchecked
         #expect(controller.notificationAuthorization == .denied)
         await controller.setNotifications(enabled: true)
         #expect(center.requests == 1, "macOS already answered; it is not asked again")
+    }
+
+    /// With the switch off, Settings doesn't contact macOS either: turning it off and later
+    /// refreshes (Settings shown, app activated) make no permission read.
+    @Test func withTheSwitchOffSettingsDoesNotContactMacOS() async {
+        let center = FakeNotificationCenter()
+        let controller = controller(center)
+        await controller.setNotifications(enabled: false)
+        await controller.refreshNotificationAuthorization()
+        #expect(center.contacts == 0)
+        #expect(controller.notificationAuthorization == nil)
     }
 
     /// The Settings footer follows a permission changed in System Settings once it re-reads.

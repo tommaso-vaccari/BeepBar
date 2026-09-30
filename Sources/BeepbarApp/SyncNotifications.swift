@@ -14,7 +14,13 @@ protocol NotificationCenterClient: Sendable {
 /// BeepBar's notifications through `UNUserNotificationCenter`.
 struct SystemNotificationCenter: NotificationCenterClient {
     func authorization() async -> NotificationAuthorization {
-        switch await UNUserNotificationCenter.current().notificationSettings().authorizationStatus {
+        Self.authorization(from: await UNUserNotificationCenter.current().notificationSettings().authorizationStatus)
+    }
+
+    /// `.provisional` counts as allowed: macOS delivers those notifications, quietly. BeepBar never
+    /// asks for provisional permission, but a user or MDM profile may have set it.
+    static func authorization(from status: UNAuthorizationStatus) -> NotificationAuthorization {
+        switch status {
         case .notDetermined: .notDetermined
         case .authorized, .provisional: .allowed
         default: .denied
@@ -96,7 +102,10 @@ enum AutomaticNotificationIssue: String {
 
     func requestAuthorizationIfNeeded() async {
         guard isEnabled else { return }
-        guard NotificationPolicy.shouldRequestAuthorization(enabled: isEnabled, authorization: await center.authorization()) else { return }
+        let authorization = await center.authorization()
+        // Re-checked after the read: the user may have turned the switch off while it was pending,
+        // and macOS's prompt must not appear after that.
+        guard NotificationPolicy.shouldRequestAuthorization(enabled: isEnabled, authorization: authorization) else { return }
         await center.requestAuthorization()
     }
 

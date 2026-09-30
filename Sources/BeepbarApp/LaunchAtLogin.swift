@@ -60,8 +60,9 @@ final class InMemoryLoginItemService: LoginItemService, @unchecked Sendable {
         )
     }()
 
-    /// Set once the on-by-default registration has been applied, or once the user flipped the
-    /// switch themselves. Its absence is what makes the default apply, so it must never be reset.
+    /// Set once the on-by-default registration has been applied, or once the user turned the switch
+    /// off, or on successfully; a failed "on" leaves it unset so the next launch retries. Its
+    /// absence is what makes the default apply, so it must never be reset.
     nonisolated static let defaultAppliedKey = "launchAtLoginDefaultApplied"
 
     /// macOS's status, `nil` until it has been read off the main actor: the read is a blocking XPC

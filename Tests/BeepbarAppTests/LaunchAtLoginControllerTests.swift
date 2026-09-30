@@ -314,7 +314,7 @@ private final class FakeLoginItemService: LoginItemService, @unchecked Sendable 
         #expect(controller.isOn)
     }
 
-    /// A user's own choice counts as the default being applied, even before any launch applied it.
+    /// Turning it off counts as the default being applied, even before any launch applied it.
     @Test func theUsersOwnChoiceUsesUpTheDefault() async {
         let service = FakeLoginItemService(status: .enabled)
         let controller = await settings(service)
@@ -473,6 +473,22 @@ private final class FakeLoginItemService: LoginItemService, @unchecked Sendable 
         let relaunched = await launch(service)
         #expect(service.registerCalls == 3)
         #expect(relaunched.isOn)
+    }
+
+    /// A successful "on" from the switch uses up the default too, so after the user later removes
+    /// BeepBar in System Settings, the next launch doesn't add it back.
+    @Test func aSuccessfulOnFromTheSwitchUsesUpTheDefault() async {
+        let service = FakeLoginItemService(status: .notRegistered, registerOutcome: .fail)
+        let controller = await launch(service)
+        #expect(!defaults.bool(forKey: LaunchAtLoginController.defaultAppliedKey))
+        service.setRegisterOutcome(.enable)
+        await controller.setEnabled(true)
+        #expect(controller.isOn)
+        #expect(defaults.bool(forKey: LaunchAtLoginController.defaultAppliedKey))
+
+        service.setStatus(.notRegistered)
+        _ = await launch(service)
+        #expect(service.registerCalls == 2, "the relaunch must not re-add what the user removed")
     }
 
     private func waitUntil(_ condition: () -> Bool) async {

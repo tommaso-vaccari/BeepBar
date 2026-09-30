@@ -131,6 +131,7 @@ public actor SyncDatabase {
             try bind(baseline.moduleID, to: statement, index: 8)
             try stepDone(statement)
         }
+        try deleteRows("detached_items", rootID: rootID, remoteID: baseline.remoteID)
     }
 
     public func backfillModuleOwnership(rootID: UUID, files: [RemoteFileCandidate]) throws {
@@ -431,12 +432,40 @@ public actor SyncDatabase {
         } catch { try? execute("ROLLBACK"); throw error }
     }
 
-    /// Stops tracking the file the entry is about ("Tieni", "Tieni entrambe", or once it went to
-    /// the Trash) and closes the entry. The file, if still there, becomes an ordinary file of the
-    /// user's; nothing on disk is touched.
+    /// Retains identity and location for a file kept outside sync, so only that returning material
+    /// can reuse its local copy; an unrelated new download must choose a free name.
+    func detachedPaths(rootID: UUID) throws -> [String: RelativePath] {
+        try withStatement("SELECT remote_id, relative_path FROM detached_items WHERE root_id = ?") { statement in
+            try bind(rootID.uuidString, to: statement, index: 1)
+            var values: [String: RelativePath] = [:]
+            while try stepRow(statement) {
+                guard let id = text(statement, 0), let path = text(statement, 1) else { throw SyncDatabaseError.execution }
+                values[id] = try RelativePath(path)
+            }
+            return values
+        }
+    }
+
+    func rememberDetachedPath(rootID: UUID, remoteID: String, path: RelativePath) throws {
+        try withStatement("INSERT INTO detached_items(root_id, remote_id, relative_path) VALUES (?, ?, ?) ON CONFLICT(root_id, remote_id) DO UPDATE SET relative_path = excluded.relative_path") { statement in
+            try bind(rootID.uuidString, to: statement, index: 1)
+            try bind(remoteID, to: statement, index: 2)
+            try bind(path.value, to: statement, index: 3)
+            try stepDone(statement)
+        }
+    }
+
+    /// Stops tracking the file and closes its entry, retaining its path when the user keeps it.
     public func stopTracking(_ change: RemoteChange) throws {
+        try stopTracking(change, rememberingPath: false)
+    }
+
+    func stopTracking(_ change: RemoteChange, rememberingPath: Bool) throws {
         try execute("BEGIN IMMEDIATE")
         do {
+            if rememberingPath {
+                try rememberDetachedPath(rootID: change.rootID, remoteID: change.remoteID, path: change.relativePath)
+            }
             try withStatement("DELETE FROM items WHERE root_id = ? AND remote_id = ? AND relative_path = ?") { statement in
                 try bind(change.rootID.uuidString, to: statement, index: 1); try bind(change.remoteID, to: statement, index: 2)
                 try bind(change.relativePath.value, to: statement, index: 3)
@@ -686,7 +715,7 @@ public actor SyncDatabase {
             }
             // Entries and journaled moves about the course's files follow the folder too: an entry's
             // action would find the file gone, and a journaled move could no longer be recovered.
-            for (table, column) in [("remote_changes", "relative_path"), ("remote_changes", "target_path"), ("pending_remote_moves", "from_path"), ("pending_remote_moves", "to_path")] {
+            for (table, column) in [("detached_items", "relative_path"), ("remote_changes", "relative_path"), ("remote_changes", "target_path"), ("pending_remote_moves", "from_path"), ("pending_remote_moves", "to_path")] {
                 try withStatement("UPDATE \(table) SET \(column) = ? || substr(\(column), length(?) + 1) WHERE root_id = ? AND (\(column) = ? OR substr(\(column), 1, length(?) + 1) = ? || '/')") { statement in
                     try bind(move.newFolder, to: statement, index: 1); try bind(move.oldFolder, to: statement, index: 2); try bind(move.rootID.uuidString, to: statement, index: 3)
                     try bind(move.oldFolder, to: statement, index: 4); try bind(move.oldFolder, to: statement, index: 5); try bind(move.oldFolder, to: statement, index: 6); try stepDone(statement)
@@ -958,6 +987,7 @@ public actor SyncDatabase {
         // Entries waiting for the user's choice about files Moodle moved or removed (see
         // `RemoteChange`), and moves journaled before their rename (see `PendingRemoteMove`). An
         // older version ignores both tables.
+        try execute(database, "CREATE TABLE IF NOT EXISTS detached_items (root_id TEXT NOT NULL REFERENCES roots(id) ON DELETE CASCADE, remote_id TEXT NOT NULL, relative_path TEXT NOT NULL, PRIMARY KEY(root_id, remote_id))")
         try execute(database, "CREATE TABLE IF NOT EXISTS remote_changes (root_id TEXT NOT NULL REFERENCES roots(id) ON DELETE CASCADE, id TEXT PRIMARY KEY, course_id INTEGER NOT NULL, remote_id TEXT NOT NULL, kind TEXT NOT NULL CHECK(kind IN ('moved', 'removed', 'reuploaded')), relative_path TEXT NOT NULL, target_path TEXT, new_remote_id TEXT, placement_section TEXT, placement_module TEXT, placement_single INTEGER, local_sha256 TEXT NOT NULL, locally_modified INTEGER NOT NULL CHECK(locally_modified IN (0, 1)), detected_at REAL NOT NULL, UNIQUE(root_id, remote_id))")
         try execute(database, "CREATE TABLE IF NOT EXISTS pending_remote_moves (root_id TEXT NOT NULL REFERENCES roots(id) ON DELETE CASCADE, remote_id TEXT NOT NULL, batch_id TEXT NOT NULL, from_path TEXT NOT NULL, to_path TEXT NOT NULL, sha256 TEXT NOT NULL, placement_section TEXT, placement_module TEXT, placement_single INTEGER, PRIMARY KEY(root_id, remote_id))")
         try execute(database, "CREATE TABLE IF NOT EXISTS conflicts (id TEXT PRIMARY KEY, root_id TEXT NOT NULL REFERENCES roots(id) ON DELETE CASCADE, remote_id TEXT NOT NULL, relative_path TEXT NOT NULL, incoming_path TEXT NOT NULL, base_sha256 TEXT, local_sha256 TEXT, remote_sha256 TEXT NOT NULL, remote_revision TEXT NOT NULL, detected_at REAL NOT NULL, status TEXT NOT NULL CHECK(status IN ('open', 'resolved')))")
@@ -989,6 +1019,7 @@ public actor SyncDatabase {
         try execute(database, "INSERT OR IGNORE INTO schema_migrations(version) VALUES (4)")
         try execute(database, "INSERT OR IGNORE INTO schema_migrations(version) VALUES (5)")
         try execute(database, "INSERT OR IGNORE INTO schema_migrations(version) VALUES (6)")
+        try execute(database, "INSERT OR IGNORE INTO schema_migrations(version) VALUES (7)")
         try execute(database, "COMMIT")
         committed = true
     }

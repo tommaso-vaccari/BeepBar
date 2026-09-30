@@ -13,6 +13,10 @@
 - Refreshing the course list no longer overwrites a course selection that is still being saved, and course switches stay disabled until the refresh ends.
 - An interrupted database upgrade no longer leaves synchronization unable to start on later launches; Beepbar completes the remaining schema changes when reopened.
 - Disconnecting now removes any token left in a temporary file by an interrupted save. If the token cannot be removed, Beepbar keeps the account connected and shows an error so you can retry.
+- Resolving a teacher's moved or reuploaded file now checks for edits made while the choice was open. If you edit your copy again while replacing a newly downloaded copy, your newer edit stays in its original folder and the download is restored by the next sync.
+- New downloads use a numbered name when a local file already occupies their destination, while files previously kept from synchronization can be tracked again when they return.
+- A failed reupload download cannot authorize moving your only available copy to the Trash; retry synchronization first.
+- When WeBeep omits a module's contents, Beepbar waits for a complete listing before deciding that its previously downloaded files were removed.
 - When a teacher moves material to another section on WeBeep, renames it, or deletes it and uploads it again elsewhere, Beepbar now moves your copy to the matching folder instead of leaving it behind, without downloading it again. If the name is already taken there, it arrives with a number, as downloads do. A file you edited is never moved on its own: Conflicts asks whether to move your version or leave it where it is. Moves are followed from now on: after updating, files already sitting in an old folder stay where they are.
 - When a synchronization finishes, the window returns from “Annulla” to “Sincronizza ora” instead of leaving an inactive Cancel button on screen.
 - Automatic update checks now start when Beepbar launches, even if Settings is never opened.

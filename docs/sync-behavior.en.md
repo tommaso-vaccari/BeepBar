@@ -2,7 +2,7 @@
 
 This document describes what BeepBar does in every sync situation and what the user sees. It is the reference for development and code review: a PR that changes any of these behaviors updates this document (and the Italian version, [`sync-behavior.it.md`](sync-behavior.it.md)) in the same change.
 
-Parts marked **[PR #54]** are in progress and not in a released version yet.
+Parts marked with **[PR #54]**, **[PR #62]** or **[PR #63]** are not in a released version yet.
 
 ## Guarantees
 
@@ -85,7 +85,9 @@ To Moodle this is a new file; BeepBar recognizes it because the contents are ide
 
 If the file is uploaded again in exactly the same place, BeepBar keeps tracking the copy you have, edited or not: it does not download it again and asks nothing, since its contents did not change on Moodle.
 
-"Replace" moves the freshly downloaded copy (which you never touched) to the Trash and puts yours in its place; from then on an update by the teacher becomes a conflict.
+If the new copy could not be downloaded, retry synchronization before moving your old copy to the Trash. BeepBar only allows this choice once a separate regular downloaded copy exists; editing that new copy does not prevent you from keeping it. **[PR #63]**
+
+"Replace" moves the freshly downloaded copy (which you never touched) to the Trash and puts yours in its place; from then on an update by the teacher becomes a conflict. If your file changes or the destination gets taken during this action, your file stays where it is and the choice stays open. The downloaded copy remains recoverable in the Trash; the next sync restores it if its place is still empty. **[PR #63]**
 
 BeepBar only recognizes a file uploaded again in the same course, and only when Moodle reports the file's content fingerprint. If the same contents appear in more than one place, BeepBar does not guess: the new copy downloads normally and the old file is treated as removed (4.3). The same happens if the unedited copy cannot be moved (for example because something else took its new place in the meantime).
 
@@ -99,7 +101,7 @@ BeepBar only recognizes a file uploaded again in the same course, and only when 
 - **Move to the Trash**: the file goes to the macOS Trash, where it can be recovered.
 - A file still visible on Moodle but no longer downloadable is not considered removed.
 - A temporarily hidden module looks removed; if it becomes visible again before you choose, the entry disappears.
-- A file counts as removed only when Moodle showed its course in full: if a section, a module or an entry of that module could not be read in that sync, nothing in it is considered removed, and entries already open stay as they are.
+- A file counts as removed only when Moodle showed its course in full: if a section, a module or an entry of that module was omitted or could not be read in that sync, nothing in it is considered removed, and entries already open stay as they are. **[PR #63]**
 
 ### 4.4 What never moves anything
 

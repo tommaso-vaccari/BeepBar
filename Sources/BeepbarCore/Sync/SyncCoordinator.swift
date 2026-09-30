@@ -259,6 +259,7 @@ public actor SyncCoordinator {
             var changes = followed.changes
             let vanished = try await vanishedFiles(listings: listings, fetched: fetched, baselines: currentBaselines, excluding: unsettled.union(deferredLegacyIDs), deferredIDs: deferredIDs, openChanges: openChanges)
             changes += vanished.changes
+            let detachedPaths = try await database.detachedPaths(rootID: rootID)
             var items: [PreparedSyncItem] = []
             // A baseline still claimed by a remote item owns its path whether or not the local file
             // survives, so a newcomer resolving to the same name gets a suffix instead of colliding.
@@ -297,11 +298,11 @@ public actor SyncCoordinator {
                                 currentBaselines[file.id] = adopted
                             }
                         } else if let reupload {
-                            destination = try LocalPathPolicy.uniqueDestination(preferred, reserving: &reservedPaths)
+                            destination = try await freeDownloadPath(preferred, reserving: &reservedPaths)
                             if reupload.isModified {
                                 // The new copy is downloaded; the user's edited copy waits in Conflicts.
                                 changes.append(RemoteChange(rootID: rootID, courseID: file.courseID, remoteID: reupload.ghost.remoteID, kind: .reuploaded, relativePath: reupload.ghost.relativePath, targetPath: destination, newRemoteID: file.id, localSHA256: reupload.localSHA256, isLocallyModified: true))
-                            } else if let adopted = try await adoptReupload(file, ghost: reupload.ghost, snapshot: reupload.snapshot, at: destination) {
+                            } else if let adopted = try await adoptReuploadAtFreePath(file, ghost: reupload.ghost, snapshot: reupload.snapshot, preferred: preferred, destination: &destination, reserving: &reservedPaths) {
                                 currentBaselines.removeValue(forKey: reupload.ghost.remoteID)
                                 currentBaselines[file.id] = adopted
                                 if adopted.relativePath != reupload.ghost.relativePath {
@@ -312,8 +313,12 @@ public actor SyncCoordinator {
                                 // treated as removed from Moodle.
                                 changes.append(RemoteChange(rootID: rootID, courseID: file.courseID, remoteID: reupload.ghost.remoteID, kind: .removed, relativePath: reupload.ghost.relativePath, localSHA256: reupload.localSHA256, isLocallyModified: false))
                             }
+                        } else if let detached = detachedPaths[file.id], !reservedPaths.contains(detached.comparisonKey),
+                                  (try? await fileStore.containsRegularFile(detached)) == true {
+                            destination = detached
+                            reservedPaths.insert(detached.comparisonKey)
                         } else {
-                            destination = try LocalPathPolicy.uniqueDestination(preferred, reserving: &reservedPaths)
+                            destination = try await freeDownloadPath(preferred, reserving: &reservedPaths)
                         }
                     }
                     items.append(PreparedSyncItem(remote: file, destination: destination))
@@ -322,6 +327,15 @@ public actor SyncCoordinator {
             try validateNoDestinationCollisions(items)
             return PreparedRun(items: items, baselines: currentBaselines, failedCourses: failedCourses, moved: moved, readCourseIDs: Set(listings.keys), changes: changes)
         }
+    }
+
+    private func freeDownloadPath(_ preferred: RelativePath, reserving paths: inout Set<String>) async throws -> RelativePath {
+        for _ in 0..<1000 {
+            try Task.checkCancellation()
+            let candidate = try LocalPathPolicy.uniqueDestination(preferred, reserving: &paths)
+            if !(try await fileStore.downloadDestinationIsOccupied(candidate)) { return candidate }
+        }
+        throw SyncDatabaseError.execution
     }
 
     /// Moves tracked files that Moodle moved to another section, or whose module it renamed, so the
@@ -411,7 +425,7 @@ public actor SyncCoordinator {
                     var destination = plan.target
                     if case .present(let there)? = try? await fileStore.snapshotRegularFile(plan.target) {
                         if there.sha256 != plan.baseline.sha256 { destination = try await numberedFreePath(for: plan.target, owners: state.owners) }
-                    } else if try await fileStore.migrationDestinationIsOccupied(plan.target) {
+                    } else if try await fileStore.downloadDestinationIsOccupied(plan.target) {
                         destination = try await numberedFreePath(for: plan.target, owners: state.owners)
                     }
                     let step = PendingRemoteMove(batchID: UUID(), remoteID: id, from: old, to: destination, sha256: plan.baseline.sha256, placement: placement)
@@ -473,7 +487,7 @@ public actor SyncCoordinator {
             for (index, mover) in pending.enumerated() {
                 let owner = state.owners[mover.target.comparisonKey]
                 if owner == nil || owner == mover.id {
-                    if try await fileStore.migrationDestinationIsOccupied(mover.target) { blocked = blocked ?? index } else { free = index; break }
+                    if try await fileStore.downloadDestinationIsOccupied(mover.target) { blocked = blocked ?? index } else { free = index; break }
                 } else if !pending.contains(where: { $0.id == owner }) {
                     blocked = blocked ?? index
                 }
@@ -522,21 +536,30 @@ public actor SyncCoordinator {
     }
 
     private func move(_ mover: Mover, to destination: RelativePath, state: inout MoveState) async throws {
-        let step = PendingRemoteMove(batchID: UUID(), remoteID: mover.id, from: mover.from, to: destination, sha256: mover.snapshot.sha256, placement: mover.placement)
-        try await database.beginRemoteMoves(rootID: rootID, [step])
-        do {
-            try await fileStore.moveRegularFilePreservingCurrentContents(from: mover.from, to: destination, expected: mover.snapshot)
-        } catch {
-            // Changed or unreadable while being moved, or its place taken meanwhile: left alone and
-            // tried again next run.
-            try await database.discardRemoteMoves(rootID: rootID, remoteIDs: [mover.id])
+        var candidate = destination
+        for _ in 0..<1000 {
+            try Task.checkCancellation()
+            let step = PendingRemoteMove(batchID: UUID(), remoteID: mover.id, from: mover.from, to: candidate, sha256: mover.snapshot.sha256, placement: mover.placement)
+            try await database.beginRemoteMoves(rootID: rootID, [step])
+            do {
+                try await fileStore.moveRegularFile(from: mover.from, to: candidate, expected: mover.snapshot)
+            } catch FileStoreError.destinationExists {
+                // A Finder write can take a name after selection. Retry the same numbered rule
+                // while each atomic rename still refuses to replace the newly arrived file.
+                try await database.discardRemoteMoves(rootID: rootID, remoteIDs: [mover.id])
+                candidate = try await numberedFreePath(for: mover.target, owners: state.owners)
+                continue
+            } catch {
+                try await database.discardRemoteMoves(rootID: rootID, remoteIDs: [mover.id])
+                if error is CancellationError { throw error }
+                return
+            }
+            try await database.commitRemoteMoves(rootID: rootID, [step])
+            state.record(step, baseline: mover.baseline)
+            try? await fileStore.removeEmptyParentDirectories(of: mover.from)
+            state.moved[mover.courseID, default: []].append(Self.movedItem(id: mover.id, at: candidate, outcome: .moved))
             return
         }
-        try await database.commitRemoteMoves(rootID: rootID, [step])
-        state.record(step, baseline: mover.baseline)
-        // Tidying up is best effort; the move is already recorded.
-        try? await fileStore.removeEmptyParentDirectories(of: mover.from)
-        state.moved[mover.courseID, default: []].append(Self.movedItem(id: mover.id, at: destination, outcome: .moved))
     }
 
     /// `path` with the first number (`Slide (1).pdf`, `Slide (2).pdf`, …) that no tracked file,
@@ -544,7 +567,7 @@ public actor SyncCoordinator {
     private func numberedFreePath(for path: RelativePath, owners: [String: String]) async throws -> RelativePath {
         for suffix in 1...999 {
             let candidate = try LocalPathPolicy.destinationByAddingSuffix(suffix, to: path)
-            if owners[candidate.comparisonKey] == nil, !(try await fileStore.migrationDestinationIsOccupied(candidate)) { return candidate }
+            if owners[candidate.comparisonKey] == nil, !(try await fileStore.downloadDestinationIsOccupied(candidate)) { return candidate }
         }
         throw SyncDatabaseError.execution
     }
@@ -639,18 +662,34 @@ public actor SyncCoordinator {
     /// hands its baseline to the new file, so it is not downloaded a second time. Returns nil,
     /// having changed nothing, when that is not possible; the new file is then downloaded as usual.
     ///
-    /// No journal is needed: after a crash between the rename and the baseline update, the next
-    /// run downloads the new file onto the moved copy, finds identical contents and adopts it.
     /// `snapshot` is required to move the file; it may be nil when `destination` is where the file
     /// already is.
+    private func adoptReuploadAtFreePath(_ file: RemoteFileCandidate, ghost: Baseline, snapshot: FileSnapshot?, preferred: RelativePath, destination: inout RelativePath, reserving paths: inout Set<String>) async throws -> Baseline? {
+        for _ in 0..<1000 {
+            try Task.checkCancellation()
+            do { return try await adoptReupload(file, ghost: ghost, snapshot: snapshot, at: destination) }
+            catch FileStoreError.destinationExists { destination = try await freeDownloadPath(preferred, reserving: &paths) }
+        }
+        return nil
+    }
+
     private func adoptReupload(_ file: RemoteFileCandidate, ghost: Baseline, snapshot: FileSnapshot?, at destination: RelativePath) async throws -> Baseline? {
         if destination != ghost.relativePath {
-            guard let snapshot, try await fileStore.migrationDestinationIsOccupied(destination) == false else { return nil }
-            do { try await fileStore.moveRegularFilePreservingCurrentContents(from: ghost.relativePath, to: destination, expected: snapshot) }
-            catch { return nil }
+            guard let snapshot else { return nil }
+            if try await fileStore.downloadDestinationIsOccupied(destination) { throw FileStoreError.destinationExists }
+            let step = PendingRemoteMove(batchID: UUID(), remoteID: ghost.remoteID, from: ghost.relativePath, to: destination, sha256: snapshot.sha256, placement: RemotePlacement(file))
+            try await database.beginRemoteMoves(rootID: rootID, [step])
+            do { try await fileStore.moveRegularFile(from: ghost.relativePath, to: destination, expected: snapshot) }
+            catch {
+                try await database.discardRemoteMoves(rootID: rootID, remoteIDs: [ghost.remoteID])
+                if error is CancellationError { throw error }
+                if case FileStoreError.destinationExists = error { throw error }
+                return nil
+            }
+            try await database.commitRemoteMoves(rootID: rootID, [step])
         }
         let adopted = Baseline(remoteID: file.id, relativePath: destination, sha256: ghost.sha256, remoteRevision: file.observedRevision, courseID: file.courseID, moduleID: file.moduleID)
-        guard try await database.transferBaseline(rootID: rootID, from: ghost.remoteID, at: ghost.relativePath, to: adopted, placement: RemotePlacement(file)) else { return nil }
+        guard try await database.transferBaseline(rootID: rootID, from: ghost.remoteID, at: destination, to: adopted, placement: RemotePlacement(file)) else { return nil }
         if destination != ghost.relativePath { try? await fileStore.removeEmptyParentDirectories(of: ghost.relativePath) }
         return adopted
     }

@@ -44,18 +44,25 @@ public actor FileStore {
     private let rootFD: Int32
     private let rootURL: URL
     private let trash: @Sendable (URL) throws -> Void
+    private let beforeMove: (@Sendable (RelativePath, RelativePath) throws -> Void)?
     /// Number of times a file's full contents were read to compute a SHA-256 digest.
     /// Test instrumentation: lets tests prove that unchanged files are not re-read on every sync.
     private(set) var hashCount = 0
 
     /// `trash` moves a file to the Trash; tests replace it so they never touch the user's Trash.
     public init(root: URL, trash: @escaping @Sendable (URL) throws -> Void = { try FileManager.default.trashItem(at: $0, resultingItemURL: nil) }) throws {
+        try self.init(root: root, beforeMove: nil, trash: trash)
+    }
+
+    /// Tests inject a filesystem change after destination selection, before move validation.
+    init(root: URL, beforeMove: (@Sendable (RelativePath, RelativePath) throws -> Void)?, trash: @escaping @Sendable (URL) throws -> Void = { try FileManager.default.trashItem(at: $0, resultingItemURL: nil) }) throws {
         let fd = open(root.standardizedFileURL.path, O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW)
         guard fd >= 0 else { throw FileStoreError.invalidRoot }
         guard (try? Self.identity(of: fd)) != nil else { close(fd); throw FileStoreError.invalidRoot }
         rootFD = fd
         rootURL = root.standardizedFileURL
         self.trash = trash
+        self.beforeMove = beforeMove
     }
 
     deinit { close(rootFD) }
@@ -132,6 +139,27 @@ public actor FileStore {
         throw fileStoreError()
     }
 
+    func downloadDestinationIsOccupied(_ path: RelativePath) throws -> Bool {
+        try requireMovablePath(path)
+        var parent = dup(rootFD)
+        guard parent >= 0 else { throw fileStoreError() }
+        defer { close(parent) }
+        for (index, component) in path.components.enumerated() {
+            let matches = try directoryEntryNames(at: parent).filter { PathKey.of($0) == PathKey.of(component) }
+            guard !matches.isEmpty else { return false }
+            if index == path.components.count - 1 { return true }
+            guard matches.count == 1 else { return false }
+            let next = openat(parent, matches[0], O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW)
+            guard next >= 0 else {
+                if errno == ENOENT || errno == ENOTDIR || errno == ELOOP { return false }
+                throw fileStoreError()
+            }
+            close(parent)
+            parent = next
+        }
+        return false
+    }
+
     public func migrationDestinationIsOccupied(_ path: RelativePath) throws -> Bool {
         try requireMovablePath(path)
         var parent = dup(rootFD)
@@ -166,27 +194,18 @@ public actor FileStore {
     }
 
     public func moveRegularFile(from source: RelativePath, to destination: RelativePath, expected: FileSnapshot) throws {
-        try requireMovablePath(source)
-        try requireMovablePath(destination)
-        guard source != destination else { return }
-        guard case .present(let current) = try snapshotRegularFile(source),
-              current.device == expected.device, current.inode == expected.inode,
-              current.sha256 == expected.sha256 else { throw FileStoreError.localChanged }
-        let (sourceParent, sourceName) = try parentDirectory(for: source, create: false)
-        defer { close(sourceParent) }
-        let (destinationParent, destinationName) = try parentDirectory(for: destination, create: true)
-        defer { close(destinationParent) }
-        guard renameatx_np(sourceParent, sourceName, destinationParent, destinationName, UInt32(RENAME_EXCL)) == 0 else {
-            if errno == EEXIST { throw FileStoreError.destinationExists }
-            throw fileStoreError()
-        }
-        guard fsync(sourceParent) == 0, fsync(destinationParent) == 0 else { throw fileStoreError() }
+        try moveRegularFile(from: source, to: destination, expected: expected, preservingCurrentContents: false)
     }
 
     public func moveRegularFilePreservingCurrentContents(from source: RelativePath, to destination: RelativePath, expected: FileSnapshot) throws {
+        try moveRegularFile(from: source, to: destination, expected: expected, preservingCurrentContents: true)
+    }
+
+    private func moveRegularFile(from source: RelativePath, to destination: RelativePath, expected: FileSnapshot, preservingCurrentContents: Bool) throws {
         try requireMovablePath(source)
         try requireMovablePath(destination)
         guard source != destination else { return }
+        try beforeMove?(source, destination)
         let (sourceParent, sourceName) = try parentDirectory(for: source, create: false)
         defer { close(sourceParent) }
         let sourceFD = openat(sourceParent, sourceName, O_RDONLY | O_CLOEXEC | O_NOFOLLOW)
@@ -194,6 +213,9 @@ public actor FileStore {
         defer { close(sourceFD) }
         try requireRegularFile(sourceFD)
         guard try Self.identity(of: sourceFD) == FileIdentity(device: expected.device, inode: expected.inode) else { throw FileStoreError.localChanged }
+        if !preservingCurrentContents {
+            guard try sha256(of: sourceFD) == expected.sha256 else { throw FileStoreError.localChanged }
+        }
         let (destinationParent, destinationName) = try parentDirectory(for: destination, create: true)
         defer { close(destinationParent) }
         var current = stat()
@@ -217,8 +239,14 @@ public actor FileStore {
         let (secondParent, secondName) = try parentDirectory(for: second, create: false)
         defer { close(secondParent) }
         for (parent, name, snapshot) in [(firstParent, firstName, firstSnapshot), (secondParent, secondName, secondSnapshot)] {
+            let fd = openat(parent, name, O_RDONLY | O_CLOEXEC | O_NOFOLLOW)
+            guard fd >= 0 else { throw FileStoreError.localChanged }
+            defer { close(fd) }
+            try requireRegularFile(fd)
+            guard try Self.identity(of: fd) == FileIdentity(device: snapshot.device, inode: snapshot.inode),
+                  try sha256(of: fd) == snapshot.sha256 else { throw FileStoreError.localChanged }
             var current = stat()
-            guard fstatat(parent, name, &current, AT_SYMLINK_NOFOLLOW) == 0, (current.st_mode & S_IFMT) == S_IFREG,
+            guard fstatat(parent, name, &current, AT_SYMLINK_NOFOLLOW) == 0,
                   Int64(current.st_dev) == snapshot.device, UInt64(current.st_ino) == snapshot.inode else { throw FileStoreError.localChanged }
         }
         guard renameatx_np(firstParent, firstName, secondParent, secondName, UInt32(RENAME_SWAP)) == 0 else {

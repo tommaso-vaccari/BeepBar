@@ -257,6 +257,7 @@ public final class WeBeepAPIClient: @unchecked Sendable {
         let mapped = sections.compactMap { section -> RemoteContentSection? in
             guard section.id > 0 else { issueCount += 1; isComplete = false; return nil }
             let sectionName = MoodleText.normalized(section.name) ?? ""
+            if section.modules == nil { isComplete = false }
             issueCount += section.modules?.discardedCount ?? 0
             if (section.modules?.discardedCount ?? 0) > 0 { isComplete = false }
             let modules = (section.modules?.elements ?? []).compactMap { module -> RemoteContentModule? in
@@ -264,6 +265,7 @@ public final class WeBeepAPIClient: @unchecked Sendable {
                 let name = MoodleText.normalized(module.name) ?? ""
                 issueCount += module.contents?.discardedCount ?? 0
                 if (module.contents?.discardedCount ?? 0) > 0 { modulesWithDroppedEntries.insert(module.id) }
+                if module.contents == nil { modulesWithDroppedEntries.insert(module.id) }
                 if let modname = module.modname?.lowercased(), ["forum", "url", "page", "label", "choice", "feedback", "lesson", "wooclap"].contains(modname) {
                     issueCount += module.contents?.elements.count ?? 0
                     modulesWithDroppedEntries.insert(module.id)
@@ -274,7 +276,10 @@ public final class WeBeepAPIClient: @unchecked Sendable {
                     && moduleContents.count == 1
                     && moduleContents.first?.type == "file"
                 let files = moduleContents.compactMap { content -> RemoteFileCandidate? in
-                    guard content.type == "file" else { return nil }
+                    guard content.type == "file" else {
+                        if content.type != "directory" { issueCount += 1; modulesWithDroppedEntries.insert(module.id) }
+                        return nil
+                    }
                     guard let filename = bounded(content.filename), let remoteFilePath = bounded(content.filepath),
                           let filesize = content.filesize, filesize >= 0,
                           let timemodified = content.timemodified, timemodified >= 0,

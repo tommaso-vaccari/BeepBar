@@ -189,7 +189,7 @@ private struct RemoteChangeCard: View {
                 ? tr("Non è più su \(platformName). L’hai modificato.", "It is no longer on \(platformName). You edited it.")
                 : tr("Non è più su \(platformName).", "It is no longer on \(platformName).")
         case .reuploaded:
-            tr("Su \(platformName) è stato ricaricato in “\(targetFolder)” e la copia nuova è già lì. La tua l’hai modificata.", "On \(platformName) it was uploaded again to “\(targetFolder)”, and the new copy is already there. You edited yours.")
+            tr("Su \(platformName) è stato ricaricato in “\(targetFolder)”. La tua copia è modificata. Prima di spostarla nel Cestino o sostituire quella nuova, Beepbar verifica che il download sia disponibile.", "On \(platformName) it was uploaded again to “\(targetFolder)”. Your copy is edited. Before moving it to the Trash or replacing the new copy, Beepbar checks that the download is available.")
         }
     }
 

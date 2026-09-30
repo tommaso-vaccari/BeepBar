@@ -90,7 +90,7 @@ struct HomePage: View {
                         isEnabled: authentication.isCourseEnabled(course),
                         isRenaming: authentication.renamingCourseID == course.id,
                         renameError: authentication.courseRenameErrors[course.id],
-                        toggleDisabled: authentication.isSyncActive,
+                        toggleDisabled: authentication.isSyncActive || authentication.isLoadingCourses,
                         // renameFolder() is a no-op during a sync or a blocked recovery.
                         renameDisabled: authentication.isSyncActive || authentication.recoveryBlocked,
                         organizeDisabled: organizeDisabled,

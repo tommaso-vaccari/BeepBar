@@ -125,6 +125,11 @@ Al primo sync dopo l'aggiornamento, i file che il professore aveva rimosso da Mo
 - Se tutti i corsi falliscono per un problema del sito o della connessione, il sync viene segnalato come non riuscito e nessun file viene toccato.
 - Il sync automatico non usa connessioni a consumo (hotspot) e rispetta la modalità Dati ridotti; viene rimandato, non saltato, se c'è il Risparmio energetico o un'altra operazione in corso.
 
+- **[PR #62]** Durante l'aggiornamento dei corsi, i loro interruttori sono disabilitati; una scelta ancora in salvataggio viene applicata prima di ripristinare la lista aggiornata.
+- **[PR #62]** Annullare durante i controlli finali termina il sync senza mostrare un risultato completato o inviare la sua notifica. Quando compare il completamento o l'errore, il sync è terminato e l'invio della notifica non può lasciare attivo Annulla.
+- **[PR #62]** Un aggiornamento in ritardo non può sostituire lo stato di un sync avviato nel frattempo, di un account disconnesso o di una cartella di sincronizzazione diversa.
+- **[PR #62]** Se le scelte in sospeso non si possono leggere, le ultime liste mostrate restano visibili e il sync segnala un errore locale; non registra una sincronizzazione riuscita. Anche una selezione dei corsi illeggibile fa fallire l'aggiornamento o il sync automatico, invece di essere trattata come vuota.
+
 ## 7. Dove vedi cosa
 
 | Posto | Contenuto |

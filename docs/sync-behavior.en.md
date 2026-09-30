@@ -125,6 +125,11 @@ On the first sync after updating, the files the teacher removed from Moodle befo
 - If every course fails because of the site or the connection, the sync is reported as failed and no file is touched.
 - Automatic sync does not use metered connections (hotspots) and honours Low Data Mode; it is postponed, not skipped, under Low Power Mode or while another operation runs.
 
+- **[PR #62]** While courses are refreshing, their switches are disabled; a choice still being saved is applied before the refreshed list is restored.
+- **[PR #62]** Cancelling during the final checks ends the run without showing a completed result or sending its notification. Once completion or failure is shown, the run has ended and notification delivery cannot leave Cancel active.
+- **[PR #62]** A delayed refresh cannot replace the state of a sync started afterward, a disconnected account, or a different sync folder.
+- **[PR #62]** If pending choices cannot be read, their last displayed lists stay visible and the run reports a local error; it does not record a successful sync. An unreadable course selection also fails the refresh or automatic sync instead of being treated as an empty selection.
+
 ## 7. Where you see what
 
 | Place | Contents |

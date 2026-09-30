@@ -8,6 +8,9 @@
 
 ### Fixed
 
+- If pending choices cannot be read, Beepbar keeps the last displayed lists and reports an error instead of hiding them and reporting a successful synchronization.
+- Cancelling during the final checks no longer shows a completed result afterward. Once a run is complete, Cancel can no longer replace the completed or failed result with “Ready”.
+- Refreshing the course list no longer overwrites a course selection that is still being saved, and course switches stay disabled until the refresh ends.
 - An interrupted database upgrade no longer leaves synchronization unable to start on later launches; Beepbar completes the remaining schema changes when reopened.
 - Disconnecting now removes any token left in a temporary file by an interrupted save. If the token cannot be removed, Beepbar keeps the account connected and shows an error so you can retry.
 - Resolving a teacher's moved or reuploaded file now checks for edits made while the choice was open. If you edit your copy again while replacing a newly downloaded copy, your newer edit stays in its original folder and the download is restored by the next sync.

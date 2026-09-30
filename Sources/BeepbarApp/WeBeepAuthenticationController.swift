@@ -2,7 +2,6 @@ import AppKit
 import Foundation
 import SwiftUI
 import os
-@preconcurrency import UserNotifications
 import WebKit
 import BeepbarCore
 
@@ -413,7 +412,7 @@ struct MenuBarSnapshot: Sendable {
         hasStoredCredential = false
         // A preview build shares the installed app's bundle identifier, and macOS keeps the
         // notification permission per bundle: a preview must never prompt or post for real.
-        notificationCoordinator = SyncNotificationCoordinator(defaults: Self.defaults, center: Self.isUIPreview || Self.isUIPreviewOnboarding ? InertNotificationCenter() : SystemNotificationCenter())
+        notificationCoordinator = SyncNotificationCoordinator(defaults: Self.defaults, center: Self.isUIPreview || Self.isUIPreviewOnboarding ? InertNotificationCenter(authorization: .allowed) : SystemNotificationCenter())
         notificationsEnabled = Self.storedNotificationsEnabled(in: Self.defaults)
         let resolvedRootURL = Self.storedRootURL()
         rootURL = resolvedRootURL
@@ -502,7 +501,7 @@ struct MenuBarSnapshot: Sendable {
         let site = MoodleSite.site(id: nil)
         selectedSite = site
         hasStoredCredential = true
-        let isolatedDefaults = UserDefaults(suiteName: UUID().uuidString)!
+        let isolatedDefaults = Self.throwawayDefaults()
         testDefaults = isolatedDefaults
         notificationCoordinator = SyncNotificationCoordinator(defaults: isolatedDefaults, center: notificationCenter)
         notificationsEnabled = Self.storedNotificationsEnabled(in: isolatedDefaults)
@@ -519,6 +518,21 @@ struct MenuBarSnapshot: Sendable {
         super.init()
         accountState = .connected
         refreshMenuBarSnapshot()
+    }
+
+    /// Defaults for a test controller, stored in a temporary folder instead of ~/Library/Preferences:
+    /// a named suite leaves a file there that the preferences daemon rewrites even after it is
+    /// deleted, so every test run used to add files to the user's Preferences folder.
+    nonisolated static func throwawayDefaults() -> UserDefaults {
+        UserDefaults(suiteName: throwawayDefaultsSuite())!
+    }
+
+    /// The suite name behind `throwawayDefaults()`: an absolute path, which keeps the property list
+    /// in that folder. Tests that need a second handle on the same suite open it by this name.
+    nonisolated static func throwawayDefaultsSuite() -> String {
+        let folder = FileManager.default.temporaryDirectory.appending(path: "BeepbarTestDefaults-\(UUID().uuidString)", directoryHint: .isDirectory)
+        try? FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+        return folder.appending(path: "defaults").path
     }
 
     func setOperationForTesting(_ operationID: UUID?, task: Task<Void, Never>? = nil) {
@@ -977,7 +991,7 @@ struct MenuBarSnapshot: Sendable {
             automaticSyncInterval = Self.validatedAutomaticInterval(interval)
             Self.defaults.set(automaticSyncInterval, forKey: Self.autoSyncIntervalKey)
         }
-        if enabled && !wasEnabled { Task { await notificationCoordinator.requestAuthorizationIfNeeded() } }
+        if enabled && !wasEnabled { Task { await requestNotificationPermissionIfNeeded() } }
         configureBackgroundScheduler()
     }
     /// What the switch shows at launch: the stored choice, on when never set.
@@ -990,7 +1004,18 @@ struct MenuBarSnapshot: Sendable {
     func setNotifications(enabled: Bool) async {
         notificationsEnabled = enabled
         operationDefaults.set(enabled, forKey: NotificationPolicy.enabledKey)
-        guard enabled else { return }
+        guard enabled else {
+            // Forgotten, not kept: permission may change while off (no reads then), and a stale
+            // "blocked" would flash under the switch when it is turned back on.
+            notificationAuthorization = nil
+            return
+        }
+        await requestNotificationPermissionIfNeeded()
+    }
+
+    /// Asks macOS once if notifications are on and it never asked (turning on the switch, a sync,
+    /// or automatic sync), then shows its answer under the switch.
+    func requestNotificationPermissionIfNeeded() async {
         await notificationCoordinator.requestAuthorizationIfNeeded()
         await refreshNotificationAuthorization()
     }
@@ -1049,7 +1074,7 @@ struct MenuBarSnapshot: Sendable {
         let operationID = UUID()
         activeOperationID = operationID
         setSyncState(.checking)
-        Task { await notificationCoordinator.requestAuthorizationIfNeeded() }
+        Task { await requestNotificationPermissionIfNeeded() }
         syncTask = Task { [weak self] in
             do {
                 guard let self else { return }

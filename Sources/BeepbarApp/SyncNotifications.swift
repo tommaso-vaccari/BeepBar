@@ -42,9 +42,12 @@ struct SystemNotificationCenter: NotificationCenterClient {
 }
 
 /// Stands in for the notification center where none may be touched: test controllers that don't
-/// pass their own, so no test can reach the real one. Never asked, never allowed, sends nothing.
+/// pass their own, so no test can reach the real one, and UI previews, which report `.allowed` so
+/// Settings doesn't show a misleading "blocked" warning. Never prompts, sends nothing.
 struct InertNotificationCenter: NotificationCenterClient {
-    func authorization() async -> NotificationAuthorization { .denied }
+    var reportedAuthorization: NotificationAuthorization = .denied
+    init(authorization: NotificationAuthorization = .denied) { reportedAuthorization = authorization }
+    func authorization() async -> NotificationAuthorization { reportedAuthorization }
     func requestAuthorization() async {}
     func send(identifier: String, title: String, body: String, destination: NotificationDestination) async {}
 }
@@ -74,11 +77,12 @@ enum AutomaticNotificationIssue: String {
     }
 }
 
-/// Decides and sends every BeepBar notification. Each path first checks the "Notifiche" switch
-/// (`NotificationPolicy.enabledKey` in `defaults`) and macOS's permission, before any
-/// deduplication bookkeeping: with the switch off nothing reaches the notification center, and
-/// nothing is recorded as notified, so a conflict still open when notifications come back on is
-/// still announced (#64).
+/// Decides and sends every BeepBar notification. Each path checks the "Notifiche" switch
+/// (`NotificationPolicy.enabledKey` in `defaults`) and macOS's permission before recording
+/// anything as notified: with the switch off nothing reaches the notification center and nothing
+/// is recorded, so a conflict still open when notifications come back on is still announced (#64).
+/// Clearing a record is different: when a run finds no conflicts, the conflicts record is
+/// cleared even while off, so conflicts that come back later are announced as new.
 @MainActor final class SyncNotificationCoordinator {
     private static let prefix = "io.github.tvaccari.beepbar.notification.v2"
     private let deduplication: NotificationDeduplicationStore
@@ -112,7 +116,7 @@ enum AutomaticNotificationIssue: String {
     func notifyAutomaticRun(installed: Int, conflicts: [ConflictRecord], failures: Int) async {
         if conflicts.isEmpty { deduplication.resolve(condition: "conflicts") }
         guard await canSend() else { return }
-        if !conflicts.isEmpty {
+        if !conflicts.isEmpty, isEnabled {
             let fingerprint = NotificationFingerprint.conflicts(conflicts)
             if deduplication.shouldNotify(condition: "conflicts", fingerprint: fingerprint, now: Date()) {
                 await center.send(identifier: "beepbar-conflicts", title: conflicts.count == 1 ? tr("Conflitto da risolvere", "Conflict to resolve") : tr("Conflitti da risolvere", "Conflicts to resolve"), body: SyncCopy.conflictNotificationBody(conflicts.count), destination: .conflicts)
@@ -120,7 +124,7 @@ enum AutomaticNotificationIssue: String {
         }
         if failures > 0 {
             await notify(issue: .partialSync)
-        } else if installed > 0 {
+        } else if installed > 0, isEnabled {
             await sendNewMaterials(installed)
         }
     }
@@ -140,7 +144,7 @@ enum AutomaticNotificationIssue: String {
         if let beforeNotificationForTesting { await beforeNotificationForTesting(); return }
 #endif
         guard await canSend() else { return }
-        guard deduplication.shouldNotify(condition: issue.rawValue, fingerprint: issue.rawValue, now: Date()) else { return }
+        guard isEnabled, deduplication.shouldNotify(condition: issue.rawValue, fingerprint: issue.rawValue, now: Date()) else { return }
         await center.send(identifier: "beepbar-\(issue.rawValue)", title: issue.title, body: issue.body, destination: .home)
     }
 
@@ -150,10 +154,14 @@ enum AutomaticNotificationIssue: String {
         }
     }
 
-    /// The switch first: when it is off, macOS isn't even asked for its permission status.
+    /// The switch first: when it is off, macOS isn't even asked for its permission status. Checked
+    /// again once macOS answers, since the user may have turned it off meanwhile. Every send is
+    /// also preceded by a synchronous `isEnabled` check with no suspension in between, because a
+    /// run can send twice (conflicts, then new materials) with an await between the two.
     private func canSend() async -> Bool {
         guard isEnabled else { return false }
-        return NotificationPolicy.canSend(enabled: true, authorization: await center.authorization())
+        let authorization = await center.authorization()
+        return NotificationPolicy.canSend(enabled: isEnabled, authorization: authorization)
     }
 
     private func sendNewMaterials(_ count: Int) async {

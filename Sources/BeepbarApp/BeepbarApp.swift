@@ -199,7 +199,9 @@ final class StatusItemController: NSObject, NSMenuDelegate {
             }
             appearanceTrace = PerformanceTrace.shared.begin("ui.configurationWindow", category: .ui)
         }
-        if let page { router.page = page }
+        // Onboarding ignores the page (it shows onboarding anyway), and keeping it would land the user
+        // on, say, Conflitti once onboarding ends instead of Corsi.
+        if let page, !authentication.needsOnboarding { router.page = page }
         // Activate before ordering the window in: with macOS 14+ cooperative activation the
         // deprecated `activate(ignoringOtherApps:)` is ignored, which left the window open but
         // inactive, so the first click only activated the app and seemed to do nothing.

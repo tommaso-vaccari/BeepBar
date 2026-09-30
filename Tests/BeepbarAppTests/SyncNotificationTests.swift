@@ -133,16 +133,29 @@ private final class FakeNotificationCenter: NotificationCenterClient, @unchecked
     }
 
     /// Same for a send: if the user turns the switch off while the permission read before a send
-    /// is pending, nothing is sent and nothing is recorded.
+    /// is pending, nothing is sent and nothing is recorded, so once it is back on the conflict is
+    /// still announced. Covers both the manual and the automatic path.
     @Test func turningOffDuringTheReadBeforeASendPreventsIt() async throws {
         let suite = suiteName
+        let turnOffOnRead = OSAllocatedUnfairLock(initialState: true)
         let center = FakeNotificationCenter(onAuthorizationRead: {
+            guard turnOffOnRead.withLock({ $0 }) else { return }
             UserDefaults(suiteName: suite)?.set(false, forKey: NotificationPolicy.enabledKey)
         })
         let coordinator = SyncNotificationCoordinator(defaults: defaults, center: center)
+        let open = [try conflict("a")]
         await coordinator.notifyManualRun(added: 2)
-        await coordinator.notifyAutomaticRun(installed: 0, conflicts: [try conflict("a")], failures: 0)
         #expect(center.sent.isEmpty)
+
+        turnOn()
+        await coordinator.notifyAutomaticRun(installed: 0, conflicts: open, failures: 0)
+        #expect(center.sent.isEmpty)
+        #expect(!NotificationPolicy.isEnabled(storedValue: defaults.object(forKey: NotificationPolicy.enabledKey)), "the switch went off during the read")
+
+        turnOffOnRead.withLock { $0 = false }
+        turnOn()
+        await coordinator.notifyAutomaticRun(installed: 0, conflicts: open, failures: 0)
+        #expect(center.sent.map(\.identifier) == ["beepbar-conflicts"], "not recorded while off, so announced now")
     }
 
     /// A run that sends twice (conflicts, then new materials) checks the switch before each send:
@@ -346,8 +359,9 @@ struct NotificationMappingTests {
         #expect(controller.notificationAuthorization == nil)
     }
 
-    /// A permission prompt started by a sync or by automatic sync updates the footer with macOS's
-    /// answer, as turning the switch on does.
+    /// The permission helper updates the footer with macOS's answer. `synchronizeNow`,
+    /// `setAutomaticSync` and `setNotifications` all go through it (see their comments), which is
+    /// what keeps the footer current after a prompt they start.
     @Test func aPromptFromASyncUpdatesTheFooter() async {
         let center = FakeNotificationCenter(authorization: .notDetermined, afterRequest: .denied)
         let controller = controller(center)

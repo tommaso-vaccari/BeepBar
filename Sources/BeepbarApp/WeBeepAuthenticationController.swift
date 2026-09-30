@@ -991,6 +991,7 @@ struct MenuBarSnapshot: Sendable {
             automaticSyncInterval = Self.validatedAutomaticInterval(interval)
             Self.defaults.set(automaticSyncInterval, forKey: Self.autoSyncIntervalKey)
         }
+        // Through the helper, not the coordinator directly: it also refreshes the Settings footer.
         if enabled && !wasEnabled { Task { await requestNotificationPermissionIfNeeded() } }
         configureBackgroundScheduler()
     }
@@ -1074,6 +1075,7 @@ struct MenuBarSnapshot: Sendable {
         let operationID = UUID()
         activeOperationID = operationID
         setSyncState(.checking)
+        // Through the helper, not the coordinator directly: it also refreshes the Settings footer.
         Task { await requestNotificationPermissionIfNeeded() }
         syncTask = Task { [weak self] in
             do {

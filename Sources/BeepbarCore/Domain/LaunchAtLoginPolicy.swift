@@ -76,10 +76,13 @@ public enum LaunchAtLoginPolicy {
         status == .requiresApproval
     }
 
-    /// Whether a change the user asked for failed, judged by macOS's status afterwards rather than
-    /// by whether the call threw: `register()` throws `kSMErrorAlreadyRegistered` and `unregister()`
-    /// throws `kSMErrorJobNotFound` when macOS is already where the user wants it to be.
-    public static func changeFailed(enabling: Bool, statusAfter: LoginItemStatus) -> Bool {
-        enabling ? (statusAfter == .notRegistered || statusAfter == .notFound) : statusAfter == .enabled
+    /// Whether a change the user asked for failed: the call threw *and* macOS is not where the user
+    /// asked. A throw alone isn't a failure, because `register()` throws `kSMErrorAlreadyRegistered`
+    /// and `unregister()` throws `kSMErrorJobNotFound` when macOS is already there. A status alone
+    /// isn't one either, for the same reason `defaultAppliedAfterLaunch` trusts a call that
+    /// returned: the status read right after it may lag, and the next refresh catches up.
+    public static func changeFailed(enabling: Bool, threw: Bool, statusAfter: LoginItemStatus) -> Bool {
+        guard threw else { return false }
+        return enabling ? (statusAfter == .notRegistered || statusAfter == .notFound) : statusAfter == .enabled
     }
 }

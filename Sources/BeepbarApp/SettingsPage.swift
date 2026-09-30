@@ -18,6 +18,12 @@ struct SettingsPage: View {
             updatesSection
         }
         .formStyle(.grouped)
+        // On the Form, not on the startup Section: modifiers on a Section inside a Form can be
+        // applied to each of its rows, which would start one refresh per row.
+        .task { await launchAtLogin.refresh() }
+        .onReceive(NotificationCenter.default.publisher(for: NSApplication.didBecomeActiveNotification)) { _ in
+            Task { await launchAtLogin.refresh() }
+        }
         .confirmationDialog(tr("Disconnettere l'account \(authentication.selectedSite.platformName)?", "Disconnect the \(authentication.selectedSite.platformName) account?"), isPresented: $showSignOutConfirmation, titleVisibility: .visible) {
             Button(tr("Disconnetti", "Disconnect"), role: .destructive) { authentication.signOut() }
             Button(tr("Annulla", "Cancel"), role: .cancel) {}
@@ -128,7 +134,8 @@ struct SettingsPage: View {
     // MARK: Startup
 
     /// "Apri BeepBar al login". The switch shows macOS's real status, re-read whenever Settings
-    /// appears or BeepBar becomes active, because the user can also change it in System Settings.
+    /// appears or BeepBar becomes active (see the Form's `.task`), because the user can also
+    /// change it in System Settings.
     private var startupSection: some View {
         Section {
             Toggle(tr("Apri BeepBar al login", "Open BeepBar at login"), isOn: Binding(
@@ -142,10 +149,6 @@ struct SettingsPage: View {
             startupFooter
                 .font(.caption)
                 .foregroundStyle(.secondary)
-        }
-        .task { await launchAtLogin.refresh() }
-        .onReceive(NotificationCenter.default.publisher(for: NSApplication.didBecomeActiveNotification)) { _ in
-            Task { await launchAtLogin.refresh() }
         }
     }
 

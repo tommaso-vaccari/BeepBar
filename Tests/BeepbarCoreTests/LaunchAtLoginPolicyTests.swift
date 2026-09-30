@@ -94,16 +94,21 @@ struct LaunchAtLoginPolicyTests {
         #expect(!LaunchAtLoginPolicy.needsSystemSettings(.notFound))
     }
 
-    /// A change counts as failed only if macOS did not end up where the user asked, so the
-    /// "already registered" / "not found" errors macOS throws for a no-op don't show as failures.
-    @Test func aChangeFailsOnlyWhenMacOSDidNotEndUpWhereAsked() {
-        #expect(!LaunchAtLoginPolicy.changeFailed(enabling: true, statusAfter: .enabled))
-        #expect(!LaunchAtLoginPolicy.changeFailed(enabling: true, statusAfter: .requiresApproval), "held for approval is handled by opening System Settings")
-        #expect(LaunchAtLoginPolicy.changeFailed(enabling: true, statusAfter: .notRegistered))
-        #expect(LaunchAtLoginPolicy.changeFailed(enabling: true, statusAfter: .notFound))
-        #expect(!LaunchAtLoginPolicy.changeFailed(enabling: false, statusAfter: .notRegistered))
-        #expect(!LaunchAtLoginPolicy.changeFailed(enabling: false, statusAfter: .notFound))
-        #expect(!LaunchAtLoginPolicy.changeFailed(enabling: false, statusAfter: .requiresApproval))
-        #expect(LaunchAtLoginPolicy.changeFailed(enabling: false, statusAfter: .enabled))
+    /// A change counts as failed only if the call threw and macOS did not end up where the user
+    /// asked: the "already registered" / "not found" errors macOS throws for a no-op aren't
+    /// failures, and neither is a call that returned while the status read after it still lags.
+    @Test func aChangeFailsOnlyWhenTheCallThrewAndMacOSIsNotWhereAsked() {
+        #expect(!LaunchAtLoginPolicy.changeFailed(enabling: true, threw: true, statusAfter: .enabled))
+        #expect(!LaunchAtLoginPolicy.changeFailed(enabling: true, threw: true, statusAfter: .requiresApproval), "held for approval is handled by opening System Settings")
+        #expect(LaunchAtLoginPolicy.changeFailed(enabling: true, threw: true, statusAfter: .notRegistered))
+        #expect(LaunchAtLoginPolicy.changeFailed(enabling: true, threw: true, statusAfter: .notFound))
+        #expect(!LaunchAtLoginPolicy.changeFailed(enabling: false, threw: true, statusAfter: .notRegistered))
+        #expect(!LaunchAtLoginPolicy.changeFailed(enabling: false, threw: true, statusAfter: .notFound))
+        #expect(!LaunchAtLoginPolicy.changeFailed(enabling: false, threw: true, statusAfter: .requiresApproval))
+        #expect(LaunchAtLoginPolicy.changeFailed(enabling: false, threw: true, statusAfter: .enabled))
+        for status in [LoginItemStatus.enabled, .requiresApproval, .notRegistered, .notFound] {
+            #expect(!LaunchAtLoginPolicy.changeFailed(enabling: true, threw: false, statusAfter: status))
+            #expect(!LaunchAtLoginPolicy.changeFailed(enabling: false, threw: false, statusAfter: status))
+        }
     }
 }

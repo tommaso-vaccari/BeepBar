@@ -9,15 +9,19 @@ import os
 /// - `register()` fails while the user holds the item for approval (`kSMErrorLaunchDeniedByUser`)
 ///   and when it is already registered (`kSMErrorAlreadyRegistered`), leaving the status as is;
 /// - `unregister()` fails when there is nothing to remove (`kSMErrorJobNotFound`).
-/// Tests can additionally force failures, or make macOS ask for approval of a new registration.
+/// Tests can additionally force failures, make macOS ask for approval of a new registration, or
+/// make a successful registration leave the status lagging behind. It also records every call
+/// that reached it on the main thread: they are blocking XPC calls and must never block the UI.
 private final class FakeLoginItemService: LoginItemService, @unchecked Sendable {
-    enum RegisterOutcome { case enable, requireApproval, fail }
+    enum RegisterOutcome { case enable, requireApproval, fail, succeedWithStatusLagging }
     private struct State {
         var status: LoginItemStatus
         var registerOutcome = RegisterOutcome.enable
         var failUnregister = false
         var registerCalls = 0
         var unregisterCalls = 0
+        var statusReads = 0
+        var mainThreadCalls = 0
         var settingsOpened = 0
     }
     private let state: OSAllocatedUnfairLock<State>
@@ -29,7 +33,12 @@ private final class FakeLoginItemService: LoginItemService, @unchecked Sendable 
         self.registerGate = registerGate
     }
 
-    var status: LoginItemStatus { state.withLock { $0.status } }
+    var status: LoginItemStatus {
+        let onMain = Thread.isMainThread
+        return state.withLock { $0.statusReads += 1; if onMain { $0.mainThreadCalls += 1 }; return $0.status }
+    }
+    var statusReads: Int { state.withLock { $0.statusReads } }
+    var mainThreadCalls: Int { state.withLock { $0.mainThreadCalls } }
     var registerCalls: Int { state.withLock { $0.registerCalls } }
     var unregisterCalls: Int { state.withLock { $0.unregisterCalls } }
     var settingsOpened: Int { state.withLock { $0.settingsOpened } }
@@ -37,7 +46,8 @@ private final class FakeLoginItemService: LoginItemService, @unchecked Sendable 
     func setRegisterOutcome(_ outcome: RegisterOutcome) { state.withLock { $0.registerOutcome = outcome } }
 
     func register() throws {
-        state.withLock { $0.registerCalls += 1 }
+        let onMain = Thread.isMainThread
+        state.withLock { $0.registerCalls += 1; if onMain { $0.mainThreadCalls += 1 } }
         registerGate?.wait()
         let (status, outcome) = state.withLock { ($0.status, $0.registerOutcome) }
         if status == .requiresApproval || status == .enabled { throw CocoaError(.featureUnsupported) }
@@ -45,11 +55,13 @@ private final class FakeLoginItemService: LoginItemService, @unchecked Sendable 
         case .enable: state.withLock { $0.status = .enabled }
         case .requireApproval: state.withLock { $0.status = .requiresApproval }
         case .fail: throw CocoaError(.featureUnsupported)
+        case .succeedWithStatusLagging: break
         }
     }
 
     func unregister() throws {
-        let (status, fail) = state.withLock { $0.unregisterCalls += 1; return ($0.status, $0.failUnregister) }
+        let onMain = Thread.isMainThread
+        let (status, fail) = state.withLock { $0.unregisterCalls += 1; if onMain { $0.mainThreadCalls += 1 }; return ($0.status, $0.failUnregister) }
         if fail || status == .notRegistered || status == .notFound { throw CocoaError(.featureUnsupported) }
         state.withLock { $0.status = .notRegistered }
     }
@@ -319,8 +331,8 @@ private final class FakeLoginItemService: LoginItemService, @unchecked Sendable 
         #expect(controller.canChange)
     }
 
-    /// The default registration at launch also locks the switch: a tap while it runs would
-    /// otherwise hit `kSMErrorAlreadyRegistered` and show a false "couldn't add" error.
+    /// The default registration at launch also locks the switch: a tap while it runs must not
+    /// start a second registration racing the first.
     @Test func theDefaultRegistrationAtLaunchLocksTheSwitch() async {
         let gate = DispatchSemaphore(value: 0)
         let service = FakeLoginItemService(status: .notRegistered, registerGate: gate)
@@ -350,6 +362,52 @@ private final class FakeLoginItemService: LoginItemService, @unchecked Sendable 
         await controller.refresh()
         #expect(!controller.isOn)
         #expect(controller.status == .requiresApproval)
+    }
+
+    /// Every call into macOS (status reads, register, unregister) is a blocking XPC call: across
+    /// launch, Settings, both changes and a refresh, none may run on the main thread.
+    @Test func macOSIsNeverCalledOnTheMainThread() async {
+        let service = FakeLoginItemService(status: .notRegistered)
+        let controller = await launch(service)
+        await controller.setEnabled(false)
+        await controller.setEnabled(true)
+        await controller.refresh()
+        _ = await settings(service)
+        #expect(service.registerCalls == 2)
+        #expect(service.unregisterCalls == 1)
+        #expect(service.statusReads >= 5)
+        #expect(service.mainThreadCalls == 0)
+    }
+
+    /// A refresh while a change is in flight doesn't read: the change reads the status itself when
+    /// it ends, and an earlier read arriving after that would overwrite the newer status.
+    @Test func aRefreshDuringAChangeLeavesTheStatusToTheChange() async {
+        let gate = DispatchSemaphore(value: 0)
+        let service = FakeLoginItemService(status: .notRegistered, registerGate: gate)
+        let controller = await settings(service)
+        let change = Task { await controller.setEnabled(true) }
+        await waitUntil { service.registerCalls > 0 }
+        let readsBefore = service.statusReads
+        await controller.refresh()
+        #expect(service.statusReads == readsBefore, "the refresh must not read while the change is in flight")
+        gate.signal()
+        await change.value
+        #expect(controller.isOn)
+        await controller.refresh()
+        #expect(service.statusReads == readsBefore + 2, "once the change ended, refreshes read again")
+    }
+
+    /// A registration that returned while the status read after it still lags is not reported
+    /// as a failure; the next refresh shows the real status.
+    @Test func aSuccessfulChangeWithALaggingStatusIsNotAFailure() async {
+        let service = FakeLoginItemService(status: .notRegistered, registerOutcome: .succeedWithStatusLagging)
+        let controller = await settings(service)
+        await controller.setEnabled(true)
+        #expect(service.registerCalls == 1)
+        #expect(controller.errorMessage == nil)
+        service.setStatus(.enabled)
+        await controller.refresh()
+        #expect(controller.isOn)
     }
 
     private func waitUntil(_ condition: () -> Bool) async {

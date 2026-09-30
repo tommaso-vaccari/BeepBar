@@ -71,8 +71,9 @@ final class InMemoryLoginItemService: LoginItemService, @unchecked Sendable {
     /// the user did nothing, and the next launch retries.
     @Published private(set) var errorMessage: BilingualText?
     /// True while BeepBar is registering or unregistering, including the default at launch. The
-    /// switch is disabled meanwhile, so a tap cannot race a call already in flight (a second
-    /// `register()` would fail with `kSMErrorAlreadyRegistered` and show a false error).
+    /// switch is disabled meanwhile and refreshes wait, so no second or opposing call (a quick
+    /// on-then-off) races the one in flight, and no status read taken before it finished can land
+    /// after it and overwrite the newer status.
     @Published private(set) var isUpdating = false
     let location: AppLocation
 
@@ -99,9 +100,9 @@ final class InMemoryLoginItemService: LoginItemService, @unchecked Sendable {
         defer { isUpdating = false }
         let current = await readStatus()
         status = current
-        guard !defaults.bool(forKey: Self.defaultAppliedKey) else { return }
+        let defaultApplied = defaults.bool(forKey: Self.defaultAppliedKey)
         var registered = false
-        if LaunchAtLoginPolicy.shouldRegisterOnLaunch(defaultApplied: false, status: current, location: location) {
+        if LaunchAtLoginPolicy.shouldRegisterOnLaunch(defaultApplied: defaultApplied, status: current, location: location) {
             let service = service
             do {
                 try await Task.detached { try service.register() }.value
@@ -112,7 +113,7 @@ final class InMemoryLoginItemService: LoginItemService, @unchecked Sendable {
             }
             status = await readStatus()
         }
-        if LaunchAtLoginPolicy.defaultAppliedAfterLaunch(location: location, registrationSucceeded: registered, statusAfterLaunch: status ?? current) {
+        if !defaultApplied, LaunchAtLoginPolicy.defaultAppliedAfterLaunch(location: location, registrationSucceeded: registered, statusAfterLaunch: status ?? current) {
             defaults.set(true, forKey: Self.defaultAppliedKey)
         }
     }
@@ -139,8 +140,8 @@ final class InMemoryLoginItemService: LoginItemService, @unchecked Sendable {
         }
         let after = await readStatus()
         status = after
-        if LaunchAtLoginPolicy.changeFailed(enabling: enabled, statusAfter: after) {
-            BeepbarLog.lifecycle.error("Login item change failed enabled=\(enabled, privacy: .public): \(failure?.localizedDescription ?? "no error, status unchanged", privacy: .public)")
+        if LaunchAtLoginPolicy.changeFailed(enabling: enabled, threw: failure != nil, statusAfter: after) {
+            BeepbarLog.lifecycle.error("Login item change failed enabled=\(enabled, privacy: .public): \(failure?.localizedDescription ?? "", privacy: .public)")
             errorMessage = enabled
                 ? BilingualText("Non è stato possibile aggiungere BeepBar agli elementi di login.", "Couldn't add BeepBar to your login items.")
                 : BilingualText("Non è stato possibile rimuovere BeepBar dagli elementi di login.", "Couldn't remove BeepBar from your login items.")
@@ -152,6 +153,9 @@ final class InMemoryLoginItemService: LoginItemService, @unchecked Sendable {
     /// Re-reads macOS's status, e.g. after the user changed it in System Settings. A status that
     /// moved on also retires an earlier error, which described a state that no longer holds.
     func refresh() async {
+        // A change in flight reads the status itself when it ends; a read started now could
+        // arrive after that one and overwrite it with the older value.
+        guard !isUpdating else { return }
         let previous = status
         let now = await readStatus()
         status = now

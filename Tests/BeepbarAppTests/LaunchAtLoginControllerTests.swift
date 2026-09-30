@@ -23,6 +23,8 @@ private final class FakeLoginItemService: LoginItemService, @unchecked Sendable 
         var statusReads = 0
         var mainThreadCalls = 0
         var settingsOpened = 0
+        var holdNextRead = false
+        var heldReads = 0
     }
     private let state: OSAllocatedUnfairLock<State>
     /// When set, `register()` waits on it: lets a test hold a change in flight.
@@ -35,8 +37,23 @@ private final class FakeLoginItemService: LoginItemService, @unchecked Sendable 
 
     var status: LoginItemStatus {
         let onMain = Thread.isMainThread
-        return state.withLock { $0.statusReads += 1; if onMain { $0.mainThreadCalls += 1 }; return $0.status }
+        let (value, hold) = state.withLock { s -> (LoginItemStatus, Bool) in
+            s.statusReads += 1
+            if onMain { s.mainThreadCalls += 1 }
+            let hold = s.holdNextRead
+            if hold { s.holdNextRead = false; s.heldReads += 1 }
+            return (s.status, hold)
+        }
+        // A held read answers with the status as it was when it was asked, like an XPC reply that
+        // was sent before a change but delivered after it.
+        if hold { _ = readGate.wait(timeout: .now() + 2) }
+        return value
     }
+    private let readGate = DispatchSemaphore(value: 0)
+    /// Holds the next status read until `releaseHeldRead()`.
+    func holdNextStatusRead() { state.withLock { $0.holdNextRead = true } }
+    func releaseHeldRead() { readGate.signal() }
+    var heldReads: Int { state.withLock { $0.heldReads } }
     var statusReads: Int { state.withLock { $0.statusReads } }
     var mainThreadCalls: Int { state.withLock { $0.mainThreadCalls } }
     var registerCalls: Int { state.withLock { $0.registerCalls } }
@@ -49,7 +66,8 @@ private final class FakeLoginItemService: LoginItemService, @unchecked Sendable 
         let onMain = Thread.isMainThread
         state.withLock { $0.registerCalls += 1; if onMain { $0.mainThreadCalls += 1 } }
         // Bounded, so a regression that calls `register()` on the main thread (where the test
-        // would signal the gate) fails the main-thread check instead of deadlocking the suite.
+        // would signal the gate) doesn't deadlock the suite; the gated tests then fail their
+        // `mainThreadCalls == 0` check, as does `macOSIsNeverCalledOnTheMainThread`.
         _ = registerGate?.wait(timeout: .now() + 2)
         let (status, outcome) = state.withLock { ($0.status, $0.registerOutcome) }
         if status == .requiresApproval || status == .enabled { throw CocoaError(.featureUnsupported) }
@@ -328,6 +346,7 @@ private final class FakeLoginItemService: LoginItemService, @unchecked Sendable 
         await first.value
         await second.value
         #expect(service.registerCalls == 1)
+        #expect(service.mainThreadCalls == 0)
         #expect(controller.isOn)
         #expect(!controller.isUpdating)
         #expect(controller.canChange)
@@ -351,6 +370,7 @@ private final class FakeLoginItemService: LoginItemService, @unchecked Sendable 
         await launching.value
         await tap.value
         #expect(service.registerCalls == 1)
+        #expect(service.mainThreadCalls == 0)
         #expect(controller.errorMessage == nil)
         #expect(controller.isOn)
     }
@@ -410,6 +430,49 @@ private final class FakeLoginItemService: LoginItemService, @unchecked Sendable 
         service.setStatus(.enabled)
         await controller.refresh()
         #expect(controller.isOn)
+    }
+
+    /// A refresh whose read started before a change but answers after it must not put back the
+    /// older status: the switch would show off while macOS has BeepBar on.
+    @Test func aRefreshOvertakenByAChangeDoesNotOverwriteIt() async {
+        let service = FakeLoginItemService(status: .notRegistered)
+        let controller = await settings(service)
+        service.holdNextStatusRead()
+        let refreshing = Task { await controller.refresh() }
+        await waitUntil { service.heldReads == 1 }
+        await controller.setEnabled(true)
+        #expect(controller.isOn)
+        service.releaseHeldRead()
+        await refreshing.value
+        #expect(controller.isOn, "the older read must be dropped")
+        #expect(controller.status == .enabled)
+    }
+
+    /// The launch path trusts a registration that returned even if the status read after it lags:
+    /// the default counts as applied, so a later removal in System Settings is respected.
+    @Test func aDefaultRegistrationWithALaggingStatusStillUsesUpTheDefault() async {
+        let service = FakeLoginItemService(status: .notRegistered, registerOutcome: .succeedWithStatusLagging)
+        _ = await launch(service)
+        #expect(service.registerCalls == 1)
+        #expect(defaults.bool(forKey: LaunchAtLoginController.defaultAppliedKey))
+
+        service.setStatus(.notRegistered)
+        _ = await launch(service)
+        #expect(service.registerCalls == 1, "a relaunch must not re-add what the user removed")
+    }
+
+    /// A failed "on" doesn't use up the default: the user asked for it, so the next launch retries.
+    @Test func aFailedOnDoesNotUseUpTheDefault() async {
+        let service = FakeLoginItemService(status: .notRegistered, registerOutcome: .fail)
+        let controller = await launch(service)
+        await controller.setEnabled(true)
+        #expect(controller.errorMessage == couldNotAdd)
+        #expect(!defaults.bool(forKey: LaunchAtLoginController.defaultAppliedKey))
+
+        service.setRegisterOutcome(.enable)
+        let relaunched = await launch(service)
+        #expect(service.registerCalls == 3)
+        #expect(relaunched.isOn)
     }
 
     private func waitUntil(_ condition: () -> Bool) async {

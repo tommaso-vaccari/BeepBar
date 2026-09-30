@@ -160,7 +160,7 @@ struct SettingsPage: View {
         } else if launchAtLogin.status == .requiresApproval {
             VStack(alignment: .leading, spacing: 6) {
                 Text(tr("È disattivata in Impostazioni di Sistema, dove puoi riattivarla.", "It's turned off in System Settings, where you can turn it back on."))
-                Button(tr("Apri Elementi di login…", "Open Login Items…")) { launchAtLogin.openSystemSettings() }
+                Button(tr("Apri Impostazioni di Sistema…", "Open System Settings…")) { launchAtLogin.openSystemSettings() }
                     .buttonStyle(.link)
             }
         } else {

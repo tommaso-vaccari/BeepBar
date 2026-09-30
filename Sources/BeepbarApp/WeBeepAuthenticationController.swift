@@ -379,6 +379,7 @@ struct MenuBarSnapshot: Sendable {
     private var scheduledConfiguration: BackgroundScheduleConfiguration?
 #if DEBUG
     private var beforeReconciliationStateForTesting: (@MainActor () async -> Void)?
+    private var testDefaults: UserDefaults?
     private var beforeScopeRestoreForTesting: (@MainActor () -> Void)?
 #endif
 
@@ -490,7 +491,9 @@ struct MenuBarSnapshot: Sendable {
         let site = MoodleSite.site(id: nil)
         selectedSite = site
         hasStoredCredential = true
-        notificationCoordinator = SyncNotificationCoordinator(defaults: UserDefaults(suiteName: UUID().uuidString)!)
+        let isolatedDefaults = UserDefaults(suiteName: UUID().uuidString)!
+        testDefaults = isolatedDefaults
+        notificationCoordinator = SyncNotificationCoordinator(defaults: isolatedDefaults)
         rootURL = testRootURL
         needsOnboarding = false
         language = .italian
@@ -506,8 +509,9 @@ struct MenuBarSnapshot: Sendable {
         refreshMenuBarSnapshot()
     }
 
-    func setOperationForTesting(_ operationID: UUID?) {
+    func setOperationForTesting(_ operationID: UUID?, task: Task<Void, Never>? = nil) {
         activeOperationID = operationID
+        syncTask = task
     }
 
     func setSyncStateForTesting(_ state: AppSyncState) {
@@ -629,9 +633,14 @@ struct MenuBarSnapshot: Sendable {
 
     /// Forgets the stored token so another account, or another university, can be connected.
     /// The sync folder, its files and the course selection stay as they are.
-    func signOut() {
+    func signOut(removeFile: (URL) throws -> Void = { try FileManager.default.removeItem(at: $0) }) {
         guard hasStoredCredential, !isSyncActive, !isAuthenticating, !isLoadingCourses else { return }
-        FileTokenStore.delete()
+        do {
+            try FileTokenStore.delete(removeFile: removeFile)
+        } catch {
+            setSyncState(.failed(.local(BilingualText("Impossibile eliminare il token salvato. Riprova a disconnetterti.", "Couldn't remove the stored token. Try disconnecting again."))))
+            return
+        }
         Task { await credentialVault.invalidate() }
         Self.defaults.removeObject(forKey: Self.credentialExpiredKey)
         notificationCoordinator.clearFailure()
@@ -756,9 +765,9 @@ struct MenuBarSnapshot: Sendable {
         syncState = newState
         status = newState.detail
         if case .synced(let summary) = newState, let rootID {
-            Self.defaults.set(summary.completedAt.timeIntervalSince1970, forKey: Self.lastSuccessfulReconciliationKey + rootID.uuidString)
+            operationDefaults.set(summary.completedAt.timeIntervalSince1970, forKey: Self.lastSuccessfulReconciliationKey + rootID.uuidString)
             if let data = try? JSONEncoder().encode(summary) {
-                Self.defaults.set(data, forKey: Self.lastSuccessfulSummaryKey + rootID.uuidString)
+                operationDefaults.set(data, forKey: Self.lastSuccessfulSummaryKey + rootID.uuidString)
             }
         }
     }
@@ -896,7 +905,7 @@ struct MenuBarSnapshot: Sendable {
         guard !isSyncActive, !isLoadingCourses else { return }
         if enabled { enabledCourseIDs.insert(course.id) }
         else { enabledCourseIDs.remove(course.id) }
-        Self.defaults.set(enabledCourseIDs.map(String.init).sorted(), forKey: Self.enabledCoursesKey)
+        operationDefaults.set(enabledCourseIDs.map(String.init).sorted(), forKey: Self.enabledCoursesKey)
         configureBackgroundScheduler()
         if let database, let rootID {
             let folder = courseFolders[course.id] ?? defaultFolder(for: course)
@@ -1284,6 +1293,13 @@ struct MenuBarSnapshot: Sendable {
         return store
     }()
 
+    private var operationDefaults: UserDefaults {
+#if DEBUG
+        if let testDefaults { return testDefaults }
+#endif
+        return Self.defaults
+    }
+
     private static let automaticIntervals: Set<Int> = [1_800, 3_600, 7_200, 14_400, 28_800]
 
     private static func validatedAutomaticInterval(_ value: Int?) -> Int {
@@ -1418,7 +1434,7 @@ struct MenuBarSnapshot: Sendable {
                 }
             }
         }
-        Self.defaults.set(enabledCourseIDs.map(String.init).sorted(), forKey: Self.enabledCoursesKey)
+        operationDefaults.set(enabledCourseIDs.map(String.init).sorted(), forKey: Self.enabledCoursesKey)
     }
 
     func folder(for course: RemoteCourseSummary) -> String {
@@ -1551,7 +1567,9 @@ struct MenuBarSnapshot: Sendable {
 #if DEBUG
         await beforeReconciliationStateForTesting?()
 #endif
-        guard activeOperationID == operationID else { return }
+        // Cancellation keeps the operation ID until its task unwinds. Checking the ID alone
+        // would publish a completed result over the user's pending cancellation.
+        guard activeOperationID == operationID, !Task.isCancelled else { return }
         conflicts = open
         remoteChanges = changes
         courses = Self.orderedForDisplay(courses, enabledCourseIDs: enabledCourseIDs)
@@ -1624,6 +1642,8 @@ struct MenuBarSnapshot: Sendable {
         let operationID = UUID()
         activeOperationID = operationID
         automaticOutcome = .finished
+        await scopeWriteTask?.value
+        guard activeOperationID == operationID else { return .cancelled }
         // Nothing to check: leave the last result on screen instead of replacing it with "Pronto".
         guard let automaticScopes = try? await database.scopes(rootID: rootID, enabledOnly: true), !automaticScopes.isEmpty else {
             guard activeOperationID == operationID else { return .cancelled }
@@ -1678,6 +1698,7 @@ struct MenuBarSnapshot: Sendable {
     private func beginTransfer(_ operationID: UUID, automatic: Bool) async {
         guard activeOperationID == operationID else { return }
         await progressStore.reset(automatic: automatic)
+        guard activeOperationID == operationID, !Task.isCancelled else { return }
         setSyncState(.syncing)
     }
 
@@ -1690,6 +1711,7 @@ struct MenuBarSnapshot: Sendable {
         guard activeOperationID == operationID else { return }
         await finishReconciliation(progress: summary, operationID: operationID)
         guard activeOperationID == operationID else { return }
+        guard !Task.isCancelled else { cancelledSync(operationID); return }
         if summary.failures == 0 { notificationCoordinator.clearFailure() }
         BeepbarLog.sync.notice("Synchronization completed automatic=\(automatic, privacy: .public) total=\(summary.total, privacy: .public) installed=\(summary.installed, privacy: .public) conflicts=\(summary.conflicts, privacy: .public) failures=\(summary.failures, privacy: .public)")
         configureBackgroundScheduler()

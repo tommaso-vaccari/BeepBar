@@ -82,6 +82,26 @@ struct SyncDatabaseTests {
         #expect(try await reopened.baselines(rootID: rootID) == ["file": baseline])
     }
 
+    @Test func reopeningCompletesPartiallyAppliedColumnGroups() async throws {
+        let root = try temporaryRoot()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let url = root.appending(path: "state.sqlite")
+        FileManager.default.createFile(atPath: url.path, contents: nil)
+        let raw = try RawSQLite(url: url)
+        try raw.execute("CREATE TABLE pending_operations (id TEXT PRIMARY KEY, root_id TEXT NOT NULL, remote_id TEXT NOT NULL, destination_path TEXT NOT NULL, stage_path TEXT NOT NULL, expected_local_kind TEXT NOT NULL DEFAULT 'unknown')")
+        try raw.execute("CREATE TABLE sync_scopes (root_id TEXT NOT NULL, course_id INTEGER NOT NULL, display_name TEXT NOT NULL, local_folder TEXT NOT NULL DEFAULT '', enabled INTEGER NOT NULL, auto_sync INTEGER NOT NULL DEFAULT 0, managed_directory INTEGER NOT NULL DEFAULT 0, PRIMARY KEY(root_id, course_id))")
+
+        let database = try SyncDatabase(url: url)
+        #expect(try raw.query("SELECT name FROM pragma_table_info('pending_operations')").contains("expected_local_sha256"))
+        #expect(try raw.query("SELECT name FROM pragma_table_info('pending_operations')").contains("remote_sha256"))
+        #expect(try raw.query("SELECT name FROM pragma_table_info('pending_operations')").contains("remote_revision"))
+        #expect(try raw.query("SELECT name FROM pragma_table_info('pending_operations')").contains("phase"))
+        #expect(try raw.query("SELECT name FROM pragma_table_info('sync_scopes')").contains("directory_device"))
+        #expect(try raw.query("SELECT name FROM pragma_table_info('sync_scopes')").contains("directory_inode"))
+        #expect(try await database.pendingOperations(rootID: UUID()).isEmpty)
+        #expect(try await database.scopes(rootID: UUID()).isEmpty)
+    }
+
     @Test func reopeningClearsPartiallyAttributedModuleOwners() async throws {
         let root = try temporaryRoot()
         defer { try? FileManager.default.removeItem(at: root) }

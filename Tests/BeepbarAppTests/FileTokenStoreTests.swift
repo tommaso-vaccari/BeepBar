@@ -17,7 +17,7 @@ final class FileTokenStoreTests: XCTestCase {
     }
 
     override func tearDown() {
-        FileTokenStore.delete()
+        try? FileTokenStore.delete()
         if let directory = try? FileManager.default
             .url(for: .applicationSupportDirectory, in: .userDomainMask, appropriateFor: nil, create: false)
             .appendingPathComponent(testDirectoryName, isDirectory: true) {
@@ -54,10 +54,46 @@ final class FileTokenStoreTests: XCTestCase {
 
     func testDeleteRemovesStoredCredential() throws {
         try FileTokenStore.save("a-token")
-        FileTokenStore.delete()
+        try FileTokenStore.delete()
 
         XCTAssertFalse(try FileTokenStore.containsCredential())
         XCTAssertThrowsError(try FileTokenStore.load(.interactive))
+    }
+
+    func testDeleteRemovesOrphanedCredentialTempFile() throws {
+        try FileTokenStore.save("a-token")
+        let directory = try FileManager.default
+            .url(for: .applicationSupportDirectory, in: .userDomainMask, appropriateFor: nil, create: false)
+            .appendingPathComponent(testDirectoryName, isDirectory: true)
+        let tempURL = directory.appendingPathComponent(".credential-\(UUID().uuidString).tmp")
+        try Data("a-token".utf8).write(to: tempURL)
+
+        try FileTokenStore.delete()
+
+        XCTAssertFalse(FileManager.default.fileExists(atPath: tempURL.path))
+        XCTAssertFalse(try FileTokenStore.containsCredential())
+    }
+
+    func testDeleteReportsFailureAndKeepsStoredCredential() throws {
+        try FileTokenStore.save("a-token")
+
+        XCTAssertThrowsError(try FileTokenStore.delete(removeFile: { _ in throw CocoaError(.fileWriteNoPermission) }))
+
+        XCTAssertEqual(try FileTokenStore.load(.interactive), "a-token")
+    }
+
+    func testSignOutFailureKeepsAccountConnected() async throws {
+        try FileTokenStore.save("a-token")
+
+        await MainActor.run {
+            let controller = WeBeepAuthenticationController(testRootURL: FileManager.default.temporaryDirectory)
+            controller.signOut(removeFile: { _ in throw CocoaError(.fileWriteNoPermission) })
+
+            XCTAssertTrue(controller.hasStoredCredential)
+            XCTAssertEqual(controller.accountState, .connected)
+            if case .failed(.local) = controller.syncState {} else { XCTFail("Sign-out failure should be visible") }
+        }
+        XCTAssertEqual(try FileTokenStore.load(.interactive), "a-token")
     }
 
     func testSavedFileHasOwnerOnlyPermissions() throws {

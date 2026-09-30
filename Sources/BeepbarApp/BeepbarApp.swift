@@ -114,7 +114,7 @@ final class StatusItemController: NSObject, NSMenuDelegate {
     }
 
     @MainActor private static func setSymbol(_ symbol: String, on statusItem: NSStatusItem) {
-        let image = NSImage(systemSymbolName: symbol, accessibilityDescription: "Beepbar")
+        let image = NSImage(systemSymbolName: symbol, accessibilityDescription: "BeepBar")
         image?.isTemplate = true
         statusItem.button?.image = image
     }
@@ -197,7 +197,7 @@ final class StatusItemController: NSObject, NSMenuDelegate {
             // itself to the content's ideal size on every page switch.
             controller.sizingOptions = [.minSize]
             let window = NSWindow(contentViewController: controller)
-            window.title = "Beepbar"
+            window.title = "BeepBar"
             window.styleMask = [.titled, .closable, .miniaturizable, .resizable, .fullSizeContentView]
             window.titlebarAppearsTransparent = true
             window.titleVisibility = .hidden

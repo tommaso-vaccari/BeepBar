@@ -182,7 +182,7 @@ private struct SyncHeroCard: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 12) {
             HStack(alignment: .center, spacing: 14) {
-                BeepbarLogo(size: 44, badge: state.badgeSymbol, badgeTint: state.tint, accessibilityLabel: "Beepbar, \(state.title)")
+                BeepbarLogo(size: 44, badge: state.badgeSymbol, badgeTint: state.tint, accessibilityLabel: "BeepBar, \(state.title)")
                 VStack(alignment: .leading, spacing: 3) {
                     // The relative time ticks once a minute, and only while the window exists.
                     TimelineView(.everyMinute) { context in
@@ -218,7 +218,7 @@ private struct SyncHeroCard: View {
             Button(tr("Abbandona spostamento", "Abandon move"), role: .destructive) { authentication.abandonPendingModuleMoves() }
             Button(tr("Annulla", "Cancel"), role: .cancel) {}
         } message: {
-            Text(tr("Nessun file viene spostato né eliminato: Beepbar registra dove si trova ogni file e il modulo mantiene la cartella precedente.", "No files are moved or deleted: Beepbar records where each file is and the module keeps its previous folder."))
+            Text(tr("Nessun file viene spostato né eliminato: BeepBar registra dove si trova ogni file e il modulo mantiene la cartella precedente.", "No files are moved or deleted: BeepBar records where each file is and the module keeps its previous folder."))
         }
     }
 

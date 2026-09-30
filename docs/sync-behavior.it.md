@@ -138,4 +138,4 @@ Al primo sync dopo l'aggiornamento, i file che il professore aveva rimosso da Mo
 | **Attività** | Solo l'ultima sincronizzazione: nuovi, aggiornati, modifiche tue, non aggiornati, spostati, e i file modificati spostati su Moodle che ora aspettano in Conflitti **[PR #54]** |
 | **Conflitti** | Tutto ciò che aspetta una tua scelta, finché non scegli: conflitti e **[PR #54]** file spostati o rimossi su Moodle |
 | **Menu bar** | Lo stato dell'ultimo sync. Nessun testo nuovo per spostamenti e rimozioni |
-| **Notifiche** | Come oggi (nuovi materiali, conflitti). Nessuna notifica nuova per spostamenti e rimozioni |
+| **Notifiche** | Come oggi (nuovi materiali, conflitti). Nessuna notifica nuova per spostamenti e rimozioni. **[PR #67]** Si possono spegnere in Impostazioni: da spente non ne parte nessuna, e un conflitto ancora aperto viene notificato quando si riaccendono. Un clic apre Conflitti, Attività o Corsi |

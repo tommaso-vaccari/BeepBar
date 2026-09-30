@@ -15,14 +15,21 @@ struct SettingsPage: View {
             folderSection
             startupSection
             automaticSection
+            notificationsSection
             updatesSection
         }
         .formStyle(.grouped)
         // On the Form, not on the startup Section: modifiers on a Section inside a Form can be
         // applied to each of its rows, which would start one refresh per row.
-        .task { await launchAtLogin.refresh() }
+        .task {
+            await launchAtLogin.refresh()
+            await authentication.refreshNotificationAuthorization()
+        }
         .onReceive(NotificationCenter.default.publisher(for: NSApplication.didBecomeActiveNotification)) { _ in
-            Task { await launchAtLogin.refresh() }
+            Task {
+                await launchAtLogin.refresh()
+                await authentication.refreshNotificationAuthorization()
+            }
         }
         .confirmationDialog(tr("Disconnettere l'account \(authentication.selectedSite.platformName)?", "Disconnect the \(authentication.selectedSite.platformName) account?"), isPresented: $showSignOutConfirmation, titleVisibility: .visible) {
             Button(tr("Disconnetti", "Disconnect"), role: .destructive) { authentication.signOut() }
@@ -191,6 +198,45 @@ struct SettingsPage: View {
             Text(tr("Tutti i corsi selezionati vengono controllati. Conflitti e modifiche locali non vengono mai sovrascritti automaticamente.", "All selected courses are checked. Conflicts and local changes are never overwritten automatically."))
                 .font(.caption)
                 .foregroundStyle(.secondary)
+        }
+    }
+
+    // MARK: Notifications
+
+    /// "Notifiche" (#64). The switch is BeepBar's own; macOS's permission is separate and can only
+    /// be changed in System Settings, so when macOS blocks them the footer says so and links there.
+    private var notificationsSection: some View {
+        Section {
+            Toggle(tr("Notifiche", "Notifications"), isOn: Binding(
+                get: { authentication.notificationsEnabled },
+                set: { enabled in Task { await authentication.setNotifications(enabled: enabled) } }
+            ))
+        } header: {
+            Text(tr("Notifiche", "Notifications"))
+        } footer: {
+            notificationsFooter
+                .font(.caption)
+                .foregroundStyle(.secondary)
+        }
+    }
+
+    @ViewBuilder private var notificationsFooter: some View {
+        if authentication.notificationsEnabled && authentication.notificationAuthorization == .denied {
+            VStack(alignment: .leading, spacing: 6) {
+                Text(tr("macOS blocca le notifiche di BeepBar. Puoi consentirle in Impostazioni di Sistema.", "macOS is blocking BeepBar's notifications. You can allow them in System Settings."))
+                Button(tr("Apri Impostazioni di Sistema…", "Open System Settings…")) { Self.openNotificationSettings() }
+                    .buttonStyle(.link)
+            }
+        } else {
+            Text(tr("Nuovi materiali, conflitti da risolvere e problemi di sincronizzazione. Con le notifiche spente, l'icona e le pagine di BeepBar restano aggiornate.", "New materials, conflicts to resolve and sync problems. With notifications off, BeepBar's icon and pages stay up to date."))
+        }
+    }
+
+    /// BeepBar's own page in System Settings → Notifications.
+    private static func openNotificationSettings() {
+        let bundleID = Bundle.main.bundleIdentifier ?? "io.github.tvaccari.beepbar"
+        if let url = URL(string: "x-apple.systempreferences:com.apple.Notifications-Settings.extension?id=\(bundleID)") {
+            NSWorkspace.shared.open(url)
         }
     }
 

@@ -1,6 +1,7 @@
 import AppKit
 import BeepbarCore
 import SwiftUI
+import UserNotifications
 import os
 
 enum BeepbarLog {
@@ -31,6 +32,16 @@ struct BeepbarApp: App {
     // removes the race entirely.
     let authentication = WeBeepAuthenticationController()
     private var statusItemController: StatusItemController?
+    /// Kept here because `UNUserNotificationCenter.delegate` is weak.
+    private lazy var notificationResponder = NotificationResponder { [weak self] destination in
+        guard let self else { return }
+        ConfigurationWindowController.shared.show(self.authentication, page: ShellPage(destination))
+    }
+
+    /// Set before launch finishes so a click on a notification that launched BeepBar is delivered.
+    func applicationWillFinishLaunching(_ notification: Notification) {
+        UNUserNotificationCenter.current().delegate = notificationResponder
+    }
     private var terminationPending = false
 
     func applicationDidFinishLaunching(_ notification: Notification) {

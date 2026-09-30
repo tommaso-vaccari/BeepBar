@@ -8,6 +8,7 @@
 
 ### Fixed
 
+- If pending choices cannot be read, Beepbar keeps the last displayed lists and reports an error instead of hiding them and reporting a successful synchronization.
 - Cancelling during the final checks no longer shows a completed result afterward. Once a run is complete, Cancel can no longer replace the completed or failed result with “Ready”.
 - Refreshing the course list no longer overwrites a course selection that is still being saved, and course switches stay disabled until the refresh ends.
 - An interrupted database upgrade no longer leaves synchronization unable to start on later launches; Beepbar completes the remaining schema changes when reopened.

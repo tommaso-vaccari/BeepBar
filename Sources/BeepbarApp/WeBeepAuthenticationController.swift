@@ -379,6 +379,7 @@ struct MenuBarSnapshot: Sendable {
     private var scheduledConfiguration: BackgroundScheduleConfiguration?
 #if DEBUG
     private var beforeReconciliationStateForTesting: (@MainActor () async -> Void)?
+    private var beforePendingChoicesForTesting: (@MainActor () async -> Void)?
     private var testDefaults: UserDefaults?
     private var beforeScopeRestoreForTesting: (@MainActor () -> Void)?
 #endif
@@ -530,8 +531,8 @@ struct MenuBarSnapshot: Sendable {
         beforeScopeRestoreForTesting = action
     }
 
-    func restoreScopesForTesting(_ courses: [RemoteCourseSummary]) async {
-        await restoreScopes(for: courses)
+    func restoreScopesForTesting(_ courses: [RemoteCourseSummary]) async throws {
+        try await restoreScopes(for: courses)
     }
 
     func setBeforeNotificationForTesting(_ action: @escaping @MainActor () async -> Void) {
@@ -544,6 +545,25 @@ struct MenuBarSnapshot: Sendable {
 
     func setBeforeReconciliationStateForTesting(_ action: @escaping @MainActor () async -> Void) {
         beforeReconciliationStateForTesting = action
+    }
+
+    func runAutomaticSyncForTesting() async { _ = await runAutomaticSync() }
+
+    func setRootIDForTesting(_ id: UUID) { rootID = id }
+
+    func setDisconnectedForTesting() {
+        hasStoredCredential = false
+        accountState = .notConnected
+        setSyncState(.loginRequired)
+    }
+
+    func setBeforePendingChoicesForTesting(_ action: @escaping @MainActor () async -> Void) { beforePendingChoicesForTesting = action }
+
+    func reloadPendingChoicesForTesting() async { await reloadPendingChoices() }
+    func restorePersistedSyncStateForTesting() async { await restorePersistedSyncState() }
+    func lastSuccessfulTimestampForTesting() -> Double {
+        guard let rootID else { return 0 }
+        return operationDefaults.double(forKey: Self.lastSuccessfulReconciliationKey + rootID.uuidString)
     }
 
     func failSyncForTesting(_ operationID: UUID) async {
@@ -778,16 +798,25 @@ struct MenuBarSnapshot: Sendable {
         guard accountState != .expired else { setSyncState(.failed(.authenticationExpired)); return }
         guard hasStoredCredential else { setSyncState(.loginRequired); return }
         guard rootURL != nil, let rootID else { setSyncState(.needsFolder); return }
-        let open = (try? await database?.conflicts(rootID: rootID)) ?? []
-        conflicts = open
-        remoteChanges = (try? await database?.remoteChanges(rootID: rootID)) ?? []
+        let open: [ConflictRecord]
+        do {
+            let pending = try await loadPendingChoices()
+            guard self.rootID == rootID, hasStoredCredential, accountState != .expired, !isSyncActive else { return }
+            open = pending.conflicts
+            conflicts = open
+            remoteChanges = pending.changes
+        } catch {
+            guard self.rootID == rootID, hasStoredCredential, accountState != .expired, !isSyncActive else { return }
+            reportPendingChoicesReadFailure()
+            return
+        }
         if !open.isEmpty { setSyncState(.conflicts(open.count, nil)); return }
-        if let data = Self.defaults.data(forKey: Self.lastSuccessfulSummaryKey + rootID.uuidString),
+        if let data = operationDefaults.data(forKey: Self.lastSuccessfulSummaryKey + rootID.uuidString),
            let summary = try? JSONDecoder().decode(SyncCompletionSummary.self, from: data) {
             setSyncState(.synced(summary))
             return
         }
-        let timestamp = Self.defaults.double(forKey: Self.lastSuccessfulReconciliationKey + rootID.uuidString)
+        let timestamp = operationDefaults.double(forKey: Self.lastSuccessfulReconciliationKey + rootID.uuidString)
         let legacy = SyncCompletionSummary(completedAt: Date(timeIntervalSince1970: timestamp), added: 0, updated: 0, unchanged: 0, preservedLocal: 0, conflicts: 0, failures: 0)
         setSyncState(timestamp > 0 ? .synced(legacy) : .readyUnchecked)
     }
@@ -869,7 +898,7 @@ struct MenuBarSnapshot: Sendable {
                 guard report.unresolved.isEmpty else { throw SyncDatabaseError.execution }
                 rootURL = selectedURL; rootID = selectedID; recoveryBlocked = false; hasPendingModuleMoves = false
                 courseFolders = [:]; conflicts = []; remoteChanges = []
-                await restoreScopes(for: courses)
+                try await restoreScopes(for: courses)
                 Self.defaults.set(selectedURL.path, forKey: Self.rootKey)
                 Self.defaults.set(selectedID.uuidString, forKey: Self.rootIDKey)
                 await self.restorePersistedSyncState()
@@ -1079,15 +1108,38 @@ struct MenuBarSnapshot: Sendable {
 
     func refreshConflicts() {
         guard !isSyncActive else { return }
-        guard let database, let rootID else { conflicts = []; return }
-        Task { [weak self] in
-            guard let self else { return }
-            let found = (try? await database.conflicts(rootID: rootID)) ?? []
-            self.conflicts = found
-            self.remoteChanges = (try? await database.remoteChanges(rootID: rootID)) ?? []
-            if !found.isEmpty { self.setSyncState(.conflicts(found.count, nil)) }
-            else if case .conflicts = self.syncState { await self.restorePersistedSyncState() }
+        guard database != nil, rootID != nil else { return }
+        Task { [weak self] in await self?.reloadPendingChoices() }
+    }
+
+    private func reloadPendingChoices() async {
+        let expectedRootID = rootID
+        do {
+            let pending = try await loadPendingChoices()
+            guard rootID == expectedRootID, hasStoredCredential, accountState != .expired, !isSyncActive else { return }
+            conflicts = pending.conflicts
+            remoteChanges = pending.changes
+            if !conflicts.isEmpty { setSyncState(.conflicts(conflicts.count, nil)) }
+            else if case .conflicts = syncState { await restorePersistedSyncState() }
+        } catch {
+            guard rootID == expectedRootID, hasStoredCredential, accountState != .expired, !isSyncActive else { return }
+            reportPendingChoicesReadFailure()
         }
+    }
+
+    /// Both lists form one displayed snapshot: a failed second read must not hide either list.
+    private func loadPendingChoices() async throws -> (conflicts: [ConflictRecord], changes: [RemoteChange]) {
+        guard let database, let rootID else { throw SyncDatabaseError.open }
+        let open = try await database.conflicts(rootID: rootID)
+        let changes = try await database.remoteChanges(rootID: rootID)
+#if DEBUG
+        await beforePendingChoicesForTesting?()
+#endif
+        return (open, changes)
+    }
+
+    private func reportPendingChoicesReadFailure() {
+        setSyncState(.failed(.local(BilingualText("Impossibile leggere le scelte in sospeso. Riprova.", "Couldn't read pending choices. Try again."))))
     }
 
     func resolve(_ conflict: ConflictRecord, with resolution: ConflictResolution) {
@@ -1232,7 +1284,7 @@ struct MenuBarSnapshot: Sendable {
         let courses = try await fetchEnrolledCourses(token: token)
         // The account may have been disconnected while the list was loading.
         guard hasStoredCredential else { return }
-        await restoreScopes(for: courses)
+        try await restoreScopes(for: courses)
         self.courses = Self.orderedForDisplay(courses, enabledCourseIDs: enabledCourseIDs)
         accountState = .connected
         Self.defaults.removeObject(forKey: Self.credentialExpiredKey)
@@ -1374,13 +1426,13 @@ struct MenuBarSnapshot: Sendable {
             .appendingPathComponent("Beepbar", isDirectory: true)
     }
 
-    private func restoreScopes(for courses: [RemoteCourseSummary]) async {
+    private func restoreScopes(for courses: [RemoteCourseSummary]) async throws {
 #if DEBUG
         beforeScopeRestoreForTesting?()
 #endif
         await scopeWriteTask?.value
         guard let database, let rootID else { return }
-        guard let scopes = try? await database.scopes(rootID: rootID) else { return }
+        let scopes = try await database.scopes(rootID: rootID)
         let remoteIDs = Set(courses.map(\.id))
         let scopesByCourse = Dictionary(scopes.map { ($0.courseID, $0) }, uniquingKeysWith: { first, _ in first })
         let defaults = Self.defaultFolders(for: courses, saved: Dictionary(scopes.map { ($0.courseID, $0.localFolder) }, uniquingKeysWith: { first, _ in first }))
@@ -1560,10 +1612,10 @@ struct MenuBarSnapshot: Sendable {
         }
     }
 
-    private func finishReconciliation(progress: SyncProgress, operationID: UUID) async {
-        guard let database, let rootID else { return }
-        let open = (try? await database.conflicts(rootID: rootID)) ?? []
-        let changes = (try? await database.remoteChanges(rootID: rootID)) ?? []
+    private func finishReconciliation(progress: SyncProgress, operationID: UUID) async throws {
+        let pending = try await loadPendingChoices()
+        let open = pending.conflicts
+        let changes = pending.changes
 #if DEBUG
         await beforeReconciliationStateForTesting?()
 #endif
@@ -1645,7 +1697,16 @@ struct MenuBarSnapshot: Sendable {
         await scopeWriteTask?.value
         guard activeOperationID == operationID else { return .cancelled }
         // Nothing to check: leave the last result on screen instead of replacing it with "Pronto".
-        guard let automaticScopes = try? await database.scopes(rootID: rootID, enabledOnly: true), !automaticScopes.isEmpty else {
+        let automaticScopes: [SyncScope]
+        do { automaticScopes = try await database.scopes(rootID: rootID, enabledOnly: true) }
+        catch {
+            guard activeOperationID == operationID else { return .cancelled }
+            guard !Task.isCancelled else { cancelledSync(operationID); return .cancelled }
+            setSyncState(.failed(.local(BilingualText("Impossibile leggere i corsi selezionati. Riprova.", "Couldn't read selected courses. Try again."))))
+            endOperation(operationID)
+            return .finished
+        }
+        guard !automaticScopes.isEmpty else {
             guard activeOperationID == operationID else { return .cancelled }
             BeepbarLog.sync.notice("Automatic synchronization skipped reason=no-enabled-courses")
             endOperation(operationID)
@@ -1709,7 +1770,15 @@ struct MenuBarSnapshot: Sendable {
 
     private func completeSync(_ operationID: UUID, summary: SyncProgress, automatic: Bool) async {
         guard activeOperationID == operationID else { return }
-        await finishReconciliation(progress: summary, operationID: operationID)
+        do {
+            try await finishReconciliation(progress: summary, operationID: operationID)
+        } catch {
+            guard activeOperationID == operationID else { return }
+            if Task.isCancelled { cancelledSync(operationID); return }
+            reportPendingChoicesReadFailure()
+            endOperation(operationID)
+            return
+        }
         guard activeOperationID == operationID else { return }
         guard !Task.isCancelled else { cancelledSync(operationID); return }
         if summary.failures == 0 { notificationCoordinator.clearFailure() }

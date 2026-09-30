@@ -484,7 +484,7 @@ struct MenuBarSnapshot: Sendable {
                 BeepbarLog.lifecycle.notice("Bootstrap completed recoveryBlocked=\(result.recoveryBlocked, privacy: .public)")
             } catch {
                 BeepbarLog.lifecycle.error("Bootstrap failed errorType=\(String(reflecting: type(of: error)), privacy: .public)")
-                self?.setSyncState(.failed(.local(BilingualText("Impossibile preparare lo stato locale. Riapri Beepbar.", "Couldn't prepare the local state. Reopen Beepbar."))))
+                self?.setSyncState(.failed(.local(BilingualText("Impossibile preparare lo stato locale. Riapri BeepBar.", "Couldn't prepare the local state. Reopen BeepBar."))))
             }
         }
     }

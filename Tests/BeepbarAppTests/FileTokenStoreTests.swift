@@ -27,6 +27,16 @@ final class FileTokenStoreTests: XCTestCase {
         super.tearDown()
     }
 
+    /// The token store's default folder is the frozen Application Support folder (#56), the same
+    /// one the sync database uses. `originalDirectoryName` is captured before `setUp` redirects the
+    /// store, so it is the value real installs use. Guards against `directoryName` being given
+    /// its own literal, e.g. the new `BeepBar` spelling, which would sign every install out on a
+    /// case-sensitive volume while still passing on the default case-insensitive one.
+    func testDefaultDirectoryIsTheFrozenApplicationSupportFolder() {
+        XCTAssertEqual(originalDirectoryName, FileTokenStore.applicationSupportDirectoryName)
+        XCTAssertEqual(originalDirectoryName, "Beepbar")
+    }
+
     func testContainsCredentialIsFalseBeforeAnySave() throws {
         XCTAssertFalse(try FileTokenStore.containsCredential())
     }

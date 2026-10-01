@@ -363,8 +363,10 @@ struct MenuBarSnapshot: Sendable {
     private var database: SyncDatabase?
     /// Opens or reveals a file clicked in Attività; a fake in tests, so no test opens real apps.
     private let fileOpener: ActivityFileOpening
-    /// Attività items whose file wasn't where BeepBar put it when clicked; the row says so.
-    @Published private(set) var missingActivityItems: Set<String> = []
+    /// Attività items whose click found a problem, shown on their row. Cleared whenever the
+    /// displayed summary or the sync folder changes: remote ids repeat across syncs, and a file
+    /// downloaded again must not inherit the previous run's warning.
+    @Published private(set) var activityItemProblems: [String: ActivityItemProblem] = [:]
     private let operationGate = RootOperationGate()
     private var apiClient: WeBeepAPIClient
     // One downloader for the whole app lifetime: a per-run one would leave its URLSession and
@@ -819,7 +821,9 @@ struct MenuBarSnapshot: Sendable {
     }
 
     private func setSyncState(_ newState: AppSyncState) {
+        let previousSummary = lastSyncSummary
         syncState = newState
+        if lastSyncSummary != previousSummary { activityItemProblems = [:] }
         status = newState.detail
         if case .synced(let summary) = newState, let rootID {
             operationDefaults.set(summary.completedAt.timeIntervalSince1970, forKey: Self.lastSuccessfulReconciliationKey + rootID.uuidString)
@@ -934,6 +938,7 @@ struct MenuBarSnapshot: Sendable {
                 }
                 guard report.unresolved.isEmpty else { throw SyncDatabaseError.execution }
                 rootURL = selectedURL; rootID = selectedID; recoveryBlocked = false; hasPendingModuleMoves = false
+                activityItemProblems = [:]
                 courseFolders = [:]; conflicts = []; remoteChanges = []
                 try await restoreScopes(for: courses)
                 Self.defaults.set(selectedURL.path, forKey: Self.rootKey)
@@ -1003,28 +1008,33 @@ struct MenuBarSnapshot: Sendable {
     }
     /// A click on a file in Attività (`showInFinder` for the context menu's "Mostra nel Finder").
     /// The file is looked up by its remote id in the sync database now, not when the sync ran, so
-    /// a file a later sync moved still opens. A file that isn't there any more (the user moved,
-    /// renamed or deleted it) marks the row instead of opening anything; see `ActivityFilePolicy`
-    /// for the file types that are only ever shown in Finder.
+    /// a file a later sync moved still opens. What is at that path is checked by `FileStore`,
+    /// off the main actor and without following symbolic links; see `ActivityFilePolicy` for what
+    /// opens and what is only shown in Finder.
     func openActivityItem(id: String, name: String, showInFinder: Bool) async {
-        var trackedPath: RelativePath?
-        if let database, let rootID {
-            trackedPath = try? await database.baseline(rootID: rootID, remoteID: id)?.relativePath
+        // Captured together before any await, so a folder change during the lookup can't apply
+        // one folder's path to another.
+        guard let database, let rootID, let rootURL else { activityItemProblems[id] = .unavailable; return }
+        let action: ActivityFileAction
+        do {
+            let trackedPath = try await database.baseline(rootID: rootID, remoteID: id)?.relativePath
+            let fileState: OpenableFileState = if let trackedPath { try await FileStore(root: rootURL).openableFileState(trackedPath) } else { .missing }
+            action = ActivityFilePolicy.action(trackedPath: trackedPath, root: rootURL, fileState: fileState)
+        } catch {
+            guard self.rootID == rootID else { return }
+            activityItemProblems[id] = .unavailable
+            return
         }
-        guard let rootURL else { missingActivityItems.insert(id); return }
-        let isExecutableFile: (URL) -> Bool = { url in
-            var isDirectory: ObjCBool = false
-            return FileManager.default.fileExists(atPath: url.path, isDirectory: &isDirectory) && !isDirectory.boolValue && FileManager.default.isExecutableFile(atPath: url.path)
-        }
-        switch ActivityFilePolicy.action(trackedPath: trackedPath, root: rootURL, filename: name, fileExists: { FileManager.default.fileExists(atPath: $0.path) }, isExecutableFile: isExecutableFile) {
+        guard self.rootID == rootID else { return }
+        switch action {
         case .open(let url):
-            missingActivityItems.remove(id)
+            activityItemProblems[id] = nil
             if showInFinder { fileOpener.reveal(url) } else { fileOpener.open(url) }
         case .reveal(let url):
-            missingActivityItems.remove(id)
+            activityItemProblems[id] = nil
             fileOpener.reveal(url)
         case .missing:
-            missingActivityItems.insert(id)
+            activityItemProblems[id] = .missing
         }
     }
 

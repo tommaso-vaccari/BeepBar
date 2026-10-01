@@ -135,7 +135,7 @@ On the first sync after updating, the files the teacher removed from Moodle befo
 | Place | Contents |
 |---|---|
 | **Home** | A notice leading to Conflicts while something waits for your choice, including **[PR #54]** files moved or removed on Moodle |
-| **Activity** | The last sync only: new, updated, your changes, not updated, moved, and edited files moved on Moodle that now wait in Conflicts **[PR #54]**. **[PR #69]** A click opens a file where it is now, even after a later sync moved it; scripts and apps are only shown in Finder |
+| **Activity** | The last sync only: new, updated, your changes, not updated, moved, and edited files moved on Moodle that now wait in Conflicts **[PR #54]**. **[PR #69]** A click opens a file where it is now, even after a later sync moved it; the right-click menu also shows it in Finder. Only documents open directly; anything else (scripts, apps, disk images, unknown types) is only shown in Finder. A file that is no longer where BeepBar put it is reported on its row |
 | **Conflicts** | Everything waiting for your choice, until you choose: conflicts and **[PR #54]** files moved or removed on Moodle |
 | **Menu bar** | The status of the last sync. No new text for moves and removals |
 | **Notifications** | As today (new materials, conflicts). No new notifications for moves and removals. **[PR #67]** They can be turned off in Settings: while off none is sent, and a conflict still open may be notified at the next automatic sync after they are back on. A click opens Conflicts, Activity or Courses. They also appear while BeepBar is in front |

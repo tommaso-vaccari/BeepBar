@@ -99,6 +99,34 @@ public actor FileStore {
         return true
     }
 
+    /// What sits at a tracked path, for opening it from Attività: nothing, something that isn't a
+    /// plain file reached directly (a folder, or a symbolic link at the file or in any folder on
+    /// the way, since every component is opened with `O_NOFOLLOW`), or a regular file and whether
+    /// it carries an execute permission. Never follows a link out of the sync folder.
+    public func openableFileState(_ path: RelativePath) throws -> OpenableFileState {
+        let parentAndName: (Int32, String)
+        do {
+            parentAndName = try parentDirectory(for: path, create: false)
+        } catch where errno == ENOENT {
+            return .missing
+        } catch where errno == ELOOP || errno == ENOTDIR {
+            return .notARegularFile
+        }
+        let (parent, name) = parentAndName
+        defer { close(parent) }
+        let fd = openat(parent, name, O_RDONLY | O_CLOEXEC | O_NOFOLLOW | O_NONBLOCK)
+        if fd < 0 {
+            if errno == ENOENT { return .missing }
+            if errno == ELOOP { return .notARegularFile }
+            throw fileStoreError()
+        }
+        defer { close(fd) }
+        var metadata = stat()
+        guard fstat(fd, &metadata) == 0 else { throw fileStoreError() }
+        guard (metadata.st_mode & S_IFMT) == S_IFREG else { return .notARegularFile }
+        return .regular(executable: metadata.st_mode & 0o111 != 0)
+    }
+
     public func snapshotRegularFile(_ path: RelativePath) throws -> FileSnapshotState {
         try requireMovablePath(path)
         let (parent, name): (Int32, String)

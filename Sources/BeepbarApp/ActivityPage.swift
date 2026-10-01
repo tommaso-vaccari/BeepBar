@@ -14,6 +14,21 @@ struct WorkspaceFileOpener: ActivityFileOpening {
     func reveal(_ url: URL) { Finder.reveal(url) }
 }
 
+/// Why a click on an Attività file did nothing, shown on its row.
+enum ActivityItemProblem: Equatable {
+    /// Not where BeepBar put it (moved, renamed, deleted, or replaced by a folder or a link).
+    case missing
+    /// BeepBar couldn't check: the sync folder or its database couldn't be read.
+    case unavailable
+
+    var message: String {
+        switch self {
+        case .missing: tr("Non è più dove BeepBar l’ha messo: forse l’hai spostato, rinominato o eliminato.", "It's no longer where BeepBar put it: you may have moved, renamed or deleted it.")
+        case .unavailable: tr("BeepBar non è riuscita a controllare questo file. Riprova tra poco.", "BeepBar couldn't check this file. Try again shortly.")
+        }
+    }
+}
+
 /// Opens nothing: the default for test controllers.
 struct InertFileOpener: ActivityFileOpening {
     func open(_ url: URL) {}
@@ -47,7 +62,7 @@ struct ActivityPage: View {
                                     course: course,
                                     platformName: authentication.selectedSite.platformName,
                                     folderURL: authentication.rootURL?.appending(path: course.courseFolder, directoryHint: .isDirectory),
-                                    missingItems: authentication.missingActivityItems,
+                                    problems: authentication.activityItemProblems,
                                     openItem: { id, name, showInFinder in
                                         Task { await authentication.openActivityItem(id: id, name: name, showInFinder: showInFinder) }
                                     }
@@ -72,7 +87,7 @@ private struct CourseActivityCard: View {
     let course: CourseSyncCount
     let platformName: String
     let folderURL: URL?
-    let missingItems: Set<String>
+    let problems: [String: ActivityItemProblem]
     /// (remote id, name, show in Finder instead of opening).
     let openItem: (String, String, Bool) -> Void
     @State private var isExpanded = false
@@ -162,25 +177,28 @@ private struct CourseActivityCard: View {
     }
 
     /// A file that arrived or moved: a click opens it, the context menu also shows it in Finder.
-    /// Failed items aren't rows like this: there is no file to open.
+    /// Failed items aren't rows like this: there is no file to open. Labels follow what a click
+    /// will actually do: a file that is only shown in Finder never says "Apri".
     private func fileRow<Title: View, Icon: View>(id: String, name: String, @ViewBuilder title: () -> Title, @ViewBuilder icon: () -> Icon) -> some View {
-        VStack(alignment: .leading, spacing: 2) {
+        let opens = ActivityFilePolicy.opensDirectly(filename: name)
+        return VStack(alignment: .leading, spacing: 2) {
             Button { openItem(id, name, false) } label: {
                 Label { title() } icon: { icon() }
                     .contentShape(Rectangle())
             }
             .buttonStyle(.plain)
-            .help(tr("Apri “\(name)”", "Open “\(name)”"))
-            .accessibilityHint(tr("Apre il file", "Opens the file"))
+            .help(opens ? tr("Apri “\(name)”", "Open “\(name)”") : tr("Mostra “\(name)” nel Finder", "Show “\(name)” in Finder"))
+            .accessibilityHint(opens ? tr("Apre il file", "Opens the file") : tr("Mostra il file nel Finder", "Shows the file in Finder"))
             .contextMenu {
-                Button(tr("Apri", "Open")) { openItem(id, name, false) }
+                if opens { Button(tr("Apri", "Open")) { openItem(id, name, false) } }
                 Button(tr("Mostra nel Finder", "Show in Finder")) { openItem(id, name, true) }
             }
-            if missingItems.contains(id) {
-                Text(tr("Non è più dove BeepBar l’ha messo: forse l’hai spostato, rinominato o eliminato.", "It's no longer where BeepBar put it: you may have moved, renamed or deleted it."))
+            if let problem = problems[id] {
+                Text(problem.message)
                     .font(.caption)
                     .foregroundStyle(.orange)
                     .padding(.leading, 28)
+                    .onAppear { AccessibilityNotification.Announcement(problem.message).post() }
             }
         }
     }

@@ -1,4 +1,5 @@
 import Foundation
+import CryptoKit
 import Testing
 import SQLite3
 @testable import BeepbarCore
@@ -298,4 +299,119 @@ extension SyncFinalizationTests {
         await completion.value
         #expect(await center.sent == [.conflicts])
     }
+}
+
+/// Exercises actual resolver refusals and filesystem failures, rather than just their copy.
+struct ConflictChoiceFeedbackTests {
+    @Test(arguments: ["source-changed", "twin-changed", "io-error"]) @MainActor
+    func remoteRefusalIsVisibleAndSuccessfulChoiceClearsIt(_ failure: String) async throws {
+        let fixture = try await ChoiceFixture()
+        defer { fixture.remove() }
+        try fixture.write("mine", path: "Course/old.txt")
+        try fixture.write("remote", path: "Course/new.txt")
+        let oldHash = try await fixture.hash("Course/old.txt")
+        let newHash = try await fixture.hash("Course/new.txt")
+        try await fixture.database.upsertBaseline(rootID: fixture.rootID, baseline: Baseline(remoteID: "old", relativePath: try RelativePath("Course/old.txt"), sha256: "original", remoteRevision: "1", courseID: 1, moduleID: 1))
+        try await fixture.database.upsertBaseline(rootID: fixture.rootID, baseline: Baseline(remoteID: "new", relativePath: try RelativePath("Course/new.txt"), sha256: newHash, remoteRevision: "1", courseID: 1, moduleID: 1))
+        let change = RemoteChange(rootID: fixture.rootID, courseID: 1, remoteID: "old", kind: .reuploaded, relativePath: try RelativePath("Course/old.txt"), targetPath: try RelativePath("Course/new.txt"), newRemoteID: "new", localSHA256: oldHash, isLocallyModified: true)
+        _ = try await fixture.database.reconcileRemoteChanges(rootID: fixture.rootID, courseIDs: [1], desired: [change])
+        let controller = fixture.controller()
+        if failure == "source-changed" { try fixture.write("edited again", path: "Course/old.txt") }
+        if failure == "twin-changed" { try fixture.write("edited new copy", path: "Course/new.txt") }
+        if failure == "io-error" {
+            // A blocked parent is a real traversal failure, not an injected result.
+            try FileManager.default.removeItem(at: fixture.root.appending(path: "Course"))
+            try fixture.write("blocked", path: "Course")
+        }
+        controller.resolve(change, with: .replaceNewCopy)
+        try await waitForChoice(controller)
+        let feedback = try #require(controller.conflictChoiceFeedback)
+        if failure == "source-changed" { #expect(feedback.english.contains("changed in the meantime")) }
+        else if failure == "twin-changed" { #expect(feedback.english.contains("was edited")) }
+        else { #expect(feedback.english.contains("Couldn't carry out")) }
+        #expect(!feedback.italian.isEmpty)
+        #expect(try await fixture.database.remoteChange(rootID: fixture.rootID, id: change.id) != nil)
+        controller.resolve(change, with: .keepBoth)
+        try await waitForChoice(controller)
+        #expect(controller.conflictChoiceFeedback == nil)
+        #expect(try await fixture.database.remoteChange(rootID: fixture.rootID, id: change.id) == nil)
+    }
+
+    @Test(arguments: [false, true]) @MainActor
+    func ordinaryConflictRefusalAndFailureAreVisible(_ missingArtifact: Bool) async throws {
+        let fixture = try await ChoiceFixture()
+        defer { fixture.remove() }
+        try fixture.write("mine", path: "Course/file.txt")
+        let shownHash = try await fixture.hash("Course/file.txt")
+        try fixture.write("remote", path: ".beepbar/conflicts/fixture/remote.txt")
+        let remoteHash = try await fixture.hash(".beepbar/conflicts/fixture/remote.txt")
+        let conflict = ConflictRecord(id: UUID(), rootID: fixture.rootID, remoteID: "file", relativePath: try RelativePath("Course/file.txt"), incomingPath: try RelativePath(internal: ".beepbar/conflicts/fixture/remote.txt"), baseSHA256: "original", localSHA256: shownHash, remoteSHA256: remoteHash, remoteRevision: "2", detectedAt: .now, status: .open)
+        try await fixture.database.insertConflict(conflict)
+        if missingArtifact { try FileManager.default.removeItem(at: fixture.root.appending(path: ".beepbar/conflicts/fixture/remote.txt")) }
+        else { try fixture.write("edited again", path: "Course/file.txt") }
+        let controller = fixture.controller()
+        controller.resolve(conflict, with: .useRemote)
+        try await waitForChoice(controller)
+        let feedback = try #require(controller.conflictChoiceFeedback)
+        #expect(feedback.english.contains(missingArtifact ? "Couldn't resolve" : "changed in the meantime"))
+        #expect(try String(contentsOf: fixture.root.appending(path: "Course/file.txt"), encoding: .utf8) == (missingArtifact ? "mine" : "edited again"))
+        // The next successful choice clears the reason, even if the first conflict was superseded.
+        let pending = try #require(try await fixture.database.conflicts(rootID: fixture.rootID).first)
+        controller.resolve(pending, with: .keepLocal)
+        try await waitForChoice(controller)
+        #expect(controller.conflictChoiceFeedback == nil)
+    }
+
+    @Test(arguments: [false, true]) @MainActor
+    func changedRootOrDisconnectClearsChoiceFeedback(_ disconnect: Bool) async throws {
+        let fixture = try await ChoiceFixture()
+        defer { fixture.remove() }
+        let conflict = ConflictRecord(id: UUID(), rootID: fixture.rootID, remoteID: "missing", relativePath: try RelativePath("Course/missing.txt"), incomingPath: try RelativePath(internal: ".beepbar/conflicts/missing.txt"), baseSHA256: "base", localSHA256: "local", remoteSHA256: "remote", remoteRevision: "2", detectedAt: .now, status: .open)
+        try await fixture.database.insertConflict(conflict)
+        let controller = fixture.controller()
+        controller.resolve(conflict, with: .useRemote)
+        try await waitForChoice(controller)
+        #expect(controller.conflictChoiceFeedback != nil)
+        if disconnect { controller.setDisconnectedForTesting() }
+        else { controller.setRootIDForTesting(UUID()) }
+        #expect(controller.conflictChoiceFeedback == nil)
+    }
+
+    @MainActor private func waitForChoice(_ controller: WeBeepAuthenticationController) async throws {
+        let deadline = ContinuousClock.now + .seconds(5)
+        while controller.resolvingConflictID != nil || controller.resolvingRemoteChangeID != nil {
+            guard ContinuousClock.now < deadline else { throw CocoaError(.userCancelled) }
+            await Task.yield()
+        }
+    }
+}
+
+private struct ChoiceFixture {
+    let root: URL
+    let database: SyncDatabase
+    let rootID = UUID()
+
+    init() async throws {
+        root = FileManager.default.temporaryDirectory.appending(path: UUID().uuidString)
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        database = try SyncDatabase(url: root.appending(path: "state.sqlite"))
+        try await database.registerRoot(id: rootID, canonicalPath: root.path)
+    }
+
+    func write(_ value: String, path: String) throws {
+        let url = root.appending(path: path)
+        try FileManager.default.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
+        try Data(value.utf8).write(to: url)
+    }
+
+    func hash(_ path: String) async throws -> String {
+        let data = try Data(contentsOf: root.appending(path: path))
+        return SHA256.hash(data: data).map { String(format: "%02x", $0) }.joined()
+    }
+
+    @MainActor func controller() -> WeBeepAuthenticationController {
+        WeBeepAuthenticationController(testRootURL: root, database: database, rootID: rootID)
+    }
+
+    func remove() { try? FileManager.default.removeItem(at: root) }
 }

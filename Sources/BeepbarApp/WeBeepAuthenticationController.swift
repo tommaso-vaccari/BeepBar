@@ -194,23 +194,27 @@ struct SyncCompletionSummary: Codable, Equatable {
 enum SyncCopy {
     /// What happened after a choice about a file Moodle moved or removed.
     static func remoteChangeStatus(_ outcome: RemoteChangeOutcome, action: RemoteChangeAction) -> String {
+        remoteChangeFeedback(outcome, action: action).text
+    }
+
+    static func remoteChangeFeedback(_ outcome: RemoteChangeOutcome, action: RemoteChangeAction) -> BilingualText {
         switch outcome {
         case .done:
             switch action {
-            case .moveMine: tr("File spostato nella nuova cartella.", "File moved to the new folder.")
-            case .leaveHere: tr("Il file resta dov’è e continua a essere sincronizzato lì.", "The file stays where it is and keeps syncing there.")
-            case .keep, .keepBoth: tr("Il file resta sul Mac ed esce dalla sincronizzazione.", "The file stays on your Mac and is no longer synced.")
-            case .trash: tr("File spostato nel Cestino.", "File moved to the Trash.")
-            case .replaceNewCopy: tr("La tua versione ha preso il posto della copia nuova, che è nel Cestino.", "Your version took the new copy’s place; the new copy is in the Trash.")
+            case .moveMine: BilingualText("File spostato nella nuova cartella.", "File moved to the new folder.")
+            case .leaveHere: BilingualText("Il file resta dov’è e continua a essere sincronizzato lì.", "The file stays where it is and keeps syncing there.")
+            case .keep, .keepBoth: BilingualText("Il file resta sul Mac ed esce dalla sincronizzazione.", "The file stays on your Mac and is no longer synced.")
+            case .trash: BilingualText("File spostato nel Cestino.", "File moved to the Trash.")
+            case .replaceNewCopy: BilingualText("La tua versione ha preso il posto della copia nuova, che è nel Cestino.", "Your version took the new copy’s place; the new copy is in the Trash.")
             }
         case .fileChanged:
-            tr("Il file è cambiato nel frattempo: non è stato toccato. Controlla e scegli di nuovo.", "The file changed in the meantime and was not touched. Check it and choose again.")
+            BilingualText("Il file è cambiato nel frattempo: non è stato toccato. Controlla e scegli di nuovo.", "The file changed in the meantime and was not touched. Check it and choose again.")
         case .gone:
-            tr("Il file non è più dove era: non c’è più niente da scegliere.", "The file is no longer where it was: there is nothing left to choose.")
+            BilingualText("Il file non è più dove era: non c’è più niente da scegliere.", "The file is no longer where it was: there is nothing left to choose.")
         case .newCopyUnavailable:
-            tr("La copia nuova non è disponibile. Riprova la sincronizzazione prima di spostare la tua nel Cestino.", "The new copy is unavailable. Retry synchronization before moving yours to the Trash.")
+            BilingualText("La copia nuova non è disponibile. Riprova la sincronizzazione prima di spostare la tua nel Cestino.", "The new copy is unavailable. Retry synchronization before moving yours to the Trash.")
         case .newCopyNotReplaceable:
-            tr("La copia nuova non è ancora scaricata o è stata modificata: non è stata sostituita.", "The new copy isn’t downloaded yet or was edited, so it wasn’t replaced.")
+            BilingualText("La copia nuova non è ancora scaricata o è stata modificata: non è stata sostituita.", "The new copy isn’t downloaded yet or was edited, so it wasn’t replaced.")
         }
     }
 
@@ -313,8 +317,13 @@ struct MenuBarSnapshot: Sendable {
         didSet { defaultCourseFolders = Self.defaultFolders(for: courses, saved: courseFolders) }
     }
     @Published private(set) var hasStoredCredential: Bool {
-        didSet { refreshMenuBarSnapshot() }
+        didSet {
+            if !hasStoredCredential { conflictChoiceFeedback = nil }
+            refreshMenuBarSnapshot()
+        }
     }
+    /// Refused or failed choices stay visible on the Conflicts page until the next choice.
+    @Published private(set) var conflictChoiceFeedback: BilingualText?
     @Published private(set) var status = tr("Avvio BeepBar…", "Starting BeepBar…")
     @Published private(set) var syncState: AppSyncState = .starting {
         didSet { notificationGeneration += 1; refreshMenuBarSnapshot() }
@@ -393,7 +402,9 @@ struct MenuBarSnapshot: Sendable {
     /// earlier result once a new run or account state has replaced it.
     private var notificationGeneration = 0
     private var automaticOutcome: AutomaticSyncOutcome = .finished
-    private var rootID: UUID?
+    private var rootID: UUID? {
+        didSet { if rootID != oldValue { conflictChoiceFeedback = nil } }
+    }
     private var scheduledConfiguration: BackgroundScheduleConfiguration?
 #if DEBUG
     private var beforeReconciliationStateForTesting: (@MainActor () async -> Void)?
@@ -1290,7 +1301,8 @@ struct MenuBarSnapshot: Sendable {
     }
 
     func resolve(_ conflict: ConflictRecord, with resolution: ConflictResolution) {
-        guard resolvingConflictID == nil, let rootURL, let database, !recoveryBlocked, !isSyncActive else { return }
+        guard resolvingConflictID == nil, resolvingRemoteChangeID == nil, let rootURL, let rootID, let database, !recoveryBlocked, !isSyncActive else { return }
+        conflictChoiceFeedback = nil
         resolvingConflictID = conflict.id
         Task { [weak self] in
             defer { self?.resolvingConflictID = nil }
@@ -1304,7 +1316,7 @@ struct MenuBarSnapshot: Sendable {
                 case .useRemote:
                     let result = try await resolver.useRemote(id: conflict.id)
                     guard result.isInstalled else {
-                        self.status = tr("Il file locale è cambiato nel frattempo: conflitto lasciato aperto.", "The local file changed in the meantime: the conflict was left open.")
+                        self.reportConflictChoiceFeedback(BilingualText("Il file locale è cambiato nel frattempo: conflitto lasciato aperto.", "The local file changed in the meantime: the conflict was left open."), rootID: rootID)
                         self.refreshConflicts()
                         return
                     }
@@ -1312,7 +1324,7 @@ struct MenuBarSnapshot: Sendable {
                 }
                 self.refreshConflicts()
             } catch {
-                self?.status = tr("Impossibile risolvere il conflitto: nessun file locale è stato scartato.", "Couldn't resolve the conflict: no local file was discarded.")
+                self?.reportConflictChoiceFeedback(BilingualText("Impossibile risolvere il conflitto: nessun file locale è stato scartato.", "Couldn't resolve the conflict: no local file was discarded."), rootID: rootID)
                 self?.refreshConflicts()
             }
         }
@@ -1322,6 +1334,7 @@ struct MenuBarSnapshot: Sendable {
     /// stale entry never moves or trashes anything (see `RemoteChangeResolver`).
     func resolve(_ change: RemoteChange, with action: RemoteChangeAction) {
         guard resolvingRemoteChangeID == nil, resolvingConflictID == nil, let rootURL, let rootID, let database, !recoveryBlocked, !isSyncActive else { return }
+        conflictChoiceFeedback = nil
         resolvingRemoteChangeID = change.id
         Task { [weak self] in
             defer { self?.resolvingRemoteChangeID = nil }
@@ -1330,11 +1343,20 @@ struct MenuBarSnapshot: Sendable {
                 let resolver = RemoteChangeResolver(database: database, fileStore: try FileStore(root: rootURL), gate: self.operationGate)
                 let outcome = try await resolver.perform(action, on: change.id, rootID: rootID)
                 self.status = SyncCopy.remoteChangeStatus(outcome, action: action)
+                switch outcome {
+                case .done, .gone: break
+                default: self.reportConflictChoiceFeedback(SyncCopy.remoteChangeFeedback(outcome, action: action), rootID: rootID)
+                }
             } catch {
-                self?.status = tr("Impossibile completare la scelta. Nessun file è stato sovrascritto o cancellato definitivamente.", "Couldn't carry out the choice. No file was overwritten or permanently deleted.")
+                self?.reportConflictChoiceFeedback(BilingualText("Impossibile completare la scelta. Nessun file è stato sovrascritto o cancellato definitivamente.", "Couldn't carry out the choice. No file was overwritten or permanently deleted."), rootID: rootID)
             }
             self?.refreshConflicts()
         }
+    }
+
+    private func reportConflictChoiceFeedback(_ feedback: BilingualText, rootID: UUID) {
+        guard self.rootID == rootID, hasStoredCredential else { return }
+        conflictChoiceFeedback = feedback
     }
 
     func startLogin() {

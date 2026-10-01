@@ -4,6 +4,16 @@
 
 ## 2026-10-01
 
+### Release highlights
+
+- Open downloaded documents directly from Activity.
+- Notifications take you to the relevant page and can be disabled in Settings.
+- BeepBar starts at login so automatic synchronization resumes after restarting.
+- Files moved or removed on WeBeep are handled more clearly, while protecting your edited copies.
+- More reliable synchronization, cancellation, sign-in and course selection.
+
+**After updating:** macOS may show a login-item notice. Your first sync may list previously removed materials in Conflicts; you decide what to keep or move to Trash.
+
 ### New
 
 - Files a teacher removes from WeBeep are no longer left behind without a word. They appear in Conflicts, under "Spostati o rimossi su WeBeep", where you choose "Tieni" or "Sposta nel Cestino"; BeepBar never deletes anything by itself. On the first sync after updating, files removed from WeBeep in the past that are still on your Mac show up there too, all at once.

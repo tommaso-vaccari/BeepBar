@@ -100,9 +100,11 @@ public actor FileStore {
     }
 
     /// What sits at a tracked path, for opening it from Attività: nothing, something that isn't a
-    /// plain file reached directly (a folder, or a symbolic link at the file or in any folder on
-    /// the way, since every component is opened with `O_NOFOLLOW`), or a regular file and whether
-    /// it carries an execute permission. Never follows a link out of the sync folder.
+    /// plain file reached directly (a folder, a FIFO, or a symbolic link at the file or in any
+    /// folder on the way: every folder is opened with `O_NOFOLLOW` and the file itself is only
+    /// `fstatat`ed with `AT_SYMLINK_NOFOLLOW`), a path BeepBar has no permission to look into, or
+    /// a regular file and whether it carries an execute permission. Never opens the file, so it
+    /// can't block on a FIFO or download an iCloud-evicted file just to look at it.
     public func openableFileState(_ path: RelativePath) throws -> OpenableFileState {
         let parentAndName: (Int32, String)
         do {
@@ -111,18 +113,19 @@ public actor FileStore {
             return .missing
         } catch where errno == ELOOP || errno == ENOTDIR {
             return .notARegularFile
+        } catch where errno == EACCES || errno == EPERM {
+            return .unreadable
         }
         let (parent, name) = parentAndName
         defer { close(parent) }
-        let fd = openat(parent, name, O_RDONLY | O_CLOEXEC | O_NOFOLLOW | O_NONBLOCK)
-        if fd < 0 {
-            if errno == ENOENT { return .missing }
-            if errno == ELOOP { return .notARegularFile }
-            throw fileStoreError()
-        }
-        defer { close(fd) }
         var metadata = stat()
-        guard fstat(fd, &metadata) == 0 else { throw fileStoreError() }
+        guard fstatat(parent, name, &metadata, AT_SYMLINK_NOFOLLOW) == 0 else {
+            switch errno {
+            case ENOENT: return .missing
+            case EACCES, EPERM: return .unreadable
+            default: throw fileStoreError()
+            }
+        }
         guard (metadata.st_mode & S_IFMT) == S_IFREG else { return .notARegularFile }
         return .regular(executable: metadata.st_mode & 0o111 != 0)
     }

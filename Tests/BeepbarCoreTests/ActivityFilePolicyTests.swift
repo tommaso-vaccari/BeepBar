@@ -9,20 +9,24 @@ struct ActivityFilePolicyTests {
 
     /// Documents open directly: PDF, office, iWork, OpenDocument, text, images, audio, video,
     /// zip, ebooks, whatever the case of the extension.
-    @Test(arguments: ["Slide 1.pdf", "Esercizi.DOCX", "vecchio.doc", "lab.pptx", "voti.xlsx", "tesi.odt", "relazione.pages", "dati.numbers", "talk.key", "note.txt", "appunti.md", "dati.csv", "testo.rtf", "foto.png", "scan.HEIC", "schema.svg", "lezione.mp4", "audio.m4a", "codice.zip", "libro.epub"])
+    @Test(arguments: ["Slide 1.pdf", "Esercizi.DOCX", "vecchio.doc", "lab.pptx", "voti.xlsx", "tesi.odt", "relazione.pages", "dati.numbers", "talk.key", "note.txt", "appunti.md", "dati.csv", "testo.rtf", "foto.png", "scan.HEIC", "grafico.tiff", "lezione.mp4", "audio.m4a", "codice.zip", "libro.epub"])
     func documentsOpenDirectly(filename: String) {
         #expect(ActivityFilePolicy.opensDirectly(filename: filename))
     }
 
-    /// Everything else is only shown in Finder. Covers the cases a denylist missed: `.term`
-    /// (a Terminal session that runs a command) and `.tcl` (opened by Wish, which runs it), plus
-    /// disk images, profiles, shortcuts, Java Web Start, macro office files, source code of any
-    /// language, TeX, unknown types, and names without an extension.
+    /// Everything else is only shown in Finder. Covers the cases reviews found: `.term` (a
+    /// Terminal session that runs a command), `.tcl` (opened by Wish, which runs it), `.svg` (a
+    /// browser runs its script), playlists (Music imports them), and types an installed app
+    /// declares as plain text or zip (`.lua`, `.dtx`, `.otm`); plus disk images, profiles,
+    /// shortcuts, Java Web Start, macro office files, source code, TeX, unknown types, and names
+    /// without an extension.
     @Test(arguments: [
         "setup.term", "esercizio.tcl", "avvia.command", "AVVIA.COMMAND", "setup.sh", "Tool.app", "install.pkg",
         "disco.dmg", "immagine.iso", "profilo.mobileconfig", "flusso.shortcut", "app.jnlp", "link.webloc",
         "script.scpt", "macro.docm", "macro.XLSM", "esercizio.py", "main.c", "Main.java", "tesi.tex",
         "pagina.html", "dati.json", "notebook.ipynb", "archivio.rar", "README", "file.sconosciuto",
+        "schema.svg", "schema.svgz", "lista.m3u", "lista.m3u8", "radio.pls", "script.lua", "pacchetto.dtx",
+        "modello.otm", "scena.dae",
     ])
     func everythingElseIsOnlyShownInFinder(filename: String) {
         #expect(!ActivityFilePolicy.opensDirectly(filename: filename))
@@ -41,6 +45,12 @@ struct ActivityFilePolicyTests {
         #expect(ActivityFilePolicy.action(trackedPath: nil, root: root, fileState: .regular(executable: false)) == .missing)
         #expect(ActivityFilePolicy.action(trackedPath: path, root: root, fileState: .missing) == .missing)
         #expect(ActivityFilePolicy.action(trackedPath: path, root: root, fileState: .notARegularFile) == .missing)
+    }
+
+    /// A path BeepBar may not look at is reported as such, not as moved or deleted.
+    @Test func anUnreadablePathIsReportedAsUnreadable() throws {
+        let path = try RelativePath("Analisi/x.pdf")
+        #expect(ActivityFilePolicy.action(trackedPath: path, root: root, fileState: .unreadable) == .unreadable)
     }
 
     /// BeepBar's own hidden folder is never opened from Attività, even if a path points there.

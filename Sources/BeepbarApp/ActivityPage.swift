@@ -8,9 +8,15 @@ import BeepbarCore
     func reveal(_ url: URL)
 }
 
-/// The real one: the file's default app, or Finder with the file selected.
+/// The real one: the file's default app, or Finder with the file selected. When no app can open
+/// the file (a `.pages` without Pages), it is shown in Finder instead of the click doing nothing.
 struct WorkspaceFileOpener: ActivityFileOpening {
-    func open(_ url: URL) { NSWorkspace.shared.open(url) }
+    func open(_ url: URL) {
+        NSWorkspace.shared.open(url, configuration: NSWorkspace.OpenConfiguration()) { _, error in
+            guard error != nil else { return }
+            Task { @MainActor in Finder.reveal(url) }
+        }
+    }
     func reveal(_ url: URL) { Finder.reveal(url) }
 }
 
@@ -18,12 +24,18 @@ struct WorkspaceFileOpener: ActivityFileOpening {
 enum ActivityItemProblem: Equatable {
     /// Not where BeepBar put it (moved, renamed, deleted, or replaced by a folder or a link).
     case missing
-    /// BeepBar couldn't check: the sync folder or its database couldn't be read.
+    /// macOS doesn't let BeepBar look at the file or a folder on the way.
+    case unreadable
+    /// The sync folder itself can't be reached (an unplugged disk, a moved folder).
+    case folderUnavailable
+    /// The sync database couldn't be read; this one can be temporary.
     case unavailable
 
     var message: String {
         switch self {
         case .missing: tr("Non è più dove BeepBar l’ha messo: forse l’hai spostato, rinominato o eliminato.", "It's no longer where BeepBar put it: you may have moved, renamed or deleted it.")
+        case .unreadable: tr("BeepBar non ha il permesso di leggere questo file o la sua cartella.", "BeepBar isn't allowed to read this file or its folder.")
+        case .folderUnavailable: tr("La cartella dei materiali non è raggiungibile: forse è su un disco scollegato o è stata spostata.", "The materials folder can't be reached: it may be on a disconnected disk or have been moved.")
         case .unavailable: tr("BeepBar non è riuscita a controllare questo file. Riprova tra poco.", "BeepBar couldn't check this file. Try again shortly.")
         }
     }
@@ -198,7 +210,6 @@ private struct CourseActivityCard: View {
                     .font(.caption)
                     .foregroundStyle(.orange)
                     .padding(.leading, 28)
-                    .onAppear { AccessibilityNotification.Announcement(problem.message).post() }
             }
         }
     }

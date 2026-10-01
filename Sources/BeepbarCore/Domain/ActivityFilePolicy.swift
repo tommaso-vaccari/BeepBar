@@ -6,6 +6,8 @@ public enum OpenableFileState: Sendable, Equatable {
     case missing
     /// A folder, or a symbolic link at the file or in a folder on the way: not what BeepBar wrote.
     case notARegularFile
+    /// BeepBar has no permission to look at the file or a folder on the way.
+    case unreadable
     case regular(executable: Bool)
 }
 
@@ -18,6 +20,8 @@ public enum ActivityFileAction: Sendable, Equatable {
     /// BeepBar no longer tracks the file, or what is at its path isn't the file BeepBar wrote
     /// (moved, renamed, deleted, or replaced by a folder or a link): say so, open nothing.
     case missing
+    /// BeepBar isn't allowed to look at it: say so, open nothing.
+    case unreadable
 }
 
 /// Decisions behind opening a file from Attività (#69). The file is found by its remote id at
@@ -36,35 +40,45 @@ public enum ActivityFilePolicy {
         switch fileState {
         case .missing, .notARegularFile:
             return .missing
+        case .unreadable:
+            return .unreadable
         case .regular(let executable):
             guard !executable, opensDirectly(filename: trackedPath.components.last ?? "") else { return .reveal(url) }
             return .open(url)
         }
     }
 
-    /// Only documents open directly: PDF, images, audio and video, office, iWork and OpenDocument
-    /// files, plain text, and zip archives (opening one only extracts it). Anything else is shown
-    /// in Finder, where the user decides: apps, installers, disk images, scripts in any language,
-    /// Terminal session files (`.term`, `.terminal`), configuration profiles, shortcuts, links,
-    /// macro-enabled office files, and any type macOS doesn't know.
+    /// Only documents open directly: PDF, images, audio and video, presentations, spreadsheets,
+    /// ebooks, Word, OpenDocument and Pages files, RTF, plain text, Markdown, CSV/TSV and zip
+    /// archives (opening one only extracts it). Anything else is shown in Finder, where the user
+    /// decides: apps, installers, disk images, scripts and source code in any language, web
+    /// pages and XML (an SVG can carry script a browser would run), Terminal session files,
+    /// playlists, configuration profiles, shortcuts, links, macro-enabled Office formats, TeX,
+    /// and any type macOS doesn't know. Legacy Office files (`.doc`, `.xls`, `.ppt`) can hold
+    /// macros too: they open, relying on Office's own prompt before any macro runs.
     public static func opensDirectly(filename: String) -> Bool {
         let fileExtension = (filename as NSString).pathExtension.lowercased()
         guard !fileExtension.isEmpty, !excludedExtensions.contains(fileExtension) else { return false }
         guard let type = UTType(filenameExtension: fileExtension), !type.isDynamic else { return false }
         guard !runnableTypes.contains(where: { type.conforms(to: $0) }) else { return false }
-        return documentTypes.contains { type.conforms(to: $0) }
+        return exactDocumentTypes.contains(type.identifier) || documentFamilies.contains { type.conforms(to: $0) }
     }
 
-    private static let documentTypes: [UTType] = [
-        .pdf, .image, .audiovisualContent, .presentation, .spreadsheet, .rtf, .rtfd,
-        .plainText, .commaSeparatedText, .tabSeparatedText, .zip, .epub,
-    ] + [
-        "org.openxmlformats.wordprocessingml.document", "com.microsoft.word.doc",
-        "org.oasis-open.opendocument.text", "com.apple.iwork.pages.sffpages", "com.apple.iwork.pages.sections", "com.apple.iwork.pages.pages",
-    ].compactMap { UTType($0) }
+    /// Families matched by conformance: their members are media and office documents.
+    private static let documentFamilies: [UTType] = [.pdf, .image, .audiovisualContent, .presentation, .spreadsheet, .epub]
 
-    /// Checked first: some of these also conform to a document type above (a script is plain text).
-    private static let runnableTypes: [UTType] = [.sourceCode, .script, .executable, .application, .applicationBundle, .bundle, .package, .internetLocation, .diskImage]
+    /// Matched by exact identifier, not by conformance: any installed app can declare its own
+    /// type as conforming to plain text or zip (TeXShop does for `.lua` and `.dtx`, Music for
+    /// `.m3u` playlists) and then become its default app.
+    private static let exactDocumentTypes: Set<String> = [
+        "public.plain-text", "public.utf8-plain-text", "public.utf16-plain-text", "net.daringfireball.markdown",
+        "public.comma-separated-values-text", "public.tab-separated-values-text", "public.rtf", "public.zip-archive",
+        "org.openxmlformats.wordprocessingml.document", "com.microsoft.word.doc", "org.oasis-open.opendocument.text",
+        "com.apple.iwork.pages.sffpages", "com.apple.iwork.pages.sections", "com.apple.iwork.pages.pages",
+    ]
+
+    /// Checked first: some of these also conform to a document family above (an SVG is an image).
+    private static let runnableTypes: [UTType] = [.sourceCode, .script, .executable, .application, .applicationBundle, .bundle, .package, .internetLocation, .diskImage, .xml, .html]
 
     /// Extensions refused regardless of the type macOS assigns, so the decision doesn't depend on
     /// the macOS version or the installed apps. Macro-enabled office files: on macOS 27 their

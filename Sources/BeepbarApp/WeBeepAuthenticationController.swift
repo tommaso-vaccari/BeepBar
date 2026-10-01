@@ -590,6 +590,10 @@ struct MenuBarSnapshot: Sendable {
 
     func setRootIDForTesting(_ id: UUID) { rootID = id }
 
+    /// Runs inside `openActivityItem` after it captured the folder and before it looks the file
+    /// up: lets a test change the folder mid-lookup.
+    var beforeActivityLookupForTesting: (@MainActor () async -> Void)?
+
     func setDisconnectedForTesting() {
         hasStoredCredential = false
         accountState = .notConnected
@@ -1014,15 +1018,29 @@ struct MenuBarSnapshot: Sendable {
     func openActivityItem(id: String, name: String, showInFinder: Bool) async {
         // Captured together before any await, so a folder change during the lookup can't apply
         // one folder's path to another.
-        guard let database, let rootID, let rootURL else { activityItemProblems[id] = .unavailable; return }
+        guard let database, let rootID, let rootURL else { report(.unavailable, for: id); return }
+#if DEBUG
+        await beforeActivityLookupForTesting?()
+#endif
         let action: ActivityFileAction
         do {
             let trackedPath = try await database.baseline(rootID: rootID, remoteID: id)?.relativePath
-            let fileState: OpenableFileState = if let trackedPath { try await FileStore(root: rootURL).openableFileState(trackedPath) } else { .missing }
+            let fileState: OpenableFileState
+            if let trackedPath {
+                let store: FileStore
+                do { store = try FileStore(root: rootURL) } catch {
+                    guard self.rootID == rootID else { return }
+                    report(.folderUnavailable, for: id)
+                    return
+                }
+                fileState = try await store.openableFileState(trackedPath)
+            } else {
+                fileState = .missing
+            }
             action = ActivityFilePolicy.action(trackedPath: trackedPath, root: rootURL, fileState: fileState)
         } catch {
             guard self.rootID == rootID else { return }
-            activityItemProblems[id] = .unavailable
+            report(.unavailable, for: id)
             return
         }
         guard self.rootID == rootID else { return }
@@ -1034,8 +1052,18 @@ struct MenuBarSnapshot: Sendable {
             activityItemProblems[id] = nil
             fileOpener.reveal(url)
         case .missing:
-            activityItemProblems[id] = .missing
+            report(.missing, for: id)
+        case .unreadable:
+            report(.unreadable, for: id)
         }
+    }
+
+    /// Shows the problem on the row and announces it to VoiceOver on every click, including a
+    /// repeated one on a row that already shows it (the row itself doesn't change then).
+    private func report(_ problem: ActivityItemProblem, for id: String) {
+        activityItemProblems[id] = problem
+        guard let app = NSApp else { return }
+        NSAccessibility.post(element: app, notification: .announcementRequested, userInfo: [.announcement: problem.message, .priority: NSAccessibilityPriorityLevel.high.rawValue])
     }
 
     /// What the switch shows at launch: the stored choice, on when never set.

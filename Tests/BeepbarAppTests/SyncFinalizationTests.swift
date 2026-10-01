@@ -353,13 +353,34 @@ struct ConflictChoiceFeedbackTests {
         controller.resolve(conflict, with: .useRemote)
         try await waitForChoice(controller)
         let feedback = try #require(controller.conflictChoiceFeedback)
-        #expect(feedback.english.contains(missingArtifact ? "Couldn't resolve" : "changed in the meantime"))
+        #expect(feedback.english.contains(missingArtifact ? "Couldn't finish resolving" : "changed in the meantime"))
         #expect(try String(contentsOf: fixture.root.appending(path: "Course/file.txt"), encoding: .utf8) == (missingArtifact ? "mine" : "edited again"))
         // The next successful choice clears the reason, even if the first conflict was superseded.
         let pending = try #require(try await fixture.database.conflicts(rootID: fixture.rootID).first)
         controller.resolve(pending, with: .keepLocal)
         try await waitForChoice(controller)
         #expect(controller.conflictChoiceFeedback == nil)
+    }
+
+    @Test @MainActor func lateDatabaseFailureDoesNotPromiseLocalPreservation() async throws {
+        let fixture = try await ChoiceFixture()
+        defer { fixture.remove() }
+        try fixture.write("mine", path: "Course/file.txt")
+        try fixture.write("remote", path: ".beepbar/conflicts/fixture/remote.txt")
+        let conflict = ConflictRecord(id: UUID(), rootID: fixture.rootID, remoteID: "file", relativePath: try RelativePath("Course/file.txt"), incomingPath: try RelativePath(internal: ".beepbar/conflicts/fixture/remote.txt"), baseSHA256: "original", localSHA256: try await fixture.hash("Course/file.txt"), remoteSHA256: try await fixture.hash(".beepbar/conflicts/fixture/remote.txt"), remoteRevision: "2", detectedAt: .now, status: .open)
+        try await fixture.database.insertConflict(conflict)
+        var connection: OpaquePointer?
+        #expect(sqlite3_open(fixture.root.appending(path: "state.sqlite").path, &connection) == SQLITE_OK)
+        defer { sqlite3_close(connection) }
+        #expect(sqlite3_exec(connection, "CREATE TRIGGER reject_resolution BEFORE UPDATE OF status ON conflicts BEGIN SELECT RAISE(ABORT, 'injected late failure'); END", nil, nil, nil) == SQLITE_OK)
+        let controller = fixture.controller()
+        controller.resolve(conflict, with: .useRemote)
+        try await waitForChoice(controller)
+        #expect(try String(contentsOf: fixture.root.appending(path: "Course/file.txt"), encoding: .utf8) == "remote")
+        #expect(try await fixture.database.conflicts(rootID: fixture.rootID).count == 1)
+        let feedback = try #require(controller.conflictChoiceFeedback)
+        #expect(feedback.english == "Couldn't finish resolving this conflict. Check the file and refresh before retrying.")
+        #expect(!feedback.italian.contains("nessun file locale"))
     }
 
     @Test(arguments: [false, true]) @MainActor

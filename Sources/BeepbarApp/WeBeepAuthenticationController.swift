@@ -1335,7 +1335,7 @@ struct MenuBarSnapshot: Sendable {
                 }
                 self.refreshConflicts()
             } catch {
-                self?.reportConflictChoiceFeedback(BilingualText("Impossibile risolvere il conflitto: nessun file locale è stato scartato.", "Couldn't resolve the conflict: no local file was discarded."), rootID: rootID)
+                self?.reportConflictChoiceFeedback(BilingualText("Impossibile completare la risoluzione del conflitto. Controlla il file e aggiorna prima di riprovare.", "Couldn't finish resolving this conflict. Check the file and refresh before retrying."), rootID: rootID)
                 self?.refreshConflicts()
             }
         }

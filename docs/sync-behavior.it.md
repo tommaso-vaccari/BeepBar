@@ -2,15 +2,13 @@
 
 Questo documento descrive cosa fa BeepBar in ogni situazione di sincronizzazione e cosa vede l'utente. È il riferimento per sviluppo e code review: una PR che cambia uno di questi comportamenti aggiorna questo documento (e la versione inglese, [`sync-behavior.en.md`](sync-behavior.en.md)) nello stesso cambiamento.
 
-Le parti marcate con **[PR #54]**, **[PR #62]** o **[PR #63]** non sono ancora in una versione rilasciata.
-
 ## Garanzie
 
 Valgono in ogni caso descritto sotto.
 
 1. **Nessun file locale viene sovrascritto o cancellato senza una tua scelta.** Quando BeepBar non può sapere cosa preferisci, lascia il file dov'è e ti chiede.
 2. **Si valuta solo ciò che Moodle ha mostrato davvero.** Un corso che in quella sincronizzazione non si è caricato (non accessibile, errore del server, rete assente), un corso disattivato o da cui sei stato disiscritto non produce cambiamenti sui suoi file.
-3. **Ogni azione ricontrolla lo stato al momento in cui avviene.** Se nel frattempo il file è cambiato, l'azione non fa nulla e resta da decidere. Se la destinazione si è occupata, niente viene sovrascritto: un file spostato per seguire Moodle arriva con un numero (sezione 4.1), le altre azioni non fanno nulla. **[PR #54]**
+3. **Ogni azione ricontrolla lo stato al momento in cui avviene.** Se nel frattempo il file è cambiato, l'azione non fa nulla e resta da decidere. Se la destinazione si è occupata, niente viene sovrascritto: un file spostato per seguire Moodle arriva con un numero (sezione 4.1), le altre azioni non fanno nulla.
 4. **Un aggiornamento dell'app non riorganizza niente da solo.** Le nuove regole valgono per ciò che succede su Moodle da quel momento in poi.
 
 ## Termini
@@ -53,7 +51,7 @@ Un conflitto nasce quando un file è stato modificato sia da te sia su Moodle. L
 
 Finché un conflitto è aperto, quel file non viene spostato né aggiornato (vedi sezione 4).
 
-## 4. Il professore riorganizza o rimuove materiali **[PR #54]**
+## 4. Il professore riorganizza o rimuove materiali
 
 Tutte le scelte di questa sezione compaiono nella pagina **Conflitti**, nella sezione **Spostati o rimossi su Moodle**, e restano lì finché non scegli. Una voce sparisce da sola se non serve più (il file ricompare su Moodle dov'era, oppure lo sposti o lo cancelli tu).
 
@@ -85,11 +83,11 @@ Per Moodle è un file nuovo; BeepBar lo riconosce perché il contenuto è identi
 
 Se il file viene ricaricato esattamente nello stesso posto, BeepBar continua a seguire la copia che hai, modificata o no: non la riscarica e non chiede niente, perché su Moodle il contenuto non è cambiato.
 
-"Sostituisci" mette nel Cestino la copia appena scaricata (che non hai mai toccato) e porta la tua al suo posto; da lì in poi un aggiornamento del professore diventa un conflitto. Se durante questa azione il tuo file cambia o la destinazione si occupa, il tuo file resta dov’è e la scelta resta aperta. La copia scaricata resta recuperabile nel Cestino; il sync successivo la ripristina se la sua posizione è ancora libera. **[PR #63]**
+"Sostituisci" mette nel Cestino la copia appena scaricata (che non hai mai toccato) e porta la tua al suo posto; da lì in poi un aggiornamento del professore diventa un conflitto. Se durante questa azione il tuo file cambia o la destinazione si occupa, il tuo file resta dov’è e la scelta resta aperta. La copia scaricata resta recuperabile nel Cestino; il sync successivo la ripristina se la sua posizione è ancora libera.
 
 BeepBar riconosce solo un file ricaricato nello stesso corso, e solo quando Moodle fornisce l'impronta del contenuto del file. Se lo stesso contenuto compare in più posti, BeepBar non indovina: la copia nuova si scarica normalmente e il vecchio file viene trattato come rimosso (4.3). Succede lo stesso se la copia non modificata non si può spostare (per esempio perché nel frattempo qualcos'altro ha preso il suo nuovo posto).
 
-Se il download della copia nuova non è riuscito, riprova la sincronizzazione prima di spostare quella vecchia nel Cestino. BeepBar consente questa scelta solo quando esiste una copia scaricata separata; puoi conservarla anche se l'hai modificata. **[PR #63]**
+Se il download della copia nuova non è riuscito, riprova la sincronizzazione prima di spostare quella vecchia nel Cestino. BeepBar consente questa scelta solo quando esiste una copia scaricata separata; puoi conservarla anche se l'hai modificata.
 
 ### 4.3 Il file viene rimosso da Moodle
 
@@ -101,7 +99,7 @@ Se il download della copia nuova non è riuscito, riprova la sincronizzazione pr
 - **Sposta nel Cestino**: il file va nel Cestino di macOS, da cui si può recuperare.
 - Un file ancora visibile su Moodle ma diventato non scaricabile non è considerato rimosso.
 - Un modulo nascosto temporaneamente appare come rimosso; se torna visibile prima che tu scelga, la voce sparisce.
-- Un file conta come rimosso solo se Moodle ha mostrato il suo corso per intero: se in quel sync una sezione, un modulo o una voce di quel modulo è stata omessa o non si è potuta leggere, niente lì dentro viene considerato rimosso, e le voci già aperte restano come sono. **[PR #63]**
+- Un file conta come rimosso solo se Moodle ha mostrato il suo corso per intero: se in quel sync una sezione, un modulo o una voce di quel modulo è stata omessa o non si è potuta leggere, niente lì dentro viene considerato rimosso, e le voci già aperte restano come sono.
 
 ### 4.4 Cosa non fa spostare niente
 
@@ -125,20 +123,20 @@ Al primo sync dopo l'aggiornamento, i file che il professore aveva rimosso da Mo
 - Se tutti i corsi falliscono per un problema del sito o della connessione, il sync viene segnalato come non riuscito e nessun file viene toccato.
 - Il sync automatico non usa connessioni a consumo (hotspot) e rispetta la modalità Dati ridotti; viene rimandato, non saltato, se c'è il Risparmio energetico o un'altra operazione in corso.
 
-- **[PR #62]** Durante l'aggiornamento dei corsi, i loro interruttori sono disabilitati; una scelta ancora in salvataggio viene applicata prima di ripristinare la lista aggiornata.
-- **[PR #62]** Annullare durante i controlli finali termina il sync senza mostrare un risultato completato o inviare la sua notifica. Quando compare il completamento o l'errore, il sync è terminato e l'invio della notifica non può lasciare attivo Annulla.
-- **[PR #62]** Un aggiornamento in ritardo non può sostituire lo stato di un sync avviato nel frattempo, di un account disconnesso o di una cartella di sincronizzazione diversa.
-- **[PR #62]** Se le scelte in sospeso non si possono leggere, le ultime liste mostrate restano visibili e il sync segnala un errore locale; non registra una sincronizzazione riuscita. Anche una selezione dei corsi illeggibile fa fallire l'aggiornamento o il sync automatico, invece di essere trattata come vuota.
+- Durante l'aggiornamento dei corsi, i loro interruttori sono disabilitati; una scelta ancora in salvataggio viene applicata prima di ripristinare la lista aggiornata.
+- Annullare durante i controlli finali termina il sync senza mostrare un risultato completato o inviare la sua notifica. Quando compare il completamento o l'errore, il sync è terminato e l'invio della notifica non può lasciare attivo Annulla.
+- Un aggiornamento in ritardo non può sostituire lo stato di un sync avviato nel frattempo, di un account disconnesso o di una cartella di sincronizzazione diversa.
+- Se le scelte in sospeso non si possono leggere, le ultime liste mostrate restano visibili e il sync segnala un errore locale; non registra una sincronizzazione riuscita. Anche una selezione dei corsi illeggibile fa fallire l'aggiornamento o il sync automatico, invece di essere trattata come vuota.
 
-- **[PR #67]** Una notifica in attesa del controllo dei permessi viene scartata se il suo account, la cartella di sincronizzazione o il risultato sono stati sostituiti; scartarla non registra la condizione come già notificata.
+- Una notifica in attesa del controllo dei permessi viene scartata se il suo account, la cartella di sincronizzazione o il risultato sono stati sostituiti; scartarla non registra la condizione come già notificata.
 
 ## 7. Dove vedi cosa
 
 | Posto | Contenuto |
 |---|---|
-| **Home** | Un avviso che porta a Conflitti finché qualcosa aspetta una tua scelta, compresi **[PR #54]** i file spostati o rimossi su Moodle |
-| **Attività** | Solo l'ultima sincronizzazione: nuovi, aggiornati, modifiche tue, non aggiornati, spostati, e i file modificati spostati su Moodle che ora aspettano in Conflitti **[PR #54]**. **[PR #69]** Un clic apre il file dove si trova ora, anche se un sync successivo l'ha spostato; il menu del tasto destro lo mostra anche nel Finder. Si aprono direttamente solo i documenti; tutto il resto (script, app, immagini disco, tipi sconosciuti) viene solo mostrato nel Finder. Un file che non è più dove BeepBar l'ha messo, anche se sostituito con un alias Finder, viene segnalato sulla sua riga; se manca il permesso di lettura, la riga segnala il problema e non apre niente |
-| **Conflitti** | Tutto ciò che aspetta una tua scelta, finché non scegli: conflitti e **[PR #54]** file spostati o rimossi su Moodle. Una scelta rifiutata o non riuscita mostra il motivo in questa pagina; una scelta successiva cancella il vecchio messaggio |
+| **Home** | Un avviso che porta a Conflitti finché qualcosa aspetta una tua scelta, compresi i file spostati o rimossi su Moodle |
+| **Attività** | Solo l'ultima sincronizzazione: nuovi, aggiornati, modifiche tue, non aggiornati, spostati, e i file modificati spostati su Moodle che ora aspettano in Conflitti . Un clic apre il file dove si trova ora, anche se un sync successivo l'ha spostato; il menu del tasto destro lo mostra anche nel Finder. Si aprono direttamente solo i documenti; tutto il resto (script, app, immagini disco, tipi sconosciuti) viene solo mostrato nel Finder. Un file che non è più dove BeepBar l'ha messo, anche se sostituito con un alias Finder, viene segnalato sulla sua riga; se manca il permesso di lettura, la riga segnala il problema e non apre niente |
+| **Conflitti** | Tutto ciò che aspetta una tua scelta, finché non scegli: conflitti e file spostati o rimossi su Moodle. Una scelta rifiutata o non riuscita mostra il motivo in questa pagina; una scelta successiva cancella il vecchio messaggio |
 | **Menu bar** | Lo stato dell'ultimo sync. Nessun testo nuovo per spostamenti e rimozioni |
-| **Accesso** | **[PR #59]** Onboarding e Impostazioni mostrano l'accesso non riuscito accanto al pulsante; il tentativo successivo cancella il vecchio messaggio. Un tentativo non riuscito non sostituisce un account esistente. La scelta dell'università resta bloccata durante l'accesso; verifica, nuovo accesso e disconnessione aspettano la conclusione di un controllo dell'account in corso |
-| **Notifiche** | Come oggi (nuovi materiali, conflitti). Nessuna notifica nuova per spostamenti e rimozioni. **[PR #67]** Si possono spegnere in Impostazioni: da spente non ne parte nessuna, e un conflitto ancora aperto può essere notificato al sync automatico successivo alla riaccensione. Un clic apre Conflitti, Attività o Corsi. Compaiono anche quando BeepBar è in primo piano |
+| **Accesso** | Onboarding e Impostazioni mostrano l'accesso non riuscito accanto al pulsante; il tentativo successivo cancella il vecchio messaggio. Un tentativo non riuscito non sostituisce un account esistente. La scelta dell'università resta bloccata durante l'accesso; verifica, nuovo accesso e disconnessione aspettano la conclusione di un controllo dell'account in corso |
+| **Notifiche** | Come oggi (nuovi materiali, conflitti). Nessuna notifica nuova per spostamenti e rimozioni. Si possono spegnere in Impostazioni: da spente non ne parte nessuna, e un conflitto ancora aperto può essere notificato al sync automatico successivo alla riaccensione. Un clic apre Conflitti, Attività o Corsi. Compaiono anche quando BeepBar è in primo piano |

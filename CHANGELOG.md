@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## 2026-10-01
+
 ### New
 
 - Files a teacher removes from WeBeep are no longer left behind without a word. They appear in Conflicts, under "Spostati o rimossi su WeBeep", where you choose "Tieni" or "Sposta nel Cestino"; BeepBar never deletes anything by itself. On the first sync after updating, files removed from WeBeep in the past that are still on your Mac show up there too, all at once.

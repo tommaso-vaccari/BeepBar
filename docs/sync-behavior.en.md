@@ -2,15 +2,13 @@
 
 This document describes what BeepBar does in every sync situation and what the user sees. It is the reference for development and code review: a PR that changes any of these behaviors updates this document (and the Italian version, [`sync-behavior.it.md`](sync-behavior.it.md)) in the same change.
 
-Parts marked with **[PR #54]**, **[PR #62]** or **[PR #63]** are not in a released version yet.
-
 ## Guarantees
 
 These hold in every case described below.
 
 1. **No local file is overwritten or deleted without your choice.** When BeepBar cannot know what you would prefer, it leaves the file where it is and asks.
 2. **Only what Moodle actually showed is evaluated.** A course that did not load in that sync (not accessible, server error, no network), a course you turned off, or one you are no longer enrolled in causes no change to its files.
-3. **Every action re-checks the state at the moment it runs.** If the file changed in the meantime, the action does nothing and stays pending. If the destination got taken, nothing is overwritten: a file moved to follow Moodle arrives with a number (section 4.1), any other action does nothing. **[PR #54]**
+3. **Every action re-checks the state at the moment it runs.** If the file changed in the meantime, the action does nothing and stays pending. If the destination got taken, nothing is overwritten: a file moved to follow Moodle arrives with a number (section 4.1), any other action does nothing.
 4. **An app update never reorganizes anything on its own.** New rules apply to what happens on Moodle from then on.
 
 ## Terms
@@ -53,7 +51,7 @@ A conflict happens when a file was edited both by you and on Moodle. Moodle's ve
 
 While a conflict is open, that file is neither moved nor updated (see section 4).
 
-## 4. The teacher reorganizes or removes materials **[PR #54]**
+## 4. The teacher reorganizes or removes materials
 
 Every choice in this section appears on the **Conflicts** page, under **Moved or removed on Moodle**, and stays there until you choose. An entry disappears on its own when it is no longer needed (the file is back where it was on Moodle, or you moved or deleted it yourself).
 
@@ -85,9 +83,9 @@ To Moodle this is a new file; BeepBar recognizes it because the contents are ide
 
 If the file is uploaded again in exactly the same place, BeepBar keeps tracking the copy you have, edited or not: it does not download it again and asks nothing, since its contents did not change on Moodle.
 
-If the new copy could not be downloaded, retry synchronization before moving your old copy to the Trash. BeepBar only allows this choice once a separate regular downloaded copy exists; editing that new copy does not prevent you from keeping it. **[PR #63]**
+If the new copy could not be downloaded, retry synchronization before moving your old copy to the Trash. BeepBar only allows this choice once a separate regular downloaded copy exists; editing that new copy does not prevent you from keeping it.
 
-"Replace" moves the freshly downloaded copy (which you never touched) to the Trash and puts yours in its place; from then on an update by the teacher becomes a conflict. If your file changes or the destination gets taken during this action, your file stays where it is and the choice stays open. The downloaded copy remains recoverable in the Trash; the next sync restores it if its place is still empty. **[PR #63]**
+"Replace" moves the freshly downloaded copy (which you never touched) to the Trash and puts yours in its place; from then on an update by the teacher becomes a conflict. If your file changes or the destination gets taken during this action, your file stays where it is and the choice stays open. The downloaded copy remains recoverable in the Trash; the next sync restores it if its place is still empty.
 
 BeepBar only recognizes a file uploaded again in the same course, and only when Moodle reports the file's content fingerprint. If the same contents appear in more than one place, BeepBar does not guess: the new copy downloads normally and the old file is treated as removed (4.3). The same happens if the unedited copy cannot be moved (for example because something else took its new place in the meantime).
 
@@ -101,7 +99,7 @@ BeepBar only recognizes a file uploaded again in the same course, and only when 
 - **Move to the Trash**: the file goes to the macOS Trash, where it can be recovered.
 - A file still visible on Moodle but no longer downloadable is not considered removed.
 - A temporarily hidden module looks removed; if it becomes visible again before you choose, the entry disappears.
-- A file counts as removed only when Moodle showed its course in full: if a section, a module or an entry of that module was omitted or could not be read in that sync, nothing in it is considered removed, and entries already open stay as they are. **[PR #63]**
+- A file counts as removed only when Moodle showed its course in full: if a section, a module or an entry of that module was omitted or could not be read in that sync, nothing in it is considered removed, and entries already open stay as they are.
 
 ### 4.4 What never moves anything
 
@@ -125,20 +123,20 @@ On the first sync after updating, the files the teacher removed from Moodle befo
 - If every course fails because of the site or the connection, the sync is reported as failed and no file is touched.
 - Automatic sync does not use metered connections (hotspots) and honours Low Data Mode; it is postponed, not skipped, under Low Power Mode or while another operation runs.
 
-- **[PR #62]** While courses are refreshing, their switches are disabled; a choice still being saved is applied before the refreshed list is restored.
-- **[PR #62]** Cancelling during the final checks ends the run without showing a completed result or sending its notification. Once completion or failure is shown, the run has ended and notification delivery cannot leave Cancel active.
-- **[PR #62]** A delayed refresh cannot replace the state of a sync started afterward, a disconnected account, or a different sync folder.
-- **[PR #62]** If pending choices cannot be read, their last displayed lists stay visible and the run reports a local error; it does not record a successful sync. An unreadable course selection also fails the refresh or automatic sync instead of being treated as an empty selection.
+- While courses are refreshing, their switches are disabled; a choice still being saved is applied before the refreshed list is restored.
+- Cancelling during the final checks ends the run without showing a completed result or sending its notification. Once completion or failure is shown, the run has ended and notification delivery cannot leave Cancel active.
+- A delayed refresh cannot replace the state of a sync started afterward, a disconnected account, or a different sync folder.
+- If pending choices cannot be read, their last displayed lists stay visible and the run reports a local error; it does not record a successful sync. An unreadable course selection also fails the refresh or automatic sync instead of being treated as an empty selection.
 
-- **[PR #67]** A notification waiting for a permission check is discarded if its account, sync folder or result has been replaced; discarding it does not mark its condition as notified.
+- A notification waiting for a permission check is discarded if its account, sync folder or result has been replaced; discarding it does not mark its condition as notified.
 
 ## 7. Where you see what
 
 | Place | Contents |
 |---|---|
-| **Home** | A notice leading to Conflicts while something waits for your choice, including **[PR #54]** files moved or removed on Moodle |
-| **Activity** | The last sync only: new, updated, your changes, not updated, moved, and edited files moved on Moodle that now wait in Conflicts **[PR #54]**. **[PR #69]** A click opens a file where it is now, even after a later sync moved it; the right-click menu also shows it in Finder. Only documents open directly; anything else (scripts, apps, disk images, unknown types) is only shown in Finder. A file that is no longer where BeepBar put it, including one replaced with a Finder alias, is reported on its row; a file without read permission reports that problem and opens nothing |
-| **Conflicts** | Everything waiting for your choice, until you choose: conflicts and **[PR #54]** files moved or removed on Moodle. A refused or failed choice shows its reason on this page; a subsequent choice clears the old message |
+| **Home** | A notice leading to Conflicts while something waits for your choice, including files moved or removed on Moodle |
+| **Activity** | The last sync only: new, updated, your changes, not updated, moved, and edited files moved on Moodle that now wait in Conflicts . A click opens a file where it is now, even after a later sync moved it; the right-click menu also shows it in Finder. Only documents open directly; anything else (scripts, apps, disk images, unknown types) is only shown in Finder. A file that is no longer where BeepBar put it, including one replaced with a Finder alias, is reported on its row; a file without read permission reports that problem and opens nothing |
+| **Conflicts** | Everything waiting for your choice, until you choose: conflicts and files moved or removed on Moodle. A refused or failed choice shows its reason on this page; a subsequent choice clears the old message |
 | **Menu bar** | The status of the last sync. No new text for moves and removals |
-| **Sign-in** | **[PR #59]** Onboarding and Settings show a failed sign-in beside its button; the next attempt clears the old message. A failed attempt does not replace an existing account. University selection stays locked during sign-in; verification, a new sign-in and disconnect wait for an ongoing account check to finish |
-| **Notifications** | As today (new materials, conflicts). No new notifications for moves and removals. **[PR #67]** They can be turned off in Settings: while off none is sent, and a conflict still open may be notified at the next automatic sync after they are back on. A click opens Conflicts, Activity or Courses. They also appear while BeepBar is in front |
+| **Sign-in** | Onboarding and Settings show a failed sign-in beside its button; the next attempt clears the old message. A failed attempt does not replace an existing account. University selection stays locked during sign-in; verification, a new sign-in and disconnect wait for an ongoing account check to finish |
+| **Notifications** | As today (new materials, conflicts). No new notifications for moves and removals. They can be turned off in Settings: while off none is sent, and a conflict still open may be notified at the next automatic sync after they are back on. A click opens Conflicts, Activity or Courses. They also appear while BeepBar is in front |

@@ -42,19 +42,22 @@ import Testing
 
     @Test func stopsABodyLargerThanReportedBeforeItIsFullyWritten() async throws {
         // No Content-Length, so only the byte count during the transfer can catch the overrun.
-        StreamingProtocol.reset(chunks: 400, chunkSize: 64 * 1024)
+        // Chunks smaller than the 1 000-byte limit, so bytes (starting with the marker) are
+        // written to the partial file before the overrun: the leak check below then proves the
+        // partial file is removed, which a first chunk already over the limit never exercised.
+        StreamingProtocol.reset(chunks: 400, chunkSize: 256)
         let downloader = RemoteDownloader(session: Self.session(StreamingProtocol.self))
         let before = Self.downloadTemporaryFiles()
         await #expect(throws: RemoteDownloadError.invalidResponse) {
             try await downloader.download(Self.file(size: 1_000), token: "token", access: .unrestricted)
         }
-        // URLSession calls `stopLoading` on its own queue some time after the downloader cancels
-        // the task, so the stop is awaited instead of read right away (an immediate read failed
-        // 19 of 25 runs under CPU load). Waiting can't hide a transfer that was never stopped: the
-        // whole 400-chunk body arrives in about half a second, so `deliveredChunks < 400` fails.
-        let deadline = ContinuousClock.now + .seconds(5)
-        while !StreamingProtocol.wasStopped, ContinuousClock.now < deadline { try await Task.sleep(for: .milliseconds(5)) }
-        #expect(StreamingProtocol.wasStopped)
+        // URLSession tears the transfer down (`stopLoading`) on its own queue a few ms after the
+        // downloader cancels it, so wait for that before counting (reading right away failed 19 of
+        // 25 runs under CPU load); once stopped, `deliveredChunks` is final. `wasStopped` is only
+        // the wait condition: `stopLoading` also runs after a body that finished normally. The
+        // actual proof of an early stop is `deliveredChunks < 400`: a transfer never cut off
+        // delivers all 400 chunks (under a second) before the download even throws.
+        await Self.waitUntil { StreamingProtocol.wasStopped }
         #expect(StreamingProtocol.deliveredChunks < 400)
         #expect(Self.downloadTemporaries(since: before, startingWith: StreamingProtocol.marker).isEmpty)
     }
@@ -109,15 +112,22 @@ import Testing
     }
 
     @Test func cancellingTheSyncIsStillACancellationNotARejectedFile() async throws {
-        StreamingProtocol.reset(chunks: 10_000, chunkSize: 16)
+        // Chunks at least as long as the marker, so the partial file starts with it.
+        StreamingProtocol.reset(chunks: 10_000, chunkSize: 64)
         let downloader = RemoteDownloader(session: Self.session(StreamingProtocol.self))
         // Taken before the transfer starts, so the partial body it writes counts as a leak.
         let before = Self.downloadTemporaryFiles()
-        let task = Task { try await downloader.download(Self.file(size: 160_000), token: "token", access: .unrestricted) }
-        while StreamingProtocol.deliveredChunks < 5 { await Task.yield() }
+        let task = Task { try await downloader.download(Self.file(size: 640_000), token: "token", access: .unrestricted) }
+        // Cancel only once the downloader has really written a partial file: URLSession holds
+        // the first 512 bytes back before reporting a response without Content-Length, so a
+        // cancel after a few chunks never reached the cleanup this test is about.
+        await Self.waitUntil { !Self.downloadTemporaries(since: before, startingWith: StreamingProtocol.marker).isEmpty }
+        #expect(!Self.downloadTemporaries(since: before, startingWith: StreamingProtocol.marker).isEmpty, "the partial file must exist before cancelling")
         task.cancel()
         await #expect(throws: CancellationError.self) { try await task.value }
         #expect(Self.downloadTemporaries(since: before, startingWith: StreamingProtocol.marker).isEmpty)
+        // Let the transfer finish tearing down, so it can't add to the next test's counters.
+        await Self.waitUntil { StreamingProtocol.wasStopped }
     }
 
     @Test func sizeLimitDefaultsToOneGigabyteAndKeepsACustomValue() {
@@ -133,6 +143,13 @@ import Testing
             try await downloader.download(Self.file(size: 11), token: "token", access: .unrestricted)
         }
         #expect(StreamingProtocol.deliveredChunks == 0)
+    }
+
+    /// Polls `condition` for up to 5 s. Bounded so that a regression fails the test (through the
+    /// assertions after it) instead of spinning forever: CI sets no job timeout.
+    private static func waitUntil(_ condition: () -> Bool) async {
+        let deadline = ContinuousClock.now + .seconds(5)
+        while !condition(), ContinuousClock.now < deadline { try? await Task.sleep(for: .milliseconds(5)) }
     }
 
     private static func session(_ protocolClass: AnyClass) -> URLSession {

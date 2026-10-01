@@ -318,12 +318,17 @@ struct MenuBarSnapshot: Sendable {
     }
     @Published private(set) var hasStoredCredential: Bool {
         didSet {
-            if !hasStoredCredential { conflictChoiceFeedback = nil }
+            if !hasStoredCredential {
+                conflictChoiceFeedback = nil
+                authenticationFeedback = nil
+            }
             refreshMenuBarSnapshot()
         }
     }
     /// Refused or failed choices stay visible on the Conflicts page until the next choice.
     @Published private(set) var conflictChoiceFeedback: BilingualText?
+    /// Login failures belong beside the sign-in button, including during onboarding.
+    @Published private(set) var authenticationFeedback: BilingualText?
     @Published private(set) var status = tr("Avvio BeepBar…", "Starting BeepBar…")
     @Published private(set) var syncState: AppSyncState = .starting {
         didSet { notificationGeneration += 1; refreshMenuBarSnapshot() }
@@ -381,7 +386,7 @@ struct MenuBarSnapshot: Sendable {
     // One downloader for the whole app lifetime: a per-run one would leave its URLSession and
     // delegate alive forever, since nothing invalidates them when a run ends.
     private var downloader: RemoteDownloader
-    private let credentialVault = CredentialVault(read: FileTokenStore.load, write: FileTokenStore.save)
+    private let credentialVault: CredentialVault
     private let notificationCoordinator: SyncNotificationCoordinator
     private var backgroundScheduler: NSBackgroundActivityScheduler?
     private var bootstrapTask: Task<Void, Never>?
@@ -430,6 +435,7 @@ struct MenuBarSnapshot: Sendable {
     }
 
     override init() {
+        credentialVault = CredentialVault(read: FileTokenStore.load, write: FileTokenStore.save)
         fileOpener = WorkspaceFileOpener()
         let selectedSite = MoodleSite.site(id: Self.defaults.string(forKey: Self.selectedSiteKey))
         self.selectedSite = selectedSite
@@ -521,7 +527,8 @@ struct MenuBarSnapshot: Sendable {
     }
 
 #if DEBUG
-    init(testRootURL: URL, database: SyncDatabase? = nil, rootID: UUID? = nil, notificationCenter: NotificationCenterClient = InertNotificationCenter(), fileOpener: ActivityFileOpening = InertFileOpener()) {
+    init(testRootURL: URL, database: SyncDatabase? = nil, rootID: UUID? = nil, notificationCenter: NotificationCenterClient = InertNotificationCenter(), fileOpener: ActivityFileOpening = InertFileOpener(), apiClient: WeBeepAPIClient? = nil, credentialVault: CredentialVault? = nil) {
+        self.credentialVault = credentialVault ?? CredentialVault(read: FileTokenStore.load, write: FileTokenStore.save)
         self.fileOpener = fileOpener
         let site = MoodleSite.site(id: nil)
         selectedSite = site
@@ -536,8 +543,8 @@ struct MenuBarSnapshot: Sendable {
         enabledCourseIDs = [1]
         automaticSyncEnabled = false
         automaticSyncInterval = 28_800
-        apiClient = WeBeepAPIClient(policy: site.serverPolicy)
-        downloader = RemoteDownloader(policy: apiClient.policy)
+        self.apiClient = apiClient ?? WeBeepAPIClient(policy: site.serverPolicy)
+        downloader = RemoteDownloader(policy: self.apiClient.policy)
         self.database = database
         self.rootID = rootID
         super.init()
@@ -558,6 +565,10 @@ struct MenuBarSnapshot: Sendable {
         let folder = FileManager.default.temporaryDirectory.appending(path: "BeepbarTestDefaults-\(UUID().uuidString)", directoryHint: .isDirectory)
         try? FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
         return folder.appending(path: "defaults").path
+    }
+
+    func completeLoginForTesting(_ callback: URL) async {
+        await completeLogin(.success(callback))?.value
     }
 
     func setOperationForTesting(_ operationID: UUID?, task: Task<Void, Never>? = nil) {
@@ -1361,8 +1372,9 @@ struct MenuBarSnapshot: Sendable {
 
     func startLogin() {
         guard !isAuthenticating else { return }
+        authenticationFeedback = nil
         isAuthenticating = true; status = tr("Autenticazione \(selectedSite.displayName) in corso…", "Signing in to \(selectedSite.displayName)…")
-        loginWindow = LoginWindowController(site: selectedSite) { [weak self] result in self?.completeLogin(result) }
+        loginWindow = LoginWindowController(site: selectedSite) { [weak self] result in _ = self?.completeLogin(result) }
         loginWindow?.showWindow(nil)
     }
 
@@ -1456,7 +1468,7 @@ struct MenuBarSnapshot: Sendable {
         try await restoreScopes(for: courses)
         self.courses = Self.orderedForDisplay(courses, enabledCourseIDs: enabledCourseIDs)
         accountState = .connected
-        Self.defaults.removeObject(forKey: Self.credentialExpiredKey)
+        operationDefaults.removeObject(forKey: Self.credentialExpiredKey)
     }
 
     private func fetchEnrolledCourses(token: String) async throws -> [RemoteCourseSummary] {
@@ -1535,13 +1547,18 @@ struct MenuBarSnapshot: Sendable {
         return FileManager.default.fileExists(atPath: url.path, isDirectory: &isDirectory) && isDirectory.boolValue ? url : nil
     }
 
-    private func completeLogin(_ result: Result<URL, LoginWindowError>) {
-        loginWindow = nil; isAuthenticating = false
+    @discardableResult private func completeLogin(_ result: Result<URL, LoginWindowError>) -> Task<Void, Never>? {
+        loginWindow = nil
+        authenticationFeedback = nil
         // A cancelled or failed login leaves the current account and its course list untouched.
         guard case let .success(callback) = result, let token = token(from: callback) else {
-            status = tr("Accesso a \(selectedSite.platformName) annullato o callback non valido.", "Sign-in to \(selectedSite.platformName) cancelled or invalid callback."); return
+            isAuthenticating = false
+            authenticationFeedback = BilingualText("Accesso a \(selectedSite.platformName) annullato o callback non valido.", "Sign-in to \(selectedSite.platformName) cancelled or invalid callback.")
+            return nil
         }
-        Task { [weak self] in
+        isAuthenticating = true
+        return Task { [weak self] in
+            defer { self?.isAuthenticating = false }
             do {
                 guard let self else { return }
                 let siteInfo = try await self.apiClient.validateToken(token)
@@ -1551,15 +1568,15 @@ struct MenuBarSnapshot: Sendable {
                 self.siteInfo = siteInfo
                 self.hasStoredCredential = true
                 self.accountState = .connected
-                Self.defaults.removeObject(forKey: Self.credentialExpiredKey)
+                self.operationDefaults.removeObject(forKey: Self.credentialExpiredKey)
                 self.notificationCoordinator.clearFailure()
                 self.setSyncState(self.rootURL == nil ? .needsFolder : .readyUnchecked)
                 self.configureBackgroundScheduler()
                 self.loadCourses()
             } catch let error as WeBeepAPIError where error == .invalidToken {
-                self?.status = tr("Il token ricevuto non è valido. Accedi di nuovo alla piattaforma.", "The received token isn't valid. Sign in to the platform again.")
+                self?.authenticationFeedback = BilingualText("Il token ricevuto non è valido. Accedi di nuovo alla piattaforma.", "The received token isn't valid. Sign in to the platform again.")
             } catch {
-                self?.status = tr("Impossibile verificare l'accesso alla piattaforma. Il token non è stato salvato.", "Couldn't verify access to the platform. The token wasn't saved.")
+                self?.authenticationFeedback = BilingualText("Impossibile verificare l'accesso alla piattaforma. Il token non è stato salvato.", "Couldn't verify access to the platform. The token wasn't saved.")
             }
         }
     }

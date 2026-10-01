@@ -145,6 +145,12 @@ struct OnboardingView: View {
                         .disabled(authentication.isAuthenticating)
                 }
             }
+            if let feedback = authentication.authenticationFeedback {
+                Text(feedback.text)
+                    .font(.callout)
+                    .foregroundStyle(.orange)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
         }
         .card()
     }

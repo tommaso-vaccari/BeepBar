@@ -80,6 +80,11 @@ struct SettingsPage: View {
                         .disabled(authentication.isAuthenticating)
                 }
             }
+            if let feedback = authentication.authenticationFeedback {
+                Text(feedback.text)
+                    .font(.callout)
+                    .foregroundStyle(.orange)
+            }
         } header: {
             Text(tr("Account \(authentication.selectedSite.platformName)", "\(authentication.selectedSite.platformName) account"))
         } footer: {

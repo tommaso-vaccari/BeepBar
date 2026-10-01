@@ -1,5 +1,6 @@
 import Foundation
 import XCTest
+import Testing
 @testable import BeepbarApp
 import BeepbarCore
 
@@ -174,4 +175,94 @@ final class FileTokenStoreTests: XCTestCase {
         FileManager.default.createFile(atPath: fileURL.path, contents: contents)
         return fileURL
     }
+}
+
+/// Real callback decoding and API validation use a local URLProtocol and an in-memory vault.
+/// These failures must never read or write the installed application's token.
+struct LoginFeedbackTests {
+    @Test(arguments: ["invalid", "network", "save"]) @MainActor
+    func rejectedLoginShowsReasonAndRetryClearsIt(_ mode: String) async throws {
+        let configuration = URLSessionConfiguration.ephemeral
+        configuration.protocolClasses = [LoginFeedbackProtocol.self]
+        let session = URLSession(configuration: configuration)
+        defer { session.invalidateAndCancel() }
+        let storage = LoginTokenMemory()
+        let vault = CredentialVault(read: { _ in throw CredentialStorageError.absent }, write: { token in
+            if token == "save" { throw CredentialStorageError.write }
+            storage.record(token)
+        })
+        let controller = WeBeepAuthenticationController(testRootURL: FileManager.default.temporaryDirectory, apiClient: WeBeepAPIClient(session: session), credentialVault: vault)
+        controller.setDisconnectedForTesting()
+        await controller.completeLoginForTesting(callback(mode))
+        let feedback = try #require(controller.authenticationFeedback)
+        #expect(feedback.english.contains(mode == "invalid" ? "isn't valid" : "wasn't saved"))
+        #expect(!feedback.italian.isEmpty)
+        #expect(!controller.hasStoredCredential)
+        #expect(!controller.isAuthenticating)
+        #expect(storage.saved == nil)
+        await controller.completeLoginForTesting(callback("good"))
+        #expect(controller.authenticationFeedback == nil)
+        #expect(controller.hasStoredCredential)
+        #expect(storage.saved == "good")
+        #expect(!controller.isAuthenticating)
+    }
+
+    @Test @MainActor func disconnectClearsAuthenticationFailure() async throws {
+        let configuration = URLSessionConfiguration.ephemeral
+        configuration.protocolClasses = [LoginFeedbackProtocol.self]
+        let session = URLSession(configuration: configuration)
+        defer { session.invalidateAndCancel() }
+        let vault = CredentialVault(read: { _ in "previous" }, write: { _ in })
+        let controller = WeBeepAuthenticationController(testRootURL: FileManager.default.temporaryDirectory, apiClient: WeBeepAPIClient(session: session), credentialVault: vault)
+        // A rejected replacement token leaves the existing account connected.
+        await controller.completeLoginForTesting(callback("invalid"))
+        #expect(controller.authenticationFeedback != nil)
+        #expect(controller.hasStoredCredential)
+        controller.setDisconnectedForTesting()
+        #expect(controller.authenticationFeedback == nil)
+    }
+
+    private func callback(_ token: String) -> URL {
+        let payload = Data("site:::\(token)".utf8).base64EncodedString()
+        return URL(string: "moodlemobile://token=\(payload)")!
+    }
+}
+
+private final class LoginTokenMemory: @unchecked Sendable {
+    private let lock = NSLock()
+    private var value: String?
+    var saved: String? { lock.withLock { value } }
+    func record(_ token: String) { lock.withLock { value = token } }
+}
+
+private final class LoginFeedbackProtocol: URLProtocol, @unchecked Sendable {
+    override class func canInit(with request: URLRequest) -> Bool { true }
+    override class func canonicalRequest(for request: URLRequest) -> URLRequest { request }
+    override func startLoading() {
+        var data = request.httpBody ?? Data()
+        if let stream = request.httpBodyStream {
+            stream.open()
+            defer { stream.close() }
+            var buffer = [UInt8](repeating: 0, count: 1024)
+            while stream.hasBytesAvailable {
+                let count = stream.read(&buffer, maxLength: buffer.count)
+                guard count > 0 else { break }
+                data.append(contentsOf: buffer.prefix(count))
+            }
+        }
+        let body = String(data: data, encoding: .utf8) ?? ""
+        if body.contains("wstoken=network") {
+            client?.urlProtocol(self, didFailWithError: URLError(.notConnectedToInternet))
+            return
+        }
+        let response = HTTPURLResponse(url: request.url!, statusCode: 200, httpVersion: "HTTP/1.1", headerFields: ["Content-Type": "application/json"])!
+        let json: String
+        if body.contains("wstoken=invalid") { json = #"{"exception":"invalidtoken","errorcode":"invalidtoken"}"# }
+        else if body.contains("core_enrol_get_users_courses") { json = "[]" }
+        else { json = #"{"userid":7,"siteurl":"https://webeep.polimi.it","functions":[{"name":"core_enrol_get_users_courses"},{"name":"core_course_get_contents"}]}"# }
+        client?.urlProtocol(self, didReceive: response, cacheStoragePolicy: .notAllowed)
+        client?.urlProtocol(self, didLoad: Data(json.utf8))
+        client?.urlProtocolDidFinishLoading(self)
+    }
+    override func stopLoading() {}
 }

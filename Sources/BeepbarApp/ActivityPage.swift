@@ -1,5 +1,61 @@
+import AppKit
 import SwiftUI
 import BeepbarCore
+
+/// Opens or shows a file clicked in Attività. Behind a protocol so tests never open real apps.
+@MainActor protocol ActivityFileOpening {
+    func open(_ url: URL)
+    func reveal(_ url: URL)
+}
+
+/// The real one: the file's default app, or Finder with the file selected. When no app can open
+/// the file (a `.pages` without Pages), it is shown in Finder instead of the click doing nothing;
+/// macOS isn't asked to prompt for an app first. `launch` and `show` are seams for tests.
+struct WorkspaceFileOpener: ActivityFileOpening {
+    typealias Launch = (URL, @escaping @Sendable (Bool) -> Void) -> Void
+    var launch: Launch = { url, completion in
+        let configuration = NSWorkspace.OpenConfiguration()
+        configuration.promptsUserIfNeeded = false
+        NSWorkspace.shared.open(url, configuration: configuration) { _, error in completion(error == nil) }
+    }
+    var show: @MainActor (URL) -> Void = { Finder.reveal($0) }
+
+    func open(_ url: URL) {
+        let show = show
+        launch(url) { opened in
+            guard !opened else { return }
+            Task { @MainActor in show(url) }
+        }
+    }
+    func reveal(_ url: URL) { show(url) }
+}
+
+/// Why a click on an Attività file did nothing, shown on its row.
+enum ActivityItemProblem: Equatable {
+    /// Not where BeepBar put it (moved, renamed, deleted, or replaced by a folder or a link).
+    case missing
+    /// macOS doesn't let BeepBar look at the file or a folder on the way.
+    case unreadable
+    /// The sync folder itself can't be reached (an unplugged disk, a moved folder).
+    case folderUnavailable
+    /// The sync database couldn't be read; this one can be temporary.
+    case unavailable
+
+    var message: String {
+        switch self {
+        case .missing: tr("Non è più dove BeepBar l’ha messo: forse l’hai spostato, rinominato o eliminato.", "It's no longer where BeepBar put it: you may have moved, renamed or deleted it.")
+        case .unreadable: tr("BeepBar non ha il permesso di leggere questo file o la sua cartella.", "BeepBar isn't allowed to read this file or its folder.")
+        case .folderUnavailable: tr("La cartella dei materiali non è raggiungibile: forse è su un disco scollegato o è stata spostata.", "The materials folder can't be reached: it may be on a disconnected disk or have been moved.")
+        case .unavailable: tr("BeepBar non è riuscita a controllare questo file. Riprova tra poco.", "BeepBar couldn't check this file. Try again shortly.")
+        }
+    }
+}
+
+/// Opens nothing: the default for test controllers.
+struct InertFileOpener: ActivityFileOpening {
+    func open(_ url: URL) {}
+    func reveal(_ url: URL) {}
+}
 
 /// What the last synchronization brought in, course by course.
 struct ActivityPage: View {
@@ -27,7 +83,11 @@ struct ActivityPage: View {
                                 CourseActivityCard(
                                     course: course,
                                     platformName: authentication.selectedSite.platformName,
-                                    folderURL: authentication.rootURL?.appending(path: course.courseFolder, directoryHint: .isDirectory)
+                                    folderURL: authentication.rootURL?.appending(path: course.courseFolder, directoryHint: .isDirectory),
+                                    problems: authentication.activityItemProblems,
+                                    openItem: { id, name, showInFinder in
+                                        Task { await authentication.openActivityItem(id: id, name: name, showInFinder: showInFinder) }
+                                    }
                                 )
                             }
                         }
@@ -49,6 +109,9 @@ private struct CourseActivityCard: View {
     let course: CourseSyncCount
     let platformName: String
     let folderURL: URL?
+    let problems: [String: ActivityItemProblem]
+    /// (remote id, name, show in Finder instead of opening).
+    let openItem: (String, String, Bool) -> Void
     @State private var isExpanded = false
 
     var body: some View {
@@ -89,7 +152,7 @@ private struct CourseActivityCard: View {
                         }
                     }
                     ForEach(course.items) { item in
-                        Label {
+                        fileRow(id: item.id, name: item.name) {
                             Text(item.name).font(.callout).lineLimit(1)
                         } icon: {
                             Image(systemName: item.kind == .added ? "plus.circle.fill" : "arrow.triangle.2.circlepath.circle.fill")
@@ -97,7 +160,7 @@ private struct CourseActivityCard: View {
                         }
                     }
                     ForEach(course.movedItems) { item in
-                        Label {
+                        fileRow(id: item.id, name: item.name) {
                             VStack(alignment: .leading, spacing: 1) {
                                 Text(item.name).font(.callout).lineLimit(1)
                                 Text(item.explanation(platform: platformName)).font(.caption).foregroundStyle(.secondary)
@@ -133,6 +196,32 @@ private struct CourseActivityCard: View {
         }
         .card(padding: 0)
         .clipShape(RoundedRectangle(cornerRadius: BeepbarStyle.cardRadius, style: .continuous))
+    }
+
+    /// A file that arrived or moved: a click opens it, the context menu also shows it in Finder.
+    /// Failed items aren't rows like this: there is no file to open. Labels follow what a click
+    /// will actually do: a file that is only shown in Finder never says "Apri".
+    private func fileRow<Title: View, Icon: View>(id: String, name: String, @ViewBuilder title: () -> Title, @ViewBuilder icon: () -> Icon) -> some View {
+        let opens = ActivityFilePolicy.opensDirectly(filename: name)
+        return VStack(alignment: .leading, spacing: 2) {
+            Button { openItem(id, name, false) } label: {
+                Label { title() } icon: { icon() }
+                    .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+            .help(opens ? tr("Apri “\(name)”", "Open “\(name)”") : tr("Mostra “\(name)” nel Finder", "Show “\(name)” in Finder"))
+            .accessibilityHint(opens ? tr("Apre il file", "Opens the file") : tr("Mostra il file nel Finder", "Shows the file in Finder"))
+            .contextMenu {
+                if opens { Button(tr("Apri", "Open")) { openItem(id, name, false) } }
+                Button(tr("Mostra nel Finder", "Show in Finder")) { openItem(id, name, true) }
+            }
+            if let problem = problems[id] {
+                Text(problem.message)
+                    .font(.caption)
+                    .foregroundStyle(.orange)
+                    .padding(.leading, 28)
+            }
+        }
     }
 }
 

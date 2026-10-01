@@ -99,6 +99,37 @@ public actor FileStore {
         return true
     }
 
+    /// What sits at a tracked path, for opening it from Attività: nothing, something that isn't a
+    /// plain file reached directly (a folder, a FIFO, or a symbolic link at the file or in any
+    /// folder on the way: every folder is opened with `O_NOFOLLOW` and the file itself is only
+    /// `fstatat`ed with `AT_SYMLINK_NOFOLLOW`), a path BeepBar has no permission to look into, or
+    /// a regular file and whether it carries an execute permission. Never opens the file, so it
+    /// can't block on a FIFO or download an iCloud-evicted file just to look at it.
+    public func openableFileState(_ path: RelativePath) throws -> OpenableFileState {
+        let parentAndName: (Int32, String)
+        do {
+            parentAndName = try parentDirectory(for: path, create: false)
+        } catch where errno == ENOENT {
+            return .missing
+        } catch where errno == ELOOP || errno == ENOTDIR {
+            return .notARegularFile
+        } catch where errno == EACCES || errno == EPERM {
+            return .unreadable
+        }
+        let (parent, name) = parentAndName
+        defer { close(parent) }
+        var metadata = stat()
+        guard fstatat(parent, name, &metadata, AT_SYMLINK_NOFOLLOW) == 0 else {
+            switch errno {
+            case ENOENT: return .missing
+            case EACCES, EPERM: return .unreadable
+            default: throw fileStoreError()
+            }
+        }
+        guard (metadata.st_mode & S_IFMT) == S_IFREG else { return .notARegularFile }
+        return .regular(executable: metadata.st_mode & 0o111 != 0)
+    }
+
     public func snapshotRegularFile(_ path: RelativePath) throws -> FileSnapshotState {
         try requireMovablePath(path)
         let (parent, name): (Int32, String)

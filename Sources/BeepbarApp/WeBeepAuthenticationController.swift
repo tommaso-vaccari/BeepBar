@@ -361,6 +361,12 @@ struct MenuBarSnapshot: Sendable {
     private var loginWindow: LoginWindowController?
     private var siteInfo: WeBeepSiteInfo?
     private var database: SyncDatabase?
+    /// Opens or reveals a file clicked in Attività; a fake in tests, so no test opens real apps.
+    private let fileOpener: ActivityFileOpening
+    /// Attività items whose click found a problem, shown on their row. Cleared whenever the
+    /// displayed summary or the sync folder changes: remote ids repeat across syncs, and a file
+    /// downloaded again must not inherit the previous run's warning.
+    @Published private(set) var activityItemProblems: [String: ActivityItemProblem] = [:]
     private let operationGate = RootOperationGate()
     private var apiClient: WeBeepAPIClient
     // One downloader for the whole app lifetime: a per-run one would leave its URLSession and
@@ -407,6 +413,7 @@ struct MenuBarSnapshot: Sendable {
     }
 
     override init() {
+        fileOpener = WorkspaceFileOpener()
         let selectedSite = MoodleSite.site(id: Self.defaults.string(forKey: Self.selectedSiteKey))
         self.selectedSite = selectedSite
         hasStoredCredential = false
@@ -497,7 +504,8 @@ struct MenuBarSnapshot: Sendable {
     }
 
 #if DEBUG
-    init(testRootURL: URL, database: SyncDatabase? = nil, rootID: UUID? = nil, notificationCenter: NotificationCenterClient = InertNotificationCenter()) {
+    init(testRootURL: URL, database: SyncDatabase? = nil, rootID: UUID? = nil, notificationCenter: NotificationCenterClient = InertNotificationCenter(), fileOpener: ActivityFileOpening = InertFileOpener()) {
+        self.fileOpener = fileOpener
         let site = MoodleSite.site(id: nil)
         selectedSite = site
         hasStoredCredential = true
@@ -581,6 +589,10 @@ struct MenuBarSnapshot: Sendable {
     func runAutomaticSyncForTesting() async { _ = await runAutomaticSync() }
 
     func setRootIDForTesting(_ id: UUID) { rootID = id }
+
+    /// Runs inside `openActivityItem` after it captured the folder and before it looks the file
+    /// up: lets a test change the folder mid-lookup.
+    var beforeActivityLookupForTesting: (@MainActor () async -> Void)?
 
     func setDisconnectedForTesting() {
         hasStoredCredential = false
@@ -813,7 +825,9 @@ struct MenuBarSnapshot: Sendable {
     }
 
     private func setSyncState(_ newState: AppSyncState) {
+        let previousSummary = lastSyncSummary
         syncState = newState
+        if lastSyncSummary != previousSummary { activityItemProblems = [:] }
         status = newState.detail
         if case .synced(let summary) = newState, let rootID {
             operationDefaults.set(summary.completedAt.timeIntervalSince1970, forKey: Self.lastSuccessfulReconciliationKey + rootID.uuidString)
@@ -928,6 +942,7 @@ struct MenuBarSnapshot: Sendable {
                 }
                 guard report.unresolved.isEmpty else { throw SyncDatabaseError.execution }
                 rootURL = selectedURL; rootID = selectedID; recoveryBlocked = false; hasPendingModuleMoves = false
+                activityItemProblems = [:]
                 courseFolders = [:]; conflicts = []; remoteChanges = []
                 try await restoreScopes(for: courses)
                 Self.defaults.set(selectedURL.path, forKey: Self.rootKey)
@@ -995,6 +1010,62 @@ struct MenuBarSnapshot: Sendable {
         if enabled && !wasEnabled { Task { await requestNotificationPermissionIfNeeded() } }
         configureBackgroundScheduler()
     }
+    /// A click on a file in Attività (`showInFinder` for the context menu's "Mostra nel Finder").
+    /// The file is looked up by its remote id in the sync database now, not when the sync ran, so
+    /// a file a later sync moved still opens. What is at that path is checked by `FileStore`,
+    /// off the main actor and without following symbolic links; see `ActivityFilePolicy` for what
+    /// opens and what is only shown in Finder.
+    func openActivityItem(id: String, name: String, showInFinder: Bool) async {
+        // Captured together before any await, so a folder change during the lookup can't apply
+        // one folder's path to another.
+        guard let database, let rootID, let rootURL else { report(.unavailable, for: id); return }
+#if DEBUG
+        await beforeActivityLookupForTesting?()
+#endif
+        let action: ActivityFileAction
+        do {
+            let trackedPath = try await database.baseline(rootID: rootID, remoteID: id)?.relativePath
+            let fileState: OpenableFileState
+            if let trackedPath {
+                let store: FileStore
+                do { store = try FileStore(root: rootURL) } catch {
+                    guard self.rootID == rootID else { return }
+                    report(.folderUnavailable, for: id)
+                    return
+                }
+                fileState = try await store.openableFileState(trackedPath)
+            } else {
+                fileState = .missing
+            }
+            action = ActivityFilePolicy.action(trackedPath: trackedPath, root: rootURL, fileState: fileState)
+        } catch {
+            guard self.rootID == rootID else { return }
+            report(.unavailable, for: id)
+            return
+        }
+        guard self.rootID == rootID else { return }
+        switch action {
+        case .open(let url):
+            activityItemProblems[id] = nil
+            if showInFinder { fileOpener.reveal(url) } else { fileOpener.open(url) }
+        case .reveal(let url):
+            activityItemProblems[id] = nil
+            fileOpener.reveal(url)
+        case .missing:
+            report(.missing, for: id)
+        case .unreadable:
+            report(.unreadable, for: id)
+        }
+    }
+
+    /// Shows the problem on the row and announces it to VoiceOver on every click, including a
+    /// repeated one on a row that already shows it (the row itself doesn't change then).
+    private func report(_ problem: ActivityItemProblem, for id: String) {
+        activityItemProblems[id] = problem
+        guard let app = NSApp else { return }
+        NSAccessibility.post(element: app, notification: .announcementRequested, userInfo: [.announcement: problem.message, .priority: NSAccessibilityPriorityLevel.high.rawValue])
+    }
+
     /// What the switch shows at launch: the stored choice, on when never set.
     nonisolated static func storedNotificationsEnabled(in defaults: UserDefaults) -> Bool {
         NotificationPolicy.isEnabled(storedValue: defaults.object(forKey: NotificationPolicy.enabledKey))

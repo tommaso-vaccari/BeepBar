@@ -121,7 +121,9 @@ Al primo sync dopo l'aggiornamento, i file che il professore aveva rimosso da Mo
 
 - Un corso che Moodle rifiuta (non più iscritto, nascosto, riservato) non blocca gli altri; compare come "Corso non accessibile" nei dettagli.
 - Se tutti i corsi falliscono per un problema del sito o della connessione, il sync viene segnalato come non riuscito e nessun file viene toccato.
-- Il sync automatico non usa connessioni a consumo (hotspot) e rispetta la modalità Dati ridotti; viene rimandato, non saltato, se c'è il Risparmio energetico o un'altra operazione in corso.
+- Il sync automatico usa qualsiasi rete, compreso l'hotspot del telefono, come "Sincronizza ora". **[PR #76]** Viene rimandato, non saltato, se c'è il Risparmio energetico o un'altra operazione in corso.
+- **[PR #76]** Con "Risparmio dati" attivo (Impostazioni, spento di default), il sync automatico si mette in pausa quando il Mac usa l'hotspot del telefono o una rete con la Modalità dati ridotti, e riprende da solo su un'altra rete. Se il Mac passa a una di queste reti durante un sync automatico, il sync si interrompe e viene rimandato senza segnalare un errore, e l'ultimo risultato resta visibile. Una connessione davvero assente resta "Connessione assente". "Sincronizza ora" scarica sempre, su qualsiasi rete.
+- **[PR #76]** La pausa compare solo al posto di "Pronto", dell'ultimo risultato o di "Connessione assente": conflitti, accesso scaduto e cartella da scegliere restano in primo piano.
 
 - Durante l'aggiornamento dei corsi, i loro interruttori sono disabilitati; una scelta ancora in salvataggio viene applicata prima di ripristinare la lista aggiornata.
 - Annullare durante i controlli finali termina il sync senza mostrare un risultato completato o inviare la sua notifica. Quando compare il completamento o l'errore, il sync è terminato e l'invio della notifica non può lasciare attivo Annulla.
@@ -134,9 +136,9 @@ Al primo sync dopo l'aggiornamento, i file che il professore aveva rimosso da Mo
 
 | Posto | Contenuto |
 |---|---|
-| **Home** | Un avviso che porta a Conflitti finché qualcosa aspetta una tua scelta, compresi i file spostati o rimossi su Moodle |
+| **Home** | Un avviso che porta a Conflitti finché qualcosa aspetta una tua scelta, compresi i file spostati o rimossi su Moodle. **[PR #76]** Con Risparmio dati in pausa, la scheda in alto dice "In pausa per Risparmio dati", spiega perché e come riprende, e mostra ancora quando è stato l'ultimo sync |
 | **Attività** | Solo l'ultima sincronizzazione: nuovi, aggiornati, modifiche tue, non aggiornati, spostati, e i file modificati spostati su Moodle che ora aspettano in Conflitti. Un clic apre il file dove si trova ora, anche se un sync successivo l'ha spostato; il menu del tasto destro lo mostra anche nel Finder. Si aprono direttamente solo i documenti; tutto il resto (script, app, immagini disco, tipi sconosciuti) viene solo mostrato nel Finder. Un file che non è più dove BeepBar l'ha messo, anche se sostituito con un alias Finder, viene segnalato sulla sua riga; se manca il permesso di lettura, la riga segnala il problema e non apre niente |
 | **Conflitti** | Tutto ciò che aspetta una tua scelta, finché non scegli: conflitti e file spostati o rimossi su Moodle. Una scelta rifiutata o non riuscita mostra il motivo in questa pagina; una scelta successiva cancella il vecchio messaggio |
-| **Menu bar** | Lo stato dell'ultimo sync. Nessun testo nuovo per spostamenti e rimozioni |
+| **Menu bar** | Lo stato dell'ultimo sync. Nessun testo nuovo per spostamenti e rimozioni. **[PR #76]** Con Risparmio dati in pausa, "In pausa per Risparmio dati" e il motivo: "In attesa del Wi-Fi" o "Modalità dati ridotti attiva" |
 | **Accesso** | Onboarding e Impostazioni mostrano l'accesso non riuscito accanto al pulsante; il tentativo successivo cancella il vecchio messaggio. Un tentativo non riuscito non sostituisce un account esistente. La scelta dell'università resta bloccata durante l'accesso; verifica, nuovo accesso e disconnessione aspettano la conclusione di un controllo dell'account in corso |
 | **Notifiche** | Come oggi (nuovi materiali, conflitti). Nessuna notifica nuova per spostamenti e rimozioni. Si possono spegnere in Impostazioni: da spente non ne parte nessuna, e un conflitto ancora aperto può essere notificato al sync automatico successivo alla riaccensione. Un clic apre Conflitti, Attività o Corsi. Compaiono anche quando BeepBar è in primo piano |

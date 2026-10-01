@@ -12,7 +12,7 @@
 
 - Clicking a notification now opens BeepBar where it matters: Conflitti for conflicts, Attività for new materials, Corsi for sign-in and sync problems. Notifications also appear while BeepBar is in front, instead of being dropped.
 
-- Files listed in Attività open with a click, or show in Finder from the right-click menu. A file a later sync moved still opens where it is now, and if you moved or deleted it, Attività says so. Only documents (PDF, Office, iWork, text, images, audio, video, zip) open directly; anything else, such as scripts, apps or disk images, is only shown in Finder, so a click never runs a file.
+- Files listed in Attività open with a click, or show in Finder from the right-click menu; hovering a file shows which of the two a click will do. A file a later sync moved still opens where it is now, and if you moved or deleted it, Attività says so. Only documents (PDF, Office, iWork, text, images, audio, video, zip) open directly; anything else, such as scripts, apps or disk images, is only shown in Finder, so a click never runs a file.
 
 ### Improved
 

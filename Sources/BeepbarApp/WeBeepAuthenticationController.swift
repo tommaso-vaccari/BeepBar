@@ -194,23 +194,27 @@ struct SyncCompletionSummary: Codable, Equatable {
 enum SyncCopy {
     /// What happened after a choice about a file Moodle moved or removed.
     static func remoteChangeStatus(_ outcome: RemoteChangeOutcome, action: RemoteChangeAction) -> String {
+        remoteChangeFeedback(outcome, action: action).text
+    }
+
+    static func remoteChangeFeedback(_ outcome: RemoteChangeOutcome, action: RemoteChangeAction) -> BilingualText {
         switch outcome {
         case .done:
             switch action {
-            case .moveMine: tr("File spostato nella nuova cartella.", "File moved to the new folder.")
-            case .leaveHere: tr("Il file resta dov’è e continua a essere sincronizzato lì.", "The file stays where it is and keeps syncing there.")
-            case .keep, .keepBoth: tr("Il file resta sul Mac ed esce dalla sincronizzazione.", "The file stays on your Mac and is no longer synced.")
-            case .trash: tr("File spostato nel Cestino.", "File moved to the Trash.")
-            case .replaceNewCopy: tr("La tua versione ha preso il posto della copia nuova, che è nel Cestino.", "Your version took the new copy’s place; the new copy is in the Trash.")
+            case .moveMine: BilingualText("File spostato nella nuova cartella.", "File moved to the new folder.")
+            case .leaveHere: BilingualText("Il file resta dov’è e continua a essere sincronizzato lì.", "The file stays where it is and keeps syncing there.")
+            case .keep, .keepBoth: BilingualText("Il file resta sul Mac ed esce dalla sincronizzazione.", "The file stays on your Mac and is no longer synced.")
+            case .trash: BilingualText("File spostato nel Cestino.", "File moved to the Trash.")
+            case .replaceNewCopy: BilingualText("La tua versione ha preso il posto della copia nuova, che è nel Cestino.", "Your version took the new copy’s place; the new copy is in the Trash.")
             }
         case .fileChanged:
-            tr("Il file è cambiato nel frattempo: non è stato toccato. Controlla e scegli di nuovo.", "The file changed in the meantime and was not touched. Check it and choose again.")
+            BilingualText("Il file è cambiato nel frattempo: non è stato toccato. Controlla e scegli di nuovo.", "The file changed in the meantime and was not touched. Check it and choose again.")
         case .gone:
-            tr("Il file non è più dove era: non c’è più niente da scegliere.", "The file is no longer where it was: there is nothing left to choose.")
+            BilingualText("Il file non è più dove era: non c’è più niente da scegliere.", "The file is no longer where it was: there is nothing left to choose.")
         case .newCopyUnavailable:
-            tr("La copia nuova non è disponibile. Riprova la sincronizzazione prima di spostare la tua nel Cestino.", "The new copy is unavailable. Retry synchronization before moving yours to the Trash.")
+            BilingualText("La copia nuova non è disponibile. Riprova la sincronizzazione prima di spostare la tua nel Cestino.", "The new copy is unavailable. Retry synchronization before moving yours to the Trash.")
         case .newCopyNotReplaceable:
-            tr("La copia nuova non è ancora scaricata o è stata modificata: non è stata sostituita.", "The new copy isn’t downloaded yet or was edited, so it wasn’t replaced.")
+            BilingualText("La copia nuova non è ancora scaricata o è stata modificata: non è stata sostituita.", "The new copy isn’t downloaded yet or was edited, so it wasn’t replaced.")
         }
     }
 
@@ -313,11 +317,21 @@ struct MenuBarSnapshot: Sendable {
         didSet { defaultCourseFolders = Self.defaultFolders(for: courses, saved: courseFolders) }
     }
     @Published private(set) var hasStoredCredential: Bool {
-        didSet { refreshMenuBarSnapshot() }
+        didSet {
+            if !hasStoredCredential {
+                conflictChoiceFeedback = nil
+                authenticationFeedback = nil
+            }
+            refreshMenuBarSnapshot()
+        }
     }
+    /// Refused or failed choices stay visible on the Conflicts page until the next choice.
+    @Published private(set) var conflictChoiceFeedback: BilingualText?
+    /// Login failures belong beside the sign-in button, including during onboarding.
+    @Published private(set) var authenticationFeedback: BilingualText?
     @Published private(set) var status = tr("Avvio BeepBar…", "Starting BeepBar…")
     @Published private(set) var syncState: AppSyncState = .starting {
-        didSet { refreshMenuBarSnapshot() }
+        didSet { notificationGeneration += 1; refreshMenuBarSnapshot() }
     }
     @Published private(set) var accountState: AccountState = .notConnected {
         didSet { refreshMenuBarSnapshot() }
@@ -372,7 +386,7 @@ struct MenuBarSnapshot: Sendable {
     // One downloader for the whole app lifetime: a per-run one would leave its URLSession and
     // delegate alive forever, since nothing invalidates them when a run ends.
     private var downloader: RemoteDownloader
-    private let credentialVault = CredentialVault(read: FileTokenStore.load, write: FileTokenStore.save)
+    private let credentialVault: CredentialVault
     private let notificationCoordinator: SyncNotificationCoordinator
     private var backgroundScheduler: NSBackgroundActivityScheduler?
     private var bootstrapTask: Task<Void, Never>?
@@ -384,14 +398,23 @@ struct MenuBarSnapshot: Sendable {
     // clearing it redrew nothing and the window stayed on "Annulla" after a sync that downloaded
     // new files, with a button that no longer did anything.
     @Published private var activeOperationID: UUID? {
-        didSet { refreshMenuBarSnapshot() }
+        didSet {
+            if activeOperationID != nil { notificationGeneration += 1 }
+            refreshMenuBarSnapshot()
+        }
     }
+    /// Survives operation finalization, so awaiting notification permission cannot resurrect an
+    /// earlier result once a new run or account state has replaced it.
+    private var notificationGeneration = 0
     private var automaticOutcome: AutomaticSyncOutcome = .finished
-    private var rootID: UUID?
+    private var rootID: UUID? {
+        didSet { if rootID != oldValue { conflictChoiceFeedback = nil } }
+    }
     private var scheduledConfiguration: BackgroundScheduleConfiguration?
 #if DEBUG
     private var beforeReconciliationStateForTesting: (@MainActor () async -> Void)?
     private var beforePendingChoicesForTesting: (@MainActor () async -> Void)?
+    private var courseLoadTaskForTesting: Task<Void, Never>?
     private var testDefaults: UserDefaults?
     private var beforeScopeRestoreForTesting: (@MainActor () -> Void)?
 #endif
@@ -413,6 +436,7 @@ struct MenuBarSnapshot: Sendable {
     }
 
     override init() {
+        credentialVault = CredentialVault(read: FileTokenStore.load, write: FileTokenStore.save)
         fileOpener = WorkspaceFileOpener()
         let selectedSite = MoodleSite.site(id: Self.defaults.string(forKey: Self.selectedSiteKey))
         self.selectedSite = selectedSite
@@ -504,7 +528,8 @@ struct MenuBarSnapshot: Sendable {
     }
 
 #if DEBUG
-    init(testRootURL: URL, database: SyncDatabase? = nil, rootID: UUID? = nil, notificationCenter: NotificationCenterClient = InertNotificationCenter(), fileOpener: ActivityFileOpening = InertFileOpener()) {
+    init(testRootURL: URL, database: SyncDatabase? = nil, rootID: UUID? = nil, notificationCenter: NotificationCenterClient = InertNotificationCenter(), fileOpener: ActivityFileOpening = InertFileOpener(), apiClient: WeBeepAPIClient? = nil, credentialVault: CredentialVault? = nil) {
+        self.credentialVault = credentialVault ?? CredentialVault(read: FileTokenStore.load, write: FileTokenStore.save)
         self.fileOpener = fileOpener
         let site = MoodleSite.site(id: nil)
         selectedSite = site
@@ -519,8 +544,8 @@ struct MenuBarSnapshot: Sendable {
         enabledCourseIDs = [1]
         automaticSyncEnabled = false
         automaticSyncInterval = 28_800
-        apiClient = WeBeepAPIClient(policy: site.serverPolicy)
-        downloader = RemoteDownloader(policy: apiClient.policy)
+        self.apiClient = apiClient ?? WeBeepAPIClient(policy: site.serverPolicy)
+        downloader = RemoteDownloader(policy: self.apiClient.policy)
         self.database = database
         self.rootID = rootID
         super.init()
@@ -541,6 +566,13 @@ struct MenuBarSnapshot: Sendable {
         let folder = FileManager.default.temporaryDirectory.appending(path: "BeepbarTestDefaults-\(UUID().uuidString)", directoryHint: .isDirectory)
         try? FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
         return folder.appending(path: "defaults").path
+    }
+
+    var apiHostForTesting: String { apiClient.policy.host }
+
+    func completeLoginForTesting(_ callback: URL) async {
+        await completeLogin(.success(callback))?.value
+        await courseLoadTaskForTesting?.value
     }
 
     func setOperationForTesting(_ operationID: UUID?, task: Task<Void, Never>? = nil) {
@@ -578,8 +610,8 @@ struct MenuBarSnapshot: Sendable {
         notificationCoordinator.beforeNotificationForTesting = action
     }
 
-    func completeSyncForTesting(_ operationID: UUID, summary: SyncProgress) async {
-        await completeSync(operationID, summary: summary, automatic: false)
+    func completeSyncForTesting(_ operationID: UUID, summary: SyncProgress, automatic: Bool = false) async {
+        await completeSync(operationID, summary: summary, automatic: automatic)
     }
 
     func setBeforeReconciliationStateForTesting(_ action: @escaping @MainActor () async -> Void) {
@@ -697,7 +729,7 @@ struct MenuBarSnapshot: Sendable {
     /// Forgets the stored token so another account, or another university, can be connected.
     /// The sync folder, its files and the course selection stay as they are.
     func signOut(removeFile: (URL) throws -> Void = { try FileManager.default.removeItem(at: $0) }) {
-        guard hasStoredCredential, !isSyncActive, !isAuthenticating, !isLoadingCourses else { return }
+        guard hasStoredCredential, !isSyncActive, !isAuthenticating, !isVerifying, !isLoadingCourses else { return }
         do {
             try FileTokenStore.delete(removeFile: removeFile)
         } catch {
@@ -1284,7 +1316,8 @@ struct MenuBarSnapshot: Sendable {
     }
 
     func resolve(_ conflict: ConflictRecord, with resolution: ConflictResolution) {
-        guard resolvingConflictID == nil, let rootURL, let database, !recoveryBlocked, !isSyncActive else { return }
+        guard resolvingConflictID == nil, resolvingRemoteChangeID == nil, let rootURL, let rootID, let database, !recoveryBlocked, !isSyncActive else { return }
+        conflictChoiceFeedback = nil
         resolvingConflictID = conflict.id
         Task { [weak self] in
             defer { self?.resolvingConflictID = nil }
@@ -1298,7 +1331,7 @@ struct MenuBarSnapshot: Sendable {
                 case .useRemote:
                     let result = try await resolver.useRemote(id: conflict.id)
                     guard result.isInstalled else {
-                        self.status = tr("Il file locale è cambiato nel frattempo: conflitto lasciato aperto.", "The local file changed in the meantime: the conflict was left open.")
+                        self.reportConflictChoiceFeedback(BilingualText("Il file locale è cambiato nel frattempo: conflitto lasciato aperto.", "The local file changed in the meantime: the conflict was left open."), rootID: rootID)
                         self.refreshConflicts()
                         return
                     }
@@ -1306,7 +1339,7 @@ struct MenuBarSnapshot: Sendable {
                 }
                 self.refreshConflicts()
             } catch {
-                self?.status = tr("Impossibile risolvere il conflitto: nessun file locale è stato scartato.", "Couldn't resolve the conflict: no local file was discarded.")
+                self?.reportConflictChoiceFeedback(BilingualText("Impossibile completare la risoluzione del conflitto. Controlla il file e aggiorna prima di riprovare.", "Couldn't finish resolving this conflict. Check the file and refresh before retrying."), rootID: rootID)
                 self?.refreshConflicts()
             }
         }
@@ -1316,6 +1349,7 @@ struct MenuBarSnapshot: Sendable {
     /// stale entry never moves or trashes anything (see `RemoteChangeResolver`).
     func resolve(_ change: RemoteChange, with action: RemoteChangeAction) {
         guard resolvingRemoteChangeID == nil, resolvingConflictID == nil, let rootURL, let rootID, let database, !recoveryBlocked, !isSyncActive else { return }
+        conflictChoiceFeedback = nil
         resolvingRemoteChangeID = change.id
         Task { [weak self] in
             defer { self?.resolvingRemoteChangeID = nil }
@@ -1324,29 +1358,42 @@ struct MenuBarSnapshot: Sendable {
                 let resolver = RemoteChangeResolver(database: database, fileStore: try FileStore(root: rootURL), gate: self.operationGate)
                 let outcome = try await resolver.perform(action, on: change.id, rootID: rootID)
                 self.status = SyncCopy.remoteChangeStatus(outcome, action: action)
+                switch outcome {
+                case .done, .gone: break
+                default: self.reportConflictChoiceFeedback(SyncCopy.remoteChangeFeedback(outcome, action: action), rootID: rootID)
+                }
             } catch {
-                self?.status = tr("Impossibile completare la scelta. Nessun file è stato sovrascritto o cancellato definitivamente.", "Couldn't carry out the choice. No file was overwritten or permanently deleted.")
+                self?.reportConflictChoiceFeedback(BilingualText("Impossibile completare la scelta. Nessun file è stato sovrascritto o cancellato definitivamente.", "Couldn't carry out the choice. No file was overwritten or permanently deleted."), rootID: rootID)
             }
             self?.refreshConflicts()
         }
     }
 
+    private func reportConflictChoiceFeedback(_ feedback: BilingualText, rootID: UUID) {
+        guard self.rootID == rootID, hasStoredCredential else { return }
+        conflictChoiceFeedback = feedback
+    }
+
     func startLogin() {
-        guard !isAuthenticating else { return }
+        guard !isAuthenticating, !isVerifying else { return }
+        authenticationFeedback = nil
         isAuthenticating = true; status = tr("Autenticazione \(selectedSite.displayName) in corso…", "Signing in to \(selectedSite.displayName)…")
-        loginWindow = LoginWindowController(site: selectedSite) { [weak self] result in self?.completeLogin(result) }
+#if DEBUG
+        if testDefaults != nil { return }
+#endif
+        loginWindow = LoginWindowController(site: selectedSite) { [weak self] result in _ = self?.completeLogin(result) }
         loginWindow?.showWindow(nil)
     }
 
     func selectUniversity(_ university: MoodleUniversity) {
-        guard !hasStoredCredential else { return }
+        guard !hasStoredCredential, !isAuthenticating, !isVerifying else { return }
         selectSite(university == .polimi ? .polimi : MoodleSite.unipd[0])
     }
 
     func selectSite(_ site: MoodleSite) {
-        guard !hasStoredCredential, site != selectedSite else { return }
+        guard !hasStoredCredential, !isAuthenticating, !isVerifying, site != selectedSite else { return }
         selectedSite = site
-        Self.defaults.set(site.id, forKey: Self.selectedSiteKey)
+        operationDefaults.set(site.id, forKey: Self.selectedSiteKey)
         apiClient = WeBeepAPIClient(policy: site.serverPolicy)
         downloader = RemoteDownloader(policy: site.serverPolicy)
         siteInfo = nil
@@ -1354,7 +1401,7 @@ struct MenuBarSnapshot: Sendable {
         // Course ids belong to one site: the previous site's selection must not enable whatever
         // course happens to share an id on the new one.
         enabledCourseIDs = []
-        Self.defaults.set([String](), forKey: Self.enabledCoursesKey)
+        operationDefaults.set([String](), forKey: Self.enabledCoursesKey)
         if let database, let rootID {
             let previousWrite = scopeWriteTask
             scopeWriteTask = Task { await previousWrite?.value; try? await database.disableAllScopes(rootID: rootID) }
@@ -1362,11 +1409,10 @@ struct MenuBarSnapshot: Sendable {
         configureBackgroundScheduler()
     }
 
-    func validateConnection() {
-        guard !Self.isUIPreview else { return }
-        guard !isVerifying else { return }
+    @discardableResult func validateConnection() -> Task<Void, Never>? {
+        guard !Self.isUIPreview, !isVerifying, !isAuthenticating else { return nil }
         isVerifying = true; status = tr("Verifica connessione \(selectedSite.platformName) in corso…", "Checking the \(selectedSite.platformName) connection…")
-        Task { [weak self] in
+        return Task { [weak self] in
             defer { self?.isVerifying = false }
             do {
                 guard let self else { return }
@@ -1374,7 +1420,7 @@ struct MenuBarSnapshot: Sendable {
                 let siteInfo = try await self.apiClient.validateToken(token)
                 self.siteInfo = siteInfo
                 self.accountState = .connected
-                Self.defaults.removeObject(forKey: Self.credentialExpiredKey)
+                self.operationDefaults.removeObject(forKey: Self.credentialExpiredKey)
                 self.notificationCoordinator.clearFailure()
                 self.setSyncState(self.rootURL == nil ? .needsFolder : .readyUnchecked)
                 self.configureBackgroundScheduler()
@@ -1393,7 +1439,7 @@ struct MenuBarSnapshot: Sendable {
         guard accountState == .connected, hasStoredCredential, !isLoadingCourses, !isSyncActive else { return }
         courseLoadError = nil
         isLoadingCourses = true
-        Task { [weak self] in
+        let task = Task { [weak self] in
             defer { self?.isLoadingCourses = false }
             do {
                 guard let self else { return }
@@ -1416,6 +1462,11 @@ struct MenuBarSnapshot: Sendable {
                 self?.courseLoadError = BilingualText("Impossibile aggiornare i corsi. Riprova.", "Couldn't refresh courses. Try again.")
             }
         }
+#if DEBUG
+        courseLoadTaskForTesting = task
+#else
+        _ = task
+#endif
     }
 
     /// Fetches the enrolled courses and makes them the current list. Shared by the course list
@@ -1428,7 +1479,7 @@ struct MenuBarSnapshot: Sendable {
         try await restoreScopes(for: courses)
         self.courses = Self.orderedForDisplay(courses, enabledCourseIDs: enabledCourseIDs)
         accountState = .connected
-        Self.defaults.removeObject(forKey: Self.credentialExpiredKey)
+        operationDefaults.removeObject(forKey: Self.credentialExpiredKey)
     }
 
     private func fetchEnrolledCourses(token: String) async throws -> [RemoteCourseSummary] {
@@ -1507,13 +1558,18 @@ struct MenuBarSnapshot: Sendable {
         return FileManager.default.fileExists(atPath: url.path, isDirectory: &isDirectory) && isDirectory.boolValue ? url : nil
     }
 
-    private func completeLogin(_ result: Result<URL, LoginWindowError>) {
-        loginWindow = nil; isAuthenticating = false
+    @discardableResult private func completeLogin(_ result: Result<URL, LoginWindowError>) -> Task<Void, Never>? {
+        loginWindow = nil
+        authenticationFeedback = nil
         // A cancelled or failed login leaves the current account and its course list untouched.
         guard case let .success(callback) = result, let token = token(from: callback) else {
-            status = tr("Accesso a \(selectedSite.platformName) annullato o callback non valido.", "Sign-in to \(selectedSite.platformName) cancelled or invalid callback."); return
+            isAuthenticating = false
+            authenticationFeedback = BilingualText("Accesso a \(selectedSite.platformName) annullato o callback non valido.", "Sign-in to \(selectedSite.platformName) cancelled or invalid callback.")
+            return nil
         }
-        Task { [weak self] in
+        isAuthenticating = true
+        return Task { [weak self] in
+            defer { self?.isAuthenticating = false }
             do {
                 guard let self else { return }
                 let siteInfo = try await self.apiClient.validateToken(token)
@@ -1523,15 +1579,15 @@ struct MenuBarSnapshot: Sendable {
                 self.siteInfo = siteInfo
                 self.hasStoredCredential = true
                 self.accountState = .connected
-                Self.defaults.removeObject(forKey: Self.credentialExpiredKey)
+                self.operationDefaults.removeObject(forKey: Self.credentialExpiredKey)
                 self.notificationCoordinator.clearFailure()
                 self.setSyncState(self.rootURL == nil ? .needsFolder : .readyUnchecked)
                 self.configureBackgroundScheduler()
                 self.loadCourses()
             } catch let error as WeBeepAPIError where error == .invalidToken {
-                self?.status = tr("Il token ricevuto non è valido. Accedi di nuovo alla piattaforma.", "The received token isn't valid. Sign in to the platform again.")
+                self?.authenticationFeedback = BilingualText("Il token ricevuto non è valido. Accedi di nuovo alla piattaforma.", "The received token isn't valid. Sign in to the platform again.")
             } catch {
-                self?.status = tr("Impossibile verificare l'accesso alla piattaforma. Il token non è stato salvato.", "Couldn't verify access to the platform. The token wasn't saved.")
+                self?.authenticationFeedback = BilingualText("Impossibile verificare l'accesso alla piattaforma. Il token non è stato salvato.", "Couldn't verify access to the platform. The token wasn't saved.")
             }
         }
     }
@@ -1933,12 +1989,28 @@ struct MenuBarSnapshot: Sendable {
         if summary.failures == 0 { notificationCoordinator.clearFailure() }
         BeepbarLog.sync.notice("Synchronization completed automatic=\(automatic, privacy: .public) total=\(summary.total, privacy: .public) installed=\(summary.installed, privacy: .public) conflicts=\(summary.conflicts, privacy: .public) failures=\(summary.failures, privacy: .public)")
         configureBackgroundScheduler()
+        let isCurrent = currentNotificationCheck()
         await finishOperationBeforeNotification(operationID) {
             if automatic {
-                await notificationCoordinator.notifyAutomaticRun(installed: summary.installed, conflicts: conflicts, failures: summary.failures)
+                await notificationCoordinator.notifyAutomaticRun(installed: summary.installed, conflicts: conflicts, failures: summary.failures, isCurrent: isCurrent)
             } else {
-                await notificationCoordinator.notifyManualRun(added: summary.added)
+                await notificationCoordinator.notifyManualRun(added: summary.added, isCurrent: isCurrent)
             }
+        }
+    }
+
+    /// Captures notification validity separately from the active operation, which must end before
+    /// delivery. Checking the captured account and folder also covers changes with no sync state write.
+    private func currentNotificationCheck() -> @MainActor () -> Bool {
+        let generation = notificationGeneration
+        let site = selectedSite
+        let root = rootID
+        let folder = rootURL
+        let credential = hasStoredCredential
+        return { [weak self] in
+            guard let self else { return false }
+            return self.notificationGeneration == generation && self.selectedSite == site
+                && self.rootID == root && self.rootURL == folder && self.hasStoredCredential == credential
         }
     }
 
@@ -1978,8 +2050,9 @@ struct MenuBarSnapshot: Sendable {
             setSyncState(.failed(.partialSync))
             issue = automatic ? .partialSync : nil
         }
+        let isCurrent = currentNotificationCheck()
         await finishOperationBeforeNotification(operationID) {
-            if let issue { await notificationCoordinator.notify(issue: issue) }
+            if let issue { await notificationCoordinator.notify(issue: issue, isCurrent: isCurrent) }
         }
     }
 
@@ -2002,7 +2075,7 @@ struct MenuBarSnapshot: Sendable {
 
     private func expireCredential() async {
         await credentialVault.invalidate()
-        Self.defaults.set(true, forKey: Self.credentialExpiredKey)
+        operationDefaults.set(true, forKey: Self.credentialExpiredKey)
         accountState = .expired
         setSyncState(.failed(.authenticationExpired))
         configureBackgroundScheduler()

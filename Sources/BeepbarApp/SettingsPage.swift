@@ -55,6 +55,7 @@ struct SettingsPage: View {
         Section {
             if !authentication.hasStoredCredential {
                 MoodleSitePicker(authentication: authentication)
+                    .disabled(authentication.isAuthenticating || authentication.isVerifying)
             }
             HStack(spacing: 12) {
                 SymbolTile(systemImage: accountSymbol, tint: accountTint, size: 34)
@@ -69,16 +70,21 @@ struct SettingsPage: View {
                     ProgressView().controlSize(.small)
                 }
                 Button(tr("Verifica", "Verify")) { authentication.validateConnection() }
-                    .disabled(!authentication.hasStoredCredential || authentication.isVerifying)
+                    .disabled(!authentication.hasStoredCredential || authentication.isVerifying || authentication.isAuthenticating)
                 if authentication.hasStoredCredential {
                     Button(tr("Disconnetti…", "Disconnect…")) { showSignOutConfirmation = true }
-                        .disabled(authentication.isSyncActive || authentication.isLoadingCourses)
+                        .disabled(authentication.isSyncActive || authentication.isLoadingCourses || authentication.isVerifying || authentication.isAuthenticating)
                 }
                 if authentication.accountState != .connected {
                     Button(authentication.accountState == .expired ? tr("Accedi di nuovo", "Sign in again") : tr("Accedi", "Sign in")) { authentication.startLogin() }
                         .buttonStyle(.borderedProminent)
-                        .disabled(authentication.isAuthenticating)
+                        .disabled(authentication.isAuthenticating || authentication.isVerifying)
                 }
+            }
+            if let feedback = authentication.authenticationFeedback {
+                Text(feedback.text)
+                    .font(.callout)
+                    .foregroundStyle(.orange)
             }
         } header: {
             Text(tr("Account \(authentication.selectedSite.platformName)", "\(authentication.selectedSite.platformName) account"))

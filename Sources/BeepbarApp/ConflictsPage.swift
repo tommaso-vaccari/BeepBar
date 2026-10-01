@@ -28,6 +28,13 @@ struct ConflictsPage: View {
                     .foregroundStyle(.secondary)
                     .fixedSize(horizontal: false, vertical: true)
 
+                if let feedback = authentication.conflictChoiceFeedback {
+                    Label(feedback.text, systemImage: "exclamationmark.triangle")
+                        .font(.callout)
+                        .foregroundStyle(.orange)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+
                 if pendingCount == 0 {
                     ContentUnavailableView {
                         Label(tr("Nessun conflitto aperto", "No open conflicts"), systemImage: "checkmark.seal")

@@ -113,9 +113,12 @@ enum AutomaticNotificationIssue: String {
         await center.requestAuthorization()
     }
 
-    func notifyAutomaticRun(installed: Int, conflicts: [ConflictRecord], failures: Int) async {
+    /// Validity is rechecked after permission reads and between sends: a disconnected account,
+    /// changed folder or newer result must not announce or record an obsolete condition.
+    func notifyAutomaticRun(installed: Int, conflicts: [ConflictRecord], failures: Int, isCurrent: @MainActor () -> Bool = { true }) async {
+        guard isCurrent() else { return }
         if conflicts.isEmpty { deduplication.resolve(condition: "conflicts") }
-        guard await canSend() else { return }
+        guard await canSend(), isCurrent() else { return }
         if !conflicts.isEmpty, isEnabled {
             let fingerprint = NotificationFingerprint.conflicts(conflicts)
             if deduplication.shouldNotify(condition: "conflicts", fingerprint: fingerprint, now: Date()) {
@@ -123,27 +126,27 @@ enum AutomaticNotificationIssue: String {
             }
         }
         if failures > 0 {
-            await notify(issue: .partialSync)
-        } else if installed > 0, isEnabled {
+            await notify(issue: .partialSync, isCurrent: isCurrent)
+        } else if installed > 0, isEnabled, isCurrent() {
             await sendNewMaterials(installed)
         }
     }
 
     /// A manual run started from the menu leaves no menu open to show its result, so say when new
     /// materials arrived. Nothing new stays silent: the icon returning to normal is enough.
-    func notifyManualRun(added: Int) async {
+    func notifyManualRun(added: Int, isCurrent: @MainActor () -> Bool = { true }) async {
 #if DEBUG
         if let beforeNotificationForTesting { await beforeNotificationForTesting(); return }
 #endif
-        guard added > 0, await canSend() else { return }
+        guard added > 0, await canSend(), isCurrent() else { return }
         await sendNewMaterials(added)
     }
 
-    func notify(issue: AutomaticNotificationIssue) async {
+    func notify(issue: AutomaticNotificationIssue, isCurrent: @MainActor () -> Bool = { true }) async {
 #if DEBUG
         if let beforeNotificationForTesting { await beforeNotificationForTesting(); return }
 #endif
-        guard await canSend() else { return }
+        guard await canSend(), isCurrent() else { return }
         guard isEnabled, deduplication.shouldNotify(condition: issue.rawValue, fingerprint: issue.rawValue, now: Date()) else { return }
         await center.send(identifier: "beepbar-\(issue.rawValue)", title: issue.title, body: issue.body, destination: .home)
     }

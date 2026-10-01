@@ -122,6 +122,7 @@ struct OnboardingView: View {
         VStack(spacing: 12) {
             if !authentication.hasStoredCredential {
                 MoodleSitePicker(authentication: authentication)
+                    .disabled(authentication.isAuthenticating || authentication.isVerifying)
             }
             HStack(spacing: 12) {
                 SymbolTile(
@@ -142,8 +143,14 @@ struct OnboardingView: View {
                 } else {
                     Button(tr("Accedi…", "Sign in…")) { authentication.startLogin() }
                         .buttonStyle(.borderedProminent)
-                        .disabled(authentication.isAuthenticating)
+                        .disabled(authentication.isAuthenticating || authentication.isVerifying)
                 }
+            }
+            if let feedback = authentication.authenticationFeedback {
+                Text(feedback.text)
+                    .font(.callout)
+                    .foregroundStyle(.orange)
+                    .fixedSize(horizontal: false, vertical: true)
             }
         }
         .card()

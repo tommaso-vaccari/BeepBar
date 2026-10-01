@@ -116,7 +116,7 @@ jobs:
 
           Built from commit [\`${GITHUB_SHA}\`](https://github.com/${{ github.repository }}/commit/${GITHUB_SHA}). Ad-hoc signed, not notarized — see the [README](https://github.com/${{ github.repository }}#tldr--install) for the first-launch Gatekeeper step.
 
-          ## Changes
+          ## What’s new in BeepBar $SHORT_VERSION
 
           $(cat release-notes.md)
           BODYEOF

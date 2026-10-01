@@ -66,9 +66,11 @@ public enum ActivityFilePolicy {
     /// Checked first: some of these also conform to a document type above (a script is plain text).
     private static let runnableTypes: [UTType] = [.sourceCode, .script, .executable, .application, .applicationBundle, .bundle, .package, .internetLocation, .diskImage]
 
-    /// Extensions refused regardless of the type macOS assigns: macro-enabled office files conform
-    /// to their plain counterparts; TeX sources are plain text, but a TeX editor with shell escape
-    /// can run commands from them; and these names must stay refused on every macOS version.
+    /// Extensions refused regardless of the type macOS assigns, so the decision doesn't depend on
+    /// the macOS version or the installed apps. Macro-enabled office files: on macOS 27 their
+    /// types already fall outside `documentTypes` (tests pass without this entry), kept in case a
+    /// version or an office suite declares them as conforming to the plain document. TeX sources
+    /// are plain text, but a TeX editor with shell escape can run commands from them.
     private static let excludedExtensions: Set<String> = [
         "docm", "dotm", "xlsm", "xltm", "xlam", "pptm", "potm", "ppsm", "ppam",
         "tex", "ltx", "latex", "sty", "cls", "bib",

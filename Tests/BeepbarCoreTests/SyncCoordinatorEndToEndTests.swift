@@ -462,10 +462,16 @@ import Testing
 
     /// Known issue: proves that a scheduled run still reads course contents over a metered hotspot
     /// and under Low Data Mode, while docs/sync-behavior §6 says automatic sync uses neither. Only
-    /// downloads are restricted today (see the test above); the metadata requests carry no network
-    /// restriction. Whether the code or the specification changes is still to be decided. Once the
-    /// requests are restricted, `withKnownIssue` reports that the issue no longer occurs: remove the
-    /// wrapper and keep the test as the regression check.
+    /// downloads are restricted today (see the test above). This covers only the coordinator's
+    /// `core_course_get_contents`; the app's own requests in a scheduled run (site info, enrolled
+    /// courses) and the token check after a refused download are covered by
+    /// `AutomaticSyncNetworkTests` in the app tests. It sees restrictions set on each request, the
+    /// way `NetworkAccess` works for downloads. Whether the code or the specification changes is
+    /// still to be decided:
+    /// - requests restricted: `withKnownIssue` reports that the issue no longer occurs; remove the
+    ///   wrapper and keep the test as the regression check;
+    /// - the whole run deferred instead: rewrite the test around the deferral;
+    /// - the specification changed instead: delete the test and update both `sync-behavior` files.
     @Test func automaticSyncReadsCourseContentsWithoutExpensiveOrConstrainedNetworkAccess() async throws {
         let fixture = try await Fixture()
         defer { fixture.remove() }

@@ -6,6 +6,10 @@ import BeepbarCore
 /// and records every request with the network restrictions it carried. Everything is keyed by the
 /// request's token, so tests running in parallel never see each other's courses or requests; each
 /// test registers its own token and must never use the installed app's.
+///
+/// Course contents are always empty, on purpose: the controller downloads through a real
+/// `RemoteDownloader` session, not this protocol, so listing a file here would send its download
+/// to the real WeBeep host. Download paths belong in the Core tests, which mock the downloader too.
 final class MoodleRecordingProtocol: URLProtocol, @unchecked Sendable {
     struct RecordedRequest: Hashable, Sendable {
         let function: String

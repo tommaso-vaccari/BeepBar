@@ -463,13 +463,14 @@ import Testing
     /// Known issue: proves that a scheduled run still reads course contents over a metered hotspot
     /// and under Low Data Mode, while docs/sync-behavior §6 says automatic sync uses neither. Only
     /// downloads are restricted today (see the test above). This covers only the coordinator's
-    /// `core_course_get_contents`; the app's own requests in a scheduled run (site info, enrolled
-    /// courses) and the token check after a refused download are covered by
-    /// `AutomaticSyncNetworkTests` in the app tests. It sees restrictions set on each request, the
-    /// way `NetworkAccess` works for downloads. Whether the code or the specification changes is
-    /// still to be decided:
-    /// - requests restricted: `withKnownIssue` reports that the issue no longer occurs; remove the
-    ///   wrapper and keep the test as the regression check;
+    /// `core_course_get_contents`. The token check after a refused download has its own test below.
+    /// The app's own requests in a scheduled run (site info, enrolled courses) are covered by
+    /// `AutomaticSyncNetworkTests` in the app tests. `manualSyncReadsCourseContentsOverAnyNetwork`
+    /// guards the other side: "Sincronizza ora" must keep working on any network. The test sees
+    /// restrictions set on each request, the way `NetworkAccess` works for downloads. Whether the
+    /// code or the specification changes is still to be decided:
+    /// - only a scheduled run's requests restricted: `withKnownIssue` reports that the issue no
+    ///   longer occurs; remove the wrapper and keep the test as the regression check;
     /// - the whole run deferred instead: rewrite the test around the deferral;
     /// - the specification changed instead: delete the test and update both `sync-behavior` files.
     @Test func automaticSyncReadsCourseContentsWithoutExpensiveOrConstrainedNetworkAccess() async throws {
@@ -480,6 +481,27 @@ import Testing
         #expect(fixture.upstream.contentsRequestCount == 1)
         withKnownIssue("Automatic sync reads course contents over metered and Low Data networks") {
             #expect(fixture.upstream.contentsNetworkAccess == [RecordedNetworkAccess(expensive: false, constrained: false)])
+        }
+    }
+
+    /// Known issue: proves that when Moodle refuses a download during a scheduled run, the token
+    /// check that follows (`core_webservice_get_site_info`) also goes over a metered hotspot and
+    /// under Low Data Mode, against docs/sync-behavior §6. It is the one request a scheduled run
+    /// sends from the coordinator besides the course contents, and the app tests cannot reach it:
+    /// their controller downloads through a real session. Same outcomes as the test above;
+    /// `manualSyncChecksTheTokenOverAnyNetwork` guards the manual side.
+    @Test func automaticSyncChecksTheTokenWithoutExpensiveOrConstrainedNetworkAccess() async throws {
+        let fixture = try await Fixture()
+        defer { fixture.remove() }
+        fixture.upstream.setStatus(course: 1, file: 0, status: 401)
+
+        await #expect(throws: WeBeepAPIError.transport(401)) {
+            try await fixture.synchronize(targets: [fixture.targets[0]], mode: .automatic)
+        }
+        // The refused download really led to the token check: no check would prove nothing.
+        #expect(fixture.upstream.validationCount == 1)
+        withKnownIssue("Automatic sync checks the token over metered and Low Data networks") {
+            #expect(fixture.upstream.validationNetworkAccess == [RecordedNetworkAccess(expensive: false, constrained: false)])
         }
     }
 
@@ -617,6 +639,33 @@ import Testing
         _ = try await fixture.synchronize(targets: [fixture.targets[0]], mode: .manual)
         #expect(fixture.upstream.downloadCount > 0)
         #expect(fixture.upstream.downloadNetworkAccess == [RecordedNetworkAccess(expensive: true, constrained: true)])
+    }
+
+    /// Proves that "Sincronizza ora" reads course contents over any network, metered hotspot and
+    /// Low Data Mode included, as it does today. Guards against fixing
+    /// `automaticSyncReadsCourseContentsWithoutExpensiveOrConstrainedNetworkAccess` by restricting
+    /// every request instead of only a scheduled run's.
+    @Test func manualSyncReadsCourseContentsOverAnyNetwork() async throws {
+        let fixture = try await Fixture()
+        defer { fixture.remove() }
+        _ = try await fixture.synchronize(targets: [fixture.targets[0]], mode: .manual)
+        #expect(fixture.upstream.contentsRequestCount == 1)
+        #expect(fixture.upstream.contentsNetworkAccess == [RecordedNetworkAccess(expensive: true, constrained: true)])
+    }
+
+    /// Proves that after a refused download in "Sincronizza ora", the token check may use any
+    /// network. Guards the manual side of
+    /// `automaticSyncChecksTheTokenWithoutExpensiveOrConstrainedNetworkAccess` the same way.
+    @Test func manualSyncChecksTheTokenOverAnyNetwork() async throws {
+        let fixture = try await Fixture()
+        defer { fixture.remove() }
+        fixture.upstream.setStatus(course: 1, file: 0, status: 401)
+
+        await #expect(throws: WeBeepAPIError.transport(401)) {
+            try await fixture.synchronize(targets: [fixture.targets[0]], mode: .manual)
+        }
+        #expect(fixture.upstream.validationCount == 1)
+        #expect(fixture.upstream.validationNetworkAccess == [RecordedNetworkAccess(expensive: true, constrained: true)])
     }
 
     // MARK: Following moves made on Moodle
@@ -1775,6 +1824,7 @@ private final class MutableFixtureUpstream: @unchecked Sendable {
     private var networkAccess: Set<RecordedNetworkAccess> = []
     private var contentsRequests = 0
     private var contentsAccess: Set<RecordedNetworkAccess> = []
+    private var validationAccess: Set<RecordedNetworkAccess> = []
     private var sectionNames: [Int64: String] = [:]
     private var moduleNames: [Int64: String] = [:]
     private var extraModules: [Int64: [Int64: (section: String, name: String)]] = [:]
@@ -1790,6 +1840,8 @@ private final class MutableFixtureUpstream: @unchecked Sendable {
     /// `core_course_get_contents` requests and the network restrictions they carried.
     var contentsRequestCount: Int { lock.withLock { contentsRequests } }
     var contentsNetworkAccess: Set<RecordedNetworkAccess> { lock.withLock { contentsAccess } }
+    /// The network restrictions the token checks (`core_webservice_get_site_info`) carried.
+    var validationNetworkAccess: Set<RecordedNetworkAccess> { lock.withLock { validationAccess } }
     func resetDownloadCount() { lock.withLock { downloads = 0 } }
 
     func populate(courses: Int, filesPerCourse: Int) {
@@ -1834,6 +1886,7 @@ private final class MutableFixtureUpstream: @unchecked Sendable {
                 let body = String(data: request.httpBody ?? bodyData(from: request.httpBodyStream), encoding: .utf8) ?? ""
                 if formValue("wsfunction", body: body) == "core_webservice_get_site_info" {
                     validations += 1
+                    validationAccess.insert(RecordedNetworkAccess(expensive: request.allowsExpensiveNetworkAccess, constrained: request.allowsConstrainedNetworkAccess))
                     let response: Data
                     if tokenIsValid {
                         response = Data(#"{"userid":7,"siteurl":"https://fixture.beepbar.test","functions":[{"name":"core_enrol_get_users_courses"},{"name":"core_course_get_contents"}]}"#.utf8)

@@ -103,7 +103,7 @@ public actor FileStore {
     /// plain file reached directly (a folder, a FIFO, or a symbolic link at the file or in any
     /// folder on the way: every folder is opened with `O_NOFOLLOW` and the file itself is only
     /// `fstatat`ed with `AT_SYMLINK_NOFOLLOW`), a path BeepBar has no permission to look into, or
-    /// a regular file and whether it carries an execute permission. Never opens the file, so it
+    /// a readable regular file that isn't a Finder alias, and whether it carries an execute permission. Never opens the file, so it
     /// can't block on a FIFO or download an iCloud-evicted file just to look at it.
     public func openableFileState(_ path: RelativePath) throws -> OpenableFileState {
         let parentAndName: (Int32, String)
@@ -127,6 +127,29 @@ public actor FileStore {
             }
         }
         guard (metadata.st_mode & S_IFMT) == S_IFREG else { return .notARegularFile }
+        // Finder aliases are regular files, but Launch Services follows them even when their
+        // name says PDF. Read FinderInfo relative to the checked parent without following links.
+        var attributes = attrlist()
+        attributes.bitmapcount = UInt16(ATTR_BIT_MAP_COUNT)
+        attributes.commonattr = attrgroup_t(ATTR_CMN_FNDRINFO)
+        var finderInfo = [UInt8](repeating: 0, count: 36) // Four-byte length, then 32-byte FinderInfo.
+        let result = finderInfo.withUnsafeMutableBytes {
+            getattrlistat(parent, name, &attributes, $0.baseAddress, $0.count, UInt(FSOPT_NOFOLLOW))
+        }
+        guard result == 0 else {
+            if errno == ENOENT { return .missing }
+            if errno == EACCES || errno == EPERM { return .unreadable }
+            throw fileStoreError()
+        }
+        // Finder flags are big-endian at byte eight; 0x8000 marks an alias.
+        guard finderInfo[12] & 0x80 == 0 else { return .notARegularFile }
+        // stat does not check permission to read the leaf. Effective access also honors ACLs,
+        // without opening or hydrating an evicted document just to check permission.
+        guard faccessat(parent, name, R_OK, AT_EACCESS) == 0 else {
+            if errno == ENOENT { return .missing }
+            if errno == EACCES || errno == EPERM { return .unreadable }
+            throw fileStoreError()
+        }
         return .regular(executable: metadata.st_mode & 0o111 != 0)
     }
 

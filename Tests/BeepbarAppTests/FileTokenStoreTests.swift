@@ -206,6 +206,8 @@ struct LoginFeedbackTests {
         #expect(controller.hasStoredCredential)
         #expect(storage.saved == "good")
         #expect(!controller.isAuthenticating)
+        #expect(!controller.isLoadingCourses)
+        #expect(controller.courseLoadError == nil)
     }
 
     @Test @MainActor func disconnectClearsAuthenticationFailure() async throws {
@@ -232,7 +234,7 @@ struct LoginFeedbackTests {
         let gate = LoginSuspension()
         let token = UUID().uuidString
         if phase == "validation" { LoginFeedbackProtocol.suspensions.withLock { $0[token] = gate } }
-        defer { LoginFeedbackProtocol.suspensions.withLock { $0.removeValue(forKey: token) } }
+        defer { _ = LoginFeedbackProtocol.suspensions.withLock { $0.removeValue(forKey: token) } }
         let vault = CredentialVault(read: { _ in throw CredentialStorageError.absent }, write: { _ in
             gate.pause()
             throw CredentialStorageError.write
@@ -270,7 +272,7 @@ struct LoginFeedbackTests {
         let gate = LoginSuspension(outcome: outcome)
         let token = UUID().uuidString
         LoginFeedbackProtocol.suspensions.withLock { $0[token] = gate }
-        defer { LoginFeedbackProtocol.suspensions.withLock { $0.removeValue(forKey: token) } }
+        defer { _ = LoginFeedbackProtocol.suspensions.withLock { $0.removeValue(forKey: token) } }
         let vault = CredentialVault(read: { _ in token }, write: { _ in Issue.record("Verification must not replace the token") })
         let controller = WeBeepAuthenticationController(testRootURL: FileManager.default.temporaryDirectory, apiClient: WeBeepAPIClient(session: session), credentialVault: vault)
         let verification = try #require(controller.validateConnection())
@@ -299,6 +301,57 @@ struct LoginFeedbackTests {
         #expect(deletionAttempted)
     }
 
+    @Test @MainActor func successfulCallbackWaitsForSpawnedCourseRefresh() async throws {
+        let configuration = URLSessionConfiguration.ephemeral
+        configuration.protocolClasses = [LoginFeedbackProtocol.self]
+        let session = URLSession(configuration: configuration)
+        defer { session.invalidateAndCancel() }
+        let gate = LoginSuspension(outcome: "success", coursesOnly: true)
+        let token = UUID().uuidString
+        LoginFeedbackProtocol.suspensions.withLock { $0[token] = gate }
+        defer { _ = LoginFeedbackProtocol.suspensions.withLock { $0.removeValue(forKey: token) } }
+        let vault = CredentialVault(read: { _ in throw CredentialStorageError.absent }, write: { _ in })
+        let controller = WeBeepAuthenticationController(testRootURL: FileManager.default.temporaryDirectory, apiClient: WeBeepAPIClient(session: session), credentialVault: vault)
+        controller.setDisconnectedForTesting()
+        var callbackFinished = false
+        let login = Task {
+            await controller.completeLoginForTesting(callback(token))
+            callbackFinished = true
+        }
+        var started = gate.started.stream.makeAsyncIterator()
+        _ = await started.next()
+        // Drain ready main-actor continuations while the actual course request remains suspended.
+        for _ in 0..<10 { await Task.yield() }
+        #expect(controller.hasStoredCredential)
+        #expect(controller.isLoadingCourses)
+        #expect(!callbackFinished)
+        gate.release.signal()
+        await login.value
+        #expect(callbackFinished)
+        #expect(!controller.isLoadingCourses)
+        #expect(controller.courseLoadError == nil)
+    }
+
+    @Test @MainActor func browserPhaseBlocksSiteChangesUntilCallback() async throws {
+        let vault = CredentialVault(read: { _ in throw CredentialStorageError.absent }, write: { _ in Issue.record("Malformed callback must not save a token") })
+        let controller = WeBeepAuthenticationController(testRootURL: FileManager.default.temporaryDirectory, credentialVault: vault)
+        controller.setDisconnectedForTesting()
+        controller.startLogin()
+        #expect(controller.isAuthenticating)
+        controller.selectUniversity(.unipd)
+        controller.selectSite(MoodleSite.unipd[1])
+        #expect(controller.selectedSite == .polimi)
+        #expect(controller.apiHostForTesting == MoodleSite.polimi.serverPolicy.host)
+        #expect(controller.validateConnection() == nil)
+        await controller.completeLoginForTesting(URL(string: "moodlemobile://invalid")!)
+        #expect(!controller.isAuthenticating)
+        #expect(controller.authenticationFeedback != nil)
+        controller.selectUniversity(.unipd)
+        #expect(controller.selectedSite == MoodleSite.unipd[0])
+        controller.selectSite(MoodleSite.unipd[1])
+        #expect(controller.selectedSite == MoodleSite.unipd[1])
+    }
+
     private func callback(_ token: String) -> URL {
         let payload = Data("site:::\(token)".utf8).base64EncodedString()
         return URL(string: "moodlemobile://token=\(payload)")!
@@ -314,7 +367,11 @@ private final class LoginTokenMemory: @unchecked Sendable {
 
 private final class LoginSuspension: @unchecked Sendable {
     let outcome: String
-    init(outcome: String = "network") { self.outcome = outcome }
+    let coursesOnly: Bool
+    init(outcome: String = "network", coursesOnly: Bool = false) {
+        self.outcome = outcome
+        self.coursesOnly = coursesOnly
+    }
     let started = AsyncStream<Void>.makeStream()
     let release = DispatchSemaphore(value: 0)
     func pause() {
@@ -342,7 +399,7 @@ private final class LoginFeedbackProtocol: URLProtocol, @unchecked Sendable {
         let body = String(data: data, encoding: .utf8) ?? ""
         let token = body.split(separator: "&").first { $0.hasPrefix("wstoken=") }.map { String($0.dropFirst(8)) } ?? ""
         let suspension = Self.suspensions.withLock { $0[token] }
-        if let suspension {
+        if let suspension, !suspension.coursesOnly || body.contains("core_enrol_get_users_courses") {
             suspension.pause()
             if suspension.outcome == "network" {
                 client?.urlProtocol(self, didFailWithError: URLError(.notConnectedToInternet))

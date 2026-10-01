@@ -414,6 +414,7 @@ struct MenuBarSnapshot: Sendable {
 #if DEBUG
     private var beforeReconciliationStateForTesting: (@MainActor () async -> Void)?
     private var beforePendingChoicesForTesting: (@MainActor () async -> Void)?
+    private var courseLoadTaskForTesting: Task<Void, Never>?
     private var testDefaults: UserDefaults?
     private var beforeScopeRestoreForTesting: (@MainActor () -> Void)?
 #endif
@@ -571,6 +572,7 @@ struct MenuBarSnapshot: Sendable {
 
     func completeLoginForTesting(_ callback: URL) async {
         await completeLogin(.success(callback))?.value
+        await courseLoadTaskForTesting?.value
     }
 
     func setOperationForTesting(_ operationID: UUID?, task: Task<Void, Never>? = nil) {
@@ -1437,7 +1439,7 @@ struct MenuBarSnapshot: Sendable {
         guard accountState == .connected, hasStoredCredential, !isLoadingCourses, !isSyncActive else { return }
         courseLoadError = nil
         isLoadingCourses = true
-        Task { [weak self] in
+        let task = Task { [weak self] in
             defer { self?.isLoadingCourses = false }
             do {
                 guard let self else { return }
@@ -1460,6 +1462,11 @@ struct MenuBarSnapshot: Sendable {
                 self?.courseLoadError = BilingualText("Impossibile aggiornare i corsi. Riprova.", "Couldn't refresh courses. Try again.")
             }
         }
+#if DEBUG
+        courseLoadTaskForTesting = task
+#else
+        _ = task
+#endif
     }
 
     /// Fetches the enrolled courses and makes them the current list. Shared by the course list

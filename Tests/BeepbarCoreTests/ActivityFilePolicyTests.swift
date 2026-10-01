@@ -26,10 +26,27 @@ struct ActivityFilePolicyTests {
         "script.scpt", "macro.docm", "macro.XLSM", "esercizio.py", "main.c", "Main.java", "tesi.tex",
         "pagina.html", "dati.json", "notebook.ipynb", "archivio.rar", "README", "file.sconosciuto",
         "schema.svg", "schema.svgz", "lista.m3u", "lista.m3u8", "radio.pls", "script.lua", "pacchetto.dtx",
-        "modello.otm", "scena.dae",
+        "modello.otm", "scena.dae", "radio.ram", "flusso.sdp", "figura.eps", "stampa.ps", "binario.xlsb",
     ])
     func everythingElseIsOnlyShownInFinder(filename: String) {
         #expect(!ActivityFilePolicy.opensDirectly(filename: filename))
+    }
+
+    /// The extension list holds on its own, whatever types macOS declares: every entry is refused
+    /// by the list itself (not just because this macOS happens to type it as executable), in any
+    /// case. Removing an entry from the list fails this test even where its type would catch it.
+    @Test func theExtensionListRefusesEveryEntryByItself() {
+        let required: Set<String> = [
+            "docm", "dotm", "xlsm", "xltm", "xlam", "xlsb", "pptm", "potm", "ppsm", "ppam",
+            "tex", "ltx", "latex", "sty", "cls", "bib", "ps", "eps", "epsf", "epsi",
+            "ram", "rpm", "sdp", "command", "tool", "terminal", "term", "sh", "tcl",
+        ]
+        #expect(ActivityFilePolicy.excludedExtensions == required)
+        for fileExtension in required {
+            #expect(ActivityFilePolicy.isExcluded(fileExtension: fileExtension))
+            #expect(ActivityFilePolicy.isExcluded(fileExtension: fileExtension.uppercased()))
+        }
+        #expect(!ActivityFilePolicy.isExcluded(fileExtension: "pdf"))
     }
 
     /// A tracked regular file opens at its path inside the sync folder.

@@ -54,11 +54,13 @@ public enum ActivityFilePolicy {
     /// decides: apps, installers, disk images, scripts and source code in any language, web
     /// pages and XML (an SVG can carry script a browser would run), Terminal session files,
     /// playlists, configuration profiles, shortcuts, links, macro-enabled Office formats, TeX,
-    /// and any type macOS doesn't know. Legacy Office files (`.doc`, `.xls`, `.ppt`) can hold
-    /// macros too: they open, relying on Office's own prompt before any macro runs.
+    /// stream metafiles, and any type macOS doesn't know. Some documents that open can hold
+    /// macros and rely on their app's own protection before any macro runs: legacy Office files
+    /// (`.doc`, `.xls`, `.xlt`, `.xlw`, `.ppt`, `.pps`, `.pot`, behind Office's prompt) and
+    /// OpenDocument files (`.odt`, `.ods`, `.odp`, behind LibreOffice's macro security).
     public static func opensDirectly(filename: String) -> Bool {
         let fileExtension = (filename as NSString).pathExtension.lowercased()
-        guard !fileExtension.isEmpty, !excludedExtensions.contains(fileExtension) else { return false }
+        guard !fileExtension.isEmpty, !isExcluded(fileExtension: fileExtension) else { return false }
         guard let type = UTType(filenameExtension: fileExtension), !type.isDynamic else { return false }
         guard !runnableTypes.contains(where: { type.conforms(to: $0) }) else { return false }
         return exactDocumentTypes.contains(type.identifier) || documentFamilies.contains { type.conforms(to: $0) }
@@ -81,13 +83,22 @@ public enum ActivityFilePolicy {
     private static let runnableTypes: [UTType] = [.sourceCode, .script, .executable, .application, .applicationBundle, .bundle, .package, .internetLocation, .diskImage, .xml, .html]
 
     /// Extensions refused regardless of the type macOS assigns, so the decision doesn't depend on
-    /// the macOS version or the installed apps. Macro-enabled office files: on macOS 27 their
-    /// types already fall outside `documentTypes` (tests pass without this entry), kept in case a
-    /// version or an office suite declares them as conforming to the plain document. TeX sources
-    /// are plain text, but a TeX editor with shell escape can run commands from them.
-    private static let excludedExtensions: Set<String> = [
-        "docm", "dotm", "xlsm", "xltm", "xlam", "pptm", "potm", "ppsm", "ppam",
+    /// the macOS version or the installed apps. On macOS 27 most of them are already caught by
+    /// their type (a macro-enabled workbook conforms to `public.executable`), but that is a
+    /// property of the system's type declarations, which apps and versions change; this list is
+    /// what keeps them refused everywhere. Covers macro-enabled Office (incl. `.xlsb`), TeX
+    /// (a TeX editor with shell escape can run commands), PostScript (a program), stream
+    /// metafiles that send a player to URLs the uploader chose (`.ram`, `.rpm`, `.sdp`), and
+    /// Terminal and shell files.
+    static func isExcluded(fileExtension: String) -> Bool {
+        excludedExtensions.contains(fileExtension.lowercased())
+    }
+
+    static let excludedExtensions: Set<String> = [
+        "docm", "dotm", "xlsm", "xltm", "xlam", "xlsb", "pptm", "potm", "ppsm", "ppam",
         "tex", "ltx", "latex", "sty", "cls", "bib",
+        "ps", "eps", "epsf", "epsi",
+        "ram", "rpm", "sdp",
         "command", "tool", "terminal", "term", "sh", "tcl",
     ]
 }

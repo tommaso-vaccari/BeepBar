@@ -9,15 +9,25 @@ import BeepbarCore
 }
 
 /// The real one: the file's default app, or Finder with the file selected. When no app can open
-/// the file (a `.pages` without Pages), it is shown in Finder instead of the click doing nothing.
+/// the file (a `.pages` without Pages), it is shown in Finder instead of the click doing nothing;
+/// macOS isn't asked to prompt for an app first. `launch` and `show` are seams for tests.
 struct WorkspaceFileOpener: ActivityFileOpening {
+    typealias Launch = (URL, @escaping @Sendable (Bool) -> Void) -> Void
+    var launch: Launch = { url, completion in
+        let configuration = NSWorkspace.OpenConfiguration()
+        configuration.promptsUserIfNeeded = false
+        NSWorkspace.shared.open(url, configuration: configuration) { _, error in completion(error == nil) }
+    }
+    var show: @MainActor (URL) -> Void = { Finder.reveal($0) }
+
     func open(_ url: URL) {
-        NSWorkspace.shared.open(url, configuration: NSWorkspace.OpenConfiguration()) { _, error in
-            guard error != nil else { return }
-            Task { @MainActor in Finder.reveal(url) }
+        let show = show
+        launch(url) { opened in
+            guard !opened else { return }
+            Task { @MainActor in show(url) }
         }
     }
-    func reveal(_ url: URL) { Finder.reveal(url) }
+    func reveal(_ url: URL) { show(url) }
 }
 
 /// Why a click on an Attività file did nothing, shown on its row.

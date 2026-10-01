@@ -135,7 +135,7 @@ Al primo sync dopo l'aggiornamento, i file che il professore aveva rimosso da Mo
 | Posto | Contenuto |
 |---|---|
 | **Home** | Un avviso che porta a Conflitti finché qualcosa aspetta una tua scelta, compresi **[PR #54]** i file spostati o rimossi su Moodle |
-| **Attività** | Solo l'ultima sincronizzazione: nuovi, aggiornati, modifiche tue, non aggiornati, spostati, e i file modificati spostati su Moodle che ora aspettano in Conflitti **[PR #54]** |
+| **Attività** | Solo l'ultima sincronizzazione: nuovi, aggiornati, modifiche tue, non aggiornati, spostati, e i file modificati spostati su Moodle che ora aspettano in Conflitti **[PR #54]**. **[PR #69]** Un clic apre il file dove si trova ora, anche se un sync successivo l'ha spostato; script e app vengono solo mostrati nel Finder |
 | **Conflitti** | Tutto ciò che aspetta una tua scelta, finché non scegli: conflitti e **[PR #54]** file spostati o rimossi su Moodle |
 | **Menu bar** | Lo stato dell'ultimo sync. Nessun testo nuovo per spostamenti e rimozioni |
 | **Notifiche** | Come oggi (nuovi materiali, conflitti). Nessuna notifica nuova per spostamenti e rimozioni. **[PR #67]** Si possono spegnere in Impostazioni: da spente non ne parte nessuna, e un conflitto ancora aperto può essere notificato al sync automatico successivo alla riaccensione. Un clic apre Conflitti, Attività o Corsi. Compaiono anche quando BeepBar è in primo piano |

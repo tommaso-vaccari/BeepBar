@@ -361,6 +361,10 @@ struct MenuBarSnapshot: Sendable {
     private var loginWindow: LoginWindowController?
     private var siteInfo: WeBeepSiteInfo?
     private var database: SyncDatabase?
+    /// Opens or reveals a file clicked in Attività; a fake in tests, so no test opens real apps.
+    private let fileOpener: ActivityFileOpening
+    /// Attività items whose file wasn't where BeepBar put it when clicked; the row says so.
+    @Published private(set) var missingActivityItems: Set<String> = []
     private let operationGate = RootOperationGate()
     private var apiClient: WeBeepAPIClient
     // One downloader for the whole app lifetime: a per-run one would leave its URLSession and
@@ -407,6 +411,7 @@ struct MenuBarSnapshot: Sendable {
     }
 
     override init() {
+        fileOpener = WorkspaceFileOpener()
         let selectedSite = MoodleSite.site(id: Self.defaults.string(forKey: Self.selectedSiteKey))
         self.selectedSite = selectedSite
         hasStoredCredential = false
@@ -497,7 +502,8 @@ struct MenuBarSnapshot: Sendable {
     }
 
 #if DEBUG
-    init(testRootURL: URL, database: SyncDatabase? = nil, rootID: UUID? = nil, notificationCenter: NotificationCenterClient = InertNotificationCenter()) {
+    init(testRootURL: URL, database: SyncDatabase? = nil, rootID: UUID? = nil, notificationCenter: NotificationCenterClient = InertNotificationCenter(), fileOpener: ActivityFileOpening = InertFileOpener()) {
+        self.fileOpener = fileOpener
         let site = MoodleSite.site(id: nil)
         selectedSite = site
         hasStoredCredential = true
@@ -995,6 +1001,33 @@ struct MenuBarSnapshot: Sendable {
         if enabled && !wasEnabled { Task { await requestNotificationPermissionIfNeeded() } }
         configureBackgroundScheduler()
     }
+    /// A click on a file in Attività (`showInFinder` for the context menu's "Mostra nel Finder").
+    /// The file is looked up by its remote id in the sync database now, not when the sync ran, so
+    /// a file a later sync moved still opens. A file that isn't there any more (the user moved,
+    /// renamed or deleted it) marks the row instead of opening anything; see `ActivityFilePolicy`
+    /// for the file types that are only ever shown in Finder.
+    func openActivityItem(id: String, name: String, showInFinder: Bool) async {
+        var trackedPath: RelativePath?
+        if let database, let rootID {
+            trackedPath = try? await database.baseline(rootID: rootID, remoteID: id)?.relativePath
+        }
+        guard let rootURL else { missingActivityItems.insert(id); return }
+        let isExecutableFile: (URL) -> Bool = { url in
+            var isDirectory: ObjCBool = false
+            return FileManager.default.fileExists(atPath: url.path, isDirectory: &isDirectory) && !isDirectory.boolValue && FileManager.default.isExecutableFile(atPath: url.path)
+        }
+        switch ActivityFilePolicy.action(trackedPath: trackedPath, root: rootURL, filename: name, fileExists: { FileManager.default.fileExists(atPath: $0.path) }, isExecutableFile: isExecutableFile) {
+        case .open(let url):
+            missingActivityItems.remove(id)
+            if showInFinder { fileOpener.reveal(url) } else { fileOpener.open(url) }
+        case .reveal(let url):
+            missingActivityItems.remove(id)
+            fileOpener.reveal(url)
+        case .missing:
+            missingActivityItems.insert(id)
+        }
+    }
+
     /// What the switch shows at launch: the stored choice, on when never set.
     nonisolated static func storedNotificationsEnabled(in defaults: UserDefaults) -> Bool {
         NotificationPolicy.isEnabled(storedValue: defaults.object(forKey: NotificationPolicy.enabledKey))

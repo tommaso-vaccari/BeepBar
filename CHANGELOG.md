@@ -12,6 +12,8 @@
 
 - Clicking a notification now opens BeepBar where it matters: Conflitti for conflicts, Attività for new materials, Corsi for sign-in and sync problems. Notifications also appear while BeepBar is in front, instead of being dropped.
 
+- Files listed in Attività can be opened with a click, or shown in Finder from the right-click menu. A file moved by a later sync still opens where it is now; if you moved or deleted it yourself, Attività says so. Scripts and apps are only shown in Finder, never run.
+
 ### Improved
 
 - The app now spells its name BeepBar in the window, the menu, onboarding, messages and notification text, and in update prompts after this update. Your sign-in, sync folder and settings carry over unchanged.

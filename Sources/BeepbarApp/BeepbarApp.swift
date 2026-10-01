@@ -1,6 +1,7 @@
 import AppKit
 import BeepbarCore
 import SwiftUI
+import UserNotifications
 import os
 
 enum BeepbarLog {
@@ -31,6 +32,18 @@ struct BeepbarApp: App {
     // removes the race entirely.
     let authentication = WeBeepAuthenticationController()
     private var statusItemController: StatusItemController?
+    /// Kept here because `UNUserNotificationCenter.delegate` is weak.
+    private lazy var notificationResponder = NotificationResponder { [weak self] destination in
+        guard let self else { return }
+        ConfigurationWindowController.shared.show(self.authentication, page: ShellPage(destination))
+    }
+
+    /// Set before launch finishes so a click on a notification that launched BeepBar is delivered.
+    /// Not in a UI preview, which must not touch the installed app's notifications.
+    func applicationWillFinishLaunching(_ notification: Notification) {
+        guard !PreviewMode.isActive else { return }
+        UNUserNotificationCenter.current().delegate = notificationResponder
+    }
     private var terminationPending = false
 
     func applicationDidFinishLaunching(_ notification: Notification) {
@@ -38,6 +51,8 @@ struct BeepbarApp: App {
         let build = Bundle.main.object(forInfoDictionaryKey: "CFBundleVersion") as? String ?? "unknown"
         BeepbarLog.lifecycle.notice("Application launched version=\(version, privacy: .public) build=\(build, privacy: .public)")
         _ = UpdaterController.shared
+        // Once per install: on by default, never re-applied after the user turns it off.
+        Task { await LaunchAtLoginController.shared.applyDefaultOnLaunch() }
         statusItemController = StatusItemController(authentication: authentication)
 #if DEBUG
         if ProcessInfo.processInfo.arguments.contains("--ui-preview") {
@@ -114,7 +129,7 @@ final class StatusItemController: NSObject, NSMenuDelegate {
     }
 
     @MainActor private static func setSymbol(_ symbol: String, on statusItem: NSStatusItem) {
-        let image = NSImage(systemSymbolName: symbol, accessibilityDescription: "Beepbar")
+        let image = NSImage(systemSymbolName: symbol, accessibilityDescription: "BeepBar")
         image?.isTemplate = true
         statusItem.button?.image = image
     }
@@ -184,7 +199,9 @@ final class StatusItemController: NSObject, NSMenuDelegate {
             }
             appearanceTrace = PerformanceTrace.shared.begin("ui.configurationWindow", category: .ui)
         }
-        if let page { router.page = page }
+        // Onboarding ignores the page (it shows onboarding anyway), and keeping it would land the user
+        // on, say, Conflitti once onboarding ends instead of Corsi.
+        if let page, !authentication.needsOnboarding { router.page = page }
         // Activate before ordering the window in: with macOS 14+ cooperative activation the
         // deprecated `activate(ignoringOtherApps:)` is ignored, which left the window open but
         // inactive, so the first click only activated the app and seemed to do nothing.
@@ -197,7 +214,7 @@ final class StatusItemController: NSObject, NSMenuDelegate {
             // itself to the content's ideal size on every page switch.
             controller.sizingOptions = [.minSize]
             let window = NSWindow(contentViewController: controller)
-            window.title = "Beepbar"
+            window.title = "BeepBar"
             window.styleMask = [.titled, .closable, .miniaturizable, .resizable, .fullSizeContentView]
             window.titlebarAppearsTransparent = true
             window.titleVisibility = .hidden

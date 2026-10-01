@@ -90,7 +90,7 @@ struct HomePage: View {
                         isEnabled: authentication.isCourseEnabled(course),
                         isRenaming: authentication.renamingCourseID == course.id,
                         renameError: authentication.courseRenameErrors[course.id],
-                        toggleDisabled: authentication.isSyncActive,
+                        toggleDisabled: authentication.isSyncActive || authentication.isLoadingCourses,
                         // renameFolder() is a no-op during a sync or a blocked recovery.
                         renameDisabled: authentication.isSyncActive || authentication.recoveryBlocked,
                         organizeDisabled: organizeDisabled,
@@ -182,7 +182,7 @@ private struct SyncHeroCard: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 12) {
             HStack(alignment: .center, spacing: 14) {
-                BeepbarLogo(size: 44, badge: state.badgeSymbol, badgeTint: state.tint, accessibilityLabel: "Beepbar, \(state.title)")
+                BeepbarLogo(size: 44, badge: state.badgeSymbol, badgeTint: state.tint, accessibilityLabel: "BeepBar, \(state.title)")
                 VStack(alignment: .leading, spacing: 3) {
                     // The relative time ticks once a minute, and only while the window exists.
                     TimelineView(.everyMinute) { context in
@@ -203,7 +203,7 @@ private struct SyncHeroCard: View {
                 SyncProgressLine(progressStore: authentication.progressStore)
                     .transition(.opacity.combined(with: .move(edge: .top)))
             }
-            if !authentication.conflicts.isEmpty {
+            if !authentication.conflicts.isEmpty || !authentication.remoteChanges.isEmpty {
                 conflictsBanner
                     .transition(.opacity.combined(with: .move(edge: .top)))
             }
@@ -218,7 +218,7 @@ private struct SyncHeroCard: View {
             Button(tr("Abbandona spostamento", "Abandon move"), role: .destructive) { authentication.abandonPendingModuleMoves() }
             Button(tr("Annulla", "Cancel"), role: .cancel) {}
         } message: {
-            Text(tr("Nessun file viene spostato né eliminato: Beepbar registra dove si trova ogni file e il modulo mantiene la cartella precedente.", "No files are moved or deleted: Beepbar records where each file is and the module keeps its previous folder."))
+            Text(tr("Nessun file viene spostato né eliminato: BeepBar registra dove si trova ogni file e il modulo mantiene la cartella precedente.", "No files are moved or deleted: BeepBar records where each file is and the module keeps its previous folder."))
         }
     }
 
@@ -285,6 +285,7 @@ private struct SyncHeroCard: View {
         var parts: [Text] = []
         if summary.added > 0 { parts.append(figure(summary.added, tr("nuovo", "new"), tr("nuovi", "new"))) }
         if summary.updated > 0 { parts.append(figure(summary.updated, tr("aggiornato", "updated"), tr("aggiornati", "updated"))) }
+        if summary.moved > 0 { parts.append(figure(summary.moved, tr("spostato", "moved"), tr("spostati", "moved"))) }
         if summary.preservedLocal > 0 { parts.append(figure(summary.preservedLocal, tr("tua modifica protetta", "local change kept"), tr("tue modifiche protette", "local changes kept"))) }
         // `failures` also counts whole courses that failed; split them like `partialDetail` does.
         let failedCourses = summary.perCourse.filter { $0.courseFailure != nil }.count
@@ -371,6 +372,11 @@ private struct SyncHeroCard: View {
     private var conflictsBannerText: String {
         if case .conflicts = state { return tr("Scegli quale versione tenere per ogni file.", "Choose which version to keep for each file.") }
         let count = authentication.conflicts.count
+        if count == 0 {
+            let changes = authentication.remoteChanges.count
+            let platform = authentication.selectedSite.platformName
+            return changes == 1 ? tr("1 file spostato o rimosso su \(platform) aspetta una tua scelta.", "1 file moved or removed on \(platform) needs your choice.") : tr("\(changes) file spostati o rimossi su \(platform) aspettano una tua scelta.", "\(changes) files moved or removed on \(platform) need your choice.")
+        }
         return count == 1 ? tr("1 file ha due versioni: scegli quale tenere.", "1 file has two versions: choose which to keep.") : tr("\(count) file hanno due versioni: scegli quali tenere.", "\(count) files have two versions: choose which to keep.")
     }
 

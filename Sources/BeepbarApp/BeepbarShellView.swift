@@ -101,8 +101,8 @@ struct BeepbarShellView: View {
                 Image(systemName: page.systemImage)
                     .symbolVariant(isSelected ? .fill : .none)
                 Text(page.title)
-                if page == .conflicts, !authentication.conflicts.isEmpty {
-                    Text(authentication.conflicts.count, format: .number)
+                if page == .conflicts, !authentication.conflicts.isEmpty || !authentication.remoteChanges.isEmpty {
+                    Text(authentication.conflicts.count + authentication.remoteChanges.count, format: .number)
                         .font(.caption2.weight(.bold))
                         .monospacedDigit()
                         .foregroundStyle(.white)

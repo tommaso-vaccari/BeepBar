@@ -50,7 +50,7 @@ struct OnboardingView: View {
             BeepbarLogo(size: 88)
                 .shadow(color: .blue.opacity(0.35), radius: 16, y: 8)
                 .padding(.bottom, 4)
-            Text(tr("Benvenuto in Beepbar", "Welcome to Beepbar")).font(.largeTitle.weight(.bold))
+            Text(tr("Benvenuto in BeepBar", "Welcome to BeepBar")).font(.largeTitle.weight(.bold))
             Text(tr("Sincronizza in sicurezza i materiali universitari sul tuo Mac.", "Safely sync your university materials to your Mac."))
                 .font(.title3)
                 .foregroundStyle(.secondary)
@@ -122,6 +122,7 @@ struct OnboardingView: View {
         VStack(spacing: 12) {
             if !authentication.hasStoredCredential {
                 MoodleSitePicker(authentication: authentication)
+                    .disabled(authentication.isAuthenticating || authentication.isVerifying)
             }
             HStack(spacing: 12) {
                 SymbolTile(
@@ -142,8 +143,14 @@ struct OnboardingView: View {
                 } else {
                     Button(tr("Accedi…", "Sign in…")) { authentication.startLogin() }
                         .buttonStyle(.borderedProminent)
-                        .disabled(authentication.isAuthenticating)
+                        .disabled(authentication.isAuthenticating || authentication.isVerifying)
                 }
+            }
+            if let feedback = authentication.authenticationFeedback {
+                Text(feedback.text)
+                    .font(.callout)
+                    .foregroundStyle(.orange)
+                    .fixedSize(horizontal: false, vertical: true)
             }
         }
         .card()
@@ -175,7 +182,7 @@ struct OnboardingView: View {
                 Spacer()
                 if step == .wrapUp {
                     // Not the default action: Return must not skip past the sign-in above.
-                    Button(tr("Inizia a usare Beepbar", "Start using Beepbar")) { authentication.completeOnboarding() }
+                    Button(tr("Inizia a usare BeepBar", "Start using BeepBar")) { authentication.completeOnboarding() }
                         .buttonStyle(.borderedProminent)
                         .controlSize(.large)
                 } else {

@@ -4,6 +4,74 @@ import Testing
 @testable import BeepbarCore
 
 struct SyncDatabaseTests {
+    @Test func keptPathsSurviveReopeningAndStayWithinTheirRoot() async throws {
+        let root = try temporaryRoot()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let url = root.appending(path: "state.sqlite")
+        let rootID = UUID()
+        let other = UUID()
+        let database = try SyncDatabase(url: url)
+        try await database.registerRoot(id: rootID, canonicalPath: root.path + "/a")
+        try await database.registerRoot(id: other, canonicalPath: root.path + "/b")
+        let path = try RelativePath("Course/file.txt")
+        let baseline = Baseline(remoteID: "file", relativePath: path, sha256: "hash", remoteRevision: "1", courseID: 1, moduleID: 100)
+        try await database.upsertBaseline(rootID: rootID, baseline: baseline)
+        let change = RemoteChange(rootID: rootID, courseID: 1, remoteID: "file", kind: .removed, relativePath: path, localSHA256: "hash", isLocallyModified: false)
+        try await database.stopTracking(change, rememberingPath: true)
+
+        let reopened = try SyncDatabase(url: url)
+        #expect(try await reopened.detachedPaths(rootID: rootID) == ["file": path])
+        #expect(try await reopened.detachedPaths(rootID: other).isEmpty)
+        #expect(try await reopened.baseline(rootID: rootID, remoteID: "file") == nil)
+        try await reopened.upsertScope(SyncScope(rootID: rootID, courseID: 1, displayName: "Course", localFolder: "Course", enabled: true))
+        let move = PendingScopeMove(id: UUID(), rootID: rootID, courseID: 1, oldFolder: "Course", newFolder: "Renamed")
+        try await reopened.beginScopeMove(move)
+        try await reopened.commitScopeMove(move)
+        let afterRename = try SyncDatabase(url: url)
+        #expect(try await afterRename.detachedPaths(rootID: rootID) == ["file": RelativePath("Renamed/file.txt")])
+        try await reopened.upsertBaseline(rootID: rootID, baseline: baseline)
+        #expect(try await reopened.detachedPaths(rootID: rootID).isEmpty)
+    }
+
+    @Test func aFailedDetachedMigrationRollsBackAndRetries() async throws {
+        let root = try temporaryRoot()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let url = root.appending(path: "state.sqlite")
+        let rootID = UUID()
+        let database = try SyncDatabase(url: url)
+        try await database.registerRoot(id: rootID, canonicalPath: root.path)
+        let baseline = Baseline(remoteID: "file", relativePath: try RelativePath("Course/file.txt"), sha256: "hash", remoteRevision: "1", courseID: 1, moduleID: 100)
+        try await database.upsertBaseline(rootID: rootID, baseline: baseline)
+        let raw = try RawSQLite(url: url)
+        try raw.execute("DROP TABLE detached_items")
+        try raw.execute("DELETE FROM schema_migrations WHERE version = 7")
+        try raw.execute("CREATE TRIGGER interrupt_migration BEFORE INSERT ON schema_migrations WHEN NEW.version = 7 BEGIN SELECT RAISE(ABORT, 'injected failure'); END")
+        await #expect(throws: SyncDatabaseError.execution) { try await database.migrate() }
+        #expect(try raw.query("SELECT name FROM sqlite_master WHERE name = 'detached_items'").isEmpty)
+        #expect(try await database.baseline(rootID: rootID, remoteID: "file") == baseline)
+        try raw.execute("DROP TRIGGER interrupt_migration")
+        let reopened = try SyncDatabase(url: url)
+        #expect(try await reopened.detachedPaths(rootID: rootID).isEmpty)
+        #expect(try await reopened.baseline(rootID: rootID, remoteID: "file") == baseline)
+    }
+
+    @Test func migrationRepairsMissingDetachedTableWithoutChangingExistingBaselines() async throws {
+        let root = try temporaryRoot()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let url = root.appending(path: "state.sqlite")
+        let rootID = UUID()
+        let database = try SyncDatabase(url: url)
+        try await database.registerRoot(id: rootID, canonicalPath: root.path)
+        let baseline = Baseline(remoteID: "file", relativePath: try RelativePath("Course/file.txt"), sha256: "hash", remoteRevision: "1", courseID: 1, moduleID: 100)
+        try await database.upsertBaseline(rootID: rootID, baseline: baseline)
+        try RawSQLite(url: url).execute("DROP TABLE detached_items")
+        let reopened = try SyncDatabase(url: url)
+        #expect(try await reopened.detachedPaths(rootID: rootID).isEmpty)
+        #expect(try await reopened.baseline(rootID: rootID, remoteID: "file") == baseline)
+        try await reopened.migrate()
+        #expect(try await reopened.baseline(rootID: rootID, remoteID: "file") == baseline)
+    }
+
     /// Every read must surface a failing `sqlite3_step` as an error. Dropping the table through a second
     /// connection leaves the first connection's cached schema intact, so `sqlite3_prepare_v2` still succeeds
     /// and the failure only shows up at step time, which is the path `SQLITE_BUSY`/`IOERR`/`CORRUPT` take.
@@ -80,6 +148,26 @@ struct SyncDatabaseTests {
 
         #expect(try await reopened.rootID(canonicalPath: root.path) == rootID)
         #expect(try await reopened.baselines(rootID: rootID) == ["file": baseline])
+    }
+
+    @Test func reopeningCompletesPartiallyAppliedColumnGroups() async throws {
+        let root = try temporaryRoot()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let url = root.appending(path: "state.sqlite")
+        FileManager.default.createFile(atPath: url.path, contents: nil)
+        let raw = try RawSQLite(url: url)
+        try raw.execute("CREATE TABLE pending_operations (id TEXT PRIMARY KEY, root_id TEXT NOT NULL, remote_id TEXT NOT NULL, destination_path TEXT NOT NULL, stage_path TEXT NOT NULL, expected_local_kind TEXT NOT NULL DEFAULT 'unknown')")
+        try raw.execute("CREATE TABLE sync_scopes (root_id TEXT NOT NULL, course_id INTEGER NOT NULL, display_name TEXT NOT NULL, local_folder TEXT NOT NULL DEFAULT '', enabled INTEGER NOT NULL, auto_sync INTEGER NOT NULL DEFAULT 0, managed_directory INTEGER NOT NULL DEFAULT 0, PRIMARY KEY(root_id, course_id))")
+
+        let database = try SyncDatabase(url: url)
+        #expect(try raw.query("SELECT name FROM pragma_table_info('pending_operations')").contains("expected_local_sha256"))
+        #expect(try raw.query("SELECT name FROM pragma_table_info('pending_operations')").contains("remote_sha256"))
+        #expect(try raw.query("SELECT name FROM pragma_table_info('pending_operations')").contains("remote_revision"))
+        #expect(try raw.query("SELECT name FROM pragma_table_info('pending_operations')").contains("phase"))
+        #expect(try raw.query("SELECT name FROM pragma_table_info('sync_scopes')").contains("directory_device"))
+        #expect(try raw.query("SELECT name FROM pragma_table_info('sync_scopes')").contains("directory_inode"))
+        #expect(try await database.pendingOperations(rootID: UUID()).isEmpty)
+        #expect(try await database.scopes(rootID: UUID()).isEmpty)
     }
 
     @Test func reopeningClearsPartiallyAttributedModuleOwners() async throws {
@@ -178,6 +266,7 @@ struct ReadCase: Sendable, CustomTestStringConvertible {
     static let all: [ReadCase] = [
         ReadCase(name: "rootID", table: "roots") { database, _ in _ = try await database.rootID(canonicalPath: "/nowhere") },
         ReadCase(name: "baseline", table: "items") { database, rootID in _ = try await database.baseline(rootID: rootID, remoteID: "file") },
+        ReadCase(name: "detachedPaths", table: "detached_items") { database, rootID in _ = try await database.detachedPaths(rootID: rootID) },
         ReadCase(name: "baselines", table: "items") { database, rootID in _ = try await database.baselines(rootID: rootID) },
         ReadCase(name: "scopes", table: "sync_scopes") { database, rootID in _ = try await database.scopes(rootID: rootID) },
         ReadCase(name: "scope", table: "sync_scopes") { database, rootID in _ = try await database.scope(rootID: rootID, courseID: 1) },

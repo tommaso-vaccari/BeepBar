@@ -1,5 +1,17 @@
 import Foundation
 
+/// The key under which the sync root's volume treats two names as the same entry. macOS
+/// volumes are case-insensitive and normalization-insensitive by default, so `Appunti.pdf`,
+/// `APPUNTI.pdf` and a decomposed spelling of an accented name all address one file. Every
+/// check that two paths would land on the same file must compare these keys: a site that
+/// compared raw strings, or normalized differently from the others, would let two downloads,
+/// a move or a new course folder claim the same file. Keep this the single definition.
+public enum PathKey {
+    public static func of(_ name: String) -> String {
+        name.precomposedStringWithCanonicalMapping.lowercased()
+    }
+}
+
 /// The hidden directory Beepbar keeps its own staging area and conflict copies in.
 /// macOS volumes are case-insensitive by default, so a folder called `.BEEPBAR` is the
 /// same directory: every check against the reserved name has to ignore case too.
@@ -8,13 +20,13 @@ public enum ReservedNamespace {
 
     /// `true` when `component` names the reserved directory itself, ignoring case.
     public static func isReservedComponent(_ component: String) -> Bool {
-        component.precomposedStringWithCanonicalMapping.lowercased() == folderName
+        PathKey.of(component) == folderName
     }
 
     /// `true` when `name` is the reserved directory or any sibling name that shares its
     /// prefix, ignoring case. Used for the names Beepbar creates directly in the sync root.
     public static func isReservedTopLevelName(_ name: String) -> Bool {
-        name.precomposedStringWithCanonicalMapping.lowercased().hasPrefix(folderName)
+        PathKey.of(name).hasPrefix(folderName)
     }
 }
 
@@ -43,6 +55,8 @@ public struct RelativePath: Sendable, Equatable, Hashable, Codable, CustomString
 
     public var description: String { value }
     public var components: [String] { value.split(separator: "/").map(String.init) }
+    /// Equal for two paths that name the same file on disk; see `PathKey`.
+    public var comparisonKey: String { PathKey.of(value) }
 }
 
 public enum RelativePathError: Error, Sendable, Equatable {

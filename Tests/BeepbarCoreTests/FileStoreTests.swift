@@ -141,6 +141,55 @@ struct FileStoreTests {
         #expect(try await store.migrationDestinationIsOccupied(RelativePath("Course/Custom/file.pdf")))
     }
 
+    @Test func moveLeavesAnInPlaceEditAtItsOriginalLocation() async throws {
+        let root = try temporaryRoot()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let source = root.appending(path: "Course/Old/file.txt")
+        try FileManager.default.createDirectory(at: source.deletingLastPathComponent(), withIntermediateDirectories: true)
+        try Data("original".utf8).write(to: source)
+        let store = try FileStore(root: root)
+        let old = try RelativePath("Course/Old/file.txt")
+        let new = try RelativePath("Course/New/file.txt")
+        guard case .present(let snapshot) = try await store.snapshotRegularFile(old) else { Issue.record("Missing source"); return }
+
+        let handle = try FileHandle(forWritingTo: source)
+        try handle.truncate(atOffset: 0)
+        try handle.write(contentsOf: Data("edited".utf8))
+        try handle.close()
+
+        await #expect(throws: FileStoreError.localChanged) {
+            try await store.moveRegularFile(from: old, to: new, expected: snapshot)
+        }
+        #expect(try String(contentsOf: source, encoding: .utf8) == "edited")
+        #expect(!FileManager.default.fileExists(atPath: root.appending(path: new.value).path))
+    }
+
+    @Test func swapLeavesBothInPlaceEditsAtTheirOriginalLocations() async throws {
+        let root = try temporaryRoot()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let firstURL = root.appending(path: "Course/First.txt")
+        let secondURL = root.appending(path: "Course/Second.txt")
+        try FileManager.default.createDirectory(at: firstURL.deletingLastPathComponent(), withIntermediateDirectories: true)
+        try Data("first".utf8).write(to: firstURL)
+        try Data("second".utf8).write(to: secondURL)
+        let store = try FileStore(root: root)
+        let first = try RelativePath("Course/First.txt")
+        let second = try RelativePath("Course/Second.txt")
+        guard case .present(let firstSnapshot) = try await store.snapshotRegularFile(first),
+              case .present(let secondSnapshot) = try await store.snapshotRegularFile(second) else { Issue.record("Missing source"); return }
+
+        let handle = try FileHandle(forWritingTo: secondURL)
+        try handle.truncate(atOffset: 0)
+        try handle.write(contentsOf: Data("edited".utf8))
+        try handle.close()
+
+        await #expect(throws: FileStoreError.localChanged) {
+            try await store.swapRegularFiles(first, expected: firstSnapshot, with: second, expected: secondSnapshot)
+        }
+        #expect(try String(contentsOf: firstURL, encoding: .utf8) == "first")
+        #expect(try String(contentsOf: secondURL, encoding: .utf8) == "edited")
+    }
+
     private func temporaryRoot() throws -> URL {
         let root = FileManager.default.temporaryDirectory.appending(path: UUID().uuidString, directoryHint: .isDirectory)
         try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)

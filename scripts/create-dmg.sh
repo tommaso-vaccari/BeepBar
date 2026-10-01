@@ -4,7 +4,7 @@ set -euo pipefail
 app_path="${1:-build/Release/Beepbar.app}"
 output_path="${2:-build/Beepbar.dmg}"
 staging_path="$(mktemp -d /tmp/beepbar-dmg.XXXXXX)"
-volume_name="Beepbar"
+volume_name="BeepBar"
 
 cleanup() {
     rm -rf "$staging_path"

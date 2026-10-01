@@ -19,6 +19,54 @@ struct LocalPathPolicyTests {
         ) == nil)
     }
 
+    @Test func disambiguatedCourseFolderAppendsTheIDAndStaysWithinTheLengthLimit() {
+        #expect(LocalPathPolicy.courseFolder("tesi-di-laurea", disambiguatedBy: 31) == "tesi-di-laurea-31")
+        let long = LocalPathPolicy.courseFolderSlug(String(repeating: "corso lungo ", count: 20))
+        let first = LocalPathPolicy.courseFolder(long, disambiguatedBy: 1)
+        let second = LocalPathPolicy.courseFolder(long, disambiguatedBy: 2)
+        #expect(first.utf8.count <= 100 && second.utf8.count <= 100)
+        #expect(first != second)
+    }
+
+    @Test func aSavedFolderIsNotRenamedWhenItsDefaultGainsTheCourseID() {
+        // Users who already enabled one of two identically named courses keep its folder.
+        #expect(LocalPathPolicy.generatedCourseFolderReplacement(
+            storedFolder: "tesi-di-laurea",
+            storedCourseName: "Tesi di laurea",
+            currentCourseName: "Tesi di laurea",
+            courseID: 31,
+            currentDefaultFolder: "tesi-di-laurea-31"
+        ) == nil)
+        // One-word and hyphenated names read the same as their legacy spelling, ignoring case:
+        // the current-scheme folder must still be kept.
+        for (name, folder) in [("Tirocinio", "tirocinio"), ("Fisica", "Fisica"), ("Analisi-1", "analisi-1"),
+                               ("054221 - Tirocinio (2025-26)", "054221-tirocinio-2025-26"), ("054221 - Tirocinio (2025-26)", "tirocinio")] {
+            #expect(LocalPathPolicy.generatedCourseFolderReplacement(
+                storedFolder: folder,
+                storedCourseName: name,
+                currentCourseName: name,
+                courseID: 31,
+                currentDefaultFolder: LocalPathPolicy.courseFolder(LocalPathPolicy.courseFolderSlug(name), disambiguatedBy: 31)
+            ) == nil, "\(folder) was renamed")
+        }
+        // A folder from the old naming scheme still moves to the (now distinct) default.
+        #expect(LocalPathPolicy.generatedCourseFolderReplacement(
+            storedFolder: "Tesi di laurea (31)",
+            storedCourseName: "Tesi di laurea",
+            currentCourseName: "Tesi di laurea",
+            courseID: 31,
+            currentDefaultFolder: "tesi-di-laurea-31"
+        ) == "tesi-di-laurea-31")
+    }
+
+    @Test func uniqueDestinationTreatsCaseAndAccentSpellingAsTheSameFile() throws {
+        var reserved: Set<String> = []
+        let composed = try RelativePath("Corso/Lezione \u{E8}.pdf")
+        let decomposed = try RelativePath("CORSO/LEZIONE e\u{300}.PDF")
+        #expect(try LocalPathPolicy.uniqueDestination(composed, reserving: &reserved) == composed)
+        #expect(try LocalPathPolicy.uniqueDestination(decomposed, reserving: &reserved).value == "CORSO/LEZIONE \u{E8} (1).PDF")
+    }
+
     @Test func buildsStableSafeDestination() throws {
         let file = RemoteFileCandidate(id: "9:4:/pluginfile.php/a.pdf", courseID: 9, sectionID: 1, moduleID: 4, sectionName: "Settimana 1", moduleName: "Lezioni", filename: "Analisi è.pdf", remoteFilePath: "/", canonicalPluginPath: "/pluginfile.php/a.pdf", downloadURL: URL(string: "https://webeep.polimi.it/pluginfile.php/a.pdf"), size: 4, modifiedAt: nil, observedRevision: "1:4", isSupported: true)
         #expect(try LocalPathPolicy.destination(courseFolder: "Analisi", file: file).value == "Analisi/Settimana 1/Lezioni/Analisi è.pdf")

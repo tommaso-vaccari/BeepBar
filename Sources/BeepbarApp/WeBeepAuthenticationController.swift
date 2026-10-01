@@ -2,7 +2,6 @@ import AppKit
 import Foundation
 import SwiftUI
 import os
-@preconcurrency import UserNotifications
 import WebKit
 import BeepbarCore
 
@@ -35,17 +34,17 @@ enum AppFailure: Equatable {
         case .incompatibleResponse: tr("Risposta inattesa, riprova più tardi", "Unexpected response, try again later")
         case .credentialUnavailable: tr("Credenziale non leggibile", "Credential unreadable")
         case .partialSync: tr("Alcuni materiali non aggiornati", "Some materials not updated")
-        case .local: tr("Apri Beepbar per i dettagli", "Open Beepbar for details")
+        case .local: tr("Apri BeepBar per i dettagli", "Open BeepBar for details")
         }
     }
 
     var detail: String {
         switch self {
         case .authenticationExpired: tr("Accedi di nuovo per riprendere la sincronizzazione.", "Sign in again to resume syncing.")
-        case .connectivity: tr("Controlla la connessione. Beepbar riproverà automaticamente.", "Check your connection. Beepbar will retry automatically.")
+        case .connectivity: tr("Controlla la connessione. BeepBar riproverà automaticamente.", "Check your connection. BeepBar will retry automatically.")
         case .serviceUnavailable: tr("La piattaforma non risponde. I materiali locali restano disponibili.", "The platform isn't responding. Your local materials remain available.")
         case .incompatibleResponse: tr("La piattaforma ha restituito una risposta inattesa. Riprova più tardi.", "The platform returned an unexpected response. Try again later.")
-        case .credentialUnavailable: tr("Beepbar non riesce a salvare o leggere la credenziale locale. Riprova più tardi.", "Beepbar can't save or read the local credential. Try again later.")
+        case .credentialUnavailable: tr("BeepBar non riesce a salvare o leggere la credenziale locale. Riprova più tardi.", "BeepBar can't save or read the local credential. Try again later.")
         case .partialSync: tr("Alcuni materiali non sono stati aggiornati. I file esistenti sono al sicuro.", "Some materials weren't updated. Your existing files are safe.")
         case .local(let message): message.text
         }
@@ -145,6 +144,9 @@ struct SyncCompletionSummary: Codable, Equatable {
 
     var affectedCourses: [CourseSyncCount] { perCourse.filter { $0.total > 0 } }
     var hasDetail: Bool { !affectedCourses.isEmpty }
+    /// Files moved to follow a move made on Moodle. Derived from `perCourse` rather than stored,
+    /// so summaries saved before moves were followed still decode.
+    var moved: Int { perCourse.reduce(0) { $0 + $1.moved } }
 
     var detail: String {
         let activity: String
@@ -160,7 +162,7 @@ struct SyncCompletionSummary: Codable, Equatable {
             let updatedPart = u == 1 ? tr("1 aggiornato", "1 updated") : tr("\(u) aggiornati", "\(u) updated")
             activity = "\(addedPart) · \(updatedPart)."
         }
-        return activity + preservedSuffix
+        return activity + movedSuffix + preservedSuffix
     }
 
     /// "+12 nuovi · 4 aggiornati" — for places with room for a few words only.
@@ -168,6 +170,8 @@ struct SyncCompletionSummary: Codable, Equatable {
         var parts: [String] = []
         if added > 0 { parts.append(added == 1 ? tr("1 nuovo", "1 new") : tr("\(added) nuovi", "\(added) new")) }
         if updated > 0 { parts.append(updated == 1 ? tr("1 aggiornato", "1 updated") : tr("\(updated) aggiornati", "\(updated) updated")) }
+        // Moves are left out on purpose: this text is the menu bar's, and the sync behavior document
+        // (section 7) keeps moves and removals out of the menu bar.
         return parts.isEmpty ? tr("Nessuna novità", "Nothing new") : parts.joined(separator: " · ")
     }
 
@@ -175,6 +179,10 @@ struct SyncCompletionSummary: Codable, Equatable {
     var partialDetail: String {
         let failedCourses = perCourse.filter { $0.courseFailure != nil }.count
         return SyncCopy.partialDetail(failedFiles: max(0, failures - failedCourses), failedCourses: failedCourses)
+    }
+    private var movedSuffix: String {
+        guard moved > 0 else { return "" }
+        return moved == 1 ? tr(" 1 file spostato nella sua nuova cartella.", " 1 file moved to its new folder.") : tr(" \(moved) file spostati nella loro nuova cartella.", " \(moved) files moved to their new folder.")
     }
     private var preservedSuffix: String {
         guard preservedLocal > 0 else { return "" }
@@ -184,20 +192,46 @@ struct SyncCompletionSummary: Codable, Equatable {
 
 /// User-facing counts, with Italian singular and plural forms.
 enum SyncCopy {
+    /// What happened after a choice about a file Moodle moved or removed.
+    static func remoteChangeStatus(_ outcome: RemoteChangeOutcome, action: RemoteChangeAction) -> String {
+        remoteChangeFeedback(outcome, action: action).text
+    }
+
+    static func remoteChangeFeedback(_ outcome: RemoteChangeOutcome, action: RemoteChangeAction) -> BilingualText {
+        switch outcome {
+        case .done:
+            switch action {
+            case .moveMine: BilingualText("File spostato nella nuova cartella.", "File moved to the new folder.")
+            case .leaveHere: BilingualText("Il file resta dov’è e continua a essere sincronizzato lì.", "The file stays where it is and keeps syncing there.")
+            case .keep, .keepBoth: BilingualText("Il file resta sul Mac ed esce dalla sincronizzazione.", "The file stays on your Mac and is no longer synced.")
+            case .trash: BilingualText("File spostato nel Cestino.", "File moved to the Trash.")
+            case .replaceNewCopy: BilingualText("La tua versione ha preso il posto della copia nuova, che è nel Cestino.", "Your version took the new copy’s place; the new copy is in the Trash.")
+            }
+        case .fileChanged:
+            BilingualText("Il file è cambiato nel frattempo: non è stato toccato. Controlla e scegli di nuovo.", "The file changed in the meantime and was not touched. Check it and choose again.")
+        case .gone:
+            BilingualText("Il file non è più dove era: non c’è più niente da scegliere.", "The file is no longer where it was: there is nothing left to choose.")
+        case .newCopyUnavailable:
+            BilingualText("La copia nuova non è disponibile. Riprova la sincronizzazione prima di spostare la tua nel Cestino.", "The new copy is unavailable. Retry synchronization before moving yours to the Trash.")
+        case .newCopyNotReplaceable:
+            BilingualText("La copia nuova non è ancora scaricata o è stata modificata: non è stata sostituita.", "The new copy isn’t downloaded yet or was edited, so it wasn’t replaced.")
+        }
+    }
+
     static func conflictsTitle(_ count: Int) -> String {
         count == 1 ? tr("1 conflitto da risolvere", "1 conflict to resolve") : tr("\(count) conflitti da risolvere", "\(count) conflicts to resolve")
     }
 
     static func conflictNotificationBody(_ count: Int) -> String {
         count == 1
-            ? tr("Beepbar ha conservato separatamente 1 versione remota.", "Beepbar kept 1 remote version separately.")
-            : tr("Beepbar ha conservato separatamente \(count) versioni remote.", "Beepbar kept \(count) remote versions separately.")
+            ? tr("BeepBar ha conservato separatamente 1 versione remota.", "BeepBar kept 1 remote version separately.")
+            : tr("BeepBar ha conservato separatamente \(count) versioni remote.", "BeepBar kept \(count) remote versions separately.")
     }
 
     static func newMaterialsNotificationBody(_ count: Int) -> String {
         count == 1
-            ? tr("Beepbar ha aggiunto 1 materiale nella cartella scelta.", "Beepbar added 1 material to your chosen folder.")
-            : tr("Beepbar ha aggiunto \(count) materiali nella cartella scelta.", "Beepbar added \(count) materials to your chosen folder.")
+            ? tr("BeepBar ha aggiunto 1 materiale nella cartella scelta.", "BeepBar added 1 material to your chosen folder.")
+            : tr("BeepBar ha aggiunto \(count) materiali nella cartella scelta.", "BeepBar added \(count) materials to your chosen folder.")
     }
 
     static func partialDetail(failedFiles: Int, failedCourses: Int) -> String {
@@ -211,6 +245,9 @@ enum SyncCopy {
 extension CourseSyncCount {
     var addedLabel: String { added == 1 ? tr("1 nuovo", "1 new") : tr("\(added) nuovi", "\(added) new") }
     var updatedLabel: String { updated == 1 ? tr("1 aggiornato", "1 updated") : tr("\(updated) aggiornati", "\(updated) updated") }
+    var movedLabel: String { moved == 1 ? tr("1 spostato", "1 moved") : tr("\(moved) spostati", "\(moved) moved") }
+    var keptInPlace: Int { movedItems.count - moved }
+    var keptInPlaceLabel: String { keptInPlace == 1 ? tr("1 da scegliere in Conflitti", "1 to decide in Conflicts") : tr("\(keptInPlace) da scegliere in Conflitti", "\(keptInPlace) to decide in Conflicts") }
 }
 
 enum AccountState: Equatable {
@@ -265,19 +302,36 @@ struct MenuBarSnapshot: Sendable {
     var onMenuBarSymbolChange: (@MainActor (String) -> Void)?
     private var lastMenuBarSymbol: String?
 
+    // Invariant for the window: every stored property a view reads, directly or through a
+    // computed property (`isSyncActive`, `canSynchronize`, `lastSyncSummary`…), must be
+    // `@Published` or derived synchronously from one (like `defaultCourseFolders` from `courses`).
+    // A plain `var` redraws nothing on its own and only looks right while some other published
+    // change happens to follow it; see `activeOperationID` for the stuck "Annulla" this caused.
+    // A property feeding both the menu bar and the window needs `@Published` and the
+    // `refreshMenuBarSnapshot()` `didSet` described above.
     @Published private(set) var isAuthenticating = false
     @Published private(set) var isVerifying = false
     @Published private(set) var isLoadingCourses = false
     @Published private(set) var courseLoadError: BilingualText?
     @Published private(set) var courses: [RemoteCourseSummary] = [] {
-        didSet { defaultCourseFolders = Self.defaultFolders(for: courses) }
+        didSet { defaultCourseFolders = Self.defaultFolders(for: courses, saved: courseFolders) }
     }
     @Published private(set) var hasStoredCredential: Bool {
-        didSet { refreshMenuBarSnapshot() }
+        didSet {
+            if !hasStoredCredential {
+                conflictChoiceFeedback = nil
+                authenticationFeedback = nil
+            }
+            refreshMenuBarSnapshot()
+        }
     }
-    @Published private(set) var status = tr("Avvio Beepbar…", "Starting Beepbar…")
+    /// Refused or failed choices stay visible on the Conflicts page until the next choice.
+    @Published private(set) var conflictChoiceFeedback: BilingualText?
+    /// Login failures belong beside the sign-in button, including during onboarding.
+    @Published private(set) var authenticationFeedback: BilingualText?
+    @Published private(set) var status = tr("Avvio BeepBar…", "Starting BeepBar…")
     @Published private(set) var syncState: AppSyncState = .starting {
-        didSet { refreshMenuBarSnapshot() }
+        didSet { notificationGeneration += 1; refreshMenuBarSnapshot() }
     }
     @Published private(set) var accountState: AccountState = .notConnected {
         didSet { refreshMenuBarSnapshot() }
@@ -291,6 +345,11 @@ struct MenuBarSnapshot: Sendable {
     @Published private(set) var language: AppLanguage
     @Published private(set) var enabledCourseIDs: Set<Int64>
     @Published private(set) var automaticSyncEnabled: Bool
+    /// The "Notifiche" switch (#64). On unless the user turned it off; see `NotificationPolicy`.
+    @Published private(set) var notificationsEnabled: Bool
+    /// macOS's permission for BeepBar's notifications, `nil` until first read. Shown under the
+    /// switch when macOS blocks them, since only System Settings can change that.
+    @Published private(set) var notificationAuthorization: NotificationAuthorization?
     @Published private(set) var automaticSyncInterval: Int
     @Published private(set) var recoveryBlocked = false {
         didSet { refreshMenuBarSnapshot() }
@@ -303,6 +362,10 @@ struct MenuBarSnapshot: Sendable {
         didSet { refreshMenuBarSnapshot() }
     }
     @Published private(set) var resolvingConflictID: UUID?
+    /// Files Moodle moved or removed that wait for the user's choice in Conflicts. Not shown in the
+    /// menu bar or in notifications (sync behavior document, section 7), so no menu bar refresh.
+    @Published private(set) var remoteChanges: [RemoteChange] = []
+    @Published private(set) var resolvingRemoteChangeID: UUID?
     /// A module move left half done that recovery cannot finish; the user can abandon it.
     @Published private(set) var hasPendingModuleMoves = false
     // Default folder name per course id, derived from `courses` and rebuilt only when that list
@@ -312,24 +375,50 @@ struct MenuBarSnapshot: Sendable {
     private var loginWindow: LoginWindowController?
     private var siteInfo: WeBeepSiteInfo?
     private var database: SyncDatabase?
+    /// Opens or reveals a file clicked in Attività; a fake in tests, so no test opens real apps.
+    private let fileOpener: ActivityFileOpening
+    /// Attività items whose click found a problem, shown on their row. Cleared whenever the
+    /// displayed summary or the sync folder changes: remote ids repeat across syncs, and a file
+    /// downloaded again must not inherit the previous run's warning.
+    @Published private(set) var activityItemProblems: [String: ActivityItemProblem] = [:]
     private let operationGate = RootOperationGate()
     private var apiClient: WeBeepAPIClient
     // One downloader for the whole app lifetime: a per-run one would leave its URLSession and
     // delegate alive forever, since nothing invalidates them when a run ends.
     private var downloader: RemoteDownloader
-    private let credentialVault = CredentialVault(read: FileTokenStore.load, write: FileTokenStore.save)
+    private let credentialVault: CredentialVault
     private let notificationCoordinator: SyncNotificationCoordinator
     private var backgroundScheduler: NSBackgroundActivityScheduler?
     private var bootstrapTask: Task<Void, Never>?
     private var syncTask: Task<Void, Never>?
     private var scopeWriteTask: Task<Void, Never>?
-    // A window redraw must follow the operation's end even if the final notification suspends.
+    // Published because views read it through `isSyncActive` / `canSynchronize` (Annulla vs
+    // Sincronizza ora). An operation often ends after a suspension (the new-materials notification,
+    // a failure notice) with no other published change following it: when this was a plain `var`,
+    // clearing it redrew nothing and the window stayed on "Annulla" after a sync that downloaded
+    // new files, with a button that no longer did anything.
     @Published private var activeOperationID: UUID? {
-        didSet { refreshMenuBarSnapshot() }
+        didSet {
+            if activeOperationID != nil { notificationGeneration += 1 }
+            refreshMenuBarSnapshot()
+        }
     }
+    /// Survives operation finalization, so awaiting notification permission cannot resurrect an
+    /// earlier result once a new run or account state has replaced it.
+    private var notificationGeneration = 0
     private var automaticOutcome: AutomaticSyncOutcome = .finished
-    private var rootID: UUID?
+    private var rootID: UUID? {
+        didSet { if rootID != oldValue { conflictChoiceFeedback = nil } }
+    }
     private var scheduledConfiguration: BackgroundScheduleConfiguration?
+#if DEBUG
+    private var beforeReconciliationStateForTesting: (@MainActor () async -> Void)?
+    private var beforePendingChoicesForTesting: (@MainActor () async -> Void)?
+    private var courseLoadTaskForTesting: Task<Void, Never>?
+    private var deleteCredentialForTesting: (() throws -> Void)?
+    private var testDefaults: UserDefaults?
+    private var beforeScopeRestoreForTesting: (@MainActor () -> Void)?
+#endif
 
     // Pure and independently testable: whether onboarding should show depends only on these two
     // inputs. An existing root always wins, regardless of the persisted flag — this is what makes
@@ -348,10 +437,15 @@ struct MenuBarSnapshot: Sendable {
     }
 
     override init() {
+        credentialVault = CredentialVault(read: FileTokenStore.load, write: FileTokenStore.save)
+        fileOpener = WorkspaceFileOpener()
         let selectedSite = MoodleSite.site(id: Self.defaults.string(forKey: Self.selectedSiteKey))
         self.selectedSite = selectedSite
         hasStoredCredential = false
-        notificationCoordinator = SyncNotificationCoordinator(defaults: Self.defaults)
+        // A preview build shares the installed app's bundle identifier, and macOS keeps the
+        // notification permission per bundle: a preview must never prompt or post for real.
+        notificationCoordinator = SyncNotificationCoordinator(defaults: Self.defaults, center: Self.isUIPreview || Self.isUIPreviewOnboarding ? InertNotificationCenter(authorization: .allowed) : SystemNotificationCenter())
+        notificationsEnabled = Self.storedNotificationsEnabled(in: Self.defaults)
         let resolvedRootURL = Self.storedRootURL()
         rootURL = resolvedRootURL
         let resolvedNeedsOnboarding = Self.resolveNeedsOnboarding(existingRootURL: resolvedRootURL, onboardingAlreadyCompleted: Self.defaults.bool(forKey: Self.onboardingCompletedKey))
@@ -363,7 +457,7 @@ struct MenuBarSnapshot: Sendable {
         language = resolvedLanguage
         AppLanguage.current = resolvedLanguage
         Self.defaults.set(resolvedLanguage.rawValue, forKey: Self.languageKey)
-        status = tr("Avvio Beepbar…", "Starting Beepbar…")
+        status = tr("Avvio BeepBar…", "Starting BeepBar…")
         enabledCourseIDs = Set(Self.defaults.stringArray(forKey: Self.enabledCoursesKey)?.compactMap(Int64.init) ?? [])
         automaticSyncEnabled = Self.defaults.bool(forKey: Self.autoSyncKey)
         let storedAutomaticSyncInterval = Self.validatedAutomaticInterval(Self.defaults.object(forKey: Self.autoSyncIntervalKey) as? Int)
@@ -429,36 +523,128 @@ struct MenuBarSnapshot: Sendable {
                 BeepbarLog.lifecycle.notice("Bootstrap completed recoveryBlocked=\(result.recoveryBlocked, privacy: .public)")
             } catch {
                 BeepbarLog.lifecycle.error("Bootstrap failed errorType=\(String(reflecting: type(of: error)), privacy: .public)")
-                self?.setSyncState(.failed(.local(BilingualText("Impossibile preparare lo stato locale. Riapri Beepbar.", "Couldn't prepare the local state. Reopen Beepbar."))))
+                self?.setSyncState(.failed(.local(BilingualText("Impossibile preparare lo stato locale. Riapri BeepBar.", "Couldn't prepare the local state. Reopen BeepBar."))))
             }
         }
     }
 
 #if DEBUG
-    init(testRootURL: URL) {
+    init(testRootURL: URL, database: SyncDatabase? = nil, rootID: UUID? = nil, notificationCenter: NotificationCenterClient = InertNotificationCenter(), fileOpener: ActivityFileOpening = InertFileOpener(), apiClient: WeBeepAPIClient? = nil, credentialVault: CredentialVault? = nil, deleteCredential: (() throws -> Void)? = nil) {
+        deleteCredentialForTesting = deleteCredential
+        self.credentialVault = credentialVault ?? CredentialVault(read: FileTokenStore.load, write: FileTokenStore.save)
+        self.fileOpener = fileOpener
         let site = MoodleSite.site(id: nil)
         selectedSite = site
         hasStoredCredential = true
-        notificationCoordinator = SyncNotificationCoordinator(defaults: UserDefaults(suiteName: UUID().uuidString)!)
+        let isolatedDefaults = Self.throwawayDefaults()
+        testDefaults = isolatedDefaults
+        notificationCoordinator = SyncNotificationCoordinator(defaults: isolatedDefaults, center: notificationCenter)
+        notificationsEnabled = Self.storedNotificationsEnabled(in: isolatedDefaults)
         rootURL = testRootURL
         needsOnboarding = false
         language = .italian
         enabledCourseIDs = [1]
         automaticSyncEnabled = false
         automaticSyncInterval = 28_800
-        apiClient = WeBeepAPIClient(policy: site.serverPolicy)
-        downloader = RemoteDownloader(policy: apiClient.policy)
+        self.apiClient = apiClient ?? WeBeepAPIClient(policy: site.serverPolicy)
+        downloader = RemoteDownloader(policy: self.apiClient.policy)
+        self.database = database
+        self.rootID = rootID
         super.init()
         accountState = .connected
         refreshMenuBarSnapshot()
     }
 
-    func setOperationForTesting(_ operationID: UUID?) {
+    /// Defaults for a test controller, stored in a temporary folder instead of ~/Library/Preferences:
+    /// a named suite leaves a file there that the preferences daemon rewrites even after it is
+    /// deleted, so every test run used to add files to the user's Preferences folder.
+    nonisolated static func throwawayDefaults() -> UserDefaults {
+        UserDefaults(suiteName: throwawayDefaultsSuite())!
+    }
+
+    /// The suite name behind `throwawayDefaults()`: an absolute path, which keeps the property list
+    /// in that folder. Tests that need a second handle on the same suite open it by this name.
+    nonisolated static func throwawayDefaultsSuite() -> String {
+        let folder = FileManager.default.temporaryDirectory.appending(path: "BeepbarTestDefaults-\(UUID().uuidString)", directoryHint: .isDirectory)
+        try? FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+        return folder.appending(path: "defaults").path
+    }
+
+    var apiHostForTesting: String { apiClient.policy.host }
+
+    func completeLoginForTesting(_ callback: URL) async {
+        await completeLogin(.success(callback))?.value
+        await courseLoadTaskForTesting?.value
+    }
+
+    func setOperationForTesting(_ operationID: UUID?, task: Task<Void, Never>? = nil) {
         activeOperationID = operationID
+        syncTask = task
     }
 
     func setSyncStateForTesting(_ state: AppSyncState) {
         setSyncState(state)
+    }
+
+    func setLoadingCoursesForTesting(_ loading: Bool) {
+        isLoadingCourses = loading
+    }
+
+    func setScopeWriteTaskForTesting(_ task: Task<Void, Never>) {
+        scopeWriteTask = task
+    }
+
+    func setBeforeScopeRestoreForTesting(_ action: @escaping @MainActor () -> Void) {
+        beforeScopeRestoreForTesting = action
+    }
+
+    func restoreScopesForTesting(_ courses: [RemoteCourseSummary]) async throws {
+        try await restoreScopes(for: courses)
+    }
+
+    /// Sends what a finished manual sync would, through the controller's own coordinator: proves
+    /// the switch writes to the same defaults the coordinator reads.
+    func notifyManualRunForTesting(added: Int) async {
+        await notificationCoordinator.notifyManualRun(added: added)
+    }
+
+    func setBeforeNotificationForTesting(_ action: @escaping @MainActor () async -> Void) {
+        notificationCoordinator.beforeNotificationForTesting = action
+    }
+
+    func completeSyncForTesting(_ operationID: UUID, summary: SyncProgress, automatic: Bool = false) async {
+        await completeSync(operationID, summary: summary, automatic: automatic)
+    }
+
+    func setBeforeReconciliationStateForTesting(_ action: @escaping @MainActor () async -> Void) {
+        beforeReconciliationStateForTesting = action
+    }
+
+    func runAutomaticSyncForTesting() async { _ = await runAutomaticSync() }
+
+    func setRootIDForTesting(_ id: UUID) { rootID = id }
+
+    /// Runs inside `openActivityItem` after it captured the folder and before it looks the file
+    /// up: lets a test change the folder mid-lookup.
+    var beforeActivityLookupForTesting: (@MainActor () async -> Void)?
+
+    func setDisconnectedForTesting() {
+        hasStoredCredential = false
+        accountState = .notConnected
+        setSyncState(.loginRequired)
+    }
+
+    func setBeforePendingChoicesForTesting(_ action: @escaping @MainActor () async -> Void) { beforePendingChoicesForTesting = action }
+
+    func reloadPendingChoicesForTesting() async { await reloadPendingChoices() }
+    func restorePersistedSyncStateForTesting() async { await restorePersistedSyncState() }
+    func lastSuccessfulTimestampForTesting() -> Double {
+        guard let rootID else { return 0 }
+        return operationDefaults.double(forKey: Self.lastSuccessfulReconciliationKey + rootID.uuidString)
+    }
+
+    func failSyncForTesting(_ operationID: UUID) async {
+        await failedSync(operationID, error: nil, automatic: true)
     }
 #endif
 
@@ -544,9 +730,22 @@ struct MenuBarSnapshot: Sendable {
 
     /// Forgets the stored token so another account, or another university, can be connected.
     /// The sync folder, its files and the course selection stay as they are.
-    func signOut() {
-        guard hasStoredCredential, !isSyncActive, !isAuthenticating, !isLoadingCourses else { return }
-        FileTokenStore.delete()
+    func signOut(removeFile: (URL) throws -> Void = { try FileManager.default.removeItem(at: $0) }) {
+        guard hasStoredCredential, !isSyncActive, !isAuthenticating, !isVerifying, !isLoadingCourses else { return }
+        do {
+#if DEBUG
+            if let deleteCredentialForTesting {
+                try deleteCredentialForTesting()
+            } else {
+                try FileTokenStore.delete(removeFile: removeFile)
+            }
+#else
+            try FileTokenStore.delete(removeFile: removeFile)
+#endif
+        } catch {
+            setSyncState(.failed(.local(BilingualText("Impossibile eliminare il token salvato. Riprova a disconnetterti.", "Couldn't remove the stored token. Try disconnecting again."))))
+            return
+        }
         Task { await credentialVault.invalidate() }
         Self.defaults.removeObject(forKey: Self.credentialExpiredKey)
         notificationCoordinator.clearFailure()
@@ -611,8 +810,8 @@ struct MenuBarSnapshot: Sendable {
             title: menuBarTitle,
             detail: menuBarDetail,
             actionTitle: menuBarActionTitle,
-            openTitle: tr("Apri Beepbar…", "Open Beepbar…"),
-            quitTitle: tr("Esci da Beepbar", "Quit Beepbar")
+            openTitle: tr("Apri BeepBar…", "Open BeepBar…"),
+            quitTitle: tr("Esci da BeepBar", "Quit BeepBar")
         )
         let symbol = menuBarSymbol
         if symbol != lastMenuBarSymbol {
@@ -662,17 +861,20 @@ struct MenuBarSnapshot: Sendable {
         )
     }
 
+    /// Whether a sync is running; picks "Annulla" over "Sincronizza ora" in the window.
     var isSyncActive: Bool {
         activeOperationID != nil
     }
 
     private func setSyncState(_ newState: AppSyncState) {
+        let previousSummary = lastSyncSummary
         syncState = newState
+        if lastSyncSummary != previousSummary { activityItemProblems = [:] }
         status = newState.detail
         if case .synced(let summary) = newState, let rootID {
-            Self.defaults.set(summary.completedAt.timeIntervalSince1970, forKey: Self.lastSuccessfulReconciliationKey + rootID.uuidString)
+            operationDefaults.set(summary.completedAt.timeIntervalSince1970, forKey: Self.lastSuccessfulReconciliationKey + rootID.uuidString)
             if let data = try? JSONEncoder().encode(summary) {
-                Self.defaults.set(data, forKey: Self.lastSuccessfulSummaryKey + rootID.uuidString)
+                operationDefaults.set(data, forKey: Self.lastSuccessfulSummaryKey + rootID.uuidString)
             }
         }
     }
@@ -683,15 +885,25 @@ struct MenuBarSnapshot: Sendable {
         guard accountState != .expired else { setSyncState(.failed(.authenticationExpired)); return }
         guard hasStoredCredential else { setSyncState(.loginRequired); return }
         guard rootURL != nil, let rootID else { setSyncState(.needsFolder); return }
-        let open = (try? await database?.conflicts(rootID: rootID)) ?? []
-        conflicts = open
+        let open: [ConflictRecord]
+        do {
+            let pending = try await loadPendingChoices()
+            guard self.rootID == rootID, hasStoredCredential, accountState != .expired, !isSyncActive else { return }
+            open = pending.conflicts
+            conflicts = open
+            remoteChanges = pending.changes
+        } catch {
+            guard self.rootID == rootID, hasStoredCredential, accountState != .expired, !isSyncActive else { return }
+            reportPendingChoicesReadFailure()
+            return
+        }
         if !open.isEmpty { setSyncState(.conflicts(open.count, nil)); return }
-        if let data = Self.defaults.data(forKey: Self.lastSuccessfulSummaryKey + rootID.uuidString),
+        if let data = operationDefaults.data(forKey: Self.lastSuccessfulSummaryKey + rootID.uuidString),
            let summary = try? JSONDecoder().decode(SyncCompletionSummary.self, from: data) {
             setSyncState(.synced(summary))
             return
         }
-        let timestamp = Self.defaults.double(forKey: Self.lastSuccessfulReconciliationKey + rootID.uuidString)
+        let timestamp = operationDefaults.double(forKey: Self.lastSuccessfulReconciliationKey + rootID.uuidString)
         let legacy = SyncCompletionSummary(completedAt: Date(timeIntervalSince1970: timestamp), added: 0, updated: 0, unchanged: 0, preservedLocal: 0, conflicts: 0, failures: 0)
         setSyncState(timestamp > 0 ? .synced(legacy) : .readyUnchecked)
     }
@@ -731,8 +943,8 @@ struct MenuBarSnapshot: Sendable {
 
     func chooseRoot() {
         let panel = NSOpenPanel()
-        panel.title = tr("Scegli la cartella dei materiali Beepbar", "Choose the Beepbar materials folder")
-        panel.message = tr("Beepbar creerà una sottocartella per ogni corso abilitato.", "Beepbar will create a subfolder for each enabled course.")
+        panel.title = tr("Scegli la cartella dei materiali BeepBar", "Choose the BeepBar materials folder")
+        panel.message = tr("BeepBar creerà una sottocartella per ogni corso abilitato.", "BeepBar will create a subfolder for each enabled course.")
         panel.canChooseFiles = false
         panel.canChooseDirectories = true
         panel.canCreateDirectories = true
@@ -772,8 +984,9 @@ struct MenuBarSnapshot: Sendable {
                 }
                 guard report.unresolved.isEmpty else { throw SyncDatabaseError.execution }
                 rootURL = selectedURL; rootID = selectedID; recoveryBlocked = false; hasPendingModuleMoves = false
-                courseFolders = [:]; conflicts = []
-                await restoreScopes(for: courses)
+                activityItemProblems = [:]
+                courseFolders = [:]; conflicts = []; remoteChanges = []
+                try await restoreScopes(for: courses)
                 Self.defaults.set(selectedURL.path, forKey: Self.rootKey)
                 Self.defaults.set(selectedID.uuidString, forKey: Self.rootIDKey)
                 await self.restorePersistedSyncState()
@@ -806,10 +1019,10 @@ struct MenuBarSnapshot: Sendable {
     }
 
     func setCourse(_ course: RemoteCourseSummary, enabled: Bool) {
-        guard !isSyncActive else { return }
+        guard !isSyncActive, !isLoadingCourses else { return }
         if enabled { enabledCourseIDs.insert(course.id) }
         else { enabledCourseIDs.remove(course.id) }
-        Self.defaults.set(enabledCourseIDs.map(String.init).sorted(), forKey: Self.enabledCoursesKey)
+        operationDefaults.set(enabledCourseIDs.map(String.init).sorted(), forKey: Self.enabledCoursesKey)
         configureBackgroundScheduler()
         if let database, let rootID {
             let folder = courseFolders[course.id] ?? defaultFolder(for: course)
@@ -835,9 +1048,103 @@ struct MenuBarSnapshot: Sendable {
             automaticSyncInterval = Self.validatedAutomaticInterval(interval)
             Self.defaults.set(automaticSyncInterval, forKey: Self.autoSyncIntervalKey)
         }
-        if enabled && !wasEnabled { Task { await notificationCoordinator.requestAuthorizationIfNeeded() } }
+        // Through the helper, not the coordinator directly: it also refreshes the Settings footer.
+        if enabled && !wasEnabled { Task { await requestNotificationPermissionIfNeeded() } }
         configureBackgroundScheduler()
     }
+    /// A click on a file in Attività (`showInFinder` for the context menu's "Mostra nel Finder").
+    /// The file is looked up by its remote id in the sync database now, not when the sync ran, so
+    /// a file a later sync moved still opens. What is at that path is checked by `FileStore`,
+    /// off the main actor and without following symbolic links; see `ActivityFilePolicy` for what
+    /// opens and what is only shown in Finder.
+    func openActivityItem(id: String, name: String, showInFinder: Bool) async {
+        // Captured together before any await, so a folder change during the lookup can't apply
+        // one folder's path to another.
+        guard let database, let rootID, let rootURL else { report(.unavailable, for: id); return }
+#if DEBUG
+        await beforeActivityLookupForTesting?()
+#endif
+        let action: ActivityFileAction
+        do {
+            let trackedPath = try await database.baseline(rootID: rootID, remoteID: id)?.relativePath
+            let fileState: OpenableFileState
+            if let trackedPath {
+                let store: FileStore
+                do { store = try FileStore(root: rootURL) } catch {
+                    guard self.rootID == rootID else { return }
+                    report(.folderUnavailable, for: id)
+                    return
+                }
+                fileState = try await store.openableFileState(trackedPath)
+            } else {
+                fileState = .missing
+            }
+            action = ActivityFilePolicy.action(trackedPath: trackedPath, root: rootURL, fileState: fileState)
+        } catch {
+            guard self.rootID == rootID else { return }
+            report(.unavailable, for: id)
+            return
+        }
+        guard self.rootID == rootID else { return }
+        switch action {
+        case .open(let url):
+            activityItemProblems[id] = nil
+            if showInFinder { fileOpener.reveal(url) } else { fileOpener.open(url) }
+        case .reveal(let url):
+            activityItemProblems[id] = nil
+            fileOpener.reveal(url)
+        case .missing:
+            report(.missing, for: id)
+        case .unreadable:
+            report(.unreadable, for: id)
+        }
+    }
+
+    /// Shows the problem on the row and announces it to VoiceOver on every click, including a
+    /// repeated one on a row that already shows it (the row itself doesn't change then).
+    private func report(_ problem: ActivityItemProblem, for id: String) {
+        activityItemProblems[id] = problem
+        guard let app = NSApp else { return }
+        NSAccessibility.post(element: app, notification: .announcementRequested, userInfo: [.announcement: problem.message, .priority: NSAccessibilityPriorityLevel.high.rawValue])
+    }
+
+    /// What the switch shows at launch: the stored choice, on when never set.
+    nonisolated static func storedNotificationsEnabled(in defaults: UserDefaults) -> Bool {
+        NotificationPolicy.isEnabled(storedValue: defaults.object(forKey: NotificationPolicy.enabledKey))
+    }
+
+    /// The "Notifiche" switch. Turning it on asks macOS for permission if it never asked; turning it
+    /// off stops every notification before it reaches macOS, and never prompts (#64).
+    func setNotifications(enabled: Bool) async {
+        notificationsEnabled = enabled
+        operationDefaults.set(enabled, forKey: NotificationPolicy.enabledKey)
+        guard enabled else {
+            // Forgotten, not kept: permission may change while off (no reads then), and a stale
+            // "blocked" would flash under the switch when it is turned back on.
+            notificationAuthorization = nil
+            return
+        }
+        await requestNotificationPermissionIfNeeded()
+    }
+
+    /// Asks macOS once if notifications are on and it never asked (turning on the switch, a sync,
+    /// or automatic sync), then shows its answer under the switch.
+    func requestNotificationPermissionIfNeeded() async {
+        await notificationCoordinator.requestAuthorizationIfNeeded()
+        await refreshNotificationAuthorization()
+    }
+
+    /// Re-reads macOS's permission, e.g. after the user changed it in System Settings. Only while
+    /// the switch is on: with it off BeepBar doesn't contact the notification center at all, and
+    /// the footer that shows the permission is only shown when on. Published only on change, so
+    /// each app activation doesn't redraw the window.
+    func refreshNotificationAuthorization() async {
+        guard notificationsEnabled else { return }
+        let authorization = await notificationCoordinator.authorization()
+        guard notificationsEnabled, authorization != notificationAuthorization else { return }
+        notificationAuthorization = authorization
+    }
+
     func setAutomaticSyncInterval(_ seconds: Int) { guard !isSyncActive else { return }; automaticSyncInterval = Self.validatedAutomaticInterval(seconds); Self.defaults.set(automaticSyncInterval, forKey: Self.autoSyncIntervalKey); configureBackgroundScheduler() }
 
     func renameFolder(for course: RemoteCourseSummary, to newFolder: String) {
@@ -881,7 +1188,8 @@ struct MenuBarSnapshot: Sendable {
         let operationID = UUID()
         activeOperationID = operationID
         setSyncState(.checking)
-        Task { await notificationCoordinator.requestAuthorizationIfNeeded() }
+        // Through the helper, not the coordinator directly: it also refreshes the Settings footer.
+        Task { await requestNotificationPermissionIfNeeded() }
         syncTask = Task { [weak self] in
             do {
                 guard let self else { return }
@@ -950,12 +1258,13 @@ struct MenuBarSnapshot: Sendable {
             }
             let cancelled = Task.isCancelled
             self.syncTask = nil
-            self.activeOperationID = nil
             if cancelled, let previous {
                 self.setSyncState(.synced(previous))
             } else {
                 self.setSyncState(.synced(SyncCompletionSummary(completedAt: Date(), added: 5, updated: 2, unchanged: 93, preservedLocal: 0, conflicts: 0, failures: 0, perCourse: previous?.perCourse ?? [])))
             }
+            await Task.yield()
+            self.activeOperationID = nil
         }
     }
 #endif
@@ -982,18 +1291,43 @@ struct MenuBarSnapshot: Sendable {
 
     func refreshConflicts() {
         guard !isSyncActive else { return }
-        guard let database, let rootID else { conflicts = []; return }
-        Task { [weak self] in
-            guard let self else { return }
-            let found = (try? await database.conflicts(rootID: rootID)) ?? []
-            self.conflicts = found
-            if !found.isEmpty { self.setSyncState(.conflicts(found.count, nil)) }
-            else if case .conflicts = self.syncState { await self.restorePersistedSyncState() }
+        guard database != nil, rootID != nil else { return }
+        Task { [weak self] in await self?.reloadPendingChoices() }
+    }
+
+    private func reloadPendingChoices() async {
+        let expectedRootID = rootID
+        do {
+            let pending = try await loadPendingChoices()
+            guard rootID == expectedRootID, hasStoredCredential, accountState != .expired, !isSyncActive else { return }
+            conflicts = pending.conflicts
+            remoteChanges = pending.changes
+            if !conflicts.isEmpty { setSyncState(.conflicts(conflicts.count, nil)) }
+            else if case .conflicts = syncState { await restorePersistedSyncState() }
+        } catch {
+            guard rootID == expectedRootID, hasStoredCredential, accountState != .expired, !isSyncActive else { return }
+            reportPendingChoicesReadFailure()
         }
     }
 
+    /// Both lists form one displayed snapshot: a failed second read must not hide either list.
+    private func loadPendingChoices() async throws -> (conflicts: [ConflictRecord], changes: [RemoteChange]) {
+        guard let database, let rootID else { throw SyncDatabaseError.open }
+        let open = try await database.conflicts(rootID: rootID)
+        let changes = try await database.remoteChanges(rootID: rootID)
+#if DEBUG
+        await beforePendingChoicesForTesting?()
+#endif
+        return (open, changes)
+    }
+
+    private func reportPendingChoicesReadFailure() {
+        setSyncState(.failed(.local(BilingualText("Impossibile leggere le scelte in sospeso. Riprova.", "Couldn't read pending choices. Try again."))))
+    }
+
     func resolve(_ conflict: ConflictRecord, with resolution: ConflictResolution) {
-        guard resolvingConflictID == nil, let rootURL, let database, !recoveryBlocked, !isSyncActive else { return }
+        guard resolvingConflictID == nil, resolvingRemoteChangeID == nil, let rootURL, let rootID, let database, !recoveryBlocked, !isSyncActive else { return }
+        conflictChoiceFeedback = nil
         resolvingConflictID = conflict.id
         Task { [weak self] in
             defer { self?.resolvingConflictID = nil }
@@ -1007,7 +1341,7 @@ struct MenuBarSnapshot: Sendable {
                 case .useRemote:
                     let result = try await resolver.useRemote(id: conflict.id)
                     guard result.isInstalled else {
-                        self.status = tr("Il file locale è cambiato nel frattempo: conflitto lasciato aperto.", "The local file changed in the meantime: the conflict was left open.")
+                        self.reportConflictChoiceFeedback(BilingualText("Il file locale è cambiato nel frattempo: conflitto lasciato aperto.", "The local file changed in the meantime: the conflict was left open."), rootID: rootID)
                         self.refreshConflicts()
                         return
                     }
@@ -1015,28 +1349,61 @@ struct MenuBarSnapshot: Sendable {
                 }
                 self.refreshConflicts()
             } catch {
-                self?.status = tr("Impossibile risolvere il conflitto: nessun file locale è stato scartato.", "Couldn't resolve the conflict: no local file was discarded.")
+                self?.reportConflictChoiceFeedback(BilingualText("Impossibile completare la risoluzione del conflitto. Controlla il file e aggiorna prima di riprovare.", "Couldn't finish resolving this conflict. Check the file and refresh before retrying."), rootID: rootID)
                 self?.refreshConflicts()
             }
         }
     }
 
+    /// Carries out a choice about a file Moodle moved or removed. The file is re-checked first, so a
+    /// stale entry never moves or trashes anything (see `RemoteChangeResolver`).
+    func resolve(_ change: RemoteChange, with action: RemoteChangeAction) {
+        guard resolvingRemoteChangeID == nil, resolvingConflictID == nil, let rootURL, let rootID, let database, !recoveryBlocked, !isSyncActive else { return }
+        conflictChoiceFeedback = nil
+        resolvingRemoteChangeID = change.id
+        Task { [weak self] in
+            defer { self?.resolvingRemoteChangeID = nil }
+            do {
+                guard let self else { return }
+                let resolver = RemoteChangeResolver(database: database, fileStore: try FileStore(root: rootURL), gate: self.operationGate)
+                let outcome = try await resolver.perform(action, on: change.id, rootID: rootID)
+                self.status = SyncCopy.remoteChangeStatus(outcome, action: action)
+                switch outcome {
+                case .done, .gone: break
+                default: self.reportConflictChoiceFeedback(SyncCopy.remoteChangeFeedback(outcome, action: action), rootID: rootID)
+                }
+            } catch {
+                self?.reportConflictChoiceFeedback(BilingualText("Impossibile completare la scelta. Nessun file è stato sovrascritto o cancellato definitivamente.", "Couldn't carry out the choice. No file was overwritten or permanently deleted."), rootID: rootID)
+            }
+            self?.refreshConflicts()
+        }
+    }
+
+    private func reportConflictChoiceFeedback(_ feedback: BilingualText, rootID: UUID) {
+        guard self.rootID == rootID, hasStoredCredential else { return }
+        conflictChoiceFeedback = feedback
+    }
+
     func startLogin() {
-        guard !isAuthenticating else { return }
+        guard !isAuthenticating, !isVerifying else { return }
+        authenticationFeedback = nil
         isAuthenticating = true; status = tr("Autenticazione \(selectedSite.displayName) in corso…", "Signing in to \(selectedSite.displayName)…")
-        loginWindow = LoginWindowController(site: selectedSite) { [weak self] result in self?.completeLogin(result) }
+#if DEBUG
+        if testDefaults != nil { return }
+#endif
+        loginWindow = LoginWindowController(site: selectedSite) { [weak self] result in _ = self?.completeLogin(result) }
         loginWindow?.showWindow(nil)
     }
 
     func selectUniversity(_ university: MoodleUniversity) {
-        guard !hasStoredCredential else { return }
+        guard !hasStoredCredential, !isAuthenticating, !isVerifying else { return }
         selectSite(university == .polimi ? .polimi : MoodleSite.unipd[0])
     }
 
     func selectSite(_ site: MoodleSite) {
-        guard !hasStoredCredential, site != selectedSite else { return }
+        guard !hasStoredCredential, !isAuthenticating, !isVerifying, site != selectedSite else { return }
         selectedSite = site
-        Self.defaults.set(site.id, forKey: Self.selectedSiteKey)
+        operationDefaults.set(site.id, forKey: Self.selectedSiteKey)
         apiClient = WeBeepAPIClient(policy: site.serverPolicy)
         downloader = RemoteDownloader(policy: site.serverPolicy)
         siteInfo = nil
@@ -1044,7 +1411,7 @@ struct MenuBarSnapshot: Sendable {
         // Course ids belong to one site: the previous site's selection must not enable whatever
         // course happens to share an id on the new one.
         enabledCourseIDs = []
-        Self.defaults.set([String](), forKey: Self.enabledCoursesKey)
+        operationDefaults.set([String](), forKey: Self.enabledCoursesKey)
         if let database, let rootID {
             let previousWrite = scopeWriteTask
             scopeWriteTask = Task { await previousWrite?.value; try? await database.disableAllScopes(rootID: rootID) }
@@ -1052,11 +1419,10 @@ struct MenuBarSnapshot: Sendable {
         configureBackgroundScheduler()
     }
 
-    func validateConnection() {
-        guard !Self.isUIPreview else { return }
-        guard !isVerifying else { return }
+    @discardableResult func validateConnection() -> Task<Void, Never>? {
+        guard !Self.isUIPreview, !isVerifying, !isAuthenticating else { return nil }
         isVerifying = true; status = tr("Verifica connessione \(selectedSite.platformName) in corso…", "Checking the \(selectedSite.platformName) connection…")
-        Task { [weak self] in
+        return Task { [weak self] in
             defer { self?.isVerifying = false }
             do {
                 guard let self else { return }
@@ -1064,12 +1430,12 @@ struct MenuBarSnapshot: Sendable {
                 let siteInfo = try await self.apiClient.validateToken(token)
                 self.siteInfo = siteInfo
                 self.accountState = .connected
-                Self.defaults.removeObject(forKey: Self.credentialExpiredKey)
+                self.operationDefaults.removeObject(forKey: Self.credentialExpiredKey)
                 self.notificationCoordinator.clearFailure()
                 self.setSyncState(self.rootURL == nil ? .needsFolder : .readyUnchecked)
                 self.configureBackgroundScheduler()
             } catch let error as WeBeepAPIError {
-                await self?.handleServiceFailure(error, automatic: false)
+                _ = await self?.handleServiceFailure(error, automatic: false)
             } catch let error as CredentialStorageError {
                 await self?.handleCredentialStorageError(error)
             } catch {
@@ -1083,7 +1449,7 @@ struct MenuBarSnapshot: Sendable {
         guard accountState == .connected, hasStoredCredential, !isLoadingCourses, !isSyncActive else { return }
         courseLoadError = nil
         isLoadingCourses = true
-        Task { [weak self] in
+        let task = Task { [weak self] in
             defer { self?.isLoadingCourses = false }
             do {
                 guard let self else { return }
@@ -1106,6 +1472,11 @@ struct MenuBarSnapshot: Sendable {
                 self?.courseLoadError = BilingualText("Impossibile aggiornare i corsi. Riprova.", "Couldn't refresh courses. Try again.")
             }
         }
+#if DEBUG
+        courseLoadTaskForTesting = task
+#else
+        _ = task
+#endif
     }
 
     /// Fetches the enrolled courses and makes them the current list. Shared by the course list
@@ -1115,10 +1486,10 @@ struct MenuBarSnapshot: Sendable {
         let courses = try await fetchEnrolledCourses(token: token)
         // The account may have been disconnected while the list was loading.
         guard hasStoredCredential else { return }
-        await restoreScopes(for: courses)
+        try await restoreScopes(for: courses)
         self.courses = Self.orderedForDisplay(courses, enabledCourseIDs: enabledCourseIDs)
         accountState = .connected
-        Self.defaults.removeObject(forKey: Self.credentialExpiredKey)
+        operationDefaults.removeObject(forKey: Self.credentialExpiredKey)
     }
 
     private func fetchEnrolledCourses(token: String) async throws -> [RemoteCourseSummary] {
@@ -1176,6 +1547,13 @@ struct MenuBarSnapshot: Sendable {
         return store
     }()
 
+    private var operationDefaults: UserDefaults {
+#if DEBUG
+        if let testDefaults { return testDefaults }
+#endif
+        return Self.defaults
+    }
+
     private static let automaticIntervals: Set<Int> = [1_800, 3_600, 7_200, 14_400, 28_800]
 
     private static func validatedAutomaticInterval(_ value: Int?) -> Int {
@@ -1190,13 +1568,18 @@ struct MenuBarSnapshot: Sendable {
         return FileManager.default.fileExists(atPath: url.path, isDirectory: &isDirectory) && isDirectory.boolValue ? url : nil
     }
 
-    private func completeLogin(_ result: Result<URL, LoginWindowError>) {
-        loginWindow = nil; isAuthenticating = false
+    @discardableResult private func completeLogin(_ result: Result<URL, LoginWindowError>) -> Task<Void, Never>? {
+        loginWindow = nil
+        authenticationFeedback = nil
         // A cancelled or failed login leaves the current account and its course list untouched.
         guard case let .success(callback) = result, let token = token(from: callback) else {
-            status = tr("Accesso a \(selectedSite.platformName) annullato o callback non valido.", "Sign-in to \(selectedSite.platformName) cancelled or invalid callback."); return
+            isAuthenticating = false
+            authenticationFeedback = BilingualText("Accesso a \(selectedSite.platformName) annullato o callback non valido.", "Sign-in to \(selectedSite.platformName) cancelled or invalid callback.")
+            return nil
         }
-        Task { [weak self] in
+        isAuthenticating = true
+        return Task { [weak self] in
+            defer { self?.isAuthenticating = false }
             do {
                 guard let self else { return }
                 let siteInfo = try await self.apiClient.validateToken(token)
@@ -1206,15 +1589,15 @@ struct MenuBarSnapshot: Sendable {
                 self.siteInfo = siteInfo
                 self.hasStoredCredential = true
                 self.accountState = .connected
-                Self.defaults.removeObject(forKey: Self.credentialExpiredKey)
+                self.operationDefaults.removeObject(forKey: Self.credentialExpiredKey)
                 self.notificationCoordinator.clearFailure()
                 self.setSyncState(self.rootURL == nil ? .needsFolder : .readyUnchecked)
                 self.configureBackgroundScheduler()
                 self.loadCourses()
             } catch let error as WeBeepAPIError where error == .invalidToken {
-                self?.status = tr("Il token ricevuto non è valido. Accedi di nuovo alla piattaforma.", "The received token isn't valid. Sign in to the platform again.")
+                self?.authenticationFeedback = BilingualText("Il token ricevuto non è valido. Accedi di nuovo alla piattaforma.", "The received token isn't valid. Sign in to the platform again.")
             } catch {
-                self?.status = tr("Impossibile verificare l'accesso alla piattaforma. Il token non è stato salvato.", "Couldn't verify access to the platform. The token wasn't saved.")
+                self?.authenticationFeedback = BilingualText("Impossibile verificare l'accesso alla piattaforma. Il token non è stato salvato.", "Couldn't verify access to the platform. The token wasn't saved.")
             }
         }
     }
@@ -1237,6 +1620,8 @@ struct MenuBarSnapshot: Sendable {
         Self.defaults.string(forKey: rootIDKey).flatMap(UUID.init(uuidString:))
     }
 
+    /// The installed path must go through `installedDatabaseDirectory(applicationSupport:)`, which
+    /// is what `ProductNameTests` pins: a literal here would escape that test (#56).
     private static func databaseDirectory() throws -> URL {
         guard !isUIPreview, !isUIPreviewOnboarding else {
             // Same reasoning as `defaults`: don't let a manual preview run touch the real
@@ -1246,16 +1631,26 @@ struct MenuBarSnapshot: Sendable {
             try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
             return directory
         }
-        return try FileManager.default.url(for: .applicationSupportDirectory, in: .userDomainMask, appropriateFor: nil, create: false)
-            .appendingPathComponent("Beepbar", isDirectory: true)
+        return installedDatabaseDirectory(applicationSupport: try FileManager.default.url(for: .applicationSupportDirectory, in: .userDomainMask, appropriateFor: nil, create: false))
     }
 
-    private func restoreScopes(for courses: [RemoteCourseSummary]) async {
+    /// Where an installed BeepBar keeps `sync.sqlite`: the same Application Support folder as the
+    /// token, under a name that must never change with the product's spelling (see
+    /// `FileTokenStore.applicationSupportDirectoryName`).
+    nonisolated static func installedDatabaseDirectory(applicationSupport: URL) -> URL {
+        applicationSupport.appendingPathComponent(FileTokenStore.applicationSupportDirectoryName, isDirectory: true)
+    }
+
+    private func restoreScopes(for courses: [RemoteCourseSummary]) async throws {
+#if DEBUG
+        beforeScopeRestoreForTesting?()
+#endif
+        await scopeWriteTask?.value
         guard let database, let rootID else { return }
-        guard let scopes = try? await database.scopes(rootID: rootID) else { return }
+        let scopes = try await database.scopes(rootID: rootID)
         let remoteIDs = Set(courses.map(\.id))
         let scopesByCourse = Dictionary(scopes.map { ($0.courseID, $0) }, uniquingKeysWith: { first, _ in first })
-        let defaults = Self.defaultFolders(for: courses)
+        let defaults = Self.defaultFolders(for: courses, saved: Dictionary(scopes.map { ($0.courseID, $0.localFolder) }, uniquingKeysWith: { first, _ in first }))
         enabledCourseIDs = Self.restoredEnabledCourseIDs(scopes: scopes, current: enabledCourseIDs, remoteIDs: remoteIDs)
         for course in courses {
             if let scope = scopesByCourse[course.id], !scope.localFolder.isEmpty {
@@ -1306,7 +1701,7 @@ struct MenuBarSnapshot: Sendable {
                 }
             }
         }
-        Self.defaults.set(enabledCourseIDs.map(String.init).sorted(), forKey: Self.enabledCoursesKey)
+        operationDefaults.set(enabledCourseIDs.map(String.init).sorted(), forKey: Self.enabledCoursesKey)
     }
 
     func folder(for course: RemoteCourseSummary) -> String {
@@ -1384,21 +1779,66 @@ struct MenuBarSnapshot: Sendable {
         return Set(scopes.lazy.filter { $0.enabled && remoteIDs.contains($0.courseID) }.map(\.courseID))
     }
 
-    // Pure and independently testable: the default folder for each course, falling back to the
-    // full course name when two courses would otherwise share the same folder.
-    nonisolated static func defaultFolders(for courses: [RemoteCourseSummary]) -> [Int64: String] {
-        let names = Dictionary(grouping: courses, by: { LocalPathPolicy.defaultCourseFolder($0.displayName).precomposedStringWithCanonicalMapping.lowercased() })
-        return Dictionary(courses.map { course -> (Int64, String) in
-            let base = LocalPathPolicy.defaultCourseFolder(course.displayName)
-            let duplicate = (names[base.precomposedStringWithCanonicalMapping.lowercased()]?.count ?? 0) > 1
-            return (course.id, duplicate ? LocalPathPolicy.courseFolderSlug(course.displayName) : base)
-        }, uniquingKeysWith: { first, _ in first })
+    /// Pure and independently testable: a distinct default folder for each course. Courses whose
+    /// short folder collides fall back to their full name; courses that still collide (identical
+    /// names, e.g. two "Tesi di laurea") also get their Moodle ID, then a counter if even that
+    /// name is taken by a folder saved for another course. A collision is with another
+    /// course's default or with a folder already `saved` for another course (a user may have
+    /// renamed one onto a name another course would get). Every result must differ on disk: a
+    /// scope's folder is unique per root, so two courses sharing one left the second impossible
+    /// to enable, forever (ultrareview finding).
+    nonisolated static func defaultFolders(for courses: [RemoteCourseSummary], saved: [Int64: String] = [:]) -> [Int64: String] {
+        let uniqueCourses = Dictionary(courses.map { ($0.id, $0) }, uniquingKeysWith: { first, _ in first })
+        let savedOwners = Dictionary(grouping: saved.keys, by: { PathKey.of(saved[$0]!) }).mapValues(Set.init)
+        // Each course climbs these levels only while its folder collides with another course's.
+        func candidate(_ course: RemoteCourseSummary, level: Int) -> String {
+            switch level {
+            case 0: LocalPathPolicy.defaultCourseFolder(course.displayName)
+            case 1: LocalPathPolicy.courseFolderSlug(course.displayName)
+            case 2: LocalPathPolicy.courseFolder(LocalPathPolicy.courseFolderSlug(course.displayName), disambiguatedBy: course.id)
+            default: LocalPathPolicy.courseFolder(LocalPathPolicy.courseFolder(LocalPathPolicy.courseFolderSlug(course.displayName), disambiguatedBy: course.id), disambiguatedBy: Int64(level - 1))
+            }
+        }
+        // From level 2 on, a course's candidates all differ from one another, and it climbs only
+        // when a folder saved for another course takes its name or when it loses the tie-break
+        // between two ID-carrying names below. The bound leaves room for both: one level per
+        // saved folder and one per course, past which one of its candidates must be free.
+        let maximumLevel = 3 + saved.count + uniqueCourses.count
+        var levels = uniqueCourses.mapValues { _ in 0 }
+        while true {
+            let folders = Dictionary(uniqueKeysWithValues: levels.map { id, level in (id, candidate(uniqueCourses[id]!, level: level)) })
+            let groups = Dictionary(grouping: folders.keys, by: { PathKey.of(folders[$0]!) })
+            let colliding = folders.keys.filter { id in
+                let key = PathKey.of(folders[id]!)
+                if !(savedOwners[key] ?? []).subtracting([id]).isEmpty { return true }
+                let group = groups[key]!
+                guard group.count > 1 else { return false }
+                // A course already carrying its ID keeps its name against a name-derived one,
+                // which moves aside. Between two ID-carrying names (only possible through the
+                // counter, e.g. "a-5" + counter 2 against a course called "A 5" with ID 2) the
+                // lowest ID keeps it, so every pass still makes progress.
+                if levels[id]! < 2 { return true }
+                let named = group.filter { levels[$0]! < 2 }
+                return named.isEmpty && id != group.min()!
+            }.filter { levels[$0]! < maximumLevel }
+            // Terminates: every pass raises at least one level, and levels stop at `maximumLevel`.
+            guard !colliding.isEmpty else { return folders }
+            for id in colliding { levels[id]! += 1 }
+        }
     }
 
-    private func finishReconciliation(progress: SyncProgress) async {
-        guard let database, let rootID else { return }
-        let open = (try? await database.conflicts(rootID: rootID)) ?? []
+    private func finishReconciliation(progress: SyncProgress, operationID: UUID) async throws {
+        let pending = try await loadPendingChoices()
+        let open = pending.conflicts
+        let changes = pending.changes
+#if DEBUG
+        await beforeReconciliationStateForTesting?()
+#endif
+        // Cancellation keeps the operation ID until its task unwinds. Checking the ID alone
+        // would publish a completed result over the user's pending cancellation.
+        guard activeOperationID == operationID, !Task.isCancelled else { return }
         conflicts = open
+        remoteChanges = changes
         courses = Self.orderedForDisplay(courses, enabledCourseIDs: enabledCourseIDs)
         let summary = SyncCompletionSummary(progress: progress)
         if progress.failures > 0 {
@@ -1469,8 +1909,19 @@ struct MenuBarSnapshot: Sendable {
         let operationID = UUID()
         activeOperationID = operationID
         automaticOutcome = .finished
+        await scopeWriteTask?.value
+        guard activeOperationID == operationID else { return .cancelled }
         // Nothing to check: leave the last result on screen instead of replacing it with "Pronto".
-        guard let automaticScopes = try? await database.scopes(rootID: rootID, enabledOnly: true), !automaticScopes.isEmpty else {
+        let automaticScopes: [SyncScope]
+        do { automaticScopes = try await database.scopes(rootID: rootID, enabledOnly: true) }
+        catch {
+            guard activeOperationID == operationID else { return .cancelled }
+            guard !Task.isCancelled else { cancelledSync(operationID); return .cancelled }
+            setSyncState(.failed(.local(BilingualText("Impossibile leggere i corsi selezionati. Riprova.", "Couldn't read selected courses. Try again."))))
+            endOperation(operationID)
+            return .finished
+        }
+        guard !automaticScopes.isEmpty else {
             guard activeOperationID == operationID else { return .cancelled }
             BeepbarLog.sync.notice("Automatic synchronization skipped reason=no-enabled-courses")
             endOperation(operationID)
@@ -1523,6 +1974,7 @@ struct MenuBarSnapshot: Sendable {
     private func beginTransfer(_ operationID: UUID, automatic: Bool) async {
         guard activeOperationID == operationID else { return }
         await progressStore.reset(automatic: automatic)
+        guard activeOperationID == operationID, !Task.isCancelled else { return }
         setSyncState(.syncing)
     }
 
@@ -1533,16 +1985,48 @@ struct MenuBarSnapshot: Sendable {
 
     private func completeSync(_ operationID: UUID, summary: SyncProgress, automatic: Bool) async {
         guard activeOperationID == operationID else { return }
-        await finishReconciliation(progress: summary)
-        if automatic {
-            await notificationCoordinator.notifyAutomaticRun(installed: summary.installed, conflicts: conflicts, failures: summary.failures)
-        } else {
-            await notificationCoordinator.notifyManualRun(added: summary.added)
+        do {
+            try await finishReconciliation(progress: summary, operationID: operationID)
+        } catch {
+            guard activeOperationID == operationID else { return }
+            if Task.isCancelled { cancelledSync(operationID); return }
+            reportPendingChoicesReadFailure()
+            endOperation(operationID)
+            return
         }
+        guard activeOperationID == operationID else { return }
+        guard !Task.isCancelled else { cancelledSync(operationID); return }
         if summary.failures == 0 { notificationCoordinator.clearFailure() }
         BeepbarLog.sync.notice("Synchronization completed automatic=\(automatic, privacy: .public) total=\(summary.total, privacy: .public) installed=\(summary.installed, privacy: .public) conflicts=\(summary.conflicts, privacy: .public) failures=\(summary.failures, privacy: .public)")
         configureBackgroundScheduler()
+        let isCurrent = currentNotificationCheck()
+        await finishOperationBeforeNotification(operationID) {
+            if automatic {
+                await notificationCoordinator.notifyAutomaticRun(installed: summary.installed, conflicts: conflicts, failures: summary.failures, isCurrent: isCurrent)
+            } else {
+                await notificationCoordinator.notifyManualRun(added: summary.added, isCurrent: isCurrent)
+            }
+        }
+    }
+
+    /// Captures notification validity separately from the active operation, which must end before
+    /// delivery. Checking the captured account and folder also covers changes with no sync state write.
+    private func currentNotificationCheck() -> @MainActor () -> Bool {
+        let generation = notificationGeneration
+        let site = selectedSite
+        let root = rootID
+        let folder = rootURL
+        let credential = hasStoredCredential
+        return { [weak self] in
+            guard let self else { return false }
+            return self.notificationGeneration == generation && self.selectedSite == site
+                && self.rootID == root && self.rootURL == folder && self.hasStoredCredential == credential
+        }
+    }
+
+    func finishOperationBeforeNotification(_ operationID: UUID, notify: () async -> Void) async {
         endOperation(operationID)
+        await notify()
     }
 
     private func cancelledSync(_ operationID: UUID) {
@@ -1569,36 +2053,41 @@ struct MenuBarSnapshot: Sendable {
     private func failedSync(_ operationID: UUID, error: WeBeepAPIError?, automatic: Bool) async {
         guard activeOperationID == operationID else { return }
         BeepbarLog.sync.error("Synchronization failed automatic=\(automatic, privacy: .public) errorType=\(error.map { String(reflecting: type(of: $0)) } ?? "unknown", privacy: .public)")
+        let issue: AutomaticNotificationIssue?
         if let error {
-            await handleServiceFailure(error, automatic: automatic)
+            issue = await handleServiceFailure(error, automatic: automatic)
         } else {
             setSyncState(.failed(.partialSync))
-            if automatic { await notificationCoordinator.notify(issue: .partialSync) }
+            issue = automatic ? .partialSync : nil
         }
-        endOperation(operationID)
+        let isCurrent = currentNotificationCheck()
+        await finishOperationBeforeNotification(operationID) {
+            if let issue { await notificationCoordinator.notify(issue: issue, isCurrent: isCurrent) }
+        }
     }
 
-    private func handleServiceFailure(_ error: WeBeepAPIError, automatic: Bool) async {
+    private func handleServiceFailure(_ error: WeBeepAPIError, automatic: Bool) async -> AutomaticNotificationIssue? {
         switch SyncServiceFailure(error) {
         case .authenticationExpired:
-            await expireCredential(notify: automatic)
+            await expireCredential()
+            return automatic ? .authenticationExpired : nil
         case .connectivity:
             setSyncState(.failed(.connectivity))
+            return nil
         case .serviceUnavailable:
             setSyncState(.failed(.serviceUnavailable))
-            if automatic { await notificationCoordinator.notify(issue: .serviceUnavailable) }
+            return automatic ? .serviceUnavailable : nil
         case .incompatibleResponse:
             setSyncState(.failed(.incompatibleResponse))
-            if automatic { await notificationCoordinator.notify(issue: .incompatibleResponse) }
+            return automatic ? .incompatibleResponse : nil
         }
     }
 
-    private func expireCredential(notify: Bool = false) async {
+    private func expireCredential() async {
         await credentialVault.invalidate()
-        Self.defaults.set(true, forKey: Self.credentialExpiredKey)
+        operationDefaults.set(true, forKey: Self.credentialExpiredKey)
         accountState = .expired
         setSyncState(.failed(.authenticationExpired))
-        if notify { await notificationCoordinator.notify(issue: .authenticationExpired) }
         configureBackgroundScheduler()
     }
 
@@ -1709,100 +2198,6 @@ private actor BootstrapService {
             try await RecoveryCoordinator(rootID: rootID, database: database, fileStore: try FileStore(root: rootURL)).recover()
         }
         return !report.unresolved.isEmpty
-    }
-}
-
-private enum AutomaticNotificationIssue: String {
-    case authenticationExpired
-    case serviceUnavailable
-    case incompatibleResponse
-    case partialSync
-
-    var title: String {
-        switch self {
-        case .authenticationExpired: tr("Accesso scaduto", "Sign-in expired")
-        case .serviceUnavailable: tr("Piattaforma non disponibile", "Platform unavailable")
-        case .incompatibleResponse: tr("Problema con la piattaforma", "Platform problem")
-        case .partialSync: tr("Sincronizzazione incompleta", "Sync incomplete")
-        }
-    }
-
-    var body: String {
-        switch self {
-        case .authenticationExpired: tr("Apri Beepbar e accedi di nuovo per riprendere la sincronizzazione.", "Open Beepbar and sign in again to resume syncing.")
-        case .serviceUnavailable: tr("La piattaforma non risponde. I materiali locali restano disponibili.", "The platform isn't responding. Your local materials remain available.")
-        case .incompatibleResponse: tr("La piattaforma ha restituito una risposta inattesa. Apri Beepbar per i dettagli.", "The platform returned an unexpected response. Open Beepbar for details.")
-        case .partialSync: tr("Alcuni materiali non sono stati aggiornati. Apri Beepbar per i dettagli.", "Some materials weren't updated. Open Beepbar for details.")
-        }
-    }
-}
-
-@MainActor private final class SyncNotificationCoordinator {
-    private static let prefix = "io.github.tvaccari.beepbar.notification.v2"
-    private let deduplication: NotificationDeduplicationStore
-
-    init(defaults: UserDefaults = .standard) {
-        deduplication = NotificationDeduplicationStore(defaults: defaults, prefix: Self.prefix)
-    }
-
-    func requestAuthorizationIfNeeded() async {
-        let center = UNUserNotificationCenter.current()
-        let settings = await center.notificationSettings()
-        guard settings.authorizationStatus == .notDetermined else { return }
-        _ = try? await center.requestAuthorization(options: [.alert, .sound])
-    }
-
-    func notifyAutomaticRun(installed: Int, conflicts: [ConflictRecord], failures: Int) async {
-        let center = UNUserNotificationCenter.current()
-        let settings = await center.notificationSettings()
-        guard settings.authorizationStatus == .authorized else { return }
-        if conflicts.isEmpty {
-            deduplication.resolve(condition: "conflicts")
-        } else {
-            let fingerprint = NotificationFingerprint.conflicts(conflicts)
-            if deduplication.shouldNotify(condition: "conflicts", fingerprint: fingerprint, now: Date()) {
-                await send(center, title: conflicts.count == 1 ? tr("Conflitto da risolvere", "Conflict to resolve") : tr("Conflitti da risolvere", "Conflicts to resolve"), body: SyncCopy.conflictNotificationBody(conflicts.count), identifier: "beepbar-conflicts")
-            }
-        }
-        if failures > 0 {
-            await notify(issue: .partialSync)
-        } else {
-            if installed > 0 {
-                await send(center, title: installed == 1 ? tr("Nuovo materiale disponibile", "New material available") : tr("Nuovi materiali disponibili", "New materials available"), body: SyncCopy.newMaterialsNotificationBody(installed), identifier: "beepbar-new-files-\(UUID().uuidString)")
-            }
-        }
-    }
-
-    /// A manual run started from the menu leaves no menu open to show its result, so say when new
-    /// materials arrived. Nothing new stays silent: the icon returning to normal is enough.
-    /// Without a notification delegate, macOS drops the banner while Beepbar's window is in front.
-    func notifyManualRun(added: Int) async {
-        guard added > 0 else { return }
-        let center = UNUserNotificationCenter.current()
-        let settings = await center.notificationSettings()
-        guard settings.authorizationStatus == .authorized else { return }
-        await send(center, title: added == 1 ? tr("Nuovo materiale disponibile", "New material available") : tr("Nuovi materiali disponibili", "New materials available"), body: SyncCopy.newMaterialsNotificationBody(added), identifier: "beepbar-new-files-\(UUID().uuidString)")
-    }
-
-    func notify(issue: AutomaticNotificationIssue) async {
-        let center = UNUserNotificationCenter.current()
-        let settings = await center.notificationSettings()
-        guard settings.authorizationStatus == .authorized else { return }
-        guard deduplication.shouldNotify(condition: issue.rawValue, fingerprint: issue.rawValue, now: Date()) else { return }
-        await send(center, title: issue.title, body: issue.body, identifier: "beepbar-\(issue.rawValue)")
-    }
-
-    func clearFailure() {
-        for issue in [AutomaticNotificationIssue.authenticationExpired, .serviceUnavailable, .incompatibleResponse, .partialSync] {
-            deduplication.resolve(condition: issue.rawValue)
-        }
-    }
-
-    private func send(_ center: UNUserNotificationCenter, title: String, body: String, identifier: String) async {
-        let content = UNMutableNotificationContent()
-        content.title = title
-        content.body = body
-        try? await center.add(UNNotificationRequest(identifier: identifier, content: content, trigger: nil))
     }
 }
 

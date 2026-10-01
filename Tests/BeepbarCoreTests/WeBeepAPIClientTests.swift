@@ -146,8 +146,40 @@ import Testing
         let contents = try await WeBeepAPIClient(session: session).fetchContents(courseID: 9, token: "token")
 
         #expect(contents.issueCount == 2)
+        #expect(!contents.isComplete)
+        #expect(contents.modulesWithDroppedEntries == [4])
         #expect(contents.sections[0].modules.map(\.id) == [4])
         #expect(contents.sections[0].modules[0].files.map(\.filename) == ["intro.pdf"])
+    }
+
+    @Test func missingModuleContentsCannotProveTrackedFilesWereRemoved() async throws {
+        let session = testSession { _ in
+            response(status: 200, body: #"[{"id":1,"modules":[{"id":4,"name":"Slides","modname":"folder"}]}]"#)
+        }
+        let contents = try await WeBeepAPIClient(session: session).fetchContents(courseID: 9, token: "token")
+
+        #expect(contents.sections[0].modules[0].files.isEmpty)
+        #expect(contents.modulesWithDroppedEntries == [4])
+    }
+
+    @Test func missingSectionModulesCannotProveTrackedFilesWereRemoved() async throws {
+        let session = testSession { _ in
+            response(status: 200, body: #"[{"id":1,"name":"Week 1"}]"#)
+        }
+        let contents = try await WeBeepAPIClient(session: session).fetchContents(courseID: 9, token: "token")
+
+        #expect(contents.sections[0].modules.isEmpty)
+        #expect(!contents.isComplete)
+    }
+
+    @Test func contentWithMissingTypeCannotProveTrackedFilesWereRemoved() async throws {
+        let session = testSession { _ in
+            response(status: 200, body: #"[{"id":1,"modules":[{"id":4,"name":"Slides","contents":[{"filename":"intro.pdf","filepath":"/","filesize":42,"timemodified":1,"fileurl":"https://webeep.polimi.it/webservice/pluginfile.php/1/a.pdf"}]}]}]"#)
+        }
+        let contents = try await WeBeepAPIClient(session: session).fetchContents(courseID: 9, token: "token")
+
+        #expect(contents.sections[0].modules[0].files.isEmpty)
+        #expect(contents.modulesWithDroppedEntries == [4])
     }
 
     @Test func normalizesMoodleSectionAndModuleNames() async throws {

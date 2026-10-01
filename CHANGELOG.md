@@ -2,6 +2,47 @@
 
 ## Unreleased
 
+## 2026-10-01
+
+### New
+
+- Files a teacher removes from WeBeep are no longer left behind without a word. They appear in Conflicts, under "Spostati o rimossi su WeBeep", where you choose "Tieni" or "Sposta nel Cestino"; BeepBar never deletes anything by itself. On the first sync after updating, files removed from WeBeep in the past that are still on your Mac show up there too, all at once.
+
+- BeepBar now opens by itself when you log in to your Mac, so automatic sync picks up again after a restart. It's on by default: on the first launch after updating, macOS shows a notice that BeepBar was added to your login items. Turn it off anytime with "Apri BeepBar al login" in Impostazioni, or in the login items list in System Settings; BeepBar won't turn it back on. If you had already added BeepBar to your login items yourself, remove that older entry so it doesn't open twice.
+
+- Notifications can be switched off with "Notifiche" in Impostazioni; they stay on unless you turn them off. The menu bar icon and BeepBar's pages keep showing everything either way.
+
+- Clicking a notification now opens BeepBar where it matters: Conflitti for conflicts, Attività for new materials, Corsi for sign-in and sync problems. Notifications also appear while BeepBar is in front, instead of being dropped.
+
+- Files listed in Attività open with a click, or show in Finder from the right-click menu; hovering a file shows which of the two a click will do. A file a later sync moved still opens where it is now, and if you moved or deleted it, Attività says so. Only documents (PDF, Office, iWork, text, images, audio, video, zip) open directly; anything else, such as scripts, apps or disk images, is only shown in Finder, so these are not launched by a click in Attività.
+
+### Improved
+
+- The app now spells its name BeepBar in the window, the menu, onboarding, messages and notification text, and in update prompts after this update. Your sign-in, sync folder and settings carry over unchanged.
+
+### Fixed
+
+- Failed sign-ins now show the reason beside the sign-in button, in onboarding and Settings; an existing account is kept when a new attempt fails. University selection and account actions wait for pending checks, preventing a login from ending up on the wrong platform or an old check from undoing a disconnect.
+
+- Conflitti now explains why a choice could not be completed, including when a file changed while the choice was open. If an error occurs after an action has partly completed, check the file and refresh before retrying.
+- Clicking a file in Attività no longer follows a Finder alias substituted for the downloaded document. Files without read permission show a message on their row instead of attempting to open.
+- A sync notification still waiting for a permission check is discarded if you disconnect, change the sync folder or start a newer sync; an obsolete failure no longer suppresses the next genuine failure notice.
+- Choices about moved or reuploaded files now check for edits made while the choice was open. If your copy changes during replacement, it stays in its original folder and the next sync can restore the downloaded copy.
+- New downloads get a numbered name when their destination is occupied. Files you previously kept can be tracked again when they return on WeBeep.
+- If a reuploaded copy could not be downloaded, BeepBar keeps your old copy out of the Trash until you retry synchronization and the new copy is available.
+- When WeBeep omits a module’s contents, BeepBar waits for a complete listing before treating its materials as removed.
+- When a teacher moves or renames material on WeBeep, or reuploads it elsewhere, BeepBar moves your unchanged copy to the matching folder without downloading it again. Edited files wait for your choice in Conflicts, and occupied names get a numbered suffix; files already left in older folders stay where they are after updating.
+- Cancelling during the final checks no longer shows a completed result afterward. Once a run completes or fails, notification delivery cannot leave “Annulla” active or let cancellation erase the result.
+- Course switches stay disabled while the list refreshes, and refreshing no longer loses a selection that is still being saved. A delayed refresh also cannot replace the result of a newer sync, restore a disconnected account, or show choices from a previous sync folder.
+- If saved choices or course selections cannot be read, BeepBar reports an error instead of hiding pending choices or reporting a successful sync. The last displayed choices remain visible.
+- If an update was interrupted while preparing local sync information, reopening BeepBar completes that preparation so synchronization can start again.
+- “Disconnetti…” also removes sign-in information left by an interrupted save. If removal fails, the account stays connected and BeepBar shows an error so you can retry.
+- Courses with identical names can both be selected, each with its own folder; existing folders are not renamed.
+- The preview in “Organizza cartelle” stays valid when another course synchronizes in the meantime, and its count of older files covers only the course being organized.
+- Downloads that exceed the size announced by WeBeep stop as soon as they go over, instead of filling the disk before being refused.
+
+## Earlier releases — through 2.1.38
+
 ### Fixed
 
 - When a synchronization finishes, the window returns from “Annulla” to “Sincronizza ora” instead of leaving an inactive Cancel button on screen.

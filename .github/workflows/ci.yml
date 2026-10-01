@@ -3,7 +3,9 @@ name: CI
 on:
   pull_request:
   push:
-    branches: [main]
+    # `dev` collects every PR and is only tested; a push to `main` (a dev → main merge) is what
+    # publishes a release, see the `release-artifact` job condition.
+    branches: [main, dev]
   workflow_dispatch:
 
 permissions:
@@ -111,7 +113,7 @@ jobs:
             git log -1 --pretty='- %s (`%h`)' "$GITHUB_SHA" > release-notes.md
           fi
           cat > release-body.md <<BODYEOF
-          [**Download Beepbar for macOS**](https://github.com/${{ github.repository }}/releases/latest/download/00-Beepbar.dmg)
+          [**Download BeepBar for macOS**](https://github.com/${{ github.repository }}/releases/latest/download/00-Beepbar.dmg)
 
           Built automatically from \`main\` on every push. The link above always resolves to the newest release.
 
@@ -125,9 +127,9 @@ jobs:
           <?xml version="1.0" encoding="utf-8"?>
           <rss version="2.0" xmlns:sparkle="http://www.andymatuschak.org/xml-namespaces/sparkle">
             <channel>
-              <title>Beepbar</title>
+              <title>BeepBar</title>
               <item>
-                <title>Beepbar $SHORT_VERSION</title>
+                <title>BeepBar $SHORT_VERSION</title>
                 <pubDate>$PUBDATE</pubDate>
                 <sparkle:version>$SHORT_VERSION</sparkle:version>
                 <sparkle:shortVersionString>$SHORT_VERSION</sparkle:shortVersionString>

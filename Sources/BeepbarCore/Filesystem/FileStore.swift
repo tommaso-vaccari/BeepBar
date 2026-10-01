@@ -2,7 +2,7 @@ import CryptoKit
 import Darwin
 import Foundation
 
-public enum FileStoreError: Error, Sendable, Equatable { case invalidRoot, symbolicLink, invalidStage, localChanged, destinationExists, sizeMismatch, tooLarge, ioFailure }
+public enum FileStoreError: Error, Sendable, Equatable { case invalidRoot, symbolicLink, invalidStage, localChanged, destinationExists, sizeMismatch, tooLarge, ioFailure, unsupported }
 
 private struct FileIdentity: Sendable, Equatable {
     let device: Int64
@@ -42,15 +42,27 @@ enum MigrationDirectoryEntryMatch: Equatable { case missing, exact, differentSpe
 
 public actor FileStore {
     private let rootFD: Int32
+    private let rootURL: URL
+    private let trash: @Sendable (URL) throws -> Void
+    private let beforeMove: (@Sendable (RelativePath, RelativePath) throws -> Void)?
     /// Number of times a file's full contents were read to compute a SHA-256 digest.
     /// Test instrumentation: lets tests prove that unchanged files are not re-read on every sync.
     private(set) var hashCount = 0
 
-    public init(root: URL) throws {
+    /// `trash` moves a file to the Trash; tests replace it so they never touch the user's Trash.
+    public init(root: URL, trash: @escaping @Sendable (URL) throws -> Void = { try FileManager.default.trashItem(at: $0, resultingItemURL: nil) }) throws {
+        try self.init(root: root, beforeMove: nil, trash: trash)
+    }
+
+    /// Tests inject a filesystem change after destination selection, before move validation.
+    init(root: URL, beforeMove: (@Sendable (RelativePath, RelativePath) throws -> Void)?, trash: @escaping @Sendable (URL) throws -> Void = { try FileManager.default.trashItem(at: $0, resultingItemURL: nil) }) throws {
         let fd = open(root.standardizedFileURL.path, O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW)
         guard fd >= 0 else { throw FileStoreError.invalidRoot }
         guard (try? Self.identity(of: fd)) != nil else { close(fd); throw FileStoreError.invalidRoot }
         rootFD = fd
+        rootURL = root.standardizedFileURL
+        self.trash = trash
+        self.beforeMove = beforeMove
     }
 
     deinit { close(rootFD) }
@@ -85,6 +97,60 @@ public actor FileStore {
         defer { close(fd) }
         try requireRegularFile(fd)
         return true
+    }
+
+    /// What sits at a tracked path, for opening it from Attività: nothing, something that isn't a
+    /// plain file reached directly (a folder, a FIFO, or a symbolic link at the file or in any
+    /// folder on the way: every folder is opened with `O_NOFOLLOW` and the file itself is only
+    /// `fstatat`ed with `AT_SYMLINK_NOFOLLOW`), a path BeepBar has no permission to look into, or
+    /// a readable regular file that isn't a Finder alias, and whether it carries an execute permission. Never opens the file, so it
+    /// can't block on a FIFO or download an iCloud-evicted file just to look at it.
+    public func openableFileState(_ path: RelativePath) throws -> OpenableFileState {
+        let parentAndName: (Int32, String)
+        do {
+            parentAndName = try parentDirectory(for: path, create: false)
+        } catch where errno == ENOENT {
+            return .missing
+        } catch where errno == ELOOP || errno == ENOTDIR {
+            return .notARegularFile
+        } catch where errno == EACCES || errno == EPERM {
+            return .unreadable
+        }
+        let (parent, name) = parentAndName
+        defer { close(parent) }
+        var metadata = stat()
+        guard fstatat(parent, name, &metadata, AT_SYMLINK_NOFOLLOW) == 0 else {
+            switch errno {
+            case ENOENT: return .missing
+            case EACCES, EPERM: return .unreadable
+            default: throw fileStoreError()
+            }
+        }
+        guard (metadata.st_mode & S_IFMT) == S_IFREG else { return .notARegularFile }
+        // Finder aliases are regular files, but Launch Services follows them even when their
+        // name says PDF. Read FinderInfo relative to the checked parent without following links.
+        var attributes = attrlist()
+        attributes.bitmapcount = UInt16(ATTR_BIT_MAP_COUNT)
+        attributes.commonattr = attrgroup_t(ATTR_CMN_FNDRINFO)
+        var finderInfo = [UInt8](repeating: 0, count: 36) // Four-byte length, then 32-byte FinderInfo.
+        let result = finderInfo.withUnsafeMutableBytes {
+            getattrlistat(parent, name, &attributes, $0.baseAddress, $0.count, UInt(FSOPT_NOFOLLOW))
+        }
+        guard result == 0 else {
+            if errno == ENOENT { return .missing }
+            if errno == EACCES || errno == EPERM { return .unreadable }
+            throw fileStoreError()
+        }
+        // Finder flags are big-endian at byte eight; 0x8000 marks an alias.
+        guard finderInfo[12] & 0x80 == 0 else { return .notARegularFile }
+        // stat does not check permission to read the leaf. Effective access also honors ACLs,
+        // without opening or hydrating an evicted document just to check permission.
+        guard faccessat(parent, name, R_OK, AT_EACCESS) == 0 else {
+            if errno == ENOENT { return .missing }
+            if errno == EACCES || errno == EPERM { return .unreadable }
+            throw fileStoreError()
+        }
+        return .regular(executable: metadata.st_mode & 0o111 != 0)
     }
 
     public func snapshotRegularFile(_ path: RelativePath) throws -> FileSnapshotState {
@@ -127,6 +193,27 @@ public actor FileStore {
         throw fileStoreError()
     }
 
+    func downloadDestinationIsOccupied(_ path: RelativePath) throws -> Bool {
+        try requireMovablePath(path)
+        var parent = dup(rootFD)
+        guard parent >= 0 else { throw fileStoreError() }
+        defer { close(parent) }
+        for (index, component) in path.components.enumerated() {
+            let matches = try directoryEntryNames(at: parent).filter { PathKey.of($0) == PathKey.of(component) }
+            guard !matches.isEmpty else { return false }
+            if index == path.components.count - 1 { return true }
+            guard matches.count == 1 else { return false }
+            let next = openat(parent, matches[0], O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW)
+            guard next >= 0 else {
+                if errno == ENOENT || errno == ENOTDIR || errno == ELOOP { return false }
+                throw fileStoreError()
+            }
+            close(parent)
+            parent = next
+        }
+        return false
+    }
+
     public func migrationDestinationIsOccupied(_ path: RelativePath) throws -> Bool {
         try requireMovablePath(path)
         var parent = dup(rootFD)
@@ -154,34 +241,25 @@ public actor FileStore {
     }
 
     static func migrationDirectoryEntryMatch(_ component: String, entries: [String]) -> MigrationDirectoryEntryMatch {
-        let key = component.precomposedStringWithCanonicalMapping.lowercased()
-        let matches = entries.filter { $0.precomposedStringWithCanonicalMapping.lowercased() == key }
+        let key = PathKey.of(component)
+        let matches = entries.filter { PathKey.of($0) == key }
         guard matches.count == 1 else { return matches.isEmpty ? .missing : .ambiguous }
         return matches[0].utf8.elementsEqual(component.utf8) ? .exact : .differentSpelling
     }
 
     public func moveRegularFile(from source: RelativePath, to destination: RelativePath, expected: FileSnapshot) throws {
-        try requireMovablePath(source)
-        try requireMovablePath(destination)
-        guard source != destination else { return }
-        guard case .present(let current) = try snapshotRegularFile(source),
-              current.device == expected.device, current.inode == expected.inode,
-              current.sha256 == expected.sha256 else { throw FileStoreError.localChanged }
-        let (sourceParent, sourceName) = try parentDirectory(for: source, create: false)
-        defer { close(sourceParent) }
-        let (destinationParent, destinationName) = try parentDirectory(for: destination, create: true)
-        defer { close(destinationParent) }
-        guard renameatx_np(sourceParent, sourceName, destinationParent, destinationName, UInt32(RENAME_EXCL)) == 0 else {
-            if errno == EEXIST { throw FileStoreError.destinationExists }
-            throw fileStoreError()
-        }
-        guard fsync(sourceParent) == 0, fsync(destinationParent) == 0 else { throw fileStoreError() }
+        try moveRegularFile(from: source, to: destination, expected: expected, preservingCurrentContents: false)
     }
 
     public func moveRegularFilePreservingCurrentContents(from source: RelativePath, to destination: RelativePath, expected: FileSnapshot) throws {
+        try moveRegularFile(from: source, to: destination, expected: expected, preservingCurrentContents: true)
+    }
+
+    private func moveRegularFile(from source: RelativePath, to destination: RelativePath, expected: FileSnapshot, preservingCurrentContents: Bool) throws {
         try requireMovablePath(source)
         try requireMovablePath(destination)
         guard source != destination else { return }
+        try beforeMove?(source, destination)
         let (sourceParent, sourceName) = try parentDirectory(for: source, create: false)
         defer { close(sourceParent) }
         let sourceFD = openat(sourceParent, sourceName, O_RDONLY | O_CLOEXEC | O_NOFOLLOW)
@@ -189,6 +267,9 @@ public actor FileStore {
         defer { close(sourceFD) }
         try requireRegularFile(sourceFD)
         guard try Self.identity(of: sourceFD) == FileIdentity(device: expected.device, inode: expected.inode) else { throw FileStoreError.localChanged }
+        if !preservingCurrentContents {
+            guard try sha256(of: sourceFD) == expected.sha256 else { throw FileStoreError.localChanged }
+        }
         let (destinationParent, destinationName) = try parentDirectory(for: destination, create: true)
         defer { close(destinationParent) }
         var current = stat()
@@ -199,6 +280,42 @@ public actor FileStore {
             throw fileStoreError()
         }
         guard fsync(sourceParent) == 0, fsync(destinationParent) == 0 else { throw fileStoreError() }
+    }
+
+    /// Exchanges two regular files in one atomic rename (`RENAME_SWAP`), each checked to still be
+    /// the file that was hashed. Used when Moodle swaps two files' places, so neither ever needs a
+    /// temporary name that a crash could strand. Throws `unsupported` on a volume that cannot swap.
+    public func swapRegularFiles(_ first: RelativePath, expected firstSnapshot: FileSnapshot, with second: RelativePath, expected secondSnapshot: FileSnapshot) throws {
+        try requireMovablePath(first)
+        try requireMovablePath(second)
+        let (firstParent, firstName) = try parentDirectory(for: first, create: false)
+        defer { close(firstParent) }
+        let (secondParent, secondName) = try parentDirectory(for: second, create: false)
+        defer { close(secondParent) }
+        for (parent, name, snapshot) in [(firstParent, firstName, firstSnapshot), (secondParent, secondName, secondSnapshot)] {
+            let fd = openat(parent, name, O_RDONLY | O_CLOEXEC | O_NOFOLLOW)
+            guard fd >= 0 else { throw FileStoreError.localChanged }
+            defer { close(fd) }
+            try requireRegularFile(fd)
+            guard try Self.identity(of: fd) == FileIdentity(device: snapshot.device, inode: snapshot.inode),
+                  try sha256(of: fd) == snapshot.sha256 else { throw FileStoreError.localChanged }
+            var current = stat()
+            guard fstatat(parent, name, &current, AT_SYMLINK_NOFOLLOW) == 0,
+                  Int64(current.st_dev) == snapshot.device, UInt64(current.st_ino) == snapshot.inode else { throw FileStoreError.localChanged }
+        }
+        guard renameatx_np(firstParent, firstName, secondParent, secondName, UInt32(RENAME_SWAP)) == 0 else {
+            if errno == ENOTSUP || errno == EINVAL { throw FileStoreError.unsupported }
+            throw fileStoreError()
+        }
+        guard fsync(firstParent) == 0, fsync(secondParent) == 0 else { throw fileStoreError() }
+    }
+
+    /// Moves a regular file to the Trash, where the user can still recover it, provided it is
+    /// still the file that was hashed (`expected`).
+    public func trashRegularFile(_ path: RelativePath, expected: FileSnapshot) throws {
+        guard case .present(let current) = try snapshotRegularFile(path), current == expected else { throw FileStoreError.localChanged }
+        do { try trash(rootURL.appending(path: path.value, directoryHint: .notDirectory)) }
+        catch { throw FileStoreError.ioFailure }
     }
 
     /// Removes the directories that held `path` while they are empty, deepest first, stopping at the

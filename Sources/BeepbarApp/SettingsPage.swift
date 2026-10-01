@@ -6,16 +6,31 @@ struct SettingsPage: View {
     // Sparkle's setting isn't observable; mirror it so the toggle reflects changes immediately.
     @State private var checksForUpdates = UpdaterController.shared.automaticallyChecksForUpdates
     @State private var showSignOutConfirmation = false
+    @ObservedObject private var launchAtLogin = LaunchAtLoginController.shared
 
     var body: some View {
         Form {
             languageSection
             accountSection
             folderSection
+            startupSection
             automaticSection
+            notificationsSection
             updatesSection
         }
         .formStyle(.grouped)
+        // On the Form, not on the startup Section: modifiers on a Section inside a Form can be
+        // applied to each of its rows, which would start one refresh per row.
+        .task {
+            await launchAtLogin.refresh()
+            await authentication.refreshNotificationAuthorization()
+        }
+        .onReceive(NotificationCenter.default.publisher(for: NSApplication.didBecomeActiveNotification)) { _ in
+            Task {
+                await launchAtLogin.refresh()
+                await authentication.refreshNotificationAuthorization()
+            }
+        }
         .confirmationDialog(tr("Disconnettere l'account \(authentication.selectedSite.platformName)?", "Disconnect the \(authentication.selectedSite.platformName) account?"), isPresented: $showSignOutConfirmation, titleVisibility: .visible) {
             Button(tr("Disconnetti", "Disconnect"), role: .destructive) { authentication.signOut() }
             Button(tr("Annulla", "Cancel"), role: .cancel) {}
@@ -40,6 +55,7 @@ struct SettingsPage: View {
         Section {
             if !authentication.hasStoredCredential {
                 MoodleSitePicker(authentication: authentication)
+                    .disabled(authentication.isAuthenticating || authentication.isVerifying)
             }
             HStack(spacing: 12) {
                 SymbolTile(systemImage: accountSymbol, tint: accountTint, size: 34)
@@ -54,16 +70,21 @@ struct SettingsPage: View {
                     ProgressView().controlSize(.small)
                 }
                 Button(tr("Verifica", "Verify")) { authentication.validateConnection() }
-                    .disabled(!authentication.hasStoredCredential || authentication.isVerifying)
+                    .disabled(!authentication.hasStoredCredential || authentication.isVerifying || authentication.isAuthenticating)
                 if authentication.hasStoredCredential {
                     Button(tr("Disconnetti…", "Disconnect…")) { showSignOutConfirmation = true }
-                        .disabled(authentication.isSyncActive || authentication.isLoadingCourses)
+                        .disabled(authentication.isSyncActive || authentication.isLoadingCourses || authentication.isVerifying || authentication.isAuthenticating)
                 }
                 if authentication.accountState != .connected {
                     Button(authentication.accountState == .expired ? tr("Accedi di nuovo", "Sign in again") : tr("Accedi", "Sign in")) { authentication.startLogin() }
                         .buttonStyle(.borderedProminent)
-                        .disabled(authentication.isAuthenticating)
+                        .disabled(authentication.isAuthenticating || authentication.isVerifying)
                 }
+            }
+            if let feedback = authentication.authenticationFeedback {
+                Text(feedback.text)
+                    .font(.callout)
+                    .foregroundStyle(.orange)
             }
         } header: {
             Text(tr("Account \(authentication.selectedSite.platformName)", "\(authentication.selectedSite.platformName) account"))
@@ -123,6 +144,43 @@ struct SettingsPage: View {
         }
     }
 
+    // MARK: Startup
+
+    /// "Apri BeepBar al login". The switch shows macOS's real status, re-read whenever Settings
+    /// appears or BeepBar becomes active (see the Form's `.task`), because the user can also
+    /// change it in System Settings.
+    private var startupSection: some View {
+        Section {
+            Toggle(tr("Apri BeepBar al login", "Open BeepBar at login"), isOn: Binding(
+                get: { launchAtLogin.isOn },
+                set: { enabled in Task { await launchAtLogin.setEnabled(enabled) } }
+            ))
+            .disabled(!launchAtLogin.canChange)
+        } header: {
+            Text(tr("Avvio", "Startup"))
+        } footer: {
+            startupFooter
+                .font(.caption)
+                .foregroundStyle(.secondary)
+        }
+    }
+
+    @ViewBuilder private var startupFooter: some View {
+        if let error = launchAtLogin.errorMessage {
+            Text(error.text)
+        } else if launchAtLogin.location != .applications && !launchAtLogin.isOn {
+            Text(tr("Sposta BeepBar nella cartella Applicazioni per aprirla al login.", "Move BeepBar to the Applications folder to open it at login."))
+        } else if launchAtLogin.status == .requiresApproval {
+            VStack(alignment: .leading, spacing: 6) {
+                Text(tr("È disattivata in Impostazioni di Sistema, dove puoi riattivarla.", "It's turned off in System Settings, where you can turn it back on."))
+                Button(tr("Apri Impostazioni di Sistema…", "Open System Settings…")) { launchAtLogin.openSystemSettings() }
+                    .buttonStyle(.link)
+            }
+        } else {
+            Text(tr("Quando è attiva, BeepBar si apre da sola all'accesso al Mac, così la sincronizzazione automatica riprende anche dopo un riavvio.", "When it's on, BeepBar opens by itself when you log in to your Mac, so automatic sync resumes after a restart too."))
+        }
+    }
+
     // MARK: Background
 
     private var automaticSection: some View {
@@ -146,6 +204,45 @@ struct SettingsPage: View {
             Text(tr("Tutti i corsi selezionati vengono controllati. Conflitti e modifiche locali non vengono mai sovrascritti automaticamente.", "All selected courses are checked. Conflicts and local changes are never overwritten automatically."))
                 .font(.caption)
                 .foregroundStyle(.secondary)
+        }
+    }
+
+    // MARK: Notifications
+
+    /// "Notifiche" (#64). The switch is BeepBar's own; macOS's permission is separate and can only
+    /// be changed in System Settings, so when macOS blocks them the footer says so and links there.
+    private var notificationsSection: some View {
+        Section {
+            Toggle(tr("Notifiche", "Notifications"), isOn: Binding(
+                get: { authentication.notificationsEnabled },
+                set: { enabled in Task { await authentication.setNotifications(enabled: enabled) } }
+            ))
+        } header: {
+            Text(tr("Notifiche", "Notifications"))
+        } footer: {
+            notificationsFooter
+                .font(.caption)
+                .foregroundStyle(.secondary)
+        }
+    }
+
+    @ViewBuilder private var notificationsFooter: some View {
+        if authentication.notificationsEnabled && authentication.notificationAuthorization == .denied {
+            VStack(alignment: .leading, spacing: 6) {
+                Text(tr("macOS blocca le notifiche di BeepBar. Puoi consentirle in Impostazioni di Sistema.", "macOS is blocking BeepBar's notifications. You can allow them in System Settings."))
+                Button(tr("Apri Impostazioni di Sistema…", "Open System Settings…")) { Self.openNotificationSettings() }
+                    .buttonStyle(.link)
+            }
+        } else {
+            Text(tr("Nuovi materiali, conflitti da risolvere e problemi di sincronizzazione. Con le notifiche spente, l'icona e le pagine di BeepBar restano aggiornate.", "New materials, conflicts to resolve and sync problems. With notifications off, BeepBar's icon and pages stay up to date."))
+        }
+    }
+
+    /// BeepBar's own page in System Settings → Notifications.
+    private static func openNotificationSettings() {
+        let bundleID = Bundle.main.bundleIdentifier ?? "io.github.tvaccari.beepbar"
+        if let url = URL(string: "x-apple.systempreferences:com.apple.Notifications-Settings.extension?id=\(bundleID)") {
+            NSWorkspace.shared.open(url)
         }
     }
 

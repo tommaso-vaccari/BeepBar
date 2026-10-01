@@ -130,14 +130,15 @@ Al primo sync dopo l'aggiornamento, i file che il professore aveva rimosso da Mo
 - **[PR #62]** Un aggiornamento in ritardo non può sostituire lo stato di un sync avviato nel frattempo, di un account disconnesso o di una cartella di sincronizzazione diversa.
 - **[PR #62]** Se le scelte in sospeso non si possono leggere, le ultime liste mostrate restano visibili e il sync segnala un errore locale; non registra una sincronizzazione riuscita. Anche una selezione dei corsi illeggibile fa fallire l'aggiornamento o il sync automatico, invece di essere trattata come vuota.
 
-- **[PR #67]** Una notifica in attesa di macOS viene scartata se il suo account, la cartella di sincronizzazione o il risultato sono stati sostituiti; scartarla non registra la condizione come già notificata.
+- **[PR #67]** Una notifica in attesa del controllo dei permessi viene scartata se il suo account, la cartella di sincronizzazione o il risultato sono stati sostituiti; scartarla non registra la condizione come già notificata.
 
 ## 7. Dove vedi cosa
 
 | Posto | Contenuto |
 |---|---|
 | **Home** | Un avviso che porta a Conflitti finché qualcosa aspetta una tua scelta, compresi **[PR #54]** i file spostati o rimossi su Moodle |
-| **Attività** | Solo l'ultima sincronizzazione: nuovi, aggiornati, modifiche tue, non aggiornati, spostati, e i file modificati spostati su Moodle che ora aspettano in Conflitti **[PR #54]**. **[PR #69]** Un clic apre il file dove si trova ora, anche se un sync successivo l'ha spostato; il menu del tasto destro lo mostra anche nel Finder. Si aprono direttamente solo i documenti; tutto il resto (script, app, immagini disco, tipi sconosciuti) viene solo mostrato nel Finder. Un file che non è più dove BeepBar l'ha messo viene segnalato sulla sua riga |
-| **Conflitti** | Tutto ciò che aspetta una tua scelta, finché non scegli: conflitti e **[PR #54]** file spostati o rimossi su Moodle |
+| **Attività** | Solo l'ultima sincronizzazione: nuovi, aggiornati, modifiche tue, non aggiornati, spostati, e i file modificati spostati su Moodle che ora aspettano in Conflitti **[PR #54]**. **[PR #69]** Un clic apre il file dove si trova ora, anche se un sync successivo l'ha spostato; il menu del tasto destro lo mostra anche nel Finder. Si aprono direttamente solo i documenti; tutto il resto (script, app, immagini disco, tipi sconosciuti) viene solo mostrato nel Finder. Un file che non è più dove BeepBar l'ha messo, anche se sostituito con un alias Finder, viene segnalato sulla sua riga; se manca il permesso di lettura, la riga segnala il problema e non apre niente |
+| **Conflitti** | Tutto ciò che aspetta una tua scelta, finché non scegli: conflitti e **[PR #54]** file spostati o rimossi su Moodle. Una scelta rifiutata o non riuscita mostra il motivo in questa pagina; una scelta successiva cancella il vecchio messaggio |
 | **Menu bar** | Lo stato dell'ultimo sync. Nessun testo nuovo per spostamenti e rimozioni |
+| **Accesso** | Onboarding e Impostazioni mostrano l'accesso non riuscito accanto al pulsante; il tentativo successivo cancella il vecchio messaggio. Un tentativo non riuscito non sostituisce un account esistente |
 | **Notifiche** | Come oggi (nuovi materiali, conflitti). Nessuna notifica nuova per spostamenti e rimozioni. **[PR #67]** Si possono spegnere in Impostazioni: da spente non ne parte nessuna, e un conflitto ancora aperto può essere notificato al sync automatico successivo alla riaccensione. Un clic apre Conflitti, Attività o Corsi. Compaiono anche quando BeepBar è in primo piano |

@@ -130,14 +130,15 @@ On the first sync after updating, the files the teacher removed from Moodle befo
 - **[PR #62]** A delayed refresh cannot replace the state of a sync started afterward, a disconnected account, or a different sync folder.
 - **[PR #62]** If pending choices cannot be read, their last displayed lists stay visible and the run reports a local error; it does not record a successful sync. An unreadable course selection also fails the refresh or automatic sync instead of being treated as an empty selection.
 
-- **[PR #67]** A notification waiting for macOS is discarded if its account, sync folder or result has been replaced; discarding it does not mark its condition as notified.
+- **[PR #67]** A notification waiting for a permission check is discarded if its account, sync folder or result has been replaced; discarding it does not mark its condition as notified.
 
 ## 7. Where you see what
 
 | Place | Contents |
 |---|---|
 | **Home** | A notice leading to Conflicts while something waits for your choice, including **[PR #54]** files moved or removed on Moodle |
-| **Activity** | The last sync only: new, updated, your changes, not updated, moved, and edited files moved on Moodle that now wait in Conflicts **[PR #54]**. **[PR #69]** A click opens a file where it is now, even after a later sync moved it; the right-click menu also shows it in Finder. Only documents open directly; anything else (scripts, apps, disk images, unknown types) is only shown in Finder. A file that is no longer where BeepBar put it is reported on its row |
-| **Conflicts** | Everything waiting for your choice, until you choose: conflicts and **[PR #54]** files moved or removed on Moodle |
+| **Activity** | The last sync only: new, updated, your changes, not updated, moved, and edited files moved on Moodle that now wait in Conflicts **[PR #54]**. **[PR #69]** A click opens a file where it is now, even after a later sync moved it; the right-click menu also shows it in Finder. Only documents open directly; anything else (scripts, apps, disk images, unknown types) is only shown in Finder. A file that is no longer where BeepBar put it, including one replaced with a Finder alias, is reported on its row; a file without read permission reports that problem and opens nothing |
+| **Conflicts** | Everything waiting for your choice, until you choose: conflicts and **[PR #54]** files moved or removed on Moodle. A refused or failed choice shows its reason on this page; a subsequent choice clears the old message |
 | **Menu bar** | The status of the last sync. No new text for moves and removals |
+| **Sign-in** | Onboarding and Settings show a failed sign-in beside its button; the next attempt clears the old message. A failed attempt does not replace an existing account |
 | **Notifications** | As today (new materials, conflicts). No new notifications for moves and removals. **[PR #67]** They can be turned off in Settings: while off none is sent, and a conflict still open may be notified at the next automatic sync after they are back on. A click opens Conflicts, Activity or Courses. They also appear while BeepBar is in front |

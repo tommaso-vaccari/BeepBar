@@ -8,6 +8,10 @@
 
 - BeepBar now opens by itself when you log in to your Mac, so automatic sync picks up again after a restart. It's on by default: on the first launch after updating, macOS shows a notice that BeepBar was added to your login items. Turn it off anytime with "Apri BeepBar al login" in Impostazioni, or in the login items list in System Settings; BeepBar won't turn it back on. If you had already added BeepBar to your login items yourself, remove that older entry so it doesn't open twice.
 
+- Notifications can be switched off with "Notifiche" in Impostazioni; they stay on unless you turn them off (#64). The menu bar icon and BeepBar's pages keep showing everything either way.
+
+- Clicking a notification now opens BeepBar where it matters: Conflitti for conflicts, Attività for new materials, Corsi for sign-in and sync problems. Notifications also appear while BeepBar is in front, instead of being dropped.
+
 ### Improved
 
 - The app now spells its name BeepBar in the window, the menu, onboarding, messages and notification text, and in update prompts after this update. Your sign-in, sync folder and settings carry over unchanged.

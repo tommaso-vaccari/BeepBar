@@ -1,6 +1,7 @@
 import AppKit
 import BeepbarCore
 import SwiftUI
+import UserNotifications
 import os
 
 enum BeepbarLog {
@@ -31,6 +32,18 @@ struct BeepbarApp: App {
     // removes the race entirely.
     let authentication = WeBeepAuthenticationController()
     private var statusItemController: StatusItemController?
+    /// Kept here because `UNUserNotificationCenter.delegate` is weak.
+    private lazy var notificationResponder = NotificationResponder { [weak self] destination in
+        guard let self else { return }
+        ConfigurationWindowController.shared.show(self.authentication, page: ShellPage(destination))
+    }
+
+    /// Set before launch finishes so a click on a notification that launched BeepBar is delivered.
+    /// Not in a UI preview, which must not touch the installed app's notifications.
+    func applicationWillFinishLaunching(_ notification: Notification) {
+        guard !PreviewMode.isActive else { return }
+        UNUserNotificationCenter.current().delegate = notificationResponder
+    }
     private var terminationPending = false
 
     func applicationDidFinishLaunching(_ notification: Notification) {
@@ -186,7 +199,9 @@ final class StatusItemController: NSObject, NSMenuDelegate {
             }
             appearanceTrace = PerformanceTrace.shared.begin("ui.configurationWindow", category: .ui)
         }
-        if let page { router.page = page }
+        // Onboarding ignores the page (it shows onboarding anyway), and keeping it would land the user
+        // on, say, Conflitti once onboarding ends instead of Corsi.
+        if let page, !authentication.needsOnboarding { router.page = page }
         // Activate before ordering the window in: with macOS 14+ cooperative activation the
         // deprecated `activate(ignoringOtherApps:)` is ignored, which left the window open but
         // inactive, so the first click only activated the app and seemed to do nothing.

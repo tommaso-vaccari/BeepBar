@@ -12,6 +12,7 @@
 		A10000000000000000000006 /* BeepbarShellView.swift in Sources */ = {isa = PBXBuildFile; fileRef = A10000000000000000000014 /* BeepbarShellView.swift */; };
 		A10000000000000000000009 /* UpdaterController.swift in Sources */ = {isa = PBXBuildFile; fileRef = A10000000000000000000017 /* UpdaterController.swift */; };
 		A100000000000000000000AC /* LaunchAtLogin.swift in Sources */ = {isa = PBXBuildFile; fileRef = A100000000000000000000AD /* LaunchAtLogin.swift */; };
+		A100000000000000000000AE /* SyncNotifications.swift in Sources */ = {isa = PBXBuildFile; fileRef = A100000000000000000000AF /* SyncNotifications.swift */; };
 		A10000000000000000000090 /* OnboardingView.swift in Sources */ = {isa = PBXBuildFile; fileRef = A10000000000000000000091 /* OnboardingView.swift */; };
 		A10000000000000000000092 /* CredentialStorage.swift in Sources */ = {isa = PBXBuildFile; fileRef = A10000000000000000000093 /* CredentialStorage.swift */; };
 		A100000000000000000000A0 /* DesignSystem.swift in Sources */ = {isa = PBXBuildFile; fileRef = A100000000000000000000A1 /* DesignSystem.swift */; };
@@ -33,6 +34,7 @@
 		A10000000000000000000014 /* BeepbarShellView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = BeepbarShellView.swift; sourceTree = "<group>"; };
 		A10000000000000000000017 /* UpdaterController.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = UpdaterController.swift; sourceTree = "<group>"; };
 		A100000000000000000000AD /* LaunchAtLogin.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = LaunchAtLogin.swift; sourceTree = "<group>"; };
+		A100000000000000000000AF /* SyncNotifications.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SyncNotifications.swift; sourceTree = "<group>"; };
 		A10000000000000000000091 /* OnboardingView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = OnboardingView.swift; sourceTree = "<group>"; };
 		A10000000000000000000093 /* CredentialStorage.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = CredentialStorage.swift; sourceTree = "<group>"; };
 		A100000000000000000000A1 /* DesignSystem.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DesignSystem.swift; sourceTree = "<group>"; };
@@ -90,6 +92,7 @@
 				A10000000000000000000014 /* BeepbarShellView.swift */,
 				A10000000000000000000017 /* UpdaterController.swift */,
 				A100000000000000000000AD /* LaunchAtLogin.swift */,
+				A100000000000000000000AF /* SyncNotifications.swift */,
 				A10000000000000000000091 /* OnboardingView.swift */,
 				A10000000000000000000093 /* CredentialStorage.swift */,
 				A100000000000000000000A1 /* DesignSystem.swift */,
@@ -193,6 +196,7 @@
 				A10000000000000000000006 /* BeepbarShellView.swift in Sources */,
 				A10000000000000000000009 /* UpdaterController.swift in Sources */,
 				A100000000000000000000AC /* LaunchAtLogin.swift in Sources */,
+				A100000000000000000000AE /* SyncNotifications.swift in Sources */,
 				A10000000000000000000090 /* OnboardingView.swift in Sources */,
 				A10000000000000000000092 /* CredentialStorage.swift in Sources */,
 				A100000000000000000000A0 /* DesignSystem.swift in Sources */,

@@ -2,7 +2,6 @@ import AppKit
 import Foundation
 import SwiftUI
 import os
-@preconcurrency import UserNotifications
 import WebKit
 import BeepbarCore
 
@@ -332,6 +331,11 @@ struct MenuBarSnapshot: Sendable {
     @Published private(set) var language: AppLanguage
     @Published private(set) var enabledCourseIDs: Set<Int64>
     @Published private(set) var automaticSyncEnabled: Bool
+    /// The "Notifiche" switch (#64). On unless the user turned it off; see `NotificationPolicy`.
+    @Published private(set) var notificationsEnabled: Bool
+    /// macOS's permission for BeepBar's notifications, `nil` until first read. Shown under the
+    /// switch when macOS blocks them, since only System Settings can change that.
+    @Published private(set) var notificationAuthorization: NotificationAuthorization?
     @Published private(set) var automaticSyncInterval: Int
     @Published private(set) var recoveryBlocked = false {
         didSet { refreshMenuBarSnapshot() }
@@ -406,7 +410,10 @@ struct MenuBarSnapshot: Sendable {
         let selectedSite = MoodleSite.site(id: Self.defaults.string(forKey: Self.selectedSiteKey))
         self.selectedSite = selectedSite
         hasStoredCredential = false
-        notificationCoordinator = SyncNotificationCoordinator(defaults: Self.defaults)
+        // A preview build shares the installed app's bundle identifier, and macOS keeps the
+        // notification permission per bundle: a preview must never prompt or post for real.
+        notificationCoordinator = SyncNotificationCoordinator(defaults: Self.defaults, center: Self.isUIPreview || Self.isUIPreviewOnboarding ? InertNotificationCenter(authorization: .allowed) : SystemNotificationCenter())
+        notificationsEnabled = Self.storedNotificationsEnabled(in: Self.defaults)
         let resolvedRootURL = Self.storedRootURL()
         rootURL = resolvedRootURL
         let resolvedNeedsOnboarding = Self.resolveNeedsOnboarding(existingRootURL: resolvedRootURL, onboardingAlreadyCompleted: Self.defaults.bool(forKey: Self.onboardingCompletedKey))
@@ -490,13 +497,14 @@ struct MenuBarSnapshot: Sendable {
     }
 
 #if DEBUG
-    init(testRootURL: URL, database: SyncDatabase? = nil, rootID: UUID? = nil) {
+    init(testRootURL: URL, database: SyncDatabase? = nil, rootID: UUID? = nil, notificationCenter: NotificationCenterClient = InertNotificationCenter()) {
         let site = MoodleSite.site(id: nil)
         selectedSite = site
         hasStoredCredential = true
-        let isolatedDefaults = UserDefaults(suiteName: UUID().uuidString)!
+        let isolatedDefaults = Self.throwawayDefaults()
         testDefaults = isolatedDefaults
-        notificationCoordinator = SyncNotificationCoordinator(defaults: isolatedDefaults)
+        notificationCoordinator = SyncNotificationCoordinator(defaults: isolatedDefaults, center: notificationCenter)
+        notificationsEnabled = Self.storedNotificationsEnabled(in: isolatedDefaults)
         rootURL = testRootURL
         needsOnboarding = false
         language = .italian
@@ -510,6 +518,21 @@ struct MenuBarSnapshot: Sendable {
         super.init()
         accountState = .connected
         refreshMenuBarSnapshot()
+    }
+
+    /// Defaults for a test controller, stored in a temporary folder instead of ~/Library/Preferences:
+    /// a named suite leaves a file there that the preferences daemon rewrites even after it is
+    /// deleted, so every test run used to add files to the user's Preferences folder.
+    nonisolated static func throwawayDefaults() -> UserDefaults {
+        UserDefaults(suiteName: throwawayDefaultsSuite())!
+    }
+
+    /// The suite name behind `throwawayDefaults()`: an absolute path, which keeps the property list
+    /// in that folder. Tests that need a second handle on the same suite open it by this name.
+    nonisolated static func throwawayDefaultsSuite() -> String {
+        let folder = FileManager.default.temporaryDirectory.appending(path: "BeepbarTestDefaults-\(UUID().uuidString)", directoryHint: .isDirectory)
+        try? FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+        return folder.appending(path: "defaults").path
     }
 
     func setOperationForTesting(_ operationID: UUID?, task: Task<Void, Never>? = nil) {
@@ -535,6 +558,12 @@ struct MenuBarSnapshot: Sendable {
 
     func restoreScopesForTesting(_ courses: [RemoteCourseSummary]) async throws {
         try await restoreScopes(for: courses)
+    }
+
+    /// Sends what a finished manual sync would, through the controller's own coordinator: proves
+    /// the switch writes to the same defaults the coordinator reads.
+    func notifyManualRunForTesting(added: Int) async {
+        await notificationCoordinator.notifyManualRun(added: added)
     }
 
     func setBeforeNotificationForTesting(_ action: @escaping @MainActor () async -> Void) {
@@ -962,9 +991,47 @@ struct MenuBarSnapshot: Sendable {
             automaticSyncInterval = Self.validatedAutomaticInterval(interval)
             Self.defaults.set(automaticSyncInterval, forKey: Self.autoSyncIntervalKey)
         }
-        if enabled && !wasEnabled { Task { await notificationCoordinator.requestAuthorizationIfNeeded() } }
+        // Through the helper, not the coordinator directly: it also refreshes the Settings footer.
+        if enabled && !wasEnabled { Task { await requestNotificationPermissionIfNeeded() } }
         configureBackgroundScheduler()
     }
+    /// What the switch shows at launch: the stored choice, on when never set.
+    nonisolated static func storedNotificationsEnabled(in defaults: UserDefaults) -> Bool {
+        NotificationPolicy.isEnabled(storedValue: defaults.object(forKey: NotificationPolicy.enabledKey))
+    }
+
+    /// The "Notifiche" switch. Turning it on asks macOS for permission if it never asked; turning it
+    /// off stops every notification before it reaches macOS, and never prompts (#64).
+    func setNotifications(enabled: Bool) async {
+        notificationsEnabled = enabled
+        operationDefaults.set(enabled, forKey: NotificationPolicy.enabledKey)
+        guard enabled else {
+            // Forgotten, not kept: permission may change while off (no reads then), and a stale
+            // "blocked" would flash under the switch when it is turned back on.
+            notificationAuthorization = nil
+            return
+        }
+        await requestNotificationPermissionIfNeeded()
+    }
+
+    /// Asks macOS once if notifications are on and it never asked (turning on the switch, a sync,
+    /// or automatic sync), then shows its answer under the switch.
+    func requestNotificationPermissionIfNeeded() async {
+        await notificationCoordinator.requestAuthorizationIfNeeded()
+        await refreshNotificationAuthorization()
+    }
+
+    /// Re-reads macOS's permission, e.g. after the user changed it in System Settings. Only while
+    /// the switch is on: with it off BeepBar doesn't contact the notification center at all, and
+    /// the footer that shows the permission is only shown when on. Published only on change, so
+    /// each app activation doesn't redraw the window.
+    func refreshNotificationAuthorization() async {
+        guard notificationsEnabled else { return }
+        let authorization = await notificationCoordinator.authorization()
+        guard notificationsEnabled, authorization != notificationAuthorization else { return }
+        notificationAuthorization = authorization
+    }
+
     func setAutomaticSyncInterval(_ seconds: Int) { guard !isSyncActive else { return }; automaticSyncInterval = Self.validatedAutomaticInterval(seconds); Self.defaults.set(automaticSyncInterval, forKey: Self.autoSyncIntervalKey); configureBackgroundScheduler() }
 
     func renameFolder(for course: RemoteCourseSummary, to newFolder: String) {
@@ -1008,7 +1075,8 @@ struct MenuBarSnapshot: Sendable {
         let operationID = UUID()
         activeOperationID = operationID
         setSyncState(.checking)
-        Task { await notificationCoordinator.requestAuthorizationIfNeeded() }
+        // Through the helper, not the coordinator directly: it also refreshes the Settings footer.
+        Task { await requestNotificationPermissionIfNeeded() }
         syncTask = Task { [weak self] in
             do {
                 guard let self else { return }
@@ -1976,109 +2044,6 @@ private actor BootstrapService {
             try await RecoveryCoordinator(rootID: rootID, database: database, fileStore: try FileStore(root: rootURL)).recover()
         }
         return !report.unresolved.isEmpty
-    }
-}
-
-private enum AutomaticNotificationIssue: String {
-    case authenticationExpired
-    case serviceUnavailable
-    case incompatibleResponse
-    case partialSync
-
-    var title: String {
-        switch self {
-        case .authenticationExpired: tr("Accesso scaduto", "Sign-in expired")
-        case .serviceUnavailable: tr("Piattaforma non disponibile", "Platform unavailable")
-        case .incompatibleResponse: tr("Problema con la piattaforma", "Platform problem")
-        case .partialSync: tr("Sincronizzazione incompleta", "Sync incomplete")
-        }
-    }
-
-    var body: String {
-        switch self {
-        case .authenticationExpired: tr("Apri BeepBar e accedi di nuovo per riprendere la sincronizzazione.", "Open BeepBar and sign in again to resume syncing.")
-        case .serviceUnavailable: tr("La piattaforma non risponde. I materiali locali restano disponibili.", "The platform isn't responding. Your local materials remain available.")
-        case .incompatibleResponse: tr("La piattaforma ha restituito una risposta inattesa. Apri BeepBar per i dettagli.", "The platform returned an unexpected response. Open BeepBar for details.")
-        case .partialSync: tr("Alcuni materiali non sono stati aggiornati. Apri BeepBar per i dettagli.", "Some materials weren't updated. Open BeepBar for details.")
-        }
-    }
-}
-
-@MainActor private final class SyncNotificationCoordinator {
-    private static let prefix = "io.github.tvaccari.beepbar.notification.v2"
-    private let deduplication: NotificationDeduplicationStore
-#if DEBUG
-    var beforeNotificationForTesting: (@MainActor () async -> Void)?
-#endif
-
-    init(defaults: UserDefaults = .standard) {
-        deduplication = NotificationDeduplicationStore(defaults: defaults, prefix: Self.prefix)
-    }
-
-    func requestAuthorizationIfNeeded() async {
-        let center = UNUserNotificationCenter.current()
-        let settings = await center.notificationSettings()
-        guard settings.authorizationStatus == .notDetermined else { return }
-        _ = try? await center.requestAuthorization(options: [.alert, .sound])
-    }
-
-    func notifyAutomaticRun(installed: Int, conflicts: [ConflictRecord], failures: Int) async {
-        let center = UNUserNotificationCenter.current()
-        let settings = await center.notificationSettings()
-        guard settings.authorizationStatus == .authorized else { return }
-        if conflicts.isEmpty {
-            deduplication.resolve(condition: "conflicts")
-        } else {
-            let fingerprint = NotificationFingerprint.conflicts(conflicts)
-            if deduplication.shouldNotify(condition: "conflicts", fingerprint: fingerprint, now: Date()) {
-                await send(center, title: conflicts.count == 1 ? tr("Conflitto da risolvere", "Conflict to resolve") : tr("Conflitti da risolvere", "Conflicts to resolve"), body: SyncCopy.conflictNotificationBody(conflicts.count), identifier: "beepbar-conflicts")
-            }
-        }
-        if failures > 0 {
-            await notify(issue: .partialSync)
-        } else {
-            if installed > 0 {
-                await send(center, title: installed == 1 ? tr("Nuovo materiale disponibile", "New material available") : tr("Nuovi materiali disponibili", "New materials available"), body: SyncCopy.newMaterialsNotificationBody(installed), identifier: "beepbar-new-files-\(UUID().uuidString)")
-            }
-        }
-    }
-
-    /// A manual run started from the menu leaves no menu open to show its result, so say when new
-    /// materials arrived. Nothing new stays silent: the icon returning to normal is enough.
-    /// Without a notification delegate, macOS drops the banner while Beepbar's window is in front.
-    func notifyManualRun(added: Int) async {
-#if DEBUG
-        if let beforeNotificationForTesting { await beforeNotificationForTesting(); return }
-#endif
-        guard added > 0 else { return }
-        let center = UNUserNotificationCenter.current()
-        let settings = await center.notificationSettings()
-        guard settings.authorizationStatus == .authorized else { return }
-        await send(center, title: added == 1 ? tr("Nuovo materiale disponibile", "New material available") : tr("Nuovi materiali disponibili", "New materials available"), body: SyncCopy.newMaterialsNotificationBody(added), identifier: "beepbar-new-files-\(UUID().uuidString)")
-    }
-
-    func notify(issue: AutomaticNotificationIssue) async {
-#if DEBUG
-        if let beforeNotificationForTesting { await beforeNotificationForTesting(); return }
-#endif
-        let center = UNUserNotificationCenter.current()
-        let settings = await center.notificationSettings()
-        guard settings.authorizationStatus == .authorized else { return }
-        guard deduplication.shouldNotify(condition: issue.rawValue, fingerprint: issue.rawValue, now: Date()) else { return }
-        await send(center, title: issue.title, body: issue.body, identifier: "beepbar-\(issue.rawValue)")
-    }
-
-    func clearFailure() {
-        for issue in [AutomaticNotificationIssue.authenticationExpired, .serviceUnavailable, .incompatibleResponse, .partialSync] {
-            deduplication.resolve(condition: issue.rawValue)
-        }
-    }
-
-    private func send(_ center: UNUserNotificationCenter, title: String, body: String, identifier: String) async {
-        let content = UNMutableNotificationContent()
-        content.title = title
-        content.body = body
-        try? await center.add(UNNotificationRequest(identifier: identifier, content: content, trigger: nil))
     }
 }
 

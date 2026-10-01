@@ -92,7 +92,7 @@ private final class FakeLoginItemService: LoginItemService, @unchecked Sendable 
 /// Exercises the controller end to end against the fake registry and a throwaway defaults suite,
 /// launch after launch, the way an installed BeepBar would see them.
 @MainActor final class LaunchAtLoginControllerTests {
-    private let suiteName = "LaunchAtLoginControllerTests-\(UUID().uuidString)"
+    private let suiteName = WeBeepAuthenticationController.throwawayDefaultsSuite()
     private let defaults: UserDefaults
     private let couldNotAdd = BilingualText("Non è stato possibile aggiungere BeepBar agli elementi di login.", "Couldn't add BeepBar to your login items.")
     private let couldNotRemove = BilingualText("Non è stato possibile rimuovere BeepBar dagli elementi di login.", "Couldn't remove BeepBar from your login items.")
@@ -102,7 +102,7 @@ private final class FakeLoginItemService: LoginItemService, @unchecked Sendable 
     }
 
     deinit {
-        UserDefaults().removePersistentDomain(forName: suiteName)
+        removeTestDefaults(suiteName)
     }
 
     private func launch(_ service: FakeLoginItemService, from location: AppLocation = .applications) async -> LaunchAtLoginController {

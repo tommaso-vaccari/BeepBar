@@ -274,13 +274,18 @@ struct LoginFeedbackTests {
         LoginFeedbackProtocol.suspensions.withLock { $0[token] = gate }
         defer { _ = LoginFeedbackProtocol.suspensions.withLock { $0.removeValue(forKey: token) } }
         let vault = CredentialVault(read: { _ in token }, write: { _ in Issue.record("Verification must not replace the token") })
-        let controller = WeBeepAuthenticationController(testRootURL: FileManager.default.temporaryDirectory, apiClient: WeBeepAPIClient(session: session), credentialVault: vault)
+        let absentTokenRoot = FileManager.default.temporaryDirectory.appending(path: UUID().uuidString)
+        #expect(!FileManager.default.fileExists(atPath: absentTokenRoot.path))
+        var deletionAttempted = false
+        let controller = WeBeepAuthenticationController(testRootURL: absentTokenRoot, apiClient: WeBeepAPIClient(session: session), credentialVault: vault, deleteCredential: {
+            deletionAttempted = true
+            throw CredentialStorageError.write
+        })
         let verification = try #require(controller.validateConnection())
         var started = gate.started.stream.makeAsyncIterator()
         _ = await started.next()
         #expect(controller.isVerifying)
-        var deletionAttempted = false
-        controller.signOut(removeFile: { _ in deletionAttempted = true; throw CredentialStorageError.write })
+        controller.signOut()
         #expect(!deletionAttempted)
         #expect(controller.hasStoredCredential)
         controller.startLogin()
@@ -297,8 +302,9 @@ struct LoginFeedbackTests {
         #expect(controller.accountState == (outcome == "success" ? .connected : .expired))
         #expect(controller.selectedSite == .polimi)
         // After the terminal result a disconnect reaches the injected deletion hook.
-        controller.signOut(removeFile: { _ in deletionAttempted = true; throw CredentialStorageError.write })
+        controller.signOut()
         #expect(deletionAttempted)
+        #expect(!FileManager.default.fileExists(atPath: absentTokenRoot.path))
     }
 
     @Test @MainActor func successfulCallbackWaitsForSpawnedCourseRefresh() async throws {

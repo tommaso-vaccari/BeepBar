@@ -415,6 +415,7 @@ struct MenuBarSnapshot: Sendable {
     private var beforeReconciliationStateForTesting: (@MainActor () async -> Void)?
     private var beforePendingChoicesForTesting: (@MainActor () async -> Void)?
     private var courseLoadTaskForTesting: Task<Void, Never>?
+    private var deleteCredentialForTesting: (() throws -> Void)?
     private var testDefaults: UserDefaults?
     private var beforeScopeRestoreForTesting: (@MainActor () -> Void)?
 #endif
@@ -528,7 +529,8 @@ struct MenuBarSnapshot: Sendable {
     }
 
 #if DEBUG
-    init(testRootURL: URL, database: SyncDatabase? = nil, rootID: UUID? = nil, notificationCenter: NotificationCenterClient = InertNotificationCenter(), fileOpener: ActivityFileOpening = InertFileOpener(), apiClient: WeBeepAPIClient? = nil, credentialVault: CredentialVault? = nil) {
+    init(testRootURL: URL, database: SyncDatabase? = nil, rootID: UUID? = nil, notificationCenter: NotificationCenterClient = InertNotificationCenter(), fileOpener: ActivityFileOpening = InertFileOpener(), apiClient: WeBeepAPIClient? = nil, credentialVault: CredentialVault? = nil, deleteCredential: (() throws -> Void)? = nil) {
+        deleteCredentialForTesting = deleteCredential
         self.credentialVault = credentialVault ?? CredentialVault(read: FileTokenStore.load, write: FileTokenStore.save)
         self.fileOpener = fileOpener
         let site = MoodleSite.site(id: nil)
@@ -731,7 +733,15 @@ struct MenuBarSnapshot: Sendable {
     func signOut(removeFile: (URL) throws -> Void = { try FileManager.default.removeItem(at: $0) }) {
         guard hasStoredCredential, !isSyncActive, !isAuthenticating, !isVerifying, !isLoadingCourses else { return }
         do {
+#if DEBUG
+            if let deleteCredentialForTesting {
+                try deleteCredentialForTesting()
+            } else {
+                try FileTokenStore.delete(removeFile: removeFile)
+            }
+#else
             try FileTokenStore.delete(removeFile: removeFile)
+#endif
         } catch {
             setSyncState(.failed(.local(BilingualText("Impossibile eliminare il token salvato. Riprova a disconnetterti.", "Couldn't remove the stored token. Try disconnecting again."))))
             return

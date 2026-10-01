@@ -596,6 +596,32 @@ import Testing
         #expect(fixture.upstream.downloadNetworkAccess == [RecordedNetworkAccess(expensive: true, constrained: true)])
     }
 
+    /// Proves that "Sincronizza ora" reads course contents over any network, metered hotspot and
+    /// Low Data Mode included: the user asked for the run. Guards against a change that restricts
+    /// the Moodle requests a manual run sends, the way downloads can be restricted.
+    @Test func manualSyncReadsCourseContentsOverAnyNetwork() async throws {
+        let fixture = try await Fixture()
+        defer { fixture.remove() }
+        _ = try await fixture.synchronize(targets: [fixture.targets[0]], mode: .manual)
+        #expect(fixture.upstream.contentsRequestCount == 1)
+        #expect(fixture.upstream.contentsNetworkAccess == [RecordedNetworkAccess(expensive: true, constrained: true)])
+    }
+
+    /// Proves that after a refused download in "Sincronizza ora", the token check that follows may
+    /// use any network too. It is the one other Moodle request the coordinator sends, and the app
+    /// tests cannot reach it: their controller downloads through a real session.
+    @Test func manualSyncChecksTheTokenOverAnyNetwork() async throws {
+        let fixture = try await Fixture()
+        defer { fixture.remove() }
+        fixture.upstream.setStatus(course: 1, file: 0, status: 401)
+
+        await #expect(throws: WeBeepAPIError.transport(401)) {
+            try await fixture.synchronize(targets: [fixture.targets[0]], mode: .manual)
+        }
+        #expect(fixture.upstream.validationCount == 1)
+        #expect(fixture.upstream.validationNetworkAccess == [RecordedNetworkAccess(expensive: true, constrained: true)])
+    }
+
     // MARK: Following moves made on Moodle
 
     @Test func followsAModuleMovedToAnotherSectionWithoutDownloadingAgain() async throws {
@@ -1750,6 +1776,9 @@ private final class MutableFixtureUpstream: @unchecked Sendable {
     private var rejectedContents: [Int64: String] = [:]
     private var failedContents: [Int64: Int] = [:]
     private var networkAccess: Set<RecordedNetworkAccess> = []
+    private var contentsRequests = 0
+    private var contentsAccess: Set<RecordedNetworkAccess> = []
+    private var validationAccess: Set<RecordedNetworkAccess> = []
     private var sectionNames: [Int64: String] = [:]
     private var moduleNames: [Int64: String] = [:]
     private var extraModules: [Int64: [Int64: (section: String, name: String)]] = [:]
@@ -1762,6 +1791,11 @@ private final class MutableFixtureUpstream: @unchecked Sendable {
     var maximumActiveDownloads: Int { lock.withLock { peakDownloads } }
     var validationCount: Int { lock.withLock { validations } }
     var downloadNetworkAccess: Set<RecordedNetworkAccess> { lock.withLock { networkAccess } }
+    /// `core_course_get_contents` requests and the network restrictions they carried.
+    var contentsRequestCount: Int { lock.withLock { contentsRequests } }
+    var contentsNetworkAccess: Set<RecordedNetworkAccess> { lock.withLock { contentsAccess } }
+    /// The network restrictions the token checks (`core_webservice_get_site_info`) carried.
+    var validationNetworkAccess: Set<RecordedNetworkAccess> { lock.withLock { validationAccess } }
     func resetDownloadCount() { lock.withLock { downloads = 0 } }
 
     func populate(courses: Int, filesPerCourse: Int) {
@@ -1806,6 +1840,7 @@ private final class MutableFixtureUpstream: @unchecked Sendable {
                 let body = String(data: request.httpBody ?? bodyData(from: request.httpBodyStream), encoding: .utf8) ?? ""
                 if formValue("wsfunction", body: body) == "core_webservice_get_site_info" {
                     validations += 1
+                    validationAccess.insert(RecordedNetworkAccess(expensive: request.allowsExpensiveNetworkAccess, constrained: request.allowsConstrainedNetworkAccess))
                     let response: Data
                     if tokenIsValid {
                         response = Data(#"{"userid":7,"siteurl":"https://fixture.beepbar.test","functions":[{"name":"core_enrol_get_users_courses"},{"name":"core_course_get_contents"}]}"#.utf8)
@@ -1815,6 +1850,10 @@ private final class MutableFixtureUpstream: @unchecked Sendable {
                     return (HTTPURLResponse(url: url, statusCode: 200, httpVersion: nil, headerFields: ["Content-Type": "application/json"])!, response, 0, false)
                 }
                 let course = Int64(formValue("courseid", body: body) ?? "") ?? 0
+                if formValue("wsfunction", body: body) == "core_course_get_contents" {
+                    contentsRequests += 1
+                    contentsAccess.insert(RecordedNetworkAccess(expensive: request.allowsExpensiveNetworkAccess, constrained: request.allowsConstrainedNetworkAccess))
+                }
                 if let status = failedContents[course] {
                     return (HTTPURLResponse(url: url, statusCode: status, httpVersion: nil, headerFields: ["Content-Type": "text/html"])!, Data(), 0, false)
                 }

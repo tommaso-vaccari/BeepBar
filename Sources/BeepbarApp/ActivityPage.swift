@@ -208,8 +208,11 @@ private struct CourseActivityCard: View {
 }
 
 /// What a click on an Attività file does, worded for the user: on hover, in the tooltip, for
-/// VoiceOver and in the context menu. Derived from `ActivityFilePolicy`, so a file that is only
-/// shown in Finder is never labelled "Apri".
+/// VoiceOver and in the context menu. Derived from `ActivityFilePolicy.opensDirectly`, so a file
+/// whose name is only shown in Finder is never labelled "Apri". It's a prediction from the name
+/// alone: the click itself is decided against the disk (`ActivityFilePolicy.action`), so a
+/// document the user made executable is still only shown in Finder even though it says "Apri".
+/// The label can only err that way round, never promising Finder and then opening.
 enum ActivityClickAction: Equatable {
     case open
     case showInFinder

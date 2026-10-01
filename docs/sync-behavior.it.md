@@ -130,6 +130,8 @@ Al primo sync dopo l'aggiornamento, i file che il professore aveva rimosso da Mo
 - **[PR #62]** Un aggiornamento in ritardo non può sostituire lo stato di un sync avviato nel frattempo, di un account disconnesso o di una cartella di sincronizzazione diversa.
 - **[PR #62]** Se le scelte in sospeso non si possono leggere, le ultime liste mostrate restano visibili e il sync segnala un errore locale; non registra una sincronizzazione riuscita. Anche una selezione dei corsi illeggibile fa fallire l'aggiornamento o il sync automatico, invece di essere trattata come vuota.
 
+- **[PR #67]** Una notifica in attesa di macOS viene scartata se il suo account, la cartella di sincronizzazione o il risultato sono stati sostituiti; scartarla non registra la condizione come già notificata.
+
 ## 7. Dove vedi cosa
 
 | Posto | Contenuto |

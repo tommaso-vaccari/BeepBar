@@ -191,3 +191,111 @@ struct SyncFinalizationTests {
         await completion.value
     }
 }
+
+/// Holds the first real permission read while the controller can accept account/folder/run changes.
+/// Subsequent reads proceed, so a later notification proves obsolete delivery did not poison deduplication.
+private actor SuspendedNotificationCenter: NotificationCenterClient {
+    nonisolated let started = AsyncStream<Void>.makeStream()
+    nonisolated let release = AsyncStream<Void>.makeStream()
+    private var held = false
+    private let holdSend: Bool
+    init(holdSend: Bool = false) { self.holdSend = holdSend }
+    private(set) var sent: [NotificationDestination] = []
+
+    func authorization() async -> NotificationAuthorization {
+        if !held && !holdSend {
+            held = true
+            started.continuation.yield()
+            for await _ in release.stream { break }
+        }
+        return .allowed
+    }
+    func requestAuthorization() async {}
+    func send(identifier: String, title: String, body: String, destination: NotificationDestination) async {
+        sent.append(destination)
+        if holdSend && !held {
+            held = true
+            started.continuation.yield()
+            for await _ in release.stream { break }
+        }
+    }
+}
+
+extension SyncFinalizationTests {
+    /// Runs the actual coordinator after completion/failure, rather than the notification test hook.
+    /// Old notices must be dropped after disconnect, folder changes, a newer run or its successful result;
+    /// a discarded failure must also leave a subsequent genuine failure eligible for notification.
+    @Test(arguments: [false, true], ["disconnect", "root", "new-run", "new-result"]) @MainActor
+    func obsoleteNotificationsAreDroppedWithoutRecording(failed: Bool, replacement: String) async throws {
+        let root = FileManager.default.temporaryDirectory.appending(path: UUID().uuidString, directoryHint: .isDirectory)
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let database = try SyncDatabase(url: root.appending(path: "state.sqlite"))
+        let rootID = UUID()
+        try await database.registerRoot(id: rootID, canonicalPath: root.path)
+        let center = SuspendedNotificationCenter()
+        let controller = WeBeepAuthenticationController(testRootURL: root, database: database, rootID: rootID, notificationCenter: center)
+        let operationID = UUID()
+        controller.setOperationForTesting(operationID)
+        let completion = Task {
+            if failed { await controller.failSyncForTesting(operationID) }
+            else {
+                await controller.completeSyncForTesting(operationID, summary: SyncProgress(completed: 1, total: 1, added: 1, updated: 0, preservedLocal: 0, unchanged: 0, conflicts: 0, failures: 0))
+            }
+        }
+        var started = center.started.stream.makeAsyncIterator()
+        _ = await started.next()
+        #expect(!controller.isSyncActive, "notification permission must not leave Cancel active")
+        switch replacement {
+        case "disconnect": controller.setDisconnectedForTesting()
+        case "root": controller.setRootIDForTesting(UUID())
+        case "new-run": controller.setOperationForTesting(UUID())
+        default:
+            let newer = UUID()
+            controller.setOperationForTesting(newer)
+            await controller.completeSyncForTesting(newer, summary: SyncProgress(completed: 0, total: 0, added: 0, updated: 0, preservedLocal: 0, unchanged: 0, conflicts: 0, failures: 0))
+        }
+        center.release.continuation.yield()
+        await completion.value
+        #expect(await center.sent.isEmpty)
+        if failed {
+            let newerFailure = UUID()
+            controller.setOperationForTesting(newerFailure)
+            await controller.failSyncForTesting(newerFailure)
+            #expect(await center.sent == [.home], "discarded failure must not suppress the next genuine failure")
+        }
+    }
+}
+
+
+extension SyncFinalizationTests {
+    /// Real automatic completion keeps one validity snapshot for conflicts and its subsequent
+    /// materials/failure notice, even when a disconnect or a new run occurs during the first send.
+    @Test(arguments: [0, 1], ["disconnect", "new-run"]) @MainActor
+    func automaticNotificationSequenceUsesOriginalResult(failures: Int, replacement: String) async throws {
+        let root = FileManager.default.temporaryDirectory.appending(path: UUID().uuidString, directoryHint: .isDirectory)
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let database = try SyncDatabase(url: root.appending(path: "state.sqlite"))
+        let rootID = UUID()
+        try await database.registerRoot(id: rootID, canonicalPath: root.path)
+        try await database.insertConflict(ConflictRecord(id: UUID(), rootID: rootID, remoteID: "pending",
+            relativePath: try RelativePath("Course/pending.pdf"), incomingPath: try RelativePath(internal: ".beepbar/conflicts/pending.pdf"),
+            baseSHA256: "base", localSHA256: "local", remoteSHA256: "remote", remoteRevision: "2", detectedAt: .now, status: .open))
+        let center = SuspendedNotificationCenter(holdSend: true)
+        let controller = WeBeepAuthenticationController(testRootURL: root, database: database, rootID: rootID, notificationCenter: center)
+        let operationID = UUID()
+        controller.setOperationForTesting(operationID)
+        let completion = Task {
+            await controller.completeSyncForTesting(operationID, summary: SyncProgress(completed: 2, total: 2, added: 1, updated: 0, preservedLocal: 0, unchanged: 0, conflicts: 1, failures: failures), automatic: true)
+        }
+        var started = center.started.stream.makeAsyncIterator()
+        _ = await started.next()
+        #expect(!controller.isSyncActive)
+        if replacement == "disconnect" { controller.setDisconnectedForTesting() }
+        else { controller.setOperationForTesting(UUID()) }
+        center.release.continuation.yield()
+        await completion.value
+        #expect(await center.sent == [.conflicts])
+    }
+}

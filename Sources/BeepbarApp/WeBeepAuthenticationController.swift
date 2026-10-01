@@ -317,7 +317,7 @@ struct MenuBarSnapshot: Sendable {
     }
     @Published private(set) var status = tr("Avvio BeepBar…", "Starting BeepBar…")
     @Published private(set) var syncState: AppSyncState = .starting {
-        didSet { refreshMenuBarSnapshot() }
+        didSet { notificationGeneration += 1; refreshMenuBarSnapshot() }
     }
     @Published private(set) var accountState: AccountState = .notConnected {
         didSet { refreshMenuBarSnapshot() }
@@ -384,8 +384,14 @@ struct MenuBarSnapshot: Sendable {
     // clearing it redrew nothing and the window stayed on "Annulla" after a sync that downloaded
     // new files, with a button that no longer did anything.
     @Published private var activeOperationID: UUID? {
-        didSet { refreshMenuBarSnapshot() }
+        didSet {
+            if activeOperationID != nil { notificationGeneration += 1 }
+            refreshMenuBarSnapshot()
+        }
     }
+    /// Survives operation finalization, so awaiting notification permission cannot resurrect an
+    /// earlier result once a new run or account state has replaced it.
+    private var notificationGeneration = 0
     private var automaticOutcome: AutomaticSyncOutcome = .finished
     private var rootID: UUID?
     private var scheduledConfiguration: BackgroundScheduleConfiguration?
@@ -578,8 +584,8 @@ struct MenuBarSnapshot: Sendable {
         notificationCoordinator.beforeNotificationForTesting = action
     }
 
-    func completeSyncForTesting(_ operationID: UUID, summary: SyncProgress) async {
-        await completeSync(operationID, summary: summary, automatic: false)
+    func completeSyncForTesting(_ operationID: UUID, summary: SyncProgress, automatic: Bool = false) async {
+        await completeSync(operationID, summary: summary, automatic: automatic)
     }
 
     func setBeforeReconciliationStateForTesting(_ action: @escaping @MainActor () async -> Void) {
@@ -1933,12 +1939,28 @@ struct MenuBarSnapshot: Sendable {
         if summary.failures == 0 { notificationCoordinator.clearFailure() }
         BeepbarLog.sync.notice("Synchronization completed automatic=\(automatic, privacy: .public) total=\(summary.total, privacy: .public) installed=\(summary.installed, privacy: .public) conflicts=\(summary.conflicts, privacy: .public) failures=\(summary.failures, privacy: .public)")
         configureBackgroundScheduler()
+        let isCurrent = currentNotificationCheck()
         await finishOperationBeforeNotification(operationID) {
             if automatic {
-                await notificationCoordinator.notifyAutomaticRun(installed: summary.installed, conflicts: conflicts, failures: summary.failures)
+                await notificationCoordinator.notifyAutomaticRun(installed: summary.installed, conflicts: conflicts, failures: summary.failures, isCurrent: isCurrent)
             } else {
-                await notificationCoordinator.notifyManualRun(added: summary.added)
+                await notificationCoordinator.notifyManualRun(added: summary.added, isCurrent: isCurrent)
             }
+        }
+    }
+
+    /// Captures notification validity separately from the active operation, which must end before
+    /// delivery. Checking the captured account and folder also covers changes with no sync state write.
+    private func currentNotificationCheck() -> @MainActor () -> Bool {
+        let generation = notificationGeneration
+        let site = selectedSite
+        let root = rootID
+        let folder = rootURL
+        let credential = hasStoredCredential
+        return { [weak self] in
+            guard let self else { return false }
+            return self.notificationGeneration == generation && self.selectedSite == site
+                && self.rootID == root && self.rootURL == folder && self.hasStoredCredential == credential
         }
     }
 
@@ -1978,8 +2000,9 @@ struct MenuBarSnapshot: Sendable {
             setSyncState(.failed(.partialSync))
             issue = automatic ? .partialSync : nil
         }
+        let isCurrent = currentNotificationCheck()
         await finishOperationBeforeNotification(operationID) {
-            if let issue { await notificationCoordinator.notify(issue: issue) }
+            if let issue { await notificationCoordinator.notify(issue: issue, isCurrent: isCurrent) }
         }
     }
 

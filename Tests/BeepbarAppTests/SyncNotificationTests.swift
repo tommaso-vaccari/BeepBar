@@ -204,6 +204,34 @@ private final class FakeNotificationCenter: NotificationCenterClient, @unchecked
         #expect(denied.requests == 0)
     }
 
+    /// An automatic result invalidated during authorization must neither send its conflicts nor
+    /// record them; the same conflicts remain eligible when a current run later announces them.
+    @Test func obsoleteAutomaticRunDoesNotRecordConflicts() async throws {
+        let current = OSAllocatedUnfairLock(initialState: true)
+        let invalidateOnRead = OSAllocatedUnfairLock(initialState: true)
+        let center = FakeNotificationCenter(onAuthorizationRead: {
+            if invalidateOnRead.withLock({ $0 }) { current.withLock { $0 = false } }
+        })
+        let coordinator = SyncNotificationCoordinator(defaults: defaults, center: center)
+        let open = [try conflict("a")]
+        await coordinator.notifyAutomaticRun(installed: 2, conflicts: open, failures: 0, isCurrent: { current.withLock { $0 } })
+        #expect(center.sent.isEmpty)
+        invalidateOnRead.withLock { $0 = false }
+        current.withLock { $0 = true }
+        await coordinator.notifyAutomaticRun(installed: 0, conflicts: open, failures: 0, isCurrent: { current.withLock { $0 } })
+        #expect(center.sent.map(\.destination) == [.conflicts])
+    }
+
+    /// A result can be superseded while its first notification reaches macOS; the second notice
+    /// must not announce the older run's materials or failure after that suspension.
+    @Test(arguments: [0, 1]) func obsoleteRunStopsBetweenNotifications(failures: Int) async throws {
+        let current = OSAllocatedUnfairLock(initialState: true)
+        let center = FakeNotificationCenter(onSend: { current.withLock { $0 = false } })
+        let coordinator = SyncNotificationCoordinator(defaults: defaults, center: center)
+        await coordinator.notifyAutomaticRun(installed: 2, conflicts: [try conflict("a")], failures: failures, isCurrent: { current.withLock { $0 } })
+        #expect(center.sent.map(\.destination) == [.conflicts])
+    }
+
     /// Without macOS's permission nothing is sent, and nothing is recorded as notified, so the
     /// conflict is announced once the user allows notifications in System Settings.
     @Test func withoutMacOSPermissionNothingIsSentOrRecorded() async throws {

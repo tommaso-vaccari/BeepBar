@@ -130,6 +130,8 @@ On the first sync after updating, the files the teacher removed from Moodle befo
 - **[PR #62]** A delayed refresh cannot replace the state of a sync started afterward, a disconnected account, or a different sync folder.
 - **[PR #62]** If pending choices cannot be read, their last displayed lists stay visible and the run reports a local error; it does not record a successful sync. An unreadable course selection also fails the refresh or automatic sync instead of being treated as an empty selection.
 
+- **[PR #67]** A notification waiting for macOS is discarded if its account, sync folder or result has been replaced; discarding it does not mark its condition as notified.
+
 ## 7. Where you see what
 
 | Place | Contents |

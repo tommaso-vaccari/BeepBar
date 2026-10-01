@@ -20,6 +20,8 @@
 
 ### Fixed
 
+- A notification still waiting for macOS is discarded if you disconnect, change the sync folder or start a newer sync; an obsolete failure no longer suppresses the next genuine failure notice.
+
 - If pending choices cannot be read, BeepBar keeps the last displayed lists and reports an error instead of hiding them and reporting a successful synchronization.
 - Cancelling during the final checks no longer shows a completed result afterward. Once a run is complete, Cancel can no longer replace the completed or failed result with “Ready”.
 - Refreshing the course list no longer overwrites a course selection that is still being saved, and course switches stay disabled until the refresh ends.

@@ -1,6 +1,7 @@
 import Foundation
 import XCTest
 import Testing
+import os
 @testable import BeepbarApp
 import BeepbarCore
 
@@ -222,6 +223,82 @@ struct LoginFeedbackTests {
         #expect(controller.authenticationFeedback == nil)
     }
 
+    @Test(arguments: ["validation", "storage"]) @MainActor
+    func siteSelectionWaitsForAuthenticationToFinish(_ phase: String) async throws {
+        let configuration = URLSessionConfiguration.ephemeral
+        configuration.protocolClasses = [LoginFeedbackProtocol.self]
+        let session = URLSession(configuration: configuration)
+        defer { session.invalidateAndCancel() }
+        let gate = LoginSuspension()
+        let token = UUID().uuidString
+        if phase == "validation" { LoginFeedbackProtocol.suspensions.withLock { $0[token] = gate } }
+        defer { LoginFeedbackProtocol.suspensions.withLock { $0.removeValue(forKey: token) } }
+        let vault = CredentialVault(read: { _ in throw CredentialStorageError.absent }, write: { _ in
+            gate.pause()
+            throw CredentialStorageError.write
+        })
+        let controller = WeBeepAuthenticationController(testRootURL: FileManager.default.temporaryDirectory, apiClient: WeBeepAPIClient(session: session), credentialVault: vault)
+        controller.setDisconnectedForTesting()
+        let login = Task { await controller.completeLoginForTesting(callback(token)) }
+        var started = gate.started.stream.makeAsyncIterator()
+        _ = await started.next()
+        #expect(controller.isAuthenticating)
+        #expect(controller.validateConnection() == nil)
+        controller.selectUniversity(.unipd)
+        #expect(controller.selectedSite == .polimi)
+        controller.selectSite(MoodleSite.unipd[1])
+        #expect(controller.selectedSite == .polimi)
+        #expect(controller.apiHostForTesting == MoodleSite.polimi.serverPolicy.host)
+        gate.release.signal()
+        await login.value
+        #expect(!controller.isAuthenticating)
+        #expect(!controller.hasStoredCredential)
+        #expect(controller.authenticationFeedback != nil)
+        controller.selectUniversity(.unipd)
+        #expect(controller.selectedSite == MoodleSite.unipd[0])
+        controller.selectSite(MoodleSite.unipd[1])
+        #expect(controller.selectedSite == MoodleSite.unipd[1])
+        #expect(controller.apiHostForTesting == MoodleSite.unipd[1].serverPolicy.host)
+    }
+
+    @Test(arguments: ["success", "invalid"]) @MainActor
+    func verificationSerializesAccountActions(_ outcome: String) async throws {
+        let configuration = URLSessionConfiguration.ephemeral
+        configuration.protocolClasses = [LoginFeedbackProtocol.self]
+        let session = URLSession(configuration: configuration)
+        defer { session.invalidateAndCancel() }
+        let gate = LoginSuspension(outcome: outcome)
+        let token = UUID().uuidString
+        LoginFeedbackProtocol.suspensions.withLock { $0[token] = gate }
+        defer { LoginFeedbackProtocol.suspensions.withLock { $0.removeValue(forKey: token) } }
+        let vault = CredentialVault(read: { _ in token }, write: { _ in Issue.record("Verification must not replace the token") })
+        let controller = WeBeepAuthenticationController(testRootURL: FileManager.default.temporaryDirectory, apiClient: WeBeepAPIClient(session: session), credentialVault: vault)
+        let verification = try #require(controller.validateConnection())
+        var started = gate.started.stream.makeAsyncIterator()
+        _ = await started.next()
+        #expect(controller.isVerifying)
+        var deletionAttempted = false
+        controller.signOut(removeFile: { _ in deletionAttempted = true; throw CredentialStorageError.write })
+        #expect(!deletionAttempted)
+        #expect(controller.hasStoredCredential)
+        controller.startLogin()
+        #expect(!controller.isAuthenticating)
+        #expect(controller.validateConnection() == nil)
+        controller.selectUniversity(.unipd)
+        controller.selectSite(MoodleSite.unipd[1])
+        #expect(controller.selectedSite == .polimi)
+        #expect(controller.apiHostForTesting == MoodleSite.polimi.serverPolicy.host)
+        gate.release.signal()
+        await verification.value
+        #expect(!controller.isVerifying)
+        #expect(controller.hasStoredCredential)
+        #expect(controller.accountState == (outcome == "success" ? .connected : .expired))
+        #expect(controller.selectedSite == .polimi)
+        // After the terminal result a disconnect reaches the injected deletion hook.
+        controller.signOut(removeFile: { _ in deletionAttempted = true; throw CredentialStorageError.write })
+        #expect(deletionAttempted)
+    }
+
     private func callback(_ token: String) -> URL {
         let payload = Data("site:::\(token)".utf8).base64EncodedString()
         return URL(string: "moodlemobile://token=\(payload)")!
@@ -235,7 +312,19 @@ private final class LoginTokenMemory: @unchecked Sendable {
     func record(_ token: String) { lock.withLock { value = token } }
 }
 
+private final class LoginSuspension: @unchecked Sendable {
+    let outcome: String
+    init(outcome: String = "network") { self.outcome = outcome }
+    let started = AsyncStream<Void>.makeStream()
+    let release = DispatchSemaphore(value: 0)
+    func pause() {
+        started.continuation.yield()
+        release.wait()
+    }
+}
+
 private final class LoginFeedbackProtocol: URLProtocol, @unchecked Sendable {
+    static let suspensions = OSAllocatedUnfairLock(initialState: [String: LoginSuspension]())
     override class func canInit(with request: URLRequest) -> Bool { true }
     override class func canonicalRequest(for request: URLRequest) -> URLRequest { request }
     override func startLoading() {
@@ -251,13 +340,22 @@ private final class LoginFeedbackProtocol: URLProtocol, @unchecked Sendable {
             }
         }
         let body = String(data: data, encoding: .utf8) ?? ""
+        let token = body.split(separator: "&").first { $0.hasPrefix("wstoken=") }.map { String($0.dropFirst(8)) } ?? ""
+        let suspension = Self.suspensions.withLock { $0[token] }
+        if let suspension {
+            suspension.pause()
+            if suspension.outcome == "network" {
+                client?.urlProtocol(self, didFailWithError: URLError(.notConnectedToInternet))
+                return
+            }
+        }
         if body.contains("wstoken=network") {
             client?.urlProtocol(self, didFailWithError: URLError(.notConnectedToInternet))
             return
         }
         let response = HTTPURLResponse(url: request.url!, statusCode: 200, httpVersion: "HTTP/1.1", headerFields: ["Content-Type": "application/json"])!
         let json: String
-        if body.contains("wstoken=invalid") { json = #"{"exception":"invalidtoken","errorcode":"invalidtoken"}"# }
+        if body.contains("wstoken=invalid") || suspension?.outcome == "invalid" { json = #"{"exception":"invalidtoken","errorcode":"invalidtoken"}"# }
         else if body.contains("core_enrol_get_users_courses") { json = "[]" }
         else { json = #"{"userid":7,"siteurl":"https://webeep.polimi.it","functions":[{"name":"core_enrol_get_users_courses"},{"name":"core_course_get_contents"}]}"# }
         client?.urlProtocol(self, didReceive: response, cacheStoragePolicy: .notAllowed)

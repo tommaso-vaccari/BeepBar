@@ -567,6 +567,8 @@ struct MenuBarSnapshot: Sendable {
         return folder.appending(path: "defaults").path
     }
 
+    var apiHostForTesting: String { apiClient.policy.host }
+
     func completeLoginForTesting(_ callback: URL) async {
         await completeLogin(.success(callback))?.value
     }
@@ -725,7 +727,7 @@ struct MenuBarSnapshot: Sendable {
     /// Forgets the stored token so another account, or another university, can be connected.
     /// The sync folder, its files and the course selection stay as they are.
     func signOut(removeFile: (URL) throws -> Void = { try FileManager.default.removeItem(at: $0) }) {
-        guard hasStoredCredential, !isSyncActive, !isAuthenticating, !isLoadingCourses else { return }
+        guard hasStoredCredential, !isSyncActive, !isAuthenticating, !isVerifying, !isLoadingCourses else { return }
         do {
             try FileTokenStore.delete(removeFile: removeFile)
         } catch {
@@ -1371,22 +1373,25 @@ struct MenuBarSnapshot: Sendable {
     }
 
     func startLogin() {
-        guard !isAuthenticating else { return }
+        guard !isAuthenticating, !isVerifying else { return }
         authenticationFeedback = nil
         isAuthenticating = true; status = tr("Autenticazione \(selectedSite.displayName) in corso…", "Signing in to \(selectedSite.displayName)…")
+#if DEBUG
+        if testDefaults != nil { return }
+#endif
         loginWindow = LoginWindowController(site: selectedSite) { [weak self] result in _ = self?.completeLogin(result) }
         loginWindow?.showWindow(nil)
     }
 
     func selectUniversity(_ university: MoodleUniversity) {
-        guard !hasStoredCredential else { return }
+        guard !hasStoredCredential, !isAuthenticating, !isVerifying else { return }
         selectSite(university == .polimi ? .polimi : MoodleSite.unipd[0])
     }
 
     func selectSite(_ site: MoodleSite) {
-        guard !hasStoredCredential, site != selectedSite else { return }
+        guard !hasStoredCredential, !isAuthenticating, !isVerifying, site != selectedSite else { return }
         selectedSite = site
-        Self.defaults.set(site.id, forKey: Self.selectedSiteKey)
+        operationDefaults.set(site.id, forKey: Self.selectedSiteKey)
         apiClient = WeBeepAPIClient(policy: site.serverPolicy)
         downloader = RemoteDownloader(policy: site.serverPolicy)
         siteInfo = nil
@@ -1394,7 +1399,7 @@ struct MenuBarSnapshot: Sendable {
         // Course ids belong to one site: the previous site's selection must not enable whatever
         // course happens to share an id on the new one.
         enabledCourseIDs = []
-        Self.defaults.set([String](), forKey: Self.enabledCoursesKey)
+        operationDefaults.set([String](), forKey: Self.enabledCoursesKey)
         if let database, let rootID {
             let previousWrite = scopeWriteTask
             scopeWriteTask = Task { await previousWrite?.value; try? await database.disableAllScopes(rootID: rootID) }
@@ -1402,11 +1407,10 @@ struct MenuBarSnapshot: Sendable {
         configureBackgroundScheduler()
     }
 
-    func validateConnection() {
-        guard !Self.isUIPreview else { return }
-        guard !isVerifying else { return }
+    @discardableResult func validateConnection() -> Task<Void, Never>? {
+        guard !Self.isUIPreview, !isVerifying, !isAuthenticating else { return nil }
         isVerifying = true; status = tr("Verifica connessione \(selectedSite.platformName) in corso…", "Checking the \(selectedSite.platformName) connection…")
-        Task { [weak self] in
+        return Task { [weak self] in
             defer { self?.isVerifying = false }
             do {
                 guard let self else { return }
@@ -1414,7 +1418,7 @@ struct MenuBarSnapshot: Sendable {
                 let siteInfo = try await self.apiClient.validateToken(token)
                 self.siteInfo = siteInfo
                 self.accountState = .connected
-                Self.defaults.removeObject(forKey: Self.credentialExpiredKey)
+                self.operationDefaults.removeObject(forKey: Self.credentialExpiredKey)
                 self.notificationCoordinator.clearFailure()
                 self.setSyncState(self.rootURL == nil ? .needsFolder : .readyUnchecked)
                 self.configureBackgroundScheduler()
@@ -2064,7 +2068,7 @@ struct MenuBarSnapshot: Sendable {
 
     private func expireCredential() async {
         await credentialVault.invalidate()
-        Self.defaults.set(true, forKey: Self.credentialExpiredKey)
+        operationDefaults.set(true, forKey: Self.credentialExpiredKey)
         accountState = .expired
         setSyncState(.failed(.authenticationExpired))
         configureBackgroundScheduler()

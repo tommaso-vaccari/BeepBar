@@ -199,28 +199,109 @@ private struct CourseActivityCard: View {
     }
 
     /// A file that arrived or moved: a click opens it, the context menu also shows it in Finder.
-    /// Failed items aren't rows like this: there is no file to open. Labels follow what a click
-    /// will actually do: a file that is only shown in Finder never says "Apri".
+    /// Failed items aren't rows like this: there is no file to open.
     private func fileRow<Title: View, Icon: View>(id: String, name: String, @ViewBuilder title: () -> Title, @ViewBuilder icon: () -> Icon) -> some View {
-        let opens = ActivityFilePolicy.opensDirectly(filename: name)
-        return VStack(alignment: .leading, spacing: 2) {
-            Button { openItem(id, name, false) } label: {
-                Label { title() } icon: { icon() }
-                    .contentShape(Rectangle())
+        ActivityFileRow(action: ActivityClickAction(filename: name), name: name, problem: problems[id], title: title(), icon: icon()) { showInFinder in
+            openItem(id, name, showInFinder)
+        }
+    }
+}
+
+/// What a click on an Attività file does, worded for the user: on hover, in the tooltip, for
+/// VoiceOver and in the context menu. Derived from `ActivityFilePolicy`, so a file that is only
+/// shown in Finder is never labelled "Apri".
+enum ActivityClickAction: Equatable {
+    case open
+    case showInFinder
+
+    init(filename: String) {
+        self = ActivityFilePolicy.opensDirectly(filename: filename) ? .open : .showInFinder
+    }
+
+    var title: String {
+        switch self {
+        case .open: tr("Apri", "Open")
+        case .showInFinder: tr("Mostra nel Finder", "Show in Finder")
+        }
+    }
+
+    var systemImage: String {
+        switch self {
+        case .open: "arrow.up.forward.square"
+        case .showInFinder: "folder"
+        }
+    }
+
+    func help(for name: String) -> String {
+        switch self {
+        case .open: tr("Apri “\(name)”", "Open “\(name)”")
+        case .showInFinder: tr("Mostra “\(name)” nel Finder", "Show “\(name)” in Finder")
+        }
+    }
+
+    var accessibilityHint: String {
+        switch self {
+        case .open: tr("Apre il file", "Opens the file")
+        case .showInFinder: tr("Mostra il file nel Finder", "Shows the file in Finder")
+        }
+    }
+}
+
+/// One clickable file in an Attività card. On hover it shows what a click will do ("Apri" or
+/// "Mostra nel Finder") at the trailing edge, and the pointer becomes the link hand, so it reads
+/// as clickable without adding text to the list at rest. The hint keeps its space when hidden
+/// (opacity, not removal), so names don't shift while the pointer moves across rows.
+private struct ActivityFileRow<Title: View, Icon: View>: View {
+    let action: ActivityClickAction
+    let name: String
+    let problem: ActivityItemProblem?
+    let title: Title
+    let icon: Icon
+    /// `true` for the context menu's "Mostra nel Finder".
+    let open: (Bool) -> Void
+    @State private var isHovered = false
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 2) {
+            Button { open(false) } label: {
+                HStack(spacing: 8) {
+                    Label { title } icon: { icon }
+                    Spacer(minLength: 8)
+                    Label(action.title, systemImage: action.systemImage)
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .opacity(isHovered ? 1 : 0)
+                        .accessibilityHidden(true)
+                }
+                .contentShape(Rectangle())
             }
             .buttonStyle(.plain)
-            .help(opens ? tr("Apri “\(name)”", "Open “\(name)”") : tr("Mostra “\(name)” nel Finder", "Show “\(name)” in Finder"))
-            .accessibilityHint(opens ? tr("Apre il file", "Opens the file") : tr("Mostra il file nel Finder", "Shows the file in Finder"))
+            .onHover { isHovered = $0 }
+            .modifier(LinkPointer())
+            .help(action.help(for: name))
+            .accessibilityHint(action.accessibilityHint)
             .contextMenu {
-                if opens { Button(tr("Apri", "Open")) { openItem(id, name, false) } }
-                Button(tr("Mostra nel Finder", "Show in Finder")) { openItem(id, name, true) }
+                if action == .open { Button(ActivityClickAction.open.title) { open(false) } }
+                Button(ActivityClickAction.showInFinder.title) { open(true) }
             }
-            if let problem = problems[id] {
+            if let problem {
                 Text(problem.message)
                     .font(.caption)
                     .foregroundStyle(.orange)
                     .padding(.leading, 28)
             }
+        }
+    }
+}
+
+/// The link pointer on macOS 15 and later; macOS 14 keeps the arrow rather than pushing and
+/// popping `NSCursor`, which leaves the cursor stack unbalanced when a hovered row disappears.
+private struct LinkPointer: ViewModifier {
+    func body(content: Content) -> some View {
+        if #available(macOS 15.0, *) {
+            content.pointerStyle(.link)
+        } else {
+            content
         }
     }
 }

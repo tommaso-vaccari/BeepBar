@@ -48,8 +48,14 @@ import Testing
         await #expect(throws: RemoteDownloadError.invalidResponse) {
             try await downloader.download(Self.file(size: 1_000), token: "token", access: .unrestricted)
         }
-        #expect(StreamingProtocol.deliveredChunks < 400)
+        // URLSession calls `stopLoading` on its own queue some time after the downloader cancels
+        // the task, so the stop is awaited instead of read right away (an immediate read failed
+        // 19 of 25 runs under CPU load). Waiting can't hide a transfer that was never stopped: the
+        // whole 400-chunk body arrives in about half a second, so `deliveredChunks < 400` fails.
+        let deadline = ContinuousClock.now + .seconds(5)
+        while !StreamingProtocol.wasStopped, ContinuousClock.now < deadline { try await Task.sleep(for: .milliseconds(5)) }
         #expect(StreamingProtocol.wasStopped)
+        #expect(StreamingProtocol.deliveredChunks < 400)
         #expect(Self.downloadTemporaries(since: before, startingWith: StreamingProtocol.marker).isEmpty)
     }
 

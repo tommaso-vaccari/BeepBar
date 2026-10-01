@@ -52,11 +52,12 @@ import Testing
             try await downloader.download(Self.file(size: 1_000), token: "token", access: .unrestricted)
         }
         // URLSession tears the transfer down (`stopLoading`) on its own queue a few ms after the
-        // downloader cancels it, so wait for that before counting (reading right away failed 19 of
-        // 25 runs under CPU load); once stopped, `deliveredChunks` is final. `wasStopped` is only
-        // the wait condition: `stopLoading` also runs after a body that finished normally. The
-        // actual proof of an early stop is `deliveredChunks < 400`: a transfer never cut off
-        // delivers all 400 chunks (under a second) before the download even throws.
+        // downloader cancels it. Asserting `wasStopped` right away is what failed 19 of 25 runs
+        // under CPU load; waiting for it also leaves `deliveredChunks` final and nothing running
+        // into the next test. `wasStopped` is only the wait condition, since `stopLoading` also
+        // runs after a body that finished normally. The proof of an early stop is
+        // `deliveredChunks < 400`: a transfer never cut off delivers all 400 chunks (under a
+        // second) before the download even throws.
         await Self.waitUntil { StreamingProtocol.wasStopped }
         #expect(StreamingProtocol.deliveredChunks < 400)
         #expect(Self.downloadTemporaries(since: before, startingWith: StreamingProtocol.marker).isEmpty)
@@ -73,7 +74,8 @@ import Testing
         #expect(try Data(contentsOf: downloaded.temporaryURL).count == 1_024)
     }
 
-    @Test func aRedirectedResponseIsRejectedBeforeAnythingIsWritten() async throws {
+    /// Proves nothing is left behind; the body may reach disk before the rejection removes it.
+    @Test func aRedirectedResponseIsRejectedAndLeavesNothingBehind() async throws {
         let before = Self.downloadTemporaryFiles()
         let downloader = RemoteDownloader(session: Self.session(RedirectingProtocol.self))
         await #expect(throws: RemoteDownloadError.unexpectedRedirect) {
@@ -94,11 +96,14 @@ import Testing
         #expect(server.requestCount == 1)
     }
 
-    @Test func aMismatchedContentLengthIsRejectedBeforeAnythingIsWritten() async throws {
+    /// The server announces fewer bytes than WeBeep reported for the file. The body is smaller
+    /// than the expected size, so only the Content-Length check can reject it (with a larger body,
+    /// the overrun check would reject it too and hide a missing Content-Length check).
+    @Test func aMismatchedContentLengthIsRejectedAndLeavesNothingBehind() async throws {
         let before = Self.downloadTemporaryFiles()
         let downloader = RemoteDownloader(session: Self.session(WrongLengthProtocol.self))
         await #expect(throws: RemoteDownloadError.invalidResponse) {
-            try await downloader.download(Self.file(size: 3), token: "token", access: .unrestricted)
+            try await downloader.download(Self.file(size: Int64(WrongLengthProtocol.body.count + 10)), token: "token", access: .unrestricted)
         }
         #expect(Self.leakedDownloadTemporaries(since: before, body: WrongLengthProtocol.body).isEmpty)
     }
@@ -118,16 +123,19 @@ import Testing
         // Taken before the transfer starts, so the partial body it writes counts as a leak.
         let before = Self.downloadTemporaryFiles()
         let task = Task { try await downloader.download(Self.file(size: 640_000), token: "token", access: .unrestricted) }
-        // Cancel only once the downloader has really written a partial file: URLSession holds
-        // the first 512 bytes back before reporting a response without Content-Length, so a
-        // cancel after a few chunks never reached the cleanup this test is about.
+        // Cancel only once the downloader has really written a partial file. Without a
+        // Content-Type, URLSession held back the first 512 bytes to guess one, so a cancel after a
+        // few chunks never reached the cleanup this test is about; `StreamingProtocol` now sends
+        // a Content-Type, and waiting for the file keeps the test independent of that buffering.
         await Self.waitUntil { !Self.downloadTemporaries(since: before, startingWith: StreamingProtocol.marker).isEmpty }
         #expect(!Self.downloadTemporaries(since: before, startingWith: StreamingProtocol.marker).isEmpty, "the partial file must exist before cancelling")
         task.cancel()
         await #expect(throws: CancellationError.self) { try await task.value }
         #expect(Self.downloadTemporaries(since: before, startingWith: StreamingProtocol.marker).isEmpty)
-        // Let the transfer finish tearing down, so it can't add to the next test's counters.
+        // Let the transfer finish tearing down, so it can't add to the next test's counters; a
+        // timeout fails here rather than in whichever test runs next.
         await Self.waitUntil { StreamingProtocol.wasStopped }
+        #expect(StreamingProtocol.wasStopped)
     }
 
     @Test func sizeLimitDefaultsToOneGigabyteAndKeepsACustomValue() {
@@ -212,7 +220,9 @@ private final class DownloadFailureProtocol: URLProtocol, @unchecked Sendable {
 }
 
 /// Streams `chunks` pieces of body from a background queue, without a Content-Length, until
-/// the loading system stops it: lets a test see whether a transfer was cut short.
+/// the loading system stops it: lets a test see whether a transfer was cut short. It sends a
+/// Content-Type so URLSession delivers each chunk as it arrives instead of buffering the first
+/// 512 bytes to guess one.
 private final class StreamingProtocol: URLProtocol, @unchecked Sendable {
     static let marker = Data("streaming-body-\(UUID().uuidString)".utf8)
     private static let lock = NSLock()
@@ -232,7 +242,7 @@ private final class StreamingProtocol: URLProtocol, @unchecked Sendable {
     override class func canInit(with request: URLRequest) -> Bool { true }
     override class func canonicalRequest(for request: URLRequest) -> URLRequest { request }
     override func startLoading() {
-        let response = HTTPURLResponse(url: request.url!, statusCode: 200, httpVersion: "HTTP/1.1", headerFields: [:])!
+        let response = HTTPURLResponse(url: request.url!, statusCode: 200, httpVersion: "HTTP/1.1", headerFields: ["Content-Type": "application/octet-stream"])!
         client?.urlProtocol(self, didReceive: response, cacheStoragePolicy: .notAllowed)
         let (count, size) = Self.lock.withLock { (Self.chunks, Self.chunkSize) }
         queue.async { self.send(index: 0, count: count, size: size) }

@@ -1,3 +1,4 @@
+import Combine
 import Foundation
 import Testing
 import SQLite3
@@ -67,5 +68,40 @@ struct CourseSelectionDuringRefreshTests {
         try await refresh.value
 
         #expect(controller.enabledCourseIDs == [1])
+    }
+
+    /// Known issue: proves that refreshing the course list republishes the course folders and the
+    /// selection even when nothing changed. Every assignment to a `@Published` property invalidates
+    /// the window, and `courseFolders` is assigned once per course, so a refresh of 100 unchanged
+    /// courses redraws it about a hundred times. Once the refresh assigns only values that differ,
+    /// `withKnownIssue` reports that the issue no longer occurs: remove the wrapper and keep the test.
+    @Test @MainActor func refreshingUnchangedCoursesPublishesNothing() async throws {
+        let root = FileManager.default.temporaryDirectory.appending(path: UUID().uuidString, directoryHint: .isDirectory)
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let database = try SyncDatabase(url: root.appending(path: "state.sqlite"))
+        let rootID = UUID()
+        try await database.registerRoot(id: rootID, canonicalPath: root.path)
+        try await database.upsertScope(SyncScope(rootID: rootID, courseID: 1, displayName: "Course", localFolder: "Course", enabled: true))
+        let controller = WeBeepAuthenticationController(testRootURL: root, database: database, rootID: rootID)
+        try await controller.restoreScopesForTesting([course])
+        // The first refresh really restored the saved folder and selection, so the second one has
+        // nothing left to change.
+        #expect(controller.courseFolders == [1: "Course"])
+        #expect(controller.enabledCourseIDs == [1])
+
+        var folderUpdates = 0
+        var selectionUpdates = 0
+        let folders = controller.$courseFolders.dropFirst().sink { _ in folderUpdates += 1 }
+        let selection = controller.$enabledCourseIDs.dropFirst().sink { _ in selectionUpdates += 1 }
+        defer { folders.cancel(); selection.cancel() }
+        try await controller.restoreScopesForTesting([course])
+
+        #expect(controller.courseFolders == [1: "Course"])
+        #expect(controller.enabledCourseIDs == [1])
+        withKnownIssue("A refresh republishes unchanged course folders and selection") {
+            #expect(folderUpdates == 0)
+            #expect(selectionUpdates == 0)
+        }
     }
 }

@@ -460,6 +460,23 @@ import Testing
         #expect(fixture.upstream.downloadNetworkAccess == [RecordedNetworkAccess(expensive: false, constrained: false)])
     }
 
+    /// Known issue: proves that a scheduled run still reads course contents over a metered hotspot
+    /// and under Low Data Mode, while docs/sync-behavior §6 says automatic sync uses neither. Only
+    /// downloads are restricted today (see the test above); the metadata requests carry no network
+    /// restriction. Whether the code or the specification changes is still to be decided. Once the
+    /// requests are restricted, `withKnownIssue` reports that the issue no longer occurs: remove the
+    /// wrapper and keep the test as the regression check.
+    @Test func automaticSyncReadsCourseContentsWithoutExpensiveOrConstrainedNetworkAccess() async throws {
+        let fixture = try await Fixture()
+        defer { fixture.remove() }
+        _ = try await fixture.synchronize(targets: [fixture.targets[0]], mode: .automatic)
+        // The run really asked Moodle for the course: an empty record would prove nothing.
+        #expect(fixture.upstream.contentsRequestCount == 1)
+        withKnownIssue("Automatic sync reads course contents over metered and Low Data networks") {
+            #expect(fixture.upstream.contentsNetworkAccess == [RecordedNetworkAccess(expensive: false, constrained: false)])
+        }
+    }
+
     // A course whose contents Moodle refuses (unenrolled, hidden or restricted course) must not
     // stop every other selected course from syncing.
     @Test(arguments: [SyncCoordinatorMode.manual, .automatic])
@@ -1750,6 +1767,8 @@ private final class MutableFixtureUpstream: @unchecked Sendable {
     private var rejectedContents: [Int64: String] = [:]
     private var failedContents: [Int64: Int] = [:]
     private var networkAccess: Set<RecordedNetworkAccess> = []
+    private var contentsRequests = 0
+    private var contentsAccess: Set<RecordedNetworkAccess> = []
     private var sectionNames: [Int64: String] = [:]
     private var moduleNames: [Int64: String] = [:]
     private var extraModules: [Int64: [Int64: (section: String, name: String)]] = [:]
@@ -1762,6 +1781,9 @@ private final class MutableFixtureUpstream: @unchecked Sendable {
     var maximumActiveDownloads: Int { lock.withLock { peakDownloads } }
     var validationCount: Int { lock.withLock { validations } }
     var downloadNetworkAccess: Set<RecordedNetworkAccess> { lock.withLock { networkAccess } }
+    /// `core_course_get_contents` requests and the network restrictions they carried.
+    var contentsRequestCount: Int { lock.withLock { contentsRequests } }
+    var contentsNetworkAccess: Set<RecordedNetworkAccess> { lock.withLock { contentsAccess } }
     func resetDownloadCount() { lock.withLock { downloads = 0 } }
 
     func populate(courses: Int, filesPerCourse: Int) {
@@ -1815,6 +1837,10 @@ private final class MutableFixtureUpstream: @unchecked Sendable {
                     return (HTTPURLResponse(url: url, statusCode: 200, httpVersion: nil, headerFields: ["Content-Type": "application/json"])!, response, 0, false)
                 }
                 let course = Int64(formValue("courseid", body: body) ?? "") ?? 0
+                if formValue("wsfunction", body: body) == "core_course_get_contents" {
+                    contentsRequests += 1
+                    contentsAccess.insert(RecordedNetworkAccess(expensive: request.allowsExpensiveNetworkAccess, constrained: request.allowsConstrainedNetworkAccess))
+                }
                 if let status = failedContents[course] {
                     return (HTTPURLResponse(url: url, statusCode: status, httpVersion: nil, headerFields: ["Content-Type": "text/html"])!, Data(), 0, false)
                 }

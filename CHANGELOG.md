@@ -20,7 +20,7 @@
 
 ### Fixed
 
-- Failed sign-ins now show the reason beside the sign-in button, in onboarding and Settings; an existing account is kept when a new attempt fails.
+- Failed sign-ins now show the reason beside the sign-in button, in onboarding and Settings; an existing account is kept when a new attempt fails. University selection and account actions wait for pending checks, preventing a login from ending up on the wrong platform or an old check from undoing a disconnect.
 
 - Conflitti now explains why a choice could not be completed, including when a file changed while the choice was open. If an error occurs after an action has partly completed, check the file and refresh before retrying.
 - Clicking a file in Attività no longer follows a Finder alias substituted for the downloaded document. Files without read permission show a message on their row instead of attempting to open.

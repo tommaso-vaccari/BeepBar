@@ -209,18 +209,7 @@ final class StatusItemController: NSObject, NSMenuDelegate {
         if let window {
             window.makeKeyAndOrderFront(nil)
         } else {
-            let controller = NSHostingController(rootView: BeepbarShellView(authentication: authentication, router: router))
-            // Only let SwiftUI enforce the minimum size; otherwise the window keeps resizing
-            // itself to the content's ideal size on every page switch.
-            controller.sizingOptions = [.minSize]
-            let window = NSWindow(contentViewController: controller)
-            window.title = "BeepBar"
-            window.styleMask = [.titled, .closable, .miniaturizable, .resizable, .fullSizeContentView]
-            window.titlebarAppearsTransparent = true
-            window.titleVisibility = .hidden
-            window.setContentSize(NSSize(width: 780, height: 680))
-            window.minSize = NSSize(width: 680, height: 520)
-            window.isReleasedWhenClosed = false
+            let window = Self.makeWindow(authentication: authentication, router: router)
             window.delegate = self
             // The window object is rebuilt on every open (see windowWillClose), so let AppKit
             // remember where the user left it.
@@ -230,6 +219,32 @@ final class StatusItemController: NSObject, NSMenuDelegate {
             window.makeKeyAndOrderFront(nil)
         }
         authentication.refreshOnWindowOpen()
+    }
+
+    /// Builds the window `show` opens, apart from its delegate and saved frame, so tests can host
+    /// the real shell in exactly this window.
+    static func makeWindow(authentication: WeBeepAuthenticationController, router: ShellRouter) -> ConfigurationWindow {
+        let controller = NSHostingController(rootView: BeepbarShellView(authentication: authentication, router: router))
+        // Only let SwiftUI enforce the minimum size; otherwise the window keeps resizing
+        // itself to the content's ideal size on every page switch.
+        controller.sizingOptions = [.minSize]
+        let window = ConfigurationWindow(contentViewController: controller)
+        window.title = "BeepBar"
+        window.styleMask = [.titled, .closable, .miniaturizable, .resizable, .fullSizeContentView]
+        window.titlebarAppearsTransparent = true
+        window.titleVisibility = .hidden
+        window.setContentSize(NSSize(width: 780, height: 680))
+        window.minSize = NSSize(width: 680, height: 520)
+        window.isReleasedWhenClosed = false
+        // With no initial first responder, AppKit picks the first key view when the window is
+        // ordered in, which in SwiftUI is its `KeyViewProxy`: once the window is key, that proxy
+        // is presumably how SwiftUI hands focus to its first focusable view, on Corsi "Cerca
+        // corsi". The hosting view refuses first responder, so this leaves the window itself
+        // first responder, the same state a click outside a field leaves it in
+        // (`ConfigurationWindow`).
+        // Only checked in a window that isn't key, which tests can't make key.
+        window.initialFirstResponder = controller.view
+        return window
     }
 
     func windowWillClose(_ notification: Notification) {
@@ -254,5 +269,41 @@ final class StatusItemController: NSObject, NSMenuDelegate {
         guard let appearanceTrace else { return }
         PerformanceTrace.shared.end("ui.configurationWindow", category: .ui, state: appearanceTrace)
         self.appearanceTrace = nil
+    }
+}
+
+/// The configuration window. A click anywhere outside a text field ends text editing, as people
+/// expect from a page: AppKit only moves the focus to views that accept it, and nothing on Corsi
+/// does apart from other text fields, so once "Cerca corsi" had the cursor no click on a row, a
+/// switch or the background could take it away.
+///
+/// This lives in the window rather than in a SwiftUI tap gesture because it has to work for
+/// every kind of click, including those on AppKit-backed controls (switches, menus, scrollers)
+/// that never reach SwiftUI gestures. It only touches the window's own responder chain, never
+/// controller state, so it adds no AppKit→`@MainActor` state access (see the hard rule on
+/// `StatusItemController`).
+///
+/// Any click outside text counts, including the one that brings the window back from another
+/// app and a drag of the window by its header: both are clicks somewhere else. A field that
+/// should keep the cursor after one of its own SwiftUI buttons (the search field's clear button)
+/// takes it back in that button's action.
+final class ConfigurationWindow: NSWindow {
+    override func sendEvent(_ event: NSEvent) {
+        // Before dispatching, so the click still reaches its target: the switch still toggles,
+        // the button still fires, and the field has already let go when it does.
+        if event.type == .leftMouseDown,
+           Self.clickEndsTextEditing(firstResponder: firstResponder, clickedView: contentView?.hitTest(event.locationInWindow)) {
+            makeFirstResponder(nil)
+        }
+        super.sendEvent(event)
+    }
+
+    /// Whether a click on `clickedView` should end the text editing going on in `firstResponder`.
+    /// Editing shows as the shared field editor being first responder. A click on text (the
+    /// field editor itself, or any text field, which AppKit then focuses on its own) keeps
+    /// editing; any other click, or one that hits nothing, ends it.
+    static func clickEndsTextEditing(firstResponder: NSResponder?, clickedView: NSView?) -> Bool {
+        guard let editor = firstResponder as? NSTextView, editor.isFieldEditor else { return false }
+        return !(clickedView is NSText || clickedView is NSTextField)
     }
 }

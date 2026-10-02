@@ -662,6 +662,10 @@ struct MenuBarSnapshot: Sendable {
         setSyncState(state)
     }
 
+    func setCoursesForTesting(_ courses: [RemoteCourseSummary]) {
+        self.courses = courses
+    }
+
     func setLoadingCoursesForTesting(_ loading: Bool) {
         isLoadingCourses = loading
     }

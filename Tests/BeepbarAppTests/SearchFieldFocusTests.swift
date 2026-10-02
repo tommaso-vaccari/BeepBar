@@ -75,11 +75,14 @@ import BeepbarCore
         page.clickSearchField()
         page.press("a", keyCode: 0)
         #expect(page.eventually { page.searchField.stringValue == "a" }, "precondition: typing reaches the field")
-        var editingEnded = 0
-        let observer = NotificationCenter.default.addObserver(forName: NSControl.textDidEndEditingNotification, object: page.searchField, queue: nil) { _ in editingEnded += 1 }
+        let editingEnded = Counter()
+        // Posted on the main thread, from inside the click.
+        let observer = NotificationCenter.default.addObserver(forName: NSControl.textDidEndEditingNotification, object: page.searchField, queue: nil) { _ in
+            MainActor.assumeIsolated { editingEnded.value += 1 }
+        }
         defer { NotificationCenter.default.removeObserver(observer) }
         page.clickSearchField()
-        #expect(editingEnded == 0)
+        #expect(editingEnded.value == 0)
         #expect(page.searchIsFocused)
         #expect(page.searchField.stringValue == "a")
     }
@@ -113,6 +116,10 @@ import BeepbarCore
         #expect(!ConfigurationWindow.clickEndsTextEditing(firstResponder: NSTextView(), clickedView: NSView()), "a text view that isn't the field editor isn't a field being typed in")
         #expect(!ConfigurationWindow.clickEndsTextEditing(firstResponder: nil, clickedView: NSView()))
     }
+}
+
+@MainActor private final class Counter {
+    var value = 0
 }
 
 /// The Corsi page in an invisible configuration window built by `makeWindow`, as `show` builds it.

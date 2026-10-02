@@ -238,9 +238,10 @@ final class StatusItemController: NSObject, NSMenuDelegate {
         window.isReleasedWhenClosed = false
         // With no initial first responder, AppKit picks the first key view when the window is
         // ordered in, which in SwiftUI is its `KeyViewProxy`: once the window is key, that proxy
-        // is how SwiftUI hands focus to its first focusable view, on Corsi "Cerca corsi". The
-        // hosting view refuses first responder, so this leaves the window itself first
-        // responder, the same state a click outside a field leaves it in (`ConfigurationWindow`).
+        // is presumably how SwiftUI hands focus to its first focusable view, on Corsi "Cerca
+        // corsi". The hosting view refuses first responder, so this leaves the window itself
+        // first responder, the same state a click outside a field leaves it in
+        // (`ConfigurationWindow`).
         // Only checked in a window that isn't key, which tests can't make key.
         window.initialFirstResponder = controller.view
         return window

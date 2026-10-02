@@ -41,7 +41,35 @@ public actor SyncDatabase {
         guard sqlite3_busy_timeout(database, 5000) == SQLITE_OK else { throw SyncDatabaseError.open }
         try Self.execute(database, "PRAGMA foreign_keys = ON")
         try Self.execute(database, "PRAGMA journal_mode = WAL")
+        // Every change to a synced file is journaled first: a pending row, then the filesystem
+        // change (each `FileStore` rename is followed by `fsync`), then the commit that finishes
+        // it. Recovery relies on the row reaching the disk before the change it describes. In WAL
+        // mode the system SQLite defaults to NORMAL, which syncs the log only at checkpoints: a
+        // kernel panic or power cut can then drop rows that were already committed while the
+        // rename they describe survives, leaving an installed file or a moved course folder that
+        // no pending row explains. FULL syncs the log on every commit. Process crashes were
+        // already safe under NORMAL (a committed row is in the log file); this is for the machine
+        // going down. Commits don't ask for `F_FULLFSYNC` (`PRAGMA fullfsync` stays off; only
+        // checkpoints use it, `checkpoint_fullfsync` being on in the system build), and
+        // `FileStore` uses plain `fsync`, so on macOS the drive's own cache can still reorder
+        // writes on sudden power loss. A run with nothing new commits nothing, so FULL costs it
+        // nothing. An explicit `synchronous` holds after switching to WAL, so the order of these
+        // two pragmas doesn't matter.
+        try Self.execute(database, "PRAGMA synchronous = FULL")
         try Self.migrate(database)
+    }
+
+    /// The durability settings this connection actually runs with, read back from SQLite so tests
+    /// check the effective values rather than the statements that set them.
+    func durabilitySettings() throws -> (journalMode: String, synchronous: Int32, fullFsync: Int32, checkpointFullFsync: Int32) {
+        func value(_ pragma: String) throws -> (text: String?, number: Int32) {
+            try withStatement("PRAGMA \(pragma)") { statement in
+                guard try stepRow(statement) else { throw SyncDatabaseError.execution }
+                return (text(statement, 0), sqlite3_column_int(statement, 0))
+            }
+        }
+        guard let journalMode = try value("journal_mode").text else { throw SyncDatabaseError.execution }
+        return (journalMode, try value("synchronous").number, try value("fullfsync").number, try value("checkpoint_fullfsync").number)
     }
 
     public func migrate() throws {

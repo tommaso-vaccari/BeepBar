@@ -14,6 +14,12 @@
 
 - The "Cerca corsi" field in Corsi no longer stays selected. Clicking anywhere else deselects it; Esc clears what you typed, and Esc again deselects it.
 
+- If BeepBar was interrupted (a crash, a forced quit, a power cut) just as it found that you had edited a file Moodle had also updated, it could replace your edited copy with Moodle's at the next launch. Your copy is now always kept, and both versions appear in Conflicts.
+
+- Sync no longer gets stuck on "Intervento richiesto" at the next launch when a downloaded file couldn't be put in its folder (for example a folder BeepBar wasn't allowed to write to), or when BeepBar was interrupted right after downloading a new file that you then edited or deleted. The next sync handles the file as usual.
+
+- BeepBar now saves its sync progress to disk at every step. A power cut or a system crash in the middle of a sync is much less likely to make it lose track of files it had already downloaded or course folders it had already renamed.
+
 ## 2026-10-01
 
 ### Release highlights

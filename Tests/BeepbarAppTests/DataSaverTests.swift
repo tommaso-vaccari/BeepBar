@@ -114,6 +114,24 @@ import Testing
         #expect(harness.networkReads == 0)
     }
 
+    /// Proves that an automatic run skipped because nothing can be synced clears an earlier pause,
+    /// since finishing leaves no retry behind. Signing out here bypasses the rebuild on purpose: it
+    /// stands in for a blocked local recovery, the one real way to stop being able to sync without
+    /// one. Guards against "In attesa del Wi-Fi" coming back over the last result, even on Wi-Fi,
+    /// for a whole interval once the recovery is resolved.
+    @Test func aRunThatCannotSyncClearsThePause() async throws {
+        let harness = try await Harness(networks: [.hotspot])
+        defer { harness.remove() }
+        harness.controller.setDataSaver(enabled: true)
+        #expect(await harness.controller.runAutomaticSyncForTesting() == .deferred)
+        #expect(harness.controller.dataSaverPause == .hotspot)
+        harness.controller.setDisconnectedForTesting()
+
+        #expect(await harness.controller.runAutomaticSyncForTesting() == .finished)
+        #expect(harness.controller.dataSaverPause == nil)
+        #expect(harness.networkReads == 1)
+    }
+
     // MARK: Midway
 
     /// Proves that when the Mac moves to a hotspot during a Data Saver run, macOS's refusal ends

@@ -404,9 +404,10 @@ struct MenuBarSnapshot: Sendable {
     /// through `visibleDataSaverPause`, which decides whether it is what the user sees.
     /// Invariant: it is only shown while the deferred retry that will replace it is still pending.
     /// So it is cleared when a sync starts, when the switch is turned off, when the folder changes,
-    /// and whenever `configureBackgroundScheduler()` rebuilds the scheduler (automatic sync turned
-    /// off, Frequenza or the selected courses changed, signed out, sign-in expired or renewed…),
-    /// since that drops the retry.
+    /// when an automatic run is skipped because nothing can be synced, and whenever
+    /// `configureBackgroundScheduler()` rebuilds the scheduler (automatic sync turned off,
+    /// Frequenza or the selected courses changed, signed out, sign-in expired or renewed…), since
+    /// each of these drops the retry.
     @Published private(set) var dataSaverPause: DataSaverPause? {
         didSet { refreshMenuBarSnapshot() }
     }
@@ -2058,6 +2059,12 @@ struct MenuBarSnapshot: Sendable {
             return .deferred
         case .skipUnconfigured:
             BeepbarLog.sync.notice("Automatic synchronization skipped reason=configuration-unavailable")
+            // Finishing leaves no retry behind, so a pause from an earlier attempt must go too.
+            // A blocked local recovery gets here without a rebuild (`recoveryBlocked` doesn't
+            // reconfigure the scheduler), and resolving it restores an equal schedule: left in
+            // place, "In attesa del Wi-Fi" would come back over the last result, even on Wi-Fi,
+            // until the next run a whole interval later.
+            dataSaverPause = nil
             return .finished
         case .pause(let pause):
             // Nothing is sent and the state on screen is left alone (the last result, "sincronizzato

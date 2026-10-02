@@ -131,6 +131,38 @@ struct SyncDatabaseTests {
         #expect(try await database.baselines(rootID: rootID) == ["file": baseline])
     }
 
+    /// The journal row of a sync step must be on disk before the rename it describes, so every
+    /// commit syncs the log (`synchronous = FULL`, 2). WAL alone would leave the system SQLite at
+    /// NORMAL (1), which can drop committed rows on a kernel panic or power cut. Checked on a new
+    /// database, after a write, and on a database an older release left in WAL mode without the
+    /// setting: the pragma is per connection, so existing users get it as soon as they update.
+    @Test func everyConnectionSyncsTheLogOnEachCommit() async throws {
+        let root = try temporaryRoot()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let url = root.appending(path: "state.sqlite")
+        let database = try SyncDatabase(url: url)
+        var settings = try await database.durabilitySettings()
+        #expect(settings.journalMode == "wal")
+        #expect(settings.synchronous == 2)
+        try await database.registerRoot(id: UUID(), canonicalPath: root.path)
+        #expect(try await database.durabilitySettings().synchronous == 2)
+
+        let older = root.appending(path: "older.sqlite")
+        FileManager.default.createFile(atPath: older.path, contents: nil)
+        do {
+            let raw = try RawSQLite(url: older)
+            try raw.execute("PRAGMA journal_mode = WAL")
+            try raw.execute("CREATE TABLE leftover (x)")
+        }
+        let upgraded = try SyncDatabase(url: older)
+        settings = try await upgraded.durabilitySettings()
+        #expect(settings.journalMode == "wal")
+        #expect(settings.synchronous == 2)
+        // Documented, not chosen by accident: F_FULLFSYNC stays off on both the SQLite and the
+        // FileStore side (see `SyncDatabase.init`).
+        #expect(settings.fullFsync == 0)
+    }
+
     @Test func reopeningMigratesIdempotentlyAndKeepsData() async throws {
         let root = try temporaryRoot()
         defer { try? FileManager.default.removeItem(at: root) }

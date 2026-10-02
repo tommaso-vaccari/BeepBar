@@ -203,21 +203,35 @@ struct InterruptedSyncRecoveryTests {
 
     /// A conflict row as releases before this fix journaled it: the user's edit as the file to
     /// replace. Recovery must not install over it; the edit stays and the download becomes a
-    /// conflict against the last synced version.
-    @Test func olderConflictRowNeverInstallsOverTheEdit() async throws {
+    /// conflict against the last synced version. With `earlierConflict`, the same edit is already
+    /// in an open conflict with an older Moodle version: that conflict must not count as the user
+    /// choosing this newer download.
+    @Test(arguments: [false, true])
+    func olderConflictRowNeverInstallsOverTheEdit(earlierConflict: Bool) async throws {
         let fixture = try Fixture()
         defer { fixture.remove() }
         try await fixture.synced("base")
         try fixture.writeLocal("mine")
         let (database, store) = try await fixture.open()
+        if earlierConflict {
+            let older = try await fixture.stage("older remote", in: store)
+            _ = try await SyncTransactionCoordinator(database: database, fileStore: store).recordConflict(rootID: fixture.rootID, remoteID: "file", destination: fixture.path, local: .present(sha256: hash("mine")), remote: RemoteState(sha256: older.sha256, revision: "2"), artifact: older)
+        }
         let artifact = try await fixture.stage("remote", in: store)
-        try await database.beginOperation(PendingOperation(rootID: fixture.rootID, remoteID: "file", destination: fixture.path, stagePath: artifact.stagePath, expectedLocal: .present(sha256: hash("mine")), remoteSHA256: artifact.sha256, remoteRevision: "2"))
+        try await database.beginOperation(PendingOperation(rootID: fixture.rootID, remoteID: "file", destination: fixture.path, stagePath: artifact.stagePath, expectedLocal: .present(sha256: hash("mine")), remoteSHA256: artifact.sha256, remoteRevision: "3"))
 
         let report = try await fixture.relaunchAndRecover()
 
         #expect(report.unresolved.isEmpty && report.conflicts.count == 1)
-        try await fixture.expectConflictKeepingLocal("mine")
-        #expect(try await fixture.database().conflicts(rootID: fixture.rootID).first?.baseSHA256 == hash("base"))
+        #expect(try fixture.contents() == "mine")
+        let conflicts = try await fixture.database().conflicts(rootID: fixture.rootID)
+        #expect(conflicts.count == (earlierConflict ? 2 : 1))
+        let recovered = try #require(conflicts.first { $0.remoteRevision == "3" })
+        #expect(try String(contentsOf: fixture.root.appending(path: recovered.incomingPath.value), encoding: .utf8) == "remote")
+        #expect(recovered.localSHA256 == hash("mine"))
+        #expect(recovered.baseSHA256 == hash("base"))
+        #expect(try await fixture.database().pendingOperations().isEmpty)
+        #expect(try fixture.stagedFiles().isEmpty)
     }
 
     /// The user chose Moodle's version of a conflict ("Usa versione Moodle"), and the install was

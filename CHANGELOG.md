@@ -12,6 +12,8 @@
 
 - Automatic sync no longer fails with "Connessione assente" while your Mac is on a phone hotspot or a network with Low Data Mode. After updating, it downloads on these networks too, just like "Sincronizza ora"; turn on "Risparmio dati" if you'd rather it waited for another network.
 
+- The "Cerca corsi" field in Corsi no longer keeps the cursor for good. It isn't selected when the window opens, and clicking anywhere else, or pressing Esc twice, deselects it. The first Esc clears what you typed.
+
 ## 2026-10-01
 
 ### Release highlights

@@ -210,7 +210,7 @@ struct SettingsPage: View {
                 get: { authentication.dataSaverEnabled },
                 set: { authentication.setDataSaver(enabled: $0) }
             )) {
-                SettingLabel(tr("Risparmio dati", "Data Saver"), explanation: tr("Quando il Mac usa l'hotspot del telefono, la sincronizzazione automatica si mette in pausa per non consumare i tuoi dati, e riprende da sola sul Wi-Fi. Vale anche per le reti con la Modalità dati ridotti. «Sincronizza ora» scarica sempre.", "When your Mac is using your phone's hotspot, automatic sync pauses so it doesn't use up your data, and resumes on its own on Wi-Fi. The same goes for networks with Low Data Mode on. “Sync now” always downloads."))
+                SettingLabel(tr("Risparmio dati", "Data Saver"), explanation: tr("Quando il Mac usa l'hotspot del telefono, la sincronizzazione automatica si mette in pausa per non consumare i tuoi dati, e riprende da sola quando torni sul Wi-Fi. Vale anche per le reti con la Modalità dati ridotti. «Sincronizza ora» scarica sempre.", "When your Mac is using your phone's hotspot, automatic sync pauses so it doesn't use up your data, and picks up again by itself once you're back on Wi-Fi. The same goes for networks with Low Data Mode on. “Sync now” always downloads."))
             }
             .disabled(!authentication.automaticSyncEnabled)
         } header: {

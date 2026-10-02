@@ -23,6 +23,9 @@ public enum NetworkPathReader {
                     return !done
                 }
                 guard isFirst else { return }
+                // The handler holds `finish`, which holds the monitor: without dropping it, every
+                // read would leave a monitor and its queue behind (quiet at rest, AGENTS.md).
+                monitor.pathUpdateHandler = nil
                 monitor.cancel()
                 continuation.resume(returning: conditions)
             }

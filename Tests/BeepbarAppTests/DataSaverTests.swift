@@ -1,7 +1,7 @@
 import Foundation
 import os
 import Testing
-import BeepbarCore
+@testable import BeepbarCore
 @testable import BeepbarApp
 
 /// "Risparmio dati" (Data Saver), end to end through the controller against a local Moodle (see
@@ -178,6 +178,122 @@ import BeepbarCore
         #expect(!harness.controller.isSyncActive)
     }
 
+    /// Proves that "Annulla" while a refused run reads the network ends the run as cancelled:
+    /// "Pronto", like any cancelled sync, with no pause and no failure. Guards against the
+    /// cancellation being lost and the run reported as paused, or as "Connessione assente".
+    @Test func cancellingWhileTheRefusalIsCheckedCancels() async throws {
+        let harness = try await Harness(networks: [.unrestricted, .hotspot])
+        defer { harness.remove() }
+        harness.controller.setDataSaver(enabled: true)
+        harness.controller.setSyncStateForTesting(.synced(Self.lastResult))
+        MoodleRecordingProtocol.setOnHotspot(token: harness.token, true)
+        harness.sequence.onRead(2) { harness.controller.cancelSynchronization() }
+
+        await harness.controller.runAutomaticSyncForTesting()
+
+        #expect(harness.networkReads == 2)
+        #expect(harness.controller.syncState == .readyUnchecked)
+        #expect(harness.controller.dataSaverPause == nil)
+        #expect(!harness.controller.isSyncActive)
+    }
+
+    /// Proves that a run whose operation was replaced while it read the network leaves the new
+    /// operation alone: no pause, no state of its own. Guards against a stale run painting a pause
+    /// and an old result over whatever replaced it.
+    @Test func aRunReplacedWhileTheRefusalIsCheckedLeavesTheNewOneAlone() async throws {
+        let harness = try await Harness(networks: [.unrestricted, .hotspot])
+        defer { harness.remove() }
+        harness.controller.setDataSaver(enabled: true)
+        harness.controller.setSyncStateForTesting(.synced(Self.lastResult))
+        MoodleRecordingProtocol.setOnHotspot(token: harness.token, true)
+        harness.sequence.onRead(2) { harness.controller.setOperationForTesting(UUID()) }
+
+        await harness.controller.runAutomaticSyncForTesting()
+
+        #expect(harness.networkReads == 2)
+        #expect(harness.controller.dataSaverPause == nil)
+        #expect(harness.controller.syncState == .syncing)
+        #expect(harness.controller.isSyncActive)
+        harness.controller.setOperationForTesting(nil)
+    }
+
+    /// Proves that a run paused midway still shows what waits in Conflicts, as a finished run
+    /// would: files handled before the refusal may have opened conflicts. Guards against the
+    /// Conflicts notice staying hidden until some later run.
+    @Test func aPauseMidwayStillShowsConflicts() async throws {
+        let harness = try await Harness(networks: [.unrestricted, .hotspot])
+        defer { harness.remove() }
+        harness.controller.setDataSaver(enabled: true)
+        harness.controller.setSyncStateForTesting(.synced(Self.lastResult))
+        MoodleRecordingProtocol.setOnHotspot(token: harness.token, true)
+        // Stands in for a conflict recorded before the refusal, which the controller has not read.
+        try await harness.database.insertConflict(ConflictRecord(id: UUID(), rootID: harness.rootID, remoteID: "pending",
+            relativePath: try RelativePath("Course/pending.pdf"), incomingPath: try RelativePath(internal: ".beepbar/conflicts/pending.pdf"),
+            baseSHA256: "base", localSHA256: "local", remoteSHA256: "remote", remoteRevision: "2", detectedAt: .now, status: .open))
+        #expect(harness.controller.conflicts.isEmpty)
+
+        let outcome = await harness.controller.runAutomaticSyncForTesting()
+
+        #expect(outcome == .deferred)
+        #expect(harness.controller.conflicts.count == 1)
+        #expect(harness.controller.syncState == .conflicts(1, nil))
+    }
+
+    /// Proves that a run paused midway does not bring back an error from before it: it got as far
+    /// as downloading, so that error is gone, and the pause shows instead. Guards against an old
+    /// "Servizio non disponibile" hiding the pause and reporting a problem that no longer exists.
+    @Test func aPauseMidwayDoesNotBringBackAnOldError() async throws {
+        let harness = try await Harness(networks: [.unrestricted, .hotspot])
+        defer { harness.remove() }
+        harness.controller.setDataSaver(enabled: true)
+        harness.controller.setSyncStateForTesting(.failed(.serviceUnavailable))
+        MoodleRecordingProtocol.setOnHotspot(token: harness.token, true)
+
+        let outcome = await harness.controller.runAutomaticSyncForTesting()
+
+        #expect(!harness.downloads.isEmpty)
+        #expect(outcome == .deferred)
+        #expect(harness.controller.syncState == .readyUnchecked)
+        #expect(harness.controller.visibleDataSaverPause == .hotspot)
+    }
+
+    /// Proves what a pause midway puts back: everything still true stays, an error gives way to
+    /// "Pronto". Guards against a stale error coming back, or a result being lost.
+    @Test(arguments: [
+        (AppSyncState.synced(lastResult), AppSyncState.synced(lastResult)),
+        (.readyUnchecked, .readyUnchecked),
+        (.conflicts(2, lastResult), .conflicts(2, lastResult)),
+        (.partial(lastResult), .partial(lastResult)),
+        (.failed(.connectivity), .readyUnchecked),
+        (.failed(.serviceUnavailable), .readyUnchecked),
+        (.failed(.partialSync), .readyUnchecked)
+    ])
+    func aPauseMidwayPutsBackWhatIsStillTrue(_ before: AppSyncState, _ expected: AppSyncState) {
+        #expect(WeBeepAuthenticationController.stateAfterPauseMidway(before) == expected)
+    }
+
+    /// Proves that turning automatic sync off while a run reads the network stops that run: no
+    /// pause on a hotspot, no sync on Wi-Fi. Guards against a pause nothing would clear (the Data
+    /// Saver switch is disabled while automatic sync is off), and a sync after the user said no.
+    @Test(arguments: [NetworkPathConditions.hotspot, .unrestricted])
+    func turningAutomaticSyncOffWhileTheNetworkIsReadStopsTheRun(_ network: NetworkPathConditions) async throws {
+        let harness = try await Harness(networks: [network])
+        defer { harness.remove() }
+        harness.controller.setDataSaver(enabled: true)
+        harness.controller.setSyncStateForTesting(.synced(Self.lastResult))
+        harness.sequence.onRead(1) { harness.controller.setAutomaticSync(enabled: false) }
+        let requestsBefore = harness.requests.count
+
+        let outcome = await harness.controller.runAutomaticSyncForTesting()
+
+        #expect(outcome == .finished)
+        #expect(harness.networkReads == 1)
+        #expect(harness.controller.dataSaverPause == nil)
+        #expect(harness.requests.count == requestsBefore)
+        #expect(!harness.downloaded("a.txt"))
+        #expect(harness.controller.syncState == .synced(Self.lastResult))
+    }
+
     // MARK: What clears the pause
 
     /// Proves that "Sincronizza ora" on a hotspot clears the pause and downloads at once, Data
@@ -216,9 +332,10 @@ import BeepbarCore
         #expect(harness.downloaded("a.txt"))
     }
 
-    /// Proves that turning Data Saver or automatic sync off, or signing out, clears the pause at
-    /// once, and that with Data Saver off the next run on the hotspot downloads. Guards against
-    /// the window still saying "In pausa per Risparmio dati" for something no longer on.
+    /// Proves that turning Data Saver or automatic sync off, changing Frequenza or signing out
+    /// clears the pause at once, and that with Data Saver off the next run on the hotspot
+    /// downloads. Guards against the window still saying "In pausa per Risparmio dati" for
+    /// something no longer on, or after the schedule that would retry was replaced.
     @Test func turningThingsOffClearsThePause() async throws {
         let harness = try await Harness(networks: [.hotspot])
         defer { harness.remove() }
@@ -238,10 +355,77 @@ import BeepbarCore
         harness.controller.setAutomaticSync(enabled: false)
         #expect(harness.controller.dataSaverPause == nil)
 
+        harness.controller.setAutomaticSync(enabled: true)
+        await harness.controller.runAutomaticSyncForTesting()
+        #expect(harness.controller.dataSaverPause == .hotspot)
+        harness.controller.setAutomaticSyncInterval(3_600)
+        #expect(harness.controller.automaticSyncInterval == 3_600)
+        #expect(harness.controller.dataSaverPause == nil)
+
         await harness.controller.runAutomaticSyncForTesting()
         #expect(harness.controller.dataSaverPause == .hotspot)
         harness.controller.signOut()
         #expect(harness.controller.dataSaverPause == nil)
+    }
+
+    /// Proves that the pause does not come back after the sign-in expires and is renewed: both
+    /// rebuild the schedule, which drops the retry the pause promised, so the next run is a whole
+    /// interval away. Guards against "In attesa del Wi-Fi" staying on screen for hours after
+    /// signing in again, possibly back on Wi-Fi.
+    @Test func anExpiredSignInDoesNotBringThePauseBack() async throws {
+        let harness = try await Harness(networks: [.hotspot])
+        defer { harness.remove() }
+        harness.controller.setDataSaver(enabled: true)
+        await harness.controller.runAutomaticSyncForTesting()
+        #expect(harness.controller.dataSaverPause == .hotspot)
+
+        // Moodle stops accepting the token: the next course refresh finds the sign-in expired.
+        MoodleRecordingProtocol.revoke(token: harness.token)
+        harness.controller.loadCourses()
+        await harness.controller.waitForCourseLoadForTesting()
+        #expect(harness.controller.accountState == .expired)
+        #expect(harness.controller.dataSaverPause == nil)
+
+        let renewed = MoodleRecordingProtocol.register(courses: [(1, "Course")], files: [1: ["a.txt"]])
+        await harness.controller.completeLoginForTesting(moodleLoginCallback(token: renewed))
+        #expect(harness.controller.accountState == .connected)
+        #expect(harness.controller.syncState == .readyUnchecked)
+        #expect(harness.controller.visibleDataSaverPause == nil)
+        #expect(harness.controller.menuBarSnapshot.title != "In pausa per Risparmio dati")
+    }
+
+    // MARK: The menu bar icon
+
+    /// Proves that the menu bar icon shows the pause, pushed to the status item, instead of the
+    /// warning an earlier "Connessione assente" gives, and goes back when the pause ends. Guards
+    /// against a warning triangle next to a menu that says all is calm.
+    @Test func theIconShowsThePause() async throws {
+        let harness = try await Harness(networks: [.hotspot])
+        defer { harness.remove() }
+        let pushed = SymbolLog()
+        harness.controller.onMenuBarSymbolChange = { pushed.symbols.append($0) }
+        harness.controller.setDataSaver(enabled: true)
+        harness.controller.setSyncStateForTesting(.failed(.connectivity))
+        #expect(pushed.symbols.last == "exclamationmark.triangle")
+
+        await harness.controller.runAutomaticSyncForTesting()
+        #expect(harness.controller.visibleDataSaverPause == .hotspot)
+        #expect(pushed.symbols.last == "pause.circle")
+
+        harness.controller.setDataSaver(enabled: false)
+        #expect(pushed.symbols.last == "exclamationmark.triangle")
+    }
+
+    /// Proves the icon for each case: the pause the user sees wins over the state underneath, and
+    /// without one the state decides as before.
+    @Test(arguments: [
+        (AppSyncState.failed(.connectivity), DataSaverPause?.some(.hotspot), "pause.circle"),
+        (.synced(lastResult), .lowDataMode, "pause.circle"),
+        (.failed(.connectivity), nil, "exclamationmark.triangle"),
+        (.synced(lastResult), nil, "arrow.triangle.2.circlepath")
+    ])
+    func iconForEachCase(_ state: AppSyncState, _ pause: DataSaverPause?, _ expected: String) {
+        #expect(WeBeepAuthenticationController.menuBarSymbol(for: state, pause: pause) == expected)
     }
 
     // MARK: The setting
@@ -289,6 +473,11 @@ import BeepbarCore
     }
 }
 
+/// The icons the controller pushed to the status item, in order.
+@MainActor private final class SymbolLog {
+    var symbols: [String] = []
+}
+
 /// Answers the controller's network reads in order, repeating the last answer, and counts them.
 /// `onRead` runs an action on the main actor just before a given read answers, to change
 /// something while a run is waiting on it.
@@ -323,11 +512,13 @@ private final class NetworkSequence: Sendable {
 }
 
 /// A controller signed in to a local Moodle where course 1 is selected and lists `a.txt`, with a
-/// folder of its own and a scripted network.
+/// folder of its own, a scripted network, and automatic sync on, as users have it.
 @MainActor private struct Harness {
     let controller: WeBeepAuthenticationController
     let token: String
     let root: URL
+    let database: SyncDatabase
+    let rootID: UUID
     let sequence: NetworkSequence
 
     init(networks: [NetworkPathConditions?], lowPowerMode: Bool = false) async throws {
@@ -337,17 +528,24 @@ private final class NetworkSequence: Sendable {
         let rootID = UUID()
         try await database.registerRoot(id: rootID, canonicalPath: root.path)
         try await database.upsertScope(SyncScope(rootID: rootID, courseID: 1, displayName: "Course", localFolder: "Course", enabled: true))
+        self.database = database
+        self.rootID = rootID
         let token = MoodleRecordingProtocol.register(courses: [(1, "Course")], files: [1: ["a.txt"]])
         self.token = token
         let sequence = NetworkSequence(networks)
         self.sequence = sequence
         let environment = AutomaticSyncEnvironment(isLowPowerModeEnabled: { lowPowerMode }, currentNetwork: { await sequence.next() })
-        let vault = CredentialVault(read: { _ in token }, write: { _ in })
+        // The stored token, which a renewed sign-in replaces, as it replaces the real one.
+        let stored = OSAllocatedUnfairLock(initialState: token)
+        let vault = CredentialVault(read: { _ in stored.withLock { $0 } }, write: { renewed in stored.withLock { $0 = renewed } })
         controller = WeBeepAuthenticationController(testRootURL: root, database: database, rootID: rootID, apiClient: MoodleRecordingProtocol.makeClient(), downloader: MoodleRecordingProtocol.makeDownloader(), credentialVault: vault, deleteCredential: {}, automaticSyncEnvironment: environment)
         await controller.completeLoginForTesting(moodleLoginCallback(token: token))
         // Signed in through the local Moodle, with course 1 selected: every run below can sync.
         #expect(controller.courseLoadError == nil)
         #expect(controller.enabledCourseIDs == [1])
+        // A test controller registers no real background activity, so this is safe here.
+        controller.setAutomaticSync(enabled: true)
+        #expect(controller.automaticSyncEnabled)
     }
 
     var requests: [MoodleRecordingProtocol.RecordedRequest] { MoodleRecordingProtocol.requests(token: token) }

@@ -180,7 +180,8 @@ private struct SyncHeroCard: View {
     private var state: AppSyncState { authentication.syncState }
     /// "Risparmio dati" holding automatic sync back, when it is what the card shows (see
     /// `WeBeepAuthenticationController.visibleDataSaverPause`). It takes the headline, the badge
-    /// and the explanation line; "· sincronizzato X fa" stays, since that is still true.
+    /// and the line under it, in place of the last sync's summary and its "Dettagli" (Attività
+    /// still has them). After a completed sync "· sincronizzato X fa" stays, since that is still true.
     private var pause: DataSaverPause? { authentication.visibleDataSaverPause }
     private var badgeSymbol: String? { pause == nil ? state.badgeSymbol : "pause.circle.fill" }
 

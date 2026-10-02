@@ -44,6 +44,12 @@ final class MoodleRecordingProtocol: URLProtocol, @unchecked Sendable {
         accounts.withLock { $0[token]?.onHotspot = onHotspot }
     }
 
+    /// Moodle stops accepting `token`: every later call with it answers `invalidtoken`, as an
+    /// expired sign-in does. Its recorded requests go with it.
+    static func revoke(token: String) {
+        accounts.withLock { $0[token] = nil }
+    }
+
     static func requests(token: String) -> [RecordedRequest] {
         accounts.withLock { $0[token]?.requests ?? [] }
     }

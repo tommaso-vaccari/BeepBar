@@ -4,9 +4,9 @@
 
 ### New
 
-- "Risparmio dati" in Impostazioni: when it's on, automatic sync pauses while your Mac is using your phone's hotspot or a network with Low Data Mode, and picks up again by itself on another network. BeepBar shows that it's paused and why. "Sincronizza ora" always downloads. It's off unless you turn it on.
+- "Risparmio dati" in Impostazioni: when it's on, automatic sync pauses while your Mac is using your phone's hotspot or a network with Low Data Mode, and picks up again by itself on another network. BeepBar shows that it's paused and why, in the window and in the menu bar. "Sincronizza ora" always downloads. It's off unless you turn it on.
 
-- Every option in Impostazioni has an ⓘ button that explains in plain words what it does. Hover over it, or click it.
+- Every switch in Impostazioni, and the Frequenza menu, has an ⓘ button that explains in plain words what it does. Hover over it, or click it.
 
 ### Fixed
 

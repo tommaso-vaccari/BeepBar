@@ -70,8 +70,8 @@ extension DataSaverPause {
     /// The window's explanation.
     var detail: String {
         switch self {
-        case .hotspot: tr("Il Mac usa l'hotspot del telefono: BeepBar riprende da sola sul Wi-Fi, così non consuma i tuoi dati. «Sincronizza ora» scarica subito.", "Your Mac is using your phone's hotspot: BeepBar resumes on its own on Wi-Fi, so it doesn't use up your data. “Sync now” downloads right away.")
-        case .lowDataMode: tr("Su questa rete è attiva la Modalità dati ridotti: BeepBar riprende da sola su un'altra rete o quando la disattivi. «Sincronizza ora» scarica subito.", "Low Data Mode is on for this network: BeepBar resumes on its own on another network or once you turn it off. “Sync now” downloads right away.")
+        case .hotspot: tr("Il Mac usa l'hotspot del telefono: BeepBar riprende da sola quando torni sul Wi-Fi, così non consuma i tuoi dati. «Sincronizza ora» scarica subito.", "Your Mac is using your phone's hotspot: BeepBar picks up again by itself once you're back on Wi-Fi, so it doesn't use up your data. “Sync now” downloads right away.")
+        case .lowDataMode: tr("Su questa rete è attiva la Modalità dati ridotti: BeepBar riprende da sola quando passi a un'altra rete o la disattivi. «Sincronizza ora» scarica subito.", "Low Data Mode is on for this network: BeepBar picks up again by itself when you switch to another network or turn Low Data Mode off. “Sync now” downloads right away.")
         }
     }
 }
@@ -333,7 +333,7 @@ struct MenuBarSnapshot: Sendable {
     // on the main thread.
     //
     // `refreshMenuBarSnapshot()` is called from `didSet` on every stored property that feeds
-    // `menuBarAction`/`menuBarTitle`/`menuBarActionTitle`/`menuBarDetail` (currently: syncState,
+    // `menuBarAction`/`menuBarTitle`/`menuBarActionTitle`/`menuBarDetail`/`menuBarSymbol` (currently: syncState,
     // accountState, hasStoredCredential, recoveryBlocked, conflicts, rootURL, activeOperationID,
     // dataSaverPause), and
     // `setLanguage(_:)` calls it since every label depends on `AppLanguage.current`. If you make
@@ -402,8 +402,10 @@ struct MenuBarSnapshot: Sendable {
     /// Why the last automatic run was held back by "Risparmio dati", or `nil`. Never persisted:
     /// it describes the network at that moment, and the next run that goes ahead clears it. Read
     /// through `visibleDataSaverPause`, which decides whether it is what the user sees.
-    /// Cleared when a sync starts, when the switch or automatic sync is turned off, on sign-out
-    /// and when the folder changes.
+    /// Invariant: it is only shown while the deferred retry that will replace it is still pending.
+    /// So it is cleared when a sync starts, when the switch is turned off, when the folder changes,
+    /// and whenever `configureBackgroundScheduler()` rebuilds the scheduler (automatic sync turned
+    /// off, Frequenza changed, signed out, sign-in expired or renewed…), since that drops the retry.
     @Published private(set) var dataSaverPause: DataSaverPause? {
         didSet { refreshMenuBarSnapshot() }
     }
@@ -474,6 +476,9 @@ struct MenuBarSnapshot: Sendable {
     private var courseLoadTaskForTesting: Task<Void, Never>?
     private var deleteCredentialForTesting: (() throws -> Void)?
     private var testDefaults: UserDefaults?
+    /// Off in every test controller, so a test can turn automatic sync on, as users have it,
+    /// without registering a real background activity on the Mac running the tests.
+    private var registersBackgroundActivity = true
     private var beforeScopeRestoreForTesting: (@MainActor () -> Void)?
 #endif
 
@@ -608,6 +613,7 @@ struct MenuBarSnapshot: Sendable {
         enabledCourseIDs = [1]
         automaticSyncEnabled = false
         automaticSyncInterval = 28_800
+        registersBackgroundActivity = false
         dataSaverEnabled = Self.storedDataSaverEnabled(in: isolatedDefaults)
         self.automaticSyncEnvironment = automaticSyncEnvironment
         self.apiClient = apiClient ?? WeBeepAPIClient(policy: site.serverPolicy)
@@ -688,6 +694,9 @@ struct MenuBarSnapshot: Sendable {
 
     /// Waits for the sync `synchronizeNow()` started, which it does not return.
     func waitForSyncForTesting() async { await syncTask?.value }
+
+    /// Waits for the course refresh `loadCourses()` started, which it does not return.
+    func waitForCourseLoadForTesting() async { await courseLoadTaskForTesting?.value }
 
     func setRootIDForTesting(_ id: UUID) { rootID = id }
 
@@ -819,7 +828,6 @@ struct MenuBarSnapshot: Sendable {
         siteInfo = nil
         courses = []
         courseLoadError = nil
-        dataSaverPause = nil
         hasStoredCredential = false
         accountState = .notConnected
         setSyncState(recoveryBlocked ? .recoveryBlocked : .loginRequired)
@@ -847,10 +855,14 @@ struct MenuBarSnapshot: Sendable {
 
     /// Lets the icon itself say whether a sync is running or something needs attention, since the
     /// menu closes as soon as "Sincronizza ora" is clicked.
-    var menuBarSymbol: String { Self.menuBarSymbol(for: syncState) }
+    var menuBarSymbol: String { Self.menuBarSymbol(for: syncState, pause: visibleDataSaverPause) }
 
-    nonisolated static func menuBarSymbol(for syncState: AppSyncState) -> String {
-        switch syncState {
+    /// `pause` is the pause the user sees (`visibleDataSaverPause`), not the stored one: when it
+    /// shows, the icon says so instead of the warning a "Connessione assente" underneath would give,
+    /// matching the calm pause in the menu and the window.
+    nonisolated static func menuBarSymbol(for syncState: AppSyncState, pause: DataSaverPause? = nil) -> String {
+        if pause != nil { return "pause.circle" }
+        return switch syncState {
         case .checking, .syncing, .cancelling: "arrow.down.circle"
         case .conflicts, .partial, .failed, .recoveryBlocked, .loginRequired, .needsFolder: "exclamationmark.triangle"
         case .starting, .readyUnchecked, .synced: "arrow.triangle.2.circlepath"
@@ -867,8 +879,9 @@ struct MenuBarSnapshot: Sendable {
     }
 
     /// The pause only stands in for states that describe an earlier run and that the next
-    /// automatic run would replace anyway: the last result, "Pronto", and the "Connessione assente"
-    /// a refused download used to cause. Anything that asks the user to act (conflicts, sign in,
+    /// automatic run would replace anyway: the last result, "Pronto", and an earlier
+    /// "Connessione assente" (the Mac has a network again, a limited one, so the pause is the
+    /// current news). Anything that asks the user to act (conflicts, sign in,
     /// choose a folder, blocked recovery), an incomplete sync, every other failure and a running
     /// sync stay in front: hiding them behind "In pausa" would hide the real problem.
     nonisolated static func visibleDataSaverPause(_ pause: DataSaverPause?, syncState: AppSyncState, syncActive: Bool) -> DataSaverPause? {
@@ -1132,8 +1145,6 @@ struct MenuBarSnapshot: Sendable {
         let wasEnabled = automaticSyncEnabled
         automaticSyncEnabled = enabled
         operationDefaults.set(enabled, forKey: Self.autoSyncKey)
-        // The pause describes automatic sync; with it off there is nothing paused.
-        if !enabled { dataSaverPause = nil }
         if let interval {
             automaticSyncInterval = Self.validatedAutomaticInterval(interval)
             operationDefaults.set(automaticSyncInterval, forKey: Self.autoSyncIntervalKey)
@@ -1250,7 +1261,7 @@ struct MenuBarSnapshot: Sendable {
         notificationAuthorization = authorization
     }
 
-    func setAutomaticSyncInterval(_ seconds: Int) { guard !isSyncActive else { return }; automaticSyncInterval = Self.validatedAutomaticInterval(seconds); Self.defaults.set(automaticSyncInterval, forKey: Self.autoSyncIntervalKey); configureBackgroundScheduler() }
+    func setAutomaticSyncInterval(_ seconds: Int) { guard !isSyncActive else { return }; automaticSyncInterval = Self.validatedAutomaticInterval(seconds); operationDefaults.set(automaticSyncInterval, forKey: Self.autoSyncIntervalKey); configureBackgroundScheduler() }
 
     func renameFolder(for course: RemoteCourseSummary, to newFolder: String) {
         guard let rootURL, let rootID, let database, !recoveryBlocked, !isSyncActive else { return }
@@ -1971,6 +1982,10 @@ struct MenuBarSnapshot: Sendable {
         backgroundScheduler?.invalidate()
         backgroundScheduler = nil
         scheduledConfiguration = configuration
+        // The pause promised a retry soon; that retry belonged to the scheduler just dropped, and
+        // the new one first runs a whole interval later. Left on screen, "In attesa del Wi-Fi"
+        // could stay for hours, through a renewed sign-in, after the Mac is back on Wi-Fi.
+        dataSaverPause = nil
         let policy = BackgroundScheduleInput(
             automaticSyncEnabled: configuration.enabled,
             hasCredential: configuration.connected,
@@ -1982,6 +1997,9 @@ struct MenuBarSnapshot: Sendable {
             BeepbarLog.scheduler.notice("Scheduler disabled enabled=\(configuration.enabled, privacy: .public) connected=\(configuration.connected, privacy: .public) root=\(configuration.rootConfigured, privacy: .public) courses=\(configuration.enabledCourseCount, privacy: .public) recoveryBlocked=\(configuration.recoveryBlocked, privacy: .public)")
             return
         }
+#if DEBUG
+        guard registersBackgroundActivity else { return }
+#endif
         let scheduler = NSBackgroundActivityScheduler(identifier: "io.github.tvaccari.beepbar.auto-sync")
         scheduler.repeats = true
         scheduler.interval = TimeInterval(automaticSyncInterval)
@@ -2013,7 +2031,16 @@ struct MenuBarSnapshot: Sendable {
         // read after it, in the same main-actor turn as the decision and the start of the run.
         var network: NetworkPathConditions?
         if dataSaverEnabled, !lowPowerMode, activeOperationID == nil, !isLoadingCourses, isAutomaticSyncConfigured {
+            let schedule = scheduledConfiguration
             network = await automaticSyncEnvironment.currentNetwork()
+            // Rebuilt meanwhile (automatic sync turned off, Frequenza changed, signed out…): this
+            // callback belongs to a schedule that no longer exists, and the new one takes over.
+            // Going on would sync after the user turned automatic sync off, or show a pause that
+            // nothing would clear, since the rebuild that clears it has already happened.
+            guard scheduledConfiguration == schedule else {
+                BeepbarLog.sync.notice("Automatic synchronization skipped reason=schedule-changed")
+                return .finished
+            }
         }
         switch AutomaticSyncPolicy.decision(lowPowerMode: lowPowerMode, busy: activeOperationID != nil || isLoadingCourses, configured: isAutomaticSyncConfigured, dataSaverEnabled: dataSaverEnabled, network: network) {
         case .deferForLowPowerMode:
@@ -2183,9 +2210,10 @@ struct MenuBarSnapshot: Sendable {
     /// An automatic run that started with "Risparmio dati" on and then lost the network: macOS
     /// refuses a download on a hotspot or a Low Data Mode network as if the Mac were offline, which
     /// used to show a false "Connessione assente". The network is read again: if the Mac is now on
-    /// a hotspot or a Low Data Mode network, the run ends as a pause (deferred, last result back
-    /// on screen, nothing reported as failed) and returns `true`. On an ordinary or no network it
-    /// returns `false` and the failure is reported as usual, so a real outage still says so.
+    /// a hotspot or a Low Data Mode network, the run ends as a pause (deferred, the earlier state
+    /// back on screen as `stateAfterPauseMidway` decides, nothing reported as failed) and returns
+    /// `true`. On an ordinary or no network it returns `false` and the failure is reported as
+    /// usual, so a real outage still says so.
     private func pausedMidRun(_ operationID: UUID, error: WeBeepAPIError, restoring stateBeforeRun: AppSyncState) async -> Bool {
         guard SyncServiceFailure(error) == .connectivity, activeOperationID == operationID else { return false }
         let network = await automaticSyncEnvironment.currentNetwork()
@@ -2196,7 +2224,7 @@ struct MenuBarSnapshot: Sendable {
         guard let pause = AutomaticSyncPolicy.dataSaverPause(for: network) else { return false }
         BeepbarLog.sync.notice("Automatic synchronization deferred midway reason=data-saver")
         automaticOutcome = .deferred
-        setSyncState(stateBeforeRun)
+        setSyncState(Self.stateAfterPauseMidway(stateBeforeRun))
         // Turned off while the run was going: nothing to show, and the retry runs without limits.
         // Either way the refusal came from the run's limits, so it is not shown as an outage.
         dataSaverPause = dataSaverEnabled ? pause : nil
@@ -2204,6 +2232,16 @@ struct MenuBarSnapshot: Sendable {
         // Files handled before the refusal may have opened conflicts; show them like any run would.
         await reloadPendingChoices()
         return true
+    }
+
+    /// What a run stopped midway by "Risparmio dati" puts back on screen: the state from before
+    /// the run (the last result, "Pronto", conflicts, an incomplete sync), which is still true.
+    /// Except an error: the run got as far as downloading, so the site answered and the Mac was
+    /// online, and showing that error again would report a problem that is gone, and hide the
+    /// pause behind it. "Pronto" takes its place, with the pause shown over it.
+    nonisolated static func stateAfterPauseMidway(_ stateBeforeRun: AppSyncState) -> AppSyncState {
+        if case .failed = stateBeforeRun { return .readyUnchecked }
+        return stateBeforeRun
     }
 
     private func deferredAutomaticSync(_ operationID: UUID) {

@@ -158,9 +158,10 @@ struct SyncDatabaseTests {
         settings = try await upgraded.durabilitySettings()
         #expect(settings.journalMode == "wal")
         #expect(settings.synchronous == 2)
-        // Documented, not chosen by accident: F_FULLFSYNC stays off on both the SQLite and the
-        // FileStore side (see `SyncDatabase.init`).
+        // Documented, not chosen by accident (see `SyncDatabase.init`): commits use plain fsync,
+        // like `FileStore`; only checkpoints flush the drive cache (F_FULLFSYNC).
         #expect(settings.fullFsync == 0)
+        #expect(settings.checkpointFullFsync == 1)
     }
 
     @Test func reopeningMigratesIdempotentlyAndKeepsData() async throws {

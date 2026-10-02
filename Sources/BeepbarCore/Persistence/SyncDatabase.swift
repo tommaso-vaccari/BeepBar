@@ -49,8 +49,9 @@ public actor SyncDatabase {
         // rename they describe survives, leaving an installed file or a moved course folder that
         // no pending row explains. FULL syncs the log on every commit. Process crashes were
         // already safe under NORMAL (a committed row is in the log file); this is for the machine
-        // going down. Neither side asks for `F_FULLFSYNC` (`PRAGMA fullfsync` stays off, and
-        // `FileStore` uses plain `fsync`), so on macOS the drive's own cache can still reorder
+        // going down. Commits don't ask for `F_FULLFSYNC` (`PRAGMA fullfsync` stays off; only
+        // checkpoints use it, `checkpoint_fullfsync` being on in the system build), and
+        // `FileStore` uses plain `fsync`, so on macOS the drive's own cache can still reorder
         // writes on sudden power loss. A run with nothing new commits nothing, so FULL costs it
         // nothing. An explicit `synchronous` holds after switching to WAL, so the order of these
         // two pragmas doesn't matter.
@@ -60,7 +61,7 @@ public actor SyncDatabase {
 
     /// The durability settings this connection actually runs with, read back from SQLite so tests
     /// check the effective values rather than the statements that set them.
-    func durabilitySettings() throws -> (journalMode: String, synchronous: Int32, fullFsync: Int32) {
+    func durabilitySettings() throws -> (journalMode: String, synchronous: Int32, fullFsync: Int32, checkpointFullFsync: Int32) {
         func value(_ pragma: String) throws -> (text: String?, number: Int32) {
             try withStatement("PRAGMA \(pragma)") { statement in
                 guard try stepRow(statement) else { throw SyncDatabaseError.execution }
@@ -68,7 +69,7 @@ public actor SyncDatabase {
             }
         }
         guard let journalMode = try value("journal_mode").text else { throw SyncDatabaseError.execution }
-        return (journalMode, try value("synchronous").number, try value("fullfsync").number)
+        return (journalMode, try value("synchronous").number, try value("fullfsync").number, try value("checkpoint_fullfsync").number)
     }
 
     public func migrate() throws {

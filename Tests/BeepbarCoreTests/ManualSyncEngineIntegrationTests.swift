@@ -93,6 +93,33 @@ import Testing
         #expect(try await fixture.database.baseline(rootID: fixture.rootID, remoteID: "file")?.remoteRevision == "2")
     }
 
+    /// An install that fails after it was journaled, here because the course folder refuses new
+    /// entries, leaves a pending row and no download: the engine discards the staged copy on the
+    /// error. No crash is needed. That row used to stay unresolved at the next launch and block
+    /// every sync behind "Intervento richiesto"; recovery now drops it and the next sync installs
+    /// the file as usual.
+    @Test func installFailingAfterItWasJournaledDoesNotBlockLaterSyncs() async throws {
+        let fixture = try await Fixture(remoteData: Data("base".utf8))
+        defer { fixture.remove() }
+        let course = fixture.destination.deletingLastPathComponent()
+        try FileManager.default.createDirectory(at: course, withIntermediateDirectories: true)
+        try FileManager.default.setAttributes([.posixPermissions: 0o555], ofItemAtPath: course.path)
+        defer { try? FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: course.path) }
+        let engine = fixture.engine()
+        await #expect(throws: (any Error).self) {
+            _ = try await engine.sync(file: fixture.file(revision: "1"), destination: fixture.path, token: "token")
+        }
+        #expect(try await fixture.database.pendingOperations().count == 1, "precondition: the install failed after journaling")
+        try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: course.path)
+
+        let report = try await RecoveryCoordinator(rootID: fixture.rootID, database: fixture.database, fileStore: fixture.store).recover()
+
+        #expect(report.unresolved.isEmpty)
+        #expect(try await fixture.database.pendingOperations().isEmpty)
+        #expect(try await engine.sync(file: fixture.file(revision: "1"), destination: fixture.path, token: "token") == .installedNew)
+        #expect(try Data(contentsOf: fixture.destination) == Data("base".utf8))
+    }
+
     @Test func loadsBaselinesForOneRootInOneSnapshot() async throws {
         let fixture = try await Fixture(remoteData: Data("base".utf8))
         defer { fixture.remove() }

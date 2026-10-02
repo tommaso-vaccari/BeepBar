@@ -14,7 +14,11 @@ import Testing
 /// so stopping the sequence and reopening from disk reproduces it exactly. A kernel panic or power
 /// cut can also lose writes that weren't yet synced to the drive; that is what
 /// `synchronous = FULL` (`SyncDatabase.init`) and the `fsync` after every `FileStore` rename are
-/// for, and no test in a running process can show it.
+/// for, and no test in a running process can show it. Also not reached here: a crash inside
+/// `FileStore.install` between a swap and its swap back (recovery leaves it unresolved, which is
+/// safe), and `ConflictResolver.useRemote`, which doesn't take the hook (its install is covered
+/// by `chosenRemoteVersionIsInstalledAfterACrash`; a crash before `markResolved` leaves the old
+/// conflict listed).
 struct InterruptedSyncRecoveryTests {
     /// A new file, interrupted after each step, ends up installed and tracked.
     @Test(arguments: [JournalStep.journaled, .filesystemChanged, .committed])
@@ -38,7 +42,7 @@ struct InterruptedSyncRecoveryTests {
     func replacementIsFinishedAfterACrash(at step: JournalStep) async throws {
         let fixture = try Fixture()
         defer { fixture.remove() }
-        try fixture.writeLocal("base")
+        try await fixture.synced("base")
         try await fixture.crashInstalling("remote", expectedLocal: .present(sha256: hash("base")), at: step)
 
         let report = try await fixture.relaunchAndRecover()
@@ -56,6 +60,7 @@ struct InterruptedSyncRecoveryTests {
     func localEditBecomesAConflictAfterACrash(at step: JournalStep) async throws {
         let fixture = try Fixture()
         defer { fixture.remove() }
+        try await fixture.synced("base")
         try fixture.writeLocal("mine")
         try await fixture.crashInstalling("remote", expectedLocal: .present(sha256: hash("base")), at: step)
 
@@ -95,7 +100,7 @@ struct InterruptedSyncRecoveryTests {
     @Test func editMadeAfterACrashBeforeTheSwapIsKept() async throws {
         let fixture = try Fixture()
         defer { fixture.remove() }
-        try fixture.writeLocal("base")
+        try await fixture.synced("base")
         try await fixture.crashInstalling("remote", expectedLocal: .present(sha256: hash("base")), at: .journaled)
         try fixture.writeLocal("edited while BeepBar was closed")
 
@@ -124,7 +129,7 @@ struct InterruptedSyncRecoveryTests {
     @Test func editOfTheSwappedFileAfterACrashIsKept() async throws {
         let fixture = try Fixture()
         defer { fixture.remove() }
-        try fixture.writeLocal("base")
+        try await fixture.synced("base")
         try await fixture.crashInstalling("remote", expectedLocal: .present(sha256: hash("base")), at: .filesystemChanged)
         try fixture.writeLocal("annotated")
 
@@ -141,9 +146,9 @@ struct InterruptedSyncRecoveryTests {
     /// The crash hits right after a new file was installed, before it was recorded, and the user
     /// then edits it. Nothing is left to finish (the download is the file they edited), and this
     /// used to stay unresolved, blocking every sync behind "Intervento richiesto" with no way out
-    /// but choosing another folder. Now the journal row goes, the edit stays, and the next sync,
-    /// with no baseline and a file that differs from Moodle's, keeps it and offers the download
-    /// as a conflict.
+    /// but choosing another folder. Now the journal row goes and the edit stays. No sync runs
+    /// here: the planner check only shows what the next one decides from this state (no synced
+    /// version and a file unlike Moodle's: a conflict, never an overwrite).
     @Test func editOfANewFileAfterACrashDoesNotBlockSyncing() async throws {
         let fixture = try Fixture()
         defer { fixture.remove() }
@@ -159,8 +164,9 @@ struct InterruptedSyncRecoveryTests {
         #expect(try await fixture.database().pendingOperations().isEmpty)
     }
 
-    /// Same, but the user deletes the new file: the next sync downloads it again, as for any file
-    /// deleted on the Mac.
+    /// Same, but the user deletes the new file. The planner check shows the next sync downloads it
+    /// again, as for any file deleted on the Mac (run end to end in
+    /// `ManualSyncEngineIntegrationTests.installFailingAfterItWasJournaledDoesNotBlockLaterSyncs`).
     @Test func deletionOfANewFileAfterACrashDoesNotBlockSyncing() async throws {
         let fixture = try Fixture()
         defer { fixture.remove() }
@@ -193,6 +199,50 @@ struct InterruptedSyncRecoveryTests {
         #expect(report.unresolved == [operation.id])
         #expect(try fixture.contents() == "annotated")
         #expect(try await fixture.database().pendingOperations().map(\.id) == [operation.id])
+    }
+
+    /// A conflict row as releases before this fix journaled it: the user's edit as the file to
+    /// replace. Recovery must not install over it; the edit stays and the download becomes a
+    /// conflict against the last synced version.
+    @Test func olderConflictRowNeverInstallsOverTheEdit() async throws {
+        let fixture = try Fixture()
+        defer { fixture.remove() }
+        try await fixture.synced("base")
+        try fixture.writeLocal("mine")
+        let (database, store) = try await fixture.open()
+        let artifact = try await fixture.stage("remote", in: store)
+        try await database.beginOperation(PendingOperation(rootID: fixture.rootID, remoteID: "file", destination: fixture.path, stagePath: artifact.stagePath, expectedLocal: .present(sha256: hash("mine")), remoteSHA256: artifact.sha256, remoteRevision: "2"))
+
+        let report = try await fixture.relaunchAndRecover()
+
+        #expect(report.unresolved.isEmpty && report.conflicts.count == 1)
+        try await fixture.expectConflictKeepingLocal("mine")
+        #expect(try await fixture.database().conflicts(rootID: fixture.rootID).first?.baseSHA256 == hash("base"))
+    }
+
+    /// The user chose Moodle's version of a conflict ("Usa versione Moodle"), and the install was
+    /// interrupted before the swap: recovery still installs it over the edit, as the user asked.
+    /// Guards the other side of the check above, which must not turn a choice into a new conflict.
+    @Test func chosenRemoteVersionIsInstalledAfterACrash() async throws {
+        let fixture = try Fixture()
+        defer { fixture.remove() }
+        try await fixture.synced("base")
+        try fixture.writeLocal("mine")
+        let (database, store) = try await fixture.open()
+        let first = try await fixture.stage("remote", in: store)
+        _ = try await SyncTransactionCoordinator(database: database, fileStore: store).recordConflict(rootID: fixture.rootID, remoteID: "file", destination: fixture.path, local: .present(sha256: hash("mine")), remote: RemoteState(sha256: first.sha256, revision: "2"), artifact: first)
+        // `useRemote` installs a copy of the download, expecting the user's copy it recorded.
+        let copy = try await fixture.stage("remote", in: store)
+        let coordinator = SyncTransactionCoordinator(database: database, fileStore: store, interruption: Fixture.crash(at: .journaled))
+        await #expect(throws: Fixture.Crash.self) {
+            _ = try await coordinator.install(rootID: fixture.rootID, remoteID: "file", destination: fixture.path, expectedLocal: .present(sha256: hash("mine")), remote: RemoteState(sha256: copy.sha256, revision: "2"), artifact: copy)
+        }
+
+        let report = try await fixture.relaunchAndRecover()
+
+        #expect(report.unresolved.isEmpty && report.conflicts.isEmpty && report.recovered.count == 1)
+        #expect(try fixture.contents() == "remote")
+        #expect(try await fixture.database().pendingOperations().isEmpty)
     }
 
     /// A course folder rename interrupted after each step ends with the folder, its files and
@@ -286,6 +336,13 @@ private struct Fixture {
     func relaunchAndRecover() async throws -> RecoveryReport {
         let (database, store) = try await open()
         return try await RecoveryCoordinator(rootID: rootID, database: database, fileStore: store).recover()
+    }
+
+    /// A file BeepBar already synced: on disk and recorded as the last synced version, as every
+    /// replacement starts.
+    func synced(_ contents: String) async throws {
+        try writeLocal(contents)
+        try await open().0.upsertBaseline(rootID: rootID, baseline: Baseline(remoteID: "file", relativePath: path, sha256: hash(contents), remoteRevision: "1"))
     }
 
     func writeLocal(_ contents: String) throws {

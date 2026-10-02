@@ -7,6 +7,7 @@ struct HomePage: View {
     @State private var organizingCourse: RemoteCourseSummary?
     @State private var editingCourseID: Int64?
     @State private var query = ""
+    @FocusState private var searchFocused: Bool
 
     // The status card stays put; only the course list scrolls, inside its own box that takes
     // whatever height the window leaves.
@@ -135,8 +136,14 @@ struct HomePage: View {
     private var searchField: some View {
         HStack(spacing: 5) {
             Image(systemName: "magnifyingglass").foregroundStyle(.secondary)
-            TextField(tr("Cerca corso", "Search courses"), text: $query)
+            TextField(tr("Cerca corsi", "Search courses"), text: $query)
                 .textFieldStyle(.plain)
+                .focused($searchFocused)
+                // Esc first clears what was typed, then lets go of the field, like the search
+                // fields in Finder and Mail. Without it Esc did nothing at all.
+                .onExitCommand {
+                    if query.isEmpty { searchFocused = false } else { query = "" }
+                }
             if !query.isEmpty {
                 Button { query = "" } label: { Image(systemName: "xmark.circle.fill") }
                     .buttonStyle(.plain)

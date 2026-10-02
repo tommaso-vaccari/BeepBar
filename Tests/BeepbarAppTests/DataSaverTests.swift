@@ -273,15 +273,20 @@ import Testing
     }
 
     /// Proves that turning automatic sync off while a run reads the network stops that run: no
-    /// pause on a hotspot, no sync on Wi-Fi. Guards against a pause nothing would clear (the Data
-    /// Saver switch is disabled while automatic sync is off), and a sync after the user said no.
-    @Test(arguments: [NetworkPathConditions.hotspot, .unrestricted])
-    func turningAutomaticSyncOffWhileTheNetworkIsReadStopsTheRun(_ network: NetworkPathConditions) async throws {
+    /// pause on a hotspot, no sync on Wi-Fi, even if it is turned back on at once (the schedule
+    /// that started the run is gone either way). Guards against a pause nothing would clear (the
+    /// Data Saver switch is disabled while automatic sync is off, and the new schedule runs a
+    /// whole interval later), and a sync after the user said no.
+    @Test(arguments: [(NetworkPathConditions.hotspot, false), (.unrestricted, false), (.hotspot, true), (.unrestricted, true)])
+    func turningAutomaticSyncOffWhileTheNetworkIsReadStopsTheRun(_ network: NetworkPathConditions, _ backOnAtOnce: Bool) async throws {
         let harness = try await Harness(networks: [network])
         defer { harness.remove() }
         harness.controller.setDataSaver(enabled: true)
         harness.controller.setSyncStateForTesting(.synced(Self.lastResult))
-        harness.sequence.onRead(1) { harness.controller.setAutomaticSync(enabled: false) }
+        harness.sequence.onRead(1) {
+            harness.controller.setAutomaticSync(enabled: false)
+            if backOnAtOnce { harness.controller.setAutomaticSync(enabled: true) }
+        }
         let requestsBefore = harness.requests.count
 
         let outcome = await harness.controller.runAutomaticSyncForTesting()

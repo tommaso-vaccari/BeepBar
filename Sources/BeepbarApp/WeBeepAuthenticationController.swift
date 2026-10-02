@@ -405,7 +405,8 @@ struct MenuBarSnapshot: Sendable {
     /// Invariant: it is only shown while the deferred retry that will replace it is still pending.
     /// So it is cleared when a sync starts, when the switch is turned off, when the folder changes,
     /// and whenever `configureBackgroundScheduler()` rebuilds the scheduler (automatic sync turned
-    /// off, Frequenza changed, signed out, sign-in expired or renewed…), since that drops the retry.
+    /// off, Frequenza or the selected courses changed, signed out, sign-in expired or renewed…),
+    /// since that drops the retry.
     @Published private(set) var dataSaverPause: DataSaverPause? {
         didSet { refreshMenuBarSnapshot() }
     }
@@ -470,6 +471,10 @@ struct MenuBarSnapshot: Sendable {
         didSet { if rootID != oldValue { conflictChoiceFeedback = nil } }
     }
     private var scheduledConfiguration: BackgroundScheduleConfiguration?
+    /// Bumped on every real rebuild of the scheduler. Tells an automatic run whether the schedule
+    /// that started it still exists: comparing configurations can't, since turning automatic sync
+    /// off and on again rebuilds twice and ends on an equal configuration.
+    private var schedulerGeneration = 0
 #if DEBUG
     private var beforeReconciliationStateForTesting: (@MainActor () async -> Void)?
     private var beforePendingChoicesForTesting: (@MainActor () async -> Void)?
@@ -1982,6 +1987,7 @@ struct MenuBarSnapshot: Sendable {
         backgroundScheduler?.invalidate()
         backgroundScheduler = nil
         scheduledConfiguration = configuration
+        schedulerGeneration += 1
         // The pause promised a retry soon; that retry belonged to the scheduler just dropped, and
         // the new one first runs a whole interval later. Left on screen, "In attesa del Wi-Fi"
         // could stay for hours, through a renewed sign-in, after the Mac is back on Wi-Fi.
@@ -2031,13 +2037,14 @@ struct MenuBarSnapshot: Sendable {
         // read after it, in the same main-actor turn as the decision and the start of the run.
         var network: NetworkPathConditions?
         if dataSaverEnabled, !lowPowerMode, activeOperationID == nil, !isLoadingCourses, isAutomaticSyncConfigured {
-            let schedule = scheduledConfiguration
+            let generation = schedulerGeneration
             network = await automaticSyncEnvironment.currentNetwork()
-            // Rebuilt meanwhile (automatic sync turned off, Frequenza changed, signed out…): this
-            // callback belongs to a schedule that no longer exists, and the new one takes over.
-            // Going on would sync after the user turned automatic sync off, or show a pause that
-            // nothing would clear, since the rebuild that clears it has already happened.
-            guard scheduledConfiguration == schedule else {
+            // Rebuilt meanwhile (automatic sync turned off, Frequenza changed, signed out…), even
+            // if back to the same settings: this callback belongs to a schedule that no longer
+            // exists, and the new one takes over. Going on would sync after the user turned
+            // automatic sync off, or show a pause nothing would clear, since the rebuild that
+            // clears it has already happened.
+            guard schedulerGeneration == generation else {
                 BeepbarLog.sync.notice("Automatic synchronization skipped reason=schedule-changed")
                 return .finished
             }

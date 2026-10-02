@@ -145,7 +145,9 @@ struct HomePage: View {
                     if query.isEmpty { searchFocused = false } else { query = "" }
                 }
             if !query.isEmpty {
-                Button { query = "" } label: { Image(systemName: "xmark.circle.fill") }
+                // The click has already ended editing (`ConfigurationWindow`); clearing usually
+                // comes before typing a new search, so the cursor goes back in, as in Finder.
+                Button { query = ""; searchFocused = true } label: { Image(systemName: "xmark.circle.fill") }
                     .buttonStyle(.plain)
                     .foregroundStyle(.tertiary)
                     .accessibilityLabel(tr("Cancella ricerca", "Clear search"))

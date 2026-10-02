@@ -4,18 +4,21 @@ import Testing
 import BeepbarCore
 @testable import BeepbarApp
 
-/// The Corsi search field let go of the cursor only when another text field took it: it was
-/// focused as soon as the window opened, and no click on a row, a switch or the background, nor
-/// Esc, could take the focus away. These tests host the real shell in the real configuration
-/// window and send it the same mouse and keyboard events AppKit delivers, then look at what
-/// actually holds the focus. The window stays invisible and the app is never activated, so they
-/// run in CI and leave the desktop alone.
+/// The Corsi search field let go of the cursor only when another text field took it: no click on
+/// a row, a switch or the background, nor Esc, could take the focus away. These tests host the
+/// real shell in the real configuration window and send it the same mouse and keyboard events
+/// AppKit delivers, then look at what actually holds the focus. The window stays invisible and
+/// the app is never activated, so they run in CI and leave the desktop alone; it also means the
+/// window is never key, and SwiftUI-drawn buttons (`.plain`, the tab bar) don't react to clicks,
+/// so only AppKit-backed controls are clicked here.
 @MainActor @Suite(.serialized) struct SearchFieldFocusTests {
-    /// Opening the window used to put the cursor in "Cerca corsi" on every open, since AppKit
-    /// focuses the first text field it finds. Guards `initialFirstResponder`.
-    @Test func openingTheWindowFocusesNothing() throws {
+    /// Opening the window leaves the window itself first responder, not SwiftUI's key view proxy,
+    /// which hands focus to "Cerca corsi" once the window is key. Guards `initialFirstResponder`;
+    /// what a key window then does with the proxy can't be shown here (see the suite comment).
+    @Test func openingTheWindowLeavesTheFocusToTheWindow() throws {
         let page = try OpenPage()
         defer { page.close() }
+        #expect(page.window.firstResponder === page.window)
         #expect(!page.searchIsFocused)
         #expect(page.searchField.placeholderString == "Cerca corsi")
     }
@@ -27,8 +30,11 @@ import BeepbarCore
         defer { page.close() }
         page.clickSearchField()
         #expect(page.searchIsFocused, "precondition: a click on the field focuses it")
-        page.click(page.rowTextPoint)
-        #expect(!page.searchIsFocused)
+        let point = page.rowTextPoint
+        let hit = page.hitView(at: point)
+        #expect(hit?.enclosingScrollView != nil && !(hit is NSControl), "the point must be on a row in the list, not on a control: \(String(describing: hit))")
+        page.click(point)
+        #expect(page.eventually { !page.searchIsFocused })
         #expect(page.authentication.enabledCourseIDs == [1])
     }
 
@@ -41,30 +47,39 @@ import BeepbarCore
         page.clickSearchField()
         #expect(page.searchIsFocused, "precondition: a click on the field focuses it")
         page.click(try page.firstSwitchPoint())
-        #expect(!page.searchIsFocused)
-        #expect(page.authentication.enabledCourseIDs.isEmpty, "the click must still turn course 1 off")
+        #expect(page.eventually { !page.searchIsFocused })
+        #expect(page.eventually { page.authentication.enabledCourseIDs.isEmpty }, "the click must still turn course 1 off")
     }
 
     /// The empty part of the header and the page background hold nothing focusable either.
     @Test func clickingTheBackgroundLetsGoOfTheField() throws {
         let page = try OpenPage()
         defer { page.close() }
-        page.clickSearchField()
-        page.click(page.headerBlankPoint)
-        #expect(!page.searchIsFocused)
-        page.clickSearchField()
-        page.click(page.bottomPaddingPoint)
-        #expect(!page.searchIsFocused)
+        for point in [page.headerBlankPoint, page.bottomPaddingPoint] {
+            let hit = page.hitView(at: point)
+            #expect(hit != nil && hit?.enclosingScrollView == nil && !(hit is NSControl) && !(hit is NSText), "the point must be on the background: \(String(describing: hit))")
+            page.clickSearchField()
+            #expect(page.eventually { page.searchIsFocused }, "precondition: a click on the field focuses it")
+            page.click(point)
+            #expect(page.eventually { !page.searchIsFocused })
+        }
     }
 
-    /// Clicking inside the field while typing must keep the cursor there: the click lands on the
-    /// field editor, which is text, not on the background.
+    /// Clicking inside the field while typing must not end editing at all. Watching the focus
+    /// alone can't tell: a click that ended editing would be delivered to the field right after,
+    /// which starts editing again, losing the undo history on every click. So it counts the
+    /// field's end-of-editing notifications during the click.
     @Test func clickingInsideTheFieldKeepsTyping() throws {
         let page = try OpenPage()
         defer { page.close() }
         page.clickSearchField()
         page.press("a", keyCode: 0)
+        #expect(page.eventually { page.searchField.stringValue == "a" }, "precondition: typing reaches the field")
+        var editingEnded = 0
+        let observer = NotificationCenter.default.addObserver(forName: NSControl.textDidEndEditingNotification, object: page.searchField, queue: nil) { _ in editingEnded += 1 }
+        defer { NotificationCenter.default.removeObserver(observer) }
         page.clickSearchField()
+        #expect(editingEnded == 0)
         #expect(page.searchIsFocused)
         #expect(page.searchField.stringValue == "a")
     }
@@ -76,12 +91,12 @@ import BeepbarCore
         defer { page.close() }
         page.clickSearchField()
         page.press("c", keyCode: 8)
-        #expect(page.searchField.stringValue == "c", "precondition: typing reaches the field")
+        #expect(page.eventually { page.searchField.stringValue == "c" }, "precondition: typing reaches the field")
         page.press("\u{1b}", keyCode: 53)
-        #expect(page.searchField.stringValue.isEmpty)
+        #expect(page.eventually { page.searchField.stringValue.isEmpty })
         #expect(page.searchIsFocused)
         page.press("\u{1b}", keyCode: 53)
-        #expect(!page.searchIsFocused)
+        #expect(page.eventually { !page.searchIsFocused })
     }
 
     /// The decision on its own, including the cases the page doesn't reach: with no editing going
@@ -120,9 +135,12 @@ import BeepbarCore
         window = ConfigurationWindowController.makeWindow(authentication: authentication, router: ShellRouter())
         window.alphaValue = 0
         window.makeKeyAndOrderFront(nil)
-        let content = try #require(window.contentView)
         var found: NSTextField?
-        Self.settle { found = Self.find(in: content) { ($0 as? NSTextField)?.isEditable == true } as? NSTextField; return found != nil }
+        if let content = window.contentView {
+            Self.settle { found = Self.find(in: content) { ($0 as? NSTextField)?.isEditable == true } as? NSTextField; return found != nil }
+        }
+        // A failed setup still closes its window, so it can't linger over the other tests.
+        if found == nil { window.close() }
         searchField = try #require(found, "Corsi must show the search field with more than six courses")
         Self.settle(for: 0.2)
     }
@@ -136,6 +154,15 @@ import BeepbarCore
     var searchIsFocused: Bool {
         guard let editor = window.firstResponder as? NSTextView, editor.isFieldEditor else { return false }
         return editor.delegate as? NSTextField === searchField
+    }
+
+    /// The view a click at `point` lands on, as `ConfigurationWindow` sees it.
+    func hitView(at point: NSPoint) -> NSView? { window.contentView?.hitTest(point) }
+
+    /// Waits for SwiftUI to apply a change instead of trusting a fixed delay on a slow CI machine.
+    func eventually(_ condition: () -> Bool) -> Bool {
+        Self.settle(until: condition)
+        return condition()
     }
 
     private var contentBounds: NSRect { window.contentView?.bounds ?? .zero }

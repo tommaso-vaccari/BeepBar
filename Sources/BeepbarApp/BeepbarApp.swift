@@ -236,10 +236,12 @@ final class StatusItemController: NSObject, NSMenuDelegate {
         window.setContentSize(NSSize(width: 780, height: 680))
         window.minSize = NSSize(width: 680, height: 520)
         window.isReleasedWhenClosed = false
-        // With no initial first responder, AppKit gives the first text field in the window the
-        // focus when it is ordered in: on Corsi that was "Cerca corsi", with its cursor blinking
-        // on every open (the window is rebuilt each time). Starting from the hosting view leaves
-        // every field alone until the user clicks it; Tab still reaches them.
+        // With no initial first responder, AppKit picks the first key view when the window is
+        // ordered in, which in SwiftUI is its `KeyViewProxy`: once the window is key, that proxy
+        // is how SwiftUI hands focus to its first focusable view, on Corsi "Cerca corsi". The
+        // hosting view refuses first responder, so this leaves the window itself first
+        // responder, the same state a click outside a field leaves it in (`ConfigurationWindow`).
+        // Only checked in a window that isn't key, which tests can't make key.
         window.initialFirstResponder = controller.view
         return window
     }
@@ -279,6 +281,11 @@ final class StatusItemController: NSObject, NSMenuDelegate {
 /// that never reach SwiftUI gestures. It only touches the window's own responder chain, never
 /// controller state, so it adds no AppKit→`@MainActor` state access (see the hard rule on
 /// `StatusItemController`).
+///
+/// Any click outside text counts, including the one that brings the window back from another
+/// app and a drag of the window by its header: both are clicks somewhere else. A field that
+/// should keep the cursor after one of its own SwiftUI buttons (the search field's clear button)
+/// takes it back in that button's action.
 final class ConfigurationWindow: NSWindow {
     override func sendEvent(_ event: NSEvent) {
         // Before dispatching, so the click still reaches its target: the switch still toggles,

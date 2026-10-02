@@ -16,9 +16,6 @@ public enum SyncCoordinatorMode: Sendable {
 
     var metadataConcurrency: Int { self == .manual ? 3 : 2 }
     var downloadConcurrency: Int { self == .manual ? 3 : 2 }
-    // A scheduled run happens behind the user's back: it must not pull material over a metered
-    // hotspot, and it has to honour Low Data Mode.
-    var networkAccess: NetworkAccess { self == .manual ? .unrestricted : .background }
 }
 
 public actor SyncCoordinator {
@@ -44,16 +41,20 @@ public actor SyncCoordinator {
         self.platformName = platformName
     }
 
-    public func synchronize(targets: [SyncTarget], token: String, mode: SyncCoordinatorMode, progress: @escaping @Sendable (SyncProgress) async -> Void) async throws -> SyncProgress {
+    /// `networkAccess` limits the downloads only; reading course contents is small and always
+    /// allowed. It has no default on purpose: the caller decides for every run (manual runs and
+    /// automatic runs with "Risparmio dati" off use `.unrestricted`, automatic runs with it on use
+    /// `.dataSaver`), so a manual run can never inherit an automatic run's limits by accident.
+    public func synchronize(targets: [SyncTarget], token: String, mode: SyncCoordinatorMode, networkAccess: NetworkAccess, progress: @escaping @Sendable (SyncProgress) async -> Void) async throws -> SyncProgress {
         let trace = PerformanceTrace.shared.begin("sync.run", category: .sync)
         defer { PerformanceTrace.shared.end("sync.run", category: .sync, state: trace) }
         let runID = UUID()
         return try await gate.withLease(.syncing(runID)) {
-            try await self.synchronizeWithinLease(targets: targets, token: token, mode: mode, progress: progress)
+            try await self.synchronizeWithinLease(targets: targets, token: token, mode: mode, networkAccess: networkAccess, progress: progress)
         }
     }
 
-    private func synchronizeWithinLease(targets: [SyncTarget], token: String, mode: SyncCoordinatorMode, progress: @escaping @Sendable (SyncProgress) async -> Void) async throws -> SyncProgress {
+    private func synchronizeWithinLease(targets: [SyncTarget], token: String, mode: SyncCoordinatorMode, networkAccess: NetworkAccess, progress: @escaping @Sendable (SyncProgress) async -> Void) async throws -> SyncProgress {
         try Task.checkCancellation()
         guard try await database.hasPendingModuleMoves(rootID: rootID) == false else { throw SyncDatabaseError.execution }
         guard !targets.isEmpty else { return SyncProgress(completed: 0, total: 0, installed: 0, preservedLocal: 0, unchanged: 0, conflicts: 0, failures: 0) }
@@ -87,7 +88,7 @@ public actor SyncCoordinator {
                 .addingCourseFailures(prepared.failedCourses)
                 .addingMovedItems(moved, folders: courseFolders)
         }
-        let runner = ManualSyncRun(rootID: rootID, database: database, fileStore: fileStore, gate: gate, downloader: downloader, networkAccess: mode.networkAccess, maximumConcurrentDownloads: mode.downloadConcurrency)
+        let runner = ManualSyncRun(rootID: rootID, database: database, fileStore: fileStore, gate: gate, downloader: downloader, networkAccess: networkAccess, maximumConcurrentDownloads: mode.downloadConcurrency)
         do {
             let result = try await runner.startWithinLease(items: work, token: token, progress: progress)
             // Files first downloaded by this run get the placement they were downloaded with, so a

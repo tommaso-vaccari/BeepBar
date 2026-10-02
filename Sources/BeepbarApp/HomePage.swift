@@ -178,11 +178,17 @@ private struct SyncHeroCard: View {
     @State private var showAbandonConfirmation = false
 
     private var state: AppSyncState { authentication.syncState }
+    /// "Risparmio dati" holding automatic sync back, when it is what the card shows (see
+    /// `WeBeepAuthenticationController.visibleDataSaverPause`). It takes the headline, the badge
+    /// and the line under it, in place of the last sync's summary and its "Dettagli" (Attività
+    /// still has them). After a completed sync "· sincronizzato X fa" stays, since that is still true.
+    private var pause: DataSaverPause? { authentication.visibleDataSaverPause }
+    private var badgeSymbol: String? { pause == nil ? state.badgeSymbol : "pause.circle.fill" }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 12) {
             HStack(alignment: .center, spacing: 14) {
-                BeepbarLogo(size: 44, badge: state.badgeSymbol, badgeTint: state.tint, accessibilityLabel: "BeepBar, \(state.title)")
+                BeepbarLogo(size: 44, badge: badgeSymbol, badgeTint: pause == nil ? state.tint : .gray, accessibilityLabel: "BeepBar, \(pause?.title ?? state.title)")
                 VStack(alignment: .leading, spacing: 3) {
                     // The relative time ticks once a minute, and only while the window exists.
                     TimelineView(.everyMinute) { context in
@@ -213,7 +219,7 @@ private struct SyncHeroCard: View {
         .card(padding: 0)
         .animation(BeepbarStyle.snappy, value: authentication.isSyncActive)
         .animation(BeepbarStyle.snappy, value: authentication.conflicts.count)
-        .animation(BeepbarStyle.snappy, value: state.badgeSymbol)
+        .animation(BeepbarStyle.snappy, value: badgeSymbol)
         .confirmationDialog(tr("Abbandonare lo spostamento del modulo?", "Abandon the module move?"), isPresented: $showAbandonConfirmation, titleVisibility: .visible) {
             Button(tr("Abbandona spostamento", "Abandon move"), role: .destructive) { authentication.abandonPendingModuleMoves() }
             Button(tr("Annulla", "Cancel"), role: .cancel) {}
@@ -223,6 +229,8 @@ private struct SyncHeroCard: View {
     }
 
     private var headline: String {
+        // Not "Tutto aggiornato" while paused: new material may be waiting on Moodle.
+        if let pause { return pause.title }
         if case .synced = state { return tr("Tutto aggiornato", "All up to date") }
         return state.title
     }
@@ -243,7 +251,13 @@ private struct SyncHeroCard: View {
 
     // "12 nuovi · 4 aggiornati · 1 tua modifica protetta   Dettagli ›" — or the state's own explanation.
     @ViewBuilder private var secondaryLine: some View {
-        if !authentication.isSyncActive, let summary = authentication.lastSyncSummary {
+        if let pause {
+            Text(pause.detail)
+                .font(.callout)
+                .foregroundStyle(.secondary)
+                .lineLimit(3)
+                .fixedSize(horizontal: false, vertical: true)
+        } else if !authentication.isSyncActive, let summary = authentication.lastSyncSummary {
             HStack(spacing: 10) {
                 summaryText(summary)
                     .lineLimit(1)

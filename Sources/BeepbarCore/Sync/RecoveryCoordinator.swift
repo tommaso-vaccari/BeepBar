@@ -119,6 +119,17 @@ public actor RecoveryCoordinator {
                 try await database.finishOperation(id: operation.id)
                 return .recovered
             }
+            // The download is gone (installed, then edited or deleted by the user before BeepBar
+            // started again) and was never kept aside as a conflict: the row has nothing left to
+            // finish. Leaving it unresolved blocked every sync behind "Intervento richiesto" until
+            // another folder was chosen. Dropping it leaves the decision to the next sync, which
+            // compares the file as it is now with Moodle and the last synced version, and never
+            // overwrites a local change. A conflict copy with other bytes is not something this
+            // sequence writes, so that stays unresolved.
+            if try await fileStore.conflictArtifact(at: incomingPath) == nil {
+                try await database.finishOperation(id: operation.id)
+                return .recovered
+            }
             return .unresolved
         }
 

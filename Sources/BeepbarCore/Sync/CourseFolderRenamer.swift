@@ -15,15 +15,22 @@ public actor CourseFolderRenamer {
     private let database: SyncDatabase
     private let fileStore: FileStore
     private let gate: RootOperationGate
+    /// Called after each durable step (`.journaled`, `.filesystemChanged`) so tests can stop the
+    /// rename where a crash would; see `SyncTransactionCoordinator`. Always `nil` in the app.
+    private let interruption: (@Sendable (JournalStep) throws -> Void)?
 
     public init(database: SyncDatabase, fileStore: FileStore, gate: RootOperationGate) {
-        self.database = database; self.fileStore = fileStore; self.gate = gate
+        self.init(database: database, fileStore: fileStore, gate: gate, interruption: nil)
+    }
+
+    init(database: SyncDatabase, fileStore: FileStore, gate: RootOperationGate, interruption: (@Sendable (JournalStep) throws -> Void)?) {
+        self.database = database; self.fileStore = fileStore; self.gate = gate; self.interruption = interruption
     }
 
     public func rename(rootID: UUID, courseID: Int64, from oldFolder: String, to newFolder: String) async throws {
         guard oldFolder != newFolder, oldFolder.localizedCaseInsensitiveCompare(newFolder) != .orderedSame,
               !ReservedNamespace.isReservedTopLevelName(newFolder) else { throw FileStoreError.invalidStage }
-        try await gate.withLease(.renaming(courseID)) { [database, fileStore] in
+        try await gate.withLease(.renaming(courseID)) { [database, fileStore, interruption] in
             guard try await database.hasPendingModuleMoves(rootID: rootID) == false else { throw SyncDatabaseError.execution }
             guard !(try await database.hasOpenConflicts(rootID: rootID, prefix: oldFolder)),
                   !(try await database.hasPendingOperations(rootID: rootID, prefix: oldFolder)),
@@ -38,6 +45,8 @@ public actor CourseFolderRenamer {
             guard try await fileStore.topLevelDirectoryState(newFolder) == .missing else { throw CourseRenameError.folderAlreadyExists }
             let move = PendingScopeMove(id: UUID(), rootID: rootID, courseID: courseID, oldFolder: oldFolder, newFolder: newFolder)
             try await database.beginScopeMove(move)
+            // Outside the `do` below: a crash here leaves the row behind, unlike a failed rename.
+            try interruption?(.journaled)
             do {
                 try await fileStore.renameTopLevelDirectory(from: oldFolder, to: newFolder)
             } catch {
@@ -47,6 +56,7 @@ public actor CourseFolderRenamer {
                 try? await database.abortScopeMove(id: move.id)
                 throw error
             }
+            try interruption?(.filesystemChanged)
             try await database.commitScopeMove(move)
         }
     }

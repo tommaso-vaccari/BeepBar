@@ -33,18 +33,23 @@ struct BenchmarkKitTests {
     }
 
     /// The sampler catches a peak that is gone by the time it stops: a before/after reading would
-    /// report zero growth for a download that briefly held the whole file in memory.
+    /// report zero growth for a download that briefly held the whole file in memory. The buffer is
+    /// mapped and unmapped directly so its pages leave the footprint at once; with `malloc` the
+    /// allocator may keep them, and the final reading in `stop()` alone would pass the test.
     @Test func peakSamplerCatchesATransientAllocation() throws {
+        let size = 64 << 20
         let before = PeakFootprintSampler.footprint()
         let sampler = PeakFootprintSampler()
-        do {
-            let size = 64 << 20
-            let buffer = UnsafeMutableRawPointer.allocate(byteCount: size, alignment: 16)
-            buffer.initializeMemory(as: UInt8.self, repeating: 1, count: size)
-            Thread.sleep(forTimeInterval: 0.05)
-            buffer.deallocate()
-        }
-        Thread.sleep(forTimeInterval: 0.02)
+        let buffer = try #require(mmap(nil, size, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON, -1, 0))
+        try #require(buffer != MAP_FAILED)
+        buffer.initializeMemory(as: UInt8.self, repeating: 1, count: size)
+        Thread.sleep(forTimeInterval: 0.05)
+        let mapped = PeakFootprintSampler.footprint()
+        munmap(buffer, size)
+        // Precondition: the allocation is really gone, so only a sample taken while it was mapped
+        // can report it. Compared with the reading just before, not with `before`, because tests
+        // running in parallel share the process footprint.
+        try #require(PeakFootprintSampler.footprint() + (32 << 20) < mapped, "footprint still includes the buffer")
         let peak = sampler.stop()
         #expect(peak >= before + (48 << 20), "peak \(peak) vs before \(before)")
     }

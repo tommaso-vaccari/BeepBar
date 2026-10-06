@@ -12,6 +12,8 @@
 
 - Automatic sync no longer fails with "Connessione assente" while your Mac is on a phone hotspot or a network with Low Data Mode. After updating, it downloads on these networks too, just like "Sincronizza ora"; turn on "Risparmio dati" if you'd rather it waited for another network.
 
+- Downloading a new version of a large file (a lecture recording, an archive) no longer makes BeepBar use far more memory than the file itself: a 256 MB file could take about 1 GB for a moment. Memory now stays low whatever the size of the file.
+
 - The "Cerca corsi" field in Corsi no longer stays selected. Clicking anywhere else deselects it; Esc clears what you typed, and Esc again deselects it.
 
 - If BeepBar was interrupted (a crash, a forced quit, a power cut) just as it found that you had edited a file Moodle had also updated, it could replace your edited copy with Moodle's at the next launch. Your copy is now always kept, and both versions appear in Conflicts.

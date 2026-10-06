@@ -9,6 +9,15 @@ private struct FileIdentity: Sendable, Equatable {
     let inode: UInt64
 }
 
+/// A file's state as `fstat` reports it, in nanoseconds: see `FileStore.contentStamp(of:)`.
+private struct ContentStamp: Hashable {
+    let device: Int64
+    let inode: UInt64
+    let size: Int64
+    let modified: Int64
+    let changed: Int64
+}
+
 public struct StageHandle: Sendable, Equatable {
     fileprivate let name: String
     fileprivate let identity: FileIdentity
@@ -70,6 +79,15 @@ public actor FileStore {
     /// Paths resolved from the root, one directory `openat` per component, before any per-file
     /// call (`inspect`, `containsRegularFile`, occupancy checks, moves) touches the file itself.
     private var pathLookups = 0
+    /// Hashes `inspect` computed during this store's life, keyed by the exact state of the file
+    /// they were read from. Only `install`'s check before replacing a file consults them, through
+    /// `currentSHA256(of:)`; see there for why that one check, and no other, may.
+    private var inspectedHashes: [ContentStamp: String] = [:]
+    /// Insertion order of `inspectedHashes`, to forget the oldest past `inspectedHashLimit`.
+    private var inspectedOrder: [ContentStamp] = []
+    /// A run inspects a file shortly before installing over it, so a few recent entries suffice;
+    /// the bound keeps a first sync of thousands of files from holding them all.
+    private static let inspectedHashLimit = 64
 
     /// The filesystem work this store has done since it was created, for the benchmark harness and
     /// for tests that prove a run left unchanged files alone. Instance-scoped, so parallel tests
@@ -109,7 +127,7 @@ public actor FileStore {
         if fd < 0 { if errno == ENOENT { return .missing }; throw fileStoreError() }
         defer { close(fd) }
         try requireRegularFile(fd)
-        return .present(sha256: try sha256(of: fd))
+        return .present(sha256: try rememberingSHA256(of: fd))
     }
 
     public func containsRegularFile(_ path: RelativePath) throws -> Bool {
@@ -533,7 +551,7 @@ public actor FileStore {
             if existing < 0 { if errno == ENOENT { return .localChanged }; throw fileStoreError() }
             defer { close(existing) }
             try requireRegularFile(existing)
-            guard try sha256(of: existing) == expectedHash else { return .localChanged }
+            guard try currentSHA256(of: existing) == expectedHash else { return .localChanged }
             guard renameatx_np(staging, artifact.name, destinationParent, destinationName, UInt32(RENAME_SWAP)) == 0 else {
                 if errno == ENOENT { return .localChanged }
                 throw fileStoreError()
@@ -792,6 +810,51 @@ public actor FileStore {
 
     private func sha256(of fd: Int32) throws -> String {
         try hashContents(of: fd).sha256
+    }
+
+    /// Hashes the file like `sha256(of:)` and remembers the result for `currentSHA256(of:)`, but
+    /// only when the file's state was the same before and after the read: a write landing during
+    /// the hash changes the ctime, and a hash of half-old, half-new bytes must never be reused.
+    private func rememberingSHA256(of fd: Int32) throws -> String {
+        let before = try Self.contentStamp(of: fd)
+        let hash = try sha256(of: fd)
+        if try Self.contentStamp(of: fd) == before, inspectedHashes.updateValue(hash, forKey: before) == nil {
+            inspectedOrder.append(before)
+            if inspectedOrder.count > Self.inspectedHashLimit { inspectedHashes[inspectedOrder.removeFirst()] = nil }
+        }
+        return hash
+    }
+
+    /// The file's current SHA-256, reusing the one `inspect` computed when the file is provably in
+    /// the same state, and reading it in full otherwise, exactly as before. Used only by
+    /// `install`'s check before it swaps a downloaded update in: an update used to read the user's
+    /// old copy in `inspect` and again here, a whole extra read of a possibly large file.
+    ///
+    /// Why reuse is safe here and only here: this check is not the last line of defence. After the
+    /// atomic swap, `install` hashes the displaced copy in full and swaps back if it isn't the
+    /// expected one. So even a change the stamp could miss (bytes written through `mmap`, which
+    /// macOS doesn't timestamp at once) still ends as `.localChanged` with the user's file in
+    /// place. The displaced-copy hash, `discard`, rollbacks and conflict paths have nothing behind
+    /// them and must keep reading in full; never route them through here.
+    ///
+    /// Any difference in the stamp falls back to a full hash rather than to `.localChanged`, so the
+    /// outcome never changes: a file edited and then restored to identical bytes still installs.
+    private func currentSHA256(of fd: Int32) throws -> String {
+        if let known = inspectedHashes[try Self.contentStamp(of: fd)] { return known }
+        return try sha256(of: fd)
+    }
+
+    /// What `fstat` says about a file's identity and content state. Any write changes the ctime,
+    /// which only the kernel sets (`utimes` can restore the mtime, not the ctime); a save that
+    /// replaces the file changes the inode.
+    private static func contentStamp(of fd: Int32) throws -> ContentStamp {
+        var metadata = stat()
+        guard fstat(fd, &metadata) == 0 else { throw FileStoreError.ioFailure }
+        return ContentStamp(
+            device: Int64(metadata.st_dev), inode: UInt64(metadata.st_ino), size: Int64(metadata.st_size),
+            modified: Int64(metadata.st_mtimespec.tv_sec) * 1_000_000_000 + Int64(metadata.st_mtimespec.tv_nsec),
+            changed: Int64(metadata.st_ctimespec.tv_sec) * 1_000_000_000 + Int64(metadata.st_ctimespec.tv_nsec)
+        )
     }
 
     private func hashContents(of fd: Int32, copyingTo destinationFD: Int32? = nil, maximumSize: Int64? = nil, checksCancellation: Bool = false) throws -> (sha256: String, size: Int64) {

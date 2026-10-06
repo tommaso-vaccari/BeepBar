@@ -95,7 +95,7 @@ public enum RecmanURLPolicy {
     }
 }
 
-/// Turns the rows the page script extracted (`RecmanScripts.rows` in the app) into recordings.
+/// Turns the rows the page script extracted (`RecmanScripts.resultsPage` in the app) into recordings.
 ///
 /// The table has no column ids, so cells are read by position, as Recman lays them out:
 /// 0 play link · 1 academic year ("2026 / 27") · 2 date ("30/09/2026 12:29", Rome time) ·
@@ -103,19 +103,24 @@ public enum RecmanURLPolicy {
 /// A row that doesn't fit makes the whole page fail instead of being skipped: if Recman changes
 /// its layout, BeepBar must say it can't read the archive, never show a silently shorter list.
 public enum RecmanRecordingParser {
-    private struct Row: Decodable { let cells: [String]; let previewURL: String }
+    struct Row: Decodable { let cells: [String]; let previewURL: String }
     public enum ParseError: Error, Equatable { case incompatibleRows }
 
     /// Every row of one page, newest first, without duplicates; only those of `key` when given.
     public static func decode(_ data: Data, matching key: RecmanCourseKey? = nil) throws -> [RecmanRecording] {
-        let rows = try JSONDecoder().decode([Row].self, from: data)
-        let formatter = makeDateFormatter()
-        let decoded = rows.compactMap { recording(cells: $0.cells, previewURL: $0.previewURL, formatter: formatter) }
-        guard decoded.count == rows.count else { throw ParseError.incompatibleRows }
+        let decoded = try recordings(JSONDecoder().decode([Row].self, from: data))
         var seen = Set<String>()
         return decoded.filter {
             (key == nil || ($0.courseCode == key!.courseCode && $0.academicYear == key!.academicYear)) && seen.insert($0.id).inserted
         }.sorted { $0.recordedAt > $1.recordedAt }
+    }
+
+    /// Every row in page order, or `incompatibleRows` if any of them doesn't fit.
+    static func recordings(_ rows: [Row]) throws -> [RecmanRecording] {
+        let formatter = makeDateFormatter()
+        let decoded = rows.compactMap { recording(cells: $0.cells, previewURL: $0.previewURL, formatter: formatter) }
+        guard decoded.count == rows.count else { throw ParseError.incompatibleRows }
+        return decoded
     }
 
     /// One row, or nil if any cell the list relies on doesn't have the expected shape.

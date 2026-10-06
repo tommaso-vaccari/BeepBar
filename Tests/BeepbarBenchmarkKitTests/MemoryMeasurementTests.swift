@@ -1,4 +1,5 @@
 import BeepbarBenchmarkKit
+@testable import BeepbarCore
 import Foundation
 import os
 import Testing
@@ -54,6 +55,80 @@ struct MemoryMeasurementTests {
         // A chunk can be in flight on top of the window when the client samples.
         #expect(download.maximumLead <= BenchmarkUpstream.downloadWindow + 2 * (256 << 10), "mock ran \(download.maximumLead >> 10) KiB ahead")
         #expect(Int64(peak) - Int64(before) < 80 << 20, "peak grew by \((Int64(peak) - Int64(before)) >> 20) MiB for a \(size >> 20) MiB stream")
+    }
+
+    // The three tests below guard the "peak memory independent of file size" budget (AGENTS.md)
+    // against FileStore keeping every chunk it reads alive until the call returns, which made a
+    // 256 MiB update peak at about 1 GiB. Each uses a file large enough that holding it would blow
+    // far past the margin, which itself leaves room for the suites sharing this process.
+
+    /// Hashing a large file holds one chunk at a time. Guards the chunk loop in
+    /// `FileStore.hashContents`: without a pool per chunk, the 192 MiB read stays in memory.
+    @Test func hashingALargeFileKeepsMemoryFlat() async throws {
+        let root = try Self.temporaryRoot()
+        defer { try? FileManager.default.removeItem(at: root) }
+        try Self.makeSparseFile(at: root.appending(path: "Analisi/registrazione.mp4"), size: Self.largeFileSize)
+        let store = try FileStore(root: root) { _ in }
+        let before = PeakFootprintSampler.footprint()
+        let sampler = PeakFootprintSampler()
+
+        _ = try await store.inspect(try RelativePath("Analisi/registrazione.mp4"))
+
+        let peak = sampler.stop()
+        #expect(await store.counters().bytesHashed == Self.largeFileSize)
+        #expect(Int64(peak) - Int64(before) < Self.margin, "peak grew by \((Int64(peak) - Int64(before)) >> 20) MiB hashing a \(Self.largeFileSize >> 20) MiB file")
+    }
+
+    /// Restoring a large conflict copy holds one chunk at a time. Guards the copy loop in
+    /// `FileStore.copyConflictArtifactToStage`, which reads the file outside `hashContents`.
+    @Test func copyingALargeConflictArtifactKeepsMemoryFlat() async throws {
+        let root = try Self.temporaryRoot()
+        defer { try? FileManager.default.removeItem(at: root) }
+        try Self.makeSparseFile(at: root.appending(path: ".beepbar/conflicts/c1/registrazione.mp4"), size: Self.largeFileSize)
+        let store = try FileStore(root: root) { _ in }
+        let path = try RelativePath(internal: ".beepbar/conflicts/c1/registrazione.mp4")
+        let artifact = try #require(try await store.conflictArtifact(at: path))
+        let before = PeakFootprintSampler.footprint()
+        let sampler = PeakFootprintSampler()
+
+        let staged = try await store.copyConflictArtifactToStage(at: path, expectedSHA256: artifact.sha256)
+
+        let peak = sampler.stop()
+        #expect(staged.size == Self.largeFileSize)
+        try await store.discard(staged)
+        #expect(Int64(peak) - Int64(before) < Self.margin, "peak grew by \((Int64(peak) - Int64(before)) >> 20) MiB copying a \(Self.largeFileSize >> 20) MiB file")
+    }
+
+    /// A whole automatic run that downloads and installs a new version of a large file stays
+    /// flat end to end: download, staging, the five reads of the file and the install. Guards
+    /// against a path outside FileStore's chunk loop holding the file again.
+    @Test func updatingALargeFileKeepsMemoryFlat() async throws {
+        let before = PeakFootprintSampler.footprint()
+
+        let result = try await Scenarios.largeUpdate(size: Self.largeFileSize, runs: 1, warmup: 0)
+
+        #expect(result.checks.values.allSatisfy { $0 }, "\(result.checks)")
+        let peak = try #require(result.samples.first?.peakFootprint)
+        #expect(Int64(peak) - Int64(before) < Self.margin, "peak grew by \((Int64(peak) - Int64(before)) >> 20) MiB updating a \(Self.largeFileSize >> 20) MiB file")
+    }
+
+    private static let largeFileSize: Int64 = 192 << 20
+    private static let margin: Int64 = 64 << 20
+
+    private static func temporaryRoot() throws -> URL {
+        let root = FileManager.default.temporaryDirectory.appending(path: UUID().uuidString, directoryHint: .isDirectory)
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        return root
+    }
+
+    /// A sparse file reads back as zeros without the test itself ever holding its bytes, so the
+    /// footprint before the measurement doesn't depend on how the allocator recycles a buffer.
+    private static func makeSparseFile(at url: URL, size: Int64) throws {
+        try FileManager.default.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
+        #expect(FileManager.default.createFile(atPath: url.path, contents: nil))
+        let handle = try FileHandle(forWritingTo: url)
+        defer { try? handle.close() }
+        try handle.truncate(atOffset: UInt64(size))
     }
 }
 

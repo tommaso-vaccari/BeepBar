@@ -237,15 +237,24 @@ package enum Scenarios {
             }
             if index >= warmup { samples.append(sample) }
         }
-        let checks = [
-            "every run cancelled": samples.allSatisfy { $0.outcome == "cancelled" },
-            "local file preserved": samples.allSatisfy { $0.localFilePreserved == true },
-        ].merging(fraction < 1 ? ["cancelled before the download finished": samples.allSatisfy { $0.upstream.downloadBytes < size }] : [:]) { $1 }
+        let checks = cancelChecks(samples, size: size, fraction: fraction)
         return ScenarioResult(
             name: "cancel", parameters: ["size": "\(size)", "fraction": "\(fraction)", "bytesPerSecond": "\(bytesPerSecond)"],
             warmupRuns: warmup, samples: samples, checks: checks,
             notes: ["cancelled once \(threshold) of \(size) bytes had been sent by the mock"]
         )
+    }
+
+    /// What makes a cancel run valid: every run ended cancelled, the installed file kept its exact
+    /// bytes, and, when the cancel was meant to land midway (`fraction < 1`), the mock had not sent
+    /// the whole file yet; otherwise the latency would measure a cancel after the download.
+    package static func cancelChecks(_ samples: [RunSample], size: Int64, fraction: Double) -> [String: Bool] {
+        var checks = [
+            "every run cancelled": samples.allSatisfy { $0.outcome == "cancelled" },
+            "local file preserved": samples.allSatisfy { $0.localFilePreserved == true },
+        ]
+        if fraction < 1 { checks["cancelled before the download finished"] = samples.allSatisfy { $0.upstream.downloadBytes < size } }
+        return checks
     }
 
     // MARK: Measurement

@@ -102,6 +102,25 @@ struct BenchmarkKitTests {
         #expect(["AC Power", "Battery Power", "UPS Power", "unknown"].contains(environment.powerSource))
     }
 
+    /// A cancel that arrived after the whole file was sent, a run that wasn't cancelled, or a
+    /// local file that changed each invalidate a cancel run; at `--fraction 1` the whole file is
+    /// expected. Guards the checks the `cancel` scenario's numbers depend on, including failures a
+    /// real run can't be made to produce on demand.
+    @Test func cancelChecksRejectLateCancelsAndChangedFiles() {
+        func sample(sent: Int64, outcome: String = "cancelled", preserved: Bool = true) -> RunSample {
+            var upstream = UpstreamCounters()
+            upstream.downloadBytes = sent
+            return RunSample(wallMilliseconds: 1, resources: ResourceUsage(), peakFootprintGrowth: 0, database: .init(), fileStore: .init(), upstream: upstream, installed: 0, conflicts: 0, failures: 0, outcome: outcome, localFilePreserved: preserved)
+        }
+        let good = Scenarios.cancelChecks([sample(sent: 50), sample(sent: 60)], size: 100, fraction: 0.5)
+        #expect(good.count == 3 && good.values.allSatisfy { $0 })
+        #expect(Scenarios.cancelChecks([sample(sent: 50), sample(sent: 100)], size: 100, fraction: 0.5)["cancelled before the download finished"] == false)
+        #expect(Scenarios.cancelChecks([sample(sent: 50, outcome: "completed")], size: 100, fraction: 0.5)["every run cancelled"] == false)
+        #expect(Scenarios.cancelChecks([sample(sent: 50, preserved: false)], size: 100, fraction: 0.5)["local file preserved"] == false)
+        let whole = Scenarios.cancelChecks([sample(sent: 100)], size: 100, fraction: 1)
+        #expect(whole["cancelled before the download finished"] == nil && whole.values.allSatisfy { $0 })
+    }
+
     // MARK: Scenario smoke runs
 
     /// A tiny "nothing new" run passes its checks and reports no downloads or hashing: the

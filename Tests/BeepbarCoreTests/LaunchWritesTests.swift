@@ -35,10 +35,14 @@ struct LaunchWritesTests {
         }
     }
 
-    /// The launch sequence (open, `registerRoot`, recovery) on a database from an earlier launch
-    /// writes no page. Opening still commits its migration transaction, which is empty and costs
-    /// neither a frame nor an `fsync`. Guards against any step of a launch with nothing to record
-    /// writing to disk, the `registerRoot` rewrite first of all.
+    /// The launch sequence (open, `registerRoot`, recovery) on a database from an earlier launch,
+    /// holding scopes and tracked files, writes no database page and changes no row. Exactly two
+    /// empty commits remain, neither costing a frame nor an `fsync`: the opening migration's
+    /// transaction and the `registerRoot` statement whose update the `WHERE` skipped. Guards
+    /// against any database step of a launch with nothing to record writing, the `registerRoot`
+    /// rewrite first of all, including a migration step that touches existing tracked files. The
+    /// commit count is pinned so that a new write on launch shows up even before it dirties a page.
+    /// Filesystem work at launch (the staging sweep) is not measured here.
     @Test func relaunchingWithAKnownFolderWritesNoPage() async throws {
         let fixture = try Fixture()
         defer { fixture.remove() }
@@ -47,6 +51,18 @@ struct LaunchWritesTests {
             try await firstLaunch.registerRoot(id: fixture.rootID, canonicalPath: fixture.root.path)
             for course in 1...3 {
                 try await firstLaunch.upsertScope(SyncScope(rootID: fixture.rootID, courseID: Int64(course), displayName: "Corso \(course)", localFolder: "Corso \(course)", enabled: true))
+                // Tracked files with and without an owning module, as older versions left them.
+                for file in 0..<20 {
+                    let owned = file.isMultiple(of: 2)
+                    try await firstLaunch.upsertBaseline(rootID: fixture.rootID, baseline: Baseline(
+                        remoteID: "\(course):\(course * 100):/:\(file).pdf",
+                        relativePath: try RelativePath("Corso \(course)/\(file).pdf"),
+                        sha256: String(repeating: "a", count: 64),
+                        remoteRevision: "1",
+                        courseID: owned ? Int64(course) : nil,
+                        moduleID: owned ? Int64(course * 100) : nil
+                    ))
+                }
             }
         }
 
@@ -58,11 +74,13 @@ struct LaunchWritesTests {
         let written = await database.writeCounters()
         #expect(written.pagesWritten == 0)
         #expect(written.rowChanges == 0)
+        #expect(written.commits == 2)
     }
 
     /// Registering the same folder again, with or without a stored bookmark, changes no row and
-    /// writes no page. The bookmark case guards the comparison on a non-NULL blob; the NULL case,
-    /// which is what the app passes today, guards against `!=`, under which NULL never equals NULL.
+    /// writes no page. The bookmark case guards the comparison on a non-NULL blob; the NULL case
+    /// is what the app passes today, and guards against a condition that always updates when a
+    /// bookmark is NULL. (`!=` passes both: `aChangedBookmarkIsStored` is what catches it.)
     @Test(arguments: [nil, Data([0xB0, 0x0C])])
     func registeringTheSameFolderAgainWritesNothing(bookmark: Data?) async throws {
         let fixture = try Fixture()

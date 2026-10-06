@@ -1,5 +1,6 @@
 import Darwin
 import Foundation
+import os
 import Testing
 @testable import BeepbarCore
 
@@ -17,12 +18,12 @@ struct InstallHashReuseTests {
         let path: RelativePath
         var file: URL { root.appending(path: path.value) }
 
-        init() throws {
+        init(beforeSwap: (@Sendable (RelativePath) throws -> Void)? = nil) throws {
             root = FileManager.default.temporaryDirectory.appending(path: UUID().uuidString, directoryHint: .isDirectory)
             try FileManager.default.createDirectory(at: root.appending(path: "Analisi"), withIntermediateDirectories: true)
             path = try RelativePath("Analisi/lezione.pdf")
             try Data("versione dell'utente".utf8).write(to: root.appending(path: path.value))
-            store = try FileStore(root: root) { _ in }
+            store = try FileStore(root: root, beforeMove: nil, trash: { _ in }, beforeSwap: beforeSwap)
         }
 
         /// Stages Moodle's new version the way a download does.
@@ -125,13 +126,15 @@ struct InstallHashReuseTests {
         #expect(await recovery.counters().filesHashed - before == 2)
     }
 
-    /// Only the most recent inspections are kept: one pushed out by 64 later ones is read in full.
-    /// Guards the bound that stops a first sync of thousands of files from remembering them all.
-    @Test func oldInspectionsAreForgotten() async throws {
+    /// Exactly the 64 most recent inspections are kept: one followed by 63 others is still reused,
+    /// one pushed out by 64 is read in full. Guards the bound that stops a large batch of updates
+    /// from remembering them all, and pins it so an off-by-one can't silently shrink it.
+    @Test(arguments: [(63, 1), (64, 2)])
+    func onlyTheLatestInspectionsAreKept(laterInspections: Int, expectedReads: Int) async throws {
         let fixture = try Fixture()
         defer { fixture.remove() }
         let local = try await fixture.store.inspect(fixture.path)
-        for index in 0..<64 {
+        for index in 0..<laterInspections {
             let other = try RelativePath("Analisi/altro-\(index).pdf")
             try Data("altro \(index)".utf8).write(to: fixture.root.appending(path: other.value))
             _ = try await fixture.store.inspect(other)
@@ -141,6 +144,32 @@ struct InstallHashReuseTests {
         let install = try await fixture.hashes { try await fixture.store.install(update, at: fixture.path, expectedLocal: local) }
 
         guard case .installedReplacing = install.result else { Issue.record("expected an install, got \(install.result)"); return }
-        #expect(install.filesHashed == 2)
+        #expect(install.filesHashed == expectedReads)
+    }
+
+    /// An edit landing after the pre-swap check, which reused `inspect`'s hash, and before the
+    /// swap is caught by the full hash of the displaced copy: the update is swapped back out, the
+    /// user's edit stays in place, and the downloaded copy is still staged, intact, for the
+    /// conflict. This post-swap check is what makes the reuse safe whenever the stamp can't see a
+    /// change (coarse timestamps, `mmap` writes): weakening it would replace a user's edit with
+    /// Moodle's version, so this test fails if it stops comparing.
+    @Test func editBetweenCheckAndSwapIsSwappedBack() async throws {
+        let edited = Data("modifica arrivata all'ultimo".utf8)
+        let target = OSAllocatedUnfairLock<URL?>(initialState: nil)
+        let fixture = try Fixture { _ in
+            guard let url = target.withLock({ $0 }) else { return }
+            try edited.write(to: url)
+        }
+        defer { fixture.remove() }
+        let local = try await fixture.store.inspect(fixture.path)
+        let update = try await fixture.stagedUpdate()
+        target.withLock { $0 = fixture.file }
+
+        let install = try await fixture.hashes { try await fixture.store.install(update, at: fixture.path, expectedLocal: local) }
+
+        #expect(install.result == .localChanged)
+        #expect(install.filesHashed >= 1)
+        #expect(try Data(contentsOf: fixture.file) == edited)
+        #expect(try await fixture.store.stagedArtifact(at: update.stagePath) == update)
     }
 }

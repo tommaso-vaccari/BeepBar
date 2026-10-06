@@ -61,7 +61,7 @@ Every report records the commit, the machine model, the CPU, the memory, the mac
 
 **`large-update`: one large file changes on every run.**
 - *Budget:* peak memory independent of file size, throughput bound by the network.
-- *What it reports:* the peak footprint growth during the run, and `fs.bytesHashed` against the file size, i.e. how many times the file was read.
+- *What it reports:* the peak footprint during the run (`memory.peak`), and `fs.bytesHashed` against the file size, i.e. how many times the file was read.
 - *Baseline sizes:* 64 MiB and 256 MiB, so the two peaks can be compared.
 - *Note:* the mock is unthrottled, so throughput here measures the local pipeline, not a network.
 
@@ -80,7 +80,7 @@ Every counter is the change during one run.
 |---|---|---|
 | `wall`, `cpu`, `instructions` | `ContinuousClock`, `proc_pid_rusage` | Whole benchmark process: the sync plus the mock (whose answers are pre-rendered to keep its share small) |
 | `disk.written`, `disk.logicalWritten` | `proc_pid_rusage` | Bytes written to storage, and including those still in the page cache |
-| `memory.peakGrowth` | `PeakFootprintSampler` (1 ms) | Highest `phys_footprint` during the run minus the value just before |
+| `memory.peak`, `memory.peakGrowth` | `PeakFootprintSampler` (1 ms) | Highest `phys_footprint` of the process during the run, and that minus the value just before. Compare `memory.peak` across file sizes: the allocator keeps memory a previous run freed, so the growth alone is noisy |
 | `db.commits` | SQLite commit hook | Write transactions committed. Each is a WAL append and an `fsync`. An empty transaction, or a write matching no row, still counts |
 | `db.rowChanges` | `sqlite3_total_changes64` | Rows inserted, updated or deleted, identical rewrites included |
 | `db.pagesWritten` | `SQLITE_DBSTATUS_CACHE_WRITE` | WAL frames. An `UPDATE` that leaves a page byte-identical writes none |

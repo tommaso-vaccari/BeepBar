@@ -8,8 +8,12 @@ package struct RunSample: Sendable, Codable {
     /// CPU, disk and wakeups of the whole benchmark process: the sync plus the mock server, whose
     /// own share is kept small by pre-rendered answers (see `BenchmarkUpstream`).
     package var resources: ResourceUsage
-    /// Highest footprint during the run minus the footprint just before it.
+    /// Highest footprint during the run minus the footprint just before it. Noisy on its own: the
+    /// allocator keeps memory a previous run freed, so a run can peak without growing.
     package var peakFootprintGrowth: Int64
+    /// Highest footprint of the whole process during the run: the number to compare across file
+    /// sizes when checking that memory doesn't grow with the file.
+    package var peakFootprint: UInt64
     package var database: SyncDatabaseWriteCounters
     package var fileStore: FileStoreCounters
     package var upstream: UpstreamCounters
@@ -24,10 +28,11 @@ package struct RunSample: Sendable, Codable {
     /// Cancel scenario only: the local file still holds the last installed revision's bytes.
     package var localFilePreserved: Bool?
 
-    package init(wallMilliseconds: Double, resources: ResourceUsage, peakFootprintGrowth: Int64, database: SyncDatabaseWriteCounters, fileStore: FileStoreCounters, upstream: UpstreamCounters, installed: Int, conflicts: Int, failures: Int, outcome: String? = nil, cancelLatencyMilliseconds: Double? = nil, localFilePreserved: Bool? = nil) {
+    package init(wallMilliseconds: Double, resources: ResourceUsage, peakFootprintGrowth: Int64, peakFootprint: UInt64 = 0, database: SyncDatabaseWriteCounters, fileStore: FileStoreCounters, upstream: UpstreamCounters, installed: Int, conflicts: Int, failures: Int, outcome: String? = nil, cancelLatencyMilliseconds: Double? = nil, localFilePreserved: Bool? = nil) {
         self.wallMilliseconds = wallMilliseconds
         self.resources = resources
         self.peakFootprintGrowth = peakFootprintGrowth
+        self.peakFootprint = peakFootprint
         self.database = database
         self.fileStore = fileStore
         self.upstream = upstream
@@ -83,6 +88,7 @@ package struct Metric: Sendable {
         Metric(name: "instructions", unit: "M") { Double($0.resources.instructions) / 1e6 },
         Metric(name: "disk.written", unit: "KiB") { Double($0.resources.diskBytesWritten) / 1024 },
         Metric(name: "disk.logicalWritten", unit: "KiB") { Double($0.resources.logicalBytesWritten) / 1024 },
+        Metric(name: "memory.peak", unit: "MiB") { Double($0.peakFootprint) / 1_048_576 },
         Metric(name: "memory.peakGrowth", unit: "MiB") { Double($0.peakFootprintGrowth) / 1_048_576 },
         Metric(name: "db.commits", unit: "") { Double($0.database.commits) },
         Metric(name: "db.rowChanges", unit: "") { Double($0.database.rowChanges) },
@@ -258,6 +264,7 @@ package enum Scenarios {
             wallMilliseconds: milliseconds(wall),
             resources: resourcesAfter.since(resources),
             peakFootprintGrowth: Int64(peak) - Int64(footprint),
+            peakFootprint: peak,
             database: await fixture.database.writeCounters().since(database),
             fileStore: await fileStore.counters(),
             upstream: fixture.upstream.counters.since(upstream),

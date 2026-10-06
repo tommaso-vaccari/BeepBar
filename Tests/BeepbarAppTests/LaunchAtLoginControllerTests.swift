@@ -32,11 +32,11 @@ private final class FakeLoginItemService: LoginItemService, @unchecked Sendable 
     /// lets a test hold a change in flight.
     let registerGate: DispatchSemaphore?
     /// How long a held call waits for the test to release it, and how long `waitUntil` waits for
-    /// the fake to be reached. It must outlast any stall of a busy CI runner: with 2 s, the CI run
-    /// of PR #76 woke the test ~2.7 s late, the gate let the "in-flight" change finish on its own,
-    /// and `aRefreshDuringAChangeLeavesTheStatusToTheChange` counted one read too many. Still
-    /// bounded, so a test that never releases fails instead of hanging; correct code never waits
-    /// for it.
+    /// the fake to be reached: only an upper bound, so a test that never releases fails instead of
+    /// hanging. Correct code never waits for it. The 30 s stall on dev's CI after PR #79 came from
+    /// the controller blocking Swift's cooperative pool with these held calls, and the 2 s one on
+    /// PR #76's CI most likely did too; `LaunchAtLoginController.callMacOS` now runs them on GCD,
+    /// and `callsHeldByMacOSDoNotStarveOtherAsyncWork` guards that.
     static let toleranceSeconds = 30
 
     init(status: LoginItemStatus, registerOutcome: RegisterOutcome = .enable, failUnregister: Bool = false, registerGate: DispatchSemaphore? = nil) {
@@ -409,6 +409,25 @@ private final class FakeLoginItemService: LoginItemService, @unchecked Sendable 
         await controller.refresh()
         #expect(!controller.isOn)
         #expect(controller.status == .requiresApproval)
+    }
+
+    /// Holds one more registration in flight than Swift's cooperative pool has threads (one per
+    /// core), each from its own controller, and checks that all of them reach macOS before any is
+    /// released. Guards against running the blocking calls in `Task.detached`: there the held calls
+    /// take every pool thread, the remaining ones never start and, in the app, all async work stops
+    /// with them, as on dev's 3-core CI after PR #79.
+    @Test func callsHeldByMacOSDoNotStarveOtherAsyncWork() async {
+        let count = ProcessInfo.processInfo.activeProcessorCount + 1
+        let gates = (0..<count).map { _ in DispatchSemaphore(value: 0) }
+        let services = gates.map { FakeLoginItemService(status: .notRegistered, registerGate: $0) }
+        var controllers: [LaunchAtLoginController] = []
+        for service in services { controllers.append(await settings(service)) }
+        let changes = controllers.map { controller in Task { await controller.setEnabled(true) } }
+        await waitUntil { services.allSatisfy { $0.registerCalls == 1 } }
+        gates.forEach { $0.signal() }
+        for change in changes { await change.value }
+        #expect(services.allSatisfy { $0.gateBypasses == 0 }, "every call was held until the test released it")
+        #expect(controllers.allSatisfy { $0.status == .enabled })
     }
 
     /// Every call into macOS (status reads, register, unregister) is a blocking XPC call: across

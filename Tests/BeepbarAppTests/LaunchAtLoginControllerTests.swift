@@ -25,16 +25,19 @@ private final class FakeLoginItemService: LoginItemService, @unchecked Sendable 
         var settingsOpened = 0
         var holdNextRead = false
         var heldReads = 0
-        var gateTimeouts = 0
+        var gateBypasses = 0
     }
     private let state: OSAllocatedUnfairLock<State>
-    /// When set, `register()` waits on it: lets a test hold a change in flight.
+    /// When set, `register()` called off the main thread waits on it, up to `toleranceSeconds`:
+    /// lets a test hold a change in flight.
     let registerGate: DispatchSemaphore?
-    /// How long a held call waits for the test to release it. It must outlast any stall of a busy
-    /// CI runner: with 2 s, PR #76's CI woke the test ~2.7 s late, the gate let the "in-flight"
-    /// change finish on its own, and `aRefreshDuringAChangeLeavesTheStatusToTheChange` counted
-    /// one read too many. Still bounded, so a test that never releases fails instead of hanging.
-    private static let gateTimeout: DispatchTimeInterval = .seconds(30)
+    /// How long a held call waits for the test to release it, and how long `waitUntil` waits for
+    /// the fake to be reached. It must outlast any stall of a busy CI runner: with 2 s, the CI run
+    /// of PR #76 woke the test ~2.7 s late, the gate let the "in-flight" change finish on its own,
+    /// and `aRefreshDuringAChangeLeavesTheStatusToTheChange` counted one read too many. Still
+    /// bounded, so a test that never releases fails instead of hanging; correct code never waits
+    /// for it.
+    static let toleranceSeconds = 30
 
     init(status: LoginItemStatus, registerOutcome: RegisterOutcome = .enable, failUnregister: Bool = false, registerGate: DispatchSemaphore? = nil) {
         state = OSAllocatedUnfairLock(initialState: State(status: status, registerOutcome: registerOutcome, failUnregister: failUnregister))
@@ -46,24 +49,28 @@ private final class FakeLoginItemService: LoginItemService, @unchecked Sendable 
         let (value, hold) = state.withLock { s -> (LoginItemStatus, Bool) in
             s.statusReads += 1
             if onMain { s.mainThreadCalls += 1 }
-            let hold = s.holdNextRead
-            if hold { s.holdNextRead = false; s.heldReads += 1 }
+            // Never held on the main thread, where the test would release it: that would
+            // deadlock. Such a read counts as a bypass, not as held, so the test that set the hold
+            // up fails instead of passing without the interleaving it meant to exercise.
+            let hold = s.holdNextRead && !onMain
+            if s.holdNextRead { s.holdNextRead = false; if hold { s.heldReads += 1 } else { s.gateBypasses += 1 } }
             return (s.status, hold)
         }
         // A held read answers with the status as it was when it was asked, like an XPC reply that
-        // was sent before a change but delivered after it. Never held on the main thread, where
-        // the test would release it: that call is already a failure (`mainThreadCalls`).
-        if hold, !onMain { wait(on: readGate) }
+        // was sent before a change but delivered after it.
+        if hold { wait(on: readGate) }
         return value
     }
     private let readGate = DispatchSemaphore(value: 0)
-    /// Holds the next status read until `releaseHeldRead()`.
+    /// Holds the next status read, if it comes off the main thread, until `releaseHeldRead()` or
+    /// `toleranceSeconds`.
     func holdNextStatusRead() { state.withLock { $0.holdNextRead = true } }
     func releaseHeldRead() { readGate.signal() }
     var heldReads: Int { state.withLock { $0.heldReads } }
-    /// Held calls that went on without the test releasing them. Gated tests expect 0: otherwise
-    /// what they observed was not the interleaving they set up.
-    var gateTimeouts: Int { state.withLock { $0.gateTimeouts } }
+    /// Gated calls that went on without the test releasing them: timed out, or skipped the gate
+    /// because they ran on the main thread. Gated tests expect 0: otherwise what they observed was
+    /// not the interleaving they set up.
+    var gateBypasses: Int { state.withLock { $0.gateBypasses } }
     var statusReads: Int { state.withLock { $0.statusReads } }
     var mainThreadCalls: Int { state.withLock { $0.mainThreadCalls } }
     var registerCalls: Int { state.withLock { $0.registerCalls } }
@@ -76,9 +83,11 @@ private final class FakeLoginItemService: LoginItemService, @unchecked Sendable 
         let onMain = Thread.isMainThread
         state.withLock { $0.registerCalls += 1; if onMain { $0.mainThreadCalls += 1 } }
         // Not held on the main thread, where the test would signal the gate: a regression that
-        // calls `register()` there must not deadlock the suite. The gated tests then fail their
-        // `mainThreadCalls == 0` check, as does `macOSIsNeverCalledOnTheMainThread`.
-        if let registerGate, !onMain { wait(on: registerGate) }
+        // calls `register()` there must not deadlock the suite. It counts as a bypass instead, so
+        // the gated tests fail, as does `macOSIsNeverCalledOnTheMainThread`.
+        if let registerGate {
+            if onMain { state.withLock { $0.gateBypasses += 1 } } else { wait(on: registerGate) }
+        }
         let (status, outcome) = state.withLock { ($0.status, $0.registerOutcome) }
         if status == .requiresApproval || status == .enabled { throw CocoaError(.featureUnsupported) }
         switch outcome {
@@ -99,7 +108,7 @@ private final class FakeLoginItemService: LoginItemService, @unchecked Sendable 
     func openSystemSettings() { state.withLock { $0.settingsOpened += 1 } }
 
     private func wait(on gate: DispatchSemaphore) {
-        if gate.wait(timeout: .now() + Self.gateTimeout) == .timedOut { state.withLock { $0.gateTimeouts += 1 } }
+        if gate.wait(timeout: .now() + .seconds(Self.toleranceSeconds)) == .timedOut { state.withLock { $0.gateBypasses += 1 } }
     }
 }
 
@@ -361,7 +370,7 @@ private final class FakeLoginItemService: LoginItemService, @unchecked Sendable 
         await second.value
         #expect(service.registerCalls == 1)
         #expect(service.mainThreadCalls == 0)
-        #expect(service.gateTimeouts == 0)
+        #expect(service.gateBypasses == 0)
         #expect(controller.isOn)
         #expect(!controller.isUpdating)
         #expect(controller.canChange)
@@ -386,7 +395,7 @@ private final class FakeLoginItemService: LoginItemService, @unchecked Sendable 
         await tap.value
         #expect(service.registerCalls == 1)
         #expect(service.mainThreadCalls == 0)
-        #expect(service.gateTimeouts == 0)
+        #expect(service.gateBypasses == 0)
         #expect(controller.errorMessage == nil)
         #expect(controller.isOn)
     }
@@ -434,7 +443,7 @@ private final class FakeLoginItemService: LoginItemService, @unchecked Sendable 
         #expect(controller.isOn)
         await controller.refresh()
         #expect(service.statusReads == readsBefore + 2, "once the change ended, refreshes read again")
-        #expect(service.gateTimeouts == 0, "the change was held by the test, not released by the timeout")
+        #expect(service.gateBypasses == 0, "the change was held by the test, not released early")
     }
 
     /// A registration that returned while the status read after it still lags is not reported
@@ -464,7 +473,7 @@ private final class FakeLoginItemService: LoginItemService, @unchecked Sendable 
         await refreshing.value
         #expect(controller.isOn, "the older read must be dropped")
         #expect(controller.status == .enabled)
-        #expect(service.gateTimeouts == 0)
+        #expect(service.gateBypasses == 0)
     }
 
     /// The launch path trusts a registration that returned even if the status read after it lags:
@@ -511,7 +520,9 @@ private final class FakeLoginItemService: LoginItemService, @unchecked Sendable 
     }
 
     private func waitUntil(_ condition: () -> Bool) async {
-        let deadline = Date().addingTimeInterval(5)
+        // As long as the fake's gates: a late wake-up only delays the check, and correct code
+        // reaches the fake long before.
+        let deadline = Date().addingTimeInterval(TimeInterval(FakeLoginItemService.toleranceSeconds))
         while !condition(), Date() < deadline { try? await Task.sleep(for: .milliseconds(1)) }
         #expect(condition(), "timed out waiting for the fake registry")
     }

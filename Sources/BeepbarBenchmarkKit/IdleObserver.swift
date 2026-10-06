@@ -28,7 +28,8 @@ package struct IdleObservation: Sendable, Codable {
     /// Wakeups per second, idle plus interrupt.
     package var wakeupsPerSecond: Double { durationSeconds > 0 ? Double(total.idleWakeups + total.interruptWakeups) / durationSeconds : 0 }
 
-    /// The lines `beepbar-bench idle` prints, against the idle budget in AGENTS.md.
+    /// The lines `beepbar-bench idle` prints, against the idle budget in AGENTS.md. Network bytes
+    /// aren't in `proc_pid_rusage`; `scripts/measure-idle.sh` adds them from `nettop`.
     package func summary() -> String {
         [
             String(format: "pid %d · %.0f s%@", pid, durationSeconds, completed ? "" : " · process exited early"),
@@ -36,7 +37,6 @@ package struct IdleObservation: Sendable, Codable {
             String(format: "wakeups          %llu idle, %llu interrupt (%.2f/s)", total.idleWakeups, total.interruptWakeups, wakeupsPerSecond),
             "disk written     \(total.diskBytesWritten) bytes (logical \(total.logicalBytesWritten))",
             String(format: "footprint        %+.1f MiB (peak %.1f MiB)", Double(footprintGrowth) / 1_048_576, Double(peakFootprint) / 1_048_576),
-            "network          not measured here: see scripts/measure-idle.sh",
         ].joined(separator: "\n")
     }
 }

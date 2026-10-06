@@ -33,17 +33,24 @@ package final class BenchmarkFixture: @unchecked Sendable {
         root = container.appending(path: "Sync", directoryHint: .isDirectory)
         supportDirectory = container.appending(path: "Support", directoryHint: .isDirectory)
         trashDirectory = container.appending(path: "Trash", directoryHint: .isDirectory)
-        for directory in [root, supportDirectory, trashDirectory] {
-            try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
-        }
-        database = try SyncDatabase(url: supportDirectory.appending(path: "sync.sqlite"))
         upstream = BenchmarkUpstream()
         upstream.populate(corpus)
         apiClient = WeBeepAPIClient(policy: upstream.policy, session: upstream.session)
         downloader = RemoteDownloader(session: upstream.session, policy: upstream.policy)
-        try await database.registerRoot(id: rootID, canonicalPath: root.path)
-        for course in upstream.courseIDs {
-            try await database.upsertScope(SyncScope(rootID: rootID, courseID: course, displayName: Self.folder(course), localFolder: Self.folder(course), enabled: true))
+        // A failed setup leaves nothing behind in the temporary folder: nobody gets the fixture
+        // to call `remove()` on.
+        do {
+            for directory in [root, supportDirectory, trashDirectory] {
+                try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+            }
+            database = try SyncDatabase(url: supportDirectory.appending(path: "sync.sqlite"))
+            try await database.registerRoot(id: rootID, canonicalPath: root.path)
+            for course in upstream.courseIDs {
+                try await database.upsertScope(SyncScope(rootID: rootID, courseID: course, displayName: Self.folder(course), localFolder: Self.folder(course), enabled: true))
+            }
+        } catch {
+            try? FileManager.default.removeItem(at: container)
+            throw error
         }
     }
 

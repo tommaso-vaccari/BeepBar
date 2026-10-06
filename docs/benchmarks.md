@@ -1,8 +1,8 @@
 # Benchmarks
 
 The benchmark harness measures BeepBar against the performance budgets in `AGENTS.md`. It runs on
-demand, never as part of the regular `swift test`, and every performance PR uses it for its
-before/after numbers.
+demand, and every performance PR uses it for its before/after numbers. The regular `swift test`
+only runs its own tests and a tiny run of each scenario, about a second in all.
 
 ## Safety
 
@@ -57,7 +57,8 @@ Every report records the commit, the machine model, the CPU, the memory, the mac
 - *Budget:* ≤ 50 ms of local work per 1,000 tracked files, no file hashing, no database or disk writes, minimal requests.
 - *Setup:* `--files` files over 10 courses, or one course per 1,000 files above 10,000.
 - *Each run:* repeats the Core work of an automatic check (see "What a run covers") while Moodle has nothing new.
-- *Checks:* nothing installed, no downloads, no failures or conflicts, the same work every run.
+- *Checks:* nothing installed, no downloads, no failures or conflicts, the same work every run. These make the run valid; they are not the budget.
+- *Budget lines:* the report adds whether the run hashed no file and wrote no database page or disk byte. A budget not met is reported, not failed: the numbers are still worth quoting, and fixing them is the performance PR's job.
 
 **`large-update`: one large file changes on every run.**
 - *Budget:* peak memory independent of file size, throughput bound by the network.
@@ -81,7 +82,7 @@ Every counter is the change during one run.
 | `wall`, `cpu`, `instructions` | `ContinuousClock`, `proc_pid_rusage` | Whole benchmark process: the sync plus the mock (whose answers are pre-rendered to keep its share small) |
 | `disk.written`, `disk.logicalWritten` | `proc_pid_rusage` | Bytes written to storage, and including those still in the page cache |
 | `memory.peak`, `memory.peakGrowth` | `PeakFootprintSampler` (1 ms) | Highest `phys_footprint` of the process during the run, and that minus the value just before. Compare `memory.peak` across file sizes: the allocator keeps memory a previous run freed, so the growth alone is noisy |
-| `db.commits` | SQLite commit hook | Write transactions committed. Each is a WAL append and an `fsync`. An empty transaction, or a write matching no row, still counts |
+| `db.commits` | SQLite commit hook | Write transactions committed. An empty transaction, or a write matching no row, still counts. Only commits that wrote pages (`db.pagesWritten`) append to the WAL and wait for an `fsync` |
 | `db.rowChanges` | `sqlite3_total_changes64` | Rows inserted, updated or deleted, identical rewrites included |
 | `db.pagesWritten` | `SQLITE_DBSTATUS_CACHE_WRITE` | WAL frames. An `UPDATE` that leaves a page byte-identical writes none |
 | `fs.filesHashed`, `fs.bytesHashed` | `FileStore.counters()` | Full-content SHA-256 reads, and the bytes they read |
@@ -102,6 +103,7 @@ The database and filesystem counters are `package`-level API in `BeepbarCore`. T
 **Not covered**, because it lives in the app:
 - the keychain read;
 - the UserDefaults writes of the sync state (the last summary and the reconciliation time);
+- the "Risparmio dati" setting: runs always use `.unrestricted`;
 - notifications;
 - UI updates.
 
@@ -111,7 +113,7 @@ Keep `automaticRun` in step with the app when that sequence changes.
 
 `scripts/measure-idle.sh [minutes]` finds the Beepbar running from `/Applications` and samples it with `proc_pid_rusage` every minute (`beepbar-bench idle --pid`).
 - *What it reports:* average CPU, wakeups per second, disk writes and footprint growth.
-- *Network:* it adds the process's bytes from two `nettop` snapshots. This is best effort: a process with no traffic is simply missing from `nettop`'s list.
+- *Network:* `nettop` samples the process's open connections every second for the whole window, and each connection counts the most bytes it was seen with, minus what it had moved before the window. `nettop` forgets a connection once it closes, so two snapshots would read 0 after a check that came and went. A connection opened and closed between two samples is still missed, so the number is a lower bound, printed with the count of connections seen.
 - *Before measuring:* close BeepBar's window and leave the Mac alone. An automatic check that falls inside the window is expected and shows up as one burst.
 
 ## Profiling

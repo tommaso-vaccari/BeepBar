@@ -40,8 +40,9 @@ private final class CommitCounter: @unchecked Sendable {
 /// questions:
 /// - `rowChanges` (`sqlite3_total_changes64`): rows inserted, updated or deleted, including an update
 ///   that rewrote a row with the same values and rows of a transaction later rolled back.
-/// - `commits`: write transactions committed, each one a WAL append and, with `synchronous = FULL`,
-///   an `fsync`. An empty `BEGIN IMMEDIATE … COMMIT` or an `UPDATE` matching no row still counts.
+/// - `commits`: write transactions committed. An empty `BEGIN IMMEDIATE … COMMIT` or an `UPDATE`
+///   matching no row still counts. Only a commit that wrote pages appends to the WAL and, with
+///   `synchronous = FULL`, waits for an `fsync`; an empty one costs a lock round trip.
 /// - `pagesWritten` (`SQLITE_DBSTATUS_CACHE_WRITE`): database pages written to the WAL, i.e. WAL
 ///   frames. SQLite doesn't dirty a page an `UPDATE` leaves byte-identical, so an identical update
 ///   counts a row change and a commit without a page (an identical upsert still writes one).
@@ -99,7 +100,8 @@ public actor SyncDatabase {
         // going down. Commits don't ask for `F_FULLFSYNC` (`PRAGMA fullfsync` stays off; only
         // checkpoints use it, `checkpoint_fullfsync` being on in the system build), and
         // `FileStore` uses plain `fsync`, so on macOS the drive's own cache can still reorder
-        // writes on sudden power loss. A run with nothing new commits nothing, so FULL costs it
+        // writes on sudden power loss. A run with nothing new writes no WAL frame (the benchmark
+        // harness measures one empty commit per run, `docs/benchmarks.md`), so FULL costs it
         // nothing. An explicit `synchronous` holds after switching to WAL, so the order of these
         // two pragmas doesn't matter.
         try Self.execute(database, "PRAGMA synchronous = FULL")

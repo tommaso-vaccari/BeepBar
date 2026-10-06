@@ -100,7 +100,9 @@ func baseline(_ options: Options) throws -> Bool {
         ("large-update-256mb", ["large-update", "--size-mb", "256"]),
         ("cancel-mid", ["cancel", "--size-mb", "256", "--fraction", "0.5"]),
     ]
-    let executable = URL(fileURLWithPath: CommandLine.arguments[0]).standardizedFileURL
+    // The running binary itself, wherever it was started from (`argv[0]` may be a bare name found
+    // through PATH).
+    guard let executable = Bundle.main.executableURL else { throw BenchmarkError.setup("can't locate the beepbar-bench executable") }
     var scenarios: [ScenarioResult] = []
     var complete = true
     for (name, arguments) in plan {

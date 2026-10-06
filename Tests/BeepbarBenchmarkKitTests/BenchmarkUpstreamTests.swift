@@ -100,6 +100,21 @@ struct BenchmarkUpstreamTests {
         #expect(a.upstream.host != b.upstream.host)
     }
 
+    /// A request on the benchmark session to a host no mock serves is answered by the mock with
+    /// its own error, never passed to the real HTTP stack. Guards "no real network": the real
+    /// stack would fail this `.test` host with `.cannotFindHost`, after a DNS lookup.
+    @Test func unknownHostNeverReachesTheRealNetwork() async throws {
+        let upstream = BenchmarkUpstream()
+        let url = URL(string: "https://\(UUID().uuidString.lowercased()).bench.beepbar.test/webservice/rest/server.php")!
+        do {
+            _ = try await upstream.session.data(from: url)
+            Issue.record("a request to an unknown host succeeded")
+        } catch let error as URLError {
+            #expect(error.code == .resourceUnavailable, "\(error.code)")
+        }
+        #expect(upstream.counters.requests == 0)
+    }
+
     /// The content is deterministic per seed, differs between seeds, and reads the same however
     /// it is chunked, across the 1 MiB block boundary too. The SHA the tests compare against is
     /// computed from these reads, so a chunking bug would make both sides wrong in the same way

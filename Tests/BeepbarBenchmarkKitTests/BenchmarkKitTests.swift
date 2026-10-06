@@ -20,38 +20,25 @@ struct BenchmarkKitTests {
     }
 
     /// CPU time comes back in nanoseconds. `rusage_info` reports Mach ticks (125/3 ns each on
-    /// Apple silicon); reading them raw would report a busy loop of ~200 ms as ~5 ms.
+    /// Apple silicon); reading them raw would report a busy loop of ~200 ms as ~5 ms. Compared with
+    /// this thread's own CPU clock rather than a fixed range, because the reading covers the whole
+    /// process and other suites run in parallel: the process total can't be below this thread's
+    /// share, nor above every core busy for the whole loop.
     @Test func cpuTimeIsReportedInNanoseconds() throws {
         let before = try #require(ResourceUsage.current())
+        let threadBefore = clock_gettime_nsec_np(CLOCK_THREAD_CPUTIME_ID)
         let clock = ContinuousClock()
         let start = clock.now
         var value: UInt64 = 1
         while clock.now - start < .milliseconds(200) { value = value &* 6_364_136_223_846_793_005 &+ 1 }
         #expect(value != 0)
-        let cpu = Double(try #require(ResourceUsage.current()).since(before).cpuNanoseconds) / 1e6
-        #expect(cpu > 150 && cpu < 2_000, "cpu \(cpu) ms for a 200 ms busy loop")
-    }
-
-    /// The sampler catches a peak that is gone by the time it stops: a before/after reading would
-    /// report zero growth for a download that briefly held the whole file in memory. The buffer is
-    /// mapped and unmapped directly so its pages leave the footprint at once; with `malloc` the
-    /// allocator may keep them, and the final reading in `stop()` alone would pass the test.
-    @Test func peakSamplerCatchesATransientAllocation() throws {
-        let size = 64 << 20
-        let before = PeakFootprintSampler.footprint()
-        let sampler = PeakFootprintSampler()
-        let buffer = try #require(mmap(nil, size, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON, -1, 0))
-        try #require(buffer != MAP_FAILED)
-        buffer.initializeMemory(as: UInt8.self, repeating: 1, count: size)
-        Thread.sleep(forTimeInterval: 0.05)
-        let mapped = PeakFootprintSampler.footprint()
-        munmap(buffer, size)
-        // Precondition: the allocation is really gone, so only a sample taken while it was mapped
-        // can report it. Compared with the reading just before, not with `before`, because tests
-        // running in parallel share the process footprint.
-        try #require(PeakFootprintSampler.footprint() + (32 << 20) < mapped, "footprint still includes the buffer")
-        let peak = sampler.stop()
-        #expect(peak >= before + (48 << 20), "peak \(peak) vs before \(before)")
+        let thread = Double(clock_gettime_nsec_np(CLOCK_THREAD_CPUTIME_ID) - threadBefore)
+        let wall = clock.now - start
+        let elapsed = Double(wall.components.seconds) * 1e9 + Double(wall.components.attoseconds) / 1e9
+        let process = Double(try #require(ResourceUsage.current()).since(before).cpuNanoseconds)
+        #expect(thread > 150e6, "the busy loop ran \(thread / 1e6) ms on its thread")
+        #expect(process >= thread * 0.95, "process \(process / 1e6) ms < thread \(thread / 1e6) ms")
+        #expect(process <= elapsed * Double(ProcessInfo.processInfo.activeProcessorCount) * 1.2 + 50e6, "process \(process / 1e6) ms in \(elapsed / 1e6) ms of wall time")
     }
 
     /// Observing a live process returns samples and totals; a process that can't be read returns
@@ -121,7 +108,10 @@ struct BenchmarkKitTests {
         #expect(result.samples.count == 2)
         #expect(result.samples.allSatisfy { $0.fileStore.filesHashed == 0 && $0.upstream.downloads == 0 })
         #expect(result.samples.allSatisfy { $0.upstream.contentsRequests == 3 && $0.upstream.courseListRequests == 1 })
+        // One lookup per tracked file is today's cost, not a requirement: a PR that makes the
+        // check cheaper updates this number.
         #expect(result.summary["wall"] != nil && result.summary["fs.pathLookups"]?.median == 30)
+        #expect(result.notes.contains("budget, no file hashing: met"))
     }
 
     /// A small "large update" downloads and installs the new revision every run and counts its

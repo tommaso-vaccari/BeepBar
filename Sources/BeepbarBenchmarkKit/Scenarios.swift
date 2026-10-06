@@ -138,10 +138,20 @@ package enum Scenarios {
             "no downloads": samples.allSatisfy { $0.upstream.downloads == 0 },
             "same work every run": samples.allSatisfy { $0.database == first?.database && $0.fileStore == first?.fileStore && $0.upstream == first?.upstream },
         ]
+        // The budget's own lines are notes, not checks: a run that hashes or writes is still a
+        // valid measurement, and the number is what a performance PR quotes and improves.
+        let cpu = Distribution(samples.map { Double($0.resources.cpuNanoseconds) / 1e6 })?.median ?? 0
+        let hashed = samples.contains { $0.fileStore.filesHashed > 0 }
+        let wrote = samples.contains { $0.database.pagesWritten > 0 || $0.database.rowChanges > 0 || $0.resources.logicalBytesWritten > 0 }
+        let emptyCommits = samples.map(\.database.commits).max() ?? 0
         return ScenarioResult(
             name: "unchanged", parameters: ["files": "\(corpus.totalFiles)", "courses": "\(corpus.courses)", "modulesPerCourse": "\(corpus.modulesPerCourse)"],
             warmupRuns: warmup, samples: samples, checks: checks,
-            notes: ["cpu per 1000 files (median): \(String(format: "%.1f", (Double(samples.map(\.resources.cpuNanoseconds).sorted()[samples.count / 2]) / 1e6) / Double(corpus.totalFiles) * 1000)) ms"]
+            notes: [
+                "cpu per 1000 files (median): \(String(format: "%.1f", cpu / Double(corpus.totalFiles) * 1000)) ms (budget ≤ 50 ms)",
+                "budget, no file hashing: \(hashed ? "NOT MET" : "met")",
+                "budget, no database or disk writes: \(wrote ? "NOT MET" : "met")\(!wrote && emptyCommits > 0 ? " (\(emptyCommits) empty commit per run)" : "")",
+            ]
         )
     }
 
@@ -284,7 +294,14 @@ package enum Scenarios {
         let handle = try FileHandle(forReadingFrom: url)
         defer { try? handle.close() }
         var hash = SHA256()
-        while let chunk = try handle.read(upToCount: 1 << 20), !chunk.isEmpty { hash.update(data: chunk) }
+        // One pool per chunk: `FileHandle.read` returns autoreleased buffers, and this check runs
+        // between measured runs, so without a pool a whole file stays resident and inflates the
+        // next run's starting footprint.
+        while try autoreleasepool(invoking: {
+            guard let chunk = try handle.read(upToCount: 1 << 20), !chunk.isEmpty else { return false }
+            hash.update(data: chunk)
+            return true
+        }) {}
         return hash.finalize().map { String(format: "%02x", $0) }.joined()
     }
 }

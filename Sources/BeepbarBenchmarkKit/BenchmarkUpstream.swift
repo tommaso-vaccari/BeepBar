@@ -83,12 +83,17 @@ package struct SyntheticFileKey: Hashable, Sendable, Codable {
 /// `core_course_get_contents` and `pluginfile.php` downloads.
 ///
 /// Its own work stays out of the measurements as far as possible: course listings are rendered
-/// once per change and cached, and file bytes are copied from a small pre-generated block
-/// (`SyntheticContent`). What remains on the client side (URL loading, JSON parsing, hashing,
+/// once per change and cached, file bytes are copied from a small pre-generated block
+/// (`SyntheticContent`), and delivered chunks don't stay resident (see `startLoading`). What remains on the client side (URL loading, JSON parsing, hashing,
 /// writing) is the app's real work. Downloads stream in chunks, optionally throttled, so a large
 /// file never sits in memory here and a cancel can land midway.
 package final class BenchmarkUpstream: @unchecked Sendable {
     package static let userID = 7
+
+    /// How far a download may run ahead of the client, in bytes: the order of a TCP receive
+    /// window on a fast link. Large enough not to slow the transfer, small enough that no backlog
+    /// shows up in the memory numbers (see `BenchmarkURLProtocol.startLoading`).
+    package static let downloadWindow: Int64 = 2 << 20
 
     package let host: String
     package let policy: WeBeepServerPolicy
@@ -361,12 +366,16 @@ final class BenchmarkURLProtocol: URLProtocol, @unchecked Sendable {
 
     private let stopped = OSAllocatedUnfairLock(initialState: false)
 
-    override class func canInit(with request: URLRequest) -> Bool { upstream(for: request) != nil }
+    /// Claims every request of the sessions it is installed on, known host or not: declining one
+    /// would hand it to the real HTTP stack (and a DNS lookup), breaking "no real network". An
+    /// unknown host fails in `startLoading` with `.resourceUnavailable`, an error the real stack
+    /// wouldn't give for an unresolvable host, so a test can tell the two apart.
+    override class func canInit(with request: URLRequest) -> Bool { true }
     override class func canonicalRequest(for request: URLRequest) -> URLRequest { request }
 
     override func startLoading() {
         guard let url = request.url, let upstream = Self.upstream(for: request) else {
-            client?.urlProtocol(self, didFailWithError: URLError(.cannotConnectToHost))
+            client?.urlProtocol(self, didFailWithError: URLError(.resourceUnavailable))
             return
         }
         switch upstream.reply(to: request) {
@@ -386,6 +395,16 @@ final class BenchmarkURLProtocol: URLProtocol, @unchecked Sendable {
                 let start = clock.now
                 var sent: Int64 = 0
                 while sent < content.size {
+                    // Flow control, as TCP gives a real download: never more than `window` bytes
+                    // ahead of what the client has taken in. Without it an unthrottled mock runs
+                    // hundreds of MiB ahead of a busy client, the URL loading system queues all of
+                    // it, and `memory.peak` measures that queue instead of the app (measured:
+                    // a 256 MiB stream grew the footprint by ~700 MiB when other work competed).
+                    // Guarded by `streamingThroughTheMockKeepsMemoryFlat`.
+                    while let task, sent - task.countOfBytesReceived > BenchmarkUpstream.downloadWindow {
+                        if stopped.withLock({ $0 }) { return }
+                        Thread.sleep(forTimeInterval: 0.0002)
+                    }
                     if stopped.withLock({ $0 }) { return }
                     let chunk = content.bytes(at: sent, count: settings.chunkSize)
                     client?.urlProtocol(self, didLoad: chunk)

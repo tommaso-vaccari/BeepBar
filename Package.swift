@@ -7,6 +7,8 @@ let package = Package(
     products: [
         .library(name: "BeepbarCore", targets: ["BeepbarCore"]),
         .executable(name: "Beepbar", targets: ["BeepbarApp"]),
+        // On-demand benchmarks (docs/benchmarks.md); never part of the app.
+        .executable(name: "beepbar-bench", targets: ["BeepbarBenchmarks"]),
     ],
     dependencies: [
         .package(url: "https://github.com/sparkle-project/Sparkle", from: "2.10.0"),
@@ -22,7 +24,10 @@ let package = Package(
             dependencies: ["BeepbarCore", .product(name: "Sparkle", package: "Sparkle")],
             linkerSettings: [.linkedFramework("WebKit")]
         ),
+        .target(name: "BeepbarBenchmarkKit", dependencies: ["BeepbarCore"]),
+        .executableTarget(name: "BeepbarBenchmarks", dependencies: ["BeepbarBenchmarkKit"]),
         .testTarget(name: "BeepbarCoreTests", dependencies: ["BeepbarCore"]),
+        .testTarget(name: "BeepbarBenchmarkKitTests", dependencies: ["BeepbarBenchmarkKit", "BeepbarCore"]),
         .testTarget(name: "BeepbarAppTests", dependencies: ["BeepbarApp"]),
     ]
 )

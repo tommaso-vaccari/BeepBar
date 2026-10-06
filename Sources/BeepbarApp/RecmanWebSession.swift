@@ -98,6 +98,9 @@ enum RecmanBrowserError: Error, Equatable {
         close()
         let store = WKWebsiteDataStore.nonPersistent()
         self.store = store
+        // The web view exists before the cookies go in: cookies set on a non-persistent store
+        // that no web view uses yet have been known not to reach its first requests.
+        _ = browser()
         for cookie in cookies {
             await store.httpCookieStore.setCookie(cookie)
         }
@@ -442,7 +445,7 @@ enum RecmanBrowserError: Error, Equatable {
     }
 
     private func playbackFound(_ url: URL) {
-        trace("player found: \(Self.redacted(url))")
+        trace("player found")  // its address carries the recording id
         capturedPlayback = url
         capturingPlayback = false
         webView?.stopLoading()
@@ -451,7 +454,7 @@ enum RecmanBrowserError: Error, Equatable {
 
     // MARK: Browser and window
 
-    /// The web view and its (hidden) window, created on first use after `open(cookies:)`.
+    /// The web view and its (hidden) window, created by `open(cookies:)`.
     private func browser() -> WKWebView {
         if let webView { return webView }
         let store = store ?? .nonPersistent()
@@ -567,7 +570,10 @@ enum RecmanBrowserError: Error, Equatable {
             playbackFound(player)
             return
         }
-        if RecmanNavigationPolicy.allows(url, mainFrame: mainFrame, userDriven: entry?.navigator.isWaitingForUser == true) {
+        // During a sign-in the user asked for, Polimi may send them to another site (SPID, CIE, a
+        // 2FA provider) before the window is up: letting that load lands the entry on a page it
+        // doesn't recognize, which shows the window there. Refusing it would show the page before.
+        if RecmanNavigationPolicy.allows(url, mainFrame: mainFrame, userDriven: entry?.navigator.mode == .interactive) {
             decisionHandler(.allow)
             return
         }
@@ -610,9 +616,14 @@ enum RecmanBrowserError: Error, Equatable {
         traceHandler?(line)
     }
 
-    /// Host and path only: Polimi's query strings carry single sign-on tickets.
+    /// Host and path only: Polimi's query strings carry single sign-on tickets, and Java and
+    /// Shibboleth pages can put the session id in the path itself (`;jsessionid=…`), so each
+    /// path segment is cut at its first `;` too.
     static func redacted(_ url: URL?) -> String {
         guard let url, let components = URLComponents(url: url, resolvingAgainstBaseURL: false) else { return "(none)" }
-        return "\(components.scheme ?? "?")://\(components.host ?? "?")\(components.path)"
+        let path = components.path.split(separator: "/", omittingEmptySubsequences: false)
+            .map { $0.split(separator: ";", maxSplits: 1, omittingEmptySubsequences: false).first.map(String.init) ?? "" }
+            .joined(separator: "/")
+        return "\(components.scheme ?? "?")://\(components.host ?? "?")\(path)"
     }
 }

@@ -74,5 +74,10 @@ struct RecmanWebSessionTests {
         let url = URL(string: "https://onlineservices.polimi.it/recman_frontend/?ticket=ST-secret#frag")!
         #expect(RecmanWebSession.redacted(url) == "https://onlineservices.polimi.it/recman_frontend/")
         #expect(RecmanWebSession.redacted(nil) == "(none)")
+        // Java and Shibboleth pages put the session id in the path.
+        let pathSession = URL(string: "https://aunicalogin.polimi.it/aunicalogin/aunicalogin.jsp;jsessionid=SECRET?x=1")!
+        #expect(RecmanWebSession.redacted(pathSession) == "https://aunicalogin.polimi.it/aunicalogin/aunicalogin.jsp")
+        let middle = URL(string: "https://shibidp.polimi.it/idp/profile;jsessionid=SECRET/SAML2/Redirect/SSO")!
+        #expect(RecmanWebSession.redacted(middle) == "https://shibidp.polimi.it/idp/profile/SAML2/Redirect/SSO")
     }
 }

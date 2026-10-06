@@ -140,7 +140,8 @@ public struct RecmanEntryNavigator: Sendable {
 public enum RecmanNavigationPolicy {
     /// - Parameters:
     ///   - mainFrame: the page itself, rather than a frame embedded in it.
-    ///   - userDriven: the sign-in window is on screen, so the user is the one navigating.
+    ///   - userDriven: a sign-in the user asked for is running, so they may be sent to sites
+    ///     Polimi's login uses (SPID, CIE, a 2FA provider) and drive them as in a browser.
     public static func allows(_ url: URL, mainFrame: Bool, userDriven: Bool) -> Bool {
         guard let components = URLComponents(url: url, resolvingAgainstBaseURL: false), let scheme = components.scheme?.lowercased() else { return false }
         switch scheme {
@@ -154,8 +155,8 @@ public enum RecmanNavigationPolicy {
                 && components.path.hasPrefix("/recman_frontend") && components.user == nil && components.password == nil
         case "https":
             guard components.user == nil, components.password == nil else { return false }
-            // Embedded frames (a captcha, a 2FA widget) and, while the user is signing in, any
-            // site the login sends them to (SPID, CIE): the user drives it as in a browser.
+            // Embedded frames (a captcha, a 2FA widget) and, during a sign-in the user asked
+            // for, any site the login sends them to (SPID, CIE, a 2FA provider).
             if !mainFrame || userDriven { return true }
             // Alone, BeepBar only ever goes through Polimi's own pages.
             return components.host.map(PolimiPage.isPolimiHost) ?? false

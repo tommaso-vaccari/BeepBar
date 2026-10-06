@@ -61,7 +61,8 @@ let diagnostics = #"""
 
 @MainActor func describeCookies(_ cookies: [HTTPCookie]) {
     for cookie in cookies.sorted(by: { ($0.domain, $0.name) < ($1.domain, $1.name) }) {
-        say("    \(cookie.name) @ \(cookie.domain)\(cookie.path) \(cookie.expiresDate == nil ? "session" : "persistent") secure:\(cookie.isSecure) httpOnly:\(cookie.isHTTPOnly)")
+        let lifetime = cookie.expiresDate.map { "expires \($0.formatted(date: .abbreviated, time: .shortened))" } ?? "session"
+        say("    \(cookie.name) @ \(cookie.domain)\(cookie.path) \(lifetime) secure:\(cookie.isSecure) httpOnly:\(cookie.isHTTPOnly)")
     }
 }
 
@@ -89,7 +90,9 @@ let diagnostics = #"""
             let playStart = ContinuousClock.now
             do {
                 let player = try await session.playbackURL(for: newest)
-                say("RESULT play OK newest recording's player is \(RecmanWebSession.redacted(player)) (\(elapsed(since: playStart)))")
+                // The player's address carries the recording's id: only its shape is printed.
+                let shape = player.path.contains("/recording/playback/") ? "recordingservice …/recording/playback/<id>" : "ldr.php?RCID=<id>"
+                say("RESULT play OK newest recording's player is \(player.host ?? "?") \(shape) (\(elapsed(since: playStart)))")
             } catch {
                 say("RESULT play FAILED \(error) (\(elapsed(since: playStart)))")
                 await describePage(session, "preview")

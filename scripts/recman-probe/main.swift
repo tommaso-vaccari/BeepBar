@@ -168,6 +168,22 @@ let diagnostics = #"""
 
 let application = NSApplication.shared
 application.setActivationPolicy(.accessory)
+// Cmd-V, Cmd-C and the rest reach the sign-in fields through the main menu's Edit items. BeepBar
+// gets that menu from SwiftUI; a bare AppKit process has none, so pasting a password would do
+// nothing here. The menu is never shown (the app has no menu bar), only its shortcuts work.
+let editMenu = NSMenu(title: "Edit")
+for (title, action, key, modifiers) in [
+    ("Undo", "undo:", "z", NSEvent.ModifierFlags.command), ("Redo", "redo:", "z", [.command, .shift]),
+    ("Cut", "cut:", "x", .command), ("Copy", "copy:", "c", .command), ("Paste", "paste:", "v", .command), ("Select All", "selectAll:", "a", .command),
+] {
+    let item = NSMenuItem(title: title, action: Selector(action), keyEquivalent: key)
+    item.keyEquivalentModifierMask = modifiers
+    editMenu.addItem(item)
+}
+let mainMenu = NSMenu()
+mainMenu.addItem(NSMenuItem(title: "Edit", action: nil, keyEquivalent: ""))
+mainMenu.items[0].submenu = editMenu
+application.mainMenu = mainMenu
 Task { @MainActor in
     let status = await run()
     exit(status)

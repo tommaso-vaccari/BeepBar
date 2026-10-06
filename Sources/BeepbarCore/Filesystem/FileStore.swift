@@ -40,6 +40,23 @@ public enum TopLevelDirectoryState: Sendable, Equatable { case missing, director
 
 enum MigrationDirectoryEntryMatch: Equatable { case missing, exact, differentSpelling, ambiguous }
 
+/// A reading of `FileStore.counters()`; subtract two with `since` to measure one operation.
+package struct FileStoreCounters: Sendable, Equatable, Codable {
+    package var filesHashed: Int
+    package var bytesHashed: Int64
+    package var pathLookups: Int
+
+    package init(filesHashed: Int = 0, bytesHashed: Int64 = 0, pathLookups: Int = 0) {
+        self.filesHashed = filesHashed
+        self.bytesHashed = bytesHashed
+        self.pathLookups = pathLookups
+    }
+
+    package func since(_ earlier: FileStoreCounters) -> FileStoreCounters {
+        FileStoreCounters(filesHashed: filesHashed - earlier.filesHashed, bytesHashed: bytesHashed - earlier.bytesHashed, pathLookups: pathLookups - earlier.pathLookups)
+    }
+}
+
 public actor FileStore {
     private let rootFD: Int32
     private let rootURL: URL
@@ -48,6 +65,18 @@ public actor FileStore {
     /// Number of times a file's full contents were read to compute a SHA-256 digest.
     /// Test instrumentation: lets tests prove that unchanged files are not re-read on every sync.
     private(set) var hashCount = 0
+    /// Bytes read to compute those digests: tells one large file read twice from two small ones.
+    private var bytesHashed: Int64 = 0
+    /// Paths resolved from the root, one directory `openat` per component, before any per-file
+    /// call (`inspect`, `containsRegularFile`, occupancy checks, moves) touches the file itself.
+    private var pathLookups = 0
+
+    /// The filesystem work this store has done since it was created, for the benchmark harness and
+    /// for tests that prove a run left unchanged files alone. Instance-scoped, so parallel tests
+    /// with their own stores never see each other's work.
+    package func counters() -> FileStoreCounters {
+        FileStoreCounters(filesHashed: hashCount, bytesHashed: bytesHashed, pathLookups: pathLookups)
+    }
 
     /// `trash` moves a file to the Trash; tests replace it so they never touch the user's Trash.
     public init(root: URL, trash: @escaping @Sendable (URL) throws -> Void = { try FileManager.default.trashItem(at: $0, resultingItemURL: nil) }) throws {
@@ -713,6 +742,7 @@ public actor FileStore {
     }
 
     private func directoryFD(for components: [String], create: Bool) throws -> Int32 {
+        pathLookups += 1
         var fd = dup(rootFD)
         guard fd >= 0 else { throw fileStoreError() }
         do {
@@ -776,6 +806,7 @@ public actor FileStore {
         while let chunk = try handle.read(upToCount: 1 << 20), !chunk.isEmpty {
             if checksCancellation { try Task.checkCancellation() }
             total += Int64(chunk.count)
+            bytesHashed += Int64(chunk.count)
             if let maximumSize, total > maximumSize { throw FileStoreError.tooLarge }
             hash.update(data: chunk)
             if let destinationFD { try Self.write(chunk, to: destinationFD) }

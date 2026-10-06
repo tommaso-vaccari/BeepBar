@@ -1,0 +1,117 @@
+import BeepbarBenchmarkKit
+import BeepbarCore
+import CryptoKit
+import Foundation
+import Testing
+
+/// The mock Moodle and the fixture must behave like the real thing as far as the sync can tell,
+/// or every number the harness reports measures a different program. These tests run a real
+/// `SyncCoordinator` against them.
+struct BenchmarkUpstreamTests {
+    private func sha256(_ url: URL) throws -> String {
+        SHA256.hash(data: try Data(contentsOf: url)).map { String(format: "%02x", $0) }.joined()
+    }
+
+    /// A first sync installs every file with exactly the bytes the mock generated, and asks for
+    /// each course's contents once and each file once. Guards against a mock that serves the
+    /// wrong bytes, a metadata format the client silently drops (zero files installed would still
+    /// "pass" a run), or a counter that misses a request category.
+    @Test func firstSyncInstallsEveryFileWithTheGeneratedBytes() async throws {
+        let corpus = CorpusSpec(courses: 3, filesPerCourse: 7, modulesPerCourse: 2, fileSize: 3_000)
+        let fixture = try await BenchmarkFixture(corpus: corpus)
+        defer { fixture.remove() }
+
+        let result = try await fixture.automaticRun()
+
+        #expect(result.summary.added == corpus.totalFiles)
+        #expect(result.summary.failures == 0)
+        #expect(result.openConflicts == 0 && result.pendingChanges == 0)
+        let counters = fixture.upstream.counters
+        #expect(counters.siteInfoRequests == 1)
+        #expect(counters.courseListRequests == 1)
+        #expect(counters.contentsRequests == corpus.courses)
+        #expect(counters.downloads == corpus.totalFiles)
+        #expect(counters.otherRequests == 0)
+        #expect(counters.downloadBytes == Int64(corpus.totalFiles) * corpus.fileSize)
+        let key = SyntheticFileKey(course: 2, module: BenchmarkUpstream.moduleID(course: 2, ordinal: 1), name: "lezione-00003.pdf")
+        let installed = try #require(try await fixture.installedURL(for: key))
+        #expect(try sha256(installed) == fixture.upstream.content(of: key).sha256())
+    }
+
+    /// With nothing new on Moodle, a second run lists courses and contents again but downloads
+    /// nothing and never asks for the site info again (the app caches it). This is the request
+    /// profile the "unchanged" benchmark measures.
+    @Test func runWithNothingNewDownloadsNothing() async throws {
+        let fixture = try await BenchmarkFixture(corpus: CorpusSpec(courses: 2, filesPerCourse: 5))
+        defer { fixture.remove() }
+        try await fixture.automaticRun()
+        let before = fixture.upstream.counters
+
+        let result = try await fixture.automaticRun()
+
+        let delta = fixture.upstream.counters.since(before)
+        #expect(result.summary.installed == 0 && result.summary.failures == 0)
+        #expect(delta.siteInfoRequests == 0)
+        #expect(delta.courseListRequests == 1)
+        #expect(delta.contentsRequests == 2)
+        #expect(delta.downloads == 0 && delta.downloadBytes == 0)
+    }
+
+    /// A new revision changes the bytes and the `contenthash`, so the next run downloads and
+    /// installs exactly that file. Guards the "large update" benchmark against measuring a run
+    /// that silently skipped the update.
+    @Test func updatedFileIsDownloadedAgainWithItsNewBytes() async throws {
+        let fixture = try await BenchmarkFixture(corpus: CorpusSpec(courses: 1, filesPerCourse: 3, modulesPerCourse: 1, fileSize: 2_048))
+        defer { fixture.remove() }
+        try await fixture.automaticRun()
+        let key = SyntheticFileKey(course: 1, module: BenchmarkUpstream.moduleID(course: 1, ordinal: 0), name: "lezione-00001.pdf")
+        let original = fixture.upstream.content(of: key).sha256()
+        fixture.upstream.updateFile(key)
+        let updated = fixture.upstream.content(of: key).sha256()
+        #expect(original != updated)
+        let before = fixture.upstream.counters
+
+        let result = try await fixture.automaticRun()
+
+        #expect(result.summary.updated == 1 && result.summary.added == 0)
+        #expect(fixture.upstream.counters.since(before).downloads == 1)
+        #expect(try sha256(try #require(try await fixture.installedURL(for: key))) == updated)
+    }
+
+    /// Two mocks in the same process never see each other's requests: the harness's own tests
+    /// run in parallel, and a shared registry would mix their counters.
+    @Test func parallelUpstreamsAreIsolated() async throws {
+        async let first = BenchmarkFixture(corpus: CorpusSpec(courses: 1, filesPerCourse: 2))
+        async let second = BenchmarkFixture(corpus: CorpusSpec(courses: 2, filesPerCourse: 3))
+        let (a, b) = try await (first, second)
+        defer { a.remove(); b.remove() }
+        async let runA = a.automaticRun()
+        async let runB = b.automaticRun()
+        _ = try await (runA, runB)
+        #expect(a.upstream.counters.downloads == 2)
+        #expect(b.upstream.counters.downloads == 6)
+        #expect(a.upstream.host != b.upstream.host)
+    }
+
+    /// The content is deterministic per seed, differs between seeds, and reads the same however
+    /// it is chunked, across the 1 MiB block boundary too. The SHA the tests compare against is
+    /// computed from these reads, so a chunking bug would make both sides wrong in the same way
+    /// only if this property failed.
+    @Test func syntheticContentIsDeterministicAndChunkIndependent() {
+        let size = Int64(SyntheticContent.maximumBlockSize) * 2 + 12_345
+        let content = SyntheticContent(seed: 42, size: size)
+        #expect(SyntheticContent(seed: 42, size: size).sha256() == content.sha256())
+        #expect(SyntheticContent(seed: 43, size: size).sha256() != content.sha256())
+        var whole = Data()
+        var offset: Int64 = 0
+        while offset < size {
+            let chunk = content.bytes(at: offset, count: 300_007)
+            whole.append(chunk)
+            offset += Int64(chunk.count)
+        }
+        #expect(Int64(whole.count) == size)
+        #expect(SHA256.hash(data: whole).map { String(format: "%02x", $0) }.joined() == content.sha256())
+        #expect(content.bytes(at: size, count: 10).isEmpty)
+        #expect(content.bytes(at: size - 3, count: 10).count == 3)
+    }
+}

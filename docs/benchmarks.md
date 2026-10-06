@@ -1,0 +1,133 @@
+# Benchmarks
+
+The benchmark harness measures BeepBar against the performance budgets in `AGENTS.md`. It runs on
+demand, never as part of the regular `swift test`, and every performance PR uses it for its
+before/after numbers.
+
+## Safety
+
+- **Synthetic data only.**
+  - The corpus is generated: course names, file names, sizes and bytes.
+  - Every run happens in a new temporary folder, holding its own sync folder, its own `sync.sqlite` and its own trash folder. All of it is deleted afterwards.
+- **The user's data is never touched.** That covers:
+  - the WeBeep account and the keychain token (a fixed fake token is used);
+  - `~/Library/Application Support/Beepbar`;
+  - UserDefaults;
+  - the sync folder;
+  - the Trash.
+- **No real network.** Moodle is an in-process mock behind a `URLProtocol`, registered only on the benchmark's own `URLSession` and on a host of the form `<uuid>.bench.beepbar.test`.
+- **The app is never launched.** A locally built Release app shares its bundle id, and with it all the state above, with the installed copy.
+  - The scenarios drive `BeepbarCore` directly.
+  - The idle measurement only watches the installed app, passively.
+
+## Running
+
+```bash
+scripts/benchmark.sh                       # every scenario → PerformanceReports/baseline-<date>/
+scripts/benchmark.sh unchanged --files 15000
+scripts/benchmark.sh large-update --size-mb 512 --runs 5
+scripts/benchmark.sh cancel --fraction 0.5 --rate-mbps 100
+scripts/measure-idle.sh                    # 30 min, the installed Beepbar, passive
+```
+
+`scripts/benchmark.sh`:
+- builds `beepbar-bench` with `swift build -c release --arch arm64`;
+- passes it the current commit, plus `--dirty` when tracked files have uncommitted changes;
+- warns when the Mac is on battery.
+
+`baseline` runs each scenario in its own process, so one scenario's memory high-water mark doesn't colour the next. It writes:
+- one JSON file per scenario;
+- a merged `baseline.json`;
+- `baseline.txt`, the table also printed on screen.
+
+`PerformanceReports/` is git-ignored.
+
+The command exits non-zero when a scenario's checks fail (for example, a "nothing new" run that installed files). A number from a failed scenario measures something else and must not be quoted.
+
+**Comparing numbers** (AGENTS.md):
+- use the Release arm64 build only;
+- run on the same machine and the same power source, plugged in;
+- report the median and p95 of five warm runs (`--runs 5 --warmup 1`, the default).
+
+Every report records the commit, the machine model, the CPU, the memory, the macOS version, the power source, Low Power Mode, the thermal state and the build configuration.
+
+## Scenarios
+
+**`unchanged`: a run with nothing new.**
+- *Budget:* ≤ 50 ms of local work per 1,000 tracked files, no file hashing, no database or disk writes, minimal requests.
+- *Setup:* `--files` files over 10 courses, or one course per 1,000 files above 10,000.
+- *Each run:* repeats the Core work of an automatic check (see "What a run covers") while Moodle has nothing new.
+- *Checks:* nothing installed, no downloads, no failures or conflicts, the same work every run.
+
+**`large-update`: one large file changes on every run.**
+- *Budget:* peak memory independent of file size, throughput bound by the network.
+- *What it reports:* the peak footprint growth during the run, and `fs.bytesHashed` against the file size, i.e. how many times the file was read.
+- *Baseline sizes:* 64 MiB and 256 MiB, so the two peaks can be compared.
+- *Note:* the mock is unthrottled, so throughput here measures the local pipeline, not a network.
+
+**`cancel`: cancel during a large update.**
+- *Budget:* stopped within 1 s at p95, even mid-way through a large file.
+- *Setup:* the mock is throttled (`--rate-mbps`), and the run's task is cancelled once `--fraction` of the file has been sent.
+- *What it reports:* `cancel.latency`, from `Task.cancel()` until the run returns.
+- *Checks:* every run ended cancelled, and the previously installed file still has its exact bytes (SHA-256 compared after every run).
+- *Note:* `--fraction 1` cancels as the last chunk leaves the mock, which is the closest the harness gets to "after the download".
+
+## Counters
+
+Every counter is the change during one run.
+
+| Metric | Source | Meaning |
+|---|---|---|
+| `wall`, `cpu`, `instructions` | `ContinuousClock`, `proc_pid_rusage` | Whole benchmark process: the sync plus the mock (whose answers are pre-rendered to keep its share small) |
+| `disk.written`, `disk.logicalWritten` | `proc_pid_rusage` | Bytes written to storage, and including those still in the page cache |
+| `memory.peakGrowth` | `PeakFootprintSampler` (1 ms) | Highest `phys_footprint` during the run minus the value just before |
+| `db.commits` | SQLite commit hook | Write transactions committed. Each is a WAL append and an `fsync`. An empty transaction, or a write matching no row, still counts |
+| `db.rowChanges` | `sqlite3_total_changes64` | Rows inserted, updated or deleted, identical rewrites included |
+| `db.pagesWritten` | `SQLITE_DBSTATUS_CACHE_WRITE` | WAL frames. An `UPDATE` that leaves a page byte-identical writes none |
+| `fs.filesHashed`, `fs.bytesHashed` | `FileStore.counters()` | Full-content SHA-256 reads, and the bytes they read |
+| `fs.pathLookups` | `FileStore.counters()` | Paths resolved from the sync root before touching a file |
+| `net.*` | mock counters | Requests by kind, metadata bytes, downloaded bytes |
+
+The database and filesystem counters are `package`-level API in `BeepbarCore`. Tests use them to prove properties like "a run with nothing new writes nothing" (`WorkCountersTests` shows what each one counts).
+
+## What a run covers
+
+`BenchmarkFixture.automaticRun` mirrors the Core part of the app's automatic sync (`runAutomaticSync` and `completeSync` in `WeBeepAuthenticationController`), in this order:
+1. Read the enabled courses.
+2. Ask for the site info, only the first time.
+3. List the enrolled courses.
+4. Run a new `SyncCoordinator` in `.automatic` mode with a new `FileStore`.
+5. Read the open conflicts and pending changes.
+
+**Not covered**, because it lives in the app:
+- the keychain read;
+- the UserDefaults writes of the sync state (the last summary and the reconciliation time);
+- notifications;
+- UI updates.
+
+Keep `automaticRun` in step with the app when that sequence changes.
+
+## Idle
+
+`scripts/measure-idle.sh [minutes]` finds the Beepbar running from `/Applications` and samples it with `proc_pid_rusage` every minute (`beepbar-bench idle --pid`).
+- *What it reports:* average CPU, wakeups per second, disk writes and footprint growth.
+- *Network:* it adds the process's bytes from two `nettop` snapshots. This is best effort: a process with no traffic is simply missing from `nettop`'s list.
+- *Before measuring:* close BeepBar's window and leave the Mac alone. An automatic check that falls inside the window is expected and shows up as one burst.
+
+## Profiling
+
+The scenarios run the same code paths as the app, so the `PerformanceTrace` signposts (subsystem `io.github.tvaccari.beepbar.performance`, categories `sync`, `database`, `filesystem`, …) show up when `beepbar-bench` runs under Instruments:
+
+```bash
+xcrun xctrace record --template 'Time Profiler' --launch -- "$(swift build -c release --arch arm64 --show-bin-path)/beepbar-bench" unchanged --files 15000
+```
+
+The `Beepbar-Profile` scheme profiles the app itself. Never use it to launch a local build: it would share the installed app's data.
+
+## Extending
+
+Add a scenario to `Scenarios` with its own checks, register it in `Sources/BeepbarBenchmarks/main.swift` (and in `baseline` if it belongs to the standard set), and give it a small smoke test in `BenchmarkKitTests`.
+- New request types belong in `BenchmarkUpstream`.
+- New counters belong in Core, with a test in `WorkCountersTests` proving what they count.
+
+Extend the harness rather than writing one-off scripts.

@@ -11,9 +11,56 @@ public enum SyncDatabaseError: Error, Sendable, Equatable {
 
 private final class SQLiteHandle: @unchecked Sendable {
     let pointer: OpaquePointer?
+    /// Write transactions this connection committed, counted by SQLite's commit hook. Owned here so
+    /// it lives exactly as long as the connection the hook belongs to: `sqlite3_close` runs in
+    /// `deinit`, before the stored properties are released.
+    let commits = CommitCounter()
 
-    init(_ pointer: OpaquePointer?) { self.pointer = pointer }
+    init(_ pointer: OpaquePointer?) {
+        self.pointer = pointer
+        // A commit hook only observes: returning 0 lets every commit through. It fires for each
+        // committed write transaction, including an explicit one that changed no row and a write
+        // statement that matched none, and never for reads. Unlike `sqlite3_wal_hook`, it doesn't
+        // replace the WAL auto-checkpoint, so counting changes nothing about how the database runs.
+        sqlite3_commit_hook(pointer, { context in
+            Unmanaged<CommitCounter>.fromOpaque(context!).takeUnretainedValue().value += 1
+            return 0
+        }, Unmanaged.passUnretained(commits).toOpaque())
+    }
     deinit { sqlite3_close(pointer) }
+}
+
+/// Only touched from inside `sqlite3_step`, on the `SyncDatabase` actor that owns the connection.
+private final class CommitCounter: @unchecked Sendable {
+    var value = 0
+}
+
+/// How much one `SyncDatabase` connection has written since it opened, for the benchmark harness and
+/// for tests that prove a run wrote nothing. Three separate measures, because they answer different
+/// questions:
+/// - `rowChanges` (`sqlite3_total_changes64`): rows inserted, updated or deleted, including an update
+///   that rewrote a row with the same values and rows of a transaction later rolled back.
+/// - `commits`: write transactions committed, each one a WAL append and, with `synchronous = FULL`,
+///   an `fsync`. An empty `BEGIN IMMEDIATE … COMMIT` or an `UPDATE` matching no row still counts.
+/// - `pagesWritten` (`SQLITE_DBSTATUS_CACHE_WRITE`): database pages written to the WAL, i.e. WAL
+///   frames. SQLite doesn't dirty a page an `UPDATE` leaves byte-identical, so an identical update
+///   counts a row change and a commit without a page (an identical upsert still writes one).
+/// `PRAGMA data_version` would not do: it ignores the connection's own commits.
+package struct SyncDatabaseWriteCounters: Sendable, Equatable, Codable {
+    package var rowChanges: Int64
+    package var commits: Int
+    package var pagesWritten: Int
+
+    package init(rowChanges: Int64 = 0, commits: Int = 0, pagesWritten: Int = 0) {
+        self.rowChanges = rowChanges
+        self.commits = commits
+        self.pagesWritten = pagesWritten
+    }
+
+    /// What was written between `earlier` and `self`, both read from the same connection.
+    package func since(_ earlier: SyncDatabaseWriteCounters) -> SyncDatabaseWriteCounters {
+        SyncDatabaseWriteCounters(rowChanges: rowChanges - earlier.rowChanges, commits: commits - earlier.commits, pagesWritten: pagesWritten - earlier.pagesWritten)
+    }
 }
 
 /// Advances `statement` by one row: `true` on `SQLITE_ROW`, `false` on `SQLITE_DONE`. Any other result
@@ -74,6 +121,15 @@ public actor SyncDatabase {
 
     public func migrate() throws {
         try Self.migrate(database)
+    }
+
+    /// Everything this connection has written since it opened, opening migrations included; take
+    /// the difference of two readings (`since`) to measure one operation.
+    package func writeCounters() -> SyncDatabaseWriteCounters {
+        var pages: Int32 = 0
+        var highwater: Int32 = 0
+        sqlite3_db_status(database, SQLITE_DBSTATUS_CACHE_WRITE, &pages, &highwater, 0)
+        return SyncDatabaseWriteCounters(rowChanges: sqlite3_total_changes64(database), commits: handle.commits.value, pagesWritten: Int(pages))
     }
 
     public func registerRoot(id: UUID, canonicalPath: String, securityBookmark: Data? = nil) throws {

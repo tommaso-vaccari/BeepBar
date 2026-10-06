@@ -9,6 +9,28 @@ import Testing
 /// elsewhere still run alongside, hence the margins.
 @Suite(.serialized)
 struct MemoryMeasurementTests {
+    // The large-file tests (this one, and hashing and copying below) guard the "peak memory
+    // independent of file size" budget (AGENTS.md) against FileStore keeping every chunk it reads
+    // alive until the call returns, which made a 256 MiB update peak at about 1 GiB. Each uses a
+    // file large enough that holding it would blow far past the margin, which itself leaves room
+    // for the suites sharing this process.
+
+    /// A whole automatic run that downloads and installs a new version of a large file stays
+    /// flat end to end: download, staging, the five reads of the file and the install. Guards
+    /// against a path outside FileStore's chunk loop holding the file again. Declared first so the
+    /// serialized suite runs it before the others: if an earlier test failed, what it left alive
+    /// would raise `before`, and this run could reuse that memory without its peak ever rising
+    /// above it.
+    @Test func updatingALargeFileKeepsMemoryFlat() async throws {
+        let before = PeakFootprintSampler.footprint()
+
+        let result = try await Scenarios.largeUpdate(size: Self.largeFileSize, runs: 1, warmup: 0)
+
+        #expect(result.checks.values.allSatisfy { $0 }, "\(result.checks)")
+        let peak = try #require(result.samples.first?.peakFootprint)
+        #expect(Int64(peak) - Int64(before) < Self.margin, "peak grew by \((Int64(peak) - Int64(before)) >> 20) MiB updating a \(Self.largeFileSize >> 20) MiB file")
+    }
+
     /// The sampler catches a peak that is gone by the time it stops: a before/after reading would
     /// report zero growth for a download that briefly held the whole file in memory. The buffer is
     /// mapped and unmapped directly so its pages leave the footprint at once; with `malloc` the
@@ -57,11 +79,6 @@ struct MemoryMeasurementTests {
         #expect(Int64(peak) - Int64(before) < 80 << 20, "peak grew by \((Int64(peak) - Int64(before)) >> 20) MiB for a \(size >> 20) MiB stream")
     }
 
-    // The three tests below guard the "peak memory independent of file size" budget (AGENTS.md)
-    // against FileStore keeping every chunk it reads alive until the call returns, which made a
-    // 256 MiB update peak at about 1 GiB. Each uses a file large enough that holding it would blow
-    // far past the margin, which itself leaves room for the suites sharing this process.
-
     /// Hashing a large file holds one chunk at a time. Guards the chunk loop in
     /// `FileStore.hashContents`: without a pool per chunk, the 192 MiB read stays in memory.
     @Test func hashingALargeFileKeepsMemoryFlat() async throws {
@@ -97,19 +114,6 @@ struct MemoryMeasurementTests {
         #expect(staged.size == Self.largeFileSize)
         try await store.discard(staged)
         #expect(Int64(peak) - Int64(before) < Self.margin, "peak grew by \((Int64(peak) - Int64(before)) >> 20) MiB copying a \(Self.largeFileSize >> 20) MiB file")
-    }
-
-    /// A whole automatic run that downloads and installs a new version of a large file stays
-    /// flat end to end: download, staging, the five reads of the file and the install. Guards
-    /// against a path outside FileStore's chunk loop holding the file again.
-    @Test func updatingALargeFileKeepsMemoryFlat() async throws {
-        let before = PeakFootprintSampler.footprint()
-
-        let result = try await Scenarios.largeUpdate(size: Self.largeFileSize, runs: 1, warmup: 0)
-
-        #expect(result.checks.values.allSatisfy { $0 }, "\(result.checks)")
-        let peak = try #require(result.samples.first?.peakFootprint)
-        #expect(Int64(peak) - Int64(before) < Self.margin, "peak grew by \((Int64(peak) - Int64(before)) >> 20) MiB updating a \(Self.largeFileSize >> 20) MiB file")
     }
 
     private static let largeFileSize: Int64 = 192 << 20

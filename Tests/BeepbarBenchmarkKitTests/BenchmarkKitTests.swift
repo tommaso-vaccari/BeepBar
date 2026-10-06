@@ -30,13 +30,17 @@ struct BenchmarkKitTests {
         let clock = ContinuousClock()
         let start = clock.now
         var value: UInt64 = 1
-        while clock.now - start < .milliseconds(200) { value = value &* 6_364_136_223_846_793_005 &+ 1 }
+        // Until this thread has had 200 ms of CPU, not 200 ms of wall time: on a crowded runner
+        // the thread may get far less CPU than wall time.
+        while clock_gettime_nsec_np(CLOCK_THREAD_CPUTIME_ID) - threadBefore < 200_000_000, clock.now - start < .seconds(10) {
+            for _ in 0..<1_000 { value = value &* 6_364_136_223_846_793_005 &+ 1 }
+        }
         #expect(value != 0)
         let thread = Double(clock_gettime_nsec_np(CLOCK_THREAD_CPUTIME_ID) - threadBefore)
         let wall = clock.now - start
         let elapsed = Double(wall.components.seconds) * 1e9 + Double(wall.components.attoseconds) / 1e9
         let process = Double(try #require(ResourceUsage.current()).since(before).cpuNanoseconds)
-        #expect(thread > 150e6, "the busy loop ran \(thread / 1e6) ms on its thread")
+        try #require(thread >= 200e6, "the busy loop only got \(thread / 1e6) ms of CPU in 10 s")
         #expect(process >= thread * 0.95, "process \(process / 1e6) ms < thread \(thread / 1e6) ms")
         #expect(process <= elapsed * Double(ProcessInfo.processInfo.activeProcessorCount) * 1.2 + 50e6, "process \(process / 1e6) ms in \(elapsed / 1e6) ms of wall time")
     }
@@ -129,6 +133,7 @@ struct BenchmarkKitTests {
         let size: Int64 = 8 << 20
         let result = try await Scenarios.cancel(size: size, fraction: 0.5, bytesPerSecond: 16 << 20, runs: 2, warmup: 0)
         #expect(result.passed, "\(result.checks) \(result.samples.map(\.outcome))")
+        #expect(result.checks["cancelled before the download finished"] == true)
         for sample in result.samples {
             #expect(sample.upstream.downloadBytes < size)
             let latency = try #require(sample.cancelLatencyMilliseconds)

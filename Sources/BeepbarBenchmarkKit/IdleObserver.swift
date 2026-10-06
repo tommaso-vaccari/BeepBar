@@ -25,8 +25,9 @@ package struct IdleObservation: Sendable, Codable {
     /// Average CPU over the observation, as a share of one core (0.01 = 1%).
     package var averageCPU: Double { durationSeconds > 0 ? Double(total.cpuNanoseconds) / (durationSeconds * 1e9) : 0 }
 
-    /// Wakeups per second, idle plus interrupt.
-    package var wakeupsPerSecond: Double { durationSeconds > 0 ? Double(total.idleWakeups + total.interruptWakeups) / durationSeconds : 0 }
+    /// Interrupt wakeups per second. Idle wakeups aren't added: XNU credits each one as an
+    /// interrupt wakeup too, so they are a subset.
+    package var wakeupsPerSecond: Double { durationSeconds > 0 ? Double(total.interruptWakeups) / durationSeconds : 0 }
 
     /// The lines `beepbar-bench idle` prints, against the idle budget in AGENTS.md. Network bytes
     /// aren't in `proc_pid_rusage`; `scripts/measure-idle.sh` adds them from `nettop`.
@@ -34,7 +35,7 @@ package struct IdleObservation: Sendable, Codable {
         [
             String(format: "pid %d · %.0f s%@", pid, durationSeconds, completed ? "" : " · process exited early"),
             String(format: "average CPU      %.3f%% of one core (%.1f ms total)", averageCPU * 100, Double(total.cpuNanoseconds) / 1e6),
-            String(format: "wakeups          %llu idle, %llu interrupt (%.2f/s)", total.idleWakeups, total.interruptWakeups, wakeupsPerSecond),
+            String(format: "wakeups          %llu (%.2f/s), %llu of them from package idle", total.interruptWakeups, wakeupsPerSecond, total.idleWakeups),
             "disk written     \(total.diskBytesWritten) bytes (logical \(total.logicalBytesWritten))",
             String(format: "footprint        %+.1f MiB (peak %.1f MiB)", Double(footprintGrowth) / 1_048_576, Double(peakFootprint) / 1_048_576),
         ].joined(separator: "\n")

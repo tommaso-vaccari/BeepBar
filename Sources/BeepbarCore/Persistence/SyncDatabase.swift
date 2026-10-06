@@ -100,9 +100,8 @@ public actor SyncDatabase {
         // going down. Commits don't ask for `F_FULLFSYNC` (`PRAGMA fullfsync` stays off; only
         // checkpoints use it, `checkpoint_fullfsync` being on in the system build), and
         // `FileStore` uses plain `fsync`, so on macOS the drive's own cache can still reorder
-        // writes on sudden power loss. A run with nothing new writes no WAL frame (the benchmark
-        // harness measures one empty commit per run, `docs/benchmarks.md`), so FULL costs it
-        // nothing. An explicit `synchronous` holds after switching to WAL, so the order of these
+        // writes on sudden power loss. A run with nothing new writes no WAL frame, and a commit
+        // that wrote nothing doesn't sync, so FULL costs it nothing. An explicit `synchronous` holds after switching to WAL, so the order of these
         // two pragmas doesn't matter.
         try Self.execute(database, "PRAGMA synchronous = FULL")
         try Self.migrate(database)

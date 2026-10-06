@@ -16,8 +16,10 @@ package struct ResourceUsage: Sendable, Codable, Equatable {
     package var logicalBytesWritten: UInt64
     /// Memory charged to the process (Activity Monitor's "Memory").
     package var physFootprint: UInt64
-    /// Wakeups from idle: what keeps a laptop's CPU from staying asleep.
+    /// Wakeups that brought a package out of idle: what keeps a laptop's CPU from staying asleep.
+    /// A subset of `interruptWakeups` (XNU counts them in both).
     package var idleWakeups: UInt64
+    /// Every time a thread of the process was woken by an interrupt (a timer, I/O).
     package var interruptWakeups: UInt64
 
     package init(cpuNanoseconds: UInt64 = 0, instructions: UInt64 = 0, cycles: UInt64 = 0, diskBytesRead: UInt64 = 0, diskBytesWritten: UInt64 = 0, logicalBytesWritten: UInt64 = 0, physFootprint: UInt64 = 0, idleWakeups: UInt64 = 0, interruptWakeups: UInt64 = 0) {

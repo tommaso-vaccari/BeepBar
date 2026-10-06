@@ -119,6 +119,7 @@ package final class BenchmarkUpstream: @unchecked Sendable {
         var chunkSize = 256 * 1024
         var bytesPerSecond: Int64?
         var progress: (@Sendable (SyntheticFileKey, Int64, Int64) -> Void)?
+        var stallTimeout: Duration = .seconds(30)
     }
 
     package init() {
@@ -203,10 +204,12 @@ package final class BenchmarkUpstream: @unchecked Sendable {
     // MARK: Downloads
 
     /// Bytes per chunk handed to the client, and an optional throughput cap. A cap makes a large
-    /// download last long enough for a cancel to land midway, like a real network.
-    package func configureDownloads(chunkSize: Int = 256 * 1024, bytesPerSecond: Int64? = nil) {
+    /// download last long enough for a cancel to land midway, like a real network. A client that
+    /// takes nothing in for `stallTimeout` gets the download failed with `.timedOut`, as a server
+    /// would drop a stalled connection, instead of a mock thread waiting on it forever.
+    package func configureDownloads(chunkSize: Int = 256 * 1024, bytesPerSecond: Int64? = nil, stallTimeout: Duration = .seconds(30)) {
         precondition(chunkSize > 0)
-        settings.withLock { $0.chunkSize = chunkSize; $0.bytesPerSecond = bytesPerSecond }
+        settings.withLock { $0.chunkSize = chunkSize; $0.bytesPerSecond = bytesPerSecond; $0.stallTimeout = stallTimeout }
     }
 
     /// Called on the server's thread after each chunk with the bytes sent so far and the file size.
@@ -223,8 +226,8 @@ package final class BenchmarkUpstream: @unchecked Sendable {
         case stream(key: SyntheticFileKey, content: SyntheticContent)
     }
 
-    var downloadSettings: (chunkSize: Int, bytesPerSecond: Int64?, progress: (@Sendable (SyntheticFileKey, Int64, Int64) -> Void)?) {
-        settings.withLock { ($0.chunkSize, $0.bytesPerSecond, $0.progress) }
+    var downloadSettings: (chunkSize: Int, bytesPerSecond: Int64?, progress: (@Sendable (SyntheticFileKey, Int64, Int64) -> Void)?, stallTimeout: Duration) {
+        settings.withLock { ($0.chunkSize, $0.bytesPerSecond, $0.progress, $0.stallTimeout) }
     }
 
     func recordDownloadBytes(_ count: Int) {
@@ -389,7 +392,9 @@ final class BenchmarkURLProtocol: URLProtocol, @unchecked Sendable {
             client?.urlProtocol(self, didReceive: response, cacheStoragePolicy: .notAllowed)
             let settings = upstream.downloadSettings
             // GCD, not a Swift task: the throttle sleeps, and a sleeping cooperative thread would
-            // starve the app code being measured.
+            // starve the app code being measured. Apple documents calling the client from the
+            // thread that called `startLoading`; URLSession tolerates other threads in practice
+            // (no failure in the harness's runs), and a run loop here would add work to measure.
             DispatchQueue.global(qos: .userInitiated).async { [self] in
                 let clock = ContinuousClock()
                 let start = clock.now
@@ -401,8 +406,17 @@ final class BenchmarkURLProtocol: URLProtocol, @unchecked Sendable {
                     // it, and `memory.peak` measures that queue instead of the app (measured:
                     // a 256 MiB stream grew the footprint by ~700 MiB when other work competed).
                     // Guarded by `streamingThroughTheMockKeepsMemoryFlat`.
+                    var lastReceived: Int64 = -1
+                    var progressAt = clock.now
                     while let task, sent - task.countOfBytesReceived > BenchmarkUpstream.downloadWindow {
                         if stopped.withLock({ $0 }) { return }
+                        if task.countOfBytesReceived != lastReceived {
+                            lastReceived = task.countOfBytesReceived
+                            progressAt = clock.now
+                        } else if clock.now - progressAt > settings.stallTimeout {
+                            client?.urlProtocol(self, didFailWithError: URLError(.timedOut))
+                            return
+                        }
                         Thread.sleep(forTimeInterval: 0.0002)
                     }
                     if stopped.withLock({ $0 }) { return }

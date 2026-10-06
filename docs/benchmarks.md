@@ -9,6 +9,7 @@ only runs its own tests and a tiny run of each scenario, about a second in all.
 - **Synthetic data only.**
   - The corpus is generated: course names, file names, sizes and bytes.
   - Every run happens in a new temporary folder, holding its own sync folder, its own `sync.sqlite` and its own trash folder. All of it is deleted afterwards.
+  - Download bodies stream to the downloader's own temporary files (`$TMPDIR/Beepbar-download-*`), as in the app, and are removed when each download ends.
 - **The user's data is never touched.** That covers:
   - the WeBeep account and the keychain token (a fixed fake token is used);
   - `~/Library/Application Support/Beepbar`;
@@ -70,7 +71,7 @@ Every report records the commit, the machine model, the CPU, the memory, the mac
 - *Budget:* stopped within 1 s at p95, even mid-way through a large file.
 - *Setup:* the mock is throttled (`--rate-mbps`), and the run's task is cancelled once `--fraction` of the file has been sent.
 - *What it reports:* `cancel.latency`, from `Task.cancel()` until the run returns.
-- *Checks:* every run ended cancelled, and the previously installed file still has its exact bytes (SHA-256 compared after every run).
+- *Checks:* every run ended cancelled, before the whole file was sent when `--fraction` is below 1, and the previously installed file still has its exact bytes (SHA-256 compared after every run).
 - *Note:* `--fraction 1` cancels as the last chunk leaves the mock, which is the closest the harness gets to "after the download".
 
 ## Counters
@@ -79,9 +80,9 @@ Every counter is the change during one run.
 
 | Metric | Source | Meaning |
 |---|---|---|
-| `wall`, `cpu`, `instructions` | `ContinuousClock`, `proc_pid_rusage` | Whole benchmark process: the sync plus the mock (whose answers are pre-rendered to keep its share small) |
+| `wall`, `cpu`, `instructions` | `ContinuousClock`, `proc_pid_rusage` | Whole benchmark process: the sync plus the mock (answers pre-rendered, a 0.2 ms poll while a download waits on its flow-control window) and the 1 ms footprint sampler, both small next to the sync |
 | `disk.written`, `disk.logicalWritten` | `proc_pid_rusage` | Bytes written to storage, and including those still in the page cache |
-| `memory.peak`, `memory.peakGrowth` | `PeakFootprintSampler` (1 ms) | Highest `phys_footprint` of the process during the run, and that minus the value just before. Compare `memory.peak` across file sizes: the allocator keeps memory a previous run freed, so the growth alone is noisy |
+| `memory.peak`, `memory.peakGrowth` | `PeakFootprintSampler` (1 ms) | Highest `phys_footprint` of the process during the run, and that minus the value just before. Compare `memory.peak` across file sizes. `memory.peakGrowth` reads near zero after a warm-up even when a run needs hundreds of MiB, because the allocator keeps what the previous run freed |
 | `db.commits` | SQLite commit hook | Write transactions committed. An empty transaction, or a write matching no row, still counts. Only commits that wrote pages (`db.pagesWritten`) append to the WAL and wait for an `fsync` |
 | `db.rowChanges` | `sqlite3_total_changes64` | Rows inserted, updated or deleted, identical rewrites included |
 | `db.pagesWritten` | `SQLITE_DBSTATUS_CACHE_WRITE` | WAL frames. An `UPDATE` that leaves a page byte-identical writes none |
@@ -112,7 +113,7 @@ Keep `automaticRun` in step with the app when that sequence changes.
 ## Idle
 
 `scripts/measure-idle.sh [minutes]` finds the Beepbar running from `/Applications` and samples it with `proc_pid_rusage` every minute (`beepbar-bench idle --pid`).
-- *What it reports:* average CPU, wakeups per second, disk writes and footprint growth.
+- *What it reports:* average CPU, interrupt wakeups per second (with how many brought the CPU out of idle), disk writes and footprint growth.
 - *Network:* `nettop` samples the process's open connections every second for the whole window, and each connection counts the most bytes it was seen with, minus what it had moved before the window. `nettop` forgets a connection once it closes, so two snapshots would read 0 after a check that came and went. A connection opened and closed between two samples is still missed, so the number is a lower bound, printed with the count of connections seen.
 - *Before measuring:* close BeepBar's window and leave the Mac alone. An automatic check that falls inside the window is expected and shows up as one burst.
 

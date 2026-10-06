@@ -8,8 +8,9 @@ package struct RunSample: Sendable, Codable {
     /// CPU, disk and wakeups of the whole benchmark process: the sync plus the mock server, whose
     /// own share is kept small by pre-rendered answers (see `BenchmarkUpstream`).
     package var resources: ResourceUsage
-    /// Highest footprint during the run minus the footprint just before it. Noisy on its own: the
-    /// allocator keeps memory a previous run freed, so a run can peak without growing.
+    /// Highest footprint during the run minus the footprint just before it. Misleading after a
+    /// warm-up: the allocator keeps what earlier runs freed, so a run that needs as much memory as
+    /// the previous one reads near zero. Compare `peakFootprint` instead.
     package var peakFootprintGrowth: Int64
     /// Highest footprint of the whole process during the run: the number to compare across file
     /// sizes when checking that memory doesn't grow with the file.
@@ -237,9 +238,9 @@ package enum Scenarios {
             if index >= warmup { samples.append(sample) }
         }
         let checks = [
-            "every run cancelled mid-transfer": samples.allSatisfy { $0.outcome == "cancelled" },
+            "every run cancelled": samples.allSatisfy { $0.outcome == "cancelled" },
             "local file preserved": samples.allSatisfy { $0.localFilePreserved == true },
-        ]
+        ].merging(fraction < 1 ? ["cancelled before the download finished": samples.allSatisfy { $0.upstream.downloadBytes < size }] : [:]) { $1 }
         return ScenarioResult(
             name: "cancel", parameters: ["size": "\(size)", "fraction": "\(fraction)", "bytesPerSecond": "\(bytesPerSecond)"],
             warmupRuns: warmup, samples: samples, checks: checks,

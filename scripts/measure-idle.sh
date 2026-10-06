@@ -25,18 +25,24 @@ bench="$(swift build -c release --arch arm64 --show-bin-path)/beepbar-bench"
 # stopped.
 flows="$(mktemp -t beepbar-idle-nettop)"
 (
-    while kill -0 "$pid" 2>/dev/null; do
+    while kill -0 "$pid" 2>/dev/null && kill -0 $$ 2>/dev/null; do
         nettop -p "$pid" -L 1 -x -n -J bytes_in,bytes_out 2>/dev/null || true
         sleep 1
     done
 ) > "$flows" &
 sampler_pid=$!
-trap 'kill $sampler_pid 2>/dev/null; rm -f "$flows"' EXIT
+# zsh skips the EXIT trap when a signal ends the script, so Ctrl-C needs its own: without it the
+# sampler would keep polling Beepbar until Beepbar quits, and the log would keep growing.
+cleanup() { kill $sampler_pid 2>/dev/null || true; rm -f "$flows"; }
+trap cleanup EXIT
+trap 'cleanup; trap - EXIT; exit 130' INT TERM HUP
 
 mkdir -p PerformanceReports
 report="PerformanceReports/idle-$(date +%Y-%m-%dT%H-%M-%S).json"
 print -u2 "pid $pid · $(pmset -g batt | head -1)"
-"$bench" idle --pid "$pid" --minutes "$minutes" --json "$report"
+# Exits 1 when Beepbar quits during the window; the network bytes up to then are still printed.
+bench_status=0
+"$bench" idle --pid "$pid" --minutes "$minutes" --json "$report" || bench_status=$?
 kill $sampler_pid 2>/dev/null || true
 wait $sampler_pid 2>/dev/null || true
 
@@ -56,3 +62,4 @@ awk -F, '
         printf "network          ≥ %d bytes in, ≥ %d bytes out over %d connections (%d nettop samples, lower bound)\n", tin, tout, n, sample
     }' "$flows"
 print "JSON: $report"
+exit $bench_status

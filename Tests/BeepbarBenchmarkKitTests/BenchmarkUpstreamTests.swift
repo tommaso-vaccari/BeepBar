@@ -115,6 +115,25 @@ struct BenchmarkUpstreamTests {
         #expect(upstream.counters.requests == 0)
     }
 
+    /// A client that stops taking data in without cancelling gets the download failed with
+    /// `.timedOut` once the stall lasts `stallTimeout`, instead of leaving a mock thread polling
+    /// (and keeping the mock alive) forever.
+    @Test func stalledClientTimesOut() async throws {
+        let upstream = BenchmarkUpstream()
+        upstream.configureDownloads(stallTimeout: .milliseconds(300))
+        let key = upstream.addFile(course: 1, name: "grande.bin", size: 32 << 20)
+        let url = URL(string: "https://\(upstream.host)/webservice/pluginfile.php/1/mod_folder/content/\(key.module)/\(key.name)")!
+        let stalled = StalledDownload()
+        let clock = ContinuousClock()
+        let start = clock.now
+
+        let error = await stalled.run(url, session: upstream.session)
+
+        #expect((error as? URLError)?.code == .timedOut, "\(String(describing: error))")
+        #expect(clock.now - start < .seconds(10))
+        #expect(upstream.counters.downloadBytes < 32 << 20)
+    }
+
     /// The content is deterministic per seed, differs between seeds, and reads the same however
     /// it is chunked, across the 1 MiB block boundary too. The SHA the tests compare against is
     /// computed from these reads, so a chunking bug would make both sides wrong in the same way
@@ -135,5 +154,34 @@ struct BenchmarkUpstreamTests {
         #expect(SHA256.hash(data: whole).map { String(format: "%02x", $0) }.joined() == content.sha256())
         #expect(content.bytes(at: size, count: 10).isEmpty)
         #expect(content.bytes(at: size - 3, count: 10).count == 3)
+    }
+}
+
+/// Takes the first chunk and then holds the delegate queue for a second, as a client stuck on a
+/// slow disk would; returns the error the download ended with.
+private final class StalledDownload: NSObject, URLSessionDataDelegate, @unchecked Sendable {
+    private let lock = NSLock()
+    private var continuation: CheckedContinuation<Error?, Never>?
+    private var stalled = false
+
+    func run(_ url: URL, session: URLSession) async -> Error? {
+        await withCheckedContinuation { continuation in
+            lock.withLock { self.continuation = continuation }
+            let task = session.dataTask(with: url)
+            task.delegate = self
+            task.resume()
+        }
+    }
+
+    func urlSession(_ session: URLSession, dataTask: URLSessionDataTask, didReceive data: Data) {
+        let first = lock.withLock { () -> Bool in defer { stalled = true }; return !stalled }
+        // Hold the queue once, well past the stall timeout. Without the timeout the download would
+        // simply resume afterwards and finish without an error.
+        if first { Thread.sleep(forTimeInterval: 1) }
+    }
+
+    func urlSession(_ session: URLSession, task: URLSessionTask, didCompleteWithError error: Error?) {
+        let pending = lock.withLock { () -> CheckedContinuation<Error?, Never>? in defer { continuation = nil }; return continuation }
+        pending?.resume(returning: error)
     }
 }

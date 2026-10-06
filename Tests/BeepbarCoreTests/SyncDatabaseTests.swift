@@ -315,8 +315,8 @@ struct ReadCase: Sendable, CustomTestStringConvertible {
     ]
 }
 
-/// A second, independent connection to the same file, used to change the database behind `SyncDatabase`'s back.
-private final class RawSQLite {
+/// A second, independent connection to the same file, used to change or read the database behind `SyncDatabase`'s back.
+final class RawSQLite {
     struct Failure: Error { let message: String }
 
     private var handle: OpaquePointer?

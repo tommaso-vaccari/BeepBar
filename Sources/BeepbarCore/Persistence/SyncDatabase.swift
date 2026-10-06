@@ -133,8 +133,15 @@ public actor SyncDatabase {
         return SyncDatabaseWriteCounters(rowChanges: sqlite3_total_changes64(database), commits: handle.commits.value, pagesWritten: Int(pages))
     }
 
+    /// Records the sync folder, or brings its row up to date. Called on every launch (before
+    /// recovery), on every recovery retry and when a folder is chosen, almost always with the
+    /// values already stored. The `WHERE` makes that case write no page: SQLite rewrites a row an
+    /// upsert matches even when nothing changes, so without it each launch appended a WAL frame
+    /// and, under `synchronous = FULL`, waited for an `fsync`. It still commits an empty write
+    /// transaction, which costs a lock round trip but no frame and no `fsync`. `IS NOT`, not `!=`:
+    /// with `!=`, a bookmark added or removed would compare as NULL and the change would be lost.
     public func registerRoot(id: UUID, canonicalPath: String, securityBookmark: Data? = nil) throws {
-        try withStatement("INSERT INTO roots(id, canonical_path, security_bookmark) VALUES (?, ?, ?) ON CONFLICT(id) DO UPDATE SET canonical_path = excluded.canonical_path, security_bookmark = excluded.security_bookmark") { statement in
+        try withStatement("INSERT INTO roots(id, canonical_path, security_bookmark) VALUES (?, ?, ?) ON CONFLICT(id) DO UPDATE SET canonical_path = excluded.canonical_path, security_bookmark = excluded.security_bookmark WHERE canonical_path IS NOT excluded.canonical_path OR security_bookmark IS NOT excluded.security_bookmark") { statement in
             try bind(id.uuidString, to: statement, index: 1)
             try bind(canonicalPath, to: statement, index: 2)
             if let securityBookmark {

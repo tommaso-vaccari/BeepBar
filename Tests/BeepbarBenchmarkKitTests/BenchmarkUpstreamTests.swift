@@ -39,8 +39,9 @@ struct BenchmarkUpstreamTests {
     }
 
     /// With nothing new on Moodle, a second run lists courses and contents again but downloads
-    /// nothing and never asks for the site info again (the app caches it). This is the request
-    /// profile the "unchanged" benchmark measures.
+    /// nothing and never asks for the site info again (the app caches it), and its metadata bytes
+    /// are counted the same every time. This is the request profile the "unchanged" benchmark
+    /// measures; a `net.metadata` stuck at zero would hide a regression in response size.
     @Test func runWithNothingNewDownloadsNothing() async throws {
         let fixture = try await BenchmarkFixture(corpus: CorpusSpec(courses: 2, filesPerCourse: 5))
         defer { fixture.remove() }
@@ -55,6 +56,12 @@ struct BenchmarkUpstreamTests {
         #expect(delta.courseListRequests == 1)
         #expect(delta.contentsRequests == 2)
         #expect(delta.downloads == 0 && delta.downloadBytes == 0)
+        // The metadata of a run with nothing new is exactly what the client receives: the course
+        // list and each course's contents, re-rendered the same way every time.
+        #expect(delta.metadataBytes > 0)
+        let again = fixture.upstream.counters
+        try await fixture.automaticRun()
+        #expect(fixture.upstream.counters.since(again).metadataBytes == delta.metadataBytes)
     }
 
     /// A new revision changes the bytes and the `contenthash`, so the next run downloads and

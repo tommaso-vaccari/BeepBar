@@ -32,11 +32,11 @@ private final class FakeLoginItemService: LoginItemService, @unchecked Sendable 
     /// lets a test hold a change in flight.
     let registerGate: DispatchSemaphore?
     /// How long a held call waits for the test to release it, and how long `waitUntil` waits for
-    /// the fake to be reached. It must outlast any stall of a busy CI runner: with 2 s, the CI run
-    /// of PR #76 woke the test ~2.7 s late, the gate let the "in-flight" change finish on its own,
-    /// and `aRefreshDuringAChangeLeavesTheStatusToTheChange` counted one read too many. Still
-    /// bounded, so a test that never releases fails instead of hanging; correct code never waits
-    /// for it.
+    /// the fake to be reached: only an upper bound, so a test that never releases fails instead of
+    /// hanging. Correct code never waits for it. The 30 s stall on dev's CI after PR #79 came from
+    /// the controller blocking Swift's cooperative pool with these held calls, and the 2 s one on
+    /// PR #76's CI most likely did too; `LaunchAtLoginController.callMacOS` now runs them on GCD,
+    /// and `callsHeldByMacOSDoNotStarveOtherAsyncWork` guards that.
     static let toleranceSeconds = 30
 
     init(status: LoginItemStatus, registerOutcome: RegisterOutcome = .enable, failUnregister: Bool = false, registerGate: DispatchSemaphore? = nil) {
@@ -411,8 +411,6 @@ private final class FakeLoginItemService: LoginItemService, @unchecked Sendable 
         #expect(controller.status == .requiresApproval)
     }
 
-    /// Every call into macOS (status reads, register, unregister) is a blocking XPC call: across
-    /// launch, Settings, both changes and a refresh, none may run on the main thread.
     /// Holds one more registration in flight than Swift's cooperative pool has threads (one per
     /// core), each from its own controller, and checks that all of them reach macOS before any is
     /// released. Guards against running the blocking calls in `Task.detached`: there the held calls
@@ -432,6 +430,8 @@ private final class FakeLoginItemService: LoginItemService, @unchecked Sendable 
         #expect(controllers.allSatisfy { $0.status == .enabled })
     }
 
+    /// Every call into macOS (status reads, register, unregister) is a blocking XPC call: across
+    /// launch, Settings, both changes and a refresh, none may run on the main thread.
     @Test func macOSIsNeverCalledOnTheMainThread() async {
         let service = FakeLoginItemService(status: .notRegistered)
         let controller = await launch(service)

@@ -10,6 +10,8 @@
 
 ### Fixed
 
+- "Esci" in the menu bar no longer leaves BeepBar stuck when a sync is running: the sync stops and BeepBar closes within a few seconds.
+
 - Automatic sync no longer fails with "Connessione assente" while your Mac is on a phone hotspot or a network with Low Data Mode. After updating, it downloads on these networks too, just like "Sincronizza ora"; turn on "Risparmio dati" if you'd rather it waited for another network.
 
 - Downloading a large file (a lecture recording, an archive), or a new version of one, no longer makes BeepBar use far more memory than the file itself: a 256 MB file could take about 1 GB for a moment. Memory now stays low whatever the size of the file.

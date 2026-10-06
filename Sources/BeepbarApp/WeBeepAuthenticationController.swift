@@ -705,6 +705,8 @@ struct MenuBarSnapshot: Sendable {
     /// Waits for the sync `synchronizeNow()` started, which it does not return.
     func waitForSyncForTesting() async { await syncTask?.value }
 
+    var isMenuQuitInProgressForTesting: Bool { menuQuitInProgress }
+
     /// Waits for the course refresh `loadCourses()` started, which it does not return.
     func waitForCourseLoadForTesting() async { await courseLoadTaskForTesting?.value }
 
@@ -1407,6 +1409,15 @@ struct MenuBarSnapshot: Sendable {
         setSyncState(.cancelling)
     }
 
+    /// Stops what must not outlive the app: the background scheduler and a running sync, which is
+    /// cancelled and returned so the caller can wait for it to wind down.
+    ///
+    /// Keep this cheap and synchronous. Both quit paths call it: `applicationShouldTerminate` for a
+    /// quit from outside (Sparkle's installer, logout, the Dock), and `prepareForMenuQuit()` for
+    /// "Esci". Anything returned here is something a quit waits for, so no file, WebKit, Keychain
+    /// or network work, and never a task that is always present: a Recordings branch once saved
+    /// its cookies here and made every quit wait (see `prepareForMenuQuit()` for why waiting is
+    /// dangerous on the menu path).
     func prepareForTermination() -> Task<Void, Never>? {
         backgroundScheduler?.invalidate()
         backgroundScheduler = nil
@@ -1415,6 +1426,60 @@ struct MenuBarSnapshot: Sendable {
         syncTask.cancel()
         setSyncState(.cancelling)
         return syncTask
+    }
+
+    /// True once "Esci" has finished its shutdown work and is about to call `NSApp.terminate`.
+    /// `applicationShouldTerminate` then answers `.terminateNow` without waiting again (see
+    /// `terminationReply`). Lives here rather than on `AppDelegate` because `NSApp.delegate` is
+    /// SwiftUI's adaptor proxy, not our delegate object.
+    private(set) var menuQuitDrained = false
+    private var menuQuitInProgress = false
+
+    /// The shutdown work of "Esci", done *before* `NSApp.terminate` is called.
+    ///
+    /// Why not just call `NSApp.terminate(nil)` and let `applicationShouldTerminate` wait with
+    /// `.terminateLater`, as a quit from outside does: the menu's quit runs inside a main-queue job
+    /// (the `Task { @MainActor in … }` hop that `StatusItemController` must use, issue #30). When
+    /// `terminate` is called from inside a main-queue job and the delegate answers
+    /// `.terminateLater`, AppKit spins a nested run loop that never runs main-actor work, so the
+    /// task it waits for, the 5-second fallback and every later menu action all stall, and BeepBar
+    /// never quits. `DispatchQueue.main.async` hangs the same way; only `perform(_:afterDelay:)`
+    /// escapes, and it is banned on that path (issue #30). Verified with `scripts/quit-probe`.
+    ///
+    /// So "Esci" winds the sync down first, here, while the main actor is free, waiting at most
+    /// `timeout` as the outside path does, then sets `menuQuitDrained` so that `terminate` is
+    /// answered `.terminateNow` with nothing left pending. Returns `false` when a quit is already
+    /// on its way, so a second click on "Esci" does nothing.
+    func prepareForMenuQuit(timeout: Duration = .seconds(5)) async -> Bool {
+        guard !menuQuitInProgress else { return false }
+        menuQuitInProgress = true
+        if let syncTask = prepareForTermination() {
+            BeepbarLog.lifecycle.notice("Menu quit waiting for active synchronization")
+            await Self.wait(for: syncTask, atMost: timeout)
+        }
+        menuQuitDrained = true
+        return true
+    }
+
+    /// What `applicationShouldTerminate` answers. After "Esci" has drained (`menuQuitDrained`) it
+    /// is always `.terminateNow`, even if the sync outlived the timeout: answering `.terminateLater`
+    /// on that path is exactly what hangs (`prepareForMenuQuit()`). A quit from outside waits for a
+    /// sync still winding down; AppKit runs main-actor work while it waits on that path.
+    nonisolated static func terminationReply(menuQuitDrained: Bool, hasPendingSync: Bool) -> NSApplication.TerminateReply {
+        if menuQuitDrained { return .terminateNow }
+        return hasPendingSync ? .terminateLater : .terminateNow
+    }
+
+    /// Waits until `task` finishes or `timeout` passes, whichever comes first. `task.value` ignores
+    /// cancellation, so a task group would wait for the whole task; two unstructured tasks racing
+    /// to resume one continuation stop at the first.
+    nonisolated static func wait(for task: Task<Void, Never>, atMost timeout: Duration) async {
+        let gate = FirstResume()
+        await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
+            gate.arm(continuation)
+            Task { await task.value; gate.resume() }
+            Task { try? await Task.sleep(for: timeout); gate.resume() }
+        }
     }
 
     func refreshConflicts() {
@@ -2417,6 +2482,23 @@ private actor BootstrapService {
             try await RecoveryCoordinator(rootID: rootID, database: database, fileStore: try FileStore(root: rootURL)).recover()
         }
         return !report.unresolved.isEmpty
+    }
+}
+
+/// Resumes one continuation once, whichever caller comes first (`WeBeepAuthenticationController.wait`).
+private final class FirstResume: Sendable {
+    private let continuation = OSAllocatedUnfairLock<CheckedContinuation<Void, Never>?>(initialState: nil)
+
+    func arm(_ continuation: CheckedContinuation<Void, Never>) {
+        self.continuation.withLock { $0 = continuation }
+    }
+
+    func resume() {
+        let pending = continuation.withLock { value -> CheckedContinuation<Void, Never>? in
+            defer { value = nil }
+            return value
+        }
+        pending?.resume()
     }
 }
 

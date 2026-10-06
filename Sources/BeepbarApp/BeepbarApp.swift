@@ -64,9 +64,18 @@ struct BeepbarApp: App {
         ConfigurationWindowController.shared.show(authentication)
     }
 
+    /// Two ways in. A quit from outside (Sparkle's installer, logout, the Dock, `osascript`) arrives
+    /// here first and may wait for a sync with `.terminateLater`: AppKit keeps running main-actor
+    /// work during that wait. "Esci" arrives here only after `prepareForMenuQuit()` has already
+    /// wound everything down, and must get `.terminateNow`: `.terminateLater` on that path hangs
+    /// BeepBar for good (see `prepareForMenuQuit()` and `scripts/quit-probe`). The answer comes
+    /// from `terminationReply`, which pins that rule.
     func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
-        guard let syncTask = authentication.prepareForTermination() else {
-            BeepbarLog.lifecycle.notice("Termination accepted immediately")
+        let menuQuitDrained = authentication.menuQuitDrained
+        let pendingSync = menuQuitDrained ? nil : authentication.prepareForTermination()
+        let reply = WeBeepAuthenticationController.terminationReply(menuQuitDrained: menuQuitDrained, hasPendingSync: pendingSync != nil)
+        guard reply == .terminateLater, let syncTask = pendingSync else {
+            BeepbarLog.lifecycle.notice("Termination accepted immediately menuQuit=\(menuQuitDrained, privacy: .public)")
             return .terminateNow
         }
         guard !terminationPending else { return .terminateLater }
@@ -178,9 +187,18 @@ final class StatusItemController: NSObject, NSMenuDelegate {
         Task { @MainActor in ConfigurationWindowController.shared.show(authentication) }
     }
 
+    /// "Esci". The `Task { @MainActor in … }` hop is the issue #30 fix: keep it exactly as it is.
+    /// Inside it, the shutdown work comes first and `terminate` last, with nothing left pending.
+    /// A bare `NSApp.terminate(nil)` here, while a sync is still winding down, hangs BeepBar for
+    /// good (see `prepareForMenuQuit()`), and swapping the hop for `DispatchQueue.main.async`
+    /// hangs the same way. Rerun `scripts/quit-probe` after touching anything on this path.
     @objc private func quit() {
         BeepbarLog.lifecycle.notice("Menu quit selected")
-        Task { @MainActor in NSApp.terminate(nil) }
+        let authentication = authentication
+        Task { @MainActor in
+            guard await authentication.prepareForMenuQuit() else { return }
+            NSApp.terminate(nil)
+        }
     }
 }
 

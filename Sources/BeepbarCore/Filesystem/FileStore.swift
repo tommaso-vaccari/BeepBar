@@ -88,10 +88,11 @@ public actor FileStore {
     private var inspectedHashes: [ContentStamp: String] = [:]
     /// Insertion order of `inspectedHashes`, to forget the oldest past `inspectedHashLimit`.
     private var inspectedOrder: [ContentStamp] = []
-    /// Only files present on the Mac that a run is about to update get an entry: unchanged files
-    /// never reach `inspect` (the `unchanged` benchmark hashes nothing), and new ones are missing.
-    /// An entry is used shortly after, when that update installs, so the bound is only reached
-    /// when 64 other updates are inspected while one download is still running, which then costs
+    /// Only files present on the Mac whose Moodle revision changed get an entry (an update, a
+    /// revision-only change, a conflict path, the re-inspect after `.localChanged`): unchanged
+    /// files never reach `inspect` (the `unchanged` benchmark hashes nothing), and new ones are
+    /// missing. An entry is used shortly after, when that update installs, so the bound is reached
+    /// only when 64 other files are inspected while one download is still running, which then costs
     /// the one extra read this memo saves. The bound keeps such a batch from holding them all.
     private static let inspectedHashLimit = 64
 

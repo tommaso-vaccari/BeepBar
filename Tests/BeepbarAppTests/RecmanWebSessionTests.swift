@@ -80,4 +80,60 @@ struct RecmanWebSessionTests {
         let middle = URL(string: "https://shibidp.polimi.it/idp/profile;jsessionid=SECRET/SAML2/Redirect/SSO")!
         #expect(RecmanWebSession.redacted(middle) == "https://shibidp.polimi.it/idp/profile/SAML2/Redirect/SSO")
     }
+
+    /// ⌘A, ⌘C, ⌘V, ⌘X and undo/redo work in the sign-in page with no Edit menu around: the web
+    /// view handles them itself. Guards the first live sign-in, where a copied password couldn't
+    /// be pasted because the process had no main menu to carry ⌘V.
+    @Test func theSignInPageTakesEditingShortcutsWithoutAMenu() async throws {
+        func key(_ character: String, _ modifiers: NSEvent.ModifierFlags = .command) -> NSEvent {
+            NSEvent.keyEvent(with: .keyDown, location: .zero, modifierFlags: modifiers, timestamp: 0, windowNumber: 0, context: nil, characters: character, charactersIgnoringModifiers: character, isARepeat: false, keyCode: 0)!
+        }
+        #expect(RecmanSignInWebView.editingAction(for: key("v")) == #selector(NSText.paste(_:)))
+        #expect(RecmanSignInWebView.editingAction(for: key("c")) == #selector(NSText.copy(_:)))
+        #expect(RecmanSignInWebView.editingAction(for: key("x")) == #selector(NSText.cut(_:)))
+        #expect(RecmanSignInWebView.editingAction(for: key("Z", [.command, .shift])) == Selector(("redo:")))
+        // Only the plain shortcuts: ⌥⌘V, ⌘Q or a bare "v" keep their usual meaning.
+        #expect(RecmanSignInWebView.editingAction(for: key("v", [.command, .option])) == nil)
+        #expect(RecmanSignInWebView.editingAction(for: key("q")) == nil)
+        #expect(RecmanSignInWebView.editingAction(for: key("v", [])) == nil)
+
+        // On a real page: ⌘A selects what is typed in the focused field.
+        let configuration = WKWebViewConfiguration()
+        configuration.websiteDataStore = .nonPersistent()
+        let webView = RecmanSignInWebView(frame: NSRect(x: 0, y: 0, width: 400, height: 300), configuration: configuration)
+        let window = NSWindow(contentRect: webView.frame, styleMask: [.titled], backing: .buffered, defer: true)
+        window.isReleasedWhenClosed = false
+        window.contentView = webView
+        defer { window.close() }
+        let loaded = PageLoad()
+        webView.navigationDelegate = loaded
+        webView.loadHTMLString("<input id='password' value='typed-secret'>", baseURL: URL(string: "https://aunicalogin.polimi.it/")!)
+        await loaded.wait()
+        _ = try await webView.evaluateJavaScript("(() => { const f = document.getElementById('password'); f.focus(); f.setSelectionRange(3, 3); return 'ok' })()")
+        #expect(webView.performKeyEquivalent(with: key("a")))
+        var selection = ""
+        for _ in 0..<40 {
+            selection = try await webView.evaluateJavaScript("(() => { const f = document.getElementById('password'); return f.selectionStart + '-' + f.selectionEnd })()") as? String ?? ""
+            if selection == "0-12" { break }
+            try await Task.sleep(for: .milliseconds(50))
+        }
+        #expect(selection == "0-12")
+    }
+
+    @MainActor private final class PageLoad: NSObject, WKNavigationDelegate {
+        private var finished = false
+        private var waiter: CheckedContinuation<Void, Never>?
+
+        func wait() async {
+            if finished { return }
+            await withCheckedContinuation { waiter = $0 }
+        }
+
+        func webView(_ webView: WKWebView, didFinish navigation: WKNavigation!) {
+            finished = true
+            waiter?.resume()
+            waiter = nil
+        }
+    }
 }
+

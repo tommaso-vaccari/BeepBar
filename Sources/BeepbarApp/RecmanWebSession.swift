@@ -464,7 +464,7 @@ enum RecmanBrowserError: Error, Equatable {
         // The web view is hidden for most of its life. Without this WebKit throttles hidden
         // pages, and Polimi's self-submitting single sign-on pages would crawl or stall.
         configuration.preferences.inactiveSchedulingPolicy = .none
-        let webView = WKWebView(frame: NSRect(x: 0, y: 0, width: 920, height: 680), configuration: configuration)
+        let webView = RecmanSignInWebView(frame: NSRect(x: 0, y: 0, width: 920, height: 680), configuration: configuration)
         webView.navigationDelegate = self
         webView.uiDelegate = self
         let window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 920, height: 680), styleMask: [.titled, .closable, .miniaturizable, .resizable], backing: .buffered, defer: true)
@@ -625,5 +625,38 @@ enum RecmanBrowserError: Error, Equatable {
             .map { $0.split(separator: ";", maxSplits: 1, omittingEmptySubsequences: false).first.map(String.init) ?? "" }
             .joined(separator: "/")
         return "\(components.scheme ?? "?")://\(components.host ?? "?")\(path)"
+    }
+}
+
+/// The Recman browser's web view, which handles the editing shortcuts itself.
+///
+/// In a Mac app ⌘V, ⌘C and the rest reach a text field through the main menu's Edit items, and
+/// whether a menu-bar process has that menu depends on how it was set up. Without it the
+/// shortcuts do nothing and a copied password can't be pasted into Polimi's sign-in (first seen
+/// in the live check of 2026-10-06). Handling them here works whatever the main menu holds, and
+/// never touches it or the status item.
+final class RecmanSignInWebView: WKWebView {
+    /// The editing action a key equivalent stands for, or nil for every other key.
+    static func editingAction(for event: NSEvent) -> Selector? {
+        guard event.type == .keyDown else { return nil }
+        let modifiers = event.modifierFlags.intersection([.command, .shift, .option, .control])
+        switch (modifiers, event.charactersIgnoringModifiers?.lowercased()) {
+        case ([.command], "x"): return #selector(NSText.cut(_:))
+        case ([.command], "c"): return #selector(NSText.copy(_:))
+        case ([.command], "v"): return #selector(NSText.paste(_:))
+        case ([.command], "a"): return #selector(NSText.selectAll(_:))
+        case ([.command], "z"): return Selector(("undo:"))
+        case ([.command, .shift], "z"): return Selector(("redo:"))
+        default: return nil
+        }
+    }
+
+    override func performKeyEquivalent(with event: NSEvent) -> Bool {
+        if let action = Self.editingAction(for: event) {
+            // The web view takes cut, copy, paste and select-all itself; undo and redo belong to
+            // its window, so they go up the responder chain.
+            if NSApplication.shared.sendAction(action, to: responds(to: action) ? self : nil, from: self) { return true }
+        }
+        return super.performKeyEquivalent(with: event)
     }
 }

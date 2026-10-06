@@ -625,7 +625,7 @@ public actor FileStore {
             guard duplicate >= 0 else { throw FileStoreError.ioFailure }
             let handle = FileHandle(fileDescriptor: duplicate, closeOnDealloc: true)
             defer { try? handle.close() }
-            while let chunk = try handle.read(upToCount: 1 << 20), !chunk.isEmpty { try write(chunk, to: stage) }
+            try Self.forEachChunk(of: handle) { try write($0, to: stage) }
             let copied = try finalize(stage)
             guard copied.sha256 == expectedSHA256 && copied.size == artifact.size else { throw FileStoreError.invalidStage }
             return copied
@@ -803,7 +803,7 @@ public actor FileStore {
         try handle.seek(toOffset: 0)
         var total: Int64 = 0
         var hash = SHA256()
-        while let chunk = try handle.read(upToCount: 1 << 20), !chunk.isEmpty {
+        try Self.forEachChunk(of: handle) { chunk in
             if checksCancellation { try Task.checkCancellation() }
             total += Int64(chunk.count)
             bytesHashed += Int64(chunk.count)
@@ -813,5 +813,23 @@ public actor FileStore {
         }
         if checksCancellation { try Task.checkCancellation() }
         return (hash.finalize().map { String(format: "%02x", $0) }.joined(), total)
+    }
+
+    /// Reads `handle` from its current offset to the end in 1 MiB chunks, each read and handled
+    /// inside its own autorelease pool. Every file read and copy in this store goes through here.
+    ///
+    /// `FileHandle.read(upToCount:)` returns its buffer autoreleased, and a sync runs on a
+    /// cooperative thread whose pool only drains once the whole call returns. Without a pool per
+    /// chunk, every chunk of the file stayed alive until then: updating a 256 MiB file, which reads
+    /// it five times, peaked at about 1 GiB (`large-update` in docs/benchmarks.md). With it, the
+    /// peak stays at a few MiB whatever the size, as the "peak memory independent of file size"
+    /// budget in AGENTS.md requires. The read must stay inside the pool, not in a `while let`
+    /// condition outside it, or its buffer escapes the drain.
+    private static func forEachChunk(of handle: FileHandle, _ body: (Data) throws -> Void) throws {
+        while try autoreleasepool(invoking: {
+            guard let chunk = try handle.read(upToCount: 1 << 20), !chunk.isEmpty else { return false }
+            try body(chunk)
+            return true
+        }) {}
     }
 }

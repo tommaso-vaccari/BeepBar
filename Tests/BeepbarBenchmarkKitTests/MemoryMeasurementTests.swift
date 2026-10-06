@@ -17,10 +17,12 @@ struct MemoryMeasurementTests {
 
     /// A whole automatic run that downloads and installs a new version of a large file stays
     /// flat end to end: download, staging, the five reads of the file and the install. Guards
-    /// against a path outside FileStore's chunk loop holding the file again. Declared first so the
-    /// serialized suite runs it before the others: if an earlier test failed, what it left alive
-    /// would raise `before`, and this run could reuse that memory without its peak ever rising
-    /// above it.
+    /// against a path outside FileStore's chunk loop holding the file again.
+    ///
+    /// A failing large-file test leaves its chunks alive, which raises the next one's `before`:
+    /// later tests in this suite may then pass by reusing that memory. Only the first failure is
+    /// meaningful, and the suite as a whole still fails. Any single regression is caught: the
+    /// hash loop by this test, the copy loop (which this scenario never runs) by its own test.
     @Test func updatingALargeFileKeepsMemoryFlat() async throws {
         let before = PeakFootprintSampler.footprint()
 

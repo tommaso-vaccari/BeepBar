@@ -413,6 +413,25 @@ private final class FakeLoginItemService: LoginItemService, @unchecked Sendable 
 
     /// Every call into macOS (status reads, register, unregister) is a blocking XPC call: across
     /// launch, Settings, both changes and a refresh, none may run on the main thread.
+    /// Holds one more registration in flight than Swift's cooperative pool has threads (one per
+    /// core), each from its own controller, and checks that all of them reach macOS before any is
+    /// released. Guards against running the blocking calls in `Task.detached`: there the held calls
+    /// take every pool thread, the remaining ones never start and, in the app, all async work stops
+    /// with them, as on dev's 3-core CI after PR #79.
+    @Test func callsHeldByMacOSDoNotStarveOtherAsyncWork() async {
+        let count = ProcessInfo.processInfo.activeProcessorCount + 1
+        let gates = (0..<count).map { _ in DispatchSemaphore(value: 0) }
+        let services = gates.map { FakeLoginItemService(status: .notRegistered, registerGate: $0) }
+        var controllers: [LaunchAtLoginController] = []
+        for service in services { controllers.append(await settings(service)) }
+        let changes = controllers.map { controller in Task { await controller.setEnabled(true) } }
+        await waitUntil { services.allSatisfy { $0.registerCalls == 1 } }
+        gates.forEach { $0.signal() }
+        for change in changes { await change.value }
+        #expect(services.allSatisfy { $0.gateBypasses == 0 }, "every call was held until the test released it")
+        #expect(controllers.allSatisfy { $0.status == .enabled })
+    }
+
     @Test func macOSIsNeverCalledOnTheMainThread() async {
         let service = FakeLoginItemService(status: .notRegistered)
         let controller = await launch(service)

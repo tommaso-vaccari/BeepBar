@@ -108,7 +108,7 @@ final class InMemoryLoginItemService: LoginItemService, @unchecked Sendable {
         if LaunchAtLoginPolicy.shouldRegisterOnLaunch(defaultApplied: defaultApplied, status: current, location: location) {
             let service = service
             do {
-                try await Task.detached { try service.register() }.value
+                try await Self.callMacOS { Result { try service.register() } }.get()
                 registered = true
                 BeepbarLog.lifecycle.notice("Registered as login item by default")
             } catch {
@@ -139,7 +139,7 @@ final class InMemoryLoginItemService: LoginItemService, @unchecked Sendable {
         let service = service
         var failure: Error?
         do {
-            try await Task.detached { enabled ? try service.register() : try service.unregister() }.value
+            try await Self.callMacOS { Result { enabled ? try service.register() : try service.unregister() } }.get()
         } catch {
             failure = error
         }
@@ -178,7 +178,20 @@ final class InMemoryLoginItemService: LoginItemService, @unchecked Sendable {
 
     private func readStatus() async -> LoginItemStatus {
         let service = service
-        return await Task.detached { service.status }.value
+        return await Self.callMacOS { service.status }
+    }
+
+    /// Runs a blocking `SMAppService` call on a GCD thread and awaits its answer. Never on the main
+    /// thread, where an XPC round trip would freeze the UI, and never on Swift's cooperative pool
+    /// (`Task.detached`): that pool has one thread per core and doesn't add one when a thread
+    /// blocks, so a few slow calls can take every thread and stall all async work in the app until
+    /// they return. GCD brings up another worker when one blocks. On dev's CI after PR #79, a
+    /// 3-core runner with three tests holding their calls in flight stopped for 30 s, until the
+    /// test gates timed out.
+    private nonisolated static func callMacOS<T: Sendable>(_ call: @escaping @Sendable () -> T) async -> T {
+        await withCheckedContinuation { continuation in
+            DispatchQueue.global(qos: .userInitiated).async { continuation.resume(returning: call()) }
+        }
     }
 
     func openSystemSettings() {

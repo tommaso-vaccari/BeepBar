@@ -34,7 +34,8 @@ struct MemoryMeasurementTests {
     /// more than its window ahead of what the client took in, and the footprint stays flat. Without
     /// flow control the mock streams the whole file into the URL loading system's queue, and
     /// `memory.peak` charges that queue to the app. The client sleeps on every chunk so the mock is
-    /// always the faster side; the memory margin leaves room for the other suites sharing this
+    /// always the faster side. The lead bound is the exact check; the memory bound (80 MiB, against
+    /// 125–157 MiB measured without flow control) leaves room for the other suites sharing this
     /// process.
     @Test func streamingThroughTheMockKeepsMemoryFlat() async throws {
         let upstream = BenchmarkUpstream()
@@ -52,7 +53,7 @@ struct MemoryMeasurementTests {
         #expect(download.received == size)
         // A chunk can be in flight on top of the window when the client samples.
         #expect(download.maximumLead <= BenchmarkUpstream.downloadWindow + 2 * (256 << 10), "mock ran \(download.maximumLead >> 10) KiB ahead")
-        #expect(Int64(peak) - Int64(before) < 48 << 20, "peak grew by \((Int64(peak) - Int64(before)) >> 20) MiB for a \(size >> 20) MiB stream")
+        #expect(Int64(peak) - Int64(before) < 80 << 20, "peak grew by \((Int64(peak) - Int64(before)) >> 20) MiB for a \(size >> 20) MiB stream")
     }
 }
 

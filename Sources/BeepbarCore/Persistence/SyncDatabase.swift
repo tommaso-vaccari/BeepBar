@@ -101,8 +101,8 @@ public actor SyncDatabase {
         // checkpoints use it, `checkpoint_fullfsync` being on in the system build), and
         // `FileStore` uses plain `fsync`, so on macOS the drive's own cache can still reorder
         // writes on sudden power loss. A run with nothing new writes no WAL frame, and a commit
-        // that wrote nothing doesn't sync, so FULL costs it nothing. An explicit `synchronous` holds after switching to WAL, so the order of these
-        // two pragmas doesn't matter.
+        // that wrote nothing doesn't sync, so FULL costs it nothing. An explicit `synchronous`
+        // holds after switching to WAL, so the order of these two pragmas doesn't matter.
         try Self.execute(database, "PRAGMA synchronous = FULL")
         try Self.migrate(database)
     }

@@ -25,10 +25,16 @@ private final class FakeLoginItemService: LoginItemService, @unchecked Sendable 
         var settingsOpened = 0
         var holdNextRead = false
         var heldReads = 0
+        var gateTimeouts = 0
     }
     private let state: OSAllocatedUnfairLock<State>
     /// When set, `register()` waits on it: lets a test hold a change in flight.
     let registerGate: DispatchSemaphore?
+    /// How long a held call waits for the test to release it. It must outlast any stall of a busy
+    /// CI runner: with 2 s, PR #76's CI woke the test ~2.7 s late, the gate let the "in-flight"
+    /// change finish on its own, and `aRefreshDuringAChangeLeavesTheStatusToTheChange` counted
+    /// one read too many. Still bounded, so a test that never releases fails instead of hanging.
+    private static let gateTimeout: DispatchTimeInterval = .seconds(30)
 
     init(status: LoginItemStatus, registerOutcome: RegisterOutcome = .enable, failUnregister: Bool = false, registerGate: DispatchSemaphore? = nil) {
         state = OSAllocatedUnfairLock(initialState: State(status: status, registerOutcome: registerOutcome, failUnregister: failUnregister))
@@ -45,8 +51,9 @@ private final class FakeLoginItemService: LoginItemService, @unchecked Sendable 
             return (s.status, hold)
         }
         // A held read answers with the status as it was when it was asked, like an XPC reply that
-        // was sent before a change but delivered after it.
-        if hold { _ = readGate.wait(timeout: .now() + 2) }
+        // was sent before a change but delivered after it. Never held on the main thread, where
+        // the test would release it: that call is already a failure (`mainThreadCalls`).
+        if hold, !onMain { wait(on: readGate) }
         return value
     }
     private let readGate = DispatchSemaphore(value: 0)
@@ -54,6 +61,9 @@ private final class FakeLoginItemService: LoginItemService, @unchecked Sendable 
     func holdNextStatusRead() { state.withLock { $0.holdNextRead = true } }
     func releaseHeldRead() { readGate.signal() }
     var heldReads: Int { state.withLock { $0.heldReads } }
+    /// Held calls that went on without the test releasing them. Gated tests expect 0: otherwise
+    /// what they observed was not the interleaving they set up.
+    var gateTimeouts: Int { state.withLock { $0.gateTimeouts } }
     var statusReads: Int { state.withLock { $0.statusReads } }
     var mainThreadCalls: Int { state.withLock { $0.mainThreadCalls } }
     var registerCalls: Int { state.withLock { $0.registerCalls } }
@@ -65,10 +75,10 @@ private final class FakeLoginItemService: LoginItemService, @unchecked Sendable 
     func register() throws {
         let onMain = Thread.isMainThread
         state.withLock { $0.registerCalls += 1; if onMain { $0.mainThreadCalls += 1 } }
-        // Bounded, so a regression that calls `register()` on the main thread (where the test
-        // would signal the gate) doesn't deadlock the suite; the gated tests then fail their
+        // Not held on the main thread, where the test would signal the gate: a regression that
+        // calls `register()` there must not deadlock the suite. The gated tests then fail their
         // `mainThreadCalls == 0` check, as does `macOSIsNeverCalledOnTheMainThread`.
-        _ = registerGate?.wait(timeout: .now() + 2)
+        if let registerGate, !onMain { wait(on: registerGate) }
         let (status, outcome) = state.withLock { ($0.status, $0.registerOutcome) }
         if status == .requiresApproval || status == .enabled { throw CocoaError(.featureUnsupported) }
         switch outcome {
@@ -87,6 +97,10 @@ private final class FakeLoginItemService: LoginItemService, @unchecked Sendable 
     }
 
     func openSystemSettings() { state.withLock { $0.settingsOpened += 1 } }
+
+    private func wait(on gate: DispatchSemaphore) {
+        if gate.wait(timeout: .now() + Self.gateTimeout) == .timedOut { state.withLock { $0.gateTimeouts += 1 } }
+    }
 }
 
 /// Exercises the controller end to end against the fake registry and a throwaway defaults suite,
@@ -347,6 +361,7 @@ private final class FakeLoginItemService: LoginItemService, @unchecked Sendable 
         await second.value
         #expect(service.registerCalls == 1)
         #expect(service.mainThreadCalls == 0)
+        #expect(service.gateTimeouts == 0)
         #expect(controller.isOn)
         #expect(!controller.isUpdating)
         #expect(controller.canChange)
@@ -371,6 +386,7 @@ private final class FakeLoginItemService: LoginItemService, @unchecked Sendable 
         await tap.value
         #expect(service.registerCalls == 1)
         #expect(service.mainThreadCalls == 0)
+        #expect(service.gateTimeouts == 0)
         #expect(controller.errorMessage == nil)
         #expect(controller.isOn)
     }
@@ -410,6 +426,7 @@ private final class FakeLoginItemService: LoginItemService, @unchecked Sendable 
         let change = Task { await controller.setEnabled(true) }
         await waitUntil { service.registerCalls > 0 }
         let readsBefore = service.statusReads
+        #expect(readsBefore == 1, "only Settings has read so far: the change is still registering")
         await controller.refresh()
         #expect(service.statusReads == readsBefore, "the refresh must not read while the change is in flight")
         gate.signal()
@@ -417,6 +434,7 @@ private final class FakeLoginItemService: LoginItemService, @unchecked Sendable 
         #expect(controller.isOn)
         await controller.refresh()
         #expect(service.statusReads == readsBefore + 2, "once the change ended, refreshes read again")
+        #expect(service.gateTimeouts == 0, "the change was held by the test, not released by the timeout")
     }
 
     /// A registration that returned while the status read after it still lags is not reported
@@ -446,6 +464,7 @@ private final class FakeLoginItemService: LoginItemService, @unchecked Sendable 
         await refreshing.value
         #expect(controller.isOn, "the older read must be dropped")
         #expect(controller.status == .enabled)
+        #expect(service.gateTimeouts == 0)
     }
 
     /// The launch path trusts a registration that returned even if the status read after it lags:

@@ -398,7 +398,7 @@ import Testing
         defer { fixture.remove() }
         fixture.upstream.downloadDelay = 0.01
         let recorder = ProgressRecorder()
-        let summary = try await fixture.coordinator.synchronize(targets: [fixture.targets[0]], token: "test-token", mode: .manual) { update in recorder.append(update) }
+        let summary = try await fixture.coordinator.synchronize(targets: [fixture.targets[0]], token: "test-token", mode: .manual, networkAccess: .unrestricted) { update in recorder.append(update) }
         let progress = recorder.values
         #expect(fixture.upstream.maximumActiveDownloads == 3)
         #expect(progress.count == 100)
@@ -451,13 +451,38 @@ import Testing
         #expect(!FileManager.default.fileExists(atPath: fixture.root.path))
     }
 
-    @Test func automaticSyncDownloadsWithoutExpensiveOrConstrainedNetworkAccess() async throws {
+    /// Proves that an automatic run with "Risparmio dati" on asks macOS to keep its downloads off a
+    /// phone hotspot and Low Data Mode networks: if the Mac moves to one midway, the next download
+    /// is refused instead of spending the user's data. Guards against `.dataSaver` losing its
+    /// limits, or the coordinator ignoring the access it is given.
+    @Test func automaticSyncWithDataSaverDownloadsOnlyOverUnlimitedNetworks() async throws {
         let fixture = try await Fixture()
         defer { fixture.remove() }
-        _ = try await fixture.synchronize(targets: [fixture.targets[0]], mode: .automatic)
+        _ = try await fixture.synchronize(targets: [fixture.targets[0]], mode: .automatic, networkAccess: .dataSaver)
         #expect(fixture.upstream.downloadCount > 0)
-        // A scheduled run must not spend a metered hotspot, nor ignore Low Data Mode.
         #expect(fixture.upstream.downloadNetworkAccess == [RecordedNetworkAccess(expensive: false, constrained: false)])
+    }
+
+    /// Proves that the course listing of a Data Saver run is not limited, only its downloads: the
+    /// listing is small, and limiting it would turn a hotspot into a false "Connessione assente"
+    /// before the app could tell it apart. Guards against the limits spreading to Moodle calls.
+    @Test func automaticSyncWithDataSaverReadsCourseContentsOverAnyNetwork() async throws {
+        let fixture = try await Fixture()
+        defer { fixture.remove() }
+        _ = try await fixture.synchronize(targets: [fixture.targets[0]], mode: .automatic, networkAccess: .dataSaver)
+        #expect(fixture.upstream.contentsNetworkAccess == [RecordedNetworkAccess(expensive: true, constrained: true)])
+    }
+
+    /// Proves that with "Risparmio dati" off (the default) an automatic run downloads over any
+    /// network, hotspot included, like a manual one. Guards against the automatic mode quietly
+    /// restricting downloads on its own again, which is what showed users a false
+    /// "Connessione assente" on a hotspot.
+    @Test func automaticSyncWithoutDataSaverDownloadsOverAnyNetwork() async throws {
+        let fixture = try await Fixture()
+        defer { fixture.remove() }
+        _ = try await fixture.synchronize(targets: [fixture.targets[0]], mode: .automatic, networkAccess: .unrestricted)
+        #expect(fixture.upstream.downloadCount > 0)
+        #expect(fixture.upstream.downloadNetworkAccess == [RecordedNetworkAccess(expensive: true, constrained: true)])
     }
 
     // A course whose contents Moodle refuses (unenrolled, hidden or restricted course) must not
@@ -594,6 +619,32 @@ import Testing
         _ = try await fixture.synchronize(targets: [fixture.targets[0]], mode: .manual)
         #expect(fixture.upstream.downloadCount > 0)
         #expect(fixture.upstream.downloadNetworkAccess == [RecordedNetworkAccess(expensive: true, constrained: true)])
+    }
+
+    /// Proves that "Sincronizza ora" reads course contents over any network, metered hotspot and
+    /// Low Data Mode included: the user asked for the run. Guards against a change that restricts
+    /// the Moodle requests a manual run sends, the way downloads can be restricted.
+    @Test func manualSyncReadsCourseContentsOverAnyNetwork() async throws {
+        let fixture = try await Fixture()
+        defer { fixture.remove() }
+        _ = try await fixture.synchronize(targets: [fixture.targets[0]], mode: .manual)
+        #expect(fixture.upstream.contentsRequestCount == 1)
+        #expect(fixture.upstream.contentsNetworkAccess == [RecordedNetworkAccess(expensive: true, constrained: true)])
+    }
+
+    /// Proves that after a refused download in "Sincronizza ora", the token check that follows may
+    /// use any network too. It is the one other Moodle request the coordinator sends, and the app
+    /// tests cannot reach it: their controller downloads through a real session.
+    @Test func manualSyncChecksTheTokenOverAnyNetwork() async throws {
+        let fixture = try await Fixture()
+        defer { fixture.remove() }
+        fixture.upstream.setStatus(course: 1, file: 0, status: 401)
+
+        await #expect(throws: WeBeepAPIError.transport(401)) {
+            try await fixture.synchronize(targets: [fixture.targets[0]], mode: .manual)
+        }
+        #expect(fixture.upstream.validationCount == 1)
+        #expect(fixture.upstream.validationNetworkAccess == [RecordedNetworkAccess(expensive: true, constrained: true)])
     }
 
     // MARK: Following moves made on Moodle
@@ -1686,8 +1737,8 @@ private final class Fixture: @unchecked Sendable {
             upstream.populate(courses: 10, filesPerCourse: 100)
         }
 
-        func synchronize(targets: [SyncTarget]? = nil, mode: SyncCoordinatorMode = .manual) async throws -> SyncProgress {
-            try await coordinator.synchronize(targets: targets ?? self.targets, token: "test-token", mode: mode) { _ in }
+        func synchronize(targets: [SyncTarget]? = nil, mode: SyncCoordinatorMode = .manual, networkAccess: NetworkAccess = .unrestricted) async throws -> SyncProgress {
+            try await coordinator.synchronize(targets: targets ?? self.targets, token: "test-token", mode: mode, networkAccess: networkAccess) { _ in }
         }
 
         func remoteID(course: Int64, file: Int, module: Int64? = nil, filename: String? = nil) -> String { "\(course):\(module ?? course * 100):/:\(filename ?? "\(file).txt")" }
@@ -1750,6 +1801,9 @@ private final class MutableFixtureUpstream: @unchecked Sendable {
     private var rejectedContents: [Int64: String] = [:]
     private var failedContents: [Int64: Int] = [:]
     private var networkAccess: Set<RecordedNetworkAccess> = []
+    private var contentsRequests = 0
+    private var contentsAccess: Set<RecordedNetworkAccess> = []
+    private var validationAccess: Set<RecordedNetworkAccess> = []
     private var sectionNames: [Int64: String] = [:]
     private var moduleNames: [Int64: String] = [:]
     private var extraModules: [Int64: [Int64: (section: String, name: String)]] = [:]
@@ -1762,6 +1816,11 @@ private final class MutableFixtureUpstream: @unchecked Sendable {
     var maximumActiveDownloads: Int { lock.withLock { peakDownloads } }
     var validationCount: Int { lock.withLock { validations } }
     var downloadNetworkAccess: Set<RecordedNetworkAccess> { lock.withLock { networkAccess } }
+    /// `core_course_get_contents` requests and the network restrictions they carried.
+    var contentsRequestCount: Int { lock.withLock { contentsRequests } }
+    var contentsNetworkAccess: Set<RecordedNetworkAccess> { lock.withLock { contentsAccess } }
+    /// The network restrictions the token checks (`core_webservice_get_site_info`) carried.
+    var validationNetworkAccess: Set<RecordedNetworkAccess> { lock.withLock { validationAccess } }
     func resetDownloadCount() { lock.withLock { downloads = 0 } }
 
     func populate(courses: Int, filesPerCourse: Int) {
@@ -1806,6 +1865,7 @@ private final class MutableFixtureUpstream: @unchecked Sendable {
                 let body = String(data: request.httpBody ?? bodyData(from: request.httpBodyStream), encoding: .utf8) ?? ""
                 if formValue("wsfunction", body: body) == "core_webservice_get_site_info" {
                     validations += 1
+                    validationAccess.insert(RecordedNetworkAccess(expensive: request.allowsExpensiveNetworkAccess, constrained: request.allowsConstrainedNetworkAccess))
                     let response: Data
                     if tokenIsValid {
                         response = Data(#"{"userid":7,"siteurl":"https://fixture.beepbar.test","functions":[{"name":"core_enrol_get_users_courses"},{"name":"core_course_get_contents"}]}"#.utf8)
@@ -1815,6 +1875,10 @@ private final class MutableFixtureUpstream: @unchecked Sendable {
                     return (HTTPURLResponse(url: url, statusCode: 200, httpVersion: nil, headerFields: ["Content-Type": "application/json"])!, response, 0, false)
                 }
                 let course = Int64(formValue("courseid", body: body) ?? "") ?? 0
+                if formValue("wsfunction", body: body) == "core_course_get_contents" {
+                    contentsRequests += 1
+                    contentsAccess.insert(RecordedNetworkAccess(expensive: request.allowsExpensiveNetworkAccess, constrained: request.allowsConstrainedNetworkAccess))
+                }
                 if let status = failedContents[course] {
                     return (HTTPURLResponse(url: url, statusCode: status, httpVersion: nil, headerFields: ["Content-Type": "text/html"])!, Data(), 0, false)
                 }

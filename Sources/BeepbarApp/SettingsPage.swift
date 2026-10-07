@@ -13,6 +13,9 @@ struct SettingsPage: View {
             languageSection
             accountSection
             folderSection
+            if authentication.selectedSite.university == .polimi {
+                RecordingsSettingsSection(recordings: authentication.recordings)
+            }
             startupSection
             automaticSection
             notificationsSection
@@ -151,10 +154,12 @@ struct SettingsPage: View {
     /// change it in System Settings.
     private var startupSection: some View {
         Section {
-            Toggle(tr("Apri BeepBar al login", "Open BeepBar at login"), isOn: Binding(
+            Toggle(isOn: Binding(
                 get: { launchAtLogin.isOn },
                 set: { enabled in Task { await launchAtLogin.setEnabled(enabled) } }
-            ))
+            )) {
+                SettingLabel(tr("Apri BeepBar al login", "Open BeepBar at login"), explanation: tr("BeepBar si apre da sola ogni volta che accendi il Mac o accedi. Così la sincronizzazione automatica continua anche dopo un riavvio, senza doverti ricordare di aprirla.", "BeepBar opens by itself whenever you turn on or log in to your Mac. That way automatic sync keeps going after a restart, without you having to remember to open it."))
+            }
             .disabled(!launchAtLogin.canChange)
         } header: {
             Text(tr("Avvio", "Startup"))
@@ -183,19 +188,32 @@ struct SettingsPage: View {
 
     // MARK: Background
 
+    /// Automatic sync, how often it runs, and "Risparmio dati", which only affects automatic sync
+    /// and is therefore greyed out with it.
     private var automaticSection: some View {
         Section {
-            Toggle(tr("Sincronizzazione automatica", "Automatic sync"), isOn: Binding(
+            Toggle(isOn: Binding(
                 get: { authentication.automaticSyncEnabled },
                 set: { authentication.setAutomaticSync(enabled: $0) }
-            ))
-            Picker(tr("Frequenza", "Frequency"), selection: Binding(
+            )) {
+                SettingLabel(tr("Sincronizzazione automatica", "Automatic sync"), explanation: tr("BeepBar controlla da sola i corsi che hai scelto e scarica i nuovi materiali, anche con la finestra chiusa. Non sovrascrive mai i file che hai modificato tu.", "BeepBar checks the courses you picked on its own and downloads new materials, even with the window closed. It never overwrites files you've changed."))
+            }
+            Picker(selection: Binding(
                 get: { authentication.automaticSyncInterval },
                 set: { authentication.setAutomaticSyncInterval($0) }
             )) {
                 ForEach(AutomaticSyncOption.allCases) { option in
                     Text(option.title).tag(option.rawValue)
                 }
+            } label: {
+                SettingLabel(tr("Frequenza", "Frequency"), explanation: tr("Ogni quanto BeepBar controlla se ci sono nuovi materiali. Il momento preciso lo sceglie macOS, per risparmiare batteria.", "How often BeepBar checks for new materials. macOS picks the exact moment, to save battery."))
+            }
+            .disabled(!authentication.automaticSyncEnabled)
+            Toggle(isOn: Binding(
+                get: { authentication.dataSaverEnabled },
+                set: { authentication.setDataSaver(enabled: $0) }
+            )) {
+                SettingLabel(tr("Risparmio dati", "Data Saver"), explanation: tr("Quando il Mac usa l'hotspot del telefono, la sincronizzazione automatica si mette in pausa per non consumare i tuoi dati, e riprende da sola quando torni sul Wi-Fi. Vale anche per le reti con la Modalità dati ridotti. «Sincronizza ora» scarica sempre.", "When your Mac is using your phone's hotspot, automatic sync pauses so it doesn't use up your data, and picks up again by itself once you're back on Wi-Fi. The same goes for networks with Low Data Mode on. “Sync now” always downloads."))
             }
             .disabled(!authentication.automaticSyncEnabled)
         } header: {
@@ -213,10 +231,12 @@ struct SettingsPage: View {
     /// be changed in System Settings, so when macOS blocks them the footer says so and links there.
     private var notificationsSection: some View {
         Section {
-            Toggle(tr("Notifiche", "Notifications"), isOn: Binding(
+            Toggle(isOn: Binding(
                 get: { authentication.notificationsEnabled },
                 set: { enabled in Task { await authentication.setNotifications(enabled: enabled) } }
-            ))
+            )) {
+                SettingLabel(tr("Notifiche", "Notifications"), explanation: tr("BeepBar ti avvisa quando arrivano nuovi materiali, quando devi scegliere quale versione di un file tenere, o se la sincronizzazione ha un problema.", "BeepBar lets you know when new materials arrive, when you need to choose which version of a file to keep, or if syncing runs into a problem."))
+            }
         } header: {
             Text(tr("Notifiche", "Notifications"))
         } footer: {
@@ -250,7 +270,9 @@ struct SettingsPage: View {
 
     private var updatesSection: some View {
         Section(tr("Aggiornamenti", "Updates")) {
-            Toggle(tr("Controlla automaticamente gli aggiornamenti", "Check for updates automatically"), isOn: $checksForUpdates)
+            Toggle(isOn: $checksForUpdates) {
+                SettingLabel(tr("Controlla automaticamente gli aggiornamenti", "Check for updates automatically"), explanation: tr("BeepBar controlla da sola se c'è una nuova versione e ti avvisa. Se lo spegni, puoi sempre controllare tu con «Cerca aggiornamenti…».", "BeepBar checks for a new version on its own and lets you know. If you turn this off, you can still check yourself with “Check for updates…”."))
+            }
                 .onChange(of: checksForUpdates) { _, newValue in
                     UpdaterController.shared.automaticallyChecksForUpdates = newValue
                 }
@@ -268,5 +290,53 @@ struct SettingsPage: View {
         guard let version = info?["CFBundleShortVersionString"] as? String else { return tr("Sviluppo", "Development") }
         if let build = info?["CFBundleVersion"] as? String { return "\(version) (\(build))" }
         return version
+    }
+}
+
+/// "Registrazioni" (Polimi only): the switch of the Recordings feature, and the Polimi sign-in
+/// when it has lapsed. Off by default; turning it on starts the sign-in at once.
+private struct RecordingsSettingsSection: View {
+    @ObservedObject var recordings: RecordingsController
+
+    var body: some View {
+        Section {
+            Toggle(isOn: Binding(get: { recordings.isEnabled }, set: { recordings.setEnabled($0) })) {
+                SettingLabel(tr("Registrazioni delle lezioni", "Lecture recordings"), explanation: tr("Aggiunge la pagina Registrazioni, con le lezioni registrate dei corsi che sincronizzi, prese dall'archivio del Politecnico. Serve un accesso al Politecnico, che dura circa dieci giorni.", "Adds the Recordings page, with the recorded lectures of the courses you sync, taken from Polimi's archive. It needs a Polimi sign-in, which lasts about ten days."))
+            }
+            .disabled(!recordings.isEnabled && !recordings.canTurnOn)
+            switch recordings.access {
+            case .signingIn:
+                HStack(spacing: 8) {
+                    ProgressView().controlSize(.small)
+                    Text(tr("Accesso al Politecnico in corso…", "Signing in to Polimi…")).foregroundStyle(.secondary)
+                }
+            case .needsSignIn(let problem):
+                HStack(spacing: 10) {
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text(tr("Serve l'accesso al Politecnico", "Polimi sign-in needed"))
+                        if let problem {
+                            Text(problem.message).font(.caption).foregroundStyle(.secondary)
+                        }
+                    }
+                    Spacer()
+                    Button(tr("Accedi con Polimi", "Sign in with Polimi")) { recordings.signIn() }
+                }
+            case .ready, .off:
+                EmptyView()
+            }
+        } header: {
+            Text(tr("Registrazioni", "Recordings"))
+        } footer: {
+            Text(footer)
+                .font(.caption)
+                .foregroundStyle(.secondary)
+        }
+    }
+
+    private var footer: String {
+        if !recordings.isEnabled && !recordings.canTurnOn {
+            return tr("Collega prima il tuo account WeBeep.", "Connect your WeBeep account first.")
+        }
+        return tr("L'accesso al Politecnico resta solo su questo Mac, leggibile solo dal tuo utente. Spegnendo l'interruttore o disconnettendo l'account viene cancellato.", "The Polimi sign-in stays on this Mac only, readable only by your user. Turning the switch off or disconnecting the account deletes it.")
     }
 }

@@ -64,9 +64,18 @@ struct BeepbarApp: App {
         ConfigurationWindowController.shared.show(authentication)
     }
 
+    /// Two ways in. A quit from outside (Sparkle's installer, logout, the Dock, `osascript`) arrives
+    /// here first and may wait for a sync with `.terminateLater`: AppKit keeps running main-actor
+    /// work during that wait. "Esci" arrives here only after `prepareForMenuQuit()` has already
+    /// wound everything down, and must get `.terminateNow`: `.terminateLater` on that path hangs
+    /// BeepBar for good (see `prepareForMenuQuit()` and `scripts/quit-probe`). The answer comes
+    /// from `terminationReply`, which pins that rule.
     func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
-        guard let syncTask = authentication.prepareForTermination() else {
-            BeepbarLog.lifecycle.notice("Termination accepted immediately")
+        let menuQuitDrained = authentication.menuQuitDrained
+        let pendingSync = menuQuitDrained ? nil : authentication.prepareForTermination()
+        let reply = WeBeepAuthenticationController.terminationReply(menuQuitDrained: menuQuitDrained, hasPendingSync: pendingSync != nil)
+        guard reply == .terminateLater, let syncTask = pendingSync else {
+            BeepbarLog.lifecycle.notice("Termination accepted immediately menuQuit=\(menuQuitDrained, privacy: .public)")
             return .terminateNow
         }
         guard !terminationPending else { return .terminateLater }
@@ -178,9 +187,18 @@ final class StatusItemController: NSObject, NSMenuDelegate {
         Task { @MainActor in ConfigurationWindowController.shared.show(authentication) }
     }
 
+    /// "Esci". The `Task { @MainActor in … }` hop is the issue #30 fix: keep it exactly as it is.
+    /// Inside it, the shutdown work comes first and `terminate` last, with nothing left pending.
+    /// A bare `NSApp.terminate(nil)` here, while a sync is still winding down, hangs BeepBar for
+    /// good (see `prepareForMenuQuit()`), and swapping the hop for `DispatchQueue.main.async`
+    /// hangs the same way. Rerun `scripts/quit-probe` after touching anything on this path.
     @objc private func quit() {
         BeepbarLog.lifecycle.notice("Menu quit selected")
-        Task { @MainActor in NSApp.terminate(nil) }
+        let authentication = authentication
+        Task { @MainActor in
+            guard await authentication.prepareForMenuQuit() else { return }
+            NSApp.terminate(nil)
+        }
     }
 }
 
@@ -189,10 +207,13 @@ final class StatusItemController: NSObject, NSMenuDelegate {
     private var window: NSWindow?
     private var appearanceTrace: OSSignpostIntervalState?
     private let router = ShellRouter()
+    /// The controller the window shows, to tell Recordings when the window is gone.
+    private weak var authentication: WeBeepAuthenticationController?
     private static let frameAutosaveName = "BeepbarConfigurationWindow"
 
     func show(_ authentication: WeBeepAuthenticationController, page: ShellPage? = nil) {
         BeepbarLog.lifecycle.notice("Configuration window requested")
+        self.authentication = authentication
         if window?.isKeyWindow != true {
             if let appearanceTrace {
                 PerformanceTrace.shared.end("ui.configurationWindow", category: .ui, state: appearanceTrace)
@@ -209,18 +230,7 @@ final class StatusItemController: NSObject, NSMenuDelegate {
         if let window {
             window.makeKeyAndOrderFront(nil)
         } else {
-            let controller = NSHostingController(rootView: BeepbarShellView(authentication: authentication, router: router))
-            // Only let SwiftUI enforce the minimum size; otherwise the window keeps resizing
-            // itself to the content's ideal size on every page switch.
-            controller.sizingOptions = [.minSize]
-            let window = NSWindow(contentViewController: controller)
-            window.title = "BeepBar"
-            window.styleMask = [.titled, .closable, .miniaturizable, .resizable, .fullSizeContentView]
-            window.titlebarAppearsTransparent = true
-            window.titleVisibility = .hidden
-            window.setContentSize(NSSize(width: 780, height: 680))
-            window.minSize = NSSize(width: 680, height: 520)
-            window.isReleasedWhenClosed = false
+            let window = Self.makeWindow(authentication: authentication, router: router)
             window.delegate = self
             // The window object is rebuilt on every open (see windowWillClose), so let AppKit
             // remember where the user left it.
@@ -230,6 +240,32 @@ final class StatusItemController: NSObject, NSMenuDelegate {
             window.makeKeyAndOrderFront(nil)
         }
         authentication.refreshOnWindowOpen()
+    }
+
+    /// Builds the window `show` opens, apart from its delegate and saved frame, so tests can host
+    /// the real shell in exactly this window.
+    static func makeWindow(authentication: WeBeepAuthenticationController, router: ShellRouter) -> ConfigurationWindow {
+        let controller = NSHostingController(rootView: BeepbarShellView(authentication: authentication, recordings: authentication.recordings, router: router))
+        // Only let SwiftUI enforce the minimum size; otherwise the window keeps resizing
+        // itself to the content's ideal size on every page switch.
+        controller.sizingOptions = [.minSize]
+        let window = ConfigurationWindow(contentViewController: controller)
+        window.title = "BeepBar"
+        window.styleMask = [.titled, .closable, .miniaturizable, .resizable, .fullSizeContentView]
+        window.titlebarAppearsTransparent = true
+        window.titleVisibility = .hidden
+        window.setContentSize(NSSize(width: 780, height: 680))
+        window.minSize = NSSize(width: 680, height: 520)
+        window.isReleasedWhenClosed = false
+        // With no initial first responder, AppKit picks the first key view when the window is
+        // ordered in, which in SwiftUI is its `KeyViewProxy`: once the window is key, that proxy
+        // is presumably how SwiftUI hands focus to its first focusable view, on Corsi "Cerca
+        // corsi". The hosting view refuses first responder, so this leaves the window itself
+        // first responder, the same state a click outside a field leaves it in
+        // (`ConfigurationWindow`).
+        // Only checked in a window that isn't key, which tests can't make key.
+        window.initialFirstResponder = controller.view
+        return window
     }
 
     func windowWillClose(_ notification: Notification) {
@@ -247,6 +283,9 @@ final class StatusItemController: NSObject, NSMenuDelegate {
             window.delegate = nil
             self.window = nil
             self.router.page = .home
+            // Dropping the hierarchy doesn't reliably report the Recordings page as gone, and its
+            // browser must not outlive the window (quiet at rest).
+            self.authentication?.recordingsIfCreated?.windowClosed()
         }
     }
 
@@ -254,5 +293,41 @@ final class StatusItemController: NSObject, NSMenuDelegate {
         guard let appearanceTrace else { return }
         PerformanceTrace.shared.end("ui.configurationWindow", category: .ui, state: appearanceTrace)
         self.appearanceTrace = nil
+    }
+}
+
+/// The configuration window. A click anywhere outside a text field ends text editing, as people
+/// expect from a page: AppKit only moves the focus to views that accept it, and nothing on Corsi
+/// does apart from other text fields, so once "Cerca corsi" had the cursor no click on a row, a
+/// switch or the background could take it away.
+///
+/// This lives in the window rather than in a SwiftUI tap gesture because it has to work for
+/// every kind of click, including those on AppKit-backed controls (switches, menus, scrollers)
+/// that never reach SwiftUI gestures. It only touches the window's own responder chain, never
+/// controller state, so it adds no AppKit→`@MainActor` state access (see the hard rule on
+/// `StatusItemController`).
+///
+/// Any click outside text counts, including the one that brings the window back from another
+/// app and a drag of the window by its header: both are clicks somewhere else. A field that
+/// should keep the cursor after one of its own SwiftUI buttons (the search field's clear button)
+/// takes it back in that button's action.
+final class ConfigurationWindow: NSWindow {
+    override func sendEvent(_ event: NSEvent) {
+        // Before dispatching, so the click still reaches its target: the switch still toggles,
+        // the button still fires, and the field has already let go when it does.
+        if event.type == .leftMouseDown,
+           Self.clickEndsTextEditing(firstResponder: firstResponder, clickedView: contentView?.hitTest(event.locationInWindow)) {
+            makeFirstResponder(nil)
+        }
+        super.sendEvent(event)
+    }
+
+    /// Whether a click on `clickedView` should end the text editing going on in `firstResponder`.
+    /// Editing shows as the shared field editor being first responder. A click on text (the
+    /// field editor itself, or any text field, which AppKit then focuses on its own) keeps
+    /// editing; any other click, or one that hits nothing, ends it.
+    static func clickEndsTextEditing(firstResponder: NSResponder?, clickedView: NSView?) -> Bool {
+        guard let editor = firstResponder as? NSTextView, editor.isFieldEditor else { return false }
+        return !(clickedView is NSText || clickedView is NSTextField)
     }
 }

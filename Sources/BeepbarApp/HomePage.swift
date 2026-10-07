@@ -7,6 +7,7 @@ struct HomePage: View {
     @State private var organizingCourse: RemoteCourseSummary?
     @State private var editingCourseID: Int64?
     @State private var query = ""
+    @FocusState private var searchFocused: Bool
 
     // The status card stays put; only the course list scrolls, inside its own box that takes
     // whatever height the window leaves.
@@ -135,10 +136,18 @@ struct HomePage: View {
     private var searchField: some View {
         HStack(spacing: 5) {
             Image(systemName: "magnifyingglass").foregroundStyle(.secondary)
-            TextField(tr("Cerca corso", "Search courses"), text: $query)
+            TextField(tr("Cerca corsi", "Search courses"), text: $query)
                 .textFieldStyle(.plain)
+                .focused($searchFocused)
+                // Esc first clears what was typed, then lets go of the field, like the search
+                // fields in Finder and Mail. Without it Esc did nothing at all.
+                .onExitCommand {
+                    if query.isEmpty { searchFocused = false } else { query = "" }
+                }
             if !query.isEmpty {
-                Button { query = "" } label: { Image(systemName: "xmark.circle.fill") }
+                // The click has already ended editing (`ConfigurationWindow`); clearing usually
+                // comes before typing a new search, so the cursor goes back in, as in Finder.
+                Button { query = ""; searchFocused = true } label: { Image(systemName: "xmark.circle.fill") }
                     .buttonStyle(.plain)
                     .foregroundStyle(.tertiary)
                     .accessibilityLabel(tr("Cancella ricerca", "Clear search"))
@@ -178,11 +187,17 @@ private struct SyncHeroCard: View {
     @State private var showAbandonConfirmation = false
 
     private var state: AppSyncState { authentication.syncState }
+    /// "Risparmio dati" holding automatic sync back, when it is what the card shows (see
+    /// `WeBeepAuthenticationController.visibleDataSaverPause`). It takes the headline, the badge
+    /// and the line under it, in place of the last sync's summary and its "Dettagli" (Attività
+    /// still has them). After a completed sync "· sincronizzato X fa" stays, since that is still true.
+    private var pause: DataSaverPause? { authentication.visibleDataSaverPause }
+    private var badgeSymbol: String? { pause == nil ? state.badgeSymbol : "pause.circle.fill" }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 12) {
             HStack(alignment: .center, spacing: 14) {
-                BeepbarLogo(size: 44, badge: state.badgeSymbol, badgeTint: state.tint, accessibilityLabel: "BeepBar, \(state.title)")
+                BeepbarLogo(size: 44, badge: badgeSymbol, badgeTint: pause == nil ? state.tint : .gray, accessibilityLabel: "BeepBar, \(pause?.title ?? state.title)")
                 VStack(alignment: .leading, spacing: 3) {
                     // The relative time ticks once a minute, and only while the window exists.
                     TimelineView(.everyMinute) { context in
@@ -213,7 +228,7 @@ private struct SyncHeroCard: View {
         .card(padding: 0)
         .animation(BeepbarStyle.snappy, value: authentication.isSyncActive)
         .animation(BeepbarStyle.snappy, value: authentication.conflicts.count)
-        .animation(BeepbarStyle.snappy, value: state.badgeSymbol)
+        .animation(BeepbarStyle.snappy, value: badgeSymbol)
         .confirmationDialog(tr("Abbandonare lo spostamento del modulo?", "Abandon the module move?"), isPresented: $showAbandonConfirmation, titleVisibility: .visible) {
             Button(tr("Abbandona spostamento", "Abandon move"), role: .destructive) { authentication.abandonPendingModuleMoves() }
             Button(tr("Annulla", "Cancel"), role: .cancel) {}
@@ -223,6 +238,8 @@ private struct SyncHeroCard: View {
     }
 
     private var headline: String {
+        // Not "Tutto aggiornato" while paused: new material may be waiting on Moodle.
+        if let pause { return pause.title }
         if case .synced = state { return tr("Tutto aggiornato", "All up to date") }
         return state.title
     }
@@ -243,7 +260,13 @@ private struct SyncHeroCard: View {
 
     // "12 nuovi · 4 aggiornati · 1 tua modifica protetta   Dettagli ›" — or the state's own explanation.
     @ViewBuilder private var secondaryLine: some View {
-        if !authentication.isSyncActive, let summary = authentication.lastSyncSummary {
+        if let pause {
+            Text(pause.detail)
+                .font(.callout)
+                .foregroundStyle(.secondary)
+                .lineLimit(3)
+                .fixedSize(horizontal: false, vertical: true)
+        } else if !authentication.isSyncActive, let summary = authentication.lastSyncSummary {
             HStack(spacing: 10) {
                 summaryText(summary)
                     .lineLimit(1)

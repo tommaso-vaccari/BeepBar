@@ -197,6 +197,51 @@ enum Finder {
     }
 }
 
+/// A setting's name followed by an ⓘ that explains, in plain words, what the setting does. Used
+/// as a Toggle's or Picker's label, so the control keeps its own name for VoiceOver.
+struct SettingLabel: View {
+    let title: String
+    let explanation: String
+
+    init(_ title: String, explanation: String) {
+        self.title = title
+        self.explanation = explanation
+    }
+
+    var body: some View {
+        HStack(spacing: 5) {
+            Text(title)
+            InfoTip(subject: title, explanation: explanation)
+        }
+    }
+}
+
+/// The ⓘ itself. The explanation shows as the macOS tooltip on hover and, for people who click
+/// rather than wait, in a popover; VoiceOver reads it as the hint.
+struct InfoTip: View {
+    let subject: String
+    let explanation: String
+    @State private var isShowingPopover = false
+
+    var body: some View {
+        Button { isShowingPopover.toggle() } label: {
+            Image(systemName: "info.circle")
+                .foregroundStyle(.secondary)
+        }
+        .buttonStyle(.borderless)
+        .help(explanation)
+        .popover(isPresented: $isShowingPopover, arrowEdge: .bottom) {
+            Text(explanation)
+                .font(.callout)
+                .frame(width: 300, alignment: .leading)
+                .fixedSize(horizontal: false, vertical: true)
+                .padding(12)
+        }
+        .accessibilityLabel(tr("Informazioni su \(subject)", "About \(subject)"))
+        .accessibilityHint(explanation)
+    }
+}
+
 /// The app icon (App/Assets.xcassets/BeepbarLogo, vector) with an optional status badge in the
 /// corner, so the brand stays constant and only the badge speaks about state.
 struct BeepbarLogo: View {

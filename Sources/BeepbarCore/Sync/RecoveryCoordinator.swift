@@ -119,6 +119,19 @@ public actor RecoveryCoordinator {
                 try await database.finishOperation(id: operation.id)
                 return .recovered
             }
+            // The download is gone and was never kept aside as a conflict: the row has nothing
+            // left to finish. Either the install or conflict copy failed after journaling and the
+            // engine discarded the staged download (no crash needed), or a crash came right after
+            // installing and the user then edited or deleted the file before BeepBar started.
+            // Leaving it unresolved blocked every sync behind "Intervento richiesto" until another
+            // folder was chosen. Dropping it leaves the decision to the next sync, which
+            // compares the file as it is now with Moodle and the last synced version, and never
+            // overwrites a local change. A conflict copy with other bytes is not something this
+            // sequence writes, so that stays unresolved.
+            if try await fileStore.conflictArtifact(at: incomingPath) == nil {
+                try await database.finishOperation(id: operation.id)
+                return .recovered
+            }
             return .unresolved
         }
 
@@ -131,6 +144,15 @@ public actor RecoveryCoordinator {
             return .recovered
         }
         if destination == operation.expectedLocal {
+            // Recovery replaces a file only when the sequence that journaled the row would have:
+            // over the last synced version (a sync's install), or over the copy an open conflict
+            // recorded (the user chose Moodle's version). Releases before this check journaled a
+            // conflict with the user's edit as `expectedLocal`; such a row must not install over
+            // the edit, so anything else is kept and recorded as a conflict.
+            if case .present(let hash) = destination, !(try await mayReplace(hash, for: operation)) {
+                let synced = try await database.baseline(rootID: operation.rootID, remoteID: operation.remoteID)
+                return try await preserveConflict(operation, stage: stage, destination: destination, base: synced?.sha256)
+            }
             switch try await fileStore.install(stage, at: operation.destination, expectedLocal: operation.expectedLocal) {
             case .installedNew:
                 try await database.markCommitted(id: operation.id, baseline: baseline)
@@ -148,9 +170,24 @@ public actor RecoveryCoordinator {
         return try await preserveConflict(operation, stage: stage, destination: destination)
     }
 
-    private func preserveConflict(_ operation: PendingOperation, stage: StagedArtifact, destination: LocalState) async throws -> Outcome {
+    /// Whether a prepared row may install over the file it found, `hash`: the last synced version,
+    /// or the local copy of an open conflict on the same file whose Moodle version is the one
+    /// being installed (`ConflictResolver.useRemote` installs exactly that). Matching the download
+    /// too matters: an older release's conflict row for a newer Moodle version would otherwise
+    /// pass on the earlier conflict's local copy, which is the user's edit. The revision must
+    /// match too: Moodle can publish a new revision with identical bytes.
+    private func mayReplace(_ hash: String, for operation: PendingOperation) async throws -> Bool {
+        if try await database.baseline(rootID: operation.rootID, remoteID: operation.remoteID)?.sha256 == hash { return true }
+        return try await database.conflicts(rootID: operation.rootID).contains {
+            $0.remoteID == operation.remoteID && $0.relativePath == operation.destination && $0.localSHA256 == hash && $0.remoteSHA256 == operation.remoteSHA256 && $0.remoteRevision == operation.remoteRevision
+        }
+    }
+
+    /// `base` overrides the conflict's last synced version; `.some(nil)` means there is none, while
+    /// leaving it out uses the row's expected file.
+    private func preserveConflict(_ operation: PendingOperation, stage: StagedArtifact, destination: LocalState, base: String?? = nil) async throws -> Outcome {
         let incoming = try await fileStore.preserveAsConflict(stage, conflictID: operation.id, at: operation.destination)
-        let conflict = ConflictRecord(id: operation.id, rootID: operation.rootID, remoteID: operation.remoteID, relativePath: operation.destination, incomingPath: incoming, baseSHA256: operation.expectedLocal.sha256, localSHA256: destination.sha256, remoteSHA256: operation.remoteSHA256, remoteRevision: operation.remoteRevision, detectedAt: Date(), status: .open)
+        let conflict = ConflictRecord(id: operation.id, rootID: operation.rootID, remoteID: operation.remoteID, relativePath: operation.destination, incomingPath: incoming, baseSHA256: base ?? operation.expectedLocal.sha256, localSHA256: destination.sha256, remoteSHA256: operation.remoteSHA256, remoteRevision: operation.remoteRevision, detectedAt: Date(), status: .open)
         try await database.finishAsConflict(id: operation.id, conflict: conflict)
         return .conflict
     }

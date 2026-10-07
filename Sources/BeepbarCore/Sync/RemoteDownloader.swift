@@ -23,10 +23,13 @@ public struct NetworkAccess: Sendable, Equatable {
         self.allowsConstrainedNetworkAccess = allowsConstrainedNetworkAccess
     }
 
-    /// The user asked for this run and is watching it: any network will do.
+    /// Any network will do: every manual run, and automatic runs while "Risparmio dati" is off.
     public static let unrestricted = NetworkAccess(allowsExpensiveNetworkAccess: true, allowsConstrainedNetworkAccess: true)
-    /// Nobody asked for this run right now: never spend a metered hotspot and honour Low Data Mode.
-    public static let background = NetworkAccess(allowsExpensiveNetworkAccess: false, allowsConstrainedNetworkAccess: false)
+    /// An automatic run with "Risparmio dati" on: no phone hotspot, no Low Data Mode network. The
+    /// app already pauses such a run before it starts (`AutomaticSyncPolicy`); this catches a
+    /// network change midway, where macOS refuses the request as if the Mac were offline
+    /// (`URLError.notConnectedToInternet`) and the app shows the pause instead of an outage.
+    public static let dataSaver = NetworkAccess(allowsExpensiveNetworkAccess: false, allowsConstrainedNetworkAccess: false)
 }
 
 public struct DownloadedRemoteFile: Sendable {

@@ -1,8 +1,10 @@
 import SwiftUI
 import BeepbarCore
 
+/// The window's tabs. The raw value is only the declaration order: it is never stored, and the
+/// ⌘-number shortcuts follow the visible tabs (`visiblePages`), not this value.
 enum ShellPage: Int, CaseIterable, Identifiable {
-    case home, activity, conflicts, settings
+    case home, activity, conflicts, recordings, settings
 
     var id: Int { rawValue }
 
@@ -11,6 +13,7 @@ enum ShellPage: Int, CaseIterable, Identifiable {
         case .home: tr("Corsi", "Courses")
         case .activity: tr("Attività", "Activity")
         case .conflicts: tr("Conflitti", "Conflicts")
+        case .recordings: tr("Registrazioni", "Recordings")
         case .settings: tr("Impostazioni", "Settings")
         }
     }
@@ -20,8 +23,20 @@ enum ShellPage: Int, CaseIterable, Identifiable {
         case .home: "books.vertical"
         case .activity: "clock.arrow.circlepath"
         case .conflicts: "exclamationmark.triangle"
+        case .recordings: "play.rectangle"
         case .settings: "gearshape"
         }
+    }
+
+    /// The tabs in the bar, in order: Registrazioni only while the feature is on (Polimi only).
+    static func visiblePages(showsRecordings: Bool) -> [ShellPage] {
+        allCases.filter { $0 != .recordings || showsRecordings }
+    }
+
+    /// The page actually shown: a hidden tab (Recordings just turned off, or a stale route)
+    /// falls back to Corsi instead of an empty window.
+    static func shown(_ page: ShellPage, showsRecordings: Bool) -> ShellPage {
+        visiblePages(showsRecordings: showsRecordings).contains(page) ? page : .home
     }
 }
 
@@ -33,6 +48,7 @@ enum ShellPage: Int, CaseIterable, Identifiable {
 
 struct BeepbarShellView: View {
     @ObservedObject var authentication: WeBeepAuthenticationController
+    @ObservedObject var recordings: RecordingsController
     @ObservedObject var router: ShellRouter
     @Namespace private var tabSelection
 
@@ -54,7 +70,7 @@ struct BeepbarShellView: View {
                 header
                 Divider()
                 content
-                    .id(router.page)
+                    .id(shownPage)
                     .transition(.opacity)
                     .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
             }
@@ -64,11 +80,16 @@ struct BeepbarShellView: View {
         }
     }
 
+    private var showsRecordings: Bool { recordings.isEnabled }
+
+    private var shownPage: ShellPage { ShellPage.shown(router.page, showsRecordings: showsRecordings) }
+
     @ViewBuilder private var content: some View {
-        switch router.page {
+        switch shownPage {
         case .home: HomePage(authentication: authentication, open: open)
         case .activity: ActivityPage(authentication: authentication)
         case .conflicts: ConflictsPage(authentication: authentication)
+        case .recordings: RecordingsPage(authentication: authentication, recordings: recordings)
         case .settings: SettingsPage(authentication: authentication)
         }
     }
@@ -86,16 +107,17 @@ struct BeepbarShellView: View {
 
     private var tabBar: some View {
         HStack(spacing: 2) {
-            ForEach(ShellPage.allCases) { page in
-                tabButton(page)
+            let pages = ShellPage.visiblePages(showsRecordings: showsRecordings)
+            ForEach(Array(pages.enumerated()), id: \.element) { index, page in
+                tabButton(page, shortcut: index + 1)
             }
         }
         .padding(3)
         .background(.quaternary.opacity(0.7), in: Capsule())
     }
 
-    private func tabButton(_ page: ShellPage) -> some View {
-        let isSelected = router.page == page
+    private func tabButton(_ page: ShellPage, shortcut: Int) -> some View {
+        let isSelected = shownPage == page
         return Button { open(page) } label: {
             HStack(spacing: 5) {
                 Image(systemName: page.systemImage)
@@ -128,8 +150,9 @@ struct BeepbarShellView: View {
         }
         .buttonStyle(.plain)
         .focusEffectDisabled()
-        .keyboardShortcut(KeyEquivalent(Character(String(page.rawValue + 1))), modifiers: .command)
-        .help("\(page.title) (⌘\(page.rawValue + 1))")
+        // By position, so the shortcuts stay ⌘1…⌘n with no gap whichever tabs are shown.
+        .keyboardShortcut(KeyEquivalent(Character(String(shortcut))), modifiers: .command)
+        .help("\(page.title) (⌘\(shortcut))")
         .accessibilityAddTraits(isSelected ? .isSelected : [])
         .animation(BeepbarStyle.snappy, value: authentication.conflicts.count)
     }

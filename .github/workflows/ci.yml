@@ -45,6 +45,8 @@ jobs:
           test "$(xcrun --sdk macosx --show-sdk-version)" = "27.0"
       - name: Swift tests
         run: swift test
+      - name: Verify readable release notes
+        run: bash scripts/test-release-notes.sh
       - name: Verify release version numbering
         run: |
           test "$(scripts/build-version.sh 2.0 99)" = "2.0.99"
@@ -106,12 +108,7 @@ jobs:
           SIGNATURE=$(echo "$SPARKLE_PRIVATE_KEY" | /tmp/sparkle-tools/bin/sign_update --ed-key-file - build/00-Beepbar.dmg -p)
           LENGTH=$(stat -f%z build/00-Beepbar.dmg)
           PUBDATE=$(date -u +"%a, %d %b %Y %H:%M:%S +0000")
-          PREVIOUS_TAG=$(git tag --list 'v*' --sort=-v:refname | head -n1)
-          if [ -n "$PREVIOUS_TAG" ]; then
-            git log --pretty='- %s (`%h`)' "$PREVIOUS_TAG..$GITHUB_SHA" > release-notes.md
-          else
-            git log -1 --pretty='- %s (`%h`)' "$GITHUB_SHA" > release-notes.md
-          fi
+          bash scripts/release-notes.sh CHANGELOG.md > release-notes.md
           cat > release-body.md <<BODYEOF
           [**Download BeepBar for macOS**](https://github.com/${{ github.repository }}/releases/latest/download/00-Beepbar.dmg)
 
@@ -119,7 +116,7 @@ jobs:
 
           Built from commit [\`${GITHUB_SHA}\`](https://github.com/${{ github.repository }}/commit/${GITHUB_SHA}). Ad-hoc signed, not notarized — see the [README](https://github.com/${{ github.repository }}#tldr--install) for the first-launch Gatekeeper step.
 
-          ## Changes
+          ## What’s new in BeepBar $SHORT_VERSION
 
           $(cat release-notes.md)
           BODYEOF

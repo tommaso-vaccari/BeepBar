@@ -25,6 +25,11 @@
 		A10000000000000000000003 /* WebKit.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = A10000000000000000000021 /* WebKit.framework */; };
 		A10000000000000000000005 /* BeepbarCore in Frameworks */ = {isa = PBXBuildFile; productRef = A10000000000000000000040 /* BeepbarCore */; };
 		A10000000000000000000008 /* Sparkle in Frameworks */ = {isa = PBXBuildFile; productRef = A10000000000000000000041 /* Sparkle */; };
+		A100000000000000000000B0 /* RecmanScripts.swift in Sources */ = {isa = PBXBuildFile; fileRef = A100000000000000000000B1 /* RecmanScripts.swift */; };
+		A100000000000000000000B2 /* RecmanWebSession.swift in Sources */ = {isa = PBXBuildFile; fileRef = A100000000000000000000B3 /* RecmanWebSession.swift */; };
+		A100000000000000000000B8 /* RecordingsPage.swift in Sources */ = {isa = PBXBuildFile; fileRef = A100000000000000000000B9 /* RecordingsPage.swift */; };
+		A100000000000000000000B6 /* RecordingsController.swift in Sources */ = {isa = PBXBuildFile; fileRef = A100000000000000000000B7 /* RecordingsController.swift */; };
+		A100000000000000000000B4 /* RecordingsSessionStore.swift in Sources */ = {isa = PBXBuildFile; fileRef = A100000000000000000000B5 /* RecordingsSessionStore.swift */; };
 /* End PBXBuildFile section */
 
 /* Begin PBXFileReference section */
@@ -47,6 +52,11 @@
 		A10000000000000000000015 /* Signing.xcconfig */ = {isa = PBXFileReference; lastKnownFileType = text.xcconfig; path = Config/Signing.xcconfig; sourceTree = SOURCE_ROOT; };
 		A10000000000000000000016 /* Assets.xcassets */ = {isa = PBXFileReference; lastKnownFileType = folder.assetcatalog; path = Assets.xcassets; sourceTree = "<group>"; };
 		A10000000000000000000021 /* WebKit.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = WebKit.framework; path = System/Library/Frameworks/WebKit.framework; sourceTree = SDKROOT; };
+		A100000000000000000000B1 /* RecmanScripts.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = RecmanScripts.swift; sourceTree = "<group>"; };
+		A100000000000000000000B3 /* RecmanWebSession.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = RecmanWebSession.swift; sourceTree = "<group>"; };
+		A100000000000000000000B9 /* RecordingsPage.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = RecordingsPage.swift; sourceTree = "<group>"; };
+		A100000000000000000000B7 /* RecordingsController.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = RecordingsController.swift; sourceTree = "<group>"; };
+		A100000000000000000000B5 /* RecordingsSessionStore.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = RecordingsSessionStore.swift; sourceTree = "<group>"; };
 /* End PBXFileReference section */
 
 /* Begin PBXFrameworksBuildPhase section */
@@ -101,6 +111,11 @@
 				A100000000000000000000A7 /* ConflictsPage.swift */,
 				A100000000000000000000A9 /* ActivityPage.swift */,
 				A100000000000000000000AB /* ModuleDestinationsSheet.swift */,
+				A100000000000000000000B1 /* RecmanScripts.swift */,
+				A100000000000000000000B3 /* RecmanWebSession.swift */,
+				A100000000000000000000B9 /* RecordingsPage.swift */,
+				A100000000000000000000B7 /* RecordingsController.swift */,
+				A100000000000000000000B5 /* RecordingsSessionStore.swift */,
 			);
 			name = Sources;
 			path = Sources/BeepbarApp;
@@ -205,6 +220,11 @@
 				A100000000000000000000A6 /* ConflictsPage.swift in Sources */,
 				A100000000000000000000A8 /* ActivityPage.swift in Sources */,
 				A100000000000000000000AA /* ModuleDestinationsSheet.swift in Sources */,
+				A100000000000000000000B0 /* RecmanScripts.swift in Sources */,
+				A100000000000000000000B2 /* RecmanWebSession.swift in Sources */,
+				A100000000000000000000B8 /* RecordingsPage.swift in Sources */,
+				A100000000000000000000B6 /* RecordingsController.swift in Sources */,
+				A100000000000000000000B4 /* RecordingsSessionStore.swift in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};

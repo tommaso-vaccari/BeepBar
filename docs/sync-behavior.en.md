@@ -121,7 +121,10 @@ On the first sync after updating, the files the teacher removed from Moodle befo
 
 - A course Moodle refuses (no longer enrolled, hidden, restricted) does not block the others; it shows as "Corso non accessibile" in the details.
 - If every course fails because of the site or the connection, the sync is reported as failed and no file is touched.
-- Automatic sync does not use metered connections (hotspots) and honours Low Data Mode; it is postponed, not skipped, under Low Power Mode or while another operation runs.
+- Automatic sync uses any network, your phone's hotspot included, like "Sincronizza ora".
+- Automatic sync is postponed, not skipped, under Low Power Mode or while another operation runs.
+- With "Risparmio dati" (Data Saver) on (Settings, off by default), automatic sync pauses while the Mac uses a phone hotspot or a network with Low Data Mode, and resumes by itself on another network. If the Mac moves to one of these networks during an automatic sync, the sync stops at the next download and is postponed without reporting an error: files already downloaded stay, and the last result stays visible (an earlier error is not shown again, since that sync got past it). A connection that is really down still shows "Connessione assente". "Sincronizza ora" always downloads, on any network.
+- The pause only takes the place of "Pronto", the result of a completed sync or "Connessione assente": conflicts, materials not updated, other errors, an expired sign-in and a folder to choose stay in front. It goes away when an automatic sync starts, with "Sincronizza ora", when you turn off Data Saver or automatic sync, change Frequenza or which courses are selected, or when the account or the folder changes.
 
 - While courses are refreshing, their switches are disabled; a choice still being saved is applied before the refreshed list is restored.
 - Cancelling during the final checks ends the run without showing a completed result or sending its notification. Once completion or failure is shown, the run has ended and notification delivery cannot leave Cancel active.
@@ -134,9 +137,15 @@ On the first sync after updating, the files the teacher removed from Moodle befo
 
 | Place | Contents |
 |---|---|
-| **Home** | A notice leading to Conflicts while something waits for your choice, including files moved or removed on Moodle |
+| **Home** | A notice leading to Conflicts while something waits for your choice, including files moved or removed on Moodle. While Data Saver is pausing, the top card says "In pausa per Risparmio dati" and explains why and how it resumes, in place of the summary of the last sync (still in Activity); after a completed sync it still shows when that was |
 | **Activity** | The last sync only: new, updated, your changes, not updated, moved, and edited files moved on Moodle that now wait in Conflicts. A click opens a file where it is now, even after a later sync moved it; the right-click menu also shows it in Finder. Only documents open directly; anything else (scripts, apps, disk images, unknown types) is only shown in Finder. A file that is no longer where BeepBar put it, including one replaced with a Finder alias, is reported on its row; a file without read permission reports that problem and opens nothing |
 | **Conflicts** | Everything waiting for your choice, until you choose: conflicts and files moved or removed on Moodle. A refused or failed choice shows its reason on this page; a subsequent choice clears the old message |
-| **Menu bar** | The status of the last sync. No new text for moves and removals |
+| **Menu bar** | The status of the last sync. No new text for moves and removals. While Data Saver is pausing, "In pausa per Risparmio dati" and the reason: "In attesa del Wi-Fi" or "Modalità dati ridotti attiva"; the icon shows a pause symbol |
 | **Sign-in** | Onboarding and Settings show a failed sign-in beside its button; the next attempt clears the old message. A failed attempt does not replace an existing account. University selection stays locked during sign-in; verification, a new sign-in and disconnect wait for an ongoing account check to finish |
 | **Notifications** | As today (new materials, conflicts). No new notifications for moves and removals. They can be turned off in Settings: while off none is sent, and a conflict still open may be notified at the next automatic sync after they are back on. A click opens Conflicts, Activity or Courses. They also appear while BeepBar is in front |
+
+## Lecture recordings
+
+Without a reusable saved session, opening the page immediately explains the feature and offers Polimi sign-in before fetching recordings; an existing reusable session is used automatically.
+
+Recordings is enabled by default for Polimi accounts. Turning it off in Settings hides the page and preserves that choice between launches. Its sidebar shows only courses selected for synchronization, including courses whose code or year cannot be identified. Archive searches require both a course code and an academic year. Recordings are fetched when the page is open and played in the default browser; they are not downloaded by file synchronization. The Polimi session is stored in a separate local file and removed when you disable Recordings, disconnect or switch accounts. An expired session requires another sign-in.

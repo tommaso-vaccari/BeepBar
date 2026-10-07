@@ -1,3 +1,4 @@
+import Combine
 import Foundation
 import Testing
 import SQLite3
@@ -67,5 +68,60 @@ struct CourseSelectionDuringRefreshTests {
         try await refresh.value
 
         #expect(controller.enabledCourseIDs == [1])
+    }
+
+    /// An unchanged refresh must not publish folders or selection again. With many courses,
+    /// redundant assignments send one invalidation and copy the folder dictionary per course.
+    /// `refreshingChangedCoursesPublishesEachChangeOnce` guards changes still reaching the UI.
+    @Test @MainActor func refreshingUnchangedCoursesPublishesNothing() async throws {
+        let (controller, _, _, cleanup) = try await restoredController()
+        defer { cleanup() }
+
+        var folderUpdates = 0
+        var selectionUpdates = 0
+        let folders = controller.$courseFolders.dropFirst().sink { _ in folderUpdates += 1 }
+        let selection = controller.$enabledCourseIDs.dropFirst().sink { _ in selectionUpdates += 1 }
+        defer { folders.cancel(); selection.cancel() }
+        try await controller.restoreScopesForTesting([course])
+
+        #expect(controller.courseFolders == [1: "Course"])
+        #expect(controller.enabledCourseIDs == [1])
+        #expect(folderUpdates == 0)
+        #expect(selectionUpdates == 0)
+    }
+
+    /// Proves that a refresh still publishes a folder and a selection that changed in the database
+    /// since the last one, each exactly once with the new value. Guards against a fix for the test
+    /// above that skips the restore whenever the course list itself is unchanged.
+    @Test @MainActor func refreshingChangedCoursesPublishesEachChangeOnce() async throws {
+        let (controller, database, rootID, cleanup) = try await restoredController()
+        defer { cleanup() }
+        try await database.upsertScope(SyncScope(rootID: rootID, courseID: 1, displayName: "Course", localFolder: "Course renamed", enabled: false))
+
+        var folderValues: [[Int64: String]] = []
+        var selectionValues: [Set<Int64>] = []
+        let folders = controller.$courseFolders.dropFirst().sink { folderValues.append($0) }
+        let selection = controller.$enabledCourseIDs.dropFirst().sink { selectionValues.append($0) }
+        defer { folders.cancel(); selection.cancel() }
+        try await controller.restoreScopesForTesting([course])
+
+        #expect(folderValues == [[1: "Course renamed"]])
+        #expect(selectionValues == [[]])
+    }
+
+    /// A controller whose first refresh restored course 1's saved folder ("Course") and selection.
+    @MainActor private func restoredController() async throws -> (WeBeepAuthenticationController, SyncDatabase, UUID, () -> Void) {
+        let root = FileManager.default.temporaryDirectory.appending(path: UUID().uuidString, directoryHint: .isDirectory)
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        let database = try SyncDatabase(url: root.appending(path: "state.sqlite"))
+        let rootID = UUID()
+        try await database.registerRoot(id: rootID, canonicalPath: root.path)
+        try await database.upsertScope(SyncScope(rootID: rootID, courseID: 1, displayName: "Course", localFolder: "Course", enabled: true))
+        let controller = WeBeepAuthenticationController(testRootURL: root, database: database, rootID: rootID)
+        try await controller.restoreScopesForTesting([course])
+        // The first refresh really restored the saved folder and selection.
+        #expect(controller.courseFolders == [1: "Course"])
+        #expect(controller.enabledCourseIDs == [1])
+        return (controller, database, rootID, { try? FileManager.default.removeItem(at: root) })
     }
 }

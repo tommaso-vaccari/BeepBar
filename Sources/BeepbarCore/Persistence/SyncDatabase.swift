@@ -11,9 +11,57 @@ public enum SyncDatabaseError: Error, Sendable, Equatable {
 
 private final class SQLiteHandle: @unchecked Sendable {
     let pointer: OpaquePointer?
+    /// Write transactions this connection committed, counted by SQLite's commit hook. Owned here so
+    /// it lives exactly as long as the connection the hook belongs to: `sqlite3_close` runs in
+    /// `deinit`, before the stored properties are released.
+    let commits = CommitCounter()
 
-    init(_ pointer: OpaquePointer?) { self.pointer = pointer }
+    init(_ pointer: OpaquePointer?) {
+        self.pointer = pointer
+        // A commit hook only observes: returning 0 lets every commit through. It fires for each
+        // committed write transaction, including an explicit one that changed no row and a write
+        // statement that matched none, and never for reads. Unlike `sqlite3_wal_hook`, it doesn't
+        // replace the WAL auto-checkpoint, so counting changes nothing about how the database runs.
+        sqlite3_commit_hook(pointer, { context in
+            Unmanaged<CommitCounter>.fromOpaque(context!).takeUnretainedValue().value += 1
+            return 0
+        }, Unmanaged.passUnretained(commits).toOpaque())
+    }
     deinit { sqlite3_close(pointer) }
+}
+
+/// Only touched from inside `sqlite3_step`, on the `SyncDatabase` actor that owns the connection.
+private final class CommitCounter: @unchecked Sendable {
+    var value = 0
+}
+
+/// How much one `SyncDatabase` connection has written since it opened, for the benchmark harness and
+/// for tests that prove a run wrote nothing. Three separate measures, because they answer different
+/// questions:
+/// - `rowChanges` (`sqlite3_total_changes64`): rows inserted, updated or deleted, including an update
+///   that rewrote a row with the same values and rows of a transaction later rolled back.
+/// - `commits`: write transactions committed. An empty `BEGIN IMMEDIATE … COMMIT` or an `UPDATE`
+///   matching no row still counts. Only a commit that wrote pages appends to the WAL and, with
+///   `synchronous = FULL`, waits for an `fsync`; an empty one costs a lock round trip.
+/// - `pagesWritten` (`SQLITE_DBSTATUS_CACHE_WRITE`): database pages written to the WAL, i.e. WAL
+///   frames. SQLite doesn't dirty a page an `UPDATE` leaves byte-identical, so an identical update
+///   counts a row change and a commit without a page (an identical upsert still writes one).
+/// `PRAGMA data_version` would not do: it ignores the connection's own commits.
+package struct SyncDatabaseWriteCounters: Sendable, Equatable, Codable {
+    package var rowChanges: Int64
+    package var commits: Int
+    package var pagesWritten: Int
+
+    package init(rowChanges: Int64 = 0, commits: Int = 0, pagesWritten: Int = 0) {
+        self.rowChanges = rowChanges
+        self.commits = commits
+        self.pagesWritten = pagesWritten
+    }
+
+    /// What was written between `earlier` and `self`, both read from the same connection.
+    package func since(_ earlier: SyncDatabaseWriteCounters) -> SyncDatabaseWriteCounters {
+        SyncDatabaseWriteCounters(rowChanges: rowChanges - earlier.rowChanges, commits: commits - earlier.commits, pagesWritten: pagesWritten - earlier.pagesWritten)
+    }
 }
 
 /// Advances `statement` by one row: `true` on `SQLITE_ROW`, `false` on `SQLITE_DONE`. Any other result
@@ -41,15 +89,59 @@ public actor SyncDatabase {
         guard sqlite3_busy_timeout(database, 5000) == SQLITE_OK else { throw SyncDatabaseError.open }
         try Self.execute(database, "PRAGMA foreign_keys = ON")
         try Self.execute(database, "PRAGMA journal_mode = WAL")
+        // Every change to a synced file is journaled first: a pending row, then the filesystem
+        // change (each `FileStore` rename is followed by `fsync`), then the commit that finishes
+        // it. Recovery relies on the row reaching the disk before the change it describes. In WAL
+        // mode the system SQLite defaults to NORMAL, which syncs the log only at checkpoints: a
+        // kernel panic or power cut can then drop rows that were already committed while the
+        // rename they describe survives, leaving an installed file or a moved course folder that
+        // no pending row explains. FULL syncs the log on every commit. Process crashes were
+        // already safe under NORMAL (a committed row is in the log file); this is for the machine
+        // going down. Commits don't ask for `F_FULLFSYNC` (`PRAGMA fullfsync` stays off; only
+        // checkpoints use it, `checkpoint_fullfsync` being on in the system build), and
+        // `FileStore` uses plain `fsync`, so on macOS the drive's own cache can still reorder
+        // writes on sudden power loss. A run with nothing new writes no WAL frame, and a commit
+        // that wrote nothing doesn't sync, so FULL costs it nothing. An explicit `synchronous`
+        // holds after switching to WAL, so the order of these two pragmas doesn't matter.
+        try Self.execute(database, "PRAGMA synchronous = FULL")
         try Self.migrate(database)
+    }
+
+    /// The durability settings this connection actually runs with, read back from SQLite so tests
+    /// check the effective values rather than the statements that set them.
+    func durabilitySettings() throws -> (journalMode: String, synchronous: Int32, fullFsync: Int32, checkpointFullFsync: Int32) {
+        func value(_ pragma: String) throws -> (text: String?, number: Int32) {
+            try withStatement("PRAGMA \(pragma)") { statement in
+                guard try stepRow(statement) else { throw SyncDatabaseError.execution }
+                return (text(statement, 0), sqlite3_column_int(statement, 0))
+            }
+        }
+        guard let journalMode = try value("journal_mode").text else { throw SyncDatabaseError.execution }
+        return (journalMode, try value("synchronous").number, try value("fullfsync").number, try value("checkpoint_fullfsync").number)
     }
 
     public func migrate() throws {
         try Self.migrate(database)
     }
 
+    /// Everything this connection has written since it opened, opening migrations included; take
+    /// the difference of two readings (`since`) to measure one operation.
+    package func writeCounters() -> SyncDatabaseWriteCounters {
+        var pages: Int32 = 0
+        var highwater: Int32 = 0
+        sqlite3_db_status(database, SQLITE_DBSTATUS_CACHE_WRITE, &pages, &highwater, 0)
+        return SyncDatabaseWriteCounters(rowChanges: sqlite3_total_changes64(database), commits: handle.commits.value, pagesWritten: Int(pages))
+    }
+
+    /// Records the sync folder, or brings its row up to date. Called on every launch (before
+    /// recovery), on every recovery retry and when a folder is chosen, almost always with the
+    /// values already stored. The `WHERE` makes that case write no page: SQLite rewrites a row an
+    /// upsert matches even when nothing changes, so without it each launch appended a WAL frame
+    /// and, under `synchronous = FULL`, waited for an `fsync`. It still commits an empty write
+    /// transaction, which costs a lock round trip but no frame and no `fsync`. `IS NOT`, not `!=`:
+    /// with `!=`, a bookmark added or removed would compare as NULL and the change would be lost.
     public func registerRoot(id: UUID, canonicalPath: String, securityBookmark: Data? = nil) throws {
-        try withStatement("INSERT INTO roots(id, canonical_path, security_bookmark) VALUES (?, ?, ?) ON CONFLICT(id) DO UPDATE SET canonical_path = excluded.canonical_path, security_bookmark = excluded.security_bookmark") { statement in
+        try withStatement("INSERT INTO roots(id, canonical_path, security_bookmark) VALUES (?, ?, ?) ON CONFLICT(id) DO UPDATE SET canonical_path = excluded.canonical_path, security_bookmark = excluded.security_bookmark WHERE canonical_path IS NOT excluded.canonical_path OR security_bookmark IS NOT excluded.security_bookmark") { statement in
             try bind(id.uuidString, to: statement, index: 1)
             try bind(canonicalPath, to: statement, index: 2)
             if let securityBookmark {

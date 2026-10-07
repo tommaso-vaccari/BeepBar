@@ -2,7 +2,63 @@
 
 ## Unreleased
 
+## 2026-10-07
+
+### Release highlights
+
+- Browse lecture recordings for your synchronized Polimi courses and play them in your default browser.
+- Use Data Saver to pause automatic downloads on a phone hotspot or a network with Low Data Mode; manual sync always remains available.
+- Edited local files stay protected when synchronization is interrupted, and reopening BeepBar recovers more reliably.
+- Large downloads use much less memory, and unchanged course lists avoid unnecessary redraws.
+- Quitting from the menu bar works during synchronization, and course search is easier to deselect.
+
+**After updating:** Recordings is enabled by default for Polimi accounts. Open Recordings and sign in with Polimi to get started, or turn it off in Settings. Automatic sync now also downloads on hotspots and networks with Low Data Mode; turn on Data Saver if you prefer to wait for another network.
+
+### New
+
+- Lecture recordings for synchronized Polimi courses, grouped by week, with search and playback in your default browser. Enabled by default for Polimi accounts; sign in with Polimi to get started, or turn it off in Settings. The session is saved locally between launches.
+
+- "Risparmio dati" in Impostazioni: when it's on, automatic sync pauses while your Mac is using your phone's hotspot or a network with Low Data Mode, and picks up again by itself on another network. BeepBar shows that it's paused and why, in the window and in the menu bar. "Sincronizza ora" always downloads. It's off unless you turn it on.
+
+- Every switch in Impostazioni, and the Frequenza menu, has an ⓘ button that explains in plain words what it does. Hover over it, or click it.
+
+### Improved
+
+- Recordings have clearer course names, more room for lesson titles, and a visible Play button on every row. Search stays available in its own toolbar, including courses with only a few recordings.
+
+### Fixed
+
+- Opening Recordings without a reusable saved session now immediately explains the feature, how to sign in with Polimi and how to turn it off in Settings.
+
+- Quickly choosing another recording now opens or copies only your latest choice, even when the previous link is still loading.
+
+- Refreshing courses or finishing a sync no longer redraws an unchanged course list unnecessarily.
+
+- "Esci" in the menu bar no longer leaves BeepBar stuck when a sync is running: the sync stops and BeepBar closes within a few seconds.
+
+- Automatic sync no longer fails with "Connessione assente" while your Mac is on a phone hotspot or a network with Low Data Mode. After updating, it downloads on these networks too, just like "Sincronizza ora"; turn on "Risparmio dati" if you'd rather it waited for another network.
+
+- Downloading a large file (a lecture recording, an archive), or a new version of one, no longer makes BeepBar use far more memory than the file itself: a 256 MB file could take about 1 GB for a moment. Memory now stays low whatever the size of the file.
+
+- The "Cerca corsi" field in Corsi no longer stays selected. Clicking anywhere else deselects it; Esc clears what you typed, and Esc again deselects it.
+
+- If BeepBar was interrupted (a crash, a forced quit, a power cut) just as it found that you had edited a file Moodle had also updated, it could replace your edited copy with Moodle's at the next launch. Your copy is now always kept, and both versions appear in Conflicts.
+
+- Sync no longer gets stuck on "Intervento richiesto" at the next launch when a downloaded file couldn't be put in its folder (for example a folder BeepBar wasn't allowed to write to), or when BeepBar was interrupted right after downloading a new file that you then edited or deleted. The next sync handles the file as usual.
+
+- BeepBar now saves its sync progress to disk at every step. A power cut or a system crash in the middle of a sync is much less likely to make it lose track of files it had already downloaded or course folders it had already renamed.
+
 ## 2026-10-01
+
+### Release highlights
+
+- Open downloaded documents directly from Activity.
+- Notifications take you to the relevant page and can be disabled in Settings.
+- BeepBar starts at login so automatic synchronization resumes after restarting.
+- Files moved or removed on WeBeep are handled more clearly, while protecting your edited copies.
+- More reliable synchronization, cancellation, sign-in and course selection.
+
+**After updating:** macOS may show a login-item notice. Your first sync may list previously removed materials in Conflicts; you decide what to keep or move to Trash.
 
 ### New
 

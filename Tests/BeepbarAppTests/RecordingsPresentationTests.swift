@@ -33,6 +33,18 @@ struct RecordingsPresentationTests {
         #expect(RecordingsPresentation.selectedCourse([], selectedID: nil) == nil)
     }
 
+    /// Course labels retain their human wording while archive metadata moves to the header summary.
+    @Test func courseNamesRemoveOnlyRecognizedArchiveMetadata() {
+        #expect(RecordingsPresentation.courseName(course(1, "058167 - NUMERICAL LINEAR ALGEBRA [2026-27]")) == "NUMERICAL LINEAR ALGEBRA")
+        #expect(RecordingsPresentation.courseName(course(2, "058167 - HPC (2026-2027)")) == "HPC")
+        #expect(RecordingsPresentation.courseName(course(3, "058167 - C++ (Prof. Rossi) [2026/27]")) == "C++ (Prof. Rossi)")
+        #expect(RecordingsPresentation.courseName(course(4, "Seminar (Prof. Rossi)")) == "Seminar (Prof. Rossi)")
+        #expect(RecordingsPresentation.courseName(course(5, "058167 - HPC [2026-28]")) == "058167 - HPC [2026-28]")
+        let fallback = RemoteCourseSummary(id: 6, shortName: "058167 - HPC [2026-27]", displayName: "  ", isVisible: true, startDate: nil, endDate: nil)
+        #expect(RecordingsPresentation.courseName(fallback) == "HPC")
+        #expect(RecordingsPresentation.courseName(course(7, "058167 - [2026-27]")) == "058167 - [2026-27]")
+    }
+
     @Test func durationFormatting() {
         #expect(RecordingsPresentation.minutes("97 min") == 97)
         #expect(RecordingsPresentation.minutes("") == nil)

@@ -13,6 +13,21 @@ enum RecordingsPresentation {
             ?? courses.first
     }
 
+    /// Hide recognized archive identifiers without changing the course's wording or acronyms.
+    static func courseName(_ course: RemoteCourseSummary) -> String {
+        let displayName = course.displayName.trimmingCharacters(in: .whitespacesAndNewlines)
+        let name = displayName.isEmpty ? course.shortName.trimmingCharacters(in: .whitespacesAndNewlines) : displayName
+        guard let key = RecmanCourseKey(course: course) else { return name }
+        let nextYear = key.academicYear + 1
+        let year = "\(key.academicYear)\\s*[-/]\\s*(?:\(nextYear)|\(String(format: "%02d", nextYear % 100)))"
+        let suffix = "\\s*(?:\\[\\s*\(year)\\s*\\]|\\(\\s*\(year)\\s*\\))\\s*$"
+        let cleaned = name
+            .replacingOccurrences(of: #"^\s*[0-9]{6}\s*-\s*"#, with: "", options: .regularExpression)
+            .replacingOccurrences(of: suffix, with: "", options: .regularExpression)
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        return cleaned.isEmpty ? name : cleaned
+    }
+
     struct WeekSection: Equatable {
         let title: String
         let recordings: [RecmanRecording]
@@ -200,15 +215,16 @@ struct RecordingsPage: View {
         List(selection: Binding(get: { selectedCourse?.id }, set: { selectedCourseID = $0 })) {
             Section(tr("I tuoi corsi", "Your courses")) {
                 ForEach(searchableCourses, id: \.course.id) { entry in
-                    CourseRow(name: authentication.folder(for: entry.course), listing: recordings.listing(for: entry.key), newCount: recordings.newCount(for: entry.key))
+                    CourseRow(name: RecordingsPresentation.courseName(entry.course), key: entry.key, listing: recordings.listing(for: entry.key), newCount: recordings.newCount(for: entry.key))
                         .tag(entry.course.id)
                 }
             }
             if !unsearchableCourses.isEmpty {
                 Section(tr("Senza codice o anno", "No code or year")) {
                     ForEach(unsearchableCourses) { course in
-                        Text(authentication.folder(for: course))
-                            .lineLimit(1)
+                        Text(RecordingsPresentation.courseName(course))
+                            .lineLimit(3)
+                            .fixedSize(horizontal: false, vertical: true)
                             .foregroundStyle(.secondary)
                             .tag(course.id)
                     }
@@ -223,13 +239,13 @@ struct RecordingsPage: View {
     @ViewBuilder private var detail: some View {
         if let course = selectedCourse {
             if let key = RecmanCourseKey(course: course) {
-                CourseRecordings(name: authentication.folder(for: course), key: key, recordings: recordings) {
+                CourseRecordings(name: RecordingsPresentation.courseName(course), key: key, recordings: recordings) {
                     refresh(force: true)
                 }
                 .id(course.id)
             } else {
                 ContentUnavailableView {
-                    Label(authentication.folder(for: course), systemImage: "questionmark.folder")
+                    Label(RecordingsPresentation.courseName(course), systemImage: "questionmark.folder")
                 } description: {
                     Text(tr("Il nome del corso su WeBeep non riporta codice e anno accademico, quindi BeepBar non sa quali registrazioni cercare.",
                             "The course's name on WeBeep doesn't carry its code and academic year, so BeepBar can't tell which recordings to look for."))
@@ -239,16 +255,23 @@ struct RecordingsPage: View {
     }
 }
 
-/// A course in the sidebar: its folder name, how many recordings it has, and the new ones.
+/// A course in the sidebar keeps its code and year visible to distinguish matching names.
 private struct CourseRow: View {
     let name: String
+    let key: RecmanCourseKey
     let listing: RecordingsListing?
     let newCount: Int
 
     var body: some View {
         HStack(spacing: 8) {
             VStack(alignment: .leading, spacing: 2) {
-                Text(name).lineLimit(1)
+                Text(name)
+                    .lineLimit(3)
+                    .fixedSize(horizontal: false, vertical: true)
+                Text("\(key.courseCode) · \(key.academicYearLabel)")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
                 Text(subtitle)
                     .font(.caption)
                     .foregroundStyle(.secondary)
@@ -294,6 +317,7 @@ private struct CourseRecordings: View {
     var body: some View {
         VStack(spacing: 0) {
             header
+            toolbar
             Divider()
             if let problem = listing?.problem {
                 NoticeBanner(text: problem.message, systemImage: "wifi.exclamationmark", tint: .orange)
@@ -309,37 +333,51 @@ private struct CourseRecordings: View {
     }
 
     private var header: some View {
-        HStack(alignment: .center, spacing: 10) {
-            VStack(alignment: .leading, spacing: 2) {
-                Text(name)
-                    .font(.title3.weight(.semibold))
-                    .lineLimit(1)
-                Text(summary)
-                    .font(.callout)
-                    .foregroundStyle(.secondary)
-                    .lineLimit(1)
+        VStack(alignment: .leading, spacing: 6) {
+            Text(name)
+                .font(.title3.weight(.semibold))
+                .lineLimit(3)
+                .fixedSize(horizontal: false, vertical: true)
+            Text(summary)
+                .font(.callout)
+                .foregroundStyle(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
+            if let updatedAt = listing?.updatedAt {
+                Text(tr("Aggiornato \(updatedAt.relativeText)", "Updated \(updatedAt.relativeText)"))
+                    .font(.caption)
+                    .foregroundStyle(.tertiary)
             }
-            Spacer(minLength: 8)
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .padding(.horizontal, 20)
+        .padding(.top, 18)
+        .padding(.bottom, 14)
+    }
+
+    private var toolbar: some View {
+        HStack(spacing: 12) {
+            searchField
+            Spacer(minLength: 0)
             if recordings.newCount(for: key) > 0 {
                 Button(tr("Segna come viste", "Mark as seen")) { recordings.markSeen(key) }
                     .buttonStyle(.borderless)
                     .font(.callout)
+                    .fixedSize()
             }
-            if (listing?.recordings?.count ?? 0) > 6 || !query.isEmpty { searchField }
             Button(action: refresh) {
                 ZStack {
                     ProgressView().controlSize(.small).opacity(listing?.isLoading == true ? 1 : 0)
                     Image(systemName: "arrow.clockwise").opacity(listing?.isLoading == true ? 0 : 1)
                 }
-                .frame(width: 20, height: 20)
+                .frame(width: 24, height: 24)
             }
             .buttonStyle(.borderless)
             .disabled(listing?.isLoading == true)
             .help(tr("Aggiorna le registrazioni", "Refresh the recordings"))
             .accessibilityLabel(tr("Aggiorna registrazioni", "Refresh recordings"))
         }
-        .padding(.horizontal, 16)
-        .padding(.vertical, 12)
+        .padding(.horizontal, 20)
+        .padding(.bottom, 14)
     }
 
     private var summary: String {
@@ -350,7 +388,6 @@ private struct CourseRecordings: View {
         let minutes = list.compactMap { RecordingsPresentation.minutes($0.duration) }.reduce(0, +)
         var parts = [year, tr("\(list.count) registrazioni", englishCount(list.count, "recording", "recordings"))]
         if minutes > 0 { parts.append(RecordingsPresentation.durationText(minutes: minutes)) }
-        if let updatedAt = listing?.updatedAt { parts.append(tr("aggiornato \(updatedAt.relativeText)", "updated \(updatedAt.relativeText)")) }
         return parts.joined(separator: " · ")
     }
 
@@ -372,10 +409,10 @@ private struct CourseRecordings: View {
         }
         .font(.callout)
         .padding(.horizontal, 9)
-        .padding(.vertical, 5)
-        .frame(width: 170)
-        .background(Color(nsColor: .controlBackgroundColor), in: Capsule())
-        .overlay(Capsule().strokeBorder(.separator, lineWidth: 0.5))
+        .padding(.vertical, 7)
+        .frame(minWidth: 120, maxWidth: 280)
+        .background(Color(nsColor: .controlBackgroundColor), in: RoundedRectangle(cornerRadius: 8))
+        .overlay(RoundedRectangle(cornerRadius: 8).strokeBorder(.separator, lineWidth: 0.5))
     }
 
     @ViewBuilder private var content: some View {
@@ -435,15 +472,13 @@ private struct CourseRecordings: View {
     }
 }
 
-/// One recording: unseen dot, lesson number, title, when and how long, its kind, and a play
-/// button that shows on hover (and while the player is being looked up).
+/// A recording keeps its title above its metadata and its play action visible without hover.
 private struct RecordingRow: View {
     let recording: RecmanRecording
     let number: Int?
     let isNew: Bool
     let isOpening: Bool
     let play: () -> Void
-    @State private var isHovered = false
 
     var body: some View {
         HStack(spacing: 10) {
@@ -456,19 +491,23 @@ private struct RecordingRow: View {
                 .monospacedDigit()
                 .foregroundStyle(.tertiary)
                 .frame(width: 34, alignment: .leading)
-            VStack(alignment: .leading, spacing: 2) {
+            VStack(alignment: .leading, spacing: 6) {
                 Text(RecordingsPresentation.title(recording))
-                    .fontWeight(isNew ? .semibold : .regular)
-                    .lineLimit(1)
-                Text(details)
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-                    .lineLimit(1)
+                    .font(.body.weight(isNew ? .semibold : .medium))
+                    .lineLimit(3)
+                    .fixedSize(horizontal: false, vertical: true)
+                ViewThatFits(in: .horizontal) {
+                    HStack(spacing: 8) {
+                        metadata.fixedSize()
+                        kind.fixedSize()
+                    }
+                    VStack(alignment: .leading, spacing: 4) {
+                        metadata
+                        kind
+                    }
+                }
             }
-            Spacer(minLength: 8)
-            if !recording.title.isEmpty, !recording.kind.isEmpty {
-                CountPill(text: recording.kind)
-            }
+            .frame(maxWidth: .infinity, alignment: .leading)
             Button(action: play) {
                 ZStack {
                     ProgressView().controlSize(.small).opacity(isOpening ? 1 : 0)
@@ -477,16 +516,27 @@ private struct RecordingRow: View {
                         .foregroundStyle(Color.accentColor)
                         .opacity(isOpening ? 0 : 1)
                 }
-                .frame(width: 24, height: 24)
+                .frame(width: 32, height: 32)
             }
             .buttonStyle(.plain)
-            .opacity(isHovered || isOpening ? 1 : 0)
             .help(tr("Apri nel browser", "Open in browser"))
             .accessibilityLabel(tr("Riproduci \(RecordingsPresentation.title(recording))", "Play \(RecordingsPresentation.title(recording))"))
         }
-        .padding(.vertical, 3)
+        .padding(.vertical, 9)
         .contentShape(Rectangle())
-        .onHover { isHovered = $0 }
+    }
+
+    private var metadata: some View {
+        Text(details)
+            .font(.caption)
+            .foregroundStyle(.secondary)
+            .fixedSize(horizontal: false, vertical: true)
+    }
+
+    @ViewBuilder private var kind: some View {
+        if !recording.title.isEmpty, !recording.kind.isEmpty {
+            CountPill(text: recording.kind)
+        }
     }
 
     private var details: String {

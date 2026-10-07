@@ -10,6 +10,10 @@
 
 - Every switch in Impostazioni, and the Frequenza menu, has an ⓘ button that explains in plain words what it does. Hover over it, or click it.
 
+### Improved
+
+- Recordings have clearer course names, more room for lesson titles, and a visible Play button on every row. Search stays available in its own toolbar, including courses with only a few recordings.
+
 ### Fixed
 
 - Quickly choosing another recording now opens or copies only your latest choice, even when the previous link is still loading.

@@ -36,3 +36,10 @@ The initial CI run exposed a wall-clock assertion in `menuQuitGivesUpWaitingAfte
 ## Verification limits
 
 The existing live probe is `scripts/recman-probe.sh cold <course> <year>` followed by `warm`. Real Polimi sign-in, session expiry and playback were not repeated during this completion pass. Browser tests use WebKit fixtures and controller tests use a fake browser; a Release build and passing fixtures do not establish live SSO success.
+
+## Recordings UI follow-up
+
+- Full `swift test`: 614 tests passed (337 core, 24 benchmark, 239 app Swift Testing, 14 app XCTest). The Release build with signing disabled also succeeded.
+- All nine presentation tests passed. Returning the unprocessed course name caused four assertions in the new name-formatting regression to fail; restoring the implementation made them pass.
+- Offscreen renders checked compact and wide layouts, long titles, visible Play controls, and English/light and Italian/dark appearances. These used an isolated fake browser and preferences, without launching or replacing the installed app.
+- Independent review identified a P2 concerning courses with identical readable names. Keeping course code and academic year visible in the sidebar resolved it; the same reviewer reported no remaining actionable findings.

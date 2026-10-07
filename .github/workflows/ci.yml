@@ -15,6 +15,7 @@ jobs:
   changes:
     name: Detect changes
     runs-on: ubuntu-latest
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
     outputs:
       production: ${{ steps.filter.outputs.production }}
     steps:
@@ -37,12 +38,27 @@ jobs:
   test:
     name: Test
     runs-on: xcode-27
+    concurrency:
+      # Release and manual runs get unique groups so no validation prerequisite is dropped.
+      group: ${{ github.workflow }}-test-${{ github.event_name }}-${{ (github.event_name == 'workflow_dispatch' || github.ref == 'refs/heads/main') && github.run_id || github.ref }}
+      cancel-in-progress: true
     steps:
       - uses: actions/checkout@v4
       - name: Verify toolchain
+        id: toolchain
         run: |
           xcodebuild -version
           test "$(xcrun --sdk macosx --show-sdk-version)" = "27.0"
+          echo "fingerprint=$( { xcodebuild -version; swift --version; } | shasum -a 256 | cut -d ' ' -f 1)" >> "$GITHUB_OUTPUT"
+      - name: Cache package dependencies
+        uses: actions/cache@v4
+        with:
+          path: |
+            .build/artifacts
+            .build/checkouts
+            .build/repositories
+            build/SourcePackages
+          key: packages-v1-${{ runner.os }}-${{ runner.arch }}-${{ steps.toolchain.outputs.fingerprint }}-${{ hashFiles('Package.swift', 'Package.resolved', 'Beepbar.xcodeproj/project.pbxproj', 'Beepbar.xcodeproj/project.xcworkspace/xcshareddata/swiftpm/Package.resolved') }}
       - name: Swift tests
         run: swift test
       - name: Verify readable release notes
@@ -55,7 +71,7 @@ jobs:
           ! scripts/build-version.sh 2 110
       - name: Build and verify Release app
         run: |
-          xcodebuild -project Beepbar.xcodeproj -target Beepbar -configuration Release build CODE_SIGNING_ALLOWED=NO
+          xcodebuild -project Beepbar.xcodeproj -target Beepbar -configuration Release -clonedSourcePackagesDirPath build/SourcePackages build CODE_SIGNING_ALLOWED=NO
           file build/Release/Beepbar.app/Contents/MacOS/Beepbar | grep -q 'arm64'
           plutil -lint build/Release/Beepbar.app/Contents/Info.plist
           test -f build/Release/Beepbar.app/Contents/Resources/Assets.car

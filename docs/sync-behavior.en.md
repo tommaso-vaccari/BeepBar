@@ -146,4 +146,6 @@ On the first sync after updating, the files the teacher removed from Moodle befo
 
 ## Lecture recordings
 
+Without a reusable saved session, opening the page immediately explains the feature and offers Polimi sign-in before fetching recordings; an existing reusable session is used automatically.
+
 Recordings is enabled by default for Polimi accounts. Turning it off in Settings hides the page and preserves that choice between launches. Its sidebar shows only courses selected for synchronization, including courses whose code or year cannot be identified. Archive searches require both a course code and an academic year. Recordings are fetched when the page is open and played in the default browser; they are not downloaded by file synchronization. The Polimi session is stored in a separate local file and removed when you disable Recordings, disconnect or switch accounts. An expired session requires another sign-in.

@@ -16,6 +16,8 @@
 
 ### Fixed
 
+- Opening Recordings without a reusable saved session now immediately explains the feature, how to sign in with Polimi and how to turn it off in Settings.
+
 - Quickly choosing another recording now opens or copies only your latest choice, even when the previous link is still loading.
 
 - Refreshing courses or finishing a sync no longer redraws an unchanged course list unnecessarily.

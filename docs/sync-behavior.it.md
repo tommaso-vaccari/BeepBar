@@ -146,4 +146,6 @@ Al primo sync dopo l'aggiornamento, i file che il professore aveva rimosso da Mo
 
 ## Registrazioni delle lezioni
 
+Senza una sessione salvata riutilizzabile, aprendo la pagina compare subito una spiegazione della funzione con l'accesso Polimi, prima di recuperare le registrazioni; una sessione riutilizzabile esistente viene usata automaticamente.
+
 Registrazioni è attiva di default per gli account Polimi. Disattivandola in Impostazioni, la pagina scompare e la scelta rimane salvata tra gli avvii. La barra laterale mostra solo i corsi selezionati per la sincronizzazione, anche quelli senza codice o anno identificabile. La ricerca in archivio richiede sia il codice del corso sia l’anno accademico. Le registrazioni vengono recuperate quando la pagina è aperta e riprodotte nel browser predefinito; la sincronizzazione dei file non le scarica. La sessione Polimi viene salvata in un file locale separato e rimossa disabilitando Registrazioni, disconnettendo o cambiando account. Alla scadenza serve un nuovo accesso.

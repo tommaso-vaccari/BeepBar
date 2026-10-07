@@ -43,3 +43,11 @@ The existing live probe is `scripts/recman-probe.sh cold <course> <year>` follow
 - All nine presentation tests passed. Returning the unprocessed course name caused four assertions in the new name-formatting regression to fail; restoring the implementation made them pass.
 - Offscreen renders checked compact and wide layouts, long titles, visible Play controls, and English/light and Italian/dark appearances. These used an isolated fake browser and preferences, without launching or replacing the installed app.
 - Independent review identified a P2 concerning courses with identical readable names. Keeping course code and academic year visible in the sidebar resolved it; the same reviewer reported no remaining actionable findings.
+
+## First-use introduction follow-up
+
+- Without reusable saved cookies, the first page visit shows the existing introduction and sign-in button before creating a browser or fetching recordings. Session checking remains deferred until the page opens; matching saved sessions still load automatically.
+- Focused controller/account tests: 36 passed. Removing the production fix caused six failures in the first-use regression; restoring it made the focused suite pass again.
+- Full `swift test`: 618 tests passed (337 core, 24 benchmark, 243 app Swift Testing, 14 app XCTest). The unsigned Release build and `git diff --check` passed.
+- Independent Sol 6.1 medium review reported no actionable findings. Coverage includes missing, empty, expired, corrupt, unreadable and wrong-owner sessions, matching saved-session reuse, disabled behavior, page reconstruction and explicit sign-in before the first visit.
+- Live Polimi sign-in and the installed beta were not exercised for this change.

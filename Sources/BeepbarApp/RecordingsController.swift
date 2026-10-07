@@ -127,6 +127,7 @@ struct RecordingsListing: Equatable {
     private var signInTask: Task<Void, Never>?
     private var generation = 0
     private var visiblePages = 0
+    private var hasCheckedInitialSession = false
     /// The courses the page last asked for, reloaded after a sign-in.
     private var pageKeys: [RecmanCourseKey] = []
     private var selectedKey: RecmanCourseKey?
@@ -208,6 +209,7 @@ struct RecordingsListing: Equatable {
     /// first: when it is still alive, Polimi lets the browser through without a window.
     func signIn() {
         guard isEnabled, access != .signingIn else { return }
+        hasCheckedInitialSession = true
         invalidate()
         access = .signingIn
         let generation = self.generation
@@ -263,6 +265,11 @@ struct RecordingsListing: Equatable {
 
     func pageAppeared() {
         visiblePages += 1
+        // Keep launch and disabled recordings quiet; check only the first visit, before refresh
+        // can open WebKit. Later visits must preserve a session established by explicit sign-in.
+        guard isEnabled, access == .ready, !hasCheckedInitialSession else { return }
+        hasCheckedInitialSession = true
+        if savedCookies().isEmpty { access = .needsSignIn(nil) }
     }
 
     /// Deferred by one main-actor turn: a language switch rebuilds the page, which disappears and

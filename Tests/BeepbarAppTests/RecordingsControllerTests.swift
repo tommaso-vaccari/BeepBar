@@ -340,6 +340,83 @@ struct RecordingsControllerTests {
 
     // MARK: Session file and account
 
+    /// First use shows the explanation before any archive request, even with no synced courses.
+    /// Rebuilding or reopening the page keeps the introduction without rereading the session.
+    @Test func firstVisitWithoutASessionShowsSignInWithoutOpeningABrowser() async {
+        defer { cleanUp() }
+        let controller = makeController(useDefault: true)
+        #expect(world.storeAccesses == 0)
+        controller.pageAppeared()
+        #expect(controller.access == .needsSignIn(nil))
+        #expect(world.storeAccesses == 1)
+        controller.refresh([course], selected: course)
+        controller.pageDisappeared()
+        controller.pageAppeared()
+        controller.windowClosed()
+        controller.pageAppeared()
+        await drainTasks()
+        #expect(controller.access == .needsSignIn(nil))
+        #expect(controller.listings.isEmpty)
+        #expect(world.storeAccesses == 1)
+        #expect(world.browsersMade == 0)
+        #expect(browser.calls.isEmpty)
+        #expect(defaults.writes.isEmpty)
+    }
+
+    /// A matching saved session still loads automatically; page reconstruction keeps its browser.
+    @Test func firstVisitReusesASavedSession() async throws {
+        defer { cleanUp() }
+        try saveSession(owner: 42)
+        world.storeAccesses = 0
+        browser.listResults[course.courseCode] = .success([recording("a")])
+        let controller = makeController(useDefault: true)
+        #expect(world.storeAccesses == 0)
+        controller.pageAppeared()
+        #expect(controller.access == .ready)
+        #expect(world.storeAccesses == 1)
+        #expect(world.browsersMade == 0)
+        controller.refresh([course], selected: course)
+        await settle("saved session loaded") { controller.listing(for: course)?.recordings != nil }
+        #expect(browser.openedWith == [["SSO_LOGIN"]])
+        #expect(!browser.calls.contains("signIn"))
+        let accesses = world.storeAccesses
+        controller.pageDisappeared()
+        controller.pageAppeared()
+        await drainTasks()
+        #expect(world.storeAccesses == accesses)
+        #expect(browser.isOpen)
+    }
+
+    /// A completed explicit sign-in stays usable even when an unknown owner prevented saving it.
+    @Test func signInBeforeFirstVisitDoesNotRequireASavedSession() async {
+        defer { cleanUp() }
+        let controller = makeController(useDefault: true)
+        world.owner = nil
+        controller.signIn()
+        await settle("signed in and closed") { controller.access == .ready && !browser.isOpen }
+        let accesses = world.storeAccesses
+        controller.pageAppeared()
+        #expect(controller.access == .ready)
+        #expect(world.storeAccesses == accesses)
+    }
+
+    /// A saved file containing no reusable cookies asks for sign-in without probing Polimi.
+    @Test(arguments: [false, true])
+    func anEmptyOrExpiredSessionShowsSignIn(expired: Bool) async throws {
+        defer { cleanUp() }
+        let cookie = HTTPCookie(properties: [.name: "SSO_LOGIN", .value: "saved", .domain: "aunicalogin.polimi.it", .path: "/", .expires: world.now.addingTimeInterval(60)])!
+        try saveSession(owner: 42, cookies: expired ? [cookie] : [])
+        if expired { world.now = world.now.addingTimeInterval(120) }
+        let controller = makeController(useDefault: true)
+        controller.pageAppeared()
+        #expect(controller.access == .needsSignIn(nil))
+        controller.refresh([course], selected: course)
+        await drainTasks()
+        #expect(world.browsersMade == 0)
+        #expect(browser.calls.isEmpty)
+        #expect(controller.listings.isEmpty)
+    }
+
     /// A session saved for another WeBeep account is deleted unused, with what that account had
     /// seen: a shared Mac must not show one student's archive to the next.
     @Test func anotherAccountsSessionIsDroppedUnused() async throws {
@@ -352,7 +429,8 @@ struct RecordingsControllerTests {
         controller.pageAppeared()
         controller.refresh([course], selected: course)
         await settle("asks for the sign-in") { controller.access == .needsSignIn(nil) }
-        #expect(browser.openedWith == [[]])
+        #expect(browser.calls.isEmpty)
+        #expect(world.browsersMade == 0)
         #expect(try store.load() == nil)
         #expect(defaults.object(forKey: RecordingsController.acknowledgedKey) == nil)
     }
@@ -409,7 +487,8 @@ struct RecordingsControllerTests {
         controller.pageAppeared()
         controller.refresh([course], selected: course)
         await settle("asks for the sign-in") { controller.access == .needsSignIn(nil) }
-        #expect(browser.openedWith == [[]])
+        #expect(browser.calls.isEmpty)
+        #expect(world.browsersMade == 0)
         #expect(try store.load() == nil)
 
         // A folder where the file should be: reading fails, and nothing is deleted.

@@ -46,16 +46,26 @@ struct MenuQuitTests {
         try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
         defer { try? FileManager.default.removeItem(at: root) }
         let controller = WeBeepAuthenticationController(testRootURL: root)
-        // Ignores cancellation and ends on its own a few seconds later, so the test never hangs.
-        let stubborn = Task.detached { try? await Task.sleep(for: .seconds(4)) }
-        let sync = Task { @MainActor in _ = await stubborn.value }
+        let gate = FakeRecmanBrowser.Gate()
+        var syncFinished = false
+        let sync = Task { @MainActor in
+            await gate.wait()
+            syncFinished = true
+        }
+        while !gate.isWaiting { await Task.yield() }
         controller.setOperationForTesting(UUID(), task: sync)
+        let watchdog = Task.detached {
+            do { try await Task.sleep(for: .seconds(30)) } catch { return }
+            await gate.release()
+        }
+        defer { watchdog.cancel() }
 
-        let started = ContinuousClock.now
         #expect(await controller.prepareForMenuQuit(timeout: .milliseconds(200)))
-        #expect(ContinuousClock.now - started < .seconds(2))
+        #expect(!syncFinished)
+        #expect(sync.isCancelled)
         #expect(controller.menuQuitDrained)
-        stubborn.cancel()
+        gate.release()
+        await sync.value
     }
 
     /// With no sync running, "Esci" goes ahead straight away.
@@ -91,16 +101,27 @@ struct MenuQuitTests {
     }
 
     /// The capped wait itself: it returns when the task ends, or when the timeout passes.
-    @Test func cappedWaitReturnsOnWhicheverComesFirst() async {
+    @Test @MainActor func cappedWaitReturnsOnWhicheverComesFirst() async {
         let quick = Task<Void, Never> {}
-        var started = ContinuousClock.now
+        let started = ContinuousClock.now
         await WeBeepAuthenticationController.wait(for: quick, atMost: .seconds(30))
         #expect(ContinuousClock.now - started < .seconds(5))
 
-        let slow = Task<Void, Never> { try? await Task.sleep(for: .seconds(4)) }
-        started = ContinuousClock.now
+        let gate = FakeRecmanBrowser.Gate()
+        var slowFinished = false
+        let slow = Task<Void, Never> {
+            await gate.wait()
+            slowFinished = true
+        }
+        while !gate.isWaiting { await Task.yield() }
+        let watchdog = Task.detached {
+            do { try await Task.sleep(for: .seconds(30)) } catch { return }
+            await gate.release()
+        }
+        defer { watchdog.cancel() }
         await WeBeepAuthenticationController.wait(for: slow, atMost: .milliseconds(100))
-        #expect(ContinuousClock.now - started < .seconds(2))
-        slow.cancel()
+        #expect(!slowFinished)
+        gate.release()
+        await slow.value
     }
 }

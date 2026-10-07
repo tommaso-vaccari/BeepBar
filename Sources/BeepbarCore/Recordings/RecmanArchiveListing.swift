@@ -59,8 +59,9 @@ public struct RecmanArchiveListing: Sendable {
         case incomplete
     }
 
-    /// A course has at most a few hundred recordings a year at ten a page. More pages than this
-    /// means "prossima" never ends, not a long list.
+    /// A course has at most a few hundred recordings a year, read a hundred to a page (ten if the
+    /// archive ever stops offering a larger page). More pages than this means "prossima" never
+    /// ends, not a long list.
     public static let maximumPages = 100
 
     public let key: RecmanCourseKey

@@ -27,6 +27,9 @@
 		A10000000000000000000008 /* Sparkle in Frameworks */ = {isa = PBXBuildFile; productRef = A10000000000000000000041 /* Sparkle */; };
 		A100000000000000000000B0 /* RecmanScripts.swift in Sources */ = {isa = PBXBuildFile; fileRef = A100000000000000000000B1 /* RecmanScripts.swift */; };
 		A100000000000000000000B2 /* RecmanWebSession.swift in Sources */ = {isa = PBXBuildFile; fileRef = A100000000000000000000B3 /* RecmanWebSession.swift */; };
+		A100000000000000000000B8 /* RecordingsPage.swift in Sources */ = {isa = PBXBuildFile; fileRef = A100000000000000000000B9 /* RecordingsPage.swift */; };
+		A100000000000000000000B6 /* RecordingsController.swift in Sources */ = {isa = PBXBuildFile; fileRef = A100000000000000000000B7 /* RecordingsController.swift */; };
+		A100000000000000000000B4 /* RecordingsSessionStore.swift in Sources */ = {isa = PBXBuildFile; fileRef = A100000000000000000000B5 /* RecordingsSessionStore.swift */; };
 /* End PBXBuildFile section */
 
 /* Begin PBXFileReference section */
@@ -51,6 +54,9 @@
 		A10000000000000000000021 /* WebKit.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = WebKit.framework; path = System/Library/Frameworks/WebKit.framework; sourceTree = SDKROOT; };
 		A100000000000000000000B1 /* RecmanScripts.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = RecmanScripts.swift; sourceTree = "<group>"; };
 		A100000000000000000000B3 /* RecmanWebSession.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = RecmanWebSession.swift; sourceTree = "<group>"; };
+		A100000000000000000000B9 /* RecordingsPage.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = RecordingsPage.swift; sourceTree = "<group>"; };
+		A100000000000000000000B7 /* RecordingsController.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = RecordingsController.swift; sourceTree = "<group>"; };
+		A100000000000000000000B5 /* RecordingsSessionStore.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = RecordingsSessionStore.swift; sourceTree = "<group>"; };
 /* End PBXFileReference section */
 
 /* Begin PBXFrameworksBuildPhase section */
@@ -107,6 +113,9 @@
 				A100000000000000000000AB /* ModuleDestinationsSheet.swift */,
 				A100000000000000000000B1 /* RecmanScripts.swift */,
 				A100000000000000000000B3 /* RecmanWebSession.swift */,
+				A100000000000000000000B9 /* RecordingsPage.swift */,
+				A100000000000000000000B7 /* RecordingsController.swift */,
+				A100000000000000000000B5 /* RecordingsSessionStore.swift */,
 			);
 			name = Sources;
 			path = Sources/BeepbarApp;
@@ -213,6 +222,9 @@
 				A100000000000000000000AA /* ModuleDestinationsSheet.swift in Sources */,
 				A100000000000000000000B0 /* RecmanScripts.swift in Sources */,
 				A100000000000000000000B2 /* RecmanWebSession.swift in Sources */,
+				A100000000000000000000B8 /* RecordingsPage.swift in Sources */,
+				A100000000000000000000B6 /* RecordingsController.swift in Sources */,
+				A100000000000000000000B4 /* RecordingsSessionStore.swift in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};

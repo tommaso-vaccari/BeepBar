@@ -207,10 +207,13 @@ final class StatusItemController: NSObject, NSMenuDelegate {
     private var window: NSWindow?
     private var appearanceTrace: OSSignpostIntervalState?
     private let router = ShellRouter()
+    /// The controller the window shows, to tell Recordings when the window is gone.
+    private weak var authentication: WeBeepAuthenticationController?
     private static let frameAutosaveName = "BeepbarConfigurationWindow"
 
     func show(_ authentication: WeBeepAuthenticationController, page: ShellPage? = nil) {
         BeepbarLog.lifecycle.notice("Configuration window requested")
+        self.authentication = authentication
         if window?.isKeyWindow != true {
             if let appearanceTrace {
                 PerformanceTrace.shared.end("ui.configurationWindow", category: .ui, state: appearanceTrace)
@@ -242,7 +245,7 @@ final class StatusItemController: NSObject, NSMenuDelegate {
     /// Builds the window `show` opens, apart from its delegate and saved frame, so tests can host
     /// the real shell in exactly this window.
     static func makeWindow(authentication: WeBeepAuthenticationController, router: ShellRouter) -> ConfigurationWindow {
-        let controller = NSHostingController(rootView: BeepbarShellView(authentication: authentication, router: router))
+        let controller = NSHostingController(rootView: BeepbarShellView(authentication: authentication, recordings: authentication.recordings, router: router))
         // Only let SwiftUI enforce the minimum size; otherwise the window keeps resizing
         // itself to the content's ideal size on every page switch.
         controller.sizingOptions = [.minSize]
@@ -280,6 +283,9 @@ final class StatusItemController: NSObject, NSMenuDelegate {
             window.delegate = nil
             self.window = nil
             self.router.page = .home
+            // Dropping the hierarchy doesn't reliably report the Recordings page as gone, and its
+            // browser must not outlive the window (quiet at rest).
+            self.authentication?.recordingsIfCreated?.windowClosed()
         }
     }
 

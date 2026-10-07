@@ -297,6 +297,11 @@ enum RecmanBrowserError: Error, Equatable {
         case "missingYear": throw RecmanBrowserError.yearUnavailable
         default: throw RecmanBrowserError.unrecognized
         }
+        // Before the listing starts, since changing the page size goes back to page one.
+        switch try await submit(RecmanScripts.hundredPerPage, operation: operation) {
+        case "submitted", "unchanged": break
+        default: throw RecmanBrowserError.unrecognized
+        }
         var listing = RecmanArchiveListing(key: key)
         while true {
             guard try await isOnArchive(operation: operation) else { throw LeftTheSearch() }

@@ -433,8 +433,17 @@ struct MenuBarSnapshot: Sendable {
     // to be a lookup, not a rescan of every course name.
     private var defaultCourseFolders: [Int64: String] = [:]
     private var loginWindow: LoginWindowController?
-    private var siteInfo: WeBeepSiteInfo?
+    private var siteInfo: WeBeepSiteInfo? {
+        didSet {
+            // Only a controller that already exists can hold another account's session; one
+            // created later checks the saved session's owner when it reads it.
+            if let userID = siteInfo?.userID, userID != oldValue?.userID { recordingsStorage?.webBeepAccountChanged(to: userID) }
+        }
+    }
     private var database: SyncDatabase?
+    /// Created on first use (the window, a sign-out), so a launch with the window closed doesn't
+    /// read anything for a feature that may be off.
+    private var recordingsStorage: RecordingsController?
     /// Opens or reveals a file clicked in Attività; a fake in tests, so no test opens real apps.
     private let fileOpener: ActivityFileOpening
     /// Attività items whose click found a problem, shown on their row. Cleared whenever the
@@ -477,6 +486,8 @@ struct MenuBarSnapshot: Sendable {
     /// off and on again rebuilds twice and ends on an equal configuration.
     private var schedulerGeneration = 0
 #if DEBUG
+    private var recordingsStoreForTesting: RecordingsSessionStore?
+    private var recordingsBrowserForTesting: (@MainActor () -> RecmanBrowsing)?
     private var beforeReconciliationStateForTesting: (@MainActor () async -> Void)?
     private var beforePendingChoicesForTesting: (@MainActor () async -> Void)?
     private var courseLoadTaskForTesting: Task<Void, Never>?
@@ -552,12 +563,22 @@ struct MenuBarSnapshot: Sendable {
         }
         if Self.isUIPreview {
             needsOnboarding = false
-            let mockCourses = (1...100).map { index in
+            // Real Polimi course names ("058167 - NAME [2026-27]", one per line) can be passed in
+            // BEEPBAR_PREVIEW_COURSES to try Recordings against the real archive: the mock names
+            // carry no code or year, so they have no recordings.
+            let recordingsCourses = (ProcessInfo.processInfo.environment["BEEPBAR_PREVIEW_COURSES"] ?? "")
+                .split(separator: "\n").map { $0.trimmingCharacters(in: .whitespaces) }.filter { !$0.isEmpty }.enumerated()
+                .map { RemoteCourseSummary(id: Int64(1_000 + $0.offset), shortName: $0.element, displayName: $0.element, isVisible: true, startDate: nil, endDate: nil) }
+            let mockCourses = recordingsCourses + (1...100).map { index in
                 RemoteCourseSummary(id: Int64(index), shortName: String(format: "%06d", 58000 + index), displayName: "CORSO DI PROVA \(index) — MATERIALI E ATTIVITÀ", isVisible: true, startDate: nil, endDate: nil)
             }
-            enabledCourseIDs = Set(mockCourses.prefix(64).map(\.id))
+            // With real courses, only they are synced, as in the user's own app: Recordings lists
+            // synced courses only, and the mock ones would bury them.
+            enabledCourseIDs = Set((recordingsCourses.isEmpty ? Array(mockCourses.prefix(64)) : recordingsCourses).map(\.id))
             courses = Self.orderedForDisplay(mockCourses, enabledCourseIDs: enabledCourseIDs)
-            courseFolders = Dictionary(uniqueKeysWithValues: mockCourses.map { ($0.id, "Corso di prova \($0.id)") })
+            // Real courses keep the folder name the app would give them, so they're recognizable
+            // on the Recordings page, which lists courses by folder.
+            courseFolders = Dictionary(uniqueKeysWithValues: mockCourses.dropFirst(recordingsCourses.count).map { ($0.id, "Corso di prova \($0.id)") })
             hasStoredCredential = true
             accountState = .connected
             rootURL = FileManager.default.temporaryDirectory
@@ -602,8 +623,14 @@ struct MenuBarSnapshot: Sendable {
     /// `defaults` lets a test reopen the same settings in a second controller, as a relaunch would;
     /// without it every controller gets its own throwaway suite. `automaticSyncEnvironment`
     /// defaults to mains power and an ordinary network, so no test depends on the Mac running it.
-    init(testRootURL: URL, database: SyncDatabase? = nil, rootID: UUID? = nil, notificationCenter: NotificationCenterClient = InertNotificationCenter(), fileOpener: ActivityFileOpening = InertFileOpener(), apiClient: WeBeepAPIClient? = nil, downloader: RemoteDownloader? = nil, credentialVault: CredentialVault? = nil, deleteCredential: (() throws -> Void)? = nil, defaults: UserDefaults? = nil, automaticSyncEnvironment: AutomaticSyncEnvironment = .fixed()) {
+    ///
+    /// The Recordings session goes to `recordingsStore`, or to a throwaway folder: never to the
+    /// real one, which a sign-out in any test would otherwise delete.
+    init(testRootURL: URL, database: SyncDatabase? = nil, rootID: UUID? = nil, notificationCenter: NotificationCenterClient = InertNotificationCenter(), fileOpener: ActivityFileOpening = InertFileOpener(), apiClient: WeBeepAPIClient? = nil, downloader: RemoteDownloader? = nil, credentialVault: CredentialVault? = nil, deleteCredential: (() throws -> Void)? = nil, defaults: UserDefaults? = nil, automaticSyncEnvironment: AutomaticSyncEnvironment = .fixed(), recordingsStore: RecordingsSessionStore? = nil, recordingsBrowser: (@MainActor () -> RecmanBrowsing)? = nil) {
         deleteCredentialForTesting = deleteCredential
+        let throwawayRecordingsFolder = FileManager.default.temporaryDirectory.appendingPathComponent("beepbar-recordings-test-\(UUID().uuidString)", isDirectory: true)
+        recordingsStoreForTesting = recordingsStore ?? RecordingsSessionStore { throwawayRecordingsFolder }
+        recordingsBrowserForTesting = recordingsBrowser
         self.credentialVault = credentialVault ?? CredentialVault(read: FileTokenStore.load, write: FileTokenStore.save)
         self.fileOpener = fileOpener
         let site = MoodleSite.site(id: nil)
@@ -816,8 +843,47 @@ struct MenuBarSnapshot: Sendable {
         }
     }
 
+    /// The Recordings feature (Polimi lecture recordings), created on first use.
+    var recordings: RecordingsController {
+        if let recordingsStorage { return recordingsStorage }
+        let controller = makeRecordings()
+        recordingsStorage = controller
+        return controller
+    }
+
+    /// The Recordings controller only if something already created it, for paths that must not
+    /// create it just to tell it nothing is happening (the window closing).
+    var recordingsIfCreated: RecordingsController? { recordingsStorage }
+
+    /// The WeBeep account the saved Polimi session is bound to; nil until the account is
+    /// validated in this launch (`siteInfo`).
+    var recordingsOwnerUserID: Int? {
+#if DEBUG
+        // A preview validates no account: a fixed id lets the switch and the session work.
+        if Self.isUIPreview { return 1 }
+#endif
+        return siteInfo?.userID
+    }
+
+    private func makeRecordings() -> RecordingsController {
+        var store = RecordingsSessionStore.standard
+        var makeBrowser: @MainActor () -> RecmanBrowsing = { RecmanWebSession() }
+#if DEBUG
+        if let recordingsStoreForTesting { store = recordingsStoreForTesting }
+        if let recordingsBrowserForTesting { makeBrowser = recordingsBrowserForTesting }
+#endif
+        return RecordingsController(
+            makeBrowser: makeBrowser,
+            store: store,
+            defaults: operationDefaults,
+            ownerUserID: { [weak self] in self?.recordingsOwnerUserID },
+            isAvailable: { [weak self] in self?.selectedSite.university == .polimi }
+        )
+    }
+
     /// Forgets the stored token so another account, or another university, can be connected.
-    /// The sync folder, its files and the course selection stay as they are.
+    /// The sync folder, its files and the course selection stay as they are; the Recordings
+    /// feature is turned off and its Polimi session deleted.
     func signOut(removeFile: (URL) throws -> Void = { try FileManager.default.removeItem(at: $0) }) {
         guard hasStoredCredential, !isSyncActive, !isAuthenticating, !isVerifying, !isLoadingCourses else { return }
         do {
@@ -844,6 +910,8 @@ struct MenuBarSnapshot: Sendable {
         accountState = .notConnected
         setSyncState(recoveryBlocked ? .recoveryBlocked : .loginRequired)
         configureBackgroundScheduler()
+        // Whether or not it was on in this launch: a session saved in an earlier one goes too.
+        recordings.turnOff()
     }
 
     /// Italian text for an error raised while organizing module folders. Errors that already carry
@@ -1601,6 +1669,9 @@ struct MenuBarSnapshot: Sendable {
         downloader = RemoteDownloader(policy: site.serverPolicy)
         siteInfo = nil
         courses = []
+        // Recordings exist only for Polimi, and a Polimi session must not wait for the next
+        // Polimi account.
+        recordings.turnOff()
         // Course ids belong to one site: the previous site's selection must not enable whatever
         // course happens to share an id on the new one.
         enabledCourseIDs = []

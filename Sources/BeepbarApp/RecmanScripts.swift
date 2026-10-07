@@ -87,11 +87,36 @@ enum RecmanScripts {
     """#
 
     /// Follows the enabled "prossima" link: "submitted" (a page load follows) or "missing".
+    ///
+    /// The link's address is loaded rather than the link clicked. Recman's own script takes over
+    /// clicks on its pager links and swaps the table in place, so a click changes the page with
+    /// no page load for `RecmanWebSession` to wait for: every course with more than one page of
+    /// recordings sat for the whole load timeout and then failed as "Polimi isn't responding"
+    /// (live check of 2026-10-06). Loading the address gets the same page as a real load.
     static let nextPage = #"""
     (() => {
       const next = Array.from(document.querySelectorAll('a[href]')).find(a => (a.innerText || '').trim().replace(/\s+/g, ' ').toLowerCase() === 'prossima' && !a.classList.contains('disabled') && a.getAttribute('aria-disabled') !== 'true');
       if (!next) return 'missing';
-      next.click();
+      location.href = next.href;
+      return 'submitted';
+    })()
+    """#
+
+    /// Asks for a hundred results a page when the search runs over more than one page, so nearly
+    /// every course is read in one load instead of one per ten recordings. "submitted" (a page
+    /// load follows, back on page one) or "unchanged": everything already fits on this page, or
+    /// there is no "100" link because that is the size already shown (Recman prints the current
+    /// size as plain text). "prossima" still reads whatever doesn't fit. The link is loaded, not
+    /// clicked, for the reason `nextPage` gives.
+    static let hundredPerPage = #"""
+    (() => {
+      const clean = t => (t || '').trim().replace(/\s+/g, ' ');
+      const enabled = a => !a.classList.contains('disabled') && a.getAttribute('aria-disabled') !== 'true';
+      const links = Array.from(document.querySelectorAll('a[href]')).filter(enabled);
+      if (!links.some(a => clean(a.innerText).toLowerCase() === 'prossima')) return 'unchanged';
+      const hundred = links.find(a => clean(a.innerText) === '100');
+      if (!hundred) return 'unchanged';
+      location.href = hundred.href;
       return 'submitted';
     })()
     """#

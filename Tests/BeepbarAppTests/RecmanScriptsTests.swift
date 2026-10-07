@@ -11,10 +11,15 @@ import BeepbarCore
 struct RecmanScriptsTests {
     private static let archiveURL = URL(string: "https://onlineservices.polimi.it\(RecmanURLPolicy.archivePath)")!
 
-    /// Loads `body` as if served at `url` and waits until WebKit has finished loading it.
+    /// Loads `body` as if served at `url` and waits until WebKit has finished loading it. After
+    /// that, every page load the fixture asks for is recorded and refused, so a test sees where a
+    /// script would have gone without any request leaving the machine.
     @MainActor private final class FixturePage: NSObject, WKNavigationDelegate {
         let webView: WKWebView
         private var finished: CheckedContinuation<Void, Never>?
+        private var loaded = false
+        /// The page loads asked for since the fixture finished loading, in order.
+        private(set) var requestedLoads: [URL] = []
 
         init(_ body: String, at url: URL = RecmanScriptsTests.archiveURL) async {
             let configuration = WKWebViewConfiguration()
@@ -29,8 +34,24 @@ struct RecmanScriptsTests {
         }
 
         func webView(_ webView: WKWebView, didFinish navigation: WKNavigation!) {
+            loaded = true
             finished?.resume()
             finished = nil
+        }
+
+        func webView(_ webView: WKWebView, decidePolicyFor action: WKNavigationAction, decisionHandler: @escaping @MainActor (WKNavigationActionPolicy) -> Void) {
+            guard loaded, action.targetFrame?.isMainFrame ?? true else { return decisionHandler(.allow) }
+            if let url = action.request.url { requestedLoads.append(url) }
+            decisionHandler(.cancel)
+        }
+
+        /// The page loads asked for once WebKit has had time to act on a script's navigation,
+        /// which it decides after the script returns.
+        func requestedLoadsAfterScript() async -> [URL] {
+            for _ in 0..<50 where requestedLoads.isEmpty {
+                try? await Task.sleep(for: .milliseconds(20))
+            }
+            return requestedLoads
         }
 
         func run(_ script: String, arguments: [String: Any]? = nil) async -> String? {
@@ -165,17 +186,68 @@ struct RecmanScriptsTests {
         #expect(worded.declaredTotal == nil)
     }
 
-    /// Only an enabled "prossima" counts as a next page, and only that one is followed.
-    @Test func onlyAnEnabledNextLinkIsReportedAndFollowed() async throws {
-        let enabled = await FixturePage(Self.results(Self.row(), footer: "<a href='#' onclick='window.next = 1; return false'> Prossima </a>"))
-        #expect(try RecmanResultsPage.decode(try #require(await enabled.run(RecmanScripts.resultsPage))).hasNext)
-        #expect(await enabled.run(RecmanScripts.nextPage) == "submitted")
-        #expect(try await enabled.pageValue("window.next") == "1")
+    /// Recman's pager as the live archive draws it: the current page and page size as plain text,
+    /// the others as links whose clicks Recman's own script takes over to swap the table in place
+    /// (`window.swapped` records such a click). Pass the link texts to leave out.
+    private static func pager(without missing: Set<String> = []) -> String {
+        let links = [("2", "page2"), ("prossima", "next"), ("ultima", "last"), ("25", "size25"), ("50", "size50"), ("100", "size100"), ("tutte", "sizeAll")]
+            .filter { !missing.contains($0.0) }
+            .map { "<a class='paginator_link' href='?evn_paginator=\($0.1)'>\($0.0)</a>" }
+            .joined(separator: " ")
+        return """
+        <p>pag. 1/3 (totale:25) prima precedente 1 \(links) elementi per pagina: 10</p>
+        <script>
+          document.addEventListener('click', e => {
+            const link = e.target.closest('a.paginator_link');
+            if (link) { e.preventDefault(); window.swapped = link.getAttribute('href'); }
+          });
+        </script>
+        """
+    }
 
-        let disabled = await FixturePage(Self.results(Self.row(), footer: "<span>prossima</span><a href='#' class='disabled' onclick='window.next = 1'>prossima</a><a href='#' aria-disabled='true' onclick='window.next = 2'>prossima</a><a href='#' onclick='window.next = 3'>precedente</a>"))
+    private static func pagerURL(_ name: String) -> URL {
+        URL(string: "?evn_paginator=\(name)", relativeTo: archiveURL)!.absoluteURL
+    }
+
+    /// An enabled "prossima" is followed with a real page load, even though Recman's script
+    /// swaps the table in place when the link is clicked. Guards against clicking it again: that
+    /// changes the page with no load for the session to wait for, and every course with more than
+    /// one page of recordings hung until the timeout, then failed as "Polimi isn't responding".
+    @Test func theNextPageIsLoadedNotClicked() async throws {
+        let page = await FixturePage(Self.results(Self.row(), footer: Self.pager()))
+        #expect(try RecmanResultsPage.decode(try #require(await page.run(RecmanScripts.resultsPage))).hasNext)
+        #expect(await page.run(RecmanScripts.nextPage) == "submitted")
+        #expect(await page.requestedLoadsAfterScript() == [Self.pagerURL("next")])
+        #expect(try await page.pageValue("window.swapped") == "undefined")
+    }
+
+    /// Only an enabled "prossima" counts as a next page; with none, nothing is followed.
+    @Test func aDisabledOrMissingNextLinkIsNotFollowed() async throws {
+        let disabled = await FixturePage(Self.results(Self.row(), footer: "<span>prossima</span><a href='?evn_paginator=a' class='disabled'>prossima</a><a href='?evn_paginator=b' aria-disabled='true'>prossima</a><a href='?evn_paginator=c'>precedente</a>"))
         #expect(try RecmanResultsPage.decode(try #require(await disabled.run(RecmanScripts.resultsPage))).hasNext == false)
         #expect(await disabled.run(RecmanScripts.nextPage) == "missing")
-        #expect(try await disabled.pageValue("window.next") == "undefined")
+        #expect(await disabled.requestedLoadsAfterScript().isEmpty)
+    }
+
+    /// A search over several pages switches to a hundred a page, by loading the "100" link (not
+    /// clicking it, for the reason above), so a long course is read in one load.
+    @Test func severalPagesSwitchToAHundredAPage() async throws {
+        let page = await FixturePage(Self.results(Self.row(), footer: Self.pager()))
+        #expect(await page.run(RecmanScripts.hundredPerPage) == "submitted")
+        #expect(await page.requestedLoadsAfterScript() == [Self.pagerURL("size100")])
+        #expect(try await page.pageValue("window.swapped") == "undefined")
+    }
+
+    /// No switch, and no extra load, when everything already fits on the page, when a hundred is
+    /// the size already shown (no "100" link), or when "prossima" is disabled.
+    @Test func thePageSizeStaysWhenThereIsNothingToGain() async throws {
+        let onePage = await FixturePage(Self.results(Self.row(), footer: Self.pager(without: ["2", "prossima", "ultima"])))
+        let atHundred = await FixturePage(Self.results(Self.row(), footer: Self.pager(without: ["100"])))
+        let disabledNext = await FixturePage(Self.results(Self.row(), footer: "<a class='disabled' href='?evn_paginator=next'>prossima</a> <a href='?evn_paginator=size100'>100</a>"))
+        for page in [onePage, atHundred, disabledNext] {
+            #expect(await page.run(RecmanScripts.hundredPerPage) == "unchanged")
+            #expect(await page.requestedLoadsAfterScript().isEmpty)
+        }
     }
 
     @Test func playbackLinkFindsOnlyThePolimiWebexPlayer() async throws {

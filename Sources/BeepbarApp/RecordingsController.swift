@@ -58,7 +58,7 @@ struct RecordingsListing: Equatable {
 /// synced courses, read from Polimi's archive by `RecmanBrowsing`.
 ///
 /// Promises this class keeps, each guarded by `RecordingsControllerTests`:
-/// - **Off by default, and gone when off.** Turning it off, disconnecting the WeBeep account or
+/// - **On by default for Polimi, and gone when off.** Turning it off, disconnecting the WeBeep account or
 ///   switching university (`turnOff()`) closes the browser and deletes the saved session and
 ///   every setting the feature wrote. Another WeBeep account never inherits a Polimi session:
 ///   the saved one names its owner and is dropped when the known account differs.
@@ -117,8 +117,10 @@ struct RecordingsListing: Equatable {
 
     private enum Job: Equatable {
         case list(RecmanCourseKey)
-        case open(RecmanRecording, OpenAction)
+        case open(RecmanRecording, OpenAction, Int)
     }
+    /// Every click, including a cached player, replaces older Play/Copy effects and errors.
+    private var openingRequest = 0
     private var queue: [Job] = []
     private var runningKey: RecmanCourseKey?
     private var worker: Task<Void, Never>?
@@ -313,15 +315,18 @@ struct RecordingsListing: Equatable {
 
     private func open(_ recording: RecmanRecording, _ action: OpenAction) {
         guard isEnabled, access == .ready else { return }
+        openingRequest += 1
         openingProblem = nil
+        openingRecordingID = recording.id
+        // The cached path must replace pending openings too, or a slow lookup can later
+        // overwrite the clipboard with the link chosen before the cached one.
+        queue.removeAll { if case .open = $0 { true } else { false } }
         if let url = playbackURLs[recording.id] {
             finishOpening(recording, url: url, action: action)
             return
         }
-        openingRecordingID = recording.id
         // Only the latest click counts, and it goes before any list still waiting.
-        queue.removeAll { if case .open = $0 { true } else { false } }
-        queue.insert(.open(recording, action), at: 0)
+        queue.insert(.open(recording, action, openingRequest), at: 0)
         startWorker()
     }
 
@@ -423,15 +428,21 @@ struct RecordingsListing: Equatable {
                     guard generation == self.generation else { return }
                     runningKey = nil
                     record(recordings, for: key)
-                case .open(let recording, let action):
-                    let url = try await browser.playbackURL(for: recording)
+                case .open(let recording, let action, let request):
+                    let url: URL
+                    if let cached = playbackURLs[recording.id] {
+                        url = cached
+                    } else {
+                        url = try await browser.playbackURL(for: recording)
+                    }
                     guard generation == self.generation else { return }
                     playbackURLs[recording.id] = url
-                    finishOpening(recording, url: url, action: action)
+                    if request == openingRequest { finishOpening(recording, url: url, action: action) }
                 }
                 succeeded = true
             } catch {
                 guard generation == self.generation else { return }
+                if case .open(_, _, let request) = job, request != openingRequest { continue }
                 runningKey = nil
                 let outcome = handle(error, of: job)
                 if outcome == .next { continue }
@@ -482,7 +493,7 @@ struct RecordingsListing: Equatable {
         case .list(let key):
             listings[key, default: RecordingsListing()].problem = problem
             listings[key]?.isLoading = queue.contains(.list(key))
-        case .open(let recording, _):
+        case .open(let recording, _, _):
             if openingRecordingID == recording.id { openingRecordingID = nil }
             openingProblem = problem
         }

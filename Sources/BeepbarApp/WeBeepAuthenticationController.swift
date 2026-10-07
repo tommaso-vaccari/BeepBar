@@ -1916,7 +1916,9 @@ struct MenuBarSnapshot: Sendable {
         let remoteIDs = Set(courses.map(\.id))
         let scopesByCourse = Dictionary(scopes.map { ($0.courseID, $0) }, uniquingKeysWith: { first, _ in first })
         let defaults = Self.defaultFolders(for: courses, saved: Dictionary(scopes.map { ($0.courseID, $0.localFolder) }, uniquingKeysWith: { first, _ in first }))
-        enabledCourseIDs = Self.restoredEnabledCourseIDs(scopes: scopes, current: enabledCourseIDs, remoteIDs: remoteIDs)
+        let restoredSelection = Self.restoredEnabledCourseIDs(scopes: scopes, current: enabledCourseIDs, remoteIDs: remoteIDs)
+        // @Published sends even for equal values; unchanged refreshes must leave the UI quiet.
+        if enabledCourseIDs != restoredSelection { enabledCourseIDs = restoredSelection }
         for course in courses {
             if let scope = scopesByCourse[course.id], !scope.localFolder.isEmpty {
                 let replacement = LocalPathPolicy.generatedCourseFolderReplacement(
@@ -1930,7 +1932,7 @@ struct MenuBarSnapshot: Sendable {
                     do {
                         let renamer = CourseFolderRenamer(database: database, fileStore: try FileStore(root: rootURL), gate: operationGate)
                         try await renamer.rename(rootID: rootID, courseID: course.id, from: scope.localFolder, to: replacement)
-                        courseFolders[course.id] = replacement
+                        if courseFolders[course.id] != replacement { courseFolders[course.id] = replacement }
                         try await database.upsertScope(SyncScope(
                             rootID: rootID,
                             courseID: course.id,
@@ -1940,10 +1942,10 @@ struct MenuBarSnapshot: Sendable {
                             managedDirectory: scope.managedDirectory
                         ))
                     } catch {
-                        courseFolders[course.id] = scope.localFolder
+                        if courseFolders[course.id] != scope.localFolder { courseFolders[course.id] = scope.localFolder }
                     }
                 } else {
-                    courseFolders[course.id] = scope.localFolder
+                    if courseFolders[course.id] != scope.localFolder { courseFolders[course.id] = scope.localFolder }
                     if scope.displayName != course.displayName {
                         try? await database.upsertScope(SyncScope(
                             rootID: rootID,
@@ -1956,7 +1958,8 @@ struct MenuBarSnapshot: Sendable {
                     }
                 }
             } else {
-                courseFolders[course.id] = defaults[course.id] ?? LocalPathPolicy.defaultCourseFolder(course.displayName)
+                let folder = defaults[course.id] ?? LocalPathPolicy.defaultCourseFolder(course.displayName)
+                if courseFolders[course.id] != folder { courseFolders[course.id] = folder }
                 if scopes.isEmpty {
                     do {
                         try await database.upsertScope(SyncScope(rootID: rootID, courseID: course.id, displayName: course.displayName, localFolder: courseFolders[course.id]!, enabled: enabledCourseIDs.contains(course.id)))
@@ -2104,7 +2107,8 @@ struct MenuBarSnapshot: Sendable {
         guard activeOperationID == operationID, !Task.isCancelled else { return }
         conflicts = open
         remoteChanges = changes
-        courses = Self.orderedForDisplay(courses, enabledCourseIDs: enabledCourseIDs)
+        let ordered = Self.orderedForDisplay(courses, enabledCourseIDs: enabledCourseIDs)
+        if courses != ordered { courses = ordered }
         let summary = SyncCompletionSummary(progress: progress)
         if progress.failures > 0 {
             setSyncState(.partial(summary))

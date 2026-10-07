@@ -28,13 +28,8 @@ import BeepbarCore
         }
     }
 
-    /// Known issue: proves that finishing a sync reassigns the course list even when its order did
-    /// not change. The window is invalidated in that turn anyway (conflicts, sync state); what the
-    /// reassignment adds is one more `objectWillChange` and, through `courses`' `didSet`, a fresh
-    /// computation of every default course folder, milliseconds with hundreds of courses, on every
-    /// sync. The sort itself still has to run. Once `finishReconciliation` assigns only a list that
-    /// differs, `withKnownIssue` reports that the issue no longer occurs: remove the wrapper and keep
-    /// the test. `finishingASyncReordersCoursesEnabledDuringTheSession` guards the other side.
+    /// Finishing a sync must not republish an unchanged course list or recompute its default
+    /// folders through `didSet`. The sort still runs; the next test guards a changed order.
     @Test func finishingASyncDoesNotRepublishAnUnchangedCourseList() async throws {
         let (controller, cleanup) = try await controllerWithLoadedCourses()
         defer { cleanup() }
@@ -54,9 +49,7 @@ import BeepbarCore
         }
         #expect(!controller.isSyncActive)
         #expect(controller.courses.map(\.id) == [1, 2])
-        withKnownIssue("Finishing a sync republishes an unchanged course list") {
-            #expect(published.isEmpty)
-        }
+        #expect(published.isEmpty)
     }
 
     /// Proves that finishing a sync still moves a course enabled during the session to the top:

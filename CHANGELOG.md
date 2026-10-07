@@ -12,6 +12,10 @@
 
 ### Fixed
 
+- Quickly choosing another recording now opens or copies only your latest choice, even when the previous link is still loading.
+
+- Refreshing courses or finishing a sync no longer redraws an unchanged course list unnecessarily.
+
 - "Esci" in the menu bar no longer leaves BeepBar stuck when a sync is running: the sync stops and BeepBar closes within a few seconds.
 
 - Automatic sync no longer fails with "Connessione assente" while your Mac is on a phone hotspot or a network with Low Data Mode. After updating, it downloads on these networks too, just like "Sincronizza ora"; turn on "Risparmio dati" if you'd rather it waited for another network.

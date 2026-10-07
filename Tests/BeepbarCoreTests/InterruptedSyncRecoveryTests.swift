@@ -203,18 +203,18 @@ struct InterruptedSyncRecoveryTests {
 
     /// A conflict row as releases before this fix journaled it: the user's edit as the file to
     /// replace. Recovery must not install over it; the edit stays and the download becomes a
-    /// conflict against the last synced version. With `earlierConflict`, the same edit is already
+    /// conflict against the last synced version. With `earlierRemote`, the same edit is already
     /// in an open conflict with an older Moodle version: that conflict must not count as the user
-    /// choosing this newer download.
-    @Test(arguments: [false, true])
-    func olderConflictRowNeverInstallsOverTheEdit(earlierConflict: Bool) async throws {
+    /// choosing this newer download, even when only Moodle's revision changed.
+    @Test(arguments: [nil, "older remote", "remote"] as [String?])
+    func olderConflictRowNeverInstallsOverTheEdit(earlierRemote: String?) async throws {
         let fixture = try Fixture()
         defer { fixture.remove() }
         try await fixture.synced("base")
         try fixture.writeLocal("mine")
         let (database, store) = try await fixture.open()
-        if earlierConflict {
-            let older = try await fixture.stage("older remote", in: store)
+        if let earlierRemote {
+            let older = try await fixture.stage(earlierRemote, in: store)
             _ = try await SyncTransactionCoordinator(database: database, fileStore: store).recordConflict(rootID: fixture.rootID, remoteID: "file", destination: fixture.path, local: .present(sha256: hash("mine")), remote: RemoteState(sha256: older.sha256, revision: "2"), artifact: older)
         }
         let artifact = try await fixture.stage("remote", in: store)
@@ -225,7 +225,7 @@ struct InterruptedSyncRecoveryTests {
         #expect(report.unresolved.isEmpty && report.conflicts.count == 1)
         #expect(try fixture.contents() == "mine")
         let conflicts = try await fixture.database().conflicts(rootID: fixture.rootID)
-        #expect(conflicts.count == (earlierConflict ? 2 : 1))
+        #expect(conflicts.count == (earlierRemote != nil ? 2 : 1))
         let recovered = try #require(conflicts.first { $0.remoteRevision == "3" })
         #expect(try String(contentsOf: fixture.root.appending(path: recovered.incomingPath.value), encoding: .utf8) == "remote")
         #expect(recovered.localSHA256 == hash("mine"))

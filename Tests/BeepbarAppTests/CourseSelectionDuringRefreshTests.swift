@@ -70,14 +70,9 @@ struct CourseSelectionDuringRefreshTests {
         #expect(controller.enabledCourseIDs == [1])
     }
 
-    /// Known issue: proves that refreshing the course list republishes the course folders and the
-    /// selection even when nothing changed. `courseFolders` is assigned once per course: with 100
-    /// unchanged courses that is about 100 `objectWillChange` sends and dictionary copies in one
-    /// main-actor turn (SwiftUI coalesces them into one update), plus one for the selection. The two
-    /// halves have separate wrappers so fixing one is noticed on its own. Once the refresh assigns
-    /// only values that differ, `withKnownIssue` reports that the issue no longer occurs: remove the
-    /// wrapper and keep the test. `refreshingChangedCoursesPublishesEachChangeOnce` guards the other
-    /// side.
+    /// An unchanged refresh must not publish folders or selection again. With many courses,
+    /// redundant assignments send one invalidation and copy the folder dictionary per course.
+    /// `refreshingChangedCoursesPublishesEachChangeOnce` guards changes still reaching the UI.
     @Test @MainActor func refreshingUnchangedCoursesPublishesNothing() async throws {
         let (controller, _, _, cleanup) = try await restoredController()
         defer { cleanup() }
@@ -91,12 +86,8 @@ struct CourseSelectionDuringRefreshTests {
 
         #expect(controller.courseFolders == [1: "Course"])
         #expect(controller.enabledCourseIDs == [1])
-        withKnownIssue("A refresh republishes unchanged course folders") {
-            #expect(folderUpdates == 0)
-        }
-        withKnownIssue("A refresh republishes an unchanged course selection") {
-            #expect(selectionUpdates == 0)
-        }
+        #expect(folderUpdates == 0)
+        #expect(selectionUpdates == 0)
     }
 
     /// Proves that a refresh still publishes a folder and a selection that changed in the database

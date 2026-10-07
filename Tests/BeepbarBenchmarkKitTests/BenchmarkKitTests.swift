@@ -92,6 +92,47 @@ struct BenchmarkKitTests {
         #expect(table.contains("a note"))
     }
 
+    /// A reused output directory must not turn a failed subprocess into an old successful run.
+    @Test func subprocessRemovesAnOldReportBeforeFailure() throws {
+        let directory = FileManager.default.temporaryDirectory.appending(path: UUID().uuidString)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let output = directory.appending(path: "scenario.json")
+        let report = BenchmarkReport(environment: .current(commit: "old", dirty: false), scenarios: [])
+        try report.json().write(to: output)
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: "/usr/bin/false")
+
+        let result = try BenchmarkSubprocess.run(process, output: output)
+
+        #expect(result.report == nil)
+        #expect(!result.completed)
+        #expect(!FileManager.default.fileExists(atPath: output.path))
+    }
+
+    /// A fresh valid report completes the run only after a normal zero exit, even if its checks
+    /// passed before the subprocess exited with an error or was killed.
+    @Test(arguments: ["exit 0", "exit 1", "kill -TERM $$"])
+    func subprocessRequiresSuccessfulExitWithAFreshReport(termination: String) throws {
+        let directory = FileManager.default.temporaryDirectory.appending(path: UUID().uuidString)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let fixture = directory.appending(path: "fixture.json")
+        let output = directory.appending(path: "scenario.json")
+        let scenario = ScenarioResult(name: "fresh", parameters: [:], warmupRuns: 0, samples: [], checks: ["passed": true], notes: [])
+        let report = BenchmarkReport(environment: .current(commit: "fresh", dirty: false), scenarios: [scenario])
+        try report.json().write(to: fixture)
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: "/bin/sh")
+        process.arguments = ["-c", "cp \"$1\" \"$2\"; \(termination)", "benchmark", fixture.path, output.path]
+
+        let result = try BenchmarkSubprocess.run(process, output: output)
+
+        #expect(result.report?.environment.commit == "fresh")
+        #expect(result.report?.passed == true)
+        #expect(result.completed == (termination == "exit 0"))
+    }
+
     /// The environment names the machine and build, which AGENTS.md requires next to every number.
     @Test func environmentDescribesThisMachine() {
         let environment = BenchmarkEnvironment.current(commit: "c", dirty: false)

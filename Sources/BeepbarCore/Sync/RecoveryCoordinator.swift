@@ -174,11 +174,12 @@ public actor RecoveryCoordinator {
     /// or the local copy of an open conflict on the same file whose Moodle version is the one
     /// being installed (`ConflictResolver.useRemote` installs exactly that). Matching the download
     /// too matters: an older release's conflict row for a newer Moodle version would otherwise
-    /// pass on the earlier conflict's local copy, which is the user's edit.
+    /// pass on the earlier conflict's local copy, which is the user's edit. The revision must
+    /// match too: Moodle can publish a new revision with identical bytes.
     private func mayReplace(_ hash: String, for operation: PendingOperation) async throws -> Bool {
         if try await database.baseline(rootID: operation.rootID, remoteID: operation.remoteID)?.sha256 == hash { return true }
         return try await database.conflicts(rootID: operation.rootID).contains {
-            $0.remoteID == operation.remoteID && $0.relativePath == operation.destination && $0.localSHA256 == hash && $0.remoteSHA256 == operation.remoteSHA256
+            $0.remoteID == operation.remoteID && $0.relativePath == operation.destination && $0.localSHA256 == hash && $0.remoteSHA256 == operation.remoteSHA256 && $0.remoteRevision == operation.remoteRevision
         }
     }
 

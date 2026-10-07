@@ -112,11 +112,11 @@ func baseline(_ options: Options) throws -> Bool {
         process.arguments = arguments + common + ["--json", output.path]
         process.standardOutput = FileHandle.nullDevice
         FileHandle.standardError.write(Data("running \(name)…\n".utf8))
-        try process.run()
-        process.waitUntilExit()
-        // A scenario whose checks failed still writes its report (exit 1); one that crashed or
-        // threw writes none and is reported as missing.
-        guard let data = try? Data(contentsOf: output), let report = try? BenchmarkReport.decode(data) else {
+        let result = try BenchmarkSubprocess.run(process, output: output)
+        if !result.completed { complete = false }
+        // Keep fresh results for diagnosis even when the subprocess failed, but never count the
+        // baseline as complete unless every subprocess exited successfully with a report.
+        guard let report = result.report else {
             FileHandle.standardError.write(Data("\(name) produced no report (exit \(process.terminationStatus))\n".utf8))
             complete = false
             continue

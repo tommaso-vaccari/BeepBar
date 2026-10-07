@@ -42,6 +42,7 @@ import BeepbarCore
     /// When set, a successful listing leaves these cookies in the jar, as Polimi renewing one.
     var cookiesAfterListing: [HTTPCookie]?
     var playbackResults: [String: Result<URL, Error>] = [:]
+    var playbackGates: [String: Gate] = [:]
 
     static func cookie(_ name: String, value: String = "v", domain: String = "aunicalogin.polimi.it") -> HTTPCookie {
         HTTPCookie(properties: [.name: name, .value: value, .domain: domain, .path: "/", .secure: "TRUE"])!
@@ -77,6 +78,7 @@ import BeepbarCore
 
     func playbackURL(for recording: RecmanRecording) async throws -> URL {
         calls.append("play \(recording.id)")
+        await playbackGates[recording.id]?.wait()
         guard let result = playbackResults[recording.id] else { throw RecmanBrowserError.playbackUnavailable }
         return try result.get()
     }
@@ -692,6 +694,61 @@ struct RecordingsControllerTests {
         #expect(controller.openingRecordingID == nil)
         #expect(world.opened.isEmpty)
         #expect(world.copied.isEmpty)
+    }
+
+    /// A slow old lookup must not overwrite a newer cached copy, or show its error after the
+    /// newer choice succeeded. Both Play and Copy share this request ordering.
+    @Test(arguments: [false, true])
+    func aSlowOpeningCannotReplaceANewerCachedChoice(fails: Bool) async throws {
+        defer { cleanUp() }
+        let first = URL(string: "https://politecnicomilano.webex.com/ldr.php?RCID=a")!
+        let latest = URL(string: "https://politecnicomilano.webex.com/ldr.php?RCID=b")!
+        browser.playbackResults["a"] = fails ? .failure(RecmanBrowserError.playbackUnavailable) : .success(first)
+        browser.playbackResults["b"] = .success(latest)
+        let controller = await readyController()
+        controller.copyLink(recording("b"))
+        await settle("latest player cached") { world.copied == [latest] }
+        let gate = FakeRecmanBrowser.Gate()
+        defer { gate.release() }
+        browser.playbackGates["a"] = gate
+        controller.copyLink(recording("a"))
+        await settle("old lookup held") { gate.isWaiting }
+        controller.copyLink(recording("b"))
+        #expect(world.copied == [latest, latest])
+        gate.release()
+        // A subsequent list is a barrier: it runs only after the old opening finishes.
+        browser.listResults[course.courseCode] = .success([])
+        controller.refresh([course], selected: course)
+        await settle("old lookup finished") { controller.listing(for: course)?.recordings != nil }
+        #expect(world.copied == [latest, latest])
+        #expect(controller.openingRecordingID == nil)
+        #expect(controller.openingProblem == nil)
+        #expect(!controller.acknowledged.contains("a"))
+    }
+
+    /// A second Play while lookup is held opens only the last choice, including a repeated Play
+    /// of the same recording. The held request may cache its URL, but never opens a stale tab.
+    @Test(arguments: ["a", "b"])
+    func onlyTheLatestPlayOpensWhileALookupIsRunning(latestID: String) async {
+        defer { cleanUp() }
+        let first = URL(string: "https://politecnicomilano.webex.com/ldr.php?RCID=a")!
+        let other = URL(string: "https://politecnicomilano.webex.com/ldr.php?RCID=b")!
+        browser.playbackResults["a"] = .success(first)
+        browser.playbackResults["b"] = .success(other)
+        let gate = FakeRecmanBrowser.Gate()
+        defer { gate.release() }
+        browser.playbackGates["a"] = gate
+        let controller = await readyController()
+        controller.play(recording("a"))
+        await settle("first lookup held") { gate.isWaiting }
+        controller.play(recording(latestID))
+        gate.release()
+        browser.listResults[course.courseCode] = .success([])
+        controller.refresh([course], selected: course)
+        await settle("openings finished") { controller.listing(for: course)?.recordings != nil }
+        #expect(world.opened == [latestID == "a" ? first : other])
+        #expect(browser.playCalls == (latestID == "a" ? ["play a"] : ["play a", "play b"]))
+        #expect(controller.openingRecordingID == nil)
     }
 
     // MARK: New recordings

@@ -1,6 +1,19 @@
 import Foundation
 import IOKit.ps
 
+/// Runs a scenario without reusing a report from an earlier baseline in the same directory.
+package enum BenchmarkSubprocess {
+    package static func run(_ process: Process, output: URL) throws -> (report: BenchmarkReport?, completed: Bool) {
+        if FileManager.default.fileExists(atPath: output.path) {
+            try FileManager.default.removeItem(at: output)
+        }
+        try process.run()
+        process.waitUntilExit()
+        let report = (try? Data(contentsOf: output)).flatMap { try? BenchmarkReport.decode($0) }
+        return (report, process.terminationReason == .exit && process.terminationStatus == 0 && report != nil)
+    }
+}
+
 /// Where and how a report was produced. AGENTS.md compares numbers only across the same machine,
 /// power source and build, so every report carries them.
 package struct BenchmarkEnvironment: Sendable, Codable, Equatable {

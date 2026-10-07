@@ -2,6 +2,18 @@
 
 ## Unreleased
 
+## 2026-10-07
+
+### Release highlights
+
+- Browse lecture recordings for your synchronized Polimi courses and play them in your default browser.
+- Use Data Saver to pause automatic downloads on a phone hotspot or a network with Low Data Mode; manual sync always remains available.
+- Edited local files stay protected when synchronization is interrupted, and reopening BeepBar recovers more reliably.
+- Large downloads use much less memory, and unchanged course lists avoid unnecessary redraws.
+- Quitting from the menu bar works during synchronization, and course search is easier to deselect.
+
+**After updating:** Recordings is enabled by default for Polimi accounts. Open Recordings and sign in with Polimi to get started, or turn it off in Settings. Automatic sync now also downloads on hotspots and networks with Low Data Mode; turn on Data Saver if you prefer to wait for another network.
+
 ### New
 
 - Lecture recordings for synchronized Polimi courses, grouped by week, with search and playback in your default browser. Enabled by default for Polimi accounts; sign in with Polimi to get started, or turn it off in Settings. The session is saved locally between launches.

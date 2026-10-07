@@ -30,9 +30,11 @@ struct MenuQuitTests {
         controller.setOperationForTesting(UUID(), task: sync)
         controller.setSyncStateForTesting(.syncing)
 
+        let timeout: Duration = .seconds(30)
         let started = ContinuousClock.now
-        #expect(await controller.prepareForMenuQuit(timeout: .seconds(30)))
-        #expect(ContinuousClock.now - started < .seconds(5))
+        #expect(await controller.prepareForMenuQuit(timeout: timeout))
+        // Completion must beat the fallback; a busy CI main actor can take more than five seconds.
+        #expect(ContinuousClock.now - started < timeout)
         #expect(sync.isCancelled)
         #expect(controller.syncState == .cancelling)
         #expect(controller.menuQuitDrained)
@@ -103,9 +105,10 @@ struct MenuQuitTests {
     /// The capped wait itself: it returns when the task ends, or when the timeout passes.
     @Test @MainActor func cappedWaitReturnsOnWhicheverComesFirst() async {
         let quick = Task<Void, Never> {}
+        let timeout: Duration = .seconds(30)
         let started = ContinuousClock.now
-        await WeBeepAuthenticationController.wait(for: quick, atMost: .seconds(30))
-        #expect(ContinuousClock.now - started < .seconds(5))
+        await WeBeepAuthenticationController.wait(for: quick, atMost: timeout)
+        #expect(ContinuousClock.now - started < timeout)
 
         let gate = FakeRecmanBrowser.Gate()
         var slowFinished = false

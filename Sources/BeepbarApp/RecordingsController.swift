@@ -152,7 +152,7 @@ struct RecordingsListing: Equatable {
         self.now = now
         // A switch left on for another university (only reachable through an old settings file)
         // counts as off: the feature exists only for Polimi.
-        let enabled = defaults.bool(forKey: Self.enabledKey) && isAvailable()
+        let enabled = (defaults.object(forKey: Self.enabledKey) as? Bool ?? true) && isAvailable()
         isEnabled = enabled
         access = enabled ? .ready : .off
         acknowledgedOrder = enabled ? defaults.stringArray(forKey: Self.acknowledgedKey) ?? [] : []
@@ -178,6 +178,7 @@ struct RecordingsListing: Equatable {
             signIn()
         } else {
             turnOff()
+            defaults.set(false, forKey: Self.enabledKey)
         }
     }
 

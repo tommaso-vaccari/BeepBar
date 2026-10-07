@@ -142,7 +142,11 @@ struct RecordingsControllerTests {
     }
     private var sessionFile: URL { folder.appendingPathComponent(RecordingsSessionStore.fileName) }
 
-    private func makeController() -> RecordingsController {
+    private func makeController(useDefault: Bool = false) -> RecordingsController {
+        if !useDefault && defaults.object(forKey: RecordingsController.enabledKey) == nil {
+            defaults.set(false, forKey: RecordingsController.enabledKey)
+            defaults.resetWrites()
+        }
         let world = world
         let browser = browser
         return RecordingsController(
@@ -209,9 +213,8 @@ struct RecordingsControllerTests {
 
     // MARK: Switch
 
-    /// Off by default, and creating the controller reads no file and makes no browser: a launch
-    /// costs nothing for a feature most users never turn on. Guards "quiet at rest".
-    @Test func offByDefaultAndCreationTouchesNothing() async {
+    /// An explicitly disabled feature stays quiet.
+    @Test func disabledCreationTouchesNothing() async {
         defer { cleanUp() }
         let controller = makeController()
         controller.pageAppeared()
@@ -223,6 +226,22 @@ struct RecordingsControllerTests {
         #expect(world.storeAccesses == 0)
         #expect(world.browsersMade == 0)
         #expect(defaults.writes.isEmpty)
+    }
+
+    @Test func enabledByDefaultWithoutStartingWorkAndExplicitOptOutPersists() async {
+        defer { cleanUp() }
+        let controller = makeController(useDefault: true)
+        #expect(controller.isEnabled)
+        await drainTasks()
+        #expect(world.storeAccesses == 0)
+        #expect(world.browsersMade == 0)
+        #expect(defaults.writes.isEmpty)
+        controller.setEnabled(false)
+        #expect(!controller.isEnabled)
+        #expect(!makeController(useDefault: true).isEnabled)
+        defaults.removeObject(forKey: RecordingsController.enabledKey)
+        world.polimi = false
+        #expect(!makeController(useDefault: true).isEnabled)
     }
 
     /// The switch only turns on for Polimi with a known WeBeep account, since the session is saved
@@ -307,8 +326,9 @@ struct RecordingsControllerTests {
         #expect(!browser.isOpen)
         #expect(controller.listings.isEmpty)
         #expect(try store.load() == nil)
-        for key in [RecordingsController.enabledKey, RecordingsController.acknowledgedKey, RecordingsController.baselinedKey] {
-            #expect(defaults.object(forKey: key) == nil, "\(key) left behind")
+        #expect(defaults.object(forKey: RecordingsController.enabledKey) as? Bool == false)
+        for key in [RecordingsController.acknowledgedKey, RecordingsController.baselinedKey] {
+           #expect(defaults.object(forKey: key) == nil, "\(key) left behind")
         }
         // Nothing to do while off: the page asking again starts nothing.
         controller.refresh([course], selected: course, force: true)

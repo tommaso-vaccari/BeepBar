@@ -147,10 +147,10 @@ struct RecordingsPage: View {
     private var signIn: some View {
         VStack(spacing: 14) {
             SymbolTile(systemImage: "play.rectangle.fill", size: 52)
-            Text(tr("Accedi al Politecnico", "Sign in to Polimi"))
+            Text(tr("Registrazioni delle lezioni", "Lecture recordings"))
                 .font(.title3.weight(.semibold))
-            Text(tr("Le registrazioni delle lezioni sono dietro l'accesso del Politecnico, che dura circa dieci giorni. Quando scade, BeepBar te lo chiede di nuovo qui.",
-                    "Lecture recordings sit behind Polimi's sign-in, which lasts about ten days. When it expires, BeepBar asks you again here."))
+            Text(tr("Trova le registrazioni dei corsi che sincronizzi, cerca una lezione e riproducila nel browser. Accedi con Polimi per iniziare. Se non ti serve questa funzione, disattiva Registrazioni in Impostazioni.",
+                    "Find recordings for the courses you sync, search for a lecture and play it in your browser. Sign in with Polimi to get started. If you don't need this feature, turn off Recordings in Settings."))
                 .multilineTextAlignment(.center)
                 .foregroundStyle(.secondary)
                 .frame(maxWidth: 420)

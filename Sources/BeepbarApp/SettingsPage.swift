@@ -13,6 +13,9 @@ struct SettingsPage: View {
             languageSection
             accountSection
             folderSection
+            if authentication.selectedSite.university == .polimi {
+                RecordingsSettingsSection(recordings: authentication.recordings)
+            }
             startupSection
             automaticSection
             notificationsSection
@@ -287,5 +290,53 @@ struct SettingsPage: View {
         guard let version = info?["CFBundleShortVersionString"] as? String else { return tr("Sviluppo", "Development") }
         if let build = info?["CFBundleVersion"] as? String { return "\(version) (\(build))" }
         return version
+    }
+}
+
+/// "Registrazioni" (Polimi only): the switch of the Recordings feature, and the Polimi sign-in
+/// when it has lapsed. Off by default; turning it on starts the sign-in at once.
+private struct RecordingsSettingsSection: View {
+    @ObservedObject var recordings: RecordingsController
+
+    var body: some View {
+        Section {
+            Toggle(isOn: Binding(get: { recordings.isEnabled }, set: { recordings.setEnabled($0) })) {
+                SettingLabel(tr("Registrazioni delle lezioni", "Lecture recordings"), explanation: tr("Aggiunge la pagina Registrazioni, con le lezioni registrate dei corsi che sincronizzi, prese dall'archivio del Politecnico. Serve un accesso al Politecnico, che dura circa dieci giorni.", "Adds the Recordings page, with the recorded lectures of the courses you sync, taken from Polimi's archive. It needs a Polimi sign-in, which lasts about ten days."))
+            }
+            .disabled(!recordings.isEnabled && !recordings.canTurnOn)
+            switch recordings.access {
+            case .signingIn:
+                HStack(spacing: 8) {
+                    ProgressView().controlSize(.small)
+                    Text(tr("Accesso al Politecnico in corso…", "Signing in to Polimi…")).foregroundStyle(.secondary)
+                }
+            case .needsSignIn(let problem):
+                HStack(spacing: 10) {
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text(tr("Serve l'accesso al Politecnico", "Polimi sign-in needed"))
+                        if let problem {
+                            Text(problem.message).font(.caption).foregroundStyle(.secondary)
+                        }
+                    }
+                    Spacer()
+                    Button(tr("Accedi con Polimi", "Sign in with Polimi")) { recordings.signIn() }
+                }
+            case .ready, .off:
+                EmptyView()
+            }
+        } header: {
+            Text(tr("Registrazioni", "Recordings"))
+        } footer: {
+            Text(footer)
+                .font(.caption)
+                .foregroundStyle(.secondary)
+        }
+    }
+
+    private var footer: String {
+        if !recordings.isEnabled && !recordings.canTurnOn {
+            return tr("Collega prima il tuo account WeBeep.", "Connect your WeBeep account first.")
+        }
+        return tr("L'accesso al Politecnico resta solo su questo Mac, leggibile solo dal tuo utente. Spegnendo l'interruttore o disconnettendo l'account viene cancellato.", "The Polimi sign-in stays on this Mac only, readable only by your user. Turning the switch off or disconnecting the account deletes it.")
     }
 }

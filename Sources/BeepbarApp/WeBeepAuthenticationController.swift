@@ -433,8 +433,17 @@ struct MenuBarSnapshot: Sendable {
     // to be a lookup, not a rescan of every course name.
     private var defaultCourseFolders: [Int64: String] = [:]
     private var loginWindow: LoginWindowController?
-    private var siteInfo: WeBeepSiteInfo?
+    private var siteInfo: WeBeepSiteInfo? {
+        didSet {
+            // Only a controller that already exists can hold another account's session; one
+            // created later checks the saved session's owner when it reads it.
+            if let userID = siteInfo?.userID, userID != oldValue?.userID { recordingsStorage?.webBeepAccountChanged(to: userID) }
+        }
+    }
     private var database: SyncDatabase?
+    /// Created on first use (the window, a sign-out), so a launch with the window closed doesn't
+    /// read anything for a feature that may be off.
+    private var recordingsStorage: RecordingsController?
     /// Opens or reveals a file clicked in Attività; a fake in tests, so no test opens real apps.
     private let fileOpener: ActivityFileOpening
     /// Attività items whose click found a problem, shown on their row. Cleared whenever the
@@ -477,6 +486,8 @@ struct MenuBarSnapshot: Sendable {
     /// off and on again rebuilds twice and ends on an equal configuration.
     private var schedulerGeneration = 0
 #if DEBUG
+    private var recordingsStoreForTesting: RecordingsSessionStore?
+    private var recordingsBrowserForTesting: (@MainActor () -> RecmanBrowsing)?
     private var beforeReconciliationStateForTesting: (@MainActor () async -> Void)?
     private var beforePendingChoicesForTesting: (@MainActor () async -> Void)?
     private var courseLoadTaskForTesting: Task<Void, Never>?
@@ -552,12 +563,22 @@ struct MenuBarSnapshot: Sendable {
         }
         if Self.isUIPreview {
             needsOnboarding = false
-            let mockCourses = (1...100).map { index in
+            // Real Polimi course names ("058167 - NAME [2026-27]", one per line) can be passed in
+            // BEEPBAR_PREVIEW_COURSES to try Recordings against the real archive: the mock names
+            // carry no code or year, so they have no recordings.
+            let recordingsCourses = (ProcessInfo.processInfo.environment["BEEPBAR_PREVIEW_COURSES"] ?? "")
+                .split(separator: "\n").map { $0.trimmingCharacters(in: .whitespaces) }.filter { !$0.isEmpty }.enumerated()
+                .map { RemoteCourseSummary(id: Int64(1_000 + $0.offset), shortName: $0.element, displayName: $0.element, isVisible: true, startDate: nil, endDate: nil) }
+            let mockCourses = recordingsCourses + (1...100).map { index in
                 RemoteCourseSummary(id: Int64(index), shortName: String(format: "%06d", 58000 + index), displayName: "CORSO DI PROVA \(index) — MATERIALI E ATTIVITÀ", isVisible: true, startDate: nil, endDate: nil)
             }
-            enabledCourseIDs = Set(mockCourses.prefix(64).map(\.id))
+            // With real courses, only they are synced, as in the user's own app: Recordings lists
+            // synced courses only, and the mock ones would bury them.
+            enabledCourseIDs = Set((recordingsCourses.isEmpty ? Array(mockCourses.prefix(64)) : recordingsCourses).map(\.id))
             courses = Self.orderedForDisplay(mockCourses, enabledCourseIDs: enabledCourseIDs)
-            courseFolders = Dictionary(uniqueKeysWithValues: mockCourses.map { ($0.id, "Corso di prova \($0.id)") })
+            // Real courses keep the folder name the app would give them, so they're recognizable
+            // on the Recordings page, which lists courses by folder.
+            courseFolders = Dictionary(uniqueKeysWithValues: mockCourses.dropFirst(recordingsCourses.count).map { ($0.id, "Corso di prova \($0.id)") })
             hasStoredCredential = true
             accountState = .connected
             rootURL = FileManager.default.temporaryDirectory
@@ -602,8 +623,14 @@ struct MenuBarSnapshot: Sendable {
     /// `defaults` lets a test reopen the same settings in a second controller, as a relaunch would;
     /// without it every controller gets its own throwaway suite. `automaticSyncEnvironment`
     /// defaults to mains power and an ordinary network, so no test depends on the Mac running it.
-    init(testRootURL: URL, database: SyncDatabase? = nil, rootID: UUID? = nil, notificationCenter: NotificationCenterClient = InertNotificationCenter(), fileOpener: ActivityFileOpening = InertFileOpener(), apiClient: WeBeepAPIClient? = nil, downloader: RemoteDownloader? = nil, credentialVault: CredentialVault? = nil, deleteCredential: (() throws -> Void)? = nil, defaults: UserDefaults? = nil, automaticSyncEnvironment: AutomaticSyncEnvironment = .fixed()) {
+    ///
+    /// The Recordings session goes to `recordingsStore`, or to a throwaway folder: never to the
+    /// real one, which a sign-out in any test would otherwise delete.
+    init(testRootURL: URL, database: SyncDatabase? = nil, rootID: UUID? = nil, notificationCenter: NotificationCenterClient = InertNotificationCenter(), fileOpener: ActivityFileOpening = InertFileOpener(), apiClient: WeBeepAPIClient? = nil, downloader: RemoteDownloader? = nil, credentialVault: CredentialVault? = nil, deleteCredential: (() throws -> Void)? = nil, defaults: UserDefaults? = nil, automaticSyncEnvironment: AutomaticSyncEnvironment = .fixed(), recordingsStore: RecordingsSessionStore? = nil, recordingsBrowser: (@MainActor () -> RecmanBrowsing)? = nil) {
         deleteCredentialForTesting = deleteCredential
+        let throwawayRecordingsFolder = FileManager.default.temporaryDirectory.appendingPathComponent("beepbar-recordings-test-\(UUID().uuidString)", isDirectory: true)
+        recordingsStoreForTesting = recordingsStore ?? RecordingsSessionStore { throwawayRecordingsFolder }
+        recordingsBrowserForTesting = recordingsBrowser
         self.credentialVault = credentialVault ?? CredentialVault(read: FileTokenStore.load, write: FileTokenStore.save)
         self.fileOpener = fileOpener
         let site = MoodleSite.site(id: nil)
@@ -704,6 +731,8 @@ struct MenuBarSnapshot: Sendable {
 
     /// Waits for the sync `synchronizeNow()` started, which it does not return.
     func waitForSyncForTesting() async { await syncTask?.value }
+
+    var isMenuQuitInProgressForTesting: Bool { menuQuitInProgress }
 
     /// Waits for the course refresh `loadCourses()` started, which it does not return.
     func waitForCourseLoadForTesting() async { await courseLoadTaskForTesting?.value }
@@ -814,8 +843,47 @@ struct MenuBarSnapshot: Sendable {
         }
     }
 
+    /// The Recordings feature (Polimi lecture recordings), created on first use.
+    var recordings: RecordingsController {
+        if let recordingsStorage { return recordingsStorage }
+        let controller = makeRecordings()
+        recordingsStorage = controller
+        return controller
+    }
+
+    /// The Recordings controller only if something already created it, for paths that must not
+    /// create it just to tell it nothing is happening (the window closing).
+    var recordingsIfCreated: RecordingsController? { recordingsStorage }
+
+    /// The WeBeep account the saved Polimi session is bound to; nil until the account is
+    /// validated in this launch (`siteInfo`).
+    var recordingsOwnerUserID: Int? {
+#if DEBUG
+        // A preview validates no account: a fixed id lets the switch and the session work.
+        if Self.isUIPreview { return 1 }
+#endif
+        return siteInfo?.userID
+    }
+
+    private func makeRecordings() -> RecordingsController {
+        var store = RecordingsSessionStore.standard
+        var makeBrowser: @MainActor () -> RecmanBrowsing = { RecmanWebSession() }
+#if DEBUG
+        if let recordingsStoreForTesting { store = recordingsStoreForTesting }
+        if let recordingsBrowserForTesting { makeBrowser = recordingsBrowserForTesting }
+#endif
+        return RecordingsController(
+            makeBrowser: makeBrowser,
+            store: store,
+            defaults: operationDefaults,
+            ownerUserID: { [weak self] in self?.recordingsOwnerUserID },
+            isAvailable: { [weak self] in self?.selectedSite.university == .polimi }
+        )
+    }
+
     /// Forgets the stored token so another account, or another university, can be connected.
-    /// The sync folder, its files and the course selection stay as they are.
+    /// The sync folder, its files and the course selection stay as they are; the Recordings
+    /// feature is turned off and its Polimi session deleted.
     func signOut(removeFile: (URL) throws -> Void = { try FileManager.default.removeItem(at: $0) }) {
         guard hasStoredCredential, !isSyncActive, !isAuthenticating, !isVerifying, !isLoadingCourses else { return }
         do {
@@ -842,6 +910,8 @@ struct MenuBarSnapshot: Sendable {
         accountState = .notConnected
         setSyncState(recoveryBlocked ? .recoveryBlocked : .loginRequired)
         configureBackgroundScheduler()
+        // Whether or not it was on in this launch: a session saved in an earlier one goes too.
+        recordings.turnOff()
     }
 
     /// Italian text for an error raised while organizing module folders. Errors that already carry
@@ -1407,6 +1477,15 @@ struct MenuBarSnapshot: Sendable {
         setSyncState(.cancelling)
     }
 
+    /// Stops what must not outlive the app: the background scheduler and a running sync, which is
+    /// cancelled and returned so the caller can wait for it to wind down.
+    ///
+    /// Keep this cheap and synchronous. Both quit paths call it: `applicationShouldTerminate` for a
+    /// quit from outside (Sparkle's installer, logout, the Dock), and `prepareForMenuQuit()` for
+    /// "Esci". Anything returned here is something a quit waits for, so no file, WebKit, Keychain
+    /// or network work, and never a task that is always present: a Recordings branch once saved
+    /// its cookies here and made every quit wait (see `prepareForMenuQuit()` for why waiting is
+    /// dangerous on the menu path).
     func prepareForTermination() -> Task<Void, Never>? {
         backgroundScheduler?.invalidate()
         backgroundScheduler = nil
@@ -1415,6 +1494,60 @@ struct MenuBarSnapshot: Sendable {
         syncTask.cancel()
         setSyncState(.cancelling)
         return syncTask
+    }
+
+    /// True once "Esci" has finished its shutdown work and is about to call `NSApp.terminate`.
+    /// `applicationShouldTerminate` then answers `.terminateNow` without waiting again (see
+    /// `terminationReply`). Lives here rather than on `AppDelegate` because `NSApp.delegate` is
+    /// SwiftUI's adaptor proxy, not our delegate object.
+    private(set) var menuQuitDrained = false
+    private var menuQuitInProgress = false
+
+    /// The shutdown work of "Esci", done *before* `NSApp.terminate` is called.
+    ///
+    /// Why not just call `NSApp.terminate(nil)` and let `applicationShouldTerminate` wait with
+    /// `.terminateLater`, as a quit from outside does: the menu's quit runs inside a main-queue job
+    /// (the `Task { @MainActor in … }` hop that `StatusItemController` must use, issue #30). When
+    /// `terminate` is called from inside a main-queue job and the delegate answers
+    /// `.terminateLater`, AppKit spins a nested run loop that never runs main-actor work, so the
+    /// task it waits for, the 5-second fallback and every later menu action all stall, and BeepBar
+    /// never quits. `DispatchQueue.main.async` hangs the same way; only `perform(_:afterDelay:)`
+    /// escapes, and it is banned on that path (issue #30). Verified with `scripts/quit-probe`.
+    ///
+    /// So "Esci" winds the sync down first, here, while the main actor is free, waiting at most
+    /// `timeout` as the outside path does, then sets `menuQuitDrained` so that `terminate` is
+    /// answered `.terminateNow` with nothing left pending. Returns `false` when a quit is already
+    /// on its way, so a second click on "Esci" does nothing.
+    func prepareForMenuQuit(timeout: Duration = .seconds(5)) async -> Bool {
+        guard !menuQuitInProgress else { return false }
+        menuQuitInProgress = true
+        if let syncTask = prepareForTermination() {
+            BeepbarLog.lifecycle.notice("Menu quit waiting for active synchronization")
+            await Self.wait(for: syncTask, atMost: timeout)
+        }
+        menuQuitDrained = true
+        return true
+    }
+
+    /// What `applicationShouldTerminate` answers. After "Esci" has drained (`menuQuitDrained`) it
+    /// is always `.terminateNow`, even if the sync outlived the timeout: answering `.terminateLater`
+    /// on that path is exactly what hangs (`prepareForMenuQuit()`). A quit from outside waits for a
+    /// sync still winding down; AppKit runs main-actor work while it waits on that path.
+    nonisolated static func terminationReply(menuQuitDrained: Bool, hasPendingSync: Bool) -> NSApplication.TerminateReply {
+        if menuQuitDrained { return .terminateNow }
+        return hasPendingSync ? .terminateLater : .terminateNow
+    }
+
+    /// Waits until `task` finishes or `timeout` passes, whichever comes first. `task.value` ignores
+    /// cancellation, so a task group would wait for the whole task; two unstructured tasks racing
+    /// to resume one continuation stop at the first.
+    nonisolated static func wait(for task: Task<Void, Never>, atMost timeout: Duration) async {
+        let gate = FirstResume()
+        await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
+            gate.arm(continuation)
+            Task { await task.value; gate.resume() }
+            Task { try? await Task.sleep(for: timeout); gate.resume() }
+        }
     }
 
     func refreshConflicts() {
@@ -1536,6 +1669,9 @@ struct MenuBarSnapshot: Sendable {
         downloader = RemoteDownloader(policy: site.serverPolicy)
         siteInfo = nil
         courses = []
+        // Recordings exist only for Polimi, and a Polimi session must not wait for the next
+        // Polimi account.
+        recordings.turnOff()
         // Course ids belong to one site: the previous site's selection must not enable whatever
         // course happens to share an id on the new one.
         enabledCourseIDs = []
@@ -2417,6 +2553,23 @@ private actor BootstrapService {
             try await RecoveryCoordinator(rootID: rootID, database: database, fileStore: try FileStore(root: rootURL)).recover()
         }
         return !report.unresolved.isEmpty
+    }
+}
+
+/// Resumes one continuation once, whichever caller comes first (`WeBeepAuthenticationController.wait`).
+private final class FirstResume: Sendable {
+    private let continuation = OSAllocatedUnfairLock<CheckedContinuation<Void, Never>?>(initialState: nil)
+
+    func arm(_ continuation: CheckedContinuation<Void, Never>) {
+        self.continuation.withLock { $0 = continuation }
+    }
+
+    func resume() {
+        let pending = continuation.withLock { value -> CheckedContinuation<Void, Never>? in
+            defer { value = nil }
+            return value
+        }
+        pending?.resume()
     }
 }
 

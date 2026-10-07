@@ -143,3 +143,7 @@ On the first sync after updating, the files the teacher removed from Moodle befo
 | **Menu bar** | The status of the last sync. No new text for moves and removals. **[PR #76]** While Data Saver is pausing, "In pausa per Risparmio dati" and the reason: "In attesa del Wi-Fi" or "Modalità dati ridotti attiva"; the icon shows a pause symbol |
 | **Sign-in** | Onboarding and Settings show a failed sign-in beside its button; the next attempt clears the old message. A failed attempt does not replace an existing account. University selection stays locked during sign-in; verification, a new sign-in and disconnect wait for an ongoing account check to finish |
 | **Notifications** | As today (new materials, conflicts). No new notifications for moves and removals. They can be turned off in Settings: while off none is sent, and a conflict still open may be notified at the next automatic sync after they are back on. A click opens Conflicts, Activity or Courses. They also appear while BeepBar is in front |
+
+## Lecture recordings
+
+Recordings is optional and available for Polimi accounts. Its sidebar shows only courses selected for synchronization, including courses whose code or year cannot be identified. Archive searches require both a course code and an academic year. Recordings are fetched when the page is open and played in the default browser; they are not downloaded by file synchronization. The Polimi session is stored in a separate local file and removed when you disable Recordings, disconnect or switch accounts. An expired session requires another sign-in.

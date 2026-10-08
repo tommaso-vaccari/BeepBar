@@ -395,13 +395,17 @@ struct RecordingsListing: Equatable {
 
     private func enqueue(_ keys: [RecmanCourseKey], selected: RecmanCourseKey?, force: Bool) {
         var ordered: [RecmanCourseKey] = []
-        for key in [selected].compactMap({ $0 }) + keys where !ordered.contains(key) { ordered.append(key) }
+        for key in [selected].compactMap({ $0 }).filter({ keys.contains($0) }) + keys where !ordered.contains(key) { ordered.append(key) }
         let wanted = ordered.filter { needsLoad($0, force: force) }
         let opens = queue.filter { if case .open = $0 { true } else { false } }
-        let others = queue.filter { job in
-            if case .list(let key) = job { !wanted.contains(key) } else { false }
+        // The page's current keys replace queued listings. Keep explicit openings and the
+        // in-flight listing, but stop showing spinners for work that will no longer run.
+        for job in queue {
+            if case .list(let key) = job, !wanted.contains(key), key != runningKey {
+                listings[key]?.isLoading = false
+            }
         }
-        queue = opens + wanted.map(Job.list) + others
+        queue = opens + wanted.map(Job.list)
         for key in wanted {
             // A new attempt replaces the last one's failure: its banner next to the spinner read
             // as the new attempt having failed already.

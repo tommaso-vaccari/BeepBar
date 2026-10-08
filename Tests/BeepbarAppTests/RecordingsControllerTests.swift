@@ -634,6 +634,39 @@ struct RecordingsControllerTests {
         #expect(controller.listing(for: course)?.problem == nil)
     }
 
+    /// Removing a queued course must stop its request and spinner without cancelling an
+    /// explicit playback action or the currently running listing; reselecting loads it once.
+    @Test(arguments: [false, true], [false, true])
+    func removedQueuedCourseDoesNotLoad(copy: Bool, staleSelection: Bool) async {
+        defer { cleanUp() }
+        let gate = FakeRecmanBrowser.Gate()
+        defer { gate.release() }
+        browser.listGates[course.courseCode] = gate
+        browser.listResults[course.courseCode] = .success([])
+        browser.listResults[other.courseCode] = .success([])
+        let player = URL(string: "https://politecnicomilano.webex.com/politecnicomilano/ldr.php?RCID=x")!
+        browser.playbackResults["x"] = .success(player)
+        let controller = await readyController()
+        defer { controller.windowClosed() }
+        controller.refresh([course, other], selected: course)
+        await settle("first listing blocked") { gate.isWaiting }
+        if copy { controller.copyLink(recording("x")) }
+        else { controller.play(recording("x")) }
+        controller.refresh([course], selected: staleSelection ? other : course)
+        #expect(controller.listing(for: other)?.isLoading == false)
+        #expect(controller.listing(for: course)?.isLoading == true)
+        gate.release()
+        await settle("explicit action completed") { controller.openingRecordingID == nil }
+        await drainTasks()
+        #expect(browser.listCalls == [course.courseCode])
+        #expect(copy ? world.copied == [player] : world.opened == [player])
+        controller.refresh([course, other], selected: other)
+        controller.refresh([other, course], selected: other)
+        await settle("reselected course loaded") { controller.listing(for: other)?.recordings != nil }
+        await drainTasks()
+        #expect(browser.listCalls == [course.courseCode, other.courseCode])
+    }
+
     /// A Play clicked while a course is loading waits behind it; when that load finds Polimi
     /// unreachable, the Play is dropped with the rest of the batch and says why. Guards against
     /// the click doing nothing at all, as in the live check of 2026-10-06.

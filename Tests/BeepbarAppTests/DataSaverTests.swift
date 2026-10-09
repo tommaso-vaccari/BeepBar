@@ -317,6 +317,21 @@ import Testing
         #expect(harness.controller.syncState == .synced(Self.lastResult))
     }
 
+    @Test func cancelledNetworkReadDoesNotStartAutomaticSync() async throws {
+        let harness = try await Harness(networks: [nil])
+        defer { harness.remove() }
+        harness.controller.setDataSaver(enabled: true)
+        harness.controller.setSyncStateForTesting(.synced(Self.lastResult))
+        let requestsBefore = harness.requests.count
+        let task = Task { await harness.controller.runAutomaticSyncForTesting() }
+        harness.sequence.onRead(1) { task.cancel() }
+        #expect(await task.value == .finished)
+        #expect(harness.requests.count == requestsBefore)
+        #expect(!harness.controller.isSyncActive)
+        #expect(harness.controller.dataSaverPause == nil)
+        #expect(harness.controller.syncState == .synced(Self.lastResult))
+    }
+
     // MARK: What clears the pause
 
     /// Proves that "Sincronizza ora" on a hotspot clears the pause and downloads at once, Data

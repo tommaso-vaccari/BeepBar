@@ -4,10 +4,13 @@
 
 ### Improved
 
+- Refreshing unchanged courses avoids unnecessary interface updates while renamed courses and changed selections still appear normally.
 - Opening BeepBar restores the previous sync result with less work, keeping the interface available while a large Activity summary is read.
 - Repeated synchronization uses less memory and does less work when many materials are already saved.
 
 ### Fixed
+
+- Cancelling a network check for Data Saver stops promptly and prevents an automatic sync from starting afterward.
 
 - Removing a course from your selection now drops its waiting recordings request without interrupting playback actions.
 

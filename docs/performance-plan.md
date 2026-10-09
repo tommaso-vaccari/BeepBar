@@ -105,11 +105,10 @@ Misure sintetiche Release arm64, M5/32 GB, AC, una warm-up e sette run: D04, cor
 
 ## Lavoro aperto e issue
 
-[Tracker di consegna](https://github.com/tommaso-vaccari/BeepBar/issues/116). Le nuove issue sono assegnate a Tommaso Zanatta (`tommasoz24`); concordare eventuali riassegnazioni prima di lavorare.
+[Tracker di consegna](https://github.com/tommaso-vaccari/BeepBar/issues/116). Gli assegnatari correnti e le prese in carico sono nelle singole issue; concordare eventuali riassegnazioni prima di lavorare.
 
 | Task | Branch | Dipendenze | Issue |
 |---|---|---|---|
-| D06 | `perf/course-state-publication` | D05 | [#94](https://github.com/tommaso-vaccari/BeepBar/issues/94) |
 | D07 | `perf/isolated-ui-harness` | Nessuna | [#95](https://github.com/tommaso-vaccari/BeepBar/issues/95) |
 | D08 | `perf/progress-before-main` | D06, D07 | [#96](https://github.com/tommaso-vaccari/BeepBar/issues/96) |
 | D09 | `perf/recordings-session-io` | D01, D07 | [#97](https://github.com/tommaso-vaccari/BeepBar/issues/97) |
@@ -118,7 +117,6 @@ Misure sintetiche Release arm64, M5/32 GB, AC, una warm-up e sette run: D04, cor
 | D12 | `perf/recordings-derived-state` | D07, D09 | [#100](https://github.com/tommaso-vaccari/BeepBar/issues/100) |
 | D13 | `docs/performance-results` | D06, D07, D08, D09, D10, D11, D12 | [#101](https://github.com/tommaso-vaccari/BeepBar/issues/101) |
 | I1 | `fix/bounded-metadata-response` | Nessuna | [#102](https://github.com/tommaso-vaccari/BeepBar/issues/102) |
-| I4a | `fix/network-path-cancellation` | Nessuna | [#103](https://github.com/tommaso-vaccari/BeepBar/issues/103) |
 | I4b | `perf/precommit-hash-cancellation` | Nessuna | [#104](https://github.com/tommaso-vaccari/BeepBar/issues/104) |
 | I5 | `fix/scheduler-state-transitions` | Nessuna | [#105](https://github.com/tommaso-vaccari/BeepBar/issues/105) |
 | I9b | `fix/recordings-seen-overflow` | Nessuna | [#106](https://github.com/tommaso-vaccari/BeepBar/issues/106) |
@@ -168,7 +166,9 @@ I percorsi sono relativi al repository. Le righe si riferiscono al commit dell�
 
 ### I4 — Verificare l’annullamento oltre il download
 
-**Evidenza:** `Sources/BeepbarCore/Network/NetworkPathReader.swift`, `current`, ha una continuation e una gara primo path/timeout senza cancellation handler: un task annullato può aspettare il primo risultato o il timeout predefinito di due secondi. In `Sources/BeepbarCore/Filesystem/FileStore.swift:821/878`, `sha256` chiama `hashContents` con `checksCancellation = false`; gli hash locali lunghi non hanno i controlli usati nell’importazione.
+**I4a implementata ([#103](https://github.com/tommaso-vaccari/BeepBar/issues/103)):** lettura path con annullamento cooperativo, completamento unico e rilascio monitor/timer, anche quando la cancellazione precede l’installazione o compete con callback e timeout. Il controller scarta la lettura annullata prima di avviare sync. Provider sintetico senza risposta: completamento entro 100 ms senza sleep arbitrari; 30 gare concorrenti e Data Saver coperti. Mutazione isolata senza i due fix: otto assertion falliscono, incluse richieste inviate dopo cancellazione. Gate finali e CI riportati nella PR/issue; nessuna misura di latenza UI implicita.
+
+**Lavoro residuo I4b:** In `Sources/BeepbarCore/Filesystem/FileStore.swift:821/878`, `sha256` chiama `hashContents` con `checksCancellation = false`; gli hash locali lunghi non hanno i controlli usati nell’importazione.
 
 **Interventi distinti:** completamento della lettura path una sola volta, sensibile all’annullamento, con rilascio monitor/timer; controlli cooperativi negli hash prima delle modifiche. Verificare ogni chiamante prima di cambiare il default. Dopo swap o passo durevole, completare o recuperare in sicurezza: non interrompere lasciando uno stato parzialmente applicato.
 
@@ -186,7 +186,7 @@ I percorsi sono relativi al repository. Le righe si riferiscono al commit dell�
 
 **Riepilogo D05 integrato tramite PR #93.** Restore valido senza riscritture, decoder detached con controllo generazione/identità, migrazione legacy una tantum e nuovi risultati persistiti. Misura finale, test e limiti nella consegna D05; non ripetere il fix.
 
-**Lavoro residuo D06:** ricontrollare `refreshCourseList` e `restoreScopes` su dev corrente; assegnare corsi e salvare selezione soltanto se cambiati, mantenendo rinomina, ordine, account e feedback. Le guardie di `courseFolders` e `enabledCourseIDs` esistono già. Non rimuovere `status` salvo necessità dimostrata. Accettazione: contatori defaults/subscriber, refresh identico senza scritture/pubblicazioni, cambiamenti reali ancora visibili; matrice logout/root/risultati tardivi.
+**D06 — Implementata nella PR collegata a [#94](https://github.com/tommaso-vaccari/BeepBar/issues/94).** `refreshCourseList` confronta i corsi dopo ordinamento prima di assegnare `@Published`; `restoreScopes` confronta la selezione canonica con il valore persistito prima di salvarlo. Ripara comunque valori mancanti, duplicati o obsoleti. Le guardie esistenti su cartelle e selezione, errori e feedback sono conservate. Dieci refresh identici via rete mock: pubblicazioni corsi 10→0, scritture selezione 10→0. Riordino remoto equivalente ignorato; rinomina/rimozione ancora pubblicate, selezione cambiata salvata una volta. Otto assertion falliscono sul codice originale; suite mirate refresh/finalizzazione/Risparmio dati verdi. Suite completa, build Release, review e CI sono gate registrati nella PR/issue. Il conteggio dimostra meno lavoro, non latenza o fluidità UI: misure visive restano D07.
 
 **Indagine separata dopo I7:** encoding di un nuovo risultato da 15k dettagli costa circa 19 ms nella calibrazione sintetica e resta nel percorso esistente. Misurare occupazione main a fine sync con fixture UI isolate. Se il costo viola il budget, progettare persistenza ordinata asincrona: snapshot immutabile, ordine dei risultati, invalidazione account/root, errori, flush al quit e nessuna perdita dell’ultimo risultato. Non basta detached fire-and-forget; definire questi gate prima del fix. D05 non dimostra il budget globale UI ≤16 ms.
 

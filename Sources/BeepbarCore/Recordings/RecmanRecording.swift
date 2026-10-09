@@ -35,7 +35,7 @@ public struct RecmanCourseKey: Sendable, Equatable, Hashable {
 
 /// One row of the Recman archive. `id` is Recman's `transfer_id`, the only stable identifier a
 /// row has; `previewURL` is the row's own link, which leads to the Webex player.
-public struct RecmanRecording: Sendable, Equatable, Identifiable {
+public struct RecmanRecording: Sendable, Equatable, Identifiable, Codable {
     public let id: String
     public let courseCode: String
     public let academicYear: Int

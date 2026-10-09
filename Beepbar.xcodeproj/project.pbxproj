@@ -30,6 +30,7 @@
 		A100000000000000000000B8 /* RecordingsPage.swift in Sources */ = {isa = PBXBuildFile; fileRef = A100000000000000000000B9 /* RecordingsPage.swift */; };
 		A100000000000000000000B6 /* RecordingsController.swift in Sources */ = {isa = PBXBuildFile; fileRef = A100000000000000000000B7 /* RecordingsController.swift */; };
 		A100000000000000000000B4 /* RecordingsSessionStore.swift in Sources */ = {isa = PBXBuildFile; fileRef = A100000000000000000000B5 /* RecordingsSessionStore.swift */; };
+		B12300000000000000000001 /* RecordingsStudyState.swift in Sources */ = {isa = PBXBuildFile; fileRef = B12300000000000000000002 /* RecordingsStudyState.swift */; };
 /* End PBXBuildFile section */
 
 /* Begin PBXFileReference section */
@@ -57,6 +58,7 @@
 		A100000000000000000000B9 /* RecordingsPage.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = RecordingsPage.swift; sourceTree = "<group>"; };
 		A100000000000000000000B7 /* RecordingsController.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = RecordingsController.swift; sourceTree = "<group>"; };
 		A100000000000000000000B5 /* RecordingsSessionStore.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = RecordingsSessionStore.swift; sourceTree = "<group>"; };
+		B12300000000000000000002 /* RecordingsStudyState.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = RecordingsStudyState.swift; sourceTree = "<group>"; };
 /* End PBXFileReference section */
 
 /* Begin PBXFrameworksBuildPhase section */
@@ -116,6 +118,7 @@
 				A100000000000000000000B9 /* RecordingsPage.swift */,
 				A100000000000000000000B7 /* RecordingsController.swift */,
 				A100000000000000000000B5 /* RecordingsSessionStore.swift */,
+				B12300000000000000000002 /* RecordingsStudyState.swift */,
 			);
 			name = Sources;
 			path = Sources/BeepbarApp;
@@ -225,6 +228,7 @@
 				A100000000000000000000B8 /* RecordingsPage.swift in Sources */,
 				A100000000000000000000B6 /* RecordingsController.swift in Sources */,
 				A100000000000000000000B4 /* RecordingsSessionStore.swift in Sources */,
+				B12300000000000000000001 /* RecordingsStudyState.swift in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};

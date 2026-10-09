@@ -16,6 +16,7 @@ package struct RunSample: Sendable, Codable {
     /// sizes when checking that memory doesn't grow with the file.
     package var peakFootprint: UInt64
     package var database: SyncDatabaseWriteCounters
+    package var ownershipBackfill: OwnershipBackfillCounters
     package var fileStore: FileStoreCounters
     package var upstream: UpstreamCounters
     package var installed: Int
@@ -29,12 +30,13 @@ package struct RunSample: Sendable, Codable {
     /// Cancel scenario only: the local file still holds the last installed revision's bytes.
     package var localFilePreserved: Bool?
 
-    package init(wallMilliseconds: Double, resources: ResourceUsage, peakFootprintGrowth: Int64, peakFootprint: UInt64 = 0, database: SyncDatabaseWriteCounters, fileStore: FileStoreCounters, upstream: UpstreamCounters, installed: Int, conflicts: Int, failures: Int, outcome: String? = nil, cancelLatencyMilliseconds: Double? = nil, localFilePreserved: Bool? = nil) {
+    package init(wallMilliseconds: Double, resources: ResourceUsage, peakFootprintGrowth: Int64, peakFootprint: UInt64 = 0, database: SyncDatabaseWriteCounters, ownershipBackfill: OwnershipBackfillCounters = OwnershipBackfillCounters(), fileStore: FileStoreCounters, upstream: UpstreamCounters, installed: Int, conflicts: Int, failures: Int, outcome: String? = nil, cancelLatencyMilliseconds: Double? = nil, localFilePreserved: Bool? = nil) {
         self.wallMilliseconds = wallMilliseconds
         self.resources = resources
         self.peakFootprintGrowth = peakFootprintGrowth
         self.peakFootprint = peakFootprint
         self.database = database
+        self.ownershipBackfill = ownershipBackfill
         self.fileStore = fileStore
         self.upstream = upstream
         self.installed = installed
@@ -91,6 +93,8 @@ package struct Metric: Sendable {
         Metric(name: "disk.logicalWritten", unit: "KiB") { Double($0.resources.logicalBytesWritten) / 1024 },
         Metric(name: "memory.peak", unit: "MiB") { Double($0.peakFootprint) / 1_048_576 },
         Metric(name: "memory.peakGrowth", unit: "MiB") { Double($0.peakFootprintGrowth) / 1_048_576 },
+        Metric(name: "db.ownershipBackfill.transactions", unit: "") { Double($0.ownershipBackfill.transactions) },
+        Metric(name: "db.ownershipBackfill.updates", unit: "") { Double($0.ownershipBackfill.updates) },
         Metric(name: "db.commits", unit: "") { Double($0.database.commits) },
         Metric(name: "db.rowChanges", unit: "") { Double($0.database.rowChanges) },
         Metric(name: "db.pagesWritten", unit: "") { Double($0.database.pagesWritten) },
@@ -270,6 +274,7 @@ package enum Scenarios {
     private static func measure(_ fixture: BenchmarkFixture, _ body: (FileStore) async throws -> (BenchmarkFixture.RunResult?, String?, Duration?)) async throws -> RunSample {
         let fileStore = try fixture.makeFileStore()
         let database = await fixture.database.writeCounters()
+        let ownershipBackfill = await fixture.database.ownershipBackfillCounters
         let upstream = fixture.upstream.counters
         let footprint = PeakFootprintSampler.footprint()
         guard let resources = ResourceUsage.current() else { throw BenchmarkError.setup("proc_pid_rusage failed") }
@@ -286,6 +291,7 @@ package enum Scenarios {
             peakFootprintGrowth: Int64(peak) - Int64(footprint),
             peakFootprint: peak,
             database: await fixture.database.writeCounters().since(database),
+            ownershipBackfill: await fixture.database.ownershipBackfillCounters.since(ownershipBackfill),
             fileStore: await fileStore.counters(),
             upstream: fixture.upstream.counters.since(upstream),
             installed: run?.summary.installed ?? 0,

@@ -64,6 +64,19 @@ package struct SyncDatabaseWriteCounters: Sendable, Equatable, Codable {
     }
 }
 
+/// Backfill SQL attempts on one connection, distinct from rows changed or pages written.
+package struct OwnershipBackfillCounters: Sendable, Equatable, Codable {
+    package var transactions = 0
+    package var updates = 0
+    package init(transactions: Int = 0, updates: Int = 0) {
+        self.transactions = transactions
+        self.updates = updates
+    }
+    package func since(_ earlier: Self) -> Self {
+        Self(transactions: transactions - earlier.transactions, updates: updates - earlier.updates)
+    }
+}
+
 /// Advances `statement` by one row: `true` on `SQLITE_ROW`, `false` on `SQLITE_DONE`. Any other result
 /// (`SQLITE_BUSY`, `SQLITE_IOERR`, `SQLITE_CORRUPT`, `SQLITE_FULL`, ...) is an error and must never be
 /// mistaken for the end of the result set, or callers would act on a truncated view of the database.
@@ -79,6 +92,7 @@ public actor SyncDatabase {
     private let handle: SQLiteHandle
     /// Full baseline reads attempted by this connection, including reads that fail.
     package private(set) var baselineReadAttempts = 0
+    package private(set) var ownershipBackfillCounters = OwnershipBackfillCounters()
     private var database: OpaquePointer? { handle.pointer }
 
     public init(url: URL) throws {
@@ -230,6 +244,7 @@ public actor SyncDatabase {
     }
 
     public func backfillModuleOwnership(rootID: UUID, files: [RemoteFileCandidate]) throws {
+        ownershipBackfillCounters.transactions += 1
         try execute("BEGIN IMMEDIATE")
         do {
             let owners = Dictionary(grouping: files, by: \.id).compactMapValues { candidates -> (Int64, Int64)? in
@@ -238,6 +253,7 @@ public actor SyncDatabase {
                 return (file.courseID, file.moduleID)
             }
             for (remoteID, owner) in owners {
+                ownershipBackfillCounters.updates += 1
                 try withStatement("UPDATE items SET course_id = ?, module_id = ? WHERE root_id = ? AND remote_id = ? AND course_id IS NULL AND module_id IS NULL") { statement in
                     guard sqlite3_bind_int64(statement, 1, owner.0) == SQLITE_OK,
                           sqlite3_bind_int64(statement, 2, owner.1) == SQLITE_OK else { throw SyncDatabaseError.execution }

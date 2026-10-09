@@ -222,6 +222,62 @@ struct SyncDatabaseTests {
         #expect(baselines["module-only"]?.courseID == nil && baselines["module-only"]?.moduleID == nil)
     }
 
+    /// Current ownership and missing rows must not acquire a write lock or attempt UPDATEs.
+    @Test func ownershipBackfillDoesNoWorkWithoutLegacyCandidates() async throws {
+        let root = try temporaryRoot()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let database = try SyncDatabase(url: root.appending(path: "state.sqlite"))
+        let rootID = UUID()
+        try await database.registerRoot(id: rootID, canonicalPath: root.path)
+        try await database.upsertBaseline(rootID: rootID, baseline: Baseline(remoteID: "owned", relativePath: try RelativePath("Course/a.txt"), sha256: "hash", remoteRevision: "1", courseID: 1, moduleID: 10))
+        let before = await database.writeCounters()
+        try await database.backfillModuleOwnership(rootID: rootID, files: [ownershipFile("owned"), ownershipFile("missing")])
+        try await database.backfillModuleOwnership(rootID: rootID, files: [])
+        #expect(await database.ownershipBackfillCounters == OwnershipBackfillCounters())
+        #expect(await database.writeCounters().since(before) == SyncDatabaseWriteCounters())
+    }
+
+    /// Migrate only unambiguous legacy rows in this root, and discover later legacy arrivals.
+    @Test func ownershipBackfillMigratesOnlyMatchingLegacyRows() async throws {
+        let root = try temporaryRoot()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let database = try SyncDatabase(url: root.appending(path: "state.sqlite"))
+        let rootID = UUID(), other = UUID()
+        try await database.registerRoot(id: rootID, canonicalPath: root.path)
+        try await database.registerRoot(id: other, canonicalPath: root.path + "/other")
+        for (id, owner) in [("legacy", rootID), ("absent", rootID), ("ambiguous", rootID), ("legacy", other)] {
+            try await database.upsertBaseline(rootID: owner, baseline: Baseline(remoteID: id, relativePath: try RelativePath("Course/\(id).txt"), sha256: "hash", remoteRevision: "1"))
+        }
+        let files = [ownershipFile("legacy"), ownershipFile("legacy"), ownershipFile("ambiguous"), ownershipFile("ambiguous", module: 11), ownershipFile("missing")]
+        try await database.backfillModuleOwnership(rootID: rootID, files: files)
+        #expect(await database.ownershipBackfillCounters == OwnershipBackfillCounters(transactions: 1, updates: 1))
+        #expect(try await database.baseline(rootID: rootID, remoteID: "legacy")?.moduleID == 10)
+        for (id, owner) in [("absent", rootID), ("ambiguous", rootID), ("legacy", other)] {
+            #expect(try await database.baseline(rootID: owner, remoteID: id)?.courseID == nil)
+        }
+        try await database.backfillModuleOwnership(rootID: rootID, files: files)
+        #expect(await database.ownershipBackfillCounters == OwnershipBackfillCounters(transactions: 1, updates: 1))
+        try await database.backfillModuleOwnership(rootID: rootID, files: [ownershipFile("absent")])
+        #expect(try await database.baseline(rootID: rootID, remoteID: "absent")?.courseID == 1)
+        #expect(await database.ownershipBackfillCounters == OwnershipBackfillCounters(transactions: 2, updates: 2))
+    }
+
+    /// Candidate query failures must propagate, rather than treating an unreadable DB as current.
+    @Test func ownershipBackfillRejectsAnUnreadableCandidateTable() async throws {
+        let root = try temporaryRoot()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let url = root.appending(path: "state.sqlite")
+        let database = try SyncDatabase(url: url)
+        try RawSQLite(url: url).execute("DROP TABLE items")
+        await #expect(throws: SyncDatabaseError.self) {
+            try await database.backfillModuleOwnership(rootID: UUID(), files: [ownershipFile("missing")])
+        }
+    }
+
+    private func ownershipFile(_ id: String, module: Int64 = 10) -> RemoteFileCandidate {
+        RemoteFileCandidate(id: id, courseID: 1, sectionID: 1, moduleID: module, sectionName: "S", moduleName: "A", filename: "a.txt", remoteFilePath: "/", canonicalPluginPath: "/a", downloadURL: nil, size: 1, modifiedAt: nil, observedRevision: "1", isSupported: true)
+    }
+
     @Test func ownershipBackfillSkipsAmbiguousRemoteIDs() async throws {
         let root = try temporaryRoot()
         defer { try? FileManager.default.removeItem(at: root) }

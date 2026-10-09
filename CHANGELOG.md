@@ -12,6 +12,8 @@
 
 ### Fixed
 
+- Changing selected courses keeps the next automatic sync on schedule; automatic checks stop while local recovery needs attention and resume once it is resolved.
+
 - Cancelling a network check for Data Saver stops promptly and prevents an automatic sync from starting afterward.
 
 - Removing a course from your selection now drops its waiting recordings request without interrupting playback actions.

@@ -14,7 +14,9 @@ struct SyncFinalizationTests {
         let database = try SyncDatabase(url: root.appending(path: "state.sqlite"))
         let rootID = UUID()
         try await database.registerRoot(id: rootID, canonicalPath: root.path)
-        let defaults = CountingDefaults.throwaway()
+        let suite = WeBeepAuthenticationController.throwawayDefaultsSuite()
+        defer { removeTestDefaults(suite) }
+        let defaults = CountingDefaults(suiteName: suite)!
         let summary = SyncCompletionSummary(completedAt: Date(timeIntervalSince1970: 123), added: 1, updated: 2, unchanged: 3, preservedLocal: 4, conflicts: 0, failures: 0)
         let key = "io.github.tvaccari.beepbar.last-successful-summary.v1." + rootID.uuidString
         let bytes = try JSONEncoder().encode(summary)
@@ -28,6 +30,116 @@ struct SyncFinalizationTests {
         #expect(defaults.data(forKey: key) == bytes)
     }
 
+    /// Corrupt summaries fall back safely; timestamp-only installs migrate once, preserving old data.
+    @Test(arguments: [false, true]) @MainActor func legacySummaryMigratesOnlyOnce(_ corrupt: Bool) async throws {
+        let root = FileManager.default.temporaryDirectory.appending(path: UUID().uuidString)
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let rootID = UUID()
+        let database = try SyncDatabase(url: root.appending(path: "state.sqlite"))
+        try await database.registerRoot(id: rootID, canonicalPath: root.path)
+        let suite = WeBeepAuthenticationController.throwawayDefaultsSuite()
+        defer { removeTestDefaults(suite) }
+        let defaults = CountingDefaults(suiteName: suite)!
+        let timestampKey = "io.github.tvaccari.beepbar.last-successful-reconciliation.v1." + rootID.uuidString
+        let summaryKey = "io.github.tvaccari.beepbar.last-successful-summary.v1." + rootID.uuidString
+        defaults.set(123.0, forKey: timestampKey)
+        if corrupt { defaults.set(Data("invalid".utf8), forKey: summaryKey) }
+        let controller = WeBeepAuthenticationController(testRootURL: root, database: database, rootID: rootID, defaults: defaults)
+        defaults.resetWrites()
+        await controller.restorePersistedSyncStateForTesting()
+        #expect(controller.lastSyncSummary?.completedAt == Date(timeIntervalSince1970: 123))
+        #expect(defaults.writes == [timestampKey, summaryKey])
+        defaults.resetWrites()
+        await controller.restorePersistedSyncStateForTesting()
+        #expect(defaults.writes.isEmpty)
+    }
+
+    /// A missing or corrupt summary without a legacy timestamp is not a successful reconciliation.
+    @Test(arguments: [false, true]) @MainActor func missingSuccessfulStateDoesNotWrite(_ corrupt: Bool) async throws {
+        let root = FileManager.default.temporaryDirectory.appending(path: UUID().uuidString)
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let rootID = UUID()
+        let database = try SyncDatabase(url: root.appending(path: "state.sqlite"))
+        try await database.registerRoot(id: rootID, canonicalPath: root.path)
+        let suite = WeBeepAuthenticationController.throwawayDefaultsSuite()
+        defer { removeTestDefaults(suite) }
+        let defaults = CountingDefaults(suiteName: suite)!
+        if corrupt { defaults.set(Data("invalid".utf8), forKey: "io.github.tvaccari.beepbar.last-successful-summary.v1." + rootID.uuidString) }
+        let controller = WeBeepAuthenticationController(testRootURL: root, database: database, rootID: rootID, defaults: defaults)
+        defaults.resetWrites()
+        await controller.restorePersistedSyncStateForTesting()
+        #expect(controller.syncState == .readyUnchecked)
+        #expect(defaults.writes.isEmpty)
+    }
+
+    /// A newly completed sync persists all details, so the next launch has the same result.
+    @Test @MainActor func completedSyncPersistsSummary() async throws {
+        let root = FileManager.default.temporaryDirectory.appending(path: UUID().uuidString)
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let rootID = UUID()
+        let database = try SyncDatabase(url: root.appending(path: "state.sqlite"))
+        try await database.registerRoot(id: rootID, canonicalPath: root.path)
+        let suite = WeBeepAuthenticationController.throwawayDefaultsSuite()
+        defer { removeTestDefaults(suite) }
+        let defaults = CountingDefaults(suiteName: suite)!
+        let controller = WeBeepAuthenticationController(testRootURL: root, database: database, rootID: rootID, defaults: defaults)
+        let operation = UUID()
+        controller.setOperationForTesting(operation)
+        let item = SyncedItem(id: "new", name: "new.pdf", kind: .added)
+        let course = CourseSyncCount(courseID: 1, courseFolder: "Course", added: 1, updated: 0, items: [item])
+        await controller.completeSyncForTesting(operation, summary: SyncProgress(completed: 1, total: 1, added: 1, updated: 0, preservedLocal: 0, unchanged: 0, conflicts: 0, failures: 0, perCourse: [course]))
+        let bytes = try #require(defaults.data(forKey: "io.github.tvaccari.beepbar.last-successful-summary.v1." + rootID.uuidString))
+        let summary = try JSONDecoder().decode(SyncCompletionSummary.self, from: bytes)
+        #expect(summary == controller.lastSyncSummary)
+        #expect(summary.perCourse == [course])
+        #expect(defaults.double(forKey: "io.github.tvaccari.beepbar.last-successful-reconciliation.v1." + rootID.uuidString) == summary.completedAt.timeIntervalSince1970)
+    }
+
+    /// A decode finishing after a newer result, sign-out, root change or sync must not publish/save.
+    @Test(arguments: ["sync", "signout", "root", "root-roundtrip", "replacement", "cancel"]) @MainActor
+    func delayedSummaryCannotReplaceCurrentState(_ action: String) async throws {
+        let root = FileManager.default.temporaryDirectory.appending(path: UUID().uuidString)
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let rootID = UUID()
+        let database = try SyncDatabase(url: root.appending(path: "state.sqlite"))
+        try await database.registerRoot(id: rootID, canonicalPath: root.path)
+        let suite = WeBeepAuthenticationController.throwawayDefaultsSuite()
+        defer { removeTestDefaults(suite) }
+        let defaults = CountingDefaults(suiteName: suite)!
+        let old = SyncCompletionSummary(completedAt: Date(timeIntervalSince1970: 123), added: 1, updated: 0, unchanged: 0, preservedLocal: 0, conflicts: 0, failures: 0)
+        defaults.set(try JSONEncoder().encode(old), forKey: "io.github.tvaccari.beepbar.last-successful-summary.v1." + rootID.uuidString)
+        let controller = WeBeepAuthenticationController(testRootURL: root, database: database, rootID: rootID, defaults: defaults)
+        let started = AsyncStream<Void>.makeStream()
+        let release = AsyncStream<Void>.makeStream()
+        controller.setBeforeRestoredSummaryPublicationForTesting {
+            started.continuation.yield()
+            for await _ in release.stream { break }
+        }
+        let restore = Task { await controller.restorePersistedSyncStateForTesting() }
+        var iterator = started.stream.makeAsyncIterator()
+        _ = await iterator.next()
+        switch action {
+        case "sync": controller.setOperationForTesting(UUID()); controller.setSyncStateForTesting(.syncing)
+        case "signout": controller.setDisconnectedForTesting()
+        case "root": controller.setRootIDForTesting(UUID()); controller.setSyncStateForTesting(.needsFolder)
+        case "root-roundtrip": controller.setRootIDForTesting(UUID()); controller.setRootIDForTesting(rootID)
+        case "cancel": restore.cancel()
+        default:
+            let newer = SyncCompletionSummary(completedAt: Date(timeIntervalSince1970: 456), added: 2, updated: 0, unchanged: 0, preservedLocal: 0, conflicts: 0, failures: 0)
+            controller.setSyncStateForTesting(.synced(newer))
+        }
+        let expected = controller.syncState
+        defaults.resetWrites()
+        release.continuation.yield()
+        await restore.value
+        #expect(controller.syncState == expected)
+        #expect(defaults.writes.isEmpty)
+    }
+
     /// On-demand Release measurement of the actual controller restore, with synthetic file details.
     @Test(.enabled(if: ProcessInfo.processInfo.environment["BEEPBAR_RESTORE_BENCHMARK"] == "1")) @MainActor
     func benchmarkSummaryRestore() async throws {
@@ -38,7 +150,9 @@ struct SyncFinalizationTests {
             let rootID = UUID()
             let database = try SyncDatabase(url: root.appending(path: "state.sqlite"))
             try await database.registerRoot(id: rootID, canonicalPath: root.path)
-            let defaults = CountingDefaults.throwaway()
+            let suite = WeBeepAuthenticationController.throwawayDefaultsSuite()
+        defer { removeTestDefaults(suite) }
+        let defaults = CountingDefaults(suiteName: suite)!
             let items = (0..<count).map { SyncedItem(id: "1:100:/:file-\($0).pdf", name: "file-\($0).pdf", kind: .added) }
             let summary = SyncCompletionSummary(completedAt: Date(timeIntervalSince1970: 123), added: count, updated: 0, unchanged: 0, preservedLocal: 0, conflicts: 0, failures: 0, perCourse: [CourseSyncCount(courseID: 1, courseFolder: "Course", added: count, updated: 0, items: items)])
             let bytes = try JSONEncoder().encode(summary)
@@ -46,11 +160,17 @@ struct SyncFinalizationTests {
             let controller = WeBeepAuthenticationController(testRootURL: root, database: database, rootID: rootID, defaults: defaults)
             for run in 0..<8 {
                 defaults.resetWrites()
+                let codecStart = ContinuousClock.now
+                let decoded = try JSONDecoder().decode(SyncCompletionSummary.self, from: bytes)
+                let decodeTime = ContinuousClock.now - codecStart
+                let encodeStart = ContinuousClock.now
+                _ = try JSONEncoder().encode(decoded)
+                let encodeTime = ContinuousClock.now - encodeStart
                 let start = ContinuousClock.now
                 await controller.restorePersistedSyncStateForTesting()
                 let elapsed = ContinuousClock.now - start
                 #expect(controller.lastSyncSummary == summary)
-                if run > 0 { print("RESTORE_BENCH files=\(count) bytes=\(bytes.count) ms=\(Double(elapsed.components.seconds) * 1000 + Double(elapsed.components.attoseconds) / 1e15) writes=\(defaults.writes.count)") }
+                if run > 0 { print("RESTORE_BENCH files=\(count) bytes=\(bytes.count) ms=\(Double(elapsed.components.seconds) * 1000 + Double(elapsed.components.attoseconds) / 1e15) writes=\(defaults.writes.count) decode_ms=\(Double(decodeTime.components.seconds) * 1000 + Double(decodeTime.components.attoseconds) / 1e15) encode_ms=\(Double(encodeTime.components.seconds) * 1000 + Double(encodeTime.components.attoseconds) / 1e15)") }
             }
         }
     }

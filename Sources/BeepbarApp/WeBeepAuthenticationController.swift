@@ -154,7 +154,7 @@ enum AppSyncState: Equatable {
     }
 }
 
-struct SyncCompletionSummary: Codable, Equatable {
+struct SyncCompletionSummary: Codable, Equatable, Sendable {
     let completedAt: Date
     let added: Int
     let updated: Int
@@ -478,7 +478,7 @@ struct MenuBarSnapshot: Sendable {
     private var automaticOutcome: AutomaticSyncOutcome = .finished
     private let automaticSyncEnvironment: AutomaticSyncEnvironment
     private var rootID: UUID? {
-        didSet { if rootID != oldValue { conflictChoiceFeedback = nil } }
+        didSet { if rootID != oldValue { notificationGeneration += 1; conflictChoiceFeedback = nil } }
     }
     private var scheduledConfiguration: BackgroundScheduleConfiguration?
     /// Bumped on every real rebuild of the scheduler. Tells an automatic run whether the schedule
@@ -489,6 +489,7 @@ struct MenuBarSnapshot: Sendable {
     private var recordingsStoreForTesting: RecordingsSessionStore?
     private var recordingsBrowserForTesting: (@MainActor () -> RecmanBrowsing)?
     private var beforeReconciliationStateForTesting: (@MainActor () async -> Void)?
+    private var beforeRestoredSummaryPublicationForTesting: (@MainActor () async -> Void)?
     private var beforePendingChoicesForTesting: (@MainActor () async -> Void)?
     private var courseLoadTaskForTesting: Task<Void, Never>?
     private var deleteCredentialForTesting: (() throws -> Void)?
@@ -750,6 +751,8 @@ struct MenuBarSnapshot: Sendable {
     }
 
     func setBeforePendingChoicesForTesting(_ action: @escaping @MainActor () async -> Void) { beforePendingChoicesForTesting = action }
+
+    func setBeforeRestoredSummaryPublicationForTesting(_ action: @escaping @MainActor () async -> Void) { beforeRestoredSummaryPublicationForTesting = action }
 
     func reloadPendingChoicesForTesting() async { await reloadPendingChoices() }
     func restorePersistedSyncStateForTesting() async { await restorePersistedSyncState() }
@@ -1046,11 +1049,17 @@ struct MenuBarSnapshot: Sendable {
         activeOperationID != nil
     }
 
-    private func setSyncState(_ newState: AppSyncState) {
+    /// Publishing restored state must not encode and persist a result that is already saved.
+    private func publishSyncState(_ newState: AppSyncState) {
         let previousSummary = lastSyncSummary
         syncState = newState
         if lastSyncSummary != previousSummary { activityItemProblems = [:] }
         status = newState.detail
+    }
+
+    /// New successful results and explicit legacy migration retain their durable timestamp and detail.
+    private func setSyncState(_ newState: AppSyncState) {
+        publishSyncState(newState)
         if case .synced(let summary) = newState, let rootID {
             operationDefaults.set(summary.completedAt.timeIntervalSince1970, forKey: Self.lastSuccessfulReconciliationKey + rootID.uuidString)
             if let data = try? JSONEncoder().encode(summary) {
@@ -1065,26 +1074,42 @@ struct MenuBarSnapshot: Sendable {
         guard accountState != .expired else { setSyncState(.failed(.authenticationExpired)); return }
         guard hasStoredCredential else { setSyncState(.loginRequired); return }
         guard rootURL != nil, let rootID else { setSyncState(.needsFolder); return }
+        let generation = notificationGeneration
+        let expectedSite = selectedSite
+        let expectedURL = rootURL
         let open: [ConflictRecord]
         do {
             let pending = try await loadPendingChoices()
-            guard self.rootID == rootID, hasStoredCredential, accountState != .expired, !isSyncActive else { return }
+            guard self.rootID == rootID, selectedSite == expectedSite, rootURL == expectedURL, notificationGeneration == generation, hasStoredCredential, accountState != .expired, !recoveryBlocked, !isSyncActive, !Task.isCancelled else { return }
             open = pending.conflicts
             conflicts = open
             remoteChanges = pending.changes
         } catch {
-            guard self.rootID == rootID, hasStoredCredential, accountState != .expired, !isSyncActive else { return }
+            guard self.rootID == rootID, selectedSite == expectedSite, rootURL == expectedURL, notificationGeneration == generation, hasStoredCredential, accountState != .expired, !recoveryBlocked, !isSyncActive, !Task.isCancelled else { return }
             reportPendingChoicesReadFailure()
             return
         }
         if !open.isEmpty { setSyncState(.conflicts(open.count, nil)); return }
-        if let data = operationDefaults.data(forKey: Self.lastSuccessfulSummaryKey + rootID.uuidString),
-           let summary = try? JSONDecoder().decode(SyncCompletionSummary.self, from: data) {
-            setSyncState(.synced(summary))
-            return
+        if let data = operationDefaults.data(forKey: Self.lastSuccessfulSummaryKey + rootID.uuidString) {
+            // A large Activity summary can take more than a frame to decode. A detached task
+            // keeps that CPU work off the UI; its result remains subject to the captured identity.
+            let summary = await Task.detached(priority: .userInitiated) {
+                try? JSONDecoder().decode(SyncCompletionSummary.self, from: data)
+            }.value
+#if DEBUG
+            await beforeRestoredSummaryPublicationForTesting?()
+#endif
+            guard self.rootID == rootID, selectedSite == expectedSite, rootURL == expectedURL,
+                  notificationGeneration == generation, hasStoredCredential,
+                  accountState != .expired, !recoveryBlocked, !isSyncActive, !Task.isCancelled else { return }
+            if let summary {
+                publishSyncState(.synced(summary))
+                return
+            }
         }
         let timestamp = operationDefaults.double(forKey: Self.lastSuccessfulReconciliationKey + rootID.uuidString)
         let legacy = SyncCompletionSummary(completedAt: Date(timeIntervalSince1970: timestamp), added: 0, updated: 0, unchanged: 0, preservedLocal: 0, conflicts: 0, failures: 0)
+        // Timestamp-only installs migrate once; later restores take the read-only summary path.
         setSyncState(timestamp > 0 ? .synced(legacy) : .readyUnchecked)
     }
 

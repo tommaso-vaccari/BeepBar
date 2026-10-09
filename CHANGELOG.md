@@ -12,6 +12,8 @@
 
 ### Fixed
 
+- Old lecture recordings stay marked as seen even after browsing more than 5,000 recordings across courses. After updating, recordings forgotten by earlier versions may still need “Mark as seen”.
+
 - Changing selected courses keeps the next automatic sync on schedule; automatic checks stop while local recovery needs attention and resume once it is resolved.
 
 - Cancelling a network check for Data Saver stops promptly and prevents an automatic sync from starting afterward.

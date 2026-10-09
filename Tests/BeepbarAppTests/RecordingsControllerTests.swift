@@ -319,8 +319,7 @@ struct RecordingsControllerTests {
         controller.refresh([course], selected: course)
         await settle("listed") { controller.listing(for: course)?.recordings != nil }
         #expect(try store.load() != nil)
-        #expect(defaults.object(forKey: RecordingsController.acknowledgedKey) != nil)
-        #expect(defaults.object(forKey: RecordingsController.baselinedKey) != nil)
+        #expect(FileManager.default.fileExists(atPath: folder.appendingPathComponent(RecordingsSeenStore.fileName).path))
 
         controller.setEnabled(false)
         #expect(!controller.isEnabled)
@@ -328,6 +327,7 @@ struct RecordingsControllerTests {
         #expect(!browser.isOpen)
         #expect(controller.listings.isEmpty)
         #expect(try store.load() == nil)
+        #expect(!FileManager.default.fileExists(atPath: folder.appendingPathComponent(RecordingsSeenStore.fileName).path))
         #expect(defaults.object(forKey: RecordingsController.enabledKey) as? Bool == false)
         for key in [RecordingsController.acknowledgedKey, RecordingsController.baselinedKey] {
            #expect(defaults.object(forKey: key) == nil, "\(key) left behind")
@@ -874,14 +874,13 @@ struct RecordingsControllerTests {
         controller.refresh([course], selected: course)
         await settle("listed") { controller.listing(for: course)?.recordings != nil }
         #expect(controller.newCount(for: course) == 0)
-        let seen = defaults.stringArray(forKey: RecordingsController.acknowledgedKey)
-        #expect(Set(seen ?? []) == ["a", "b"])
+        #expect(controller.acknowledged == ["a", "b"])
 
         browser.listResults[course.courseCode] = .success([recording("c", daysAgo: 0), recording("a"), recording("b")])
         controller.refresh([course], selected: course, force: true)
         await settle("new recording") { controller.newCount(for: course) == 1 }
         #expect(controller.isNew(recording("c")))
-        #expect(defaults.stringArray(forKey: RecordingsController.acknowledgedKey) == seen, "a new recording was marked seen without being opened")
+        #expect(controller.acknowledged == ["a", "b"], "a new recording was marked seen without being opened")
 
         let relaunched = makeController()
         #expect(relaunched.isNew(recording("c")))
@@ -894,18 +893,105 @@ struct RecordingsControllerTests {
         #expect(!makeController().isNew(recording("c")))
     }
 
-    /// The seen list is capped, oldest first, so it can't grow without end over the years.
-    @Test func theSeenListIsCapped() async {
+    /// Guards #106: first baseline, cumulative cross-course history, mark seen and restart
+    /// must not rotate an old recording into New when the former global cap is exceeded.
+    @Test func historyBeyondFiveThousandSurvivesOtherCoursesAndRelaunch() async {
         defer { cleanUp() }
-        let many = (0..<(RecordingsController.acknowledgedLimit + 10)).map { recording("id\($0)") }
+        let many = (0..<5_010).map { recording("id\($0)") }
         browser.listResults[course.courseCode] = .success(many)
+        browser.listResults[other.courseCode] = .success((0..<3_000).map { recording("other\($0)", other) })
         let controller = await readyController()
+        controller.refresh([course, other], selected: course)
+        await settle("both listed") { controller.listing(for: other)?.recordings != nil }
+        #expect(controller.newCount(for: course) == 0)
+        #expect(controller.newCount(for: other) == 0)
+        #expect(controller.acknowledged.count == 8_010)
+        // An old lecture published later is still a new ID: lecture dates aren't checkpoints.
+        let late = recording("late", daysAgo: 500)
+        browser.listResults[course.courseCode] = .success(many + [late])
+        controller.refresh([course], selected: course, force: true)
+        await settle("late publication") { controller.newCount(for: course) == 1 }
+        #expect(controller.isNew(late))
+        controller.markSeen(course)
+        #expect(controller.newCount(for: course) == 0)
+        let relaunched = makeController()
+        #expect(!relaunched.isNew(recording("id0")))
+        #expect(!relaunched.isNew(late))
+        #expect(!relaunched.isNew(recording("other0", other)))
+        #expect(relaunched.isNew(recording("really-new")))
+        // Disappearance from a refresh must not prune history needed on reappearance.
+        browser.listResults[course.courseCode] = .success([])
+        controller.refresh([course], selected: course, force: true)
+        await settle("empty refresh") { controller.listing(for: course)?.recordings == [] }
+        browser.listResults[course.courseCode] = .success(many)
+        controller.refresh([course], selected: course, force: true)
+        await settle("old recordings return") { controller.listing(for: course)?.recordings?.count == many.count }
+        #expect(controller.newCount(for: course) == 0)
+    }
+
+    /// A v1 upgrade preserves surviving IDs and baselines; previously evicted IDs are
+    /// indistinguishable from new publications and stay New until explicitly acknowledged.
+    @Test func migrationPreservesSurvivorsWithoutInventingLostHistory() async throws {
+        defer { cleanUp() }
+        defaults.set(true, forKey: RecordingsController.enabledKey)
+        defaults.set(["survivor"], forKey: RecordingsController.acknowledgedKey)
+        defaults.set([RecordingsController.baselineID(courseCode: course.courseCode, academicYear: course.academicYear)], forKey: RecordingsController.baselinedKey)
+        try saveSession(owner: 42)
+        browser.listResults[course.courseCode] = .success([recording("survivor"), recording("lost"), recording("new", daysAgo: 300)])
+        let controller = makeController()
+        controller.pageAppeared()
         controller.refresh([course], selected: course)
-        await settle("listed") { controller.listing(for: course)?.recordings != nil }
-        let seen = defaults.stringArray(forKey: RecordingsController.acknowledgedKey) ?? []
-        #expect(seen.count == RecordingsController.acknowledgedLimit)
-        #expect(seen.first == "id10")
-        #expect(seen.last == "id\(RecordingsController.acknowledgedLimit + 9)")
+        await settle("migrated listing") { controller.listing(for: course)?.recordings != nil }
+        #expect(!controller.isNew(recording("survivor")))
+        #expect(controller.newCount(for: course) == 2)
+        #expect(defaults.object(forKey: RecordingsController.acknowledgedKey) == nil)
+        let relaunched = makeController()
+        #expect(!relaunched.isNew(recording("survivor")))
+        #expect(relaunched.isNew(recording("lost")))
+        controller.markSeen(course)
+        #expect(!makeController().isNew(recording("lost")))
+    }
+
+    /// v1 preferences contain no account ID. A missing saved session cannot prove whose
+    /// history survived, so a new account's first listing must establish a clean baseline.
+    @Test func migrationWithoutOwnedSessionDoesNotInheritLegacyBaseline() async {
+        defer { cleanUp() }
+        defaults.set(true, forKey: RecordingsController.enabledKey)
+        defaults.set(["old-owner"], forKey: RecordingsController.acknowledgedKey)
+        defaults.set([RecordingsController.baselineID(courseCode: course.courseCode, academicYear: course.academicYear)], forKey: RecordingsController.baselinedKey)
+        let controller = makeController()
+        controller.pageAppeared()
+        #expect(defaults.object(forKey: RecordingsController.acknowledgedKey) == nil)
+        controller.signIn()
+        await settle("signed in") { controller.access == .ready }
+        browser.listResults[course.courseCode] = .success([recording("fresh-owner")])
+        controller.refresh([course], selected: course)
+        await settle("clean first listing") { controller.listing(for: course)?.recordings != nil }
+        #expect(controller.newCount(for: course) == 0)
+        #expect(!controller.acknowledged.contains("old-owner"))
+    }
+
+    /// Disk failure leaves legacy data available for retry and reports it instead of
+    /// publishing a false saved baseline. Recovery must preserve the surviving v1 IDs.
+    @Test func failedMigrationPreservesLegacyForRetry() async throws {
+        defer { cleanUp() }
+        defaults.set(true, forKey: RecordingsController.enabledKey)
+        defaults.set(["survivor"], forKey: RecordingsController.acknowledgedKey)
+        defaults.set([RecordingsController.baselineID(courseCode: course.courseCode, academicYear: course.academicYear)], forKey: RecordingsController.baselinedKey)
+        try saveSession(owner: 42)
+        let database = folder.appendingPathComponent(RecordingsSeenStore.fileName)
+        try Data("not sqlite".utf8).write(to: database)
+        browser.listResults[course.courseCode] = .success([recording("survivor"), recording("lost")])
+        let controller = makeController()
+        controller.pageAppeared()
+        controller.refresh([course], selected: course)
+        await settle("history failure") { controller.listing(for: course)?.problem == .historyUnavailable }
+        #expect(defaults.stringArray(forKey: RecordingsController.acknowledgedKey) == ["survivor"])
+        try FileManager.default.removeItem(at: database)
+        controller.refresh([course], selected: course, force: true)
+        await settle("retry recovered") { controller.newCount(for: course) == 1 }
+        #expect(!controller.isNew(recording("survivor")))
+        #expect(controller.isNew(recording("lost")))
     }
 
     /// Every Recman failure maps to a message; a lapsed session or an unknown error reads as an

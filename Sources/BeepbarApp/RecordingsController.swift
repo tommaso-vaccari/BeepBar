@@ -11,6 +11,7 @@ enum RecordingsProblem: Equatable {
     case incomplete
     case yearUnavailable
     case playbackUnavailable
+    case historyUnavailable
 
     init(_ error: Error) {
         switch error as? RecmanBrowserError {
@@ -28,6 +29,7 @@ enum RecordingsProblem: Equatable {
         case .unrecognized: tr("L'archivio delle registrazioni è diverso dal solito e BeepBar non riesce a leggerlo.", "The recordings archive looks different from usual and BeepBar can't read it.")
         case .incomplete: tr("L'elenco è arrivato incompleto. Riprova tra poco.", "The list came back incomplete. Try again shortly.")
         case .yearUnavailable: tr("L'archivio non ha ancora le registrazioni di quest'anno accademico.", "The archive doesn't have this academic year's recordings yet.")
+        case .historyUnavailable: tr("Non è stato possibile salvare lo stato delle registrazioni. Riprova.", "Couldn’t save recording history. Try again.")
         case .playbackUnavailable: tr("Non è stato possibile aprire questa registrazione.", "Couldn't open this recording.")
         }
     }
@@ -78,8 +80,6 @@ struct RecordingsListing: Equatable {
     static let enabledKey = "io.github.tvaccari.beepbar.recordings-enabled.v1"
     static let acknowledgedKey = "io.github.tvaccari.beepbar.recordings-acknowledged.v1"
     static let baselinedKey = "io.github.tvaccari.beepbar.recordings-baselined.v1"
-    /// Oldest ids are forgotten first; a semester of every course stays well below this.
-    static let acknowledgedLimit = 5_000
     /// A course shown again within this time isn't asked for again unless the user refreshes.
     static let freshness: TimeInterval = 300
 
@@ -93,8 +93,10 @@ struct RecordingsListing: Equatable {
     /// Why the last attempt to open a recording failed, until the next one.
     @Published private(set) var openingProblem: RecordingsProblem?
     @Published private(set) var acknowledged: Set<String>
-    private var acknowledgedOrder: [String]
-    private var baselined: Set<String>
+    private var acknowledgedByCourse: [RecmanCourseKey: Set<String>] = [:]
+    private let seenStore: RecordingsSeenStore
+    private var legacyOwner: Int?
+    private var legacySeen: RecordingsSeenStore.Legacy
 
     private let makeBrowser: @MainActor () -> RecmanBrowsing
     private let store: RecordingsSessionStore
@@ -147,6 +149,7 @@ struct RecordingsListing: Equatable {
     ) {
         self.makeBrowser = makeBrowser
         self.store = store
+        self.seenStore = RecordingsSeenStore(directory: store.directory)
         self.defaults = defaults
         self.ownerUserID = ownerUserID
         self.isAvailable = isAvailable
@@ -158,9 +161,8 @@ struct RecordingsListing: Equatable {
         let enabled = (defaults.object(forKey: Self.enabledKey) as? Bool ?? true) && isAvailable()
         isEnabled = enabled
         access = enabled ? .ready : .off
-        acknowledgedOrder = enabled ? defaults.stringArray(forKey: Self.acknowledgedKey) ?? [] : []
-        acknowledged = Set(acknowledgedOrder)
-        baselined = enabled ? Set(defaults.stringArray(forKey: Self.baselinedKey) ?? []) : []
+        acknowledged = []
+        legacySeen = .init(ids: enabled ? defaults.stringArray(forKey: Self.acknowledgedKey) ?? [] : [], baselines: enabled ? defaults.stringArray(forKey: Self.baselinedKey) ?? [] : [])
     }
 
     // MARK: Switch
@@ -339,7 +341,7 @@ struct RecordingsListing: Equatable {
 
     private func finishOpening(_ recording: RecmanRecording, url: URL, action: OpenAction) {
         if openingRecordingID == recording.id { openingRecordingID = nil }
-        acknowledge([recording.id])
+        if let key = RecmanCourseKey(courseCode: recording.courseCode, academicYear: recording.academicYear) { acknowledge([recording.id], for: key) }
         switch action {
         case .play: openURL(url)
         case .copyLink: copy(url)
@@ -349,39 +351,76 @@ struct RecordingsListing: Equatable {
     // MARK: New recordings
 
     func isNew(_ recording: RecmanRecording) -> Bool {
-        baselined.contains(Self.baselineID(courseCode: recording.courseCode, academicYear: recording.academicYear)) && !acknowledged.contains(recording.id)
+        guard let key = RecmanCourseKey(courseCode: recording.courseCode, academicYear: recording.academicYear) else { return false }
+        if let seen = acknowledgedByCourse[key] { return !seen.contains(recording.id) }
+        // Usually the listing supplies this cache. A caller asking before listing reads just
+        // its one ID, after checking the saved session's owner (including offline launches).
+        if listings[key]?.recordings != nil { return false }
+        if sessionOwner == nil { _ = savedCookies() }
+        guard let owner = sessionOwner ?? ownerUserID() else { return false }
+        do {
+            guard let seen = try seenStore.seen(owner: owner, key: key, ids: [recording.id], establishBaseline: false, legacy: legacy(for: owner)) else { return false }
+            discardLegacyDefaults()
+            return !seen.contains(recording.id)
+        } catch { return false }
     }
 
     func newCount(for key: RecmanCourseKey) -> Int {
         listings[key]?.recordings?.filter(isNew).count ?? 0
     }
 
-    /// "Segna come viste": the course's dots go away without opening every recording.
+    /// "Segna come viste": publish cleared dots only after their durable acknowledgement.
     func markSeen(_ key: RecmanCourseKey) {
-        acknowledge(listings[key]?.recordings?.map(\.id) ?? [])
+        acknowledge(listings[key]?.recordings?.map(\.id) ?? [], for: key)
     }
 
     nonisolated static func baselineID(courseCode: String, academicYear: Int) -> String {
         "\(courseCode)-\(academicYear)"
     }
 
-    private func acknowledge(_ ids: [String]) {
-        let added = ids.filter { !acknowledged.contains($0) }
+    private func acknowledge(_ ids: [String], for key: RecmanCourseKey) {
+        guard let owner = sessionOwner ?? ownerUserID(), !ids.isEmpty else { return }
+        let added = ids.filter { !(acknowledgedByCourse[key]?.contains($0) ?? false) }
         guard !added.isEmpty else { return }
-        acknowledgedOrder.append(contentsOf: added)
-        if acknowledgedOrder.count > Self.acknowledgedLimit {
-            acknowledgedOrder.removeFirst(acknowledgedOrder.count - Self.acknowledgedLimit)
+        do {
+            try seenStore.acknowledge(owner: owner, key: key, ids: added, legacy: legacy(for: owner))
+            discardLegacyDefaults()
+            // Cache only scopes already loaded: opening an unseen course does not establish
+            // its first-listing baseline, nor should it make its other recordings look new.
+            if acknowledgedByCourse[key] != nil { acknowledgedByCourse[key]?.formUnion(added) }
+            publishAcknowledged()
+            listings[key]?.problem = nil
+        } catch {
+            listings[key]?.problem = .historyUnavailable
+            openingProblem = .historyUnavailable
+            log.error("Couldn't save recording history")
         }
-        acknowledged = Set(acknowledgedOrder)
-        defaults.set(acknowledgedOrder, forKey: Self.acknowledgedKey)
+    }
+
+    private func publishAcknowledged() {
+        acknowledged = acknowledgedByCourse.values.reduce(into: Set<String>()) { $0.formUnion($1) }
+    }
+
+    /// Import only history whose saved session verified this account. A failed session read
+    /// preserves v1 for retry, but does not authorize attaching it to a later fresh sign-in.
+    private func legacy(for owner: Int) -> RecordingsSeenStore.Legacy {
+        legacyOwner == owner ? legacySeen : .init(ids: [], baselines: [])
+    }
+
+    /// v1 keys are removed only after the SQLite migration committed. Keeping legacySeen in
+    /// memory until reset lets a failed first migration retry without losing surviving IDs.
+    private func discardLegacyDefaults() {
+        for key in [Self.acknowledgedKey, Self.baselinedKey] where defaults.object(forKey: key) != nil { defaults.removeObject(forKey: key) }
     }
 
     private func forgetSeen() {
-        acknowledgedOrder = []
+        acknowledgedByCourse = [:]
         acknowledged = []
-        baselined = []
+        legacySeen = .init(ids: [], baselines: [])
+        legacyOwner = nil
         defaults.removeObject(forKey: Self.acknowledgedKey)
         defaults.removeObject(forKey: Self.baselinedKey)
+        do { try seenStore.delete() } catch { log.error("Couldn't delete recording history") }
     }
 
     // MARK: Worker
@@ -476,11 +515,16 @@ struct RecordingsListing: Equatable {
         listing.problem = nil
         listing.updatedAt = now()
         listings[key] = listing
-        let baseline = Self.baselineID(courseCode: key.courseCode, academicYear: key.academicYear)
-        if !baselined.contains(baseline) {
-            baselined.insert(baseline)
-            defaults.set(baselined.sorted(), forKey: Self.baselinedKey)
-            acknowledge(recordings.map(\.id))
+        guard let owner = sessionOwner ?? ownerUserID() else { return }
+        do {
+            acknowledgedByCourse[key] = try seenStore.seen(owner: owner, key: key, ids: recordings.map(\.id), establishBaseline: true, legacy: legacy(for: owner))
+            discardLegacyDefaults()
+            publishAcknowledged()
+        } catch {
+            // Preserve any previous cache and history; a failed transaction is not a new
+            // baseline. The next complete listing retries rather than overwriting the DB.
+            listings[key]?.problem = .historyUnavailable
+            log.error("Couldn't load recording history")
         }
     }
 
@@ -566,12 +610,20 @@ struct RecordingsListing: Equatable {
             log.error("Couldn't read the saved Polimi session")
             return []
         }
-        guard let data else { return [] }
+        guard let data else {
+            // v1 history has no owner. Without a verifiable saved session, attaching it to
+            // the next sign-in could leak another student’s state; v2 is already scoped.
+            legacySeen = .init(ids: [], baselines: [])
+            discardLegacyDefaults()
+            return []
+        }
         let snapshot: RecmanSessionCodec.Snapshot
         do {
             snapshot = try RecmanSessionCodec.decode(data, now: now())
         } catch {
             log.notice("Saved Polimi session unreadable: dropped")
+            legacySeen = .init(ids: [], baselines: [])
+            discardLegacyDefaults()
             discardSessionFile()
             return []
         }
@@ -584,6 +636,7 @@ struct RecordingsListing: Equatable {
             return []
         }
         sessionOwner = snapshot.ownerUserID
+        legacyOwner = snapshot.ownerUserID
         savedFingerprint = Self.fingerprint(snapshot.cookies)
         return snapshot.cookies
     }

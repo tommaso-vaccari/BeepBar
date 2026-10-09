@@ -118,7 +118,6 @@ Misure sintetiche Release arm64, M5/32 GB, AC, una warm-up e sette run: D04, cor
 | D12 | `perf/recordings-derived-state` | D07, D09 | [#100](https://github.com/tommaso-vaccari/BeepBar/issues/100) |
 | D13 | `docs/performance-results` | D06, D07, D08, D09, D10, D11, D12 | [#101](https://github.com/tommaso-vaccari/BeepBar/issues/101) |
 | I1 | `fix/bounded-metadata-response` | Nessuna | [#102](https://github.com/tommaso-vaccari/BeepBar/issues/102) |
-| I4a | `fix/network-path-cancellation` | Nessuna | [#103](https://github.com/tommaso-vaccari/BeepBar/issues/103) |
 | I4b | `perf/precommit-hash-cancellation` | Nessuna | [#104](https://github.com/tommaso-vaccari/BeepBar/issues/104) |
 | I5 | `fix/scheduler-state-transitions` | Nessuna | [#105](https://github.com/tommaso-vaccari/BeepBar/issues/105) |
 | I9b | `fix/recordings-seen-overflow` | Nessuna | [#106](https://github.com/tommaso-vaccari/BeepBar/issues/106) |
@@ -168,7 +167,9 @@ I percorsi sono relativi al repository. Le righe si riferiscono al commit dell�
 
 ### I4 — Verificare l’annullamento oltre il download
 
-**Evidenza:** `Sources/BeepbarCore/Network/NetworkPathReader.swift`, `current`, ha una continuation e una gara primo path/timeout senza cancellation handler: un task annullato può aspettare il primo risultato o il timeout predefinito di due secondi. In `Sources/BeepbarCore/Filesystem/FileStore.swift:821/878`, `sha256` chiama `hashContents` con `checksCancellation = false`; gli hash locali lunghi non hanno i controlli usati nell’importazione.
+**I4a implementata ([#103](https://github.com/tommaso-vaccari/BeepBar/issues/103)):** lettura path con annullamento cooperativo, completamento unico e rilascio monitor/timer, anche quando la cancellazione precede l’installazione o compete con callback e timeout. Il controller scarta la lettura annullata prima di avviare sync. Provider sintetico senza risposta: completamento entro 100 ms senza sleep arbitrari; 30 gare concorrenti e Data Saver coperti. Mutazione isolata senza i due fix: otto assertion falliscono, incluse richieste inviate dopo cancellazione. Gate finali e CI riportati nella PR/issue; nessuna misura di latenza UI implicita.
+
+**Lavoro residuo I4b:** In `Sources/BeepbarCore/Filesystem/FileStore.swift:821/878`, `sha256` chiama `hashContents` con `checksCancellation = false`; gli hash locali lunghi non hanno i controlli usati nell’importazione.
 
 **Interventi distinti:** completamento della lettura path una sola volta, sensibile all’annullamento, con rilascio monitor/timer; controlli cooperativi negli hash prima delle modifiche. Verificare ogni chiamante prima di cambiare il default. Dopo swap o passo durevole, completare o recuperare in sicurezza: non interrompere lasciando uno stato parzialmente applicato.
 

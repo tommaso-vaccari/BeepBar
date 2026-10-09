@@ -9,6 +9,8 @@
 
 ### Fixed
 
+- Cancelling a network check for Data Saver stops promptly and prevents an automatic sync from starting afterward.
+
 - Removing a course from your selection now drops its waiting recordings request without interrupting playback actions.
 
 ## 2026-10-07

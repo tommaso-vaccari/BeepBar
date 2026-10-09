@@ -2214,7 +2214,7 @@ struct MenuBarSnapshot: Sendable {
             // exists, and the new one takes over. Going on would sync after the user turned
             // automatic sync off, or show a pause nothing would clear, since the rebuild that
             // clears it has already happened.
-            guard schedulerGeneration == generation else {
+            guard !Task.isCancelled, schedulerGeneration == generation else {
                 BeepbarLog.sync.notice("Automatic synchronization skipped reason=schedule-changed")
                 return .finished
             }

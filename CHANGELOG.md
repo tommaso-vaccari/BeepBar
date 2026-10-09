@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+### Fixed
+
+- Removing a course from your selection now drops its waiting recordings request without interrupting playback actions.
+
 ## 2026-10-07
 
 ### Release highlights

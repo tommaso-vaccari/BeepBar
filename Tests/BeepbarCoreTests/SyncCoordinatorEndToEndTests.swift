@@ -3,6 +3,34 @@ import Testing
 @testable import BeepbarCore
 
 @Suite(.serialized) struct SyncCoordinatorEndToEndTests {
+    /// Planning needs the post-backfill snapshot only, even when a prior sync tracked files.
+    @Test func readsBaselinesOncePerRun() async throws {
+        let fixture = try await Fixture()
+        defer { fixture.remove() }
+        let before = await fixture.database.baselineReadAttempts
+        _ = try await fixture.synchronize(targets: [fixture.targets[0]])
+        #expect(await fixture.database.baselineReadAttempts - before == 1)
+        _ = try await fixture.synchronize(targets: [fixture.targets[0]])
+        #expect(await fixture.database.baselineReadAttempts - before == 2)
+    }
+
+    /// A corrupt baseline must fail planning after metadata without downloading or touching files.
+    @Test func invalidBaselineFailsBeforeDownloads() async throws {
+        let fixture = try await Fixture()
+        defer { fixture.remove() }
+        _ = try await fixture.synchronize(targets: [fixture.targets[0]])
+        let raw = try RawSQLite(url: fixture.supportDirectory.appending(path: "state.sqlite"))
+        try raw.execute("UPDATE items SET relative_path = '../unsafe.txt' WHERE remote_id = '\(fixture.remoteID(course: 1, file: 0))'")
+        fixture.upstream.resetDownloadCount()
+        do {
+            _ = try await fixture.synchronize(targets: [fixture.targets[0]])
+            Issue.record("An invalid baseline must not produce a successful sync")
+        } catch is RelativePathError { }
+        #expect(fixture.upstream.downloadCount == 0)
+        #expect(fixture.contents("Course 1/Lezioni/0.txt") == "x")
+        #expect(try await fixture.database.pendingOperations().isEmpty)
+    }
+
     @Test func installsThousandFilesAndSecondRunDoesNotDownloadAgain() async throws {
         let fixture = try await Fixture()
         defer { fixture.remove() }

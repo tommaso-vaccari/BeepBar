@@ -61,17 +61,11 @@ public actor SyncCoordinator {
         // Before any baseline is read: a move interrupted by a crash is completed or dropped first.
         try await RemoteMoveJournal.recover(rootID: rootID, database: database, fileStore: fileStore)
         try await ensureManagedDirectories(targets)
-        let baselines: [String: Baseline]
-        do {
-            let trace = PerformanceTrace.shared.begin("sync.baselines", category: .database)
-            defer { PerformanceTrace.shared.end("sync.baselines", category: .database, state: trace) }
-            baselines = try await database.baselines(rootID: rootID)
-        }
         let prepared: PreparedRun
         do {
             let trace = PerformanceTrace.shared.begin("sync.metadata", category: .sync)
             defer { PerformanceTrace.shared.end("sync.metadata", category: .sync, state: trace) }
-            prepared = try await prepareItems(targets: targets, token: token, baselines: baselines, concurrency: mode.metadataConcurrency)
+            prepared = try await prepareItems(targets: targets, token: token, concurrency: mode.metadataConcurrency)
         }
         let work: [PreparedSyncItem]
         do {
@@ -163,7 +157,7 @@ public actor SyncCoordinator {
         }
     }
 
-    private func prepareItems(targets: [SyncTarget], token: String, baselines: [String: Baseline], concurrency: Int) async throws -> PreparedRun {
+    private func prepareItems(targets: [SyncTarget], token: String, concurrency: Int) async throws -> PreparedRun {
         try await withThrowingTaskGroup(of: (Int, Result<RemoteCourseContents, WeBeepAPIError>).self) { group in
             var next = 0
             var fetched: [(Int, [RemoteFileCandidate])] = []
@@ -210,7 +204,14 @@ public actor SyncCoordinator {
             let allFiles = fetched.flatMap { $0.1 }
             try Self.validateUniqueRemoteIDs(allFiles)
             try await database.backfillModuleOwnership(rootID: rootID, files: allFiles)
-            var currentBaselines = try await database.baselines(rootID: rootID)
+            // This is the authoritative snapshot: recovery ran before metadata and ownership
+            // backfill must finish before planning can trust course/module identity.
+            var currentBaselines: [String: Baseline]
+            do {
+                let trace = PerformanceTrace.shared.begin("sync.baselines", category: .database)
+                defer { PerformanceTrace.shared.end("sync.baselines", category: .database, state: trace) }
+                currentBaselines = try await database.baselines(rootID: rootID)
+            }
             for file in allFiles {
                 guard let baseline = currentBaselines[file.id] else { continue }
                 guard (baseline.courseID == nil && baseline.moduleID == nil)

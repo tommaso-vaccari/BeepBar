@@ -268,6 +268,7 @@ def execute(args):
     try:
         with temporary_root() as temp:
             result['temporaryRoot'] = str(temp)
+            save()
             def export(label):
                 root = temp / label
                 root.mkdir()

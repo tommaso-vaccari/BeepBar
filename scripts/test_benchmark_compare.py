@@ -1,5 +1,6 @@
 """Behavior tests: invalid evidence, incompatible fixtures and subprocess cleanup cannot claim gains."""
-import copy
+import argparse
+import json
 import importlib.util
 from pathlib import Path
 import signal
@@ -140,6 +141,42 @@ class ComparisonTests(unittest.TestCase):
                         b.run([sys.executable, '-c', 'import time; time.sleep(30)'], root, Path(outer) / 'interrupt.log', [])
             self.assertGreaterEqual(calls, 2)
             self.assertFalse(root.exists())
+
+    def test_orchestrator_freezes_refs_and_rejects_failed_runs_with_reports(self):
+        with tempfile.TemporaryDirectory() as folder:
+            out = Path(folder) / 'results'
+            args = argparse.Namespace(main='main', base_dev='dev', candidate='dev', harness_ref=None,
+                                      out=str(out), runs=5, warmup=1, saved_folder_overrides=False,
+                                      dependency_cache=folder, smoke=True)
+            def fake_run(command, cwd, log, records, env=None):
+                records.append({'command': command, 'exit': 0})
+                log.write_text('diagnostic')
+                if command[:2] == ['git', 'archive']:
+                    # Export helper extracts our tiny real tar archive into each source root.
+                    import io, tarfile
+                    with tarfile.open(command[3], 'w') as archive:
+                        for name in b.MEASUREMENT:
+                            data = b'Metric(name: "wall", unit: "ms")'
+                            item = tarfile.TarInfo(name + '/Scenarios.swift')
+                            item.size = len(data)
+                            archive.addfile(item, io.BytesIO(data))
+                if '--show-bin-path' in command:
+                    return str(Path(cwd) / 'bin')
+                if '--json' in command:
+                    path = Path(command[command.index('--json') + 1])
+                    path.write_text(json.dumps(report()))
+                    raise b.InvalidComparison('failed despite emitted report')
+                return 'toolchain'
+            with patch.object(b.subprocess, 'check_output', return_value='a' * 40 + '\n') as resolve, \
+                    patch.object(b, 'run', fake_run):
+                self.assertEqual(b.execute(args), 1)
+                self.assertEqual(resolve.call_count, 2)
+            result = json.loads((out / 'comparison.json').read_text())
+            self.assertFalse(result['valid'])
+            self.assertTrue(result['cleaned'])
+            self.assertEqual(len(result['scenarios']), 3)
+            self.assertTrue(all(not s['valid'] and 'rows' not in s for s in result['scenarios'].values()))
+            self.assertTrue((out / 'main' / 'unchanged-smoke.json').exists())
 
     def test_saved_folder_adjustment_is_explicit_and_non_repeatable(self):
         with tempfile.TemporaryDirectory() as folder:

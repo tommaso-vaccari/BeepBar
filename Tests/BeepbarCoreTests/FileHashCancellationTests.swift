@@ -36,9 +36,16 @@ struct FileHashCancellationTests {
         fixture.probe.arm()
         let result = await Task { try await fixture.read() }.result
         #expect(result.isCancellation)
+        let stage = try await fixture.store.createStage()
+        try await fixture.store.write(Data("remote".utf8), to: stage)
+        let artifact = try await fixture.store.finalize(stage)
         let before = await fixture.store.counters()
-        #expect(try await fixture.store.inspect(fixture.path) == fixture.original)
-        #expect(await fixture.store.counters().since(before).bytesHashed == Fixture.size)
+        let installed = try await fixture.store.install(artifact, at: fixture.path, expectedLocal: fixture.original)
+        guard case .installedReplacing(let rollback) = installed else { Issue.record("Expected replacement after partial inspection, got \(installed)"); return }
+        #expect(await fixture.store.counters().since(before).filesHashed == 2)
+        #expect(try String(contentsOf: fixture.root.appending(path: fixture.path.value), encoding: .utf8) == "remote")
+        try await fixture.store.discard(rollback)
+        try await fixture.store.discard(fixture.stage)
     }
 
     @Test(arguments: [JournalStep.journaled, .filesystemChanged, .committed])
@@ -62,6 +69,31 @@ struct FileHashCancellationTests {
         #expect(try String(contentsOf: fixture.root.appending(path: fixture.path.value), encoding: .utf8) == "remote")
         #expect(try await database.pendingOperations().isEmpty)
         #expect(try await database.baseline(rootID: rootID, remoteID: "file")?.sha256 == artifact.sha256)
+        #expect(try FileManager.default.contentsOfDirectory(atPath: fixture.root.appending(path: ".beepbar/staging").path).isEmpty)
+    }
+
+    @Test(arguments: [JournalStep.journaled, .filesystemChanged])
+    func cancelledJournaledConflictPreservesBothCopies(_ point: JournalStep) async throws {
+        let fixture = try await Fixture(read: .stage)
+        defer { fixture.remove() }
+        try await fixture.store.discard(fixture.stage)
+        let rootID = UUID()
+        let database = try SyncDatabase(url: fixture.root.appending(path: "state.sqlite"))
+        try await database.registerRoot(id: rootID, canonicalPath: fixture.root.path)
+        let stage = try await fixture.store.createStage()
+        try await fixture.store.write(Data("remote".utf8), to: stage)
+        let artifact = try await fixture.store.finalize(stage)
+        let coordinator = SyncTransactionCoordinator(database: database, fileStore: fixture.store, interruption: { step in
+            if step == point { withUnsafeCurrentTask { $0?.cancel() } }
+        })
+        let outcome = try await Task {
+            try await coordinator.install(rootID: rootID, remoteID: "file", destination: fixture.path, expectedLocal: .present(sha256: "older baseline"), remote: RemoteState(sha256: artifact.sha256, revision: "2"), artifact: artifact)
+        }.value
+        guard case .conflict(let conflict) = outcome else { Issue.record("Expected conflict, got \(outcome)"); return }
+        #expect(try await fixture.store.inspect(fixture.path) == fixture.original)
+        #expect(try await fixture.store.conflictArtifact(at: conflict.incomingPath)?.sha256 == artifact.sha256)
+        #expect(try await database.conflict(id: conflict.id) == conflict)
+        #expect(try await database.pendingOperations().isEmpty)
         #expect(try FileManager.default.contentsOfDirectory(atPath: fixture.root.appending(path: ".beepbar/staging").path).isEmpty)
     }
 

@@ -4,6 +4,8 @@
 
 ### Improved
 
+- Cancelling sync stops large local file checks promptly while journaled file changes still finish safely.
+
 - Refreshing unchanged courses avoids unnecessary interface updates while renamed courses and changed selections still appear normally.
 - Opening BeepBar restores the previous sync result with less work, keeping the interface available while a large Activity summary is read.
 - Repeated synchronization uses less memory and does less work when many materials are already saved.

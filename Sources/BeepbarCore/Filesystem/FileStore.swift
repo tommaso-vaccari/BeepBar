@@ -74,6 +74,7 @@ public actor FileStore {
     /// Tests change the destination after `install`'s pre-swap check and before the swap, the
     /// window only the post-swap check of the displaced copy guards.
     private let beforeSwap: (@Sendable (RelativePath) throws -> Void)?
+    private let beforeReadChunk: (@Sendable (Bool, Int64) -> Void)?
     /// Number of times a file's full contents were read to compute a SHA-256 digest.
     /// Test instrumentation: lets tests prove that unchanged files are not re-read on every sync.
     private(set) var hashCount = 0
@@ -110,7 +111,7 @@ public actor FileStore {
 
     /// Tests inject a filesystem change after destination selection, before move validation.
     /// `beforeSwap` comes last so that existing trailing closures keep binding to `trash`.
-    init(root: URL, beforeMove: (@Sendable (RelativePath, RelativePath) throws -> Void)?, trash: @escaping @Sendable (URL) throws -> Void = { try FileManager.default.trashItem(at: $0, resultingItemURL: nil) }, beforeSwap: (@Sendable (RelativePath) throws -> Void)? = nil) throws {
+    init(root: URL, beforeMove: (@Sendable (RelativePath, RelativePath) throws -> Void)?, trash: @escaping @Sendable (URL) throws -> Void = { try FileManager.default.trashItem(at: $0, resultingItemURL: nil) }, beforeSwap: (@Sendable (RelativePath) throws -> Void)? = nil, beforeReadChunk: (@Sendable (Bool, Int64) -> Void)? = nil) throws {
         let fd = open(root.standardizedFileURL.path, O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW)
         guard fd >= 0 else { throw FileStoreError.invalidRoot }
         guard (try? Self.identity(of: fd)) != nil else { close(fd); throw FileStoreError.invalidRoot }
@@ -119,11 +120,13 @@ public actor FileStore {
         self.trash = trash
         self.beforeMove = beforeMove
         self.beforeSwap = beforeSwap
+        self.beforeReadChunk = beforeReadChunk
     }
 
     deinit { close(rootFD) }
 
-    public func inspect(_ path: RelativePath) throws -> LocalState {
+    /// Ordinary reads can stop; recovery and a journaled change explicitly finish their read.
+    public func inspect(_ path: RelativePath, checksCancellation: Bool = true) throws -> LocalState {
         let parentAndName: (Int32, String)
         do {
             parentAndName = try parentDirectory(for: path, create: false)
@@ -136,7 +139,7 @@ public actor FileStore {
         if fd < 0 { if errno == ENOENT { return .missing }; throw fileStoreError() }
         defer { close(fd) }
         try requireRegularFile(fd)
-        return .present(sha256: try rememberingSHA256(of: fd))
+        return .present(sha256: try rememberingSHA256(of: fd, checksCancellation: checksCancellation))
     }
 
     public func containsRegularFile(_ path: RelativePath) throws -> Bool {
@@ -209,7 +212,7 @@ public actor FileStore {
         return .regular(executable: metadata.st_mode & 0o111 != 0)
     }
 
-    public func snapshotRegularFile(_ path: RelativePath) throws -> FileSnapshotState {
+    public func snapshotRegularFile(_ path: RelativePath, checksCancellation: Bool = true) throws -> FileSnapshotState {
         try requireMovablePath(path)
         let (parent, name): (Int32, String)
         do { (parent, name) = try parentDirectory(for: path, create: false) }
@@ -220,7 +223,7 @@ public actor FileStore {
         defer { close(fd) }
         try requireRegularFile(fd)
         let identity = try Self.identity(of: fd)
-        return .present(FileSnapshot(device: identity.device, inode: identity.inode, sha256: try sha256(of: fd)))
+        return .present(FileSnapshot(device: identity.device, inode: identity.inode, sha256: try sha256(of: fd, checksCancellation: checksCancellation)))
     }
 
     public func regularFileIdentity(_ path: RelativePath) throws -> DirectoryIdentity? {
@@ -324,7 +327,7 @@ public actor FileStore {
         try requireRegularFile(sourceFD)
         guard try Self.identity(of: sourceFD) == FileIdentity(device: expected.device, inode: expected.inode) else { throw FileStoreError.localChanged }
         if !preservingCurrentContents {
-            guard try sha256(of: sourceFD) == expected.sha256 else { throw FileStoreError.localChanged }
+            guard try sha256(of: sourceFD, checksCancellation: false) == expected.sha256 else { throw FileStoreError.localChanged }
         }
         let (destinationParent, destinationName) = try parentDirectory(for: destination, create: true)
         defer { close(destinationParent) }
@@ -354,7 +357,7 @@ public actor FileStore {
             defer { close(fd) }
             try requireRegularFile(fd)
             guard try Self.identity(of: fd) == FileIdentity(device: snapshot.device, inode: snapshot.inode),
-                  try sha256(of: fd) == snapshot.sha256 else { throw FileStoreError.localChanged }
+                  try sha256(of: fd, checksCancellation: false) == snapshot.sha256 else { throw FileStoreError.localChanged }
             var current = stat()
             guard fstatat(parent, name, &current, AT_SYMLINK_NOFOLLOW) == 0,
                   Int64(current.st_dev) == snapshot.device, UInt64(current.st_ino) == snapshot.inode else { throw FileStoreError.localChanged }
@@ -369,7 +372,7 @@ public actor FileStore {
     /// Moves a regular file to the Trash, where the user can still recover it, provided it is
     /// still the file that was hashed (`expected`).
     public func trashRegularFile(_ path: RelativePath, expected: FileSnapshot) throws {
-        guard case .present(let current) = try snapshotRegularFile(path), current == expected else { throw FileStoreError.localChanged }
+        guard case .present(let current) = try snapshotRegularFile(path, checksCancellation: false), current == expected else { throw FileStoreError.localChanged }
         do { try trash(rootURL.appending(path: path.value, directoryHint: .notDirectory)) }
         catch { throw FileStoreError.ioFailure }
     }
@@ -532,9 +535,11 @@ public actor FileStore {
         let fd = try openStage(stage, in: staging, flags: O_RDONLY)
         defer { close(fd) }
         guard fsync(fd) == 0 else { throw fileStoreError() }
-        return StagedArtifact(name: stage.name, identity: stage.identity, stagePath: stage.relativePath, sha256: try sha256(of: fd), size: try fileSize(of: fd))
+        return StagedArtifact(name: stage.name, identity: stage.identity, stagePath: stage.relativePath, sha256: try sha256(of: fd, checksCancellation: true), size: try fileSize(of: fd))
     }
 
+    // Once journaled, installation, displaced-copy validation and rollback finish even if the
+    // caller cancels. Interruptible inspection happens before the journal is written.
     public func install(_ artifact: StagedArtifact, at path: RelativePath, expectedLocal: LocalState) throws -> InstallResult {
         let trace = PerformanceTrace.shared.begin("filesystem.install", category: .filesystem)
         defer { PerformanceTrace.shared.end("filesystem.install", category: .filesystem, state: trace) }
@@ -571,7 +576,7 @@ public actor FileStore {
                 guard current >= 0 else { return false }
                 defer { close(current) }
                 try self.requireRegularFile(current)
-                guard try self.sha256(of: current) == artifact.sha256 else { return false }
+                guard try self.sha256(of: current, checksCancellation: false) == artifact.sha256 else { return false }
                 guard renameatx_np(staging, artifact.name, destinationParent, destinationName, UInt32(RENAME_SWAP)) == 0 else { throw self.fileStoreError() }
                 guard fsync(staging) == 0, fsync(destinationParent) == 0 else { throw self.fileStoreError() }
                 return true
@@ -581,7 +586,7 @@ public actor FileStore {
                 guard displacedFD >= 0 else { throw fileStoreError() }
                 defer { close(displacedFD) }
                 try requireRegularFile(displacedFD)
-                let displacedHash = try sha256(of: displacedFD)
+                let displacedHash = try sha256(of: displacedFD, checksCancellation: false)
                 guard displacedHash == expectedHash else {
                     guard try rollbackIfRemoteIsStillInstalled() else { throw FileStoreError.localChanged }
                     return .localChanged
@@ -601,7 +606,7 @@ public actor FileStore {
         defer { close(staging) }
         let stage = StageHandle(name: recovery.name, identity: recovery.identity, relativePath: recovery.relativePath)
         let fd = try openStage(stage, in: staging, flags: O_RDONLY)
-        let hash = try sha256(of: fd)
+        let hash = try sha256(of: fd, checksCancellation: false)
         close(fd)
         guard hash == recovery.sha256 else { throw FileStoreError.localChanged }
         guard unlinkat(staging, recovery.name, 0) == 0 else { throw fileStoreError() }
@@ -622,7 +627,7 @@ public actor FileStore {
         return incoming
     }
 
-    public func conflictArtifact(at path: RelativePath) throws -> StagedArtifact? {
+    public func conflictArtifact(at path: RelativePath, checksCancellation: Bool = true) throws -> StagedArtifact? {
         let components = path.components
         guard components.count >= 4, components[0] == ".beepbar", components[1] == "conflicts" else { throw FileStoreError.invalidStage }
         let (parent, name): (Int32, String)
@@ -636,7 +641,7 @@ public actor FileStore {
         if fd < 0 { if errno == ENOENT { return nil }; throw fileStoreError() }
         defer { close(fd) }
         try requireRegularFile(fd)
-        return StagedArtifact(name: name, identity: try Self.identity(of: fd), stagePath: path, sha256: try sha256(of: fd), size: try fileSize(of: fd))
+        return StagedArtifact(name: name, identity: try Self.identity(of: fd), stagePath: path, sha256: try sha256(of: fd, checksCancellation: checksCancellation), size: try fileSize(of: fd))
     }
 
     public func copyConflictArtifactToStage(at path: RelativePath, expectedSHA256: String) throws -> StagedArtifact {
@@ -653,7 +658,13 @@ public actor FileStore {
             guard duplicate >= 0 else { throw FileStoreError.ioFailure }
             let handle = FileHandle(fileDescriptor: duplicate, closeOnDealloc: true)
             defer { try? handle.close() }
-            try Self.forEachChunk(of: handle) { try write($0, to: stage) }
+            var copiedBytes: Int64 = 0
+            try Self.forEachChunk(of: handle) { chunk in
+                beforeReadChunk?(true, copiedBytes)
+                try Task.checkCancellation()
+                try write(chunk, to: stage)
+                copiedBytes += Int64(chunk.count)
+            }
             let copied = try finalize(stage)
             guard copied.sha256 == expectedSHA256 && copied.size == artifact.size else { throw FileStoreError.invalidStage }
             return copied
@@ -664,7 +675,7 @@ public actor FileStore {
     }
 
     public func discardConflictArtifact(at path: RelativePath, expectedSHA256: String) throws {
-        guard let artifact = try conflictArtifact(at: path), artifact.sha256 == expectedSHA256 else { throw FileStoreError.localChanged }
+        guard let artifact = try conflictArtifact(at: path, checksCancellation: false), artifact.sha256 == expectedSHA256 else { throw FileStoreError.localChanged }
         let (parent, name) = try parentDirectory(for: path, create: false)
         defer { close(parent) }
         guard unlinkat(parent, name, 0) == 0 else { throw fileStoreError() }
@@ -733,7 +744,7 @@ public actor FileStore {
         if fd < 0 { if errno == ENOENT { return nil }; throw fileStoreError() }
         defer { close(fd) }
         try requireRegularFile(fd)
-        return StagedArtifact(name: components[2], identity: try Self.identity(of: fd), stagePath: path, sha256: try sha256(of: fd), size: try fileSize(of: fd))
+        return StagedArtifact(name: components[2], identity: try Self.identity(of: fd), stagePath: path, sha256: try sha256(of: fd, checksCancellation: false), size: try fileSize(of: fd))
     }
 
     private func parentDirectory(for path: RelativePath, create: Bool) throws -> (Int32, String) {
@@ -818,17 +829,17 @@ public actor FileStore {
         return FileIdentity(device: Int64(metadata.st_dev), inode: UInt64(metadata.st_ino))
     }
 
-    private func sha256(of fd: Int32) throws -> String {
-        try hashContents(of: fd).sha256
+    private func sha256(of fd: Int32, checksCancellation: Bool) throws -> String {
+        try hashContents(of: fd, checksCancellation: checksCancellation).sha256
     }
 
     /// Hashes the file like `sha256(of:)` and remembers the result for `currentSHA256(of:)`, but
     /// only when the file's state was the same before and after the read, so a hash of half-old,
     /// half-new bytes is never stored. Belt and braces: the entry is keyed by the stamp taken
     /// before the read, which a write during the read has already left behind.
-    private func rememberingSHA256(of fd: Int32) throws -> String {
+    private func rememberingSHA256(of fd: Int32, checksCancellation: Bool) throws -> String {
         let before = try Self.contentStamp(of: fd)
-        let hash = try sha256(of: fd)
+        let hash = try sha256(of: fd, checksCancellation: checksCancellation)
         if try Self.contentStamp(of: fd) == before, inspectedHashes.updateValue(hash, forKey: before) == nil {
             inspectedOrder.append(before)
             if inspectedOrder.count > Self.inspectedHashLimit { inspectedHashes[inspectedOrder.removeFirst()] = nil }
@@ -856,7 +867,7 @@ public actor FileStore {
     /// outcome never changes: a file edited and then restored to identical bytes still installs.
     private func currentSHA256(of fd: Int32) throws -> String {
         if let known = inspectedHashes[try Self.contentStamp(of: fd)] { return known }
-        return try sha256(of: fd)
+        return try sha256(of: fd, checksCancellation: false)
     }
 
     /// What `fstat` says about a file's identity and content state. On APFS, the sync folder's
@@ -875,7 +886,8 @@ public actor FileStore {
         )
     }
 
-    private func hashContents(of fd: Int32, copyingTo destinationFD: Int32? = nil, maximumSize: Int64? = nil, checksCancellation: Bool = false) throws -> (sha256: String, size: Int64) {
+    private func hashContents(of fd: Int32, copyingTo destinationFD: Int32? = nil, maximumSize: Int64? = nil, checksCancellation: Bool) throws -> (sha256: String, size: Int64) {
+        if checksCancellation { try Task.checkCancellation() }
         hashCount += 1
         let duplicate = dup(fd)
         guard duplicate >= 0 else { throw FileStoreError.ioFailure }
@@ -885,6 +897,7 @@ public actor FileStore {
         var total: Int64 = 0
         var hash = SHA256()
         try Self.forEachChunk(of: handle) { chunk in
+            beforeReadChunk?(checksCancellation, total)
             if checksCancellation { try Task.checkCancellation() }
             total += Int64(chunk.count)
             bytesHashed += Int64(chunk.count)

@@ -75,7 +75,7 @@ public actor SyncTransactionCoordinator {
             let conflictID = operation.id
             let incoming = try await fileStore.preserveAsConflict(artifact, conflictID: conflictID, at: destination)
             try interruption?(.filesystemChanged)
-            let local = try await fileStore.inspect(destination)
+            let local = try await fileStore.inspect(destination, checksCancellation: false)
             let conflict = ConflictRecord(id: conflictID, rootID: rootID, remoteID: remoteID, relativePath: destination, incomingPath: incoming, baseSHA256: expectedLocal.sha256, localSHA256: local.sha256, remoteSHA256: remote.sha256, remoteRevision: remote.revision, detectedAt: Date(), status: .open)
             try await database.finishAsConflict(id: operation.id, conflict: conflict)
             return .conflict(conflict)

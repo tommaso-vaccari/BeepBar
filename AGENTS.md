@@ -4,6 +4,17 @@ This file contains the general workflow and project rules shared by the team. Pu
 
 Read `AGENTS.override.md` first when it exists. It stays untracked and must never be copied into shared files, commits, PRs, or comments.
 
+## Starting or resuming work
+
+Every agent must establish context from the shared repository and GitHub before implementing a task:
+
+1. Read [team workflow](docs/team-workflow.md) for task ownership, handoff, verification, and delivery rules, and [product direction and performance plan](docs/performance-plan.md) for priorities, dependencies, evidence, and acceptance criteria.
+2. Read the relevant [behavior specification in Italian](docs/sync-behavior.it.md) and [English](docs/sync-behavior.en.md). These define the behavior to preserve; the performance plan defines improvements within those guarantees. Read [benchmark documentation](docs/benchmarks.md) before measuring performance.
+3. Inspect the current [GitHub issues](https://github.com/tommaso-vaccari/BeepBar/issues), the selected issue's full discussion, linked PRs, and their current status. Use the task requested by the user; when asked to choose, select an unassigned issue whose prerequisites are satisfied, following the plan's priorities. Do not duplicate work already assigned or in progress. Follow the team workflow to claim the issue within the user's authorized scope.
+4. Verify the checkout, branch, local changes, and current remote base. Recheck historical findings against current code; an old audit, chat, or override does not prove that a bug or dependency is still open. Before implementing, state the issue, base commit, scope, dependencies, and completion criteria.
+5. Do not assume access to other agents' chats or rely on them for essential context. If a relevant earlier chat is available and access is authorized, consult it only to fill a specific gap, verify its claims against current sources, and preserve any necessary non-private decisions or evidence in the issue, PR, or shared documentation. If required context remains unavailable, identify the gap and ask the user rather than guessing.
+6. Before pausing or handing off, record the branch/commit, PR, completed work, uncommitted changes, verification results and their SHA, unresolved findings, blockers, and next step in the shared issue or PR within the authorized scope. Keep personal details in the override. Another agent must be able to resume from shared sources without this chat.
+
 ## Build and verification
 
 - Battle-test every completed change as far as practical: cover the reported regression, nearby edge cases and failure paths, and user-visible UI behavior when affected. Prefer tests that exercise real behavior and would fail without the fix; avoid tests that merely repeat the implementation.

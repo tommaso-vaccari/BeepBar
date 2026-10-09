@@ -157,6 +157,24 @@ public actor SyncCoordinator {
         }
     }
 
+    /// Only unanimous, nonempty metadata may rename an override. Keep the saved name when
+    /// Moodle disagrees, rather than letting response order pick it; each changed module writes once.
+    package static func moduleOverrideRenames(files: [RemoteFileCandidate], overrides: [Int64: [Int64: ModulePathOverride]]) -> [Int64: [Int64: String]] {
+        var names: [Int64: [Int64: Set<String>]] = [:]
+        for file in files where overrides[file.courseID]?[file.moduleID] != nil {
+            names[file.courseID, default: [:]][file.moduleID, default: []].insert(file.moduleName)
+        }
+        var changes: [Int64: [Int64: String]] = [:]
+        for (course, modules) in names {
+            for (module, candidates) in modules {
+                guard candidates.count == 1, let name = candidates.first, !name.isEmpty,
+                      name != overrides[course]?[module]?.lastKnownName else { continue }
+                changes[course, default: [:]][module] = name
+            }
+        }
+        return changes
+    }
+
     private func prepareItems(targets: [SyncTarget], token: String, concurrency: Int) async throws -> PreparedRun {
         try await withThrowingTaskGroup(of: (Int, Result<RemoteCourseContents, WeBeepAPIError>).self) { group in
             var next = 0
@@ -248,8 +266,12 @@ public actor SyncCoordinator {
                     baselineIDsByPath?[preferred]?.removeAll { $0 == legacyID }
                 }
             }
-            for file in allFiles where !file.moduleName.isEmpty && overridesByCourse[file.courseID]?[file.moduleID] != nil {
-                try await database.updateModulePathOverrideName(rootID: rootID, courseID: file.courseID, moduleID: file.moduleID, name: file.moduleName)
+            let renamedOverrides = Self.moduleOverrideRenames(files: allFiles, overrides: overridesByCourse)
+            for courseID in renamedOverrides.keys.sorted() {
+                for moduleID in renamedOverrides[courseID]!.keys.sorted() {
+                    try Task.checkCancellation()
+                    try await database.updateModulePathOverrideName(rootID: rootID, courseID: courseID, moduleID: moduleID, name: renamedOverrides[courseID]![moduleID]!)
+                }
             }
             let openChanges = Dictionary(try await database.remoteChanges(rootID: rootID).map { ($0.remoteID, $0) }, uniquingKeysWith: { first, _ in first })
             let unsettled = Set(try await database.conflicts(rootID: rootID).map(\.remoteID)).union(try await database.pendingOperations(rootID: rootID).map(\.remoteID))

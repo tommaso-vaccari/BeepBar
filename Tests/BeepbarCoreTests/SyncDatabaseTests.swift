@@ -220,6 +220,12 @@ struct SyncDatabaseTests {
 
         #expect(baselines["course-only"]?.courseID == nil && baselines["course-only"]?.moduleID == nil)
         #expect(baselines["module-only"]?.courseID == nil && baselines["module-only"]?.moduleID == nil)
+        try await reopened.backfillModuleOwnership(rootID: rootID, files: [ownershipFile("course-only"), ownershipFile("module-only")])
+        #expect(await reopened.ownershipBackfillCounters == OwnershipBackfillCounters(transactions: 1, updates: 2))
+        for id in ["course-only", "module-only"] {
+            let migrated = try await reopened.baseline(rootID: rootID, remoteID: id)
+            #expect(migrated?.courseID == 1 && migrated?.moduleID == 10)
+        }
     }
 
     /// Current ownership and missing rows must not acquire a write lock or attempt UPDATEs.
@@ -235,6 +241,10 @@ struct SyncDatabaseTests {
         try await database.backfillModuleOwnership(rootID: rootID, files: [])
         #expect(await database.ownershipBackfillCounters == OwnershipBackfillCounters())
         #expect(await database.writeCounters().since(before) == SyncDatabaseWriteCounters())
+        try await database.upsertBaseline(rootID: rootID, baseline: Baseline(remoteID: "later", relativePath: try RelativePath("Course/later.txt"), sha256: "hash", remoteRevision: "1"))
+        try await database.backfillModuleOwnership(rootID: rootID, files: [ownershipFile("later")])
+        #expect(try await database.baseline(rootID: rootID, remoteID: "later")?.moduleID == 10)
+        #expect(await database.ownershipBackfillCounters == OwnershipBackfillCounters(transactions: 1, updates: 1))
     }
 
     /// Migrate only unambiguous legacy rows in this root, and discover later legacy arrivals.

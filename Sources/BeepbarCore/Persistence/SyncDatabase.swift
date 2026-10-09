@@ -244,14 +244,26 @@ public actor SyncDatabase {
     }
 
     public func backfillModuleOwnership(rootID: UUID, files: [RemoteFileCandidate]) throws {
+        // Query each run so newly imported legacy rows remain eligible without taking a write lock.
+        let legacyIDs: Set<String> = try withStatement("SELECT remote_id FROM items WHERE root_id = ? AND course_id IS NULL AND module_id IS NULL") { statement in
+            try bind(rootID.uuidString, to: statement, index: 1)
+            var ids: Set<String> = []
+            while try stepRow(statement) {
+                guard let remoteID = text(statement, 0) else { throw SyncDatabaseError.execution }
+                ids.insert(remoteID)
+            }
+            return ids
+        }
+        guard !legacyIDs.isEmpty else { return }
+        let owners = Dictionary(grouping: files.filter { legacyIDs.contains($0.id) }, by: \.id).compactMapValues { candidates -> (Int64, Int64)? in
+            let values = Set(candidates.map { "\($0.courseID):\($0.moduleID)" })
+            guard values.count == 1, let file = candidates.first else { return nil }
+            return (file.courseID, file.moduleID)
+        }
+        guard !owners.isEmpty else { return }
         ownershipBackfillCounters.transactions += 1
         try execute("BEGIN IMMEDIATE")
         do {
-            let owners = Dictionary(grouping: files, by: \.id).compactMapValues { candidates -> (Int64, Int64)? in
-                let values = Set(candidates.map { "\($0.courseID):\($0.moduleID)" })
-                guard values.count == 1, let file = candidates.first else { return nil }
-                return (file.courseID, file.moduleID)
-            }
             for (remoteID, owner) in owners {
                 ownershipBackfillCounters.updates += 1
                 try withStatement("UPDATE items SET course_id = ?, module_id = ? WHERE root_id = ? AND remote_id = ? AND course_id IS NULL AND module_id IS NULL") { statement in

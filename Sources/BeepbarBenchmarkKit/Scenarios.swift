@@ -141,7 +141,7 @@ package enum Scenarios {
             "nothing installed": samples.allSatisfy { $0.installed == 0 },
             "no failures or conflicts": samples.allSatisfy { $0.failures == 0 && $0.conflicts == 0 },
             "no downloads": samples.allSatisfy { $0.upstream.downloads == 0 },
-            "same work every run": samples.allSatisfy { $0.database == first?.database && $0.fileStore == first?.fileStore && $0.upstream == first?.upstream },
+            "same work every run": samples.allSatisfy { $0.database == first?.database && $0.ownershipBackfill == first?.ownershipBackfill && $0.fileStore == first?.fileStore && $0.upstream == first?.upstream },
         ]
         // The budget's own lines are notes, not checks: a run that hashes or writes is still a
         // valid measurement, and the number is what a performance PR quotes and improves.

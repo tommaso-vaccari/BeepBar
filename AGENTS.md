@@ -163,6 +163,7 @@ Being fast, reactive and nearly free in the background is a product feature. Per
   | Cancel | stopped within 1 s (p95), even mid-way through a large file |
 
 - Measurement:
+  - Use `scripts/benchmark.sh compare --main origin/main --base-dev origin/dev --candidate HEAD --out PerformanceReports/<unique-name>` for both required comparisons. Follow the [single-command agent procedure](docs/benchmarks.md#reproducible-ref-comparisons-single-agent-command) for prerequisites, compatibility adjustments, validation and retained evidence; incompatible native fixtures must fail unless an explicit measurement-only adjustment is recorded.
   - Release build (arm64), synthetic corpus only, never real WeBeep data or the user's account.
   - Use the existing `PerformanceTrace` signposts and the `Beepbar-Profile` scheme.
   - Idle is observed over 30-minute sessions.

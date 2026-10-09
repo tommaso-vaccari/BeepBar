@@ -59,6 +59,8 @@ jobs:
             .build/repositories
             build/SourcePackages
           key: packages-v1-${{ runner.os }}-${{ runner.arch }}-${{ steps.toolchain.outputs.fingerprint }}-${{ hashFiles('Package.swift', 'Package.resolved', 'Beepbar.xcodeproj/project.pbxproj', 'Beepbar.xcodeproj/project.xcworkspace/xcshareddata/swiftpm/Package.resolved') }}
+      - name: Benchmark comparison tests
+        run: python3 scripts/test_benchmark_compare.py
       - name: Swift tests
         run: swift test
       - name: Verify readable release notes

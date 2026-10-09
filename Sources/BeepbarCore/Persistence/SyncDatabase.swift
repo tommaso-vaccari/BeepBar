@@ -77,6 +77,8 @@ private func stepRow(_ statement: OpaquePointer) throws -> Bool {
 
 public actor SyncDatabase {
     private let handle: SQLiteHandle
+    /// Full baseline reads attempted by this connection, including reads that fail.
+    package private(set) var baselineReadAttempts = 0
     private var database: OpaquePointer? { handle.pointer }
 
     public init(url: URL) throws {
@@ -200,7 +202,8 @@ public actor SyncDatabase {
     }
 
     public func baselines(rootID: UUID) throws -> [String: Baseline] {
-        try withStatement("SELECT remote_id, relative_path, base_sha256, remote_revision, course_id, module_id FROM items WHERE root_id = ?") { statement in
+        baselineReadAttempts += 1
+        return try withStatement("SELECT remote_id, relative_path, base_sha256, remote_revision, course_id, module_id FROM items WHERE root_id = ?") { statement in
             try bind(rootID.uuidString, to: statement, index: 1)
             var values: [String: Baseline] = [:]
             while try stepRow(statement) {

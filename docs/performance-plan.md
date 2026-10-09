@@ -105,11 +105,10 @@ Misure sintetiche Release arm64, M5/32 GB, AC, una warm-up e sette run: D04, cor
 
 ## Lavoro aperto e issue
 
-[Tracker di consegna](https://github.com/tommaso-vaccari/BeepBar/issues/116). Le nuove issue sono assegnate a Tommaso Zanatta (`tommasoz24`); concordare eventuali riassegnazioni prima di lavorare.
+[Tracker di consegna](https://github.com/tommaso-vaccari/BeepBar/issues/116). Gli assegnatari correnti e le prese in carico sono nelle singole issue; concordare eventuali riassegnazioni prima di lavorare.
 
 | Task | Branch | Dipendenze | Issue |
 |---|---|---|---|
-| D06 | `perf/course-state-publication` | D05 | [#94](https://github.com/tommaso-vaccari/BeepBar/issues/94) |
 | D07 | `perf/isolated-ui-harness` | Nessuna | [#95](https://github.com/tommaso-vaccari/BeepBar/issues/95) |
 | D08 | `perf/progress-before-main` | D06, D07 | [#96](https://github.com/tommaso-vaccari/BeepBar/issues/96) |
 | D09 | `perf/recordings-session-io` | D01, D07 | [#97](https://github.com/tommaso-vaccari/BeepBar/issues/97) |
@@ -187,7 +186,7 @@ I percorsi sono relativi al repository. Le righe si riferiscono al commit dell�
 
 **Riepilogo D05 integrato tramite PR #93.** Restore valido senza riscritture, decoder detached con controllo generazione/identità, migrazione legacy una tantum e nuovi risultati persistiti. Misura finale, test e limiti nella consegna D05; non ripetere il fix.
 
-**Lavoro residuo D06:** ricontrollare `refreshCourseList` e `restoreScopes` su dev corrente; assegnare corsi e salvare selezione soltanto se cambiati, mantenendo rinomina, ordine, account e feedback. Le guardie di `courseFolders` e `enabledCourseIDs` esistono già. Non rimuovere `status` salvo necessità dimostrata. Accettazione: contatori defaults/subscriber, refresh identico senza scritture/pubblicazioni, cambiamenti reali ancora visibili; matrice logout/root/risultati tardivi.
+**D06 — Implementata nella PR collegata a [#94](https://github.com/tommaso-vaccari/BeepBar/issues/94).** `refreshCourseList` confronta i corsi dopo ordinamento prima di assegnare `@Published`; `restoreScopes` confronta la selezione canonica con il valore persistito prima di salvarlo. Ripara comunque valori mancanti, duplicati o obsoleti. Le guardie esistenti su cartelle e selezione, errori e feedback sono conservate. Dieci refresh identici via rete mock: pubblicazioni corsi 10→0, scritture selezione 10→0. Riordino remoto equivalente ignorato; rinomina/rimozione ancora pubblicate, selezione cambiata salvata una volta. Otto assertion falliscono sul codice originale; suite mirate refresh/finalizzazione/Risparmio dati verdi. Suite completa, build Release, review e CI sono gate registrati nella PR/issue. Il conteggio dimostra meno lavoro, non latenza o fluidità UI: misure visive restano D07.
 
 **Indagine separata dopo I7:** encoding di un nuovo risultato da 15k dettagli costa circa 19 ms nella calibrazione sintetica e resta nel percorso esistente. Misurare occupazione main a fine sync con fixture UI isolate. Se il costo viola il budget, progettare persistenza ordinata asincrona: snapshot immutabile, ordine dei risultati, invalidazione account/root, errori, flush al quit e nessuna perdita dell’ultimo risultato. Non basta detached fire-and-forget; definire questi gate prima del fix. D05 non dimostra il budget globale UI ≤16 ms.
 

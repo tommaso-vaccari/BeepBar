@@ -50,6 +50,10 @@ final class MoodleRecordingProtocol: URLProtocol, @unchecked Sendable {
         accounts.withLock { $0[token] = nil }
     }
 
+    static func setCourses(token: String, courses: [(id: Int64, name: String)]) {
+        accounts.withLock { $0[token]?.courses = courses }
+    }
+
     static func requests(token: String) -> [RecordedRequest] {
         accounts.withLock { $0[token]?.requests ?? [] }
     }

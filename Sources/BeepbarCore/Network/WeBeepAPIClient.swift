@@ -328,16 +328,12 @@ public final class WeBeepAPIClient: @unchecked Sendable {
 
     private func request(_ function: AllowedFunction, token: String, fields: [String: String], limit: Int) async throws -> Data {
         let request = Self.request(function: function, token: token, fields: fields, endpoint: policy.endpoint)
-        let (data, response): (Data, URLResponse)
-        do { (data, response) = try await session.data(for: request) }
+        do { return try await BoundedMetadataResponse(limit: limit).run(request, in: session) }
+        catch let error as WeBeepAPIError { throw error }
+        catch is CancellationError { throw CancellationError() }
         catch let error as URLError where error.code == .cancelled { throw CancellationError() }
         catch let error as URLError { throw WeBeepAPIError.network(NetworkFailure(error.code)) }
         catch { throw WeBeepAPIError.invalidResponse }
-        guard let http = response as? HTTPURLResponse else { throw WeBeepAPIError.invalidResponse }
-        guard (200...299).contains(http.statusCode) else { throw WeBeepAPIError.transport(http.statusCode) }
-        guard http.value(forHTTPHeaderField: "Content-Type")?.lowercased().contains("application/json") == true else { throw WeBeepAPIError.invalidResponse }
-        guard data.count <= limit else { throw WeBeepAPIError.responseTooLarge }
-        return data
     }
 
     static func validationRequest(token: String) -> URLRequest {
@@ -380,6 +376,80 @@ public final class WeBeepAPIClient: @unchecked Sendable {
         configuration.urlCache = nil
         configuration.timeoutIntervalForRequest = 15
         return URLSession(configuration: configuration, delegate: RejectRedirects(), delegateQueue: nil)
+    }
+}
+
+/// Accumulates metadata only up to the caller's cap, cancelling reception at the first overrun (#102).
+/// The task uses the original session, including injected URLProtocols and credentials. Redirect and
+/// authentication methods remain on its session delegate, as with the bounded file downloader.
+private final class BoundedMetadataResponse: NSObject, URLSessionDataDelegate, @unchecked Sendable {
+    private let limit: Int
+    private let lock = NSLock()
+    private var body = Data()
+    private var receivedResponse = false
+    private var rejection: Error?
+    private var continuation: CheckedContinuation<Data, Error>?
+
+    init(limit: Int) { self.limit = limit }
+
+    /// No async byte sequence or main-actor hop: URLSession supplies background chunk callbacks.
+    func run(_ request: URLRequest, in session: URLSession) async throws -> Data {
+        try Task.checkCancellation()
+        let task = session.dataTask(with: request)
+        task.delegate = self
+        return try await withTaskCancellationHandler {
+            try await withCheckedThrowingContinuation { continuation in
+                lock.withLock { self.continuation = continuation }
+                task.resume()
+            }
+        } onCancel: {
+            task.cancel()
+        }
+    }
+
+    func urlSession(_ session: URLSession, dataTask: URLSessionDataTask, didReceive response: URLResponse, completionHandler: @escaping @Sendable (URLSession.ResponseDisposition) -> Void) {
+        let failure: WeBeepAPIError?
+        if let http = response as? HTTPURLResponse {
+            if !(200...299).contains(http.statusCode) { failure = .transport(http.statusCode) }
+            else if http.value(forHTTPHeaderField: "Content-Type")?.lowercased().contains("application/json") != true { failure = .invalidResponse }
+            else if http.expectedContentLength > Int64(limit) { failure = .responseTooLarge }
+            else { failure = nil }
+        } else { failure = .invalidResponse }
+        lock.withLock {
+            receivedResponse = true
+            if let failure { rejection = failure }
+        }
+        completionHandler(failure == nil ? .allow : .cancel)
+    }
+
+    func urlSession(_ session: URLSession, dataTask: URLSessionDataTask, didReceive data: Data) {
+        let stop = lock.withLock { () -> Bool in
+            guard rejection == nil else { return true }
+            // Count the bytes URLSession delivers after decompression. Header lengths can be absent,
+            // false, or compressed; they never replace this check or permit an oversized allocation.
+            guard data.count <= limit - body.count else {
+                rejection = WeBeepAPIError.responseTooLarge
+                body = Data()
+                return true
+            }
+            body.append(data)
+            return false
+        }
+        if stop { dataTask.cancel() }
+    }
+
+    func urlSession(_ session: URLSession, task: URLSessionTask, didCompleteWithError error: Error?) {
+        let (pending, data, failure) = lock.withLock { () -> (CheckedContinuation<Data, Error>?, Data, Error?) in
+            let pending = continuation
+            continuation = nil
+            // Transport cancellation caused by our cap must remain responseTooLarge, not user cancellation.
+            let failure = rejection ?? error ?? (receivedResponse ? nil : WeBeepAPIError.invalidResponse)
+            let data = failure == nil ? body : Data()
+            body = Data()
+            return (pending, data, failure)
+        }
+        if let failure { pending?.resume(throwing: failure) }
+        else { pending?.resume(returning: data) }
     }
 }
 

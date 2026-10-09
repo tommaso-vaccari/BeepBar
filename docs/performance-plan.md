@@ -117,7 +117,6 @@ Misure sintetiche Release arm64, M5/32 GB, AC, una warm-up e sette run: D04, cor
 | D12 | `perf/recordings-derived-state` | D07, D09 | [#100](https://github.com/tommaso-vaccari/BeepBar/issues/100) |
 | D13 | `docs/performance-results` | D06, D07, D08, D09, D10, D11, D12 | [#101](https://github.com/tommaso-vaccari/BeepBar/issues/101) |
 | I1 | `fix/bounded-metadata-response` | Nessuna | [#102](https://github.com/tommaso-vaccari/BeepBar/issues/102) |
-| I5 | `fix/scheduler-state-transitions` | Nessuna | [#105](https://github.com/tommaso-vaccari/BeepBar/issues/105) |
 | I9b | `fix/recordings-seen-overflow` | Nessuna | [#106](https://github.com/tommaso-vaccari/BeepBar/issues/106) |
 | I9d | `perf/recordings-play-priority` | D07 | [#107](https://github.com/tommaso-vaccari/BeepBar/issues/107) |
 | R01 | `perf/sync-summary-persistence` | D07 | [#109](https://github.com/tommaso-vaccari/BeepBar/issues/109) |
@@ -182,11 +181,9 @@ I percorsi sono relativi al repository. Le righe si riferiscono al commit dell�
 
 ### I5 — Mantenere coerente lo scheduler senza ripartire a ogni cambio conteggio
 
-**Evidenza:** `WeBeepAuthenticationController.swift:2122`, `configureBackgroundScheduler`, include il numero esatto `enabledCourseCount` nella chiave di uguaglianza. Passare da uno a due corsi ricrea lo scheduler e ne fa ripartire l’intervallo. `recoveryBlocked` (414) aggiorna la presentazione ma non riconfigura sempre lo scheduler: errori di spostamento moduli (2007, 2024) possono lasciarlo attivo a risvegliarsi per saltare il lavoro. La callback automatica riconosce esplicitamente il caso intorno a riga 2207.
+**Implementata per [#105](https://github.com/tommaso-vaccari/BeepBar/issues/105).** La chiave dello scheduler distingue selezione vuota/non vuota; cambiare corsi senza svuotarla conserva la registrazione e la scadenza. Le transizioni di recovery invalidano o ripristinano la pianificazione una volta sola. Una generazione identifica il timer, un’altra invalida le risposte rete quando cambia selezione: una callback di un timer rimosso termina senza leggere la rete; cambiare selezione rimuove comunque la pausa Risparmio dati (§6).
 
-**Intervento:** separare idoneità alla pianificazione (esiste almeno un corso), cambi della selezione, cancellazione della pausa e invalidazione delle callback in corso. Riconfigurare nelle transizioni di blocco/sblocco del recupero. Non confondere ricreazione del timer con incremento della generazione o semantica Risparmio dati.
-
-**Accettazione:** scheduler/clock iniettati: 1→2 mantiene la scadenza; 1→0 disabilita; 0→1 abilita; recovery false→true ferma la pianificazione; true→false la ripristina una volta sola. Risposte path tardive non avviano callback obsolete. Cambiare selezione continua a rimuovere la pausa Risparmio dati come da §6. Misurare separatamente i risvegli: nessun risparmio numerico dedotto dal solo codice.
+**Prova riproducibile:** tre regressioni controller con scheduler e clock sintetici, account/root/DB e rete isolati; sul codice originale compilato falliscono 14 assertion. A clock 120 s, aggiungere un secondo corso conserva la scadenza a 28.800 s invece di spostarla a 28.920 s; registrazioni 2→1. Coperti 1→0, 0→1, recovery ripetuto, callback obsolete e risposta path sospesa durante un cambio selezione. Tutti i 27 test Risparmio dati passano dopo il fix. Review indipendente, suite completa, build Release e CI pre/post merge sono gate riportati nella PR/issue. Questi conteggi dimostrano eliminazione di reset inutili e correttezza, non latenza UI, consumo energetico o frequenza reale dei risvegli macOS; nessuna misura live con account reale eseguita.
 
 ### I6 — Separare ripristino e salvataggio; non pubblicare valori identici
 

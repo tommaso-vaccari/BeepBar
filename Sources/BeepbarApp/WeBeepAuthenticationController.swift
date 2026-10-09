@@ -388,7 +388,14 @@ struct MenuBarSnapshot: Sendable {
     @Published private(set) var needsOnboarding: Bool
     /// Mirrors `AppLanguage.current`; published so the window rebuilds in the new language.
     @Published private(set) var language: AppLanguage
-    @Published private(set) var enabledCourseIDs: Set<Int64>
+    @Published private(set) var enabledCourseIDs: Set<Int64> {
+        didSet {
+            guard enabledCourseIDs != oldValue else { return }
+            schedulerGeneration += 1
+            dataSaverPause = nil
+            configureBackgroundScheduler()
+        }
+    }
     @Published private(set) var automaticSyncEnabled: Bool
     /// The "Notifiche" switch (#64). On unless the user turned it off; see `NotificationPolicy`.
     @Published private(set) var notificationsEnabled: Bool
@@ -406,13 +413,17 @@ struct MenuBarSnapshot: Sendable {
     /// So it is cleared when a sync starts, when the switch is turned off, when the folder changes,
     /// when an automatic run is skipped because nothing can be synced, and whenever
     /// `configureBackgroundScheduler()` rebuilds the scheduler (automatic sync turned off,
-    /// Frequenza or the selected courses changed, signed out, sign-in expired or renewed…), since
-    /// each of these drops the retry.
+    /// Frequenza changed, signed out, sign-in expired or renewed…), since each drops the retry.
+    /// Selection changes also clear it and invalidate pending network checks without moving
+    /// an eligible scheduler's deadline.
     @Published private(set) var dataSaverPause: DataSaverPause? {
         didSet { refreshMenuBarSnapshot() }
     }
     @Published private(set) var recoveryBlocked = false {
-        didSet { refreshMenuBarSnapshot() }
+        didSet {
+            refreshMenuBarSnapshot()
+            if recoveryBlocked != oldValue { configureBackgroundScheduler() }
+        }
     }
     @Published private(set) var courseFolders: [Int64: String] = [:]
     @Published private(set) var courseRenameErrors: [Int64: String] = [:]
@@ -457,7 +468,17 @@ struct MenuBarSnapshot: Sendable {
     private var downloader: RemoteDownloader
     private let credentialVault: CredentialVault
     private let notificationCoordinator: SyncNotificationCoordinator
-    private var backgroundScheduler: NSBackgroundActivityScheduler?
+    private var backgroundScheduler: BackgroundActivityRegistration?
+    /// Owns the real registration; tests replace it with a clock-backed registration, never macOS activity.
+    private var scheduleBackgroundActivity: (TimeInterval, @escaping @Sendable (@escaping NSBackgroundActivityScheduler.CompletionHandler) -> Void) -> BackgroundActivityRegistration = { interval, callback in
+        let scheduler = NSBackgroundActivityScheduler(identifier: "io.github.tvaccari.beepbar.auto-sync")
+        scheduler.repeats = true
+        scheduler.interval = interval
+        scheduler.tolerance = interval * 0.5
+        scheduler.qualityOfService = .utility
+        scheduler.schedule(callback)
+        return BackgroundActivityRegistration(invalidate: { scheduler.invalidate() })
+    }
     private var bootstrapTask: Task<Void, Never>?
     private var syncTask: Task<Void, Never>?
     private var scopeWriteTask: Task<Void, Never>?
@@ -485,6 +506,7 @@ struct MenuBarSnapshot: Sendable {
     /// that started it still exists: comparing configurations can't, since turning automatic sync
     /// off and on again rebuilds twice and ends on an equal configuration.
     private var schedulerGeneration = 0
+    private var schedulerRegistrationGeneration = 0
 #if DEBUG
     private var recordingsStoreForTesting: RecordingsSessionStore?
     private var recordingsBrowserForTesting: (@MainActor () -> RecmanBrowsing)?
@@ -693,6 +715,13 @@ struct MenuBarSnapshot: Sendable {
     func setCoursesForTesting(_ courses: [RemoteCourseSummary]) {
         self.courses = courses
     }
+
+    func setBackgroundSchedulerForTesting(_ register: @escaping (TimeInterval, @escaping @Sendable (@escaping NSBackgroundActivityScheduler.CompletionHandler) -> Void) -> BackgroundActivityRegistration) {
+        scheduleBackgroundActivity = register
+        registersBackgroundActivity = true
+    }
+
+    func setRecoveryBlockedForTesting(_ blocked: Bool) { recoveryBlocked = blocked }
 
     func setLoadingCoursesForTesting(_ loading: Bool) {
         isLoadingCourses = loading
@@ -2156,7 +2185,7 @@ struct MenuBarSnapshot: Sendable {
             interval: automaticSyncInterval,
             connected: accountState == .connected,
             rootConfigured: rootURL != nil,
-            enabledCourseCount: enabledCourseIDs.count,
+            hasEnabledCourses: !enabledCourseIDs.isEmpty,
             recoveryBlocked: recoveryBlocked
         )
         guard configuration != scheduledConfiguration else { return }
@@ -2164,6 +2193,7 @@ struct MenuBarSnapshot: Sendable {
         backgroundScheduler = nil
         scheduledConfiguration = configuration
         schedulerGeneration += 1
+        schedulerRegistrationGeneration += 1
         // The pause promised a retry soon; that retry belonged to the scheduler just dropped, and
         // the new one first runs a whole interval later. Left on screen, "In attesa del Wi-Fi"
         // could stay for hours, through a renewed sign-in, after the Mac is back on Wi-Fi.
@@ -2172,28 +2202,29 @@ struct MenuBarSnapshot: Sendable {
             automaticSyncEnabled: configuration.enabled,
             hasCredential: configuration.connected,
             hasRoot: configuration.rootConfigured,
-            enabledCourseCount: configuration.enabledCourseCount,
+            enabledCourseCount: configuration.hasEnabledCourses ? 1 : 0,
             recoveryBlocked: recoveryBlocked
         )
         guard BackgroundSchedulePolicy.shouldSchedule(policy) else {
-            BeepbarLog.scheduler.notice("Scheduler disabled enabled=\(configuration.enabled, privacy: .public) connected=\(configuration.connected, privacy: .public) root=\(configuration.rootConfigured, privacy: .public) courses=\(configuration.enabledCourseCount, privacy: .public) recoveryBlocked=\(configuration.recoveryBlocked, privacy: .public)")
+            BeepbarLog.scheduler.notice("Scheduler disabled enabled=\(configuration.enabled, privacy: .public) connected=\(configuration.connected, privacy: .public) root=\(configuration.rootConfigured, privacy: .public) courses=\(self.enabledCourseIDs.count, privacy: .public) recoveryBlocked=\(configuration.recoveryBlocked, privacy: .public)")
             return
         }
 #if DEBUG
         guard registersBackgroundActivity else { return }
 #endif
-        let scheduler = NSBackgroundActivityScheduler(identifier: "io.github.tvaccari.beepbar.auto-sync")
-        scheduler.repeats = true
-        scheduler.interval = TimeInterval(automaticSyncInterval)
-        scheduler.tolerance = TimeInterval(automaticSyncInterval) * 0.5
-        scheduler.qualityOfService = .utility
-        BeepbarLog.scheduler.notice("Scheduler configured intervalSeconds=\(self.automaticSyncInterval, privacy: .public) toleranceSeconds=\(Int(scheduler.tolerance), privacy: .public)")
-        scheduler.schedule { [weak self] completion in
+        BeepbarLog.scheduler.notice("Scheduler configured intervalSeconds=\(self.automaticSyncInterval, privacy: .public)")
+        let registrationGeneration = schedulerRegistrationGeneration
+        let scheduler = scheduleBackgroundActivity(TimeInterval(automaticSyncInterval)) { [weak self] completion in
             Task { @MainActor [weak self] in
+                guard let self, self.schedulerRegistrationGeneration == registrationGeneration,
+                      self.backgroundScheduler != nil else {
+                    completion(.finished)
+                    return
+                }
                 BeepbarLog.scheduler.notice("Scheduler callback started")
                 let trace = PerformanceTrace.shared.begin("scheduler.callback", category: .scheduler)
                 defer { PerformanceTrace.shared.end("scheduler.callback", category: .scheduler, state: trace) }
-                let outcome = await self?.runAutomaticSync() ?? .finished
+                let outcome = await self.runAutomaticSync()
                 BeepbarLog.scheduler.notice("Scheduler callback completed outcome=\(outcome.diagnosticName, privacy: .public)")
                 completion(outcome.schedulerResult)
             }
@@ -2235,10 +2266,6 @@ struct MenuBarSnapshot: Sendable {
         case .skipUnconfigured:
             BeepbarLog.sync.notice("Automatic synchronization skipped reason=configuration-unavailable")
             // Finishing leaves no retry behind, so a pause from an earlier attempt must go too.
-            // A blocked local recovery gets here without a rebuild (`recoveryBlocked` doesn't
-            // reconfigure the scheduler), and resolving it restores an equal schedule: left in
-            // place, "In attesa del Wi-Fi" would come back over the last result, even on Wi-Fi,
-            // until the next run a whole interval later.
             dataSaverPause = nil
             return .finished
         case .pause(let pause):
@@ -2502,12 +2529,17 @@ struct MenuBarSnapshot: Sendable {
 
 }
 
+/// A registration can be invalidated without coupling schedule identity to an enabled-course count.
+struct BackgroundActivityRegistration {
+    let invalidate: () -> Void
+}
+
 private struct BackgroundScheduleConfiguration: Equatable {
     let enabled: Bool
     let interval: Int
     let connected: Bool
     let rootConfigured: Bool
-    let enabledCourseCount: Int
+    let hasEnabledCourses: Bool
     let recoveryBlocked: Bool
 }
 

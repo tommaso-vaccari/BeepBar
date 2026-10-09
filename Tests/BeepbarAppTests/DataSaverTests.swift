@@ -10,6 +10,68 @@ import Testing
 @MainActor struct DataSaverTests {
     private nonisolated static let lastResult = SyncCompletionSummary(completedAt: Date(timeIntervalSince1970: 1_800_000_000), added: 3, updated: 0, unchanged: 10, preservedLocal: 0, conflicts: 0, failures: 0)
 
+    /// A nonempty selection keeps the original deadline; empty selection and recovery stop activity.
+    @Test func schedulerKeepsDeadlineAndTracksRecovery() async throws {
+        let schedule = TestSchedule()
+        let harness = try await Harness(networks: [.hotspot], schedule: schedule)
+        defer { harness.remove() }
+        #expect(schedule.registrations == 1)
+        let deadline = schedule.deadline
+        schedule.now = 120
+        let second = RemoteCourseSummary(id: 2, shortName: "Second", displayName: "Second", isVisible: nil, startDate: nil, endDate: nil)
+        harness.controller.setCourse(second, enabled: true)
+        #expect(schedule.registrations == 1)
+        #expect(schedule.deadline == deadline)
+        harness.controller.setCourse(harness.controller.courses[0], enabled: false)
+        #expect(schedule.registrations == 1)
+        harness.controller.setCourse(second, enabled: false)
+        #expect(!schedule.active)
+        harness.controller.setCourse(second, enabled: true)
+        #expect(schedule.registrations == 2 && schedule.active)
+        harness.controller.setRecoveryBlockedForTesting(true)
+        #expect(!schedule.active)
+        harness.controller.setRecoveryBlockedForTesting(true)
+        #expect(schedule.registrations == 2)
+        harness.controller.setRecoveryBlockedForTesting(false)
+        #expect(schedule.registrations == 3 && schedule.active)
+        harness.controller.setRecoveryBlockedForTesting(false)
+        #expect(schedule.registrations == 3)
+    }
+
+    /// A queued callback from an invalidated registration must finish without reading the network.
+    @Test func invalidatedSchedulerCallbackDoesNotRun() async throws {
+        let schedule = TestSchedule()
+        let harness = try await Harness(networks: [.hotspot], schedule: schedule)
+        defer { harness.remove() }
+        harness.controller.setDataSaver(enabled: true)
+        harness.controller.setAutomaticSync(enabled: false)
+        harness.controller.setAutomaticSync(enabled: true)
+        #expect(await schedule.fire(0) == .finished)
+        #expect(harness.networkReads == 0)
+        #expect(harness.controller.dataSaverPause == nil)
+        #expect(await schedule.fire(1) == .deferred)
+        #expect(harness.networkReads == 1)
+        #expect(harness.controller.dataSaverPause == .hotspot)
+    }
+
+    /// Selection changes clear a pause and reject pending path answers without replacing the timer.
+    @Test func selectionInvalidatesPathButNotDeadline() async throws {
+        let schedule = TestSchedule()
+        let harness = try await Harness(networks: [.hotspot, .hotspot], schedule: schedule)
+        defer { harness.remove() }
+        harness.controller.setDataSaver(enabled: true)
+        #expect(await schedule.fire(0) == .deferred)
+        let deadline = schedule.deadline
+        let first = harness.controller.courses[0]
+        harness.controller.setCourse(RemoteCourseSummary(id: 2, shortName: "Second", displayName: "Second", isVisible: nil, startDate: nil, endDate: nil), enabled: true)
+        #expect(harness.controller.dataSaverPause == nil)
+        #expect(schedule.registrations == 1 && schedule.deadline == deadline)
+        harness.sequence.onRead(2) { harness.controller.setCourse(first, enabled: false) }
+        #expect(await schedule.fire(0) == .finished)
+        #expect(harness.controller.dataSaverPause == nil)
+        #expect(schedule.registrations == 1 && schedule.deadline == deadline)
+    }
+
     // MARK: Before a run
 
     /// Proves that with Data Saver on, an automatic run on a hotspot or a Low Data Mode network
@@ -559,7 +621,7 @@ private final class NetworkSequence: Sendable {
     let rootID: UUID
     let sequence: NetworkSequence
 
-    init(networks: [NetworkPathConditions?], lowPowerMode: Bool = false) async throws {
+    init(networks: [NetworkPathConditions?], lowPowerMode: Bool = false, schedule: TestSchedule? = nil) async throws {
         root = FileManager.default.temporaryDirectory.appending(path: UUID().uuidString, directoryHint: .isDirectory)
         try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
         let database = try SyncDatabase(url: root.appending(path: "state.sqlite"))
@@ -582,6 +644,7 @@ private final class NetworkSequence: Sendable {
         #expect(controller.courseLoadError == nil)
         #expect(controller.enabledCourseIDs == [1])
         // A test controller registers no real background activity, so this is safe here.
+        if let schedule { controller.setBackgroundSchedulerForTesting { interval, callback in schedule.register(interval, callback) } }
         controller.setAutomaticSync(enabled: true)
         #expect(controller.automaticSyncEnabled)
     }
@@ -595,4 +658,23 @@ private final class NetworkSequence: Sendable {
     }
 
     func remove() { try? FileManager.default.removeItem(at: root) }
+}
+
+/// Deterministic registration clock; keeps old callbacks to model macOS callbacks already queued.
+@MainActor private final class TestSchedule {
+    var now: TimeInterval = 0
+    private(set) var deadline: TimeInterval?
+    private(set) var active = false
+    private var callbacks: [@Sendable (@escaping NSBackgroundActivityScheduler.CompletionHandler) -> Void] = []
+    var registrations: Int { callbacks.count }
+    func register(_ interval: TimeInterval, _ callback: @escaping @Sendable (@escaping NSBackgroundActivityScheduler.CompletionHandler) -> Void) -> BackgroundActivityRegistration {
+        callbacks.append(callback)
+        deadline = now + interval
+        active = true
+        return BackgroundActivityRegistration { self.active = false; self.deadline = nil }
+    }
+    func fire(_ index: Int) async -> NSBackgroundActivityScheduler.Result {
+        let callback = callbacks[index]
+        return await withCheckedContinuation { continuation in callback { continuation.resume(returning: $0) } }
+    }
 }

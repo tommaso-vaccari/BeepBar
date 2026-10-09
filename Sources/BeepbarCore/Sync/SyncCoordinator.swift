@@ -426,7 +426,7 @@ public actor SyncCoordinator {
                 let source: FileSnapshotState
                 // Unreadable right now (permissions, an evicted cloud file, an I/O error): nothing
                 // is recorded, so the move is tried again next run instead of being forgotten.
-                do { source = try await fileStore.snapshotRegularFile(old) } catch { continue }
+                do { source = try await fileStore.snapshotRegularFile(old) } catch is CancellationError { throw CancellationError() } catch { continue }
                 switch source {
                 case .missing:
                     // Nothing to move: the user deleted it, and it is downloaded again in its new
@@ -452,6 +452,7 @@ public actor SyncCoordinator {
                     } else if try await fileStore.downloadDestinationIsOccupied(plan.target) {
                         destination = try await numberedFreePath(for: plan.target, owners: state.owners)
                     }
+                    try Task.checkCancellation()
                     let step = PendingRemoteMove(batchID: UUID(), remoteID: id, from: old, to: destination, sha256: plan.baseline.sha256, placement: placement)
                     guard (try? await database.commitRemoteMoves(rootID: rootID, [step])) != nil else { continue }
                     state.record(step, baseline: plan.baseline)

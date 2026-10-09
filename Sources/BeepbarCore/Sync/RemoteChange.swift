@@ -100,8 +100,8 @@ enum RemoteMoveJournal {
         for batch in Dictionary(grouping: pending, by: \.batchID).values {
             var arrived = true
             for move in batch {
-                guard case .present(let there)? = try? await fileStore.snapshotRegularFile(move.to), there.sha256 == move.sha256 else { arrived = false; break }
-                if batch.count == 1, case .present(let left)? = try? await fileStore.snapshotRegularFile(move.from), left.sha256 == move.sha256 { arrived = false; break }
+                guard case .present(let there)? = try? await fileStore.snapshotRegularFile(move.to, checksCancellation: false), there.sha256 == move.sha256 else { arrived = false; break }
+                if batch.count == 1, case .present(let left)? = try? await fileStore.snapshotRegularFile(move.from, checksCancellation: false), left.sha256 == move.sha256 { arrived = false; break }
             }
             if arrived, (try? await database.commitRemoteMoves(rootID: rootID, batch)) != nil {
                 if let move = batch.first, batch.count == 1 { try? await fileStore.removeEmptyParentDirectories(of: move.from) }

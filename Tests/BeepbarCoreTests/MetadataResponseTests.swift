@@ -7,7 +7,7 @@ import Testing
 @Suite(.serialized) struct MetadataResponseTests {
     @Test(arguments: [nil, "1", "1048576", "invalid", "99999999999999999999999999999"] as [String?])
     func stopsOversizedResponseWhileReceiving(_ length: String?) async throws {
-        let fixture = MetadataFixture(total: 16 * 1_048_576, length: length)
+        let fixture = MetadataFixture(total: 16 * 1_048_576, length: length, cancellationBoundary: 1_048_576 + MetadataFixture.chunkSize)
         let session = fixture.session()
         defer { session.invalidateAndCancel() }
         await #expect(throws: WeBeepAPIError.responseTooLarge) {
@@ -37,7 +37,7 @@ import Testing
     }
 
     @Test func rejectsExcessiveLengthBeforeReceivingBody() async {
-        let fixture = MetadataFixture(total: 16 * 1_048_576, length: "16777216")
+        let fixture = MetadataFixture(total: 16 * 1_048_576, length: "16777216", cancellationBoundary: MetadataFixture.chunkSize)
         let session = fixture.session()
         defer { session.invalidateAndCancel() }
         await #expect(throws: WeBeepAPIError.responseTooLarge) {
@@ -50,7 +50,7 @@ import Testing
     @Test(arguments: [(503, "application/json", WeBeepAPIError.transport(503)),
                       (200, "text/html", .invalidResponse)])
     func preservesResponseErrors(_ status: Int, _ type: String, _ error: WeBeepAPIError) async {
-        let fixture = MetadataFixture(total: 16 * 1_048_576, length: "16777216", status: status, type: type)
+        let fixture = MetadataFixture(total: 16 * 1_048_576, length: "16777216", status: status, type: type, cancellationBoundary: MetadataFixture.chunkSize)
         let session = fixture.session()
         defer { session.invalidateAndCancel() }
         await #expect(throws: error) { try await WeBeepAPIClient(session: session).validateToken("token") }
@@ -92,7 +92,7 @@ import Testing
     /// Opt-in probe runs in a fresh Release test process for each advertised body size/ref.
     @Test func memoryProbe() async throws {
         guard let raw = ProcessInfo.processInfo.environment["BEEPBAR_METADATA_PROBE_MIB"], let mib = Int(raw), mib > 1 else { return }
-        let fixture = MetadataFixture(total: mib * 1_048_576)
+        let fixture = MetadataFixture(total: mib * 1_048_576, cancellationBoundary: 1_048_576 + MetadataFixture.chunkSize)
         let session = fixture.session()
         defer { session.invalidateAndCancel() }
         await #expect(throws: WeBeepAPIError.responseTooLarge) { try await WeBeepAPIClient(session: session).validateToken("token") }
@@ -113,15 +113,18 @@ private final class MetadataFixture: @unchecked Sendable {
     let status: Int
     let type: String
     let failure: URLError.Code?
+    let cancellationBoundary: Int?
     let lock = NSLock()
     private var count = 0
     private var cancelled = false
     var sent: Int { lock.withLock { count } }
     var stopped: Bool { lock.withLock { cancelled } }
 
-    init(total: Int, prefix: String = MetadataFixture.siteInfo, length: String? = nil, status: Int = 200, type: String = "application/json", failure: URLError.Code? = nil) {
+    init(total: Int, prefix: String = MetadataFixture.siteInfo, length: String? = nil, status: Int = 200, type: String = "application/json", failure: URLError.Code? = nil, cancellationBoundary: Int? = nil) {
         self.total = total; self.prefix = prefix; self.length = length
         self.status = status; self.type = type; self.failure = failure
+        self.cancellationBoundary = cancellationBoundary
+        stoppedEvent.enter()
     }
     func session() -> URLSession {
         MetadataProtocol.fixture = self
@@ -129,13 +132,13 @@ private final class MetadataFixture: @unchecked Sendable {
         config.protocolClasses = [MetadataProtocol.self]
         return URLSession(configuration: config)
     }
-    private let stoppedSignal = DispatchSemaphore(value: 0)
+    private let stoppedEvent = DispatchGroup()
     /// Completion can precede URLProtocol.stopLoading. The signal is the handoff; timeout is only a watchdog.
     func waitForStop() async {
         guard !stopped else { return }
         await withCheckedContinuation { continuation in
             DispatchQueue.global().async {
-                _ = self.stoppedSignal.wait(timeout: .now() + 1)
+                _ = self.stoppedEvent.wait(timeout: .now() + 1)
                 continuation.resume()
             }
         }
@@ -146,7 +149,12 @@ private final class MetadataFixture: @unchecked Sendable {
             cancelled = true
             return true
         }
-        if firstStop { stoppedSignal.signal() }
+        if firstStop { stoppedEvent.leave() }
+    }
+    /// Hold the fixture's transport window after the decisive chunk. A broken receiver is allowed
+    /// to continue after the watchdog, so the base still receives the entire body and fails red.
+    func waitAtCancellationBoundary() {
+        if sent == cancellationBoundary { _ = stoppedEvent.wait(timeout: .now() + 2) }
     }
     func next() -> Data? {
         lock.withLock {
@@ -176,6 +184,7 @@ private final class MetadataProtocol: URLProtocol, @unchecked Sendable {
             client?.urlProtocol(self, didReceive: response, cacheStoragePolicy: .notAllowed)
             while let chunk = fixture.next() {
                 client?.urlProtocol(self, didLoad: chunk)
+                fixture.waitAtCancellationBoundary()
                 Thread.sleep(forTimeInterval: 0.001)
             }
             if !fixture.stopped { client?.urlProtocolDidFinishLoading(self) }

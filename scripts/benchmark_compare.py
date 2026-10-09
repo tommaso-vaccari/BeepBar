@@ -47,8 +47,17 @@ def run(command, cwd, log, records, env=None):
             except subprocess.TimeoutExpired:
                 os.killpg(process.pid, signal.SIGKILL)
                 process.wait()
+            try:
+                os.killpg(process.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
             raise
     if record['exit'] != 0:
+        # A failed parent may leave descendants holding fixture/build files.
+        try:
+            os.killpg(process.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
         raise InvalidComparison(f'subprocess failed ({record["exit"]}); see {log}')
     return log.read_text()
 
@@ -130,15 +139,19 @@ def sample_metric(sample, metric):
         'fs.pathLookups': ('fileStore.pathLookups', 1), 'net.metadata': ('upstream.metadataBytes', 1024),
         'net.downloaded': ('upstream.downloadBytes', 1048576), 'cancel.latency': ('cancelLatencyMilliseconds', 1)}
     if metric == 'net.requests':
-        return sum(sample['upstream'][key] for key in
-                   ('contentsRequests', 'courseListRequests', 'downloads', 'otherRequests', 'siteInfoRequests'))
+        values = [sample['upstream'][key] for key in
+                  ('contentsRequests', 'courseListRequests', 'downloads', 'otherRequests', 'siteInfoRequests')]
+        if any(type(v) is not int or v < 0 for v in values):
+            raise InvalidComparison('invalid request counters')
+        return sum(values)
     if metric not in fields:
         raise InvalidComparison('unsupported raw metric ' + metric)
     path, scale = fields[metric]
     value = sample
     for key in path.split('.'):
         value = value[key]
-    if type(value) not in (int, float) or not math.isfinite(value):
+    if (type(value) not in (int, float) or not math.isfinite(value)
+            or (value < 0 and metric != 'memory.peakGrowth')):
         raise InvalidComparison('invalid raw sample')
     return value / scale
 
@@ -232,9 +245,14 @@ def temporary_root():
 def execute(args):
     repo = Path(__file__).resolve().parent.parent
     # Freeze all identities before creating results or starting builds; no automatic ref refresh.
-    shas = {label: subprocess.check_output(['git', 'rev-parse', '--verify', ref + '^{commit}'], cwd=repo, text=True).strip()
-            for label, ref in [('main', args.main), ('base-dev', args.base_dev), ('candidate', args.candidate),
-                               ('harness', args.harness_ref or args.candidate)]}
+    resolved = {}
+    shas = {}
+    for label, ref in [('main', args.main), ('base-dev', args.base_dev), ('candidate', args.candidate),
+                       ('harness', args.harness_ref or args.candidate)]:
+        if ref not in resolved:
+            resolved[ref] = subprocess.check_output(['git', 'rev-parse', '--verify', ref + '^{commit}'],
+                                                    cwd=repo, text=True).strip()
+        shas[label] = resolved[ref]
     out = Path(args.out).resolve()
     out.mkdir(parents=True, exist_ok=False)
     result = {'schemaVersion': 1, 'shas': shas, 'runs': args.runs, 'warmup': args.warmup,
@@ -257,7 +275,12 @@ def execute(args):
                 run(['git', 'archive', '-o', str(archive), shas[label]], repo,
                     out / (label + '-export.log'), result['commands'])
                 with tarfile.open(archive) as tar:
-                    tar.extractall(root, filter='data')
+                    # Git archives are expected to contain only regular repository files.
+                    for member in tar.getmembers():
+                        if (not (member.isfile() or member.isdir()) or Path(member.name).is_absolute()
+                                or '..' in Path(member.name).parts):
+                            raise InvalidComparison('unsafe archive member ' + member.name)
+                    tar.extractall(root)
                 return root
             harness = export('harness')
             if args.saved_folder_overrides:

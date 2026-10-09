@@ -47,6 +47,7 @@ class ComparisonTests(unittest.TestCase):
             lambda r: r['scenarios'][0]['parameters'].update(files='100'),
             lambda r: r['scenarios'][0]['summary']['wall'].update(median=999),
             lambda r: r['scenarios'][0]['samples'][0].update(wallMilliseconds=float('nan')),
+            lambda r: r['scenarios'][0]['samples'][0].update(wallMilliseconds=-1),
             lambda r: r['scenarios'][0].update(summary={}),
             lambda r: r['environment'].update(commit='b' * 40),
             lambda r: r['environment'].update(dirty=True),
@@ -101,6 +102,27 @@ class ComparisonTests(unittest.TestCase):
             self.assertEqual(sentinel.read_text(), 'keep')
             self.assertIn('diagnostic', log.read_text())
             self.assertEqual(records[0]['exit'], 7)
+
+    def test_failed_parent_kills_surviving_descendant(self):
+        with tempfile.TemporaryDirectory() as folder:
+            pid_file = Path(folder) / 'child.pid'
+            script = ('import subprocess,sys; from pathlib import Path; '
+                      'p=subprocess.Popen([sys.executable,"-c","import time; time.sleep(30)"]); '
+                      'Path(sys.argv[1]).write_text(str(p.pid)); raise SystemExit(7)')
+            with self.assertRaises(b.InvalidComparison):
+                b.run([sys.executable, '-c', script, str(pid_file)], Path(folder), Path(folder) / 'log', [])
+            # The descendant may be a zombie until reparented; it must no longer be running.
+            status = subprocess.run(['ps', '-o', 'stat=', '-p', pid_file.read_text()], text=True, stdout=subprocess.PIPE).stdout
+            self.assertTrue(not status.strip() or status.strip().startswith('Z'))
+
+    def test_impossible_metric_domains(self):
+        for metric, sample in [('cpu', {'resources': {'cpuNanoseconds': -1}}),
+                               ('cancel.latency', {'cancelLatencyMilliseconds': -1}),
+                               ('net.requests', {'upstream': dict.fromkeys(('contentsRequests', 'courseListRequests',
+                                                      'downloads', 'otherRequests', 'siteInfoRequests'), True)})]:
+            with self.subTest(metric=metric), self.assertRaises(b.InvalidComparison):
+                b.sample_metric(sample, metric)
+        self.assertEqual(b.sample_metric({'peakFootprintGrowth': -1048576}, 'memory.peakGrowth'), -1)
 
     def test_interrupted_child_is_reaped_before_cleanup(self):
         with tempfile.TemporaryDirectory() as outer:

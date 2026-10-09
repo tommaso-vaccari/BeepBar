@@ -154,7 +154,7 @@ Use the existing harness through `scripts/benchmark.sh compare`. It never checks
 this checkout, launches/installs the app, or measures real accounts/network. It archives each
 full source SHA into its own temporary directory and builds `beepbar-bench` Release arm64.
 
-Prerequisites: macOS on Apple Silicon, Xcode/Swift matching CI, Git, Python 3.12+ (standard library
+Prerequisites: macOS on Apple Silicon, Xcode/Swift matching CI, Git, Python 3.9+ (standard library
 only), AC power, Low Power Mode off, nominal thermal state, enough temporary disk space and
 resolved Swift package dependencies. The command copies only dependency artifacts/checkouts/
 repositories from `.build` (or `--dependency-cache DIR`); it never reuses compiled app/Core objects.

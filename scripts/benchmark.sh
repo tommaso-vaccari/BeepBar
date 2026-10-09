@@ -7,6 +7,11 @@
 set -euo pipefail
 cd "${0:A:h}/.."
 
+if [[ "${1:-}" == compare ]]; then
+    shift
+    exec python3 scripts/benchmark_compare.py "$@"
+fi
+
 swift build -c release --arch arm64 --product beepbar-bench
 bench="$(swift build -c release --arch arm64 --show-bin-path)/beepbar-bench"
 

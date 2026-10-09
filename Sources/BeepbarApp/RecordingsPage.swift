@@ -117,7 +117,6 @@ enum RecordingsPresentation {
 struct RecordingsPage: View {
     @ObservedObject var authentication: WeBeepAuthenticationController
     @ObservedObject var recordings: RecordingsController
-    @State private var selectedCourseID: Int64?
 
     private var courses: [RemoteCourseSummary] {
         RecordingsPresentation.syncedCourses(authentication.courses, enabledIDs: authentication.enabledCourseIDs)
@@ -133,6 +132,16 @@ struct RecordingsPage: View {
 
     private var keys: [RecmanCourseKey] { searchableCourses.map(\.key) }
 
+    private var selectedCourseID: Int64? {
+        if case .course(let id) = recordings.study.destination { return id }
+        return nil
+    }
+
+    private var destination: RecordingsDestination {
+        if recordings.study.destination == .watchlist { return .watchlist }
+        return selectedCourse.map { .course($0.id) } ?? .watchlist
+    }
+
     private var selectedCourse: RemoteCourseSummary? {
         RecordingsPresentation.selectedCourse(courses, selectedID: selectedCourseID)
     }
@@ -141,7 +150,9 @@ struct RecordingsPage: View {
         Group {
             switch recordings.access {
             case .ready: browser
-            case .signingIn, .needsSignIn, .off: signIn
+            case .signingIn, .needsSignIn:
+                if !recordings.study.bookmarks.isEmpty { browser } else { signIn }
+            case .off: signIn
             }
         }
         .onAppear {
@@ -150,17 +161,24 @@ struct RecordingsPage: View {
         }
         .onDisappear { recordings.pageDisappeared() }
         .onChange(of: keys) { refresh() }
-        .onChange(of: selectedCourseID) { refresh() }
+        .onChange(of: destination) { refresh() }
+        .onChange(of: recordings.study.bookmarks.map(\.id)) { refresh() }
     }
 
     private func refresh(force: Bool = false) {
-        recordings.refresh(keys, selected: selectedCourse.flatMap(RecmanCourseKey.init(course:)), force: force)
+        let savedKeys = recordings.study.bookmarks.compactMap { RecmanCourseKey(courseCode: $0.recording.courseCode, academicYear: $0.recording.academicYear) }
+        let requested = destination == .watchlist ? Array(Set(keys + savedKeys)).sorted { ($0.academicYear, $0.courseCode) < ($1.academicYear, $1.courseCode) } : keys
+        recordings.refresh(requested, selected: destination == .watchlist ? nil : selectedCourse.flatMap(RecmanCourseKey.init(course:)), force: force)
     }
 
     // MARK: Sign-in
 
     private var signIn: some View {
         VStack(spacing: 14) {
+            if let problem = recordings.studyProblem {
+                NoticeBanner(text: problem.text, systemImage: "exclamationmark.triangle", tint: .orange)
+                    .frame(maxWidth: 420)
+            }
             SymbolTile(systemImage: "play.rectangle.fill", size: 52)
             Text(tr("Registrazioni delle lezioni", "Lecture recordings"))
                 .font(.title3.weight(.semibold))
@@ -193,30 +211,52 @@ struct RecordingsPage: View {
 
     // MARK: Two panes
 
-    @ViewBuilder private var browser: some View {
-        if courses.isEmpty {
-            ContentUnavailableView {
-                Label(tr("Nessun corso sincronizzato", "No synced courses"), systemImage: "books.vertical")
-            } description: {
-                Text(tr("Scegli i corsi da sincronizzare in Corsi: qui trovi le loro registrazioni.", "Choose the courses to sync in Courses: their recordings show up here."))
-            }
-        } else {
-            HStack(spacing: 0) {
-                sidebar
-                    .frame(width: 230)
+    private var browser: some View {
+        VStack(spacing: 0) {
+            if recordings.access != .ready {
+                HStack(spacing: 10) {
+                    Text(tr("La watchlist è salvata. Accedi con Polimi per riprodurre e aggiornare le lezioni.", "Your watchlist is saved. Sign in with Polimi to play and refresh lessons."))
+                        .font(.callout)
+                    Spacer()
+                    if recordings.access == .signingIn { ProgressView().controlSize(.small) }
+                    else { Button(tr("Accedi con Polimi", "Sign in with Polimi")) { recordings.signIn() } }
+                }
+                .padding(14)
+                if case .needsSignIn(let problem?) = recordings.access {
+                    NoticeBanner(text: problem.message, systemImage: "wifi.exclamationmark", tint: .orange)
+                        .padding(.horizontal, 14)
+                        .padding(.bottom, 14)
+                }
                 Divider()
-                detail
-                    .frame(maxWidth: .infinity, maxHeight: .infinity)
+            }
+            if let problem = recordings.studyProblem {
+                NoticeBanner(text: problem.text, systemImage: "exclamationmark.triangle", tint: .orange)
+                    .padding(14)
+            }
+            HStack(spacing: 0) {
+                sidebar.frame(width: 230)
+                Divider()
+                detail.frame(maxWidth: .infinity, maxHeight: .infinity)
             }
         }
     }
 
     private var sidebar: some View {
-        List(selection: Binding(get: { selectedCourse?.id }, set: { selectedCourseID = $0 })) {
+        List(selection: Binding<RecordingsDestination?>(get: { destination }, set: { if let value = $0 { recordings.selectDestination(value) } })) {
+            Section {
+                HStack {
+                    Label(tr("Watchlist", "Watchlist"), systemImage: "bookmark")
+                    Spacer()
+                    Text(recordings.study.bookmarks.count, format: .number)
+                        .foregroundStyle(.secondary)
+                        .monospacedDigit()
+                }
+                .tag(RecordingsDestination.watchlist)
+            }
             Section(tr("I tuoi corsi", "Your courses")) {
                 ForEach(searchableCourses, id: \.course.id) { entry in
                     CourseRow(name: RecordingsPresentation.courseName(entry.course), key: entry.key, listing: recordings.listing(for: entry.key), newCount: recordings.newCount(for: entry.key))
-                        .tag(entry.course.id)
+                        .tag(RecordingsDestination.course(entry.course.id))
                 }
             }
             if !unsearchableCourses.isEmpty {
@@ -226,7 +266,7 @@ struct RecordingsPage: View {
                             .lineLimit(3)
                             .fixedSize(horizontal: false, vertical: true)
                             .foregroundStyle(.secondary)
-                            .tag(course.id)
+                            .tag(RecordingsDestination.course(course.id))
                     }
                 }
             }
@@ -237,7 +277,9 @@ struct RecordingsPage: View {
     }
 
     @ViewBuilder private var detail: some View {
-        if let course = selectedCourse {
+        if destination == .watchlist {
+            WatchlistRecordings(recordings: recordings) { refresh(force: true) }
+        } else if let course = selectedCourse {
             if let key = RecmanCourseKey(course: course) {
                 CourseRecordings(name: RecordingsPresentation.courseName(course), key: key, recordings: recordings) {
                     refresh(force: true)
@@ -359,7 +401,7 @@ private struct CourseRecordings: View {
             searchField
             Spacer(minLength: 0)
             if recordings.newCount(for: key) > 0 {
-                Button(tr("Segna come viste", "Mark as seen")) { recordings.markSeen(key) }
+                Button(tr("Segna novità come lette", "Mark new recordings as read")) { recordings.markSeen(key) }
                     .buttonStyle(.borderless)
                     .font(.callout)
                     .fixedSize()
@@ -451,6 +493,10 @@ private struct CourseRecordings: View {
                             number: numbers[recording.id],
                             isNew: recordings.isNew(recording),
                             isOpening: recordings.openingRecordingID == recording.id,
+                            isWatchlisted: recordings.study.contains(recording),
+                            canEdit: recordings.canEditStudy,
+                            canPlay: recordings.access == .ready,
+                            toggleWatchlist: { recordings.toggleWatchlist(recording, courseName: name) },
                             play: { recordings.play(recording) }
                         )
                         .tag(recording.id)
@@ -465,9 +511,107 @@ private struct CourseRecordings: View {
             if let recording = ids.first.flatMap({ byID[$0] }) {
                 Button(tr("Apri nel browser", "Open in browser")) { recordings.play(recording) }
                 Button(tr("Copia link", "Copy link")) { recordings.copyLink(recording) }
+                Button(recordings.study.contains(recording) ? tr("Rimuovi dalla watchlist", "Remove from watchlist") : tr("Aggiungi alla watchlist", "Add to watchlist")) { recordings.toggleWatchlist(recording, courseName: name) }
+                    .disabled(!recordings.canEditStudy)
             }
         } primaryAction: { ids in
             if let recording = ids.first.flatMap({ byID[$0] }) { recordings.play(recording) }
+        }
+    }
+}
+
+/// The global queue uses saved snapshots, so choosing what to watch never requires visiting each course.
+private struct WatchlistRecordings: View {
+    @ObservedObject var recordings: RecordingsController
+    let refresh: () -> Void
+    @State private var query = ""
+    @State private var selection: String?
+
+    private var shown: [RecordingsStudyState.Bookmark] { recordings.study.visibleBookmarks(query: query) }
+
+    private var listings: [RecordingsListing] {
+        let keys = Set(recordings.study.bookmarks.compactMap {
+            RecmanCourseKey(courseCode: $0.recording.courseCode, academicYear: $0.recording.academicYear)
+        })
+        return keys.sorted { ($0.academicYear, $0.courseCode) < ($1.academicYear, $1.courseCode) }
+            .compactMap { recordings.listing(for: $0) }
+    }
+    private var isLoading: Bool { listings.contains { $0.isLoading } }
+
+    var body: some View {
+        VStack(spacing: 0) {
+            VStack(alignment: .leading, spacing: 6) {
+                Text(tr("Watchlist", "Watchlist")).font(.title3.weight(.semibold))
+                Text(tr("Le lezioni che hai scelto, da tutti i corsi.", "The lessons you chose, from every course."))
+                    .font(.callout).foregroundStyle(.secondary)
+            }
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .padding(.horizontal, 20).padding(.top, 18).padding(.bottom, 14)
+            HStack(spacing: 12) {
+                TextField(tr("Cerca lezioni o corsi", "Search lessons or courses"), text: $query)
+                    .textFieldStyle(.roundedBorder)
+                    .frame(minWidth: 120, maxWidth: 280)
+                Spacer(minLength: 0)
+                Button(action: refresh) {
+                    ZStack {
+                        Image(systemName: "arrow.clockwise").opacity(isLoading ? 0 : 1)
+                        if isLoading { ProgressView().controlSize(.small) }
+                    }
+                }
+                    .buttonStyle(.borderless)
+                    .help(tr("Aggiorna la watchlist", "Refresh watchlist"))
+                    .accessibilityLabel(tr("Aggiorna la watchlist", "Refresh watchlist"))
+                    .disabled(recordings.access != .ready || isLoading)
+            }
+            .padding(.horizontal, 20).padding(.bottom, 14)
+            Divider()
+            if let problem = listings.compactMap(\.problem).first {
+                NoticeBanner(text: problem.message, systemImage: "wifi.exclamationmark", tint: .orange).padding(14)
+            }
+            if let problem = recordings.openingProblem {
+                NoticeBanner(text: problem.message, systemImage: "play.slash", tint: .orange).padding(14)
+            }
+            if shown.isEmpty { empty.frame(maxWidth: .infinity, maxHeight: .infinity) }
+            else {
+                List(selection: $selection) {
+                    ForEach(shown) { bookmark in
+                        let item = bookmark.recording
+                        RecordingRow(recording: item, number: nil, isNew: recordings.isNew(item),
+                            isOpening: recordings.openingRecordingID == item.id,
+                            isWatchlisted: true,
+                            canEdit: recordings.canEditStudy, canPlay: recordings.access == .ready && !bookmark.unavailable,
+                            courseName: bookmark.courseName, unavailable: bookmark.unavailable,
+                            toggleWatchlist: { recordings.toggleWatchlist(item, courseName: bookmark.courseName) },
+                            play: { recordings.play(item) })
+                            .tag(bookmark.id)
+                    }
+                }
+                .listStyle(.inset).scrollContentBackground(.hidden)
+                .contextMenu(forSelectionType: String.self) { ids in
+                    if let bookmark = shown.first(where: { ids.contains($0.id) }) {
+                        Button(tr("Rimuovi dalla watchlist", "Remove from watchlist")) { recordings.toggleWatchlist(bookmark.recording, courseName: bookmark.courseName) }
+                            .disabled(!recordings.canEditStudy)
+                        Button(tr("Apri nel browser", "Open in browser")) { recordings.play(bookmark.recording) }
+                            .disabled(recordings.access != .ready || bookmark.unavailable)
+                    }
+                } primaryAction: { ids in
+                    if let bookmark = shown.first(where: { ids.contains($0.id) }), !bookmark.unavailable {
+                        recordings.play(bookmark.recording)
+                    }
+                }
+            }
+        }
+    }
+
+    @ViewBuilder private var empty: some View {
+        if recordings.study.bookmarks.isEmpty {
+            ContentUnavailableView {
+                Label(tr("La watchlist è vuota", "Your watchlist is empty"), systemImage: "bookmark")
+            } description: {
+                Text(tr("Scegli un corso e usa il segnalibro accanto a una lezione per aggiungerla qui.", "Choose a course and bookmark a lesson to add it here."))
+            }
+        } else {
+            ContentUnavailableView.search(text: query)
         }
     }
 }
@@ -478,6 +622,12 @@ private struct RecordingRow: View {
     let number: Int?
     let isNew: Bool
     let isOpening: Bool
+    let isWatchlisted: Bool
+    let canEdit: Bool
+    let canPlay: Bool
+    var courseName: String? = nil
+    var unavailable = false
+    let toggleWatchlist: () -> Void
     let play: () -> Void
 
     var body: some View {
@@ -486,12 +636,15 @@ private struct RecordingRow: View {
                 .fill(isNew ? Color.accentColor : .clear)
                 .frame(width: 7, height: 7)
                 .accessibilityLabel(isNew ? tr("Nuova", "New") : "")
-            Text(number.map { "#\($0)" } ?? "")
-                .font(.callout)
-                .monospacedDigit()
-                .foregroundStyle(.tertiary)
-                .frame(width: 34, alignment: .leading)
+            if let number {
+                Text("#\(number)")
+                    .font(.callout).monospacedDigit().foregroundStyle(.tertiary)
+                    .frame(width: 34, alignment: .leading)
+            }
             VStack(alignment: .leading, spacing: 6) {
+                if let courseName {
+                    Text(courseName).font(.caption.weight(.semibold)).foregroundStyle(.secondary)
+                }
                 Text(RecordingsPresentation.title(recording))
                     .font(.body.weight(isNew ? .semibold : .medium))
                     .lineLimit(3)
@@ -506,8 +659,20 @@ private struct RecordingRow: View {
                         kind
                     }
                 }
+                if unavailable {
+                    Text(tr("Non più disponibile nell’archivio", "No longer available in the archive"))
+                        .font(.caption).foregroundStyle(.secondary)
+                }
             }
             .frame(maxWidth: .infinity, alignment: .leading)
+            Button(action: toggleWatchlist) {
+                Image(systemName: isWatchlisted ? "bookmark.fill" : "bookmark")
+                    .foregroundStyle(isWatchlisted ? Color.accentColor : .secondary)
+                    .frame(width: 28, height: 32)
+            }
+            .buttonStyle(.plain).disabled(!canEdit)
+            .help(isWatchlisted ? tr("Rimuovi dalla watchlist", "Remove from watchlist") : tr("Aggiungi alla watchlist", "Add to watchlist"))
+            .accessibilityLabel(isWatchlisted ? tr("Rimuovi dalla watchlist", "Remove from watchlist") : tr("Aggiungi alla watchlist", "Add to watchlist"))
             Button(action: play) {
                 ZStack {
                     ProgressView().controlSize(.small).opacity(isOpening ? 1 : 0)
@@ -519,6 +684,7 @@ private struct RecordingRow: View {
                 .frame(width: 32, height: 32)
             }
             .buttonStyle(.plain)
+            .disabled(!canPlay)
             .help(tr("Apri nel browser", "Open in browser"))
             .accessibilityLabel(tr("Riproduci \(RecordingsPresentation.title(recording))", "Play \(RecordingsPresentation.title(recording))"))
         }
@@ -540,7 +706,11 @@ private struct RecordingRow: View {
     }
 
     private var details: String {
-        let when = recording.recordedAt.formatted(Date.FormatStyle().weekday(.abbreviated).day().month(.abbreviated).hour().minute().locale(BeepbarStyle.locale))
+        var style = Date.FormatStyle().weekday(.abbreviated).day().month(.abbreviated).hour().minute().locale(BeepbarStyle.locale)
+        if Calendar.current.component(.year, from: recording.recordedAt) != Calendar.current.component(.year, from: Date()) {
+            style = style.year()
+        }
+        let when = recording.recordedAt.formatted(style)
         let length = RecordingsPresentation.minutes(recording.duration).map { RecordingsPresentation.durationText(minutes: $0) } ?? recording.duration
         return "\(when) · \(length)"
     }

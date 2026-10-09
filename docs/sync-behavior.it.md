@@ -147,6 +147,10 @@ Al primo sync dopo l'aggiornamento, i file che il professore aveva rimosso da Mo
 
 ## Registrazioni delle lezioni
 
-Senza una sessione salvata riutilizzabile, aprendo la pagina compare subito una spiegazione della funzione con l'accesso Polimi, prima di recuperare le registrazioni; una sessione riutilizzabile esistente viene usata automaticamente.
+Senza una sessione salvata riutilizzabile, aprendo la pagina compare una spiegazione della funzione con l’accesso Polimi; se l’account è noto e ha una watchlist salvata, l’elenco resta consultabile e l’accesso viene proposto sopra le lezioni. Una sessione riutilizzabile esistente viene usata automaticamente.
 
 Registrazioni è attiva di default per gli account Polimi. Disattivandola in Impostazioni, la pagina scompare e la scelta rimane salvata tra gli avvii. La barra laterale mostra solo i corsi selezionati per la sincronizzazione, anche quelli senza codice o anno identificabile. La ricerca in archivio richiede sia il codice del corso sia l’anno accademico. Le registrazioni vengono recuperate quando la pagina è aperta e riprodotte nel browser predefinito; la sincronizzazione dei file non le scarica. La sessione Polimi viene salvata in un file locale separato e rimossa disabilitando Registrazioni, disconnettendo o cambiando account. Alla scadenza serve un nuovo accesso.
+
+La Watchlist, sopra i corsi nella stessa pagina, raccoglie solo le lezioni aggiunte manualmente con il segnalibro. Mostra corso, titolo, data e durata salvati, anche prima di ricaricare i corsi. Le lezioni restano in elenco finché rimuovi il segnalibro, anche dopo averle aperte. «Segna novità come lette» riguarda solo gli indicatori di novità. La scelta della vista resta salvata.
+
+La watchlist è salvata localmente per account e sopravvive alla scadenza della sessione e alla disattivazione della funzione. Alla disconnessione non è più visibile; un altro account non la eredita. Un aggiornamento riuscito conserva le lezioni non più presenti, segnalandole come non disponibili; un errore o una cancellazione non le rimuove. La watchlist può contenere lezioni di corsi non più selezionati per la sincronizzazione.

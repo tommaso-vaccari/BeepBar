@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+### New
+
+- Save lessons from different courses in a single Watchlist inside Recordings. Add or remove bookmarks and find your saved list again after restarting.
+
 ### Improved
 
 - Cancelling sync stops large local file checks promptly while file changes already underway still finish safely.

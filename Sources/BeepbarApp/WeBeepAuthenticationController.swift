@@ -589,7 +589,8 @@ struct MenuBarSnapshot: Sendable {
             // Real Polimi course names ("058167 - NAME [2026-27]", one per line) can be passed in
             // BEEPBAR_PREVIEW_COURSES to try Recordings against the real archive: the mock names
             // carry no code or year, so they have no recordings.
-            let recordingsCourses = (ProcessInfo.processInfo.environment["BEEPBAR_PREVIEW_COURSES"] ?? "")
+            let previewNames = ProcessInfo.processInfo.arguments.contains("--watchlist-preview") ? WatchlistPreviewBrowser.courseNames.joined(separator: "\n") : (ProcessInfo.processInfo.environment["BEEPBAR_PREVIEW_COURSES"] ?? "")
+            let recordingsCourses = previewNames
                 .split(separator: "\n").map { $0.trimmingCharacters(in: .whitespaces) }.filter { !$0.isEmpty }.enumerated()
                 .map { RemoteCourseSummary(id: Int64(1_000 + $0.offset), shortName: $0.element, displayName: $0.element, isVisible: true, startDate: nil, endDate: nil) }
             let mockCourses = recordingsCourses + (1...100).map { index in
@@ -904,14 +905,40 @@ struct MenuBarSnapshot: Sendable {
         if let recordingsStoreForTesting { store = recordingsStoreForTesting }
         if let recordingsBrowserForTesting { makeBrowser = recordingsBrowserForTesting }
 #endif
-        return RecordingsController(
+#if DEBUG
+        if Self.isUIPreview && ProcessInfo.processInfo.arguments.contains("--watchlist-preview") {
+            makeBrowser = { WatchlistPreviewBrowser() }
+            store = RecordingsSessionStore { FileManager.default.temporaryDirectory.appendingPathComponent("Beepbar-watchlist-preview-session", isDirectory: true) }
+        }
+#endif
+        let controller = RecordingsController(
             makeBrowser: makeBrowser,
             store: store,
             defaults: operationDefaults,
             ownerUserID: { [weak self] in self?.recordingsOwnerUserID },
             isAvailable: { [weak self] in self?.selectedSite.university == .polimi }
         )
+#if DEBUG
+        if Self.isUIPreview && ProcessInfo.processInfo.arguments.contains("--watchlist-preview") {
+            if controllerDefaultsHaveNoWatchlist {
+                for course in courses.prefix(2) {
+                    if let key = RecmanCourseKey(course: course), let lesson = WatchlistPreviewBrowser.lessons(for: key).first {
+                        controller.toggleWatchlist(lesson, courseName: RecordingsPresentation.courseName(course))
+                    }
+                }
+                controller.selectDestination(.watchlist)
+            }
+            controller.signIn()
+        }
+#endif
+        return controller
     }
+
+#if DEBUG
+    private var controllerDefaultsHaveNoWatchlist: Bool {
+        operationDefaults.data(forKey: RecordingsController.studyKey(owner: 1)) == nil
+    }
+#endif
 
     /// Forgets the stored token so another account, or another university, can be connected.
     /// The sync folder, its files and the course selection stay as they are; the Recordings
@@ -1857,12 +1884,14 @@ struct MenuBarSnapshot: Sendable {
     /// identifier (they're unsigned executables built from the same target), so writing straight
     /// to `.standard` during manual preview testing would silently overwrite the real installed
     /// app's settings (sync root, credentials-expired flag, etc). Preview runs get their own
-    /// throwaway suite, wiped at launch so every preview run starts from a clean slate.
+    /// separate suite, wiped at launch except for the watchlist demo, which keeps choices
+    /// so manual testing can verify restoration after relaunch.
     private static let defaults: UserDefaults = {
         guard isUIPreview || isUIPreviewOnboarding else { return .standard }
-        let suiteName = "io.github.tvaccari.beepbar.preview"
+        let watchlistPreview = isUIPreview && ProcessInfo.processInfo.arguments.contains("--watchlist-preview")
+        let suiteName = watchlistPreview ? "io.github.tvaccari.beepbar.preview.watchlist" : "io.github.tvaccari.beepbar.preview"
         let store = UserDefaults(suiteName: suiteName) ?? .standard
-        if let domain = store.persistentDomain(forName: suiteName) {
+        if !watchlistPreview, let domain = store.persistentDomain(forName: suiteName) {
             for key in domain.keys { store.removeObject(forKey: key) }
         }
         return store

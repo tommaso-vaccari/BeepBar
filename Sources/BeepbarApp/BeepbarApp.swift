@@ -56,7 +56,7 @@ struct BeepbarApp: App {
         statusItemController = StatusItemController(authentication: authentication)
 #if DEBUG
         if ProcessInfo.processInfo.arguments.contains("--ui-preview") {
-            ConfigurationWindowController.shared.show(authentication)
+            ConfigurationWindowController.shared.show(authentication, page: ProcessInfo.processInfo.arguments.contains("--watchlist-preview") ? .recordings : .home)
             return
         }
 #endif

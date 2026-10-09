@@ -147,6 +147,10 @@ On the first sync after updating, the files the teacher removed from Moodle befo
 
 ## Lecture recordings
 
-Without a reusable saved session, opening the page immediately explains the feature and offers Polimi sign-in before fetching recordings; an existing reusable session is used automatically.
+Without a reusable saved session, opening the page explains the feature and offers Polimi sign-in; if the account is known and has a saved watchlist, the list remains visible with a sign-in prompt above its lessons. An existing reusable session is used automatically.
 
 Recordings is enabled by default for Polimi accounts. Turning it off in Settings hides the page and preserves that choice between launches. Its sidebar shows only courses selected for synchronization, including courses whose code or year cannot be identified. Archive searches require both a course code and an academic year. Recordings are fetched when the page is open and played in the default browser; they are not downloaded by file synchronization. The Polimi session is stored in a separate local file and removed when you disable Recordings, disconnect or switch accounts. An expired session requires another sign-in.
+
+Watchlist, above the courses on the same page, collects only lessons manually added with the bookmark. It shows saved course, title, date and duration before courses are reloaded. Lessons remain in the list until their bookmark is removed, even after opening them. “Mark new recordings as read” only affects novelty indicators. Navigation is remembered.
+
+Watchlist is saved locally per account and survives session expiry and disabling the feature. It is hidden after disconnecting; another account never inherits it. A successful refresh retains lessons missing from the archive and marks them unavailable; a failure or cancellation never removes them. Watchlist can contain lessons from courses no longer selected for synchronization.

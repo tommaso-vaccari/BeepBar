@@ -3,6 +3,35 @@ import Testing
 @testable import BeepbarCore
 
 @Suite(.serialized) struct SyncCoordinatorEndToEndTests {
+    /// An override keeps its destination, and unchanged metadata must issue no name UPDATE.
+    @Test func unchangedModuleOverrideDoesNotWrite() async throws {
+        let fixture = try await Fixture()
+        defer { fixture.remove() }
+        try await fixture.database.commitModuleMove(PendingModuleMove(rootID: fixture.rootID, courseID: 1, moduleID: 100, action: .set, oldFolder: nil, newFolder: "Custom", lastKnownName: "Lezioni", files: []))
+        _ = try await fixture.synchronize(targets: [fixture.targets[0]])
+        let before = await fixture.database.moduleOverrideUpdateAttempts
+        _ = try await fixture.synchronize(targets: [fixture.targets[0]])
+        #expect(await fixture.database.moduleOverrideUpdateAttempts == before)
+        #expect(fixture.contents("Course 1/Custom/0.txt") == "x")
+    }
+
+    /// One renamed module with a hundred files updates its display name once, preserving edits.
+    @Test func renamedModuleOverrideWritesOnce() async throws {
+        let fixture = try await Fixture()
+        defer { fixture.remove() }
+        try await fixture.database.commitModuleMove(PendingModuleMove(rootID: fixture.rootID, courseID: 1, moduleID: 100, action: .set, oldFolder: nil, newFolder: "Custom", lastKnownName: "Lezioni", files: []))
+        _ = try await fixture.synchronize(targets: [fixture.targets[0]])
+        try fixture.write("local edit", to: "Course 1/Custom/0.txt")
+        fixture.upstream.setModuleName(course: 1, name: "Nuovo nome")
+        let before = await fixture.database.moduleOverrideUpdateAttempts
+        _ = try await fixture.synchronize(targets: [fixture.targets[0]])
+        #expect(await fixture.database.moduleOverrideUpdateAttempts - before == 1)
+        let saved = try await fixture.database.modulePathOverride(rootID: fixture.rootID, courseID: 1, moduleID: 100)
+        #expect(saved?.lastKnownName == "Nuovo nome")
+        #expect(saved?.localFolder == "Custom")
+        #expect(fixture.contents("Course 1/Custom/0.txt") == "local edit")
+    }
+
     /// Planning needs the post-backfill snapshot only, even when a prior sync tracked files.
     @Test func readsBaselinesOncePerRun() async throws {
         let fixture = try await Fixture()

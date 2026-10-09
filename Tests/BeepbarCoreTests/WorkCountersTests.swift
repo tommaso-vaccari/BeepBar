@@ -109,6 +109,28 @@ struct WorkCountersTests {
         #expect(await second.writeCounters().since(secondBefore) == SyncDatabaseWriteCounters())
     }
 
+    /// Failed ownership UPDATEs count attempts, while rollback preserves the legacy row.
+    @Test func ownershipAttemptsCountFailuresAndStayConnectionLocal() async throws {
+        let root = try temporaryRoot()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let url = root.appending(path: "state.sqlite")
+        let first = try SyncDatabase(url: url)
+        let second = try SyncDatabase(url: url)
+        let rootID = UUID()
+        try await first.registerRoot(id: rootID, canonicalPath: root.path)
+        try await first.upsertBaseline(rootID: rootID, baseline: Baseline(remoteID: "legacy", relativePath: try RelativePath("a.txt"), sha256: "hash", remoteRevision: "1"))
+        try RawSQLite(url: url).execute("CREATE TRIGGER reject_owner BEFORE UPDATE OF course_id ON items BEGIN SELECT RAISE(ABORT, 'test'); END")
+        let before = await first.ownershipBackfillCounters
+        let file = RemoteFileCandidate(id: "legacy", courseID: 1, sectionID: 1, moduleID: 10, sectionName: "S", moduleName: "A", filename: "a.txt", remoteFilePath: "/", canonicalPluginPath: "/a", downloadURL: nil, size: 1, modifiedAt: nil, observedRevision: "1", isSupported: true)
+
+        await #expect(throws: SyncDatabaseError.self) {
+            try await first.backfillModuleOwnership(rootID: rootID, files: [file])
+        }
+        #expect(await first.ownershipBackfillCounters.since(before) == OwnershipBackfillCounters(transactions: 1, updates: 1))
+        #expect(await second.ownershipBackfillCounters == OwnershipBackfillCounters())
+        #expect(try await first.baseline(rootID: rootID, remoteID: "legacy")?.courseID == nil)
+    }
+
     /// Hashing a file counts one file and exactly its bytes, across the 1 MiB read chunks, and one
     /// path lookup. Guards `bytesHashed` (which tells one big file read twice from two small ones)
     /// against counting chunks, capacities or only the first read.
@@ -143,6 +165,7 @@ struct WorkCountersTests {
     /// `since` subtracts field by field, so a measured window excludes everything before it.
     @Test func sinceSubtractsEveryField() {
         #expect(SyncDatabaseWriteCounters(rowChanges: 9, commits: 5, pagesWritten: 7).since(SyncDatabaseWriteCounters(rowChanges: 4, commits: 2, pagesWritten: 3)) == SyncDatabaseWriteCounters(rowChanges: 5, commits: 3, pagesWritten: 4))
+        #expect(OwnershipBackfillCounters(transactions: 5, updates: 9).since(OwnershipBackfillCounters(transactions: 2, updates: 4)) == OwnershipBackfillCounters(transactions: 3, updates: 5))
         #expect(FileStoreCounters(filesHashed: 3, bytesHashed: 100, pathLookups: 8).since(FileStoreCounters(filesHashed: 1, bytesHashed: 40, pathLookups: 5)) == FileStoreCounters(filesHashed: 2, bytesHashed: 60, pathLookups: 3))
     }
 }

@@ -4,7 +4,7 @@
 
 ### Improved
 
-- Repeated synchronization uses less memory when many materials are already saved.
+- Repeated synchronization uses less memory and does less work when many materials are already saved.
 
 ### Fixed
 

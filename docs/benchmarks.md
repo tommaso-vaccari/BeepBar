@@ -84,6 +84,7 @@ Every counter is the change during one run.
 | `disk.written`, `disk.logicalWritten` | `proc_pid_rusage` | Bytes written to storage, and including those still in the page cache |
 | `memory.peak`, `memory.peakGrowth` | `PeakFootprintSampler` (1 ms) | Highest `phys_footprint` of the process during the run, and that minus the value just before. Compare `memory.peak` across file sizes. `memory.peakGrowth` reads near zero after a warm-up even when a run needs hundreds of MiB, because the allocator keeps what the previous run freed |
 | `db.commits` | SQLite commit hook | Write transactions committed. An empty transaction, or a write matching no row, still counts. Only commits that wrote pages (`db.pagesWritten`) append to the WAL and wait for an `fsync` |
+| `db.ownershipBackfill.transactions`, `db.ownershipBackfill.updates` | Connection-local attempt counters | Ownership migration write transactions and per-row UPDATEs attempted, including failed attempts; separate from rows actually changed |
 | `db.rowChanges` | `sqlite3_total_changes64` | Rows inserted, updated or deleted, identical rewrites included |
 | `db.pagesWritten` | `SQLITE_DBSTATUS_CACHE_WRITE` | WAL frames. An `UPDATE` that leaves a page byte-identical writes none |
 | `fs.filesHashed`, `fs.bytesHashed` | `FileStore.counters()` | Full-content SHA-256 reads, and the bytes they read |

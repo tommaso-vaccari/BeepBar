@@ -16,43 +16,16 @@ commands:
   baseline       every scenario, each in its own process   --out DIR (PerformanceReports/baseline-<date>)
   idle           watch a running process passively         --pid N --minutes N (30) --interval-seconds N (60)
 
-common options:
-  --runs N (5)  --warmup N (1, 0 allowed)  --json PATH  --commit SHA  --dirty
+scenario and baseline options:
+  --runs N (5)  --warmup N (1, 0 allowed)
+scenario and idle options:
+  --json PATH
+common metadata:
+  --commit SHA  --dirty
 """
 
-enum CLIError: Error {
-    case usage(String)
-}
 
-struct Options {
-    var values: [String: String] = [:]
-    var flags: Set<String> = []
-
-    init(_ arguments: ArraySlice<String>) throws {
-        var iterator = arguments.makeIterator()
-        while let argument = iterator.next() {
-            guard argument.hasPrefix("--") else { throw CLIError.usage("unexpected argument \(argument)") }
-            let name = String(argument.dropFirst(2))
-            if name == "dirty" { flags.insert(name); continue }
-            guard let value = iterator.next() else { throw CLIError.usage("missing value for \(argument)") }
-            values[name] = value
-        }
-    }
-
-    func int(_ name: String, _ fallback: Int, allowZero: Bool = false) throws -> Int {
-        guard let text = values[name] else { return fallback }
-        guard let value = Int(text), value > 0 || (allowZero && value == 0) else { throw CLIError.usage("--\(name) needs a \(allowZero ? "non-negative" : "positive") integer") }
-        return value
-    }
-
-    func double(_ name: String, _ fallback: Double) throws -> Double {
-        guard let text = values[name] else { return fallback }
-        guard let value = Double(text), value > 0, value.isFinite else { throw CLIError.usage("--\(name) needs a positive number") }
-        return value
-    }
-}
-
-func environment(_ options: Options) -> BenchmarkEnvironment {
+func environment(_ options: BenchmarkOptions) -> BenchmarkEnvironment {
     BenchmarkEnvironment.current(commit: options.values["commit"] ?? ProcessInfo.processInfo.environment["BEEPBAR_BENCH_COMMIT"] ?? "unknown", dirty: options.flags.contains("dirty"))
 }
 
@@ -66,7 +39,7 @@ func emit(_ report: BenchmarkReport, json path: String?) throws {
     }
 }
 
-func runScenario(_ command: String, _ options: Options) async throws -> ScenarioResult {
+func runScenario(_ command: String, _ options: BenchmarkOptions) async throws -> ScenarioResult {
     let runs = try options.int("runs", 5)
     let warmup = try options.int("warmup", 1, allowZero: true)
     let megabyte: Int64 = 1_048_576
@@ -87,7 +60,7 @@ func runScenario(_ command: String, _ options: Options) async throws -> Scenario
 
 /// Runs each scenario in a fresh process, so one scenario's memory high-water mark, caches and
 /// leftover threads never colour the next one, then merges their JSON into one report.
-func baseline(_ options: Options) throws -> Bool {
+func baseline(_ options: BenchmarkOptions) throws -> Bool {
     let stamp = ISO8601DateFormatter().string(from: Date()).replacingOccurrences(of: ":", with: "-")
     let directory = URL(fileURLWithPath: options.values["out"] ?? "PerformanceReports/baseline-\(stamp)", isDirectory: true)
     try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
@@ -129,7 +102,7 @@ func baseline(_ options: Options) throws -> Bool {
     return complete && report.passed
 }
 
-func idle(_ options: Options) throws -> Bool {
+func idle(_ options: BenchmarkOptions) throws -> Bool {
     guard let pidText = options.values["pid"], let pid = Int32(pidText), pid > 0 else { throw CLIError.usage("idle needs --pid") }
     let minutes = try options.double("minutes", 30)
     let interval = try options.double("interval-seconds", 60)
@@ -155,7 +128,7 @@ guard let command = arguments.first, command != "--help", command != "-h" else {
     exit(arguments.isEmpty ? 64 : 0)
 }
 do {
-    let options = try Options(arguments.dropFirst())
+    let options = try BenchmarkOptions(arguments.dropFirst(), command: command)
     let passed: Bool
     switch command {
     case "baseline":

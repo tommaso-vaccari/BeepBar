@@ -249,6 +249,8 @@ Prova red/green: il parser originale produce 20 assertion fallite; la review ha 
 
 Sono attività concrete di verifica, non ottimizzazioni già giustificate.
 
+**R06 / [#114](https://github.com/tommaso-vaccari/BeepBar/issues/114), checkpoint 2026-10-09.** Verificata l’unica failure del run `37899467406`, attempt 1, nell’assertion di riavvio dopo `markSeen`; attempt 2 verde sullo stesso SHA `39683c2ba7b173672ece501f57054e37085a45d5`. Controller e test invariati su dev `ac68333265a68b3f1e01e7f0958c3aae31cc7850`. Analizzati ordine pubblicazione/defaults e isolamento UUID delle fixture; la causa resta non confermata. La toolchain locale Command Line Tools non compila le macro Testing/SwiftUI e non esegue xcodebuild: zero ripetizioni completate, suite e Release non verificate sul candidato. Nessun fix, nessuna chiusura: restano ripetizioni isolate/parallele con account distinti e cattura defaults/pubblicazioni prima del riavvio. [Rapporto con comandi, evidenze e prossimo esperimento](recordings-acknowledgement-investigation.md). Confronti prestazionali base dev → HEAD / main → HEAD non applicabili a questa consegna documentale; nessun beneficio runtime rivendicato.
+
 | Candidato | Prossimo esperimento e criterio decisionale |
 |---|---|
 | Migrazioni ripetute all’avvio | Strumentare `SyncDatabase.migrate` (implementazione privata a 1057), riparazione ownership parziale e controlli schema. Misurare apertura DB corrente vuoto/15k/grande. Spostare lavoro dietro versioni solo se il costo è significativo; test release saltate, ownership vecchia/parziale e downgrade/riapertura. Le scritture `registerRoot` sono già corrette. |

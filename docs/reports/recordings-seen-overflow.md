@@ -12,11 +12,14 @@ listing atomically creates its baseline plus all IDs. Later listings query membe
 current IDs; opening or “Mark as seen” inserts acknowledgements. Dates are never checkpoints:
 old lecture dates and out-of-order publication remain new if their ID has not been acknowledged.
 Duplicate insertions do not rewrite rows. SQLite uses FULL synchronization, rollback journaling,
-a 2 MiB page cache, a private 0600 file and 0700 folder. Calls currently remain synchronous on
-the controller's main actor; no UI latency improvement is claimed. The complete history is not
-loaded into RAM, but the already displayed listings and their seen-ID caches still scale with
-courses visited in the current process. Main-thread latency should be measured with D07 before
-claiming a responsiveness result or choosing a further executor change.
+a 2 MiB page cache, a private 0600 file and 0700 folder. The synchronous SQLite primitives execute on a serial history actor, including migration,
+lookups, writes and cleanup. The controller validates account/namespace after each await and
+also generation for listing results. `isNew` reads only the successfully published listing's
+membership snapshot; it performs no disk lookup. Listings and membership are published together,
+and a failed history read retains the prior pair (or shows the error without a first list).
+No process-wide aggregate set is constructed. The complete history is not loaded into RAM,
+but displayed listings and per-list seen-ID snapshots still scale with courses visited in the
+current process. D07 remains necessary before claiming app-wide UI latency results.
 
 v1 survivors are imported once in a transaction, together with existing course/year baselines.
 Their original scope was not stored; the small legacy survivor index is consulted only for
@@ -32,12 +35,21 @@ linear in unique acknowledged IDs plus SQLite indexes/pages; repeated unchanged 
 history. With synthetic 32-character IDs, this host measured 299,008 bytes for 5,001 IDs
 and 581,632 bytes for 10,000 IDs (about 58 bytes per ID, including database tables/pages).
 One Debug sample measured a 10,000-ID baseline at 15.3 ms and membership lookup at 52.5 ms.
-The latter currently runs on the main actor and can block the UI; this is a material limitation
-for independent review, not a responsiveness improvement. These are uncontrolled single samples,
-not p95 measurements or before/after UI comparisons. Disabling Recordings, disconnecting or changing account deletes the history database
-and its journal sidecars. A storage error is reported rather than publishing a false durable
-baseline. Scope keys still prevent a failed cleanup from giving another account's acknowledgements
-to the current account.
+This measurement was from checkpoint `30c7f14`, whose synchronous main-actor lookup could block
+UI. Independent review rejected that design; the revised history actor executes the same work
+off the main actor. These are uncontrolled single samples, not p95 measurements or before/after
+UI comparisons. Executor placement is covered by actual I/O thread probes and held-operation
+lifecycle fixtures, rather than inferred from the raw operation duration. Disabling Recordings, disconnecting or changing account synchronously persists a new opaque UUID
+namespace in the preferences and invalidates the previous worker. The old worker then removes its
+database/sidecars, serialized after in-flight work. New namespace operations await this cleanup
+barrier. If removal fails, the tombstone prevents same-account re-enable/relaunch from reusing old
+baselines, and obsolete files are retried on subsequent history work. Only this opaque UUID remains
+when the feature is off; it contains no account or recording IDs. Failed removals may leave obsolete
+disk data until permissions/storage recover. A storage error is reported rather than publishing
+a false durable baseline. Explicit acknowledgements continue across page closure for the same
+account/namespace; account reset rejects them, and listing results from stale generations cannot
+return. A per-course acknowledgement revision makes a delayed read requery if a newer acknowledgement
+was published while the read returned.
 
 ## Validation and limits
 
@@ -45,6 +57,12 @@ Relevant fixtures cover 5,010 recordings plus 3,000 in another course, first lis
 seen”, relaunch, disappearance/reappearance, out-of-order dates, v1 survivors/missing IDs,
 unknown ownership, corrupt database/retry, identity/year isolation, duplicate insertion,
 empty baselines, file permissions, reset and transaction rollback on a midway insert failure.
+Review follow-ups add worker-thread execution probes, a held history read during page close,
+transient failure with an existing list, cleanup denial across re-enable/relaunch, held
+acknowledgement after reset, acknowledgement across close/reopen, and delayed read versus newer
+acknowledgement. Repeated clicks coalesce IDs already pending so slow storage does not retain
+one duplicate task/list per click. Cleanup uses unlink and never recursively removes a directory
+unexpectedly replacing a database file.
 
 Normal gates are `swift test` and the CI `xcodebuild ... Release ... CODE_SIGNING_ALLOWED=NO`.
 This host has Command Line Tools without Xcode: `xcodebuild` rejects the active developer
@@ -57,6 +75,12 @@ Targeted fallback is reproducible with:
 ```sh
 python3 scripts/recordings-seen-isolated-tests.py
 python3 scripts/recordings-seen-isolated-tests.py --mutate-cap  # expected nonzero
+python3 scripts/recordings-seen-isolated-tests.py --mutate-main-actor  # expected nonzero
+python3 scripts/recordings-seen-isolated-tests.py --mutate-reset  # expected nonzero
+python3 scripts/recordings-seen-isolated-tests.py --mutate-snapshot  # expected nonzero
+python3 scripts/recordings-seen-isolated-tests.py --mutate-revision  # expected nonzero
+python3 scripts/recordings-seen-isolated-tests.py --mutate-coalescing  # expected nonzero
+python3 scripts/recordings-seen-isolated-tests.py --mutate-cleanup-kind  # expected nonzero
 python3 scripts/recordings-seen-isolated-tests.py --probe-disk
 swift build --build-system native --target BeepbarCore -c release
 ```
@@ -69,10 +93,18 @@ working checkout, installed app, user preferences or real account. This fallback
 full CI. Live Polimi, app-wide responsiveness, power-loss durability and base-dev/main UI timing
 comparisons remain unmeasured.
 
-Checkpoint validation before independent review: targeted copied implementation is green with
+Historical checkpoint `30c7f14` validation before its rejected independent review: targeted copied implementation is green with
 40 tests in two suites (0.247 s runtime). Controlled global-cap mutation is red: two selected
 regressions produce six issues, including old recordings becoming New after cross-course/relaunch
 and disappearance/reappearance. The original source was unchanged by the mutation. Final Core
 Release compilation passed (11.76 s). Disk probe passed separately (one instrumentation test).
 `git diff --check` is clean. Full-suite/App Release/online CI remain outstanding because of the
 local toolchain limits above; judge review and any follow-up fixes must precede pushing/opening PR.
+
+Review iteration (not yet approved): actor execution, reset tombstone, paired snapshots and removal
+of the aggregate address the four review findings. Additional regressions guard acknowledgement
+revisions, close/reopen, duplicate-click coalescing and nonrecursive cleanup. Initial Xcode targeted
+runs passed; final full-suite/Release results and controlled mutation results are recorded against
+the exact next checkpoint in issue #106 before its second independent review. The earlier CLT
+limitation is historical; the installed Xcode now supports the standard gates without any license
+acceptance action by this task. No installed app was signed, launched or replaced.

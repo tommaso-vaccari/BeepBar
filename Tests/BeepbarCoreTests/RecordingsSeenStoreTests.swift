@@ -51,6 +51,18 @@ struct RecordingsSeenStoreTests {
         #expect(try store.seen(owner: 42, key: key, ids: ["a", "fail"], establishBaseline: true, legacy: empty) == ["a", "fail"])
     }
 
+    /// Cleanup must not recursively delete local files if the expected database path is
+    /// unexpectedly a directory. Reset can tombstone it; removal reports the collision.
+    @Test func cleanupDoesNotRecursivelyDeleteUnexpectedDatabaseDirectory() throws {
+        defer { cleanUp() }
+        let collision = folder.appendingPathComponent(RecordingsSeenStore.fileName)
+        try FileManager.default.createDirectory(at: collision, withIntermediateDirectories: true)
+        let sentinel = collision.appendingPathComponent("local.fixture")
+        try Data("preserve".utf8).write(to: sentinel)
+        #expect(throws: (any Error).self) { try store.delete() }
+        #expect(try Data(contentsOf: sentinel) == Data("preserve".utf8))
+    }
+
     /// An acknowledgement before the first listing must not turn that scope into a baseline.
     /// Legacy survivor matching is limited to migrated courses, not fresh course baselines.
     @Test func openingBeforeListingAndMigrationAreDistinct() throws {

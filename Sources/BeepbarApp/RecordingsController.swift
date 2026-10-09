@@ -54,6 +54,10 @@ struct RecordingsListing: Equatable {
     var isLoading = false
     var problem: RecordingsProblem?
     var updatedAt: Date?
+    /// Membership snapshot paired with this exact successfully loaded list.
+    var seenIDs: Set<String>?
+    /// A successful acknowledgement cannot turn a failed list refresh into a fresh one.
+    var historyReadFailed = false
 }
 
 /// The Recordings feature: the switch in Settings, the Polimi session, and the recordings of the
@@ -62,7 +66,7 @@ struct RecordingsListing: Equatable {
 /// Promises this class keeps, each guarded by `RecordingsControllerTests`:
 /// - **On by default for Polimi, and gone when off.** Turning it off, disconnecting the WeBeep account or
 ///   switching university (`turnOff()`) closes the browser and deletes the saved session and
-///   every setting the feature wrote. Another WeBeep account never inherits a Polimi session:
+///   its user data (an opaque reset namespace remains). Another WeBeep account never inherits a Polimi session:
 ///   the saved one names its owner and is dropped when the known account differs.
 /// - **Quiet at rest.** Nothing runs and no file is read until the Recordings page is shown or a
 ///   sign-in starts; the browser is closed as soon as the page is gone, unless a sign-in is on
@@ -80,6 +84,8 @@ struct RecordingsListing: Equatable {
     static let enabledKey = "io.github.tvaccari.beepbar.recordings-enabled.v1"
     static let acknowledgedKey = "io.github.tvaccari.beepbar.recordings-acknowledged.v1"
     static let baselinedKey = "io.github.tvaccari.beepbar.recordings-baselined.v1"
+    /// Durable reset tombstone: a failed file removal can never reuse the old namespace.
+    static let historyNamespaceKey = "io.github.tvaccari.beepbar.recordings-history-namespace.v2"
     /// A course shown again within this time isn't asked for again unless the user refreshes.
     static let freshness: TimeInterval = 300
 
@@ -92,9 +98,13 @@ struct RecordingsListing: Equatable {
     @Published private(set) var openingRecordingID: String?
     /// Why the last attempt to open a recording failed, until the next one.
     @Published private(set) var openingProblem: RecordingsProblem?
-    @Published private(set) var acknowledged: Set<String>
-    private var acknowledgedByCourse: [RecmanCourseKey: Set<String>] = [:]
-    private let seenStore: RecordingsSeenStore
+    private var seenHistory: RecordingsSeenHistory
+    private let makeSeenHistory: @MainActor (UUID?) -> RecordingsSeenHistory
+    private var historyResetTask: Task<Void, Never>?
+    private var historyRevision: [RecmanCourseKey: Int] = [:]
+    private var pendingAcknowledgements: [UUID: RecmanCourseKey] = [:]
+    /// Coalesce repeated clicks while the same IDs are being committed; no duplicate task queue.
+    private var pendingAcknowledgementIDs: [RecmanCourseKey: Set<String>] = [:]
     private var legacyOwner: Int?
     private var legacySeen: RecordingsSeenStore.Legacy
 
@@ -138,6 +148,7 @@ struct RecordingsListing: Equatable {
         makeBrowser: @escaping @MainActor () -> RecmanBrowsing = { RecmanWebSession() },
         store: RecordingsSessionStore = .standard,
         defaults: UserDefaults,
+        makeSeenHistory: (@MainActor (UUID?) -> RecordingsSeenHistory)? = nil,
         ownerUserID: @escaping @MainActor () -> Int?,
         isAvailable: @escaping @MainActor () -> Bool,
         openURL: @escaping @MainActor (URL) -> Void = { NSWorkspace.shared.open($0) },
@@ -149,7 +160,20 @@ struct RecordingsListing: Equatable {
     ) {
         self.makeBrowser = makeBrowser
         self.store = store
-        self.seenStore = RecordingsSeenStore(directory: store.directory)
+        let historyFactory = makeSeenHistory ?? { namespace in
+            RecordingsSeenHistory(store: RecordingsSeenStore(directory: store.directory, namespace: namespace))
+        }
+        self.makeSeenHistory = historyFactory
+        let savedNamespace = defaults.string(forKey: Self.historyNamespaceKey)
+        let namespace = savedNamespace.flatMap(UUID.init(uuidString:))
+        if savedNamespace != nil && namespace == nil {
+            // An invalid tombstone must not fall back to the pre-reset canonical database.
+            let replacement = UUID()
+            defaults.set(replacement.uuidString, forKey: Self.historyNamespaceKey)
+            self.seenHistory = historyFactory(replacement)
+        } else {
+            self.seenHistory = historyFactory(namespace)
+        }
         self.defaults = defaults
         self.ownerUserID = ownerUserID
         self.isAvailable = isAvailable
@@ -161,7 +185,6 @@ struct RecordingsListing: Equatable {
         let enabled = (defaults.object(forKey: Self.enabledKey) as? Bool ?? true) && isAvailable()
         isEnabled = enabled
         access = enabled ? .ready : .off
-        acknowledged = []
         legacySeen = .init(ids: enabled ? defaults.stringArray(forKey: Self.acknowledgedKey) ?? [] : [], baselines: enabled ? defaults.stringArray(forKey: Self.baselinedKey) ?? [] : [])
     }
 
@@ -187,7 +210,8 @@ struct RecordingsListing: Equatable {
         }
     }
 
-    /// Off and forgotten: browser closed, saved session deleted, every recordings setting removed.
+    /// Off and forgotten: session/history removed; a persisted opaque namespace prevents reuse
+    /// if history file cleanup fails. It contains no account or recording IDs.
     /// Also called when the WeBeep account is disconnected or the university changes, whether or
     /// not the feature was on, so no session outlives the account it was made for.
     func turnOff() {
@@ -341,7 +365,7 @@ struct RecordingsListing: Equatable {
 
     private func finishOpening(_ recording: RecmanRecording, url: URL, action: OpenAction) {
         if openingRecordingID == recording.id { openingRecordingID = nil }
-        if let key = RecmanCourseKey(courseCode: recording.courseCode, academicYear: recording.academicYear) { acknowledge([recording.id], for: key) }
+        if let key = RecmanCourseKey(courseCode: recording.courseCode, academicYear: recording.academicYear) { scheduleAcknowledge([recording.id], for: key, opening: openingRequest) }
         switch action {
         case .play: openURL(url)
         case .copyLink: copy(url)
@@ -350,55 +374,83 @@ struct RecordingsListing: Equatable {
 
     // MARK: New recordings
 
+    /// Pure memory lookup: a list is published only with its matching membership snapshot.
+    /// No disk read, lazy migration or aggregate scan runs from SwiftUI row evaluation.
     func isNew(_ recording: RecmanRecording) -> Bool {
-        guard let key = RecmanCourseKey(courseCode: recording.courseCode, academicYear: recording.academicYear) else { return false }
-        if let seen = acknowledgedByCourse[key] { return !seen.contains(recording.id) }
-        // Usually the listing supplies this cache. A caller asking before listing reads just
-        // its one ID, after checking the saved session's owner (including offline launches).
-        if listings[key]?.recordings != nil { return false }
-        if sessionOwner == nil { _ = savedCookies() }
-        guard let owner = sessionOwner ?? ownerUserID() else { return false }
-        do {
-            guard let seen = try seenStore.seen(owner: owner, key: key, ids: [recording.id], establishBaseline: false, legacy: legacy(for: owner)) else { return false }
-            discardLegacyDefaults()
-            return !seen.contains(recording.id)
-        } catch { return false }
+        guard let key = RecmanCourseKey(courseCode: recording.courseCode, academicYear: recording.academicYear),
+              let seen = listings[key]?.seenIDs else { return false }
+        return !seen.contains(recording.id)
     }
 
     func newCount(for key: RecmanCourseKey) -> Int {
-        listings[key]?.recordings?.filter(isNew).count ?? 0
+        guard let listing = listings[key], let seen = listing.seenIDs else { return 0 }
+        return listing.recordings?.reduce(0) { $0 + (seen.contains($1.id) ? 0 : 1) } ?? 0
     }
 
-    /// "Segna come viste": publish cleared dots only after their durable acknowledgement.
+    /// Dots clear after the serialized worker commits their durable acknowledgement.
     func markSeen(_ key: RecmanCourseKey) {
-        acknowledge(listings[key]?.recordings?.map(\.id) ?? [], for: key)
+        scheduleAcknowledge(listings[key]?.recordings?.map(\.id) ?? [], for: key)
     }
 
     nonisolated static func baselineID(courseCode: String, academicYear: Int) -> String {
         "\(courseCode)-\(academicYear)"
     }
 
-    private func acknowledge(_ ids: [String], for key: RecmanCourseKey) {
+    private func scheduleAcknowledge(_ ids: [String], for key: RecmanCourseKey, opening: Int? = nil) {
         guard let owner = sessionOwner ?? ownerUserID(), !ids.isEmpty else { return }
-        let added = ids.filter { !(acknowledgedByCourse[key]?.contains($0) ?? false) }
+        let pending = pendingAcknowledgementIDs[key] ?? []
+        let added = ids.filter { !(listings[key]?.seenIDs?.contains($0) ?? false) && !pending.contains($0) }
         guard !added.isEmpty else { return }
-        do {
-            try seenStore.acknowledge(owner: owner, key: key, ids: added, legacy: legacy(for: owner))
-            discardLegacyDefaults()
-            // Cache only scopes already loaded: opening an unseen course does not establish
-            // its first-listing baseline, nor should it make its other recordings look new.
-            if acknowledgedByCourse[key] != nil { acknowledgedByCourse[key]?.formUnion(added) }
-            publishAcknowledged()
-            listings[key]?.problem = nil
-        } catch {
-            listings[key]?.problem = .historyUnavailable
-            openingProblem = .historyUnavailable
-            log.error("Couldn't save recording history")
+        let history = seenHistory
+        let generation = self.generation
+        let legacy = legacy(for: owner)
+        let reset = historyResetTask
+        let operation = UUID()
+        pendingAcknowledgements[operation] = key
+        pendingAcknowledgementIDs[key, default: []].formUnion(added)
+        Task { [weak self] in
+            guard let self else { return }
+            defer {
+                // A reset removes the operation token; its old completion must not subtract
+                // IDs belonging to a later account's acknowledgement of the same course.
+                if self.pendingAcknowledgements.removeValue(forKey: operation) != nil {
+                    self.pendingAcknowledgementIDs[key]?.subtract(added)
+                    if self.pendingAcknowledgementIDs[key]?.isEmpty == true { self.pendingAcknowledgementIDs.removeValue(forKey: key) }
+                }
+            }
+            await reset?.value
+            // Explicit user acknowledgements persist when the page closes, but never after
+            // an account/reset boundary. Their fixed scoped IDs remain valid across page generations.
+            guard self.isCurrentIdentity(history, owner: owner) else { return }
+            do {
+                try await history.acknowledge(owner: owner, key: key, ids: added, legacy: legacy)
+                guard self.isCurrentIdentity(history, owner: owner) else { return }
+                self.discardLegacyDefaults()
+                self.historyRevision[key, default: 0] += 1
+                // Explicit acknowledgement IDs belong to this account/course, so they remain
+                // valid across page generations (close/reopen). Never publish old browser/list
+                // results here: only merge the committed IDs into a current matching snapshot.
+                // Opening before the first listing still does not establish a baseline.
+                if self.listings[key]?.seenIDs != nil { self.listings[key]?.seenIDs?.formUnion(added) }
+                if self.listings[key]?.historyReadFailed != true, self.listings[key]?.problem == .historyUnavailable { self.listings[key]?.problem = nil }
+            } catch {
+                guard self.isCurrentHistory(history, owner: owner, generation: generation) else { return }
+                self.listings[key]?.problem = .historyUnavailable
+                if let opening, opening == self.openingRequest { self.openingProblem = .historyUnavailable }
+                self.log.error("Couldn't save recording history")
+            }
         }
     }
 
-    private func publishAcknowledged() {
-        acknowledged = acknowledgedByCourse.values.reduce(into: Set<String>()) { $0.formUnion($1) }
+    /// Validate both identity and lifecycle after every await, before publishing or scheduling
+    /// another operation. The old actor is also invalidated at reset, so queued writes reject.
+    private func isCurrentHistory(_ history: RecordingsSeenHistory, owner: Int, generation: Int) -> Bool {
+        self.generation == generation && isCurrentIdentity(history, owner: owner)
+    }
+
+    private func isCurrentIdentity(_ history: RecordingsSeenHistory, owner: Int) -> Bool {
+        isEnabled && seenHistory === history && (sessionOwner ?? ownerUserID()) == owner &&
+            (ownerUserID() == nil || ownerUserID() == owner)
     }
 
     /// Import only history whose saved session verified this account. A failed session read
@@ -414,13 +466,27 @@ struct RecordingsListing: Equatable {
     }
 
     private func forgetSeen() {
-        acknowledgedByCourse = [:]
-        acknowledged = []
+        for key in listings.keys { listings[key]?.seenIDs = nil }
+        historyRevision = [:]
+        pendingAcknowledgements = [:]
+        pendingAcknowledgementIDs = [:]
         legacySeen = .init(ids: [], baselines: [])
         legacyOwner = nil
         defaults.removeObject(forKey: Self.acknowledgedKey)
         defaults.removeObject(forKey: Self.baselinedKey)
-        do { try seenStore.delete() } catch { log.error("Couldn't delete recording history") }
+        // Rotate the persisted namespace before asynchronous cleanup. Removal can fail, but
+        // neither re-enable nor restart ever reads that previous namespace again (#106).
+        let namespace = UUID()
+        defaults.set(namespace.uuidString, forKey: Self.historyNamespaceKey)
+        let previous = seenHistory
+        previous.invalidate()
+        let reset = historyResetTask
+        seenHistory = makeSeenHistory(namespace)
+        historyResetTask = Task { [log] in
+            await reset?.value
+            do { try await previous.invalidateAndDelete() }
+            catch { log.error("Couldn't delete obsolete recording history; next use retries cleanup") }
+        }
     }
 
     // MARK: Worker
@@ -428,6 +494,7 @@ struct RecordingsListing: Equatable {
     private func needsLoad(_ key: RecmanCourseKey, force: Bool) -> Bool {
         if key == runningKey { return false }
         if force || queue.contains(.list(key)) { return true }
+        if listings[key]?.problem == .historyUnavailable { return true }
         guard let updatedAt = listings[key]?.updatedAt else { return true }
         return now().timeIntervalSince(updatedAt) > Self.freshness
     }
@@ -476,8 +543,9 @@ struct RecordingsListing: Equatable {
                     runningKey = key
                     let recordings = try await browser.recordings(for: key)
                     guard generation == self.generation else { return }
+                    await record(recordings, for: key, generation: generation)
+                    guard generation == self.generation else { return }
                     runningKey = nil
-                    record(recordings, for: key)
                 case .open(let recording, let action, let request):
                     let url: URL
                     if let cached = playbackURLs[recording.id] {
@@ -508,22 +576,43 @@ struct RecordingsListing: Equatable {
         startWorker()
     }
 
-    private func record(_ recordings: [RecmanRecording], for key: RecmanCourseKey) {
-        var listing = listings[key] ?? RecordingsListing()
-        listing.recordings = recordings
-        listing.isLoading = queue.contains(.list(key))
-        listing.problem = nil
-        listing.updatedAt = now()
-        listings[key] = listing
-        guard let owner = sessionOwner ?? ownerUserID() else { return }
-        do {
-            acknowledgedByCourse[key] = try seenStore.seen(owner: owner, key: key, ids: recordings.map(\.id), establishBaseline: true, legacy: legacy(for: owner))
-            discardLegacyDefaults()
-            publishAcknowledged()
-        } catch {
-            // Preserve any previous cache and history; a failed transaction is not a new
-            // baseline. The next complete listing retries rather than overwriting the DB.
+    private func record(_ recordings: [RecmanRecording], for key: RecmanCourseKey, generation: Int) async {
+        guard let owner = sessionOwner ?? ownerUserID() else {
+            listings[key]?.isLoading = false
             listings[key]?.problem = .historyUnavailable
+            return
+        }
+        let history = seenHistory
+        let legacy = legacy(for: owner)
+        await historyResetTask?.value
+        guard isCurrentHistory(history, owner: owner, generation: generation) else { return }
+        do {
+            let ids = recordings.map(\.id)
+            var seen: Set<String>
+            while true {
+                let revision = historyRevision[key, default: 0]
+                seen = try await history.seen(owner: owner, key: key, ids: ids, legacy: legacy)
+                guard isCurrentHistory(history, owner: owner, generation: generation) else { return }
+                // An acknowledgement can commit/publish while this snapshot returns. Requery
+                // rather than overwrite that newer state with an older membership snapshot.
+                if historyRevision[key, default: 0] == revision { break }
+            }
+            discardLegacyDefaults()
+            var listing = listings[key] ?? RecordingsListing()
+            listing.recordings = recordings
+            listing.seenIDs = seen
+            listing.historyReadFailed = false
+            listing.isLoading = queue.contains(.list(key))
+            listing.problem = nil
+            listing.updatedAt = now()
+            // Publish the list and its history together. A failed refresh retains the previous
+            // pair, so a newly returned list cannot use an incomplete/stale membership cache.
+            listings[key] = listing
+        } catch {
+            guard isCurrentHistory(history, owner: owner, generation: generation) else { return }
+            listings[key, default: RecordingsListing()].isLoading = queue.contains(.list(key))
+            listings[key]?.problem = .historyUnavailable
+            listings[key]?.historyReadFailed = true
             log.error("Couldn't load recording history")
         }
     }
@@ -577,6 +666,9 @@ struct RecordingsListing: Equatable {
 
     /// Stops the worker and any sign-in for good: they belong to an older generation from now on.
     private func invalidate() {
+        // A pending explicit acknowledgement may commit after the page closes. Its old
+        // generation cannot publish, so force a history reload when this list returns.
+        for key in pendingAcknowledgements.values { listings[key]?.updatedAt = nil }
         generation += 1
         worker?.cancel()
         worker = nil

@@ -4,11 +4,28 @@ import Foundation
 /// Exact recording history scoped to the WeBeep account, course and academic year (#106).
 /// Only IDs supplied by the current listing are queried: old history stays on disk, never in
 /// a process-wide set. No time-based eviction is safe because Recman can publish old lectures.
-/// Calls are synchronous and serialized by the controller; each call closes its connection.
+/// Calls are synchronous primitives owned by RecordingsSeenHistory off the main actor; each
+/// call closes its connection. A namespace tombstone makes failed cleanup safe across relaunch.
 public struct RecordingsSeenStore: Sendable {
     public static let fileName = "recordings-seen-v2.sqlite"
     private let directory: @Sendable () throws -> URL
-    public init(directory: @escaping @Sendable () throws -> URL) { self.directory = directory }
+    public let databaseFileName: String
+    private let removeFile: @Sendable (URL) throws -> Void
+    public init(directory: @escaping @Sendable () throws -> URL, namespace: UUID? = nil) {
+        self.init(directory: directory, namespace: namespace, removeFile: Self.unlinkFile)
+    }
+
+    /// Test injection changes only file removal, so reset regressions use the real database.
+    package init(directory: @escaping @Sendable () throws -> URL, namespace: UUID? = nil, removeFile: @escaping @Sendable (URL) throws -> Void) {
+        self.directory = directory
+        databaseFileName = namespace.map { "recordings-seen-v2-\($0.uuidString).sqlite" } ?? Self.fileName
+        self.removeFile = removeFile
+    }
+
+    /// unlink never recursively removes a directory unexpectedly replacing a database file.
+    private static func unlinkFile(_ url: URL) throws {
+        if unlink(url.path) != 0, errno != ENOENT { throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO) }
+    }
 
     /// v1 did not retain the course of each seen ID. Keep its surviving IDs in a small legacy
     /// table and consult them for migrated courses only; evicted IDs cannot be recovered.
@@ -62,13 +79,26 @@ public struct RecordingsSeenStore: Sendable {
         }
     }
 
-    /// Feature disable/logout/account change is the explicit retention boundary. The connection
-    /// has already closed, so no outstanding write can recreate the deleted history.
+    /// Remove this namespace. Its worker must invalidate pending operations first; a controller
+    /// tombstone has already rotated the active namespace before this cleanup runs.
     public func delete() throws {
         let folder = try directory()
         for suffix in ["", "-journal", "-wal", "-shm"] {
-            let url = folder.appendingPathComponent(Self.fileName + suffix)
-            if FileManager.default.fileExists(atPath: url.path) { try FileManager.default.removeItem(at: url) }
+            let url = folder.appendingPathComponent(databaseFileName + suffix)
+            if FileManager.default.fileExists(atPath: url.path) { try removeFile(url) }
+        }
+    }
+
+    /// Retry obsolete tombstoned files on actual history work, never with an idle timer.
+    /// A failed deletion does not prevent the new namespace from storing its own baseline.
+    public func removeObsoleteFiles() throws {
+        let folder = try directory()
+        guard FileManager.default.fileExists(atPath: folder.path) else { return }
+        for name in try FileManager.default.contentsOfDirectory(atPath: folder.path) {
+            let base = name.replacingOccurrences(of: #"-(journal|wal|shm)$"#, with: "", options: .regularExpression)
+            guard base != databaseFileName,
+                  base == Self.fileName || base.range(of: #"^recordings-seen-v2-[0-9A-Fa-f-]{36}\.sqlite$"#, options: .regularExpression) != nil else { continue }
+            try removeFile(folder.appendingPathComponent(name))
         }
     }
 
@@ -79,7 +109,7 @@ public struct RecordingsSeenStore: Sendable {
         // Foundation normalizes /private/var back to symlinked /var on macOS. Resolve only
         // the existing parent, preserving NOFOLLOW for the final history file itself.
         guard let resolved = realpath(folder.path, nil) else { throw SyncDatabaseError.invalidPath }
-        let path = String(cString: resolved) + "/" + Self.fileName
+        let path = String(cString: resolved) + "/" + databaseFileName
         free(resolved)
         // Create privately before SQLite opens it; never chmod a newly exposed history file.
         let fd = open(path, O_CREAT | O_EXCL | O_WRONLY | O_NOFOLLOW, 0o600)
@@ -147,5 +177,65 @@ public struct RecordingsSeenStore: Sendable {
     }
     private func run(_ sql: String, _ values: [String], db: OpaquePointer) throws {
         _ = try exists(sql, values, db: db)
+    }
+}
+
+/// Synchronous, cheap invalidation also rejects actor calls queued after a reset. The lock is
+/// never held during disk work, so closing a page/account cannot wait for SQLite on the main.
+private final class RecordingHistoryValidity: @unchecked Sendable {
+    private let lock = NSLock()
+    private var active = true
+    func invalidate() { lock.withLock { active = false } }
+    var isActive: Bool { lock.withLock { active } }
+}
+
+/// Serial executor for durable history operations. No SQLite call runs on the main actor.
+/// After invalidation, a queued old request cannot recreate a reset namespace. The UUID namespace
+/// selected by the controller prevents reuse even if removal itself fails (e.g. permissions).
+public actor RecordingsSeenHistory {
+    private let store: RecordingsSeenStore
+    private nonisolated let validity = RecordingHistoryValidity()
+    private let beforeRead: @Sendable () async -> Void
+    private let beforeAcknowledge: @Sendable () async -> Void
+    private let afterRead: @Sendable () async -> Void
+
+    public init(store: RecordingsSeenStore) {
+        self.store = store
+        beforeRead = {}
+        beforeAcknowledge = {}
+        afterRead = {}
+    }
+
+    /// Gates exercise real actor reentrancy, late results and resets in isolated tests.
+    package init(store: RecordingsSeenStore, beforeRead: @escaping @Sendable () async -> Void = {}, beforeAcknowledge: @escaping @Sendable () async -> Void = {}, afterRead: @escaping @Sendable () async -> Void = {}) {
+        self.store = store
+        self.beforeRead = beforeRead
+        self.beforeAcknowledge = beforeAcknowledge
+        self.afterRead = afterRead
+    }
+
+    public func seen(owner: Int, key: RecmanCourseKey, ids: [String], legacy: RecordingsSeenStore.Legacy) async throws -> Set<String> {
+        await beforeRead()
+        guard validity.isActive, !Task.isCancelled else { throw CancellationError() }
+        try? store.removeObsoleteFiles()
+        // This synchronous actor segment has no await between identity validation and commit.
+        let seen = try store.seen(owner: owner, key: key, ids: ids, establishBaseline: true, legacy: legacy) ?? []
+        await afterRead()
+        guard validity.isActive, !Task.isCancelled else { throw CancellationError() }
+        return seen
+    }
+
+    public func acknowledge(owner: Int, key: RecmanCourseKey, ids: [String], legacy: RecordingsSeenStore.Legacy) async throws {
+        await beforeAcknowledge()
+        guard validity.isActive, !Task.isCancelled else { throw CancellationError() }
+        try? store.removeObsoleteFiles()
+        try store.acknowledge(owner: owner, key: key, ids: ids, legacy: legacy)
+    }
+
+    public nonisolated func invalidate() { validity.invalidate() }
+
+    public func invalidateAndDelete() throws {
+        invalidate()
+        try store.delete()
     }
 }

@@ -72,6 +72,18 @@ I budget sono obiettivi provvisori, non risultati già raggiunti. Una baseline n
 | File nuovi/aggiornati | Memoria indipendente dalla dimensione del file; misurare throughput, CPU e letture prima di attribuire il limite alla rete |
 | Annullamento | p95 <1 s nelle fasi interrompibili, compresi file grandi; sicurezza del completamento/recupero nelle fasi atomiche |
 
+## Risultati obbligatori nelle PR: incremento e confronto con main
+
+Comando unico riproducibile: [`scripts/benchmark.sh compare`](benchmarks.md#reproducible-ref-comparisons-single-agent-command); seguire prerequisiti, policy di compatibilità e passi per agenti. Conservare report e limiti; validazione tooling distinta dai benefici applicativi.
+
+Ogni PR di performance deve riportare due confronti distinti, con SHA esatti e link ai report: **base dev della PR → HEAD finale** per attribuire il beneficio alla modifica, e **main → HEAD finale** per quantificare il risultato cumulativo rispetto alla release. Alla chiusura di D13 ripetere l'intera baseline su main e dev finali. Verificare i riferimenti remoti prima delle misure; fissare lo SHA di main per il ciclo e non cambiare silenziosamente il riferimento se arriva una release. Un confronto con un main successivo è una nuova serie dichiarata.
+
+Usare la stessa macchina, Release arm64, alimentazione e condizioni termiche confrontabili, dataset, rete sintetica, warm-up, campioni e harness equivalente su entrambi i commit. Un vecchio report dev non è automaticamente una baseline main. Conservare JSON e comandi; se cambia il corpus o lo strumento, rieseguire entrambi i lati oppure dichiarare il confronto non disponibile.
+
+La descrizione della PR include una tabella con scenario/metrica/unità, main, base dev, HEAD, delta assoluto e percentuale per entrambi i confronti. Separare CPU, tempo trascorso, memoria, lavoro DB/I/O/rete e annullamento; includere peggioramenti, dispersione e limiti. Per costi riportare riduzione `(prima - dopo) / prima × 100`; per throughput incremento `(dopo - prima) / prima × 100`. Con baseline zero riportare solo delta assoluto, senza percentuale. Non sommare percentuali di task o corpus differenti né trasformare benchmark Core in una promessa sulla reattività dell'intera app.
+
+Se manca una misura confrontabile, scrivere **non misurato** e indicare il comando/prossimo passo; non sostituire numeri con deduzioni dal codice. Per fix di correttezza senza beneficio temporale dimostrato riportare la regressione red/green e i conteggi pertinenti; per PR solo documentali dichiarare non applicabile. Il report finale deve permettere affermazioni delimitate come «sync invariata: X% meno CPU rispetto a main», non «app X% più veloce» senza misure end-to-end dedicate.
+
 ## Review e battle testing obbligatori
 
 1. Un reviewer senior indipendente, che non ha scritto la modifica, esamina l’intero diff contro i principi qui definiti e le specifiche IT/EN. Per lavoro affidato ad agenti usare un subagente indipendente; il responsabile della modifica non può autocertificare la review.

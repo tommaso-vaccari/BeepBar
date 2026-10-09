@@ -147,3 +147,95 @@ BEEPBAR_RESTORE_BENCHMARK=1 swift test -c release --arch arm64 -Xswiftc -DDEBUG 
 ```
 
 Release optimization remains enabled; `DEBUG` enables the existing isolated controller constructor and test hooks. All data, defaults and SQLite are temporary; no account, real preferences or network is used. The test is disabled in regular CI. It restores synthetic summaries containing 1,000 and 15,000 file details, warms up once and prints seven samples, JSON size, write attempts, end-to-end restore latency and separate synchronous codec timings. Compare the same configuration on the same machine and power source, without concurrent builds/tests. End-to-end async latency is not main-thread occupancy: use the codec timings to justify moving decode work and Instruments to validate UI latency. New-result encoding remains a separate path.
+
+## Reproducible ref comparisons (single agent command)
+
+Use the existing harness through `scripts/benchmark.sh compare`. It never checks out a ref in
+this checkout, launches/installs the app, or measures real accounts/network. It archives each
+full source SHA into its own temporary directory and builds `beepbar-bench` Release arm64.
+
+Prerequisites: macOS on Apple Silicon, Xcode/Swift matching CI, Git, Python 3.9+ (standard library
+only), AC power, Low Power Mode off, nominal thermal state, enough temporary disk space and
+resolved Swift package dependencies. The command copies only dependency artifacts/checkouts/
+repositories from `.build` (or `--dependency-cache DIR`); it never reuses compiled app/Core objects.
+Dependency resolution is disabled: missing dependencies fail with retained build logs. Build
+sandbox disabling is limited to SwiftPM in isolated source directories. Do not run builds/tests
+concurrently with measurements. Default sampling is five measured runs after one warm-up.
+
+Agent steps:
+
+1. Read the project instructions and measurement requirements; inspect `git status` and preserve
+   user changes. Fetch remote refs explicitly before measuring: `git fetch origin`.
+2. Commit the candidate on its feature branch. Choose the PR's actual base-dev SHA and freeze main
+   for this series; a later release requires a separately named output series.
+3. Run the single command from a checkout containing this tooling (the measured candidate can be
+   another ref). Each ref is resolved to a full SHA exactly once before any build. `--out` must not
+   exist; existing evidence is never overwritten.
+
+```sh
+scripts/benchmark.sh compare --main origin/main --base-dev origin/dev \
+  --candidate HEAD --out PerformanceReports/my-change --runs 5 --warmup 1
+```
+
+4. If native measurement source trees differ, the command refuses the comparison. Inspect the
+   differences first. Explicitly choose one committed harness for all three production revisions
+   with `--harness-ref REF`. Only `Sources/BeepbarBenchmarkKit` and `Sources/BeepbarBenchmarks` are
+   overlaid; production sources, package manifest and dependencies remain from each source SHA.
+   Build/API incompatibility fails instead of patching production. Selecting an older harness
+   means its newer counters are unmeasured. Every overlay is retained as a per-ref patch and
+   native/effective file SHA-256 identities; adjusted raw reports carry `dirty: true`.
+
+The released fixture historically omitted saved folder overrides. To reproduce the explicitly
+matched fixture documented in the existing `2026-10-09-main-vs-dev/conditions.log`, choose an old
+harness and request this specific fixture-only adjustment:
+
+```sh
+scripts/benchmark.sh compare --main origin/main --base-dev origin/dev \
+  --candidate HEAD --harness-ref origin/main --saved-folder-overrides \
+  --out PerformanceReports/my-change-matched --runs 5 --warmup 1
+```
+
+`--saved-folder-overrides` persists normal module destinations before the setup sync on all
+three revisions. It requires `--harness-ref`, refuses an already adjusted or unrecognized fixture,
+and records the option, effective hashes and actual source patches. It changes no application code.
+A harness selection is an explicit measurement policy; inspect its checks/workload against the
+budget being evaluated. Unknown metrics or raw-report schemas are refused. If an API, manifest,
+fixture or instrumentation cannot be made equivalent using these measurement-only options,
+report **not measured** and extend the existing harness with a reviewed adjustment first.
+
+5. Check exit status, `comparison.json` validity and every scenario's checks. Reports must agree
+   on scenario name/parameters, check names, warm-up, sample counts, machine, OS, power and build.
+   Metric distributions are recalculated from raw samples and checked against the harness JSON.
+   Failed subprocesses, missing/invalid samples or incompatible reports never produce valid rows.
+   Costs increasing at either median or p95 are marked regressions; delta is candidate minus base,
+   percentage is cost reduction `(base - candidate) / base * 100`. A zero baseline has no percentage.
+6. Paste `comparison.md` into the PR and retain the output directory. Separate tooling validation
+   from measured app gains. Include regressions, spread and limitations; Core timings establish
+   no UI, idle or real-network improvement. With five runs p95 is the maximum, not a stable tail estimate.
+
+Exit codes: **0** all comparisons valid (regressions still appear), **1** invalid comparison/build/
+subprocess/report or output error, **64** invalid arguments, **130** interruption (SIGINT/SIGTERM).
+Failure results and diagnostics remain; incomplete runs have `valid: false`. An output directory
+creation failure leaves the existing directory untouched. Temporary source/build/fixture/dependency
+and module-cache files owned by this command are removed on success, failure and handled interruption;
+logs/results stay. SIGKILL or power loss cannot run cleanup; `temporaryRoot` identifies the owned
+leftover directory. Never delete unrelated paths or existing reports.
+
+Output layout:
+
+```text
+comparison.json                 SHAs, refs, driver hash, effective/native harness hashes,
+                                commands/exits, toolchain/environments, comparisons, limitations
+comparison.md                   PR table: units, median/p95, absolute/% deltas, regressions
+{main,base-dev,candidate}-*.log  export/build/toolchain diagnostics
+*-measurement.patch            explicit per-source measurement adjustments
+{main,base-dev,candidate}/       each scenario's raw JSON (samples/checks/notes/environment) + log
+```
+
+The standard plan is unchanged 1k/15k, updates 64/256 MiB and mid-download cancellation.
+For a real end-to-end tooling smoke test, append `--smoke`; it uses 10 files, a 1 MiB update and
+4 MiB throttled cancellation with identical sampling on all three refs. Smoke reports explicitly
+state that the reduced corpus does not establish the standard baseline.
+
+Run safeguards locally with `python3 scripts/test_benchmark_compare.py`; CI runs these alongside
+`swift test`. Mutation checks must use a disposable copy, especially for cleanup changes.

@@ -4,6 +4,38 @@ This file contains the general workflow and project rules shared by the team. Pu
 
 Read `AGENTS.override.md` first when it exists. It stays untracked and must never be copied into shared files, commits, PRs, or comments.
 
+## Starting or resuming work
+
+Every agent must establish context from the shared repository and GitHub before implementing a task:
+
+1. Read [team workflow](docs/team-workflow.md) for task ownership, handoff, verification, and delivery rules, and [product direction and performance plan](docs/performance-plan.md) for priorities, dependencies, evidence, and acceptance criteria.
+2. Read the relevant [behavior specification in Italian](docs/sync-behavior.it.md) and [English](docs/sync-behavior.en.md). These define the behavior to preserve; the performance plan defines improvements within those guarantees. Read [benchmark documentation](docs/benchmarks.md) before measuring performance.
+3. Inspect the current [GitHub issues](https://github.com/tommaso-vaccari/BeepBar/issues), the [performance delivery tracker](https://github.com/tommaso-vaccari/BeepBar/issues/116), the selected issue's full discussion, dependencies, linked issues and PRs, and their current status. Use the task requested by the user; when asked to choose, select an unassigned issue whose prerequisites are satisfied, following the plan's priorities. Do not duplicate work already assigned or in progress. The tracker's assignee does not own every child issue.
+4. Verify the checkout, branch, local changes, and current remote base. Recheck historical findings against current code; an old audit, chat, or override does not prove that a bug or dependency is still open. Before implementing, state the issue, base commit, scope, dependencies, and completion criteria.
+5. Recover all context relevant to the selected task: issue bodies and comments, dependency decisions, linked PR discussions and reviews, existing reports, and related earlier chats when accessible and authorized. Search by issue number, task identifier, branch, and affected component; follow relevant references until scope, decisions, evidence, and open questions are understood. Do not assume access to other agents' chats or rely on them for essential context. Verify historical claims against current sources and preserve necessary non-private decisions or evidence in the issue, PR, or shared documentation. If required context remains unavailable, identify the gap and ask the user rather than guessing.
+6. Before pausing or handing off, record the branch/commit, PR, completed work, uncommitted changes, verification results and their SHA, unresolved findings, blockers, and next step in the shared issue or PR within the authorized scope. Keep personal details in the override. Another agent must be able to resume from shared sources without this chat.
+
+## Issue ownership and keeping the plan current
+
+- Selecting an issue means taking responsibility for its delivery. Before implementation, assign it to the responsible team member using their authorized GitHub identity and record the working branch, base SHA, dependencies, scope, and completion criteria. Recheck ownership immediately before claiming it; never take over or reassign another member's task without agreement. If GitHub access prevents recording ownership, report the coordination blocker before starting overlapping work.
+- Keep the issue, linked PR, relevant tracker entry, and `docs/performance-plan.md` consistent when work starts, scope or dependencies change, evidence changes a finding, work pauses, or delivery completes. The issue is authoritative for live ownership and operational status; the plan records the current roadmap, findings, decisions, and delivery evidence with issue/PR links. Do not store shared progress only in a chat or private override.
+- Update the relevant plan sections in every performance delivery PR, including investigations ending without a fix. Record measured results, exact SHAs, commands/report references, regressions, limitations, remaining work, and the decision. Follow the plan's requirements for both base-dev → HEAD and main → HEAD comparisons; unavailable measurements stay explicitly unmeasured. An open PR is not integrated work, and integration into `dev` is not a released feature.
+- Explain how the proposal and final result satisfy the principles below, especially any affected guarantee or trade-off. If shared sources disagree, resolve or report the discrepancy rather than silently choosing one. Coordinate edits to shared plan sections with concurrent tasks and preserve unrelated changes.
+
+## Core product principles
+
+BeepBar provides up-to-date course materials, protects students' local work, and makes recordings accessible through a responsive native app with minimal attention and resource use. These principles apply to every feature, fix, investigation, and review; their detailed criteria remain in the performance plan and behavior specifications. Keep these summaries aligned when an explicitly agreed product decision changes them.
+
+1. **Protect user data.** Never lose or overwrite local changes without the specified user choice. Preserve three-way sync, containment, checks at the point of action, atomicity, journaling, and recovery.
+2. **Respond immediately with useful content.** Keep menus, windows, and actions responsive during work. Show known content immediately and refresh in the background; an empty window is not useful content.
+3. **Be nearly free at rest.** Avoid unnecessary CPU, network, writes, timers, and memory growth when no work is due. Release tasks and resources after completion.
+4. **Make cost proportional to necessary work.** Avoid repeated reads, hashes, queries, writes, and identical publications while retaining checks required for correctness, including locally deleted files.
+5. **Preserve freshness.** Respect the configured interval and acquire updates when available. Optimize each check instead of delaying or skipping it; preserve the specification's explicit network and energy policies.
+6. **Bound resources during work.** Bound response reception, memory, concurrency, and queues. Stream large files and avoid UI work proportional to every list element on each event.
+7. **Make cancellation real and state truthful.** Stop interruptible work promptly; finish or recover atomic changes safely. Distinguish saved, refreshing, paused, failed, cancelled, and completed states; reject stale asynchronous results.
+8. **Preserve identity and compatibility.** Scope caches and results to site, account, root, and operation. Prevent old identity data returning after logout or account changes; verify migrations and rollback for users who skip releases.
+9. **Prove benefits with the smallest justified change.** Reproduce or measure first, prioritize correctness and blocked user actions, and report regressions and uncertainty. Never trade guarantees for benchmark gains or infer app-wide responsiveness from Core measurements. Use isolated synthetic data; real-account validation requires explicit authorization.
+
 ## Build and verification
 
 - Battle-test every completed change as far as practical: cover the reported regression, nearby edge cases and failure paths, and user-visible UI behavior when affected. Prefer tests that exercise real behavior and would fail without the fix; avoid tests that merely repeat the implementation.
@@ -131,6 +163,7 @@ Being fast, reactive and nearly free in the background is a product feature. Per
   | Cancel | stopped within 1 s (p95), even mid-way through a large file |
 
 - Measurement:
+  - Use `scripts/benchmark.sh compare --main origin/main --base-dev origin/dev --candidate HEAD --out PerformanceReports/<unique-name>` for both required comparisons. Follow the [single-command agent procedure](docs/benchmarks.md#reproducible-ref-comparisons-single-agent-command) for prerequisites, compatibility adjustments, validation and retained evidence; incompatible native fixtures must fail unless an explicit measurement-only adjustment is recorded.
   - Release build (arm64), synthetic corpus only, never real WeBeep data or the user's account.
   - Use the existing `PerformanceTrace` signposts and the `Beepbar-Profile` scheme.
   - Idle is observed over 30-minute sessions.

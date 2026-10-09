@@ -135,3 +135,13 @@ Add a scenario to `Scenarios` with its own checks, register it in `Sources/Beepb
 - New counters belong in Core, with a test in `WorkCountersTests` proving what they count.
 
 Extend the harness rather than writing one-off scripts.
+
+## Persisted Activity summary restore
+
+Run the on-demand controller benchmark without launching the app:
+
+```sh
+BEEPBAR_RESTORE_BENCHMARK=1 swift test -c release --arch arm64 -Xswiftc -DDEBUG --filter SyncFinalizationTests/benchmarkSummaryRestore
+```
+
+Release optimization remains enabled; `DEBUG` enables the existing isolated controller constructor and test hooks. All data, defaults and SQLite are temporary; no account, real preferences or network is used. The test is disabled in regular CI. It restores synthetic summaries containing 1,000 and 15,000 file details, warms up once and prints seven samples, JSON size, write attempts, end-to-end restore latency and separate synchronous codec timings. Compare the same configuration on the same machine and power source, without concurrent builds/tests. End-to-end async latency is not main-thread occupancy: use the codec timings to justify moving decode work and Instruments to validate UI latency. New-result encoding remains a separate path.

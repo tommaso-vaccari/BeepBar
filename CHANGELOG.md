@@ -4,6 +4,7 @@
 
 ### Improved
 
+- Opening BeepBar restores the previous sync result with less work, keeping the interface available while a large Activity summary is read.
 - Repeated synchronization uses less memory and does less work when many materials are already saved.
 
 ### Fixed

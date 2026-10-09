@@ -123,7 +123,6 @@ Misure sintetiche Release arm64, M5/32 GB, AC, una warm-up e sette run: D04, cor
 | I5 | `fix/scheduler-state-transitions` | Nessuna | [#105](https://github.com/tommaso-vaccari/BeepBar/issues/105) |
 | I9b | `fix/recordings-seen-overflow` | Nessuna | [#106](https://github.com/tommaso-vaccari/BeepBar/issues/106) |
 | I9d | `perf/recordings-play-priority` | D07 | [#107](https://github.com/tommaso-vaccari/BeepBar/issues/107) |
-| I11 | `fix/benchmark-option-validation` | Nessuna | [#108](https://github.com/tommaso-vaccari/BeepBar/issues/108) |
 | R01 | `perf/sync-summary-persistence` | D07 | [#109](https://github.com/tommaso-vaccari/BeepBar/issues/109) |
 | R02 | `perf/startup-migration-profile` | Nessuna | [#110](https://github.com/tommaso-vaccari/BeepBar/issues/110) |
 | R03 | `perf/directory-traversal-profile` | Nessuna | [#111](https://github.com/tommaso-vaccari/BeepBar/issues/111) |
@@ -225,11 +224,11 @@ Prima del fix definire una rappresentazione che distingua contenuti già present
 
 **Registrazioni:** ordinamento/raggruppamento, filtri e scansioni `newCount` si ripetono con aggiornamenti del controller osservato. Profilare `RecordingsPresentation` e `RecordingsPage`; solo dopo introdurre cache derivate per revisione effettiva della lista e input di presentazione. Invalidare per lingua/fuso orario, ricerca e stato visto. Confrontare allocazioni, valutazioni dei body e scorrimento. Se visite a molti corsi/anni mostrano crescita, definire retention limitata di liste e URL playback, preservando la riapertura immediata già prevista.
 
-### I11 — Rendere visibili gli errori nelle opzioni benchmark
+### I11 — Errori nelle opzioni benchmark rifiutati prima del lavoro
 
-**Riprodotto:** nell’audit è stato usato `baseline --output ...`, ma il flag corretto è `--out`. `Sources/BeepbarBenchmarks/main.swift:27`, `Options`, accetta la chiave sconosciuta e usa silenziosamente il percorso predefinito. Le misure restano valide, ma un’automazione può cercarle nel posto sbagliato.
+**Consegna [#108](https://github.com/tommaso-vaccari/BeepBar/issues/108).** Il parser condiviso col test valida opzioni per comando, duplicati, valori mancanti e domini numerici prima di creare output o avviare scenari. `baseline --output` ora termina con usage/64; il flag resta `--out`. Controllate anche somme dei campioni/arrotondamento del corpus e conversioni MiB: input non rappresentabili non causano trap. Default, warmup zero e opzioni valide conservati; `--json` per scenari/idle, `--out` per baseline.
 
-Validare nomi per comando e valori mancanti/duplicati, fallendo con usage prima di iniziare. Accettazione: `--output` termina nonzero senza run; `--out`, opzioni degli scenari e default documentati restano validi. Test del parser; nessuna promessa di guadagno runtime per questa correzione degli strumenti.
+Prova red/green: il parser originale produce 20 assertion fallite; la review ha trovato overflow, riprodotti con altre cinque assertion fallite prima della correzione. Il parser finale passa 37 casi parametrizzati. Il binario Release rifiuta sette invocazioni invalide con exit 64, usage e nessun output; una sync sintetica da un file conserva JSON e successo. Review indipendente reiterata fino a CLEAN. Suite completa, build Release e CI sono gate della PR collegata alla issue. Nessun miglioramento runtime dell’app rivendicato.
 
 ## Indagini con una condizione precisa per procedere
 

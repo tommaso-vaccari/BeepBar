@@ -41,6 +41,8 @@ scripts/measure-idle.sh                    # 30 min, the installed Beepbar, pass
 - a merged `baseline.json`;
 - `baseline.txt`, the table also printed on screen.
 
+Options are validated before any benchmark work: unknown or wrong-command options, duplicates, missing values and invalid numeric values exit with status 64 and usage. Use `baseline --out DIR` for baseline output; `--json PATH` belongs to individual scenarios and `idle`. `--runs` and `--warmup` apply to scenarios and baseline. The wrapper supplies `--commit` and `--dirty`; do not repeat them.
+
 `PerformanceReports/` is git-ignored.
 
 The command exits non-zero when a scenario's checks fail (for example, a "nothing new" run that installed files). A number from a failed scenario measures something else and must not be quoted.

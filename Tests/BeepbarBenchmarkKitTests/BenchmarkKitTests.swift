@@ -201,3 +201,66 @@ struct BenchmarkKitTests {
         }
     }
 }
+
+/// Invalid CLI input must fail before creating a corpus, report directory or idle observer.
+struct BenchmarkOptionsTests {
+    @Test(arguments: [
+        ("baseline", ["--output", "report"]),
+        ("unchanged", ["--out", "report"]),
+        ("baseline", ["--json", "report.json"]),
+        ("idle", ["--files", "1"]),
+        ("large-update", ["--fraction", "0.5"]),
+        ("cancel", ["--files", "1"]),
+        ("unknown", []),
+        ("baseline", ["--out"]),
+        ("baseline", ["--out", "--runs", "1"]),
+        ("baseline", ["--out", ""]),
+        ("baseline", ["--runs", "1", "--runs", "2"]),
+        ("baseline", ["--dirty", "--dirty"]),
+        ("baseline", ["--runs", "0"]),
+        ("unchanged", ["--files", "-1"]),
+        ("unchanged", ["--courses", "0"]),
+        ("cancel", ["--fraction", "1.1"]),
+        ("cancel", ["--fraction", "nan"]),
+        ("large-update", ["--size-mb", String(Int.max)]),
+        ("cancel", ["--rate-mbps", String(Int.max)]),
+        ("baseline", ["--runs", String(Int.max)]),
+        ("unchanged", ["--warmup", String(Int.max)]),
+        ("unchanged", ["--files", String(Int.max)]),
+        ("unchanged", ["--files", "1", "--courses", String(Int.max)]),
+        ("unchanged", ["--files", String(Int.max - 1000), "--courses", "2000"]),
+        ("idle", []),
+        ("idle", ["--pid", "2147483648"]),
+        ("idle", ["--pid", "1", "--minutes", "inf"]),
+    ])
+    func rejectsBeforeWork(command: String, arguments: [String]) {
+        #expect(throws: CLIError.self) {
+            try BenchmarkOptions(arguments[...], command: command)
+        }
+    }
+
+    /// Defaults, zero warmup, each command's options and literal paths remain usable.
+    @Test(arguments: ["unchanged", "large-update", "cancel", "baseline"])
+    func defaultsAndCommonMetadata(command: String) throws {
+        let defaults = try BenchmarkOptions([][...], command: command)
+        #expect(try defaults.int("runs", 5) == 5)
+        #expect(try defaults.int("warmup", 1, allowZero: true) == 1)
+        let options = try BenchmarkOptions(["--runs", "2", "--warmup", "0", "--commit", "sha", "--dirty"][...], command: command)
+        #expect(try options.int("runs", 5) == 2)
+        #expect(try options.int("warmup", 1, allowZero: true) == 0)
+        #expect(options.values["commit"] == "sha" && options.flags.contains("dirty"))
+    }
+
+    @Test(arguments: [
+        ("unchanged", ["--files", "1", "--courses", "1", "--json", "a b.json"]),
+        ("large-update", ["--size-mb", "1"]),
+        ("cancel", ["--size-mb", "1", "--fraction", "1", "--rate-mbps", "1"]),
+        ("baseline", ["--out", "a b"]),
+        ("baseline", ["--runs", String(Int.max), "--warmup", "0"]),
+        ("idle", ["--pid", "1", "--minutes", "0.01", "--interval-seconds", "0.1", "--json", "idle.json", "--commit", "sha", "--dirty"]),
+    ])
+    func acceptsCommandOptions(command: String, arguments: [String]) throws {
+        let options = try BenchmarkOptions(arguments[...], command: command)
+        #expect(!options.values.isEmpty)
+    }
+}

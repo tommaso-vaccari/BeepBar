@@ -1776,7 +1776,9 @@ struct MenuBarSnapshot: Sendable {
         // The account may have been disconnected while the list was loading.
         guard hasStoredCredential else { return }
         try await restoreScopes(for: courses)
-        self.courses = Self.orderedForDisplay(courses, enabledCourseIDs: enabledCourseIDs)
+        let ordered = Self.orderedForDisplay(courses, enabledCourseIDs: enabledCourseIDs)
+        // #94: equal @Published assignments still invalidate every course subscriber.
+        if self.courses != ordered { self.courses = ordered }
         accountState = .connected
         operationDefaults.removeObject(forKey: Self.credentialExpiredKey)
     }
@@ -1994,7 +1996,11 @@ struct MenuBarSnapshot: Sendable {
                 }
             }
         }
-        operationDefaults.set(enabledCourseIDs.map(String.init).sorted(), forKey: Self.enabledCoursesKey)
+        let selection = enabledCourseIDs.map(String.init).sorted()
+        // Compare persisted data, not just the in-memory set: missing/legacy values still need repair.
+        if operationDefaults.stringArray(forKey: Self.enabledCoursesKey) != selection {
+            operationDefaults.set(selection, forKey: Self.enabledCoursesKey)
+        }
     }
 
     func folder(for course: RemoteCourseSummary) -> String {

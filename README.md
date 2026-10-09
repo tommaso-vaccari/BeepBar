@@ -93,6 +93,8 @@ CI runs the tests and builds an ad-hoc-signed arm64 DMG.
 
 ## Contributing
 
+Development PRs target `dev`. Before taking a task, read the [shared Performance Plan](docs/performance-plan.md) and [team workflow](docs/team-workflow.md), claim its linked issue, and follow the independent review and regression verification gates.
+
 Found a bug or have a feature request? [Open an issue](https://github.com/tommaso-vaccari/BeepBar/issues). Pull requests are welcome too.
 
 ## License

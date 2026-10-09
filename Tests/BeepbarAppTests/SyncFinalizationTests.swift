@@ -6,6 +6,55 @@ import SQLite3
 @testable import BeepbarApp
 
 struct SyncFinalizationTests {
+    /// Restoring a valid summary publishes every detail without writing the timestamp or JSON again.
+    @Test @MainActor func restoredSummaryDoesNotPersistAgain() async throws {
+        let root = FileManager.default.temporaryDirectory.appending(path: UUID().uuidString)
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let database = try SyncDatabase(url: root.appending(path: "state.sqlite"))
+        let rootID = UUID()
+        try await database.registerRoot(id: rootID, canonicalPath: root.path)
+        let defaults = CountingDefaults.throwaway()
+        let summary = SyncCompletionSummary(completedAt: Date(timeIntervalSince1970: 123), added: 1, updated: 2, unchanged: 3, preservedLocal: 4, conflicts: 0, failures: 0)
+        let key = "io.github.tvaccari.beepbar.last-successful-summary.v1." + rootID.uuidString
+        let bytes = try JSONEncoder().encode(summary)
+        defaults.set(bytes, forKey: key)
+        defaults.resetWrites()
+        let controller = WeBeepAuthenticationController(testRootURL: root, database: database, rootID: rootID, defaults: defaults)
+        defaults.resetWrites()
+        await controller.restorePersistedSyncStateForTesting()
+        #expect(controller.syncState == .synced(summary))
+        #expect(defaults.writes.isEmpty)
+        #expect(defaults.data(forKey: key) == bytes)
+    }
+
+    /// On-demand Release measurement of the actual controller restore, with synthetic file details.
+    @Test(.enabled(if: ProcessInfo.processInfo.environment["BEEPBAR_RESTORE_BENCHMARK"] == "1")) @MainActor
+    func benchmarkSummaryRestore() async throws {
+        for count in [1000, 15000] {
+            let root = FileManager.default.temporaryDirectory.appending(path: UUID().uuidString)
+            try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+            defer { try? FileManager.default.removeItem(at: root) }
+            let rootID = UUID()
+            let database = try SyncDatabase(url: root.appending(path: "state.sqlite"))
+            try await database.registerRoot(id: rootID, canonicalPath: root.path)
+            let defaults = CountingDefaults.throwaway()
+            let items = (0..<count).map { SyncedItem(id: "1:100:/:file-\($0).pdf", name: "file-\($0).pdf", kind: .added) }
+            let summary = SyncCompletionSummary(completedAt: Date(timeIntervalSince1970: 123), added: count, updated: 0, unchanged: 0, preservedLocal: 0, conflicts: 0, failures: 0, perCourse: [CourseSyncCount(courseID: 1, courseFolder: "Course", added: count, updated: 0, items: items)])
+            let bytes = try JSONEncoder().encode(summary)
+            defaults.set(bytes, forKey: "io.github.tvaccari.beepbar.last-successful-summary.v1." + rootID.uuidString)
+            let controller = WeBeepAuthenticationController(testRootURL: root, database: database, rootID: rootID, defaults: defaults)
+            for run in 0..<8 {
+                defaults.resetWrites()
+                let start = ContinuousClock.now
+                await controller.restorePersistedSyncStateForTesting()
+                let elapsed = ContinuousClock.now - start
+                #expect(controller.lastSyncSummary == summary)
+                if run > 0 { print("RESTORE_BENCH files=\(count) bytes=\(bytes.count) ms=\(Double(elapsed.components.seconds) * 1000 + Double(elapsed.components.attoseconds) / 1e15) writes=\(defaults.writes.count)") }
+            }
+        }
+    }
+
     @Test(arguments: ["refresh-sync", "restore-sync", "refresh-signout", "restore-signout", "refresh-root", "restore-root"]) @MainActor
     func delayedPendingChoicesCannotReplaceNewAccountOrSyncState(_ action: String) async throws {
         let root = FileManager.default.temporaryDirectory.appending(path: UUID().uuidString)

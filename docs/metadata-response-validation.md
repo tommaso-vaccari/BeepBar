@@ -81,32 +81,33 @@ BEEPBAR_METADATA_PROBE_MIB=128 swift test -c release --filter MetadataResponseTe
 Repeat in five fresh processes per size. Do not measure a compiler together with the test:
 compile first, then use `swift test --skip-build -c release --filter MetadataResponseTests/memoryProbe`.
 
-## Local toolchain limitation and gates
+## Verification gates
 
-This machine has Command Line Tools but no Xcode. The unmodified repository's `swift test`
-cannot compile TestingMacros/SwiftUI macros with its default build system; the native fallback
-also cannot compile the app tests because XCTest is absent. The required xcodebuild Release
-app command fails immediately because Xcode is not installed. These gates remain for CI;
-a passing Core run does not claim full app verification.
+Xcode 27.0 (27A266a) became available after the initial probe. Standard repository gates
+passed on `819462da4400228346b81d7c613344b412da2802`:
 
-For meaningful local coverage, an external temporary package reads the exact repository
-Sources/Tests and includes CSQLite, BeepbarCore, BeepbarBenchmarkKit and their test targets only.
-Its minimal manifest has no dependencies or app target. This changes no production source or
-repository manifest. Use the following options with that package:
+- `swift test`: 368 Core + 27 Benchmark + 257 App Swift Testing tests and 14 XCTest tests
+  passed (666 total), including metadata/API, sync failures, recordings and app behavior.
+- `xcodebuild -project Beepbar.xcodeproj -target Beepbar -configuration Release build
+  CODE_SIGNING_ALLOWED=NO`: BUILD SUCCEEDED. The normal app was not launched or installed.
 
-```sh
-swift test --package-path "$coreVerification" --build-system native --disable-xctest   -Xswiftc -F -Xswiftc /Library/Developer/CommandLineTools/Library/Developer/Frameworks   -Xlinker -rpath -Xlinker /Library/Developer/CommandLineTools/Library/Developer/Frameworks
-```
+The exact final documentation commit and its gate rerun are recorded in the issue before
+independent review. Production code is unchanged from the implementation commit used by
+this memory experiment; the later test improvement only bounds the synthetic transport window.
 
-Focused metadata/API tests: 32 tests in three suites passed. SyncCoordinatorEndToEndTests
-also passed, including server failures, incompatible responses, expired tokens and cancellation.
-All 395 Core/Benchmark tests in 43 suites passed after the transport-window fixture improvement.
-The exact final documentation commit and rerun are recorded in the issue.
-Release compilation of this same Core/test package passed for the probe.
+Initial validation had only Command Line Tools, without the necessary SwiftUI/Testing macros
+and XCTest. An external temporary package read the exact repository Sources/Tests and included
+CSQLite, BeepbarCore, BeepbarBenchmarkKit and their test targets only. That fallback used SDK27,
+native SwiftPM, `--disable-xctest`, and the CLT Testing.framework compiler/linker paths; it changed
+no production source or repository manifest. All 395 Core/Benchmark tests passed there,
+including the five-case final controlled mutation (red without the fix, green restored).
+Its Release arm64 build supplied the isolated memory-probe binaries. Those earlier environment
+failures are resolved for the standard test/build gates by the installed Xcode toolchain.
 
-The mandatory standard benchmark `scripts/benchmark.sh compare --main origin/main
---base-dev origin/dev --candidate HEAD ...` is **unmeasured**: its Xcode/version and AC-power
-prerequisites are unavailable. Both standard base-dev → HEAD and cumulative main → HEAD
-comparisons remain unmeasured, including normal-response throughput, CPU and UI occupancy.
-The table above is the separate synthetic memory experiment only. No app was launched,
-installed or signed. Independent review and CI gates must be recorded before readiness.
+The standard benchmark `scripts/benchmark.sh compare --main origin/main --base-dev origin/dev
+--candidate HEAD ...` remains **unmeasured** at this checkpoint. The memory experiment was on
+battery, and no coordinated AC-powered reference comparison was run. Both standard base-dev
+→ HEAD and cumulative main → HEAD comparisons remain unmeasured, including normal-response
+throughput, CPU and UI occupancy. The table above is the separate synthetic memory experiment
+only. No benchmark was rerun while the other tasks were running their verification.
+Independent review and online CI must be recorded before readiness.

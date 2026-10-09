@@ -92,6 +92,8 @@ public actor SyncDatabase {
     private let handle: SQLiteHandle
     /// Full baseline reads attempted by this connection, including reads that fail.
     package private(set) var baselineReadAttempts = 0
+    /// Override-name SQL attempts, including failed statements, on this connection only.
+    package private(set) var moduleOverrideUpdateAttempts = 0
     package private(set) var ownershipBackfillCounters = OwnershipBackfillCounters()
     private var database: OpaquePointer? { handle.pointer }
 
@@ -309,6 +311,7 @@ public actor SyncDatabase {
     }
 
     public func updateModulePathOverrideName(rootID: UUID, courseID: Int64, moduleID: Int64, name: String) throws {
+        moduleOverrideUpdateAttempts += 1
         try withStatement("UPDATE module_path_overrides SET last_known_name = ? WHERE root_id = ? AND course_id = ? AND module_id = ?") { statement in
             try bind(name, to: statement, index: 1); try bind(rootID.uuidString, to: statement, index: 2)
             guard sqlite3_bind_int64(statement, 3, courseID) == SQLITE_OK, sqlite3_bind_int64(statement, 4, moduleID) == SQLITE_OK else { throw SyncDatabaseError.execution }

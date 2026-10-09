@@ -92,7 +92,11 @@ struct FileHashCancellationTests {
         guard case .conflict(let conflict) = outcome else { Issue.record("Expected conflict, got \(outcome)"); return }
         #expect(try await fixture.store.inspect(fixture.path) == fixture.original)
         #expect(try await fixture.store.conflictArtifact(at: conflict.incomingPath)?.sha256 == artifact.sha256)
-        #expect(try await database.conflict(id: conflict.id) == conflict)
+        let saved = try #require(try await database.conflict(id: conflict.id))
+        #expect(saved.rootID == rootID && saved.remoteID == "file")
+        #expect(saved.relativePath == fixture.path && saved.incomingPath == conflict.incomingPath)
+        #expect(saved.localSHA256 == fixture.hash && saved.remoteSHA256 == artifact.sha256)
+        #expect(saved.baseSHA256 == "older baseline" && saved.remoteRevision == "2" && saved.status == .open)
         #expect(try await database.pendingOperations().isEmpty)
         #expect(try FileManager.default.contentsOfDirectory(atPath: fixture.root.appending(path: ".beepbar/staging").path).isEmpty)
     }

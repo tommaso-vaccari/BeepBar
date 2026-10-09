@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+### Improved
+
+- Repeated synchronization uses less memory when many materials are already saved.
+
 ### Fixed
 
 - Removing a course from your selection now drops its waiting recordings request without interrupting playback actions.

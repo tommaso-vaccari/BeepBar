@@ -667,8 +667,9 @@ private struct RecordingRow: View {
             .frame(maxWidth: .infinity, alignment: .leading)
             Button(action: toggleWatchlist) {
                 Image(systemName: isWatchlisted ? "bookmark.fill" : "bookmark")
+                    .font(.system(size: 20))
                     .foregroundStyle(isWatchlisted ? Color.accentColor : .secondary)
-                    .frame(width: 28, height: 32)
+                    .frame(width: 32, height: 32)
             }
             .buttonStyle(.plain).disabled(!canEdit)
             .help(isWatchlisted ? tr("Rimuovi dalla watchlist", "Remove from watchlist") : tr("Aggiungi alla watchlist", "Add to watchlist"))

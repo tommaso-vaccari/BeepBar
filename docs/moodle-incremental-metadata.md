@@ -2,12 +2,12 @@
 
 Issue: [#113](https://github.com/tommaso-vaccari/BeepBar/issues/113). Indagine documentale, nessuna modifica al codice. Risponde alla riga «Metadati incrementali Moodle» di [performance-plan.md](performance-plan.md#indagini-con-una-condizione-precisa-per-procedere).
 
-**Esito in una riga:** Moodle espone API di «aggiornamenti dal timestamp» (`core_course_check_updates`, `core_course_get_updates_since`), ma per costruzione non segnalano rimozioni, spostamenti tra sezioni, rinomine di sezione, file cancellati dentro una cartella né cambi di visibilità/gruppo; usano confronti stretti su timestamp del server e non riducono il numero di richieste per corso. Un sync corretto dovrebbe comunque eseguire la scansione completa per coprire quei casi, quindi non c'è risparmio da ottenere senza ridurre copertura o freschezza. **Decisione: la scansione completa per corso resta l'unico percorso; nessuna implementazione incrementale.** I dettagli, le fonti e i rilievi collaterali seguono.
+**Esito in una riga:** Moodle espone API di «aggiornamenti dal timestamp» (`core_course_check_updates`, `core_course_get_updates_since`), ma per costruzione non segnalano moduli rimossi, spostamenti tra sezioni, rinomine di sezione né cambi di visibilità/gruppo; usano confronti stretti su timestamp del server e non riducono il numero di richieste per corso. Un sync corretto dovrebbe comunque eseguire la scansione completa per coprire quei casi, quindi non c'è risparmio da ottenere senza ridurre copertura o freschezza. **Decisione: la scansione completa per corso resta l'unico percorso; nessuna implementazione incrementale.** I dettagli, le fonti e i rilievi collaterali seguono.
 
 ## 1. Metodo e limiti dell'indagine
 
 - Fonti primarie: sorgente ufficiale `moodle/moodle`, branch `main`, commit `f20534726a59a4b64d168bc4a70fc9518251613e` (3 ottobre 2026), `public/version.php` = `6.0dev (Build: 20261005)`. Nel branch `main` l'albero vive sotto `public/`; nelle release 4.x/5.0 gli stessi file stanno alla radice (es. `course/externallib.php`). Le annotazioni `@since` nel sorgente datano ogni funzione alla versione che l'ha introdotta e valgono anche per i siti più vecchi.
-- Dall'ambiente di lavoro `docs.moodle.org`, `moodledev.io` e `tracker.moodle.org` non erano raggiungibili (DNS negato) e `raw.githubusercontent.com` rispondeva 404: la verifica è stata fatta su un clone shallow del repository. Gli URL delle pagine pubbliche sono riportati in §9 per la review a campione e per il lettore; le citazioni con riga si riferiscono al commit sopra.
+- Durante la stesura `docs.moodle.org`, `moodledev.io` e `tracker.moodle.org` non erano raggiungibili da quell'ambiente: la verifica è stata fatta su un clone shallow del repository. La review successiva ha raggiunto docs.moodle.org (pagina legacy in sola lettura) e il sorgente via API GitHub, confermando versioni e righe. Gli URL delle pagine pubbliche sono riportati in §10 per la review a campione e per il lettore; le citazioni con riga si riferiscono al commit sopra.
 - Nessuna chiamata al servizio reale, nessun token, nessun dato di account. Il set di funzioni che WeBeep abilita per il servizio usato dall'app non è verificabile offline: BeepBar lo riceve già in `core_webservice_get_site_info` (`functions[].name`) e lo conserva in `WeBeepSiteInfo.availableFunctions`; un controllo futuro può leggerlo da lì senza esporre il token (§7).
 - Nessuna misura di prestazioni: non ci sono numeri «prima/dopo» perché non viene proposta alcuna modifica. Le stime di richieste e byte in §6 sono conteggi derivati dalle firme delle API, non misure.
 
@@ -17,7 +17,7 @@ Codice su `dev` `713033c`.
 
 | Passo | Funzione Moodle | Dove | Cosa ne ricava |
 |---|---|---|---|
-| Validazione token | `core_webservice_get_site_info` | `WeBeepAPIClient.validateToken` | `userid`, `siteurl` (deve coincidere con il sito atteso), elenco `functions`: l'app rifiuta un sito senza `core_enrol_get_users_courses` e `core_course_get_contents` (`missingRequiredFunction`). Limite risposta 1 MiB. |
+| Validazione token | `core_webservice_get_site_info` | `WeBeepAPIClient.validateToken` | `userid`, `siteurl` (deve coincidere con il sito atteso), elenco `functions`: quando Moodle restituisce l'elenco, l'app rifiuta un sito senza `core_enrol_get_users_courses` e `core_course_get_contents` (`missingRequiredFunction`); senza elenco il controllo non si applica. Limite risposta 1 MiB. |
 | Elenco corsi | `core_enrol_get_users_courses` (`userid`) | `WeBeepAPIClient.fetchCourses` | `id`, `shortname`, `displayname/fullname`, `visible`, `startdate`, `enddate`. Limite 2 MiB, max 2000 corsi. |
 | Contenuti di ogni corso selezionato | `core_course_get_contents` (`courseid`, senza `options`) | `WeBeepAPIClient.fetchContents`, una richiesta per corso, concorrenza `mode.metadataConcurrency` in `SyncCoordinator.prepareItems` | Sezioni → moduli → `contents[]` di tipo `file`: `filename`, `filepath`, `filesize`, `timemodified`, `fileurl`, `isexternalfile`, e `contenthash` se presente. Limite 4 MiB, max 1000 sezioni. |
 | Download | `fileurl` (`webservice/pluginfile.php`) | `RemoteDownloader` | Solo URL del sito, senza credenziali in query. |
@@ -28,7 +28,7 @@ Dalla risposta di `core_course_get_contents` dipendono tutte le garanzie della s
 - **Revisione** = `contenthash` se Moodle lo fornisce, altrimenti `"\(timemodified):\(filesize)"`. `SyncPlanner.decide` confronta la revisione con la baseline per distinguere «nessuna operazione» da «adotta la nuova baseline»; il contenuto reale viene comunque verificato con l'hash locale quando serve.
 - **Posizione locale** = cartella corso + nome sezione (salvo «material…») + nome modulo + `filepath` (`LocalPathPolicy.destination`). `RemotePlacement` registra `(sectionName, moduleName, isSingleFileResource)`: la **rinomina di una sezione o di un modulo** e lo **spostamento in un'altra sezione** sono rilevati confrontando i nomi presenti nella risposta completa (`followRemoteMoves`, §4.1 della specifica).
 - **Rimozioni e ricaricamenti** (§4.2–4.3): un file tracciato conta come sparito solo se il suo corso è stato elencato **per intero** (`RemoteCourseContents.isComplete`) e il suo modulo non ha voci scartate (`modulesWithDroppedEntries`); altrimenti «non conoscibile in questo sync» e le scelte già aperte restano. Il ricaricamento altrove è riconosciuto solo con `contenthash` identico e univoco nel corso.
-- **Visibilità e gruppi**: non esiste gestione esplicita. Moodle omette dalla risposta i moduli non visibili all'utente (vedi §4), quindi «modulo nascosto» appare come «file rimosso» e la voce sparisce quando torna visibile, esattamente come descritto in §4.3 della specifica. Un corso che il sito rifiuta è un errore di quel corso (`courseFailure`), non del sync; se tutti i corsi falliscono con errori di sito/connessione, fallisce il sync.
+- **Visibilità e gruppi**: non esiste gestione esplicita. Moodle omette dalla risposta i moduli non visibili all'utente e non mostrati sulla pagina del corso (`!uservisible && !is_visible_on_course_page()`, vedi §4), quindi «modulo nascosto» appare come «file rimosso»; un modulo con restrizioni ma ancora mostrato sulla pagina arriva senza `contents` e finisce in `modulesWithDroppedEntries` (file «non conoscibili in questo sync», non rimossi) e la voce sparisce quando torna visibile, esattamente come descritto in §4.3 della specifica. Un corso che il sito rifiuta è un errore di quel corso (`courseFailure`), non del sync; se tutti i corsi falliscono con errori di sito/connessione, fallisce il sync.
 - **Risposte incomplete ed errori**: `LossyArray` scarta la singola voce malformata, contando `issueCount` e marcando modulo/corso come incompleti; errori HTTP, content-type, dimensione, redirect e `invalidtoken` hanno mappature dedicate (`WeBeepAPIError`, `SyncServiceFailure`).
 - **Checkpoint**: i metadati sono letti ogni run e usati solo per quel run; non esiste un cursore persistente «ultimo timestamp visto». Lo stato durevole è nelle baseline, nei placement, nei conflitti e nel journal (`SyncTransactionCoordinator`), che un run interrotto lascia recuperabili. Un run con nulla di nuovo non scrive (budget «Run with nothing new»).
 
@@ -40,7 +40,7 @@ Tutte dichiarate in `public/lib/db/services.php` (o nei `db/services.php` del pl
 
 | Funzione | `@since` | Firma (parametri → ritorno) | Dichiarazione | Nota |
 |---|---|---|---|---|
-| `core_course_get_contents` | 2.2; `options` 2.9; campi file `mimetype`, `isexternalfile`, `repositorytype`, `uservisible`, `availabilityinfo` 3.3 | `courseid`, `options[{name,value}]` con `excludemodules`, `excludecontents`, `includestealthmodules`, `sectionid`, `sectionnumber`, `cmid`, `modname`, `modid` → `[section{id,name,…,modules[{id,name,modname,uservisible,…,contents[]}]}]` | `services.php:552–560`, `'capabilities' => 'moodle/course:update, moodle/course:viewhiddencourses'` (documentative: la funzione lavora anche senza, limitandosi a ciò che l'utente vede) | È la funzione usata oggi. `course/externallib.php:59–135` (parametri), `93–445` (corpo). |
+| `core_course_get_contents` | 2.2; `options` 2.9; campi file `mimetype`, `isexternalfile`, `repositorytype`, `uservisible`, `availabilityinfo` 3.3 | `courseid`, `options[{name,value}]` con `excludemodules`, `excludecontents`, `includestealthmodules`, `sectionid`, `sectionnumber`, `cmid`, `modname`, `modid` → `[section{id,name,…,modules[{id,name,modname,uservisible,…,contents[]}]}]` | `services.php:552–560`, `'capabilities' => 'moodle/course:update, moodle/course:viewhiddencourses'` (documentative: la funzione lavora anche senza, limitandosi a ciò che l'utente vede) | È la funzione usata oggi. `course/externallib.php:62–` (parametri), `96–445` (corpo). |
 | `core_course_check_updates` | 3.2 | `courseid`, `tocheck[{contextlevel:'module', id:cmid, since}]`, `filter[]` ∈ {`configuration`, `fileareas`, `completion`, `ratings`, `comments`, `gradeitems`, `outcomes`} → `{instances[{contextlevel,id,updates[{name,timeupdated?,itemids?}]}], warnings[]}` | `services.php:744–752` | `course/externallib.php:3538–3665`; delega a `course_check_updates` (`course/lib.php:3216–3270`). |
 | `core_course_get_updates_since` | 3.3 | `courseid`, `since`, `filter[]` → come sopra | `services.php:753–761` | `course/externallib.php:3667–3760`: costruisce `tocheck` con **tutti i moduli `uservisible`** del corso e chiama `check_updates`. |
 | `core_course_get_course_module` | 3.0 | `cmid` → `{cm{id,course,module,name,modname,instance,section,sectionnum,groupmode,visible,…}, warnings}` | `services.php:561–568` | Un modulo per richiesta, **senza** l'elenco dei file. `course/externallib.php:2963`. |
@@ -50,7 +50,7 @@ Tutte dichiarate in `public/lib/db/services.php` (o nei `db/services.php` del pl
 | `core_files_get_files` | 2.2; campi aggiuntivi 2.9 | `contextid`, `component`, `filearea`, `itemid`, `filepath`, `filename`, `modified` («timestamp to return files changed after this time»), `contextlevel`, `instanceid` → `{parents[], files[]}` | `services.php:952–959` | Un contesto (= un modulo) per richiesta; browsing, non elenco di corso. `files/externallib.php:52–200`. |
 | `core_webservice_get_site_info` | 2.2 | `serviceshortnames[]` → `{userid, siteurl, functions[{name,version}], release?, version?, advancedfeatures[], …}` | `services.php:2842–2849` | Già usata: `functions` è l'elenco autorevole di ciò che il token può chiamare. `webservice/externallib.php:63–236`. |
 | `core_enrol_get_users_courses` | 2.2 | `userid`, `returnusercount` → `[{id, shortname, fullname, displayname, visible, hidden, startdate, enddate, lastaccess, …}]` | `services.php:901–909`, `'capabilities' => 'moodle/course:viewparticipants'` (documentativa) | Già usata. Nessun timestamp di «ultimo cambiamento dei contenuti». `enrol/externallib.php:406–570`. |
-| `tool_mobile_call_external_functions` | 3.7 | `requests[{function, arguments(JSON), settingfilter, settingfileurl, settinglang}]` → `{responses[{error, data, exception?}]}` | `admin/tool/mobile/db/services.php:76–83`, `'type' => 'write'` | Batching di più funzioni in una richiesta HTTP. `admin/tool/mobile/classes/external.php:506–`. |
+| `tool_mobile_call_external_functions` | 3.7 | `requests[{function, arguments(JSON), settingfilter, settingfileurl, settinglang}]` → `{responses[{error, data, exception?}]}` | `admin/tool/mobile/db/services.php:76–83`, `'type' => 'write'` | Batching di più funzioni in una richiesta HTTP. `admin/tool/mobile/classes/external.php:530–`. |
 | `tool_mobile_get_config`, `tool_mobile_get_public_config`, `tool_mobile_get_content`, `tool_mobile_get_plugins_supporting_mobile` | 3.2–3.5 | configurazione del sito / contenuti per l'app mobile | `admin/tool/mobile/db/services.php` | Non riguardano i contenuti dei corsi: nessun uso per il sync. |
 
 ## 4. Cosa segnalano davvero `check_updates` e `get_updates_since`
@@ -68,14 +68,14 @@ Per ogni modulo richiesto:
    - `completion`, `gradeitems`, `outcomes`, `comments`, `ratings`: non pertinenti ai file.
 5. La risposta include **solo** le istanze con almeno un'area `updated = true` (`course/externallib.php:3595–3620`); il resto è silenzio, indistinguibile da «modulo non controllato».
 
-Quali operazioni del docente toccano `timemodified` dell'istanza o delle righe `files` (verificato in `course/format/classes/local/cmactions.php`, Moodle 5.2+/6.0; le funzioni globali `set_coursemodule_*`/`moveto_module` di `course/lib.php` vi delegano):
+Quali operazioni del docente toccano `timemodified` dell'istanza o delle righe `files` (verificato in `course/format/classes/local/cmactions.php`, Moodle 5.2+/6.0; le funzioni globali `set_coursemodule_*`/`moveto_module` di `course/lib.php` vi delegano; nelle versioni precedenti il comportamento può differire, vedi §9 rilievo 3):
 
 | Operazione su Moodle | `configuration` | `contentfiles` | Nota |
 |---|---|---|---|
 | Carica/sostituisce un file in resource/folder | sì (salvataggio form: `resource_update_instance` imposta `timemodified`) | sì (nuova riga `files`) | Coperto. |
-| Cancella un file dentro una cartella (`folder`) | solo se il docente salva il form del modulo; non con la cancellazione inline del file manager | **no**: una riga cancellata non ha timestamp da confrontare | Non coperto in modo affidabile. |
+| Cancella un file dentro una cartella (`folder`) | sì dalla pagina «Modifica» della cartella (`mod/folder/edit.php:71–74` imposta `timemodified = time()` e incrementa `revision`) e dal form del modulo | **no**: una riga cancellata non ha timestamp da confrontare | Coperto come `configuration` per i percorsi standard; una `get_contents` del modulo mostra la cancellazione. Una cancellazione fatta fuori da quei percorsi (es. da codice di terze parti) non sarebbe segnalata. |
 | Rinomina il modulo | sì (`cmactions::rename` scrive `timemodified` sull'istanza; test `test_check_updates`, `course/tests/externallib_test.php:3297`) | — | Coperto, ma senza il nuovo nome: serve comunque una `get_contents`. |
-| Nasconde/mostra il modulo | sì (`cmactions::set_visibility` scrive `timemodified` sull'istanza) | — | Nascosto: il modulo diventa non `uservisible` e **sparisce** dalla risposta di `get_updates_since` senza alcuna segnalazione. Mostrato: compare come `configuration`. |
+| Nasconde/mostra il modulo | sì (`cmactions::set_visibility` scrive `timemodified` sull'istanza) | — | Nascosto: il modulo diventa non `uservisible` e **sparisce** dalla risposta di `get_updates_since` senza alcuna segnalazione. Mostrato: compare come `configuration` solo dove `set_visibility` scrive `timemodified` (Moodle recenti); in `MOODLE_401_STABLE` `set_coursemodule_visible` non lo scrive, quindi su siti 4.1 nemmeno il ritorno è segnalato. |
 | Sposta il modulo in un'altra sezione (`move_before`, `move_end_section`) | **no** (`course_add_cm_to_section` aggiorna `course_modules.section` e `course_sections.sequence`) | no | Non coperto: BeepBar lo tratta come spostamento (§4.1 della specifica) e lo rileva solo dal nome sezione nella risposta completa. |
 | Rinomina una sezione | no (tabella `course_sections`) | no | Non coperto; `check_updates` supporta solo `contextlevel = 'module'` (warning `contextlevelnotsupported`). |
 | Cancella il modulo | nessuna voce (`get_updates_since`) / `cmidnotincourse` (`check_updates` con id espliciti) | — | Coperto solo chiedendo esplicitamente ogni modulo noto: N moduli nella richiesta, e un modulo mai visto dall'app non può essere chiesto. |
@@ -94,13 +94,13 @@ Eventi che la specifica obbliga a gestire e come li vede ciascun approccio. «In
 | Nuovo file in un modulo esistente | sì | sì (`contentfiles`) | no |
 | Nuovo modulo con file | sì | sì (`configuration`: istanza creata dopo `since`) | no |
 | File sostituito (stesso nome) | sì, via `timemodified:filesize` o `contenthash` | sì | no |
-| File cancellato da una cartella (§4.3) | sì (manca dall'elenco completo) | **no** | sì |
+| File cancellato da una cartella (§4.3) | sì (manca dall'elenco completo) | sì come `configuration` se cancellato dalla pagina «Modifica» o dal form della cartella | solo per altri percorsi |
 | Modulo cancellato (§4.3) | sì | no con `get_updates_since`; sì con `check_updates` solo per id già noti | sì |
 | Modulo spostato di sezione (§4.1) | sì (nome sezione) | **no** | sì |
 | Sezione rinominata (§4.1: «tutti i file che contiene seguono il nuovo nome») | sì | **no** | sì |
 | Modulo rinominato (§4.1) | sì | segnalato, ma il nome arriva solo con `get_contents` | parziale |
 | Modulo/sezione nascosti (§4.3: «appare come rimosso») | sì | **no** (silenzio) | sì |
-| Modulo/sezione di nuovo visibili («la voce sparisce») | sì | sì come `configuration` solo per il modulo; non per la sezione | sì |
+| Modulo/sezione di nuovo visibili («la voce sparisce») | sì | sì come `configuration` solo per il modulo e solo nelle versioni che scrivono `timemodified` (non 4.1); mai per la sezione | sì |
 | Restrizioni di gruppo/accesso che cambiano `uservisible` | sì | **no** | sì |
 | File ricaricato altrove con stesso `contenthash` (§4.2) | sì, quando il sito fornisce `contenthash` | no (nuovo e sparito arrivano in run diversi o mai) | sì |
 | Risposta incompleta/voce malformata | gestita per modulo e per corso (`isComplete`) | i `warnings` coprono solo id chiesti; il silenzio non è distinguibile | sì |
@@ -151,14 +151,15 @@ Numeri reali non misurati: non esistono misure di byte per corso su WeBeep in re
 
 1. **`contenthash` non è un campo di `core_course_get_contents`** nel sorgente ufficiale (`course/externallib.php:555–600`, `mod/resource/lib.php:451–477`, `mod/folder/lib.php:320–345`; la cronologia di `course/upgrade.txt` per 3.2/3.3/3.6/3.7 non lo introduce mai). BeepBar lo legge come opzionale e la specifica §4.2 dichiara il riconoscimento del ricaricamento «solo quando Moodle fornisce l'impronta»: comportamento coerente, nessun bug. Va però messo in chiaro che, su un Moodle non modificato, il ramo «ricaricato altrove» non si attiva mai e la revisione è sempre `timemodified:filesize`. Il piano e la specifica non promettono altro; se in futuro si volesse rendere §4.2 effettivo servirebbe un'altra fonte dell'impronta (nessuna funzione tra quelle esaminate la espone).
 2. Le `capabilities` elencate in `services.php` per `core_course_get_contents` e `core_enrol_get_users_courses` sono documentative (Moodle le mostra all'amministratore quando crea un servizio); il codice applica solo `validate_context` e la visibilità effettiva. Non cambia nulla per l'app.
-3. In Moodle `main` le funzioni globali `course_delete_module`, `set_coursemodule_visible`, `set_coursemodule_name`, `moveto_module` sono deprecate (5.2) a favore di `core_courseformat\local\cmactions`; la semantica dei timestamp descritta in §4 è quella delle nuove classi. Per siti 4.x le funzioni globali scrivevano le stesse tabelle.
+3. In Moodle `main` `course_delete_module` e `moveto_module` sono deprecate (5.2) a favore di `core_courseformat\local\cmactions`; `set_coursemodule_visible` e `set_coursemodule_name` non sono deprecate e delegano a `cmactions`. La semantica dei timestamp descritta in §4 è quella di `main`. Non vale per tutte le versioni: in `MOODLE_401_STABLE` `set_coursemodule_visible` non scrive il `timemodified` dell'istanza (lo fa solo `set_coursemodule_name`), quindi su siti 4.1 nemmeno un modulo reso di nuovo visibile è segnalato. Questo rafforza la decisione.
 
 ## 10. Fonti
 
 Sorgente (commit `f20534726a59a4b64d168bc4a70fc9518251613e`, `main`; percorsi sotto `public/`):
 
-- `course/externallib.php`: `get_course_contents_parameters` 59–85, `get_course_contents` 93–445 (visibilità corso 164–176, filtro `uservisible` 240–242, contenuti solo se `uservisible` 342–375, sezioni non visibili svuotate 411–427), `get_course_contents_returns` 555–600, `get_course_module` 2963, `check_updates_parameters/check_updates/check_updates_returns` 3538–3665, `get_updates_since_*` 3667–3760.
-- `course/lib.php`: `course_check_updates` 3216–3270, `course_check_module_updates_since` 3690–3790, `set_coursemodule_visible` 697, `set_coursemodule_name` 709, `course_delete_module` 734 (deprecata 5.2), `moveto_module` 1195.
+- `course/externallib.php`: `get_course_contents_parameters` 62–85, `get_course_contents` 96–445 (visibilità corso 164–176, filtro `!uservisible && !is_visible_on_course_page()` 240–242, contenuti solo se `uservisible` 342–375, sezioni non visibili svuotate 411–427), `get_course_contents_returns` 451– (struttura annidata `contents` 555–600), `get_course_module` 2963, `check_updates_parameters/check_updates/check_updates_returns` 3538–3665, `get_updates_since_*` 3667–3760.
+- `course/lib.php`: `course_check_updates` 3216–3270, `course_check_module_updates_since` 3690–3790, `set_coursemodule_visible` 697, `set_coursemodule_name` 709, `course_delete_module` 734 (deprecata 5.2), `moveto_module` 1195 (deprecata 5.2).
+- `mod/folder/edit.php`: 71–74 (`timemodified` e `revision` aggiornati al salvataggio).
 - `course/format/classes/local/cmactions.php`: `rename`, `set_visibility`, `move_before` (648), `move_end_section` (687).
 - `course/tests/externallib_test.php`: `test_check_updates` 3297.
 - `course/upgrade.txt`: sezioni 3.2, 3.3, 3.6, 3.7 (campi aggiunti a `get_course_contents`).
@@ -171,7 +172,7 @@ Sorgente (commit `f20534726a59a4b64d168bc4a70fc9518251613e`, `main`; percorsi so
 - `enrol/externallib.php`: `get_users_courses` 406–570.
 - `admin/tool/mobile/db/services.php`: 28–100; `admin/tool/mobile/classes/external.php`: `call_external_functions` (`@since 3.7`).
 
-Pagine pubbliche corrispondenti (non raggiungibili da questo ambiente; da verificare a campione in review):
+Pagine pubbliche corrispondenti (verificate a campione in review: gli URL GitHub `main/public/…` risolvono e la tabella di docs.moodle.org conferma le versioni):
 
 - https://github.com/moodle/moodle/blob/main/public/course/externallib.php
 - https://github.com/moodle/moodle/blob/main/public/course/lib.php
@@ -181,7 +182,6 @@ Pagine pubbliche corrispondenti (non raggiungibili da questo ambiente; da verifi
 - https://github.com/moodle/moodle/blob/main/public/course/format/classes/local/cmactions.php
 - https://github.com/moodle/moodle/blob/main/public/course/upgrade.txt
 - https://docs.moodle.org/dev/Web_service_API_functions (tabella delle funzioni con versione di introduzione)
-- https://moodledev.io/docs/apis/subsystems/external/functions (dichiarazione delle funzioni esterne, `services`, `capabilities`)
-- https://moodledev.io/general/app/development/ (uso di `core_course_check_updates` da parte della Moodle App)
+- https://moodledev.io/docs/apis/subsystems/external/functions (funzioni esterne in generale)
 
 Codice BeepBar (`dev` `713033c`): `Sources/BeepbarCore/Network/WeBeepAPIClient.swift`, `Sources/BeepbarCore/Sync/SyncCoordinator.swift` (`prepareItems`, `followRemoteMoves`, `vanishedFiles`), `SyncPlanner.swift`, `RemoteMovePolicy.swift`, `LocalPathPolicy.swift`, `SyncTransactionCoordinator.swift`, `Sources/BeepbarBenchmarkKit/BenchmarkUpstream.swift` (contatori `net.*`).

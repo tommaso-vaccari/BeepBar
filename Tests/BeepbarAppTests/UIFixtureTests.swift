@@ -20,11 +20,14 @@ import BeepbarCore
     /// Returning focus must not turn a late activation into the reported initial key latency.
     @Test func firstKeyTimestampSurvivesLaterFocusChanges() {
         var timing = UIFixtureWindowTiming()
-        #expect(timing.becameKey(milliseconds: 4))
-        #expect(!timing.becameKey(milliseconds: 100))
+        let first = timing.becameKey(milliseconds: 4)
+        let later = timing.becameKey(milliseconds: 100)
+        #expect(first)
+        #expect(!later)
         #expect(timing.keyMilliseconds == 4)
         timing = UIFixtureWindowTiming()
-        #expect(timing.becameKey(milliseconds: 7))
+        let reopened = timing.becameKey(milliseconds: 7)
+        #expect(reopened)
         #expect(timing.keyMilliseconds == 7)
     }
 

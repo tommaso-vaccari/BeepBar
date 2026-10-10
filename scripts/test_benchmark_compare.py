@@ -66,6 +66,35 @@ class ComparisonTests(unittest.TestCase):
                 with self.assertRaises(b.InvalidComparison):
                     self.compare(reports)
 
+    def test_scenario_specific_metrics_are_required_only_where_reported(self):
+        units = {'wall': 'ms', 'cancel.latency': 'ms', 'summary.encode': 'ms', 'summary.write': 'ms', 'summary.bytes': 'KiB'}
+        self.assertEqual(b.expected_metrics(units, 'unchanged'), {'wall'})
+        self.assertEqual(b.expected_metrics(units, 'cancel'), {'wall', 'cancel.latency'})
+        self.assertEqual(b.expected_metrics(units, 'summary-persist'), {'wall', 'summary.encode', 'summary.write', 'summary.bytes'})
+        # A summary-persist report must carry its own metrics, computed from the raw samples.
+        samples = [{'wallMilliseconds': 1, 'summaryEncodeMilliseconds': x, 'summaryWriteMilliseconds': 2, 'summaryBytes': 2048} for x in (2, 4, 6, 8, 10)]
+        good = report()
+        good['scenarios'][0].update(name='summary-persist', samples=samples, summary={
+            'wall': b.distribution([1] * 5), 'summary.encode': b.distribution([2, 4, 6, 8, 10]),
+            'summary.write': b.distribution([2] * 5), 'summary.bytes': b.distribution([2] * 5)})
+        scenario = b.validate(good, 'a' * 40, 5, 1, units)
+        self.assertEqual(scenario['summary']['summary.bytes']['median'], 2)
+        for change in [lambda s: s['summary'].pop('summary.encode'),
+                       lambda s: s['samples'][0].update(summaryBytes=-1),
+                       lambda s: s['summary']['summary.write'].update(median=3)]:
+            broken = report()
+            broken['scenarios'][0].update(name='summary-persist', samples=[dict(x) for x in samples], summary={
+                'wall': b.distribution([1] * 5), 'summary.encode': b.distribution([2, 4, 6, 8, 10]),
+                'summary.write': b.distribution([2] * 5), 'summary.bytes': b.distribution([2] * 5)})
+            change(broken['scenarios'][0])
+            with self.subTest(change=change), self.assertRaises(b.InvalidComparison):
+                b.validate(broken, 'a' * 40, 5, 1, units)
+        # An unchanged report that claims summary metrics is refused too.
+        bad = report()
+        bad['scenarios'][0]['summary']['summary.bytes'] = b.distribution([1] * 5)
+        with self.assertRaises(b.InvalidComparison):
+            b.validate(bad, 'a' * 40, 5, 1, units)
+
     def test_invalid_markdown_has_no_numeric_claim(self):
         text = b.markdown({'shas': {}, 'scenarios': {'broken': {'valid': False, 'error': 'checks failed'}}})
         self.assertIn('INVALID', text)

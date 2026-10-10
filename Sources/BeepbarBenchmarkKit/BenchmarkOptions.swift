@@ -18,6 +18,7 @@ public struct BenchmarkOptions {
         case "unchanged": allowed = metadata.union(sampling).union(["files", "courses", "json"])
         case "large-update": allowed = metadata.union(sampling).union(["size-mb", "json"])
         case "cancel": allowed = metadata.union(sampling).union(["size-mb", "fraction", "rate-mbps", "json"])
+        case "summary-persist": allowed = metadata.union(sampling).union(["details", "courses", "json"])
         case "baseline": allowed = metadata.union(sampling).union(["out"])
         case "idle": allowed = metadata.union(["pid", "minutes", "interval-seconds", "json"])
         default: throw CLIError.usage("unknown command \(command)")
@@ -35,7 +36,7 @@ public struct BenchmarkOptions {
             values[name] = value
         }
         // Validate eagerly: baseline creates its directory before reading its sampling values.
-        for name in ["runs", "warmup", "files", "courses", "size-mb", "rate-mbps"] where values[name] != nil {
+        for name in ["runs", "warmup", "files", "courses", "details", "size-mb", "rate-mbps"] where values[name] != nil {
             let value = try int(name, 1, allowZero: name == "warmup")
             if ["size-mb", "rate-mbps"].contains(name), value > Int64.max / 1_048_576 {
                 throw CLIError.usage("--\(name) is too large")

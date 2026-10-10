@@ -1,10 +1,20 @@
+#if canImport(CryptoKit)
 import CryptoKit
+#else
+import Crypto
+#endif
+#if canImport(Darwin)
 import Darwin
+#else
+import Glibc
+#endif
 import Foundation
 import Testing
 @testable import BeepbarCore
 
 struct FileStoreTests {
+    /// macOS only: the hidden flag is Finder metadata; the Linux shim sets nothing (see LinuxCompat.swift).
+    #if canImport(Darwin)
     @Test func hidesInternalBookkeepingDirectoryFromFinder() async throws {
         let root = try temporaryRoot()
         defer { try? FileManager.default.removeItem(at: root) }
@@ -16,6 +26,7 @@ struct FileStoreTests {
         #expect(stat(path, &info) == 0)
         #expect(info.st_flags & UInt32(UF_HIDDEN) != 0)
     }
+    #endif
 
     @Test func installsOnlyWhenDestinationIsStillMissing() async throws {
         let root = try temporaryRoot()

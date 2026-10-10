@@ -1,11 +1,19 @@
 import Foundation
+#if canImport(Network)
 import Network
+#endif
+#if canImport(os)
 import os
+#endif
 
 /// Takes one network-path snapshot for Data Saver, without leaving a monitor running at rest.
 public enum NetworkPathReader {
     /// Returns `nil` on timeout or cancellation. Callers must check cancellation before starting work.
     public static func current(timeout: Duration = .seconds(2)) async -> NetworkPathConditions? {
+#if !canImport(Network)
+        // No path monitor on Linux (Core tests only): answer as a timeout would.
+        return nil
+#else
         await current { receive, timedOut in
             let monitor = NWPathMonitor()
             let queue = DispatchQueue(label: "io.github.tvaccari.beepbar.network-path")
@@ -25,6 +33,7 @@ public enum NetworkPathReader {
                 timer.cancel()
             }
         }
+#endif
     }
 
     internal static func current(start: @Sendable (

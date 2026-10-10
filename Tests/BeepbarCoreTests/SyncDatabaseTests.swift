@@ -1,5 +1,9 @@
 import Foundation
+#if canImport(SQLite3)
 import SQLite3
+#else
+import CSQLite
+#endif
 import Testing
 @testable import BeepbarCore
 
@@ -161,7 +165,10 @@ struct SyncDatabaseTests {
         // Documented, not chosen by accident (see `SyncDatabase.init`): commits use plain fsync,
         // like `FileStore`; only checkpoints flush the drive cache (F_FULLFSYNC).
         #expect(settings.fullFsync == 0)
+#if canImport(Darwin)
+        // F_FULLFSYNC is a macOS call; SQLite ignores the pragma elsewhere.
         #expect(settings.checkpointFullFsync == 1)
+#endif
     }
 
     @Test func reopeningMigratesIdempotentlyAndKeepsData() async throws {

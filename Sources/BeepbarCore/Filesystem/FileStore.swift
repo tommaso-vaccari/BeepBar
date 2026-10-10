@@ -1,5 +1,13 @@
+#if canImport(CryptoKit)
 import CryptoKit
+#else
+import Crypto
+#endif
+#if canImport(Darwin)
 import Darwin
+#else
+import Glibc
+#endif
 import Foundation
 
 public enum FileStoreError: Error, Sendable, Equatable { case invalidRoot, symbolicLink, invalidStage, localChanged, destinationExists, sizeMismatch, tooLarge, ioFailure, unsupported }
@@ -105,13 +113,13 @@ public actor FileStore {
     }
 
     /// `trash` moves a file to the Trash; tests replace it so they never touch the user's Trash.
-    public init(root: URL, trash: @escaping @Sendable (URL) throws -> Void = { try FileManager.default.trashItem(at: $0, resultingItemURL: nil) }) throws {
+    public init(root: URL, trash: @escaping @Sendable (URL) throws -> Void = FileStore.defaultTrash) throws {
         try self.init(root: root, beforeMove: nil, trash: trash)
     }
 
     /// Tests inject a filesystem change after destination selection, before move validation.
     /// `beforeSwap` comes last so that existing trailing closures keep binding to `trash`.
-    init(root: URL, beforeMove: (@Sendable (RelativePath, RelativePath) throws -> Void)?, trash: @escaping @Sendable (URL) throws -> Void = { try FileManager.default.trashItem(at: $0, resultingItemURL: nil) }, beforeSwap: (@Sendable (RelativePath) throws -> Void)? = nil, beforeReadChunk: (@Sendable (Bool, Int64) -> Void)? = nil) throws {
+    init(root: URL, beforeMove: (@Sendable (RelativePath, RelativePath) throws -> Void)?, trash: @escaping @Sendable (URL) throws -> Void = FileStore.defaultTrash, beforeSwap: (@Sendable (RelativePath) throws -> Void)? = nil, beforeReadChunk: (@Sendable (Bool, Int64) -> Void)? = nil) throws {
         let fd = open(root.standardizedFileURL.path, O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW)
         guard fd >= 0 else { throw FileStoreError.invalidRoot }
         guard (try? Self.identity(of: fd)) != nil else { close(fd); throw FileStoreError.invalidRoot }
@@ -186,6 +194,7 @@ public actor FileStore {
             }
         }
         guard (metadata.st_mode & S_IFMT) == S_IFREG else { return .notARegularFile }
+#if canImport(Darwin)
         // Finder aliases are regular files, but Launch Services follows them even when their
         // name says PDF. Read FinderInfo relative to the checked parent without following links.
         var attributes = attrlist()
@@ -202,6 +211,7 @@ public actor FileStore {
         }
         // Finder flags are big-endian at byte eight; 0x8000 marks an alias.
         guard finderInfo[12] & 0x80 == 0 else { return .notARegularFile }
+#endif
         // stat does not check permission to read the leaf. Effective access also honors ACLs,
         // without opening or hydrating an evicted document just to check permission.
         guard faccessat(parent, name, R_OK, AT_EACCESS) == 0 else {
@@ -482,7 +492,7 @@ public actor FileStore {
         try data.withUnsafeBytes { bytes in
             var offset = 0
             while offset < bytes.count {
-                let count = Darwin.write(fd, bytes.baseAddress!.advanced(by: offset), bytes.count - offset)
+                let count = posixWrite(fd, bytes.baseAddress!.advanced(by: offset), bytes.count - offset)
                 if count < 0, errno == EINTR { continue }
                 guard count > 0 else { throw fileStoreError() }
                 offset += count
@@ -521,7 +531,7 @@ public actor FileStore {
         try data.withUnsafeBytes { bytes in
             var offset = 0
             while offset < bytes.count {
-                let count = Darwin.write(fd, bytes.baseAddress!.advanced(by: offset), bytes.count - offset)
+                let count = posixWrite(fd, bytes.baseAddress!.advanced(by: offset), bytes.count - offset)
                 if count < 0, errno == EINTR { continue }
                 guard count > 0 else { throw FileStoreError.ioFailure }
                 offset += count
@@ -927,3 +937,26 @@ public actor FileStore {
         }) {}
     }
 }
+
+extension FileStore {
+    /// Where a file goes when the user chooses to trash it and no caller supplied its own policy:
+    /// the Finder trash. On Linux, where only the Core tests run and there is no trash, it is
+    /// moved under a per-process folder in the temporary directory, so a test can still prove
+    /// that nothing was deleted outright.
+    public static let defaultTrash: @Sendable (URL) throws -> Void = {
+#if canImport(Darwin)
+        try FileManager.default.trashItem(at: $0, resultingItemURL: nil)
+#else
+        let trash = FileManager.default.temporaryDirectory.appending(path: "beepbar-trash-\(ProcessInfo.processInfo.processIdentifier)", directoryHint: .isDirectory)
+        try FileManager.default.createDirectory(at: trash, withIntermediateDirectories: true)
+        try FileManager.default.moveItem(at: $0, to: trash.appending(path: "\(UUID().uuidString)-\($0.lastPathComponent)", directoryHint: .notDirectory))
+#endif
+    }
+}
+
+/// `write(2)`, named so it is not shadowed by `FileStore`'s own `write` methods.
+#if canImport(Darwin)
+private let posixWrite = Darwin.write
+#else
+private let posixWrite = Glibc.write
+#endif

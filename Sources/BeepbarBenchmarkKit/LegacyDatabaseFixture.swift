@@ -13,8 +13,8 @@ import Foundation
 /// lose the module, a half attribution today's `CHECK` forbids (written with constraints off, as
 /// a table upgraded by `ADD COLUMN`, which has no such `CHECK`, could hold it); the recorded
 /// migration versions are deleted; and the tables and the index added by later releases are
-/// dropped. The next open must put all of
-/// it back in one transaction, and the opens after that must find nothing to do.
+/// dropped. The next open must put all of it back in one transaction, and the opens after that
+/// must find nothing to do.
 ///
 /// Safety: everything lives in a new temporary folder that `remove()` deletes; the user's
 /// database, preferences, keychain and sync folder are never touched.

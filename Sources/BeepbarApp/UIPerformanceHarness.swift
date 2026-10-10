@@ -272,7 +272,7 @@ struct UIFixtureCycle: Codable {
     let resourcesAfterClose: UIFixtureResources
 }
 
-struct UIFixtureReport: Codable {
+struct UIFixtureReport: Encodable {
     let schemaVersion = 1
     let scenario: String
     let valid: Bool
@@ -368,7 +368,7 @@ struct UIFixtureReport: Codable {
             self.ready?.resume(throwing: UIFixtureError.missingContent); self.ready = nil
         }
         defer { timeout.cancel() }
-        try await withCheckedThrowingContinuation { continuation in
+        try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
             if timedOut { continuation.resume(throwing: UIFixtureError.missingContent) }
             else { ready = continuation; signalReady() }
         }

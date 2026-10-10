@@ -7,7 +7,7 @@
     <key>BeepBarTelemetryNamespace</key>
     <string>com.beepbar</string>
     <key>BeepBarTelemetryDefaultEnabled</key>
-    <false/>
+    <true/>
 	<key>CFBundleDevelopmentRegion</key>
 	<string>$(DEVELOPMENT_LANGUAGE)</string>
 	<key>CFBundleExecutable</key>

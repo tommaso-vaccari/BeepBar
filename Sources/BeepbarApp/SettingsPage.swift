@@ -46,16 +46,14 @@ struct SettingsPage: View {
     }
 
     private var telemetrySection: some View {
-        Section {
-            Toggle(tr("Condividi statistiche di utilizzo", "Share usage statistics"), isOn: Binding(
+        Section("Telemetry") {
+            Toggle(isOn: Binding(
                 get: { telemetry.isEnabled },
                 set: { telemetry.setEnabled($0) }
-            ))
+            )) {
+                SettingLabel("Telemetry", explanation: tr("Serve solo a contare gli utenti attivi giornalieri di BeepBar. Invia a TelemetryDeck un ping al giorno con un identificativo casuale dell’installazione e la versione dell’app. Nessun dato dell’account, corso o file.", "Used only to count BeepBar’s daily active users. Sends TelemetryDeck one daily ping with a random installation identifier and the app version. No account, course or file data."))
+            }
             .disabled(!telemetry.isConfigured)
-        } header: {
-            Text(tr("Statistiche", "Statistics"))
-        } footer: {
-            Text(tr("Un ping al giorno a TelemetryDeck con un identificativo casuale dell’installazione e la versione di BeepBar. Nessun dato dell’account, corso o file.", "One daily ping to TelemetryDeck with a random installation identifier and the BeepBar version. No account, course or file data."))
         }
     }
 

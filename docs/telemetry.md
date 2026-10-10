@@ -4,7 +4,7 @@ BeepBar uses TelemetryDeck's [Ingest API v2](https://telemetrydeck.com/docs/inge
 
 ## Configuration and user choice
 
-`App/Info.plist` holds the public App ID and organization namespace (`com.beepbar`). These are ingest identifiers, not credentials. Missing or invalid configuration disables telemetry. `BeepBarTelemetryDefaultEnabled` is false: new and existing installations send nothing until the user enables the setting. The Statistics section in Settings lets users change the saved preference; a saved opt-out always takes precedence over the build default. The toggle and explanation are available in Italian and English.
+`App/Info.plist` holds the public App ID and organization namespace (`com.beepbar`). These are ingest identifiers, not credentials. Missing or invalid configuration disables telemetry. `BeepBarTelemetryDefaultEnabled` is true: new and existing installations with no saved choice send automatically on their first Release launch after updating. The Telemetry switch in Settings lets users disable it; a saved opt-out always takes precedence over the build default. The info button explains the daily active-user count and transmitted fields in Italian and English.
 
 Debug builds, tests and UI previews do not use production configuration. Release builds send only when the setting is enabled. Tests inject their own isolated preferences, sender, clock and scheduler. Nothing requires the installed app or its data.
 

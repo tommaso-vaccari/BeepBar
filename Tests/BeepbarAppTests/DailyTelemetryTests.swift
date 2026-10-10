@@ -86,33 +86,30 @@ struct DailyTelemetryTests {
         #expect(await recorder.count == 0)
     }
 
-    /// First launches and updates remain silent until enabled; the saved choice survives reconstruction.
-    @Test func optInStartsAndPersistsAcrossRelaunch() async {
+    /// First launches and updates send by default, but a saved opt-out survives relaunch and later opt-in.
+    @Test func defaultOnAndSavedOptOutSurviveRelaunch() async {
         let harness = Harness()
         defer { harness.remove() }
         let recorder = Recorder()
-        let controller = DailyTelemetryController(defaults: harness.defaults, configuration: configuration,
-            defaultEnabled: false, send: { try await recorder.send($0) }, schedule: { _, _ in
-                BackgroundActivityRegistration(invalidate: {})
-            })
+        let controller = harness.controller(configuration, recorder: recorder)
+        #expect(controller.isEnabled)
         await controller.start()
-        #expect(!controller.isEnabled)
-        #expect(await recorder.count == 0)
-        #expect(harness.defaults.object(forKey: DailyTelemetryController.installationKey) == nil)
-        controller.setEnabled(true)
-        for _ in 0..<1_000 {
-            if await recorder.count == 1 { break }
-            await Task.yield()
-        }
         #expect(await recorder.count == 1)
-        controller.stop()
+        controller.setEnabled(false)
         let relaunched = harness.controller(configuration, recorder: recorder)
-        #expect(relaunched.isEnabled)
+        #expect(!relaunched.isEnabled)
         await relaunched.start()
         #expect(await recorder.count == 1)
-        relaunched.setEnabled(false)
-        let optedOut = harness.controller(configuration, recorder: recorder)
-        #expect(!optedOut.isEnabled)
+        relaunched.setEnabled(true)
+        for _ in 0..<1_000 { await Task.yield() }
+        #expect(await recorder.count == 1)
+        #expect(harness.defaults.bool(forKey: DailyTelemetryController.enabledKey))
+        relaunched.stop()
+        let enabledAgain = harness.controller(configuration, recorder: recorder)
+        #expect(enabledAgain.isEnabled)
+        await enabledAgain.start()
+        #expect(await recorder.count == 1)
+        enabledAgain.stop()
     }
 
     /// A failed request consumes the daily attempt and resumes the next day, without retrying on wake.

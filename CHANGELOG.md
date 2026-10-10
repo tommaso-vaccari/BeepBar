@@ -5,7 +5,7 @@
 ### New
 
 - Save lessons from different courses in a single Watchlist inside Recordings. Add or remove bookmarks and find your saved list again after restarting.
-- An optional daily signal to TelemetryDeck helps measure active installations and app versions; it is off until enabled in Settings and contains no account, course or file information.
+- Telemetry is enabled by default to count active installations and app versions with one daily ping. Turn it off in Settings; the info button explains what is sent. No account, course or file information is included.
 
 ### Improved
 

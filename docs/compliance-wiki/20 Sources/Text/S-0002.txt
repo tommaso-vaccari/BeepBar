@@ -1,0 +1,123 @@
+DERIVED TEXT — S-0002 — 2026-10-10
+Original and SHA-256: ../../90 Operations/source-manifest.json
+
+Data controller or data processor | Data protection guide for small business | European Data Protection Board
+Skip to main content
+Back
+Search
+Menu
+Close menu
+Main navigation
+Home
+Learn the basics
+Be compliant
+Assess the risks
+Find practical info
+EN
+Select your language
+BGбългарски
+CSčeština
+DEDeutsch
+ELελληνικά
+ESespañol
+ETeesti
+FIsuomi
+FRfrançais
+HRhrvatski
+HUmagyar
+ISIcelandic
+ITitaliano
+LTlietuvių
+LVlatviešu
+NBnorsk
+NLNederlands
+PLpolski
+PTportuguês
+SLslovenščina
+SVsvenska
+Close language switcher
+Back to EDPB
+Breadcrumb
+Home
+Learn the basics
+On this page
+What is a data controller?
+What is a joint controller?
+What are the responsibilities of a controller or joint controller?
+What is a data processor?
+What is a sub-processor?
+What are the responsibilities of a processor?
+Checklist of responsibilities
+Data controller or data processor
+What is a data controller?
+A data controller determines the purposes and means of processing personal data. In other words, the data controller decides the how and why of a data processing operation. A data controller can be a legal person, for example a business, an SME, a public authority, an agency or other body.
+In certain cases, the purposes and means of processing personal data, as well as the controller, may be determined by EU or Member State law.
+What is a joint controller?
+When there are two or more data controllers who jointly determine the purpose and means of processing, they are considered joint controllers. They decide together to process personal data for a joint purpose. Joint controllership can take many forms and participation of the different controllers may be unequal. Joint controllers must therefore determine their respective responsibilities for compliance with the GDPR.
+What are the responsibilities of a controller or joint controller?
+When deciding the purposes and means of processing personal data, the controller, or joint controllers, must ensure that individuals’ personal data is protected. To achieve this, the controller, or joint controllers, has to put in place measures to protect personal data and enable individuals to exercise their rights.
+What is a data processor?
+A processor acts under the instructions of the controller only, by processing personal data on behalf of the controller.
+Similar to a data controller, or joint controller, a data processor can be a legal person, for example a business, an SME, a public authority, an agency or other bodies.
+What is a sub-processor?
+A sub-processor acts under the instructions of the processor, meaning that they may process individuals’ personal data on behalf of the processor. A sub-processor can be a legal person, for example a business, an SME, a public authority, an agency or other body.
+To note, a sub-processor can only be appointed if the controller, or joint controller, authorises it in a written form. If this is the case, the processor must draw up a binding contract with the sub-processor detailing the responsibilities of the sub-processor. This processor-sub-processor contract must provide for the same protection of individuals’ personal data as the initial contractor-processor contract.
+What are the responsibilities of a processor?
+While the overall responsibility generally lies with the data controller, data processors also have certain responsibilities under the GDPR. Processors have to carry out the processing operations with the appropriate technical and organisational measures instructed by the data controller or joint controller. In doing so, the processor assists the controller in complying with the General Data Protection Regulation.
+The controller-processor relationship, including the processor’s responsibilities, must be governed by a contract in which the processing operations and means to process personal data are documented.
+What to include in a controller-processor contract?
+The contract between the controller, or joint controller, and the processor must stipulate that the data processor:
+processes the personal data only on the instructions of the data controller, including with regard to transfers of personal data to a country outside the EEA;
+ensures that the persons authorised to process the data have committed themselves to confidentiality or are under an appropriate statutory obligation of confidentiality;
+ensures security of processing;
+shall not engage another data processor without prior specific or general written authorisation of the data controller, who has a meaningful possibility to object;
+assists the data controller for the fulfilment of the data controller’s obligations to respond to individual’s requests for exercising their rights;
+assists the data controller in securing the processing, notifying data breaches, and performing DPIAs;
+at the choice of the data controller, deletes or returns all personal data to the data controller after the end of the provision of services;
+makes available to the data controller all necessary information to demonstrate compliance with the obligations under the GDPR;
+allows for and contributes to audits, including inspections conducted by the data controller or another auditor mandated by the data controller.
+What to include in a processor - sub-processor contract?
+The contract between the processor and the sub-processor must include specific clauses that guarantee that the personal data that is to be processed will be protected in the same way as provided in the controller-processor contract.
+Who is liable to whom?
+A controller, or joint controller, is liable for both their own compliance with the GDPR, and the compliance of the chosen processor. In concrete terms, if the processor is in breach of its obligations under the GDPR, the controller, or joint controller, could be held responsible, and be subject to fines and other consequences if applicable.
+A processor is liable for both their own compliance with GDPR and may be liable to the controller for breach of the contractor-processor contract. A processor may also be liable to the controller for the breaches caused by the sub-processor.
+Checklist of responsibilities
+Controller or Joint Controller’s responsibilities checklist
+Complying with data protection principles under art. 5 GDPR
+Upholding individuals’ data protection rights
+Keeping records of processing operations
+Ensuring the security of processing
+Choosing an appropriate data processor
+Detailing in a binding contract the controller-processor relationship
+Notifying personal data breaches to the relevant EEA data protection authority and to individuals, where applicable
+Being accountable for the processing operations, practising data protection by design & default, carrying out data protection impact assessments when necessary
+Appointing a data protection officer when necessary
+Complying with the data protection obligations on international transfers of personal data
+Cooperating with data protection authorities
+Processor’s responsibilities checklist
+Following the controller’s instructions
+Keeping records of processing operations
+Ensuring the security of processing
+Respecting and upholding the binding controller-processor contract
+Obtain the authorisation of the controller before engaging a new sub-processor (and give the controller a possibility to object). If applicable, a processor - sub-processor contract must be put in place and equate to the initial contractor- processor contract
+Notifying personal data breaches to data controller
+Notifying GDPR breaches to the controller
+Being accountable for the processing operations: e.g. practising data protection by design & default
+Appointing a data protection officer when necessary
+Ensuring that international transfers are authorised by the controller and comply with the GDPR
+Cooperating with data protection authorities
+Footer
+Career opportunities
+Copyright
+Cookies
+General Data Protection Notice
+Public access to documents
+Back to EDPB
+×
+We use cookies
+When you visit our website, if you give your consent, we will use cookies to allow us to collect data for aggregated statistics to improve our services and remember your choice for future visits.
+If you don't want this, we will only use cookies to remember your choice for future visits (i.e., essential cookies).
+If you don't select any of the two options, no cookies will be deployed, but the banner will re-appear every time you enter our website.
+More information on cookies and data protection.
+Accept cookies for aggregated statistics
+No thanks, only essential cookies

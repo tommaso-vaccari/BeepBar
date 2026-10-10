@@ -1,0 +1,75 @@
+[
+  {
+    "id": "S-0001",
+    "title": "GDPR",
+    "url": "https://eur-lex.europa.eu/legal-content/IT/TXT/?uri=CELEX:02016R0679-20160504",
+    "resolved_url": "https://eur-lex.europa.eu/legal-content/IT/TXT/?uri=CELEX:02016R0679-20160504",
+    "retrieved_date": "2026-10-10",
+    "sha256": "dbdfcbde42b0b713bfc9155eb6cef691ddecccf11de9ccb7cd639d864e1ce818",
+    "bytes": 751183,
+    "content_type": "text/html; charset=UTF-8",
+    "raw": "S-0001-2026-10-10.html"
+  },
+  {
+    "id": "S-0002",
+    "title": "EDPB roles",
+    "url": "https://www.edpb.europa.eu/sme/learn-the-basics/data-controller-or-data-processor_en",
+    "resolved_url": "https://www.edpb.europa.eu/sme/learn-the-basics/data-controller-or-data-processor_en",
+    "retrieved_date": "2026-10-10",
+    "sha256": "5eab779d44a96ff3dec8ec84550252bf7bd6b5a31b049ff40164043358092daf",
+    "bytes": 32339,
+    "content_type": "text/html; charset=utf-8",
+    "raw": "S-0002-2026-10-10.html"
+  },
+  {
+    "id": "S-0003",
+    "title": "Sparkle customization",
+    "url": "https://sparkle-project.org/documentation/customization/",
+    "resolved_url": "https://sparkle-project.org/documentation/customization/",
+    "retrieved_date": "2026-10-10",
+    "sha256": "c860ca4da5e4a48d12df94fad37421bf2d46e2c1076549a1b9993f52bfaa6baf",
+    "bytes": 19433,
+    "content_type": "text/html; charset=utf-8",
+    "raw": "S-0003-2026-10-10.html"
+  },
+  {
+    "id": "S-0004",
+    "title": "GitHub privacy",
+    "url": "https://docs.github.com/en/site-policy/privacy-policies/github-general-privacy-statement",
+    "resolved_url": "https://docs.github.com/en/site-policy/privacy-policies/github-general-privacy-statement",
+    "retrieved_date": "2026-10-10",
+    "sha256": "97bc9907b7194d21a88a777319e5443a0dbf1bb898f1687c01fc464faaffadad",
+    "bytes": 304812,
+    "content_type": "text/html; charset=utf-8",
+    "raw": "S-0004-2026-10-10.html"
+  },
+  {
+    "id": "S-0005",
+    "title": "BeepBar code evidence",
+    "commit": "c9a04dc2f510fb02d0662f1c66ce0c53f54e5296",
+    "retrieved_date": "2026-10-10",
+    "sha256": "3161f46cd294a4e2df520569f607201f48195a01508bd62721e0e2405ca9d7d0",
+    "bytes": 18137,
+    "raw": "S-0005-code-c9a04dc.md"
+  },
+  {
+    "id": "S-0006",
+    "title": "Karpathy LLM Wiki",
+    "url": "https://gist.github.com/karpathy/442a6bf555914893e9891c11519de94f",
+    "resolved_url": "https://gist.githubusercontent.com/karpathy/442a6bf555914893e9891c11519de94f/raw/ac46de1ad27f92b28ac95459c782c07f6b8c964a/llm-wiki.md",
+    "retrieved_date": "2026-10-10",
+    "sha256": "dc3efe98ae62f23dd08acad13aba2e95287beb20b6bec2f4af0423557fe37401",
+    "bytes": 11985,
+    "raw": "S-0006-karpathy-ac46de1.md",
+    "revision": "ac46de1ad27f92b28ac95459c782c07f6b8c964a"
+  },
+  {
+    "id": "S-0007",
+    "title": "BeepBar telemetry code",
+    "commit": "d3a42dc775ef461f5406c85818a1e1e0f57ad6dc",
+    "retrieved_date": "2026-10-10",
+    "sha256": "5fa18baa8a2d18f41d40bca2eb8a0f6043a8c62f401d5edc859338dac28ba0f3",
+    "bytes": 11961,
+    "raw": "S-0007-telemetry-d3a42dc.md"
+  }
+]

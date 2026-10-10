@@ -113,6 +113,10 @@ private struct CourseActivityCard: View {
     /// (remote id, name, show in Finder instead of opening).
     let openItem: (String, String, Bool) -> Void
     @State private var isExpanded = false
+    /// How many rows of the expanded course exist as views; grows with "Mostra altri" and is
+    /// clamped to the course by `ActivityRowLayout.page`, so a smaller summary under the same
+    /// course id (the card keeps its state across refreshes) still shows a complete page.
+    @State private var visibleRows = ActivityRowLayout.pageSize
 
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
@@ -143,42 +147,27 @@ private struct CourseActivityCard: View {
 
             if isExpanded {
                 Divider().padding(.leading, 56)
+                // Only the first `visibleRows` rows exist as views (#99): the outer LazyVStack makes
+                // courses lazy, not the rows inside one, so a course with thousands of items used to
+                // build every row on expansion and on every redraw of the page. The page is a prefix
+                // of the course, so ids and positions never change while more rows are revealed.
+                let page = ActivityRowLayout.page(for: course, visible: visibleRows)
                 VStack(alignment: .leading, spacing: 7) {
-                    if let failure = course.courseFailure {
-                        Label {
-                            Text(failure).font(.callout)
-                        } icon: {
-                            Image(systemName: "exclamationmark.triangle.fill").foregroundStyle(.orange)
-                        }
+                    ForEach(page.rows) { row in
+                        activityRow(row)
                     }
-                    ForEach(course.items) { item in
-                        fileRow(id: item.id, name: item.name) {
-                            Text(item.name).font(.callout).lineLimit(1)
-                        } icon: {
-                            Image(systemName: item.kind == .added ? "plus.circle.fill" : "arrow.triangle.2.circlepath.circle.fill")
-                                .foregroundStyle(item.kind == .added ? .green : .blue)
-                        }
-                    }
-                    ForEach(course.movedItems) { item in
-                        fileRow(id: item.id, name: item.name) {
-                            VStack(alignment: .leading, spacing: 1) {
-                                Text(item.name).font(.callout).lineLimit(1)
-                                Text(item.explanation(platform: platformName)).font(.caption).foregroundStyle(.secondary)
+                    if let title = ActivityRowLayout.showMoreTitle(for: page) {
+                        HStack(spacing: 8) {
+                            Button(title, systemImage: "ellipsis.circle") {
+                                visibleRows = ActivityRowLayout.nextVisibleCount(after: visibleRows, total: ActivityRowLayout.rowCount(for: course))
                             }
-                        } icon: {
-                            Image(systemName: item.outcome == .moved ? "arrow.right.circle.fill" : "lock.circle.fill")
-                                .foregroundStyle(item.outcome == .moved ? .teal : .purple)
-                        }
-                    }
-                    ForEach(course.failedItems) { item in
-                        Label {
-                            VStack(alignment: .leading, spacing: 1) {
-                                Text(item.name).font(.callout).lineLimit(1)
-                                Text(item.reason).font(.caption).foregroundStyle(.secondary)
+                            .buttonStyle(.link)
+                            .font(.callout)
+                            if let caption = ActivityRowLayout.hiddenCaption(for: page) {
+                                Text(caption).font(.caption).foregroundStyle(.secondary)
                             }
-                        } icon: {
-                            Image(systemName: "exclamationmark.triangle.fill").foregroundStyle(.orange)
                         }
+                        .padding(.top, 2)
                     }
                     if let folderURL {
                         Button(tr("Mostra nel Finder", "Show in Finder"), systemImage: "folder") { Finder.reveal(folderURL) }
@@ -196,6 +185,45 @@ private struct CourseActivityCard: View {
         }
         .card(padding: 0)
         .clipShape(RoundedRectangle(cornerRadius: BeepbarStyle.cardRadius, style: .continuous))
+    }
+
+    /// One row of the page, drawn as the card always drew it: the course failure and failed items
+    /// as plain labels (there is no file to open), files and moved files as clickable rows.
+    @ViewBuilder private func activityRow(_ row: ActivityRow) -> some View {
+        switch row.content {
+        case .courseFailure(let failure):
+            Label {
+                Text(failure).font(.callout)
+            } icon: {
+                Image(systemName: "exclamationmark.triangle.fill").foregroundStyle(.orange)
+            }
+        case .file(let item):
+            fileRow(id: item.id, name: item.name) {
+                Text(item.name).font(.callout).lineLimit(1)
+            } icon: {
+                Image(systemName: item.kind == .added ? "plus.circle.fill" : "arrow.triangle.2.circlepath.circle.fill")
+                    .foregroundStyle(item.kind == .added ? .green : .blue)
+            }
+        case .moved(let item):
+            fileRow(id: item.id, name: item.name) {
+                VStack(alignment: .leading, spacing: 1) {
+                    Text(item.name).font(.callout).lineLimit(1)
+                    Text(item.explanation(platform: platformName)).font(.caption).foregroundStyle(.secondary)
+                }
+            } icon: {
+                Image(systemName: item.outcome == .moved ? "arrow.right.circle.fill" : "lock.circle.fill")
+                    .foregroundStyle(item.outcome == .moved ? .teal : .purple)
+            }
+        case .failed(let item):
+            Label {
+                VStack(alignment: .leading, spacing: 1) {
+                    Text(item.name).font(.callout).lineLimit(1)
+                    Text(item.reason).font(.caption).foregroundStyle(.secondary)
+                }
+            } icon: {
+                Image(systemName: "exclamationmark.triangle.fill").foregroundStyle(.orange)
+            }
+        }
     }
 
     /// A file that arrived or moved: a click opens it, the context menu also shows it in Finder.

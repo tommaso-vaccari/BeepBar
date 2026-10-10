@@ -169,7 +169,7 @@ struct CourseSelectionDuringRefreshTests {
     @MainActor private func networkController() async throws -> (WeBeepAuthenticationController, CountingDefaults, String, URL) {
         let root = FileManager.default.temporaryDirectory.appending(path: UUID().uuidString)
         try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
-        let defaults = CountingDefaults(suiteName: root.appending(path: "defaults").path)!
+        let defaults = MemoryCountingDefaults.isolated()
         let database = try SyncDatabase(url: root.appending(path: "state.sqlite"))
         let rootID = UUID()
         try await database.registerRoot(id: rootID, canonicalPath: root.path)

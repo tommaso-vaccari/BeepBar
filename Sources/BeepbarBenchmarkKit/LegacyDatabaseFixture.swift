@@ -30,7 +30,8 @@ package final class LegacyDatabaseFixture: Sendable {
         precondition(files >= 0 && courses > 0 && (0...1).contains(legacyFraction) && partialRows >= 0)
         // Which rows keep an owner is decided by their index, so the count is known up front and
         // every stored property is set before the fixture starts creating anything.
-        func hasOwner(_ index: Int) -> Bool { Double(index % 1000) >= legacyFraction * 1000 }
+        // Decided per ten rows, so a corpus as small as a smoke test's still gets both kinds.
+        func hasOwner(_ index: Int) -> Bool { Double(index % 10) >= legacyFraction * 10 }
         let owned = (0..<files).filter(hasOwner).count
         self.files = files
         self.partialRows = min(partialRows, owned)

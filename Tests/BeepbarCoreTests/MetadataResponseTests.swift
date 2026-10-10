@@ -1,5 +1,12 @@
 import Foundation
+#if canImport(FoundationNetworking)
+import FoundationNetworking
+#endif
+#if canImport(Darwin)
 import Darwin
+#else
+import Glibc
+#endif
 import Testing
 @testable import BeepbarCore
 
@@ -89,6 +96,24 @@ import Testing
         await #expect(throws: CancellationError.self) { try await cancelled.value }
     }
 
+    /// Opt-in probe runs in a fresh Release test process for each advertised body size/ref.
+    #if canImport(Darwin)
+    @Test func memoryProbe() async throws {
+        guard let raw = ProcessInfo.processInfo.environment["BEEPBAR_METADATA_PROBE_MIB"], let mib = Int(raw), mib > 1 else { return }
+        let fixture = MetadataFixture(total: mib * 1_048_576, cancellationBoundary: 1_048_576 + MetadataFixture.chunkSize)
+        let session = fixture.session()
+        defer { session.invalidateAndCancel() }
+        await #expect(throws: WeBeepAPIError.responseTooLarge) { try await WeBeepAPIClient(session: session).validateToken("token") }
+        await fixture.waitForStop()
+        var usage = rusage()
+        getrusage(RUSAGE_SELF, &usage)
+        print("METADATA_PROBE advertised=\(fixture.total) sent=\(fixture.sent) peak_rss_bytes=\(usage.ru_maxrss)")
+    }
+    #endif
+}
+
+/// Transport-independent bridge regressions also run in the Linux Core suite.
+struct MetadataCompletionTests {
     /// Force the exact handoff order from #127: cancellation's terminal delegate callback
     /// arrives before a consumer is installed. The watchdog only releases a broken receiver.
     @Test func terminalCancellationBeforeContinuationInstallationIsRetained() async throws {
@@ -174,18 +199,6 @@ import Testing
         }
     }
 
-    /// Opt-in probe runs in a fresh Release test process for each advertised body size/ref.
-    @Test func memoryProbe() async throws {
-        guard let raw = ProcessInfo.processInfo.environment["BEEPBAR_METADATA_PROBE_MIB"], let mib = Int(raw), mib > 1 else { return }
-        let fixture = MetadataFixture(total: mib * 1_048_576, cancellationBoundary: 1_048_576 + MetadataFixture.chunkSize)
-        let session = fixture.session()
-        defer { session.invalidateAndCancel() }
-        await #expect(throws: WeBeepAPIError.responseTooLarge) { try await WeBeepAPIClient(session: session).validateToken("token") }
-        await fixture.waitForStop()
-        var usage = rusage()
-        getrusage(RUSAGE_SELF, &usage)
-        print("METADATA_PROBE advertised=\(fixture.total) sent=\(fixture.sent) peak_rss_bytes=\(usage.ru_maxrss)")
-    }
 }
 
 /// Lazily produces fixed chunks on one background queue; it never allocates the advertised body.

@@ -1,3 +1,6 @@
+// This socket fixture verifies Apple's CFNetwork behavior, including authentication and
+// transparent gzip. Linux Core checks cover the transport-independent completion protocol.
+#if canImport(Darwin)
 import Foundation
 import Darwin
 import Testing
@@ -95,3 +98,5 @@ private final class MetadataHTTPServer: @unchecked Sendable {
         _ = finished.wait(timeout: .now() + 2)
     }
 }
+
+#endif

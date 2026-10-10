@@ -548,8 +548,10 @@ struct MenuBarSnapshot: Sendable {
     private var recordingsStoreForTesting: RecordingsSessionStore?
     private var recordingsBrowserForTesting: (@MainActor () -> RecmanBrowsing)?
     private var beforeReconciliationStateForTesting: (@MainActor () async -> Void)?
-    /// Whether the last sync result encoded by `finishReconciliation` was encoded on the main
-    /// thread; nil until one is (R01, #109).
+    /// Whether the last sync result to be encoded was encoded on the main thread; nil until one
+    /// is (R01, #109). Set by the pre-encode in `finishReconciliation` and by the inline
+    /// `setSyncState(_:)` save, which always encodes on the main actor, so a completion path that
+    /// goes back to the inline save shows up as `true`.
     private(set) var summaryEncodedOnMainThreadForTesting: Bool?
     private var beforeRestoredSummaryPublicationForTesting: (@MainActor () async -> Void)?
     private var beforePendingChoicesForTesting: (@MainActor () async -> Void)?
@@ -1169,6 +1171,9 @@ struct MenuBarSnapshot: Sendable {
     private func setSyncState(_ newState: AppSyncState) {
         publishSyncState(newState)
         if case .synced(let summary) = newState, rootID != nil {
+#if DEBUG
+            summaryEncodedOnMainThreadForTesting = true
+#endif
             saveSuccessfulResult(summary, data: try? JSONEncoder().encode(summary))
         }
     }

@@ -140,8 +140,9 @@ struct SyncFinalizationTests {
         #expect(defaults.writes.isEmpty)
     }
 
-    /// Two syncs in a row, each with a new successful result: when each sync returns, both keys
-    /// already hold its result, and the next launch shows the newer one (R01, #109). The encode
+    /// Two syncs in a row, each with a new successful result, then a third result published
+    /// directly: as each returns, both keys already hold it, and the next launch shows the newest
+    /// (R01, #109). The encode
     /// moved off the main actor; this guards what must not move with it. Fails if the save becomes
     /// a write that lands after the publication (fire-and-forget), if the encoded bytes are
     /// dropped, or if the newer result does not replace the older one, which the next launch would
@@ -175,12 +176,21 @@ struct SyncFinalizationTests {
             #expect(try JSONDecoder().decode(SyncCompletionSummary.self, from: bytes) == published)
             #expect(defaults.double(forKey: timestampKey) == published.completedAt.timeIntervalSince1970)
         }
+        // The same turn, with no suspension to let a deferred write catch up: once the result is
+        // published, both keys already hold it. Fails if the save moves into a task.
+        let direct = await EncodedSyncSummary.encode(Self.syntheticSummary(details: 3, courses: 1, completedAt: Date(timeIntervalSince1970: 456)))
+        defaults.resetWrites()
+        controller.setSyncStateForTesting(synced: direct)
+        #expect(controller.syncState == .synced(direct.summary))
+        #expect(defaults.writes == [timestampKey, summaryKey])
+        #expect(defaults.data(forKey: summaryKey) == direct.data)
+        #expect(defaults.double(forKey: timestampKey) == 456)
         let newest = controller.lastSyncSummary
         // The next launch: a new controller on a second handle of the same suite.
         let relaunched = WeBeepAuthenticationController(testRootURL: root, database: database, rootID: rootID, defaults: try #require(UserDefaults(suiteName: suite)))
         await relaunched.restorePersistedSyncStateForTesting()
         #expect(relaunched.lastSyncSummary == newest)
-        #expect(relaunched.lastSyncSummary?.added == 3)
+        #expect(relaunched.lastSyncSummary?.completedAt == Date(timeIntervalSince1970: 456))
     }
 
     /// A sync's new result is encoded off the main thread (R01, #109): the encode of 15,000 file

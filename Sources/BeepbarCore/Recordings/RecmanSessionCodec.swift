@@ -1,4 +1,7 @@
 import Foundation
+#if canImport(FoundationNetworking)
+import FoundationNetworking
+#endif
 
 /// The Polimi session BeepBar keeps on disk (`RecordingsSessionStore` in the app), so the archive
 /// opens on its own after a relaunch instead of asking for a Polimi sign-in every time.

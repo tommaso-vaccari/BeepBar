@@ -1,5 +1,12 @@
 import Foundation
+#if canImport(FoundationNetworking)
+import FoundationNetworking
+#endif
+#if canImport(Darwin)
 import Darwin
+#else
+import Glibc
+#endif
 import Testing
 @testable import BeepbarCore
 
@@ -245,7 +252,10 @@ private final class StreamingProtocol: URLProtocol, @unchecked Sendable {
         let response = HTTPURLResponse(url: request.url!, statusCode: 200, httpVersion: "HTTP/1.1", headerFields: ["Content-Type": "application/octet-stream"])!
         client?.urlProtocol(self, didReceive: response, cacheStoragePolicy: .notAllowed)
         let (count, size) = Self.lock.withLock { (Self.chunks, Self.chunkSize) }
-        queue.async { self.send(index: 0, count: count, size: size) }
+        // `URLProtocol` is not `Sendable` on Linux's Foundation, so the class's own `@unchecked
+        // Sendable` does not reach the closure there; the instance is guarded by `queue` anyway.
+        nonisolated(unsafe) let this = self
+        queue.async { this.send(index: 0, count: count, size: size) }
     }
     private func send(index: Int, count: Int, size: Int) {
         guard !isStopped else { return }
@@ -254,7 +264,8 @@ private final class StreamingProtocol: URLProtocol, @unchecked Sendable {
         if index == 0 { chunk.replaceSubrange(0..<min(size, Self.marker.count), with: Self.marker.prefix(size)) }
         client?.urlProtocol(self, didLoad: chunk)
         Self.lock.withLock { Self.delivered += 1 }
-        queue.asyncAfter(deadline: .now() + .milliseconds(1)) { self.send(index: index + 1, count: count, size: size) }
+        nonisolated(unsafe) let this = self
+        queue.asyncAfter(deadline: .now() + .milliseconds(1)) { this.send(index: index + 1, count: count, size: size) }
     }
     override func stopLoading() {
         queue.sync { isStopped = true }
@@ -285,9 +296,15 @@ private final class LocalRedirectServer: @unchecked Sendable {
     var requestCount: Int { lock.withLock { requests } }
 
     init() throws {
+#if canImport(Darwin)
         let listeningFD = socket(AF_INET, SOCK_STREAM, 0)
         guard listeningFD >= 0 else { throw CocoaError(.fileReadUnknown) }
         var address = sockaddr_in(sin_len: UInt8(MemoryLayout<sockaddr_in>.size), sin_family: sa_family_t(AF_INET), sin_port: 0, sin_addr: in_addr(s_addr: inet_addr("127.0.0.1")), sin_zero: (0, 0, 0, 0, 0, 0, 0, 0))
+#else
+        let listeningFD = socket(AF_INET, Int32(SOCK_STREAM.rawValue), 0)
+        guard listeningFD >= 0 else { throw CocoaError(.fileReadUnknown) }
+        var address = sockaddr_in(sin_family: sa_family_t(AF_INET), sin_port: 0, sin_addr: in_addr(s_addr: inet_addr("127.0.0.1")), sin_zero: (0, 0, 0, 0, 0, 0, 0, 0))
+#endif
         let bound = withUnsafePointer(to: &address) { $0.withMemoryRebound(to: sockaddr.self, capacity: 1) { bind(listeningFD, $0, socklen_t(MemoryLayout<sockaddr_in>.size)) } }
         guard bound == 0, listen(listeningFD, 2) == 0 else { close(listeningFD); throw CocoaError(.fileReadUnknown) }
         var size = socklen_t(MemoryLayout<sockaddr_in>.size)
@@ -299,7 +316,7 @@ private final class LocalRedirectServer: @unchecked Sendable {
         DispatchQueue.global().async { [self] in serve() }
     }
 
-    func stop() { shutdown(fd, SHUT_RDWR); close(fd) }
+    func stop() { shutdown(fd, Int32(SHUT_RDWR)); close(fd) }
 
     private func serve() {
         while true {

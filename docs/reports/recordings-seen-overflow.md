@@ -64,13 +64,69 @@ acknowledgement. Repeated clicks coalesce IDs already pending so slow storage do
 one duplicate task/list per click. Cleanup uses unlink and never recursively removes a directory
 unexpectedly replacing a database file.
 
-Normal gates are `swift test` and the CI `xcodebuild ... Release ... CODE_SIGNING_ALLOWED=NO`.
-This host has Command Line Tools without Xcode: `xcodebuild` rejects the active developer
-directory. Both normal SwiftPM and native builds of the full app fail because the SDK references
-`SwiftUIMacros` while its plugin is absent. Adding the bundled Testing macro plugin does not
-resolve the missing SwiftUI plugin. No full-suite/Release-app success is claimed locally.
+### Current verified implementation: `378175a`
 
-Targeted fallback is reproducible with:
+The actor/reset/snapshot revision is commit
+`378175a9ef3c19e12db235747f03255540171451`. Standard gates passed on that exact commit
+with **Xcode 27.0, build 27A266a**, selected at `/Applications/Xcode.app/Contents/Developer`.
+The previous Command Line Tools limitation was resolved before these runs. The working tree
+was clean and `git diff --check` passed. No installed app was signed, launched or replaced,
+and this task performed no license-acceptance action.
+
+| Command | Result on `378175a` | Exact local log |
+|---|---|---|
+| `swift test` | PASS: 362 Core + 27 Benchmark + 268 App Swift Testing tests, plus 14 XCTest tests = **671 total**, zero failures | `/tmp/issue106-full-378175a.log` |
+| `xcodebuild -project Beepbar.xcodeproj -target Beepbar -configuration Release -clonedSourcePackagesDirPath build/SourcePackages build CODE_SIGNING_ALLOWED=NO` | **BUILD SUCCEEDED**, signing disabled | `/tmp/issue106-release-378175a.log` |
+
+The full-suite log records these final summaries:
+
+```text
+Executed 14 tests, with 0 failures (0 unexpected)
+Test run with 362 tests in 38 suites passed after 18.477 seconds.
+Test run with 27 tests in 4 suites passed after 2.212 seconds.
+Test run with 268 tests in 30 suites passed after 12.440 seconds.
+```
+
+Controlled mutations below were made only in a disposable source copy of `378175a`.
+Every mutant compiled, ran its regression and returned nonzero; none is a compilation failure.
+Restoring the original source passed **49 targeted tests in two suites**, with zero failures
+(0.328 s runtime), logged at `/tmp/issue106-actor-restored-green.log`.
+
+| Removed guarantee | Regression result | Exact local log |
+|---|---|---|
+| History executor moved to main actor | Red: one test, one issue | `/tmp/issue106-mutation-main-actor.log` |
+| Persisted reset namespace | Red: one test, six issues | `/tmp/issue106-mutation-reset.log` |
+| Keep the previous list when history read fails | Red: one test, two issues | `/tmp/issue106-mutation-snapshot.log` |
+| Acknowledgement revision validation | Red: one test, one issue | `/tmp/issue106-mutation-revision.log` |
+| Exact history, with global 5,000-ID cap restored | Red: two tests, seven issues | `/tmp/issue106-mutation-cap.log` |
+| Duplicate-click coalescing | Red: one test, two issues | `/tmp/issue106-mutation-coalescing.log` |
+| Nonrecursive cleanup, with recursive removal restored | Red: one test, two issues | `/tmp/issue106-mutation-cleanup-kind.log` |
+
+These results address the first independent review's four code findings: synchronous main-actor
+I/O, reset after deletion failure, mismatched list/history snapshots, and the duplicated global
+aggregate. Subsequent code review requested only this report's historical/current gate correction.
+That documentation-only correction does not alter the verified implementation above or claim a
+new test run on its documentation commit. Independent approval and online PR CI remain pending;
+the **local full suite and Release app build have passed**.
+
+### Historical environment: checkpoint `30c7f14`
+
+At the earlier commit `30c7f144a1231bb9949fddb8110b52e78db5c4fb`, this host had only Command
+Line Tools, without Xcode. At that time `xcodebuild` rejected the active developer directory,
+and full app compilation failed because the SDK referenced a missing `SwiftUIMacros` plugin.
+Adding the bundled Testing macro plugin did not fix SwiftUI compilation. Those failures describe
+only the earlier checkpoint; they are **not current blockers** and are not failures of the
+verified `378175a` gates above.
+
+The targeted fallback then passed 40 tests in two suites (0.247 s runtime); restoring the global
+cap produced two failing regressions and six issues. Core Release compilation passed (11.76 s),
+and the synthetic disk probe passed separately. The synchronous main-actor lookup measured
+52.5 ms in Debug, and independent review rejected that implementation. The actor/reset/snapshot
+revision above replaced it before the successful standard Xcode gates.
+
+### Reproduction and remaining limits
+
+The isolated fixture and controlled mutations remain reproducible on the current source:
 
 ```sh
 python3 scripts/recordings-seen-isolated-tests.py
@@ -82,29 +138,13 @@ python3 scripts/recordings-seen-isolated-tests.py --mutate-revision  # expected 
 python3 scripts/recordings-seen-isolated-tests.py --mutate-coalescing  # expected nonzero
 python3 scripts/recordings-seen-isolated-tests.py --mutate-cleanup-kind  # expected nonzero
 python3 scripts/recordings-seen-isolated-tests.py --probe-disk
-swift build --build-system native --target BeepbarCore -c release
 ```
 
-The fallback copies unchanged Core and recordings controller/session/browser/scripts into a
-temporary package, uses the same controller suite (excluding real-account-controller integration)
-and store suite, and substitutes only app-global fixture settings providers. The mutation restores
-a global 5,000-row eviction in that disposable copy; regressions must fail. It does not touch the
-working checkout, installed app, user preferences or real account. This fallback does not replace
-full CI. Live Polimi, app-wide responsiveness, power-loss durability and base-dev/main UI timing
-comparisons remain unmeasured.
-
-Historical checkpoint `30c7f14` validation before its rejected independent review: targeted copied implementation is green with
-40 tests in two suites (0.247 s runtime). Controlled global-cap mutation is red: two selected
-regressions produce six issues, including old recordings becoming New after cross-course/relaunch
-and disappearance/reappearance. The original source was unchanged by the mutation. Final Core
-Release compilation passed (11.76 s). Disk probe passed separately (one instrumentation test).
-`git diff --check` is clean. Full-suite/App Release/online CI remain outstanding because of the
-local toolchain limits above; judge review and any follow-up fixes must precede pushing/opening PR.
-
-Review iteration (not yet approved): actor execution, reset tombstone, paired snapshots and removal
-of the aggregate address the four review findings. Additional regressions guard acknowledgement
-revisions, close/reopen, duplicate-click coalescing and nonrecursive cleanup. Initial Xcode targeted
-runs passed; final full-suite/Release results and controlled mutation results are recorded against
-the exact next checkpoint in issue #106 before its second independent review. The earlier CLT
-limitation is historical; the installed Xcode now supports the standard gates without any license
-acceptance action by this task. No installed app was signed, launched or replaced.
+The fixture copies unchanged Core and recordings controller/session/browser/scripts into a
+temporary package, uses the controller suite (excluding real-account-controller integration)
+and store suite, and substitutes only app-global fixture settings providers. It does not touch
+the working checkout, installed app, user preferences or real account. This fixture is separate
+from the successful standard full-suite/Release gates and does not replace online PR CI.
+Live Polimi, app-wide responsiveness, power-loss durability and base-dev/main UI timing
+comparisons remain unmeasured. The recorded disk/Debug duration samples are the historical
+synthetic measurements described above, not a claim of app-wide performance or p95 latency.

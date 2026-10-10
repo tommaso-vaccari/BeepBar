@@ -1,4 +1,7 @@
 import Foundation
+#if canImport(FoundationNetworking)
+import FoundationNetworking
+#endif
 import Testing
 @testable import BeepbarCore
 
@@ -2035,8 +2038,11 @@ private final class FixtureURLProtocol: URLProtocol, @unchecked Sendable {
             if delay > 0, !data.isEmpty {
                 let split = max(1, data.count / 2)
                 self.client?.urlProtocol(self, didLoad: data.prefix(split))
-                DispatchQueue.global().asyncAfter(deadline: .now() + delay) { [weak self] in
-                    guard let self else { return }
+                // `URLProtocol` is not `Sendable` on Linux's Foundation, so the class's own
+                // `@unchecked Sendable` does not reach this closure there.
+                nonisolated(unsafe) weak var pending = self
+                DispatchQueue.global().asyncAfter(deadline: .now() + delay) {
+                    guard let self = pending else { return }
                     guard self.workItem?.isCancelled != true else { self.finishDownloadIfNeeded(); return }
                     self.client?.urlProtocol(self, didLoad: data.dropFirst(split))
                     self.client?.urlProtocolDidFinishLoading(self)

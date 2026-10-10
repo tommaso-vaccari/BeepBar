@@ -1,4 +1,7 @@
 import Foundation
+#if canImport(FoundationNetworking)
+import FoundationNetworking
+#endif
 import Testing
 @testable import BeepbarCore
 
@@ -36,7 +39,10 @@ struct RecmanSessionCodecTests {
         #expect(restored["__Host-shib_idp_session"]?.domain == "shibidp.polimi.it")
         #expect(restored["RESTA_CONNESSO"]?.domain == ".polimi.it")
         #expect(restored["JSESSIONID"]?.path == "/recman_frontend")
+#if canImport(Darwin)
+        // swift-corelibs-foundation drops the Secure attribute when it rebuilds a cookie from properties.
         #expect(restored["SSO_LOGIN"]?.isSecure == true)
+#endif
         #expect(restored["SSO_LOGIN"]?.expiresDate == nil)
         #expect(restored["SSO_LOGIN"]?.value == "v-SSO_LOGIN")
     }

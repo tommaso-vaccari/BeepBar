@@ -140,13 +140,13 @@ struct SyncFinalizationTests {
         #expect(defaults.writes.isEmpty)
     }
 
-    /// The newest successful result is already in the preferences when `setSyncState` returns,
-    /// and replaces the previous one (R01, #109). Today both keys are written synchronously on the main actor;
-    /// any future change that moves encoding or writing off the main actor must keep this
-    /// observable contract. Guards against a fire-and-forget write (the result is not yet saved
-    /// when the next launch, a quit or another result comes), and against keeping an older
-    /// summary next to a newer timestamp, which the next launch would show as the last sync.
-    @Test @MainActor func newestSuccessfulResultIsSavedBeforeSetSyncStateReturns() async throws {
+    /// Two syncs in a row, each with a new successful result: when each sync returns, both keys
+    /// already hold its result, and the next launch shows the newer one (R01, #109). The encode
+    /// moved off the main actor; this guards what must not move with it. Fails if the save becomes
+    /// a write that lands after the publication (fire-and-forget), if the encoded bytes are
+    /// dropped, or if the newer result does not replace the older one, which the next launch would
+    /// then show as the last sync.
+    @Test @MainActor func newestCompletedResultIsSavedWithItsPublication() async throws {
         let root = FileManager.default.temporaryDirectory.appending(path: UUID().uuidString)
         try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
         defer { try? FileManager.default.removeItem(at: root) }
@@ -159,33 +159,108 @@ struct SyncFinalizationTests {
         let summaryKey = "io.github.tvaccari.beepbar.last-successful-summary.v1." + rootID.uuidString
         let timestampKey = "io.github.tvaccari.beepbar.last-successful-reconciliation.v1." + rootID.uuidString
         let controller = WeBeepAuthenticationController(testRootURL: root, database: database, rootID: rootID, defaults: defaults)
-        // A large first result, then a small one: the larger encode is the one a background
-        // writer would finish last.
-        let first = Self.syntheticSummary(details: 2000, courses: 10, completedAt: Date(timeIntervalSince1970: 1000))
-        let second = Self.syntheticSummary(details: 3, courses: 2, completedAt: Date(timeIntervalSince1970: 2000))
-        for summary in [first, second] {
+        // A large result, then a small one: a background writer would finish the larger one last.
+        for details in [2000, 3] {
+            let progress = Self.syntheticProgress(details: details, courses: 10)
+            let operation = UUID()
+            controller.setOperationForTesting(operation)
             defaults.resetWrites()
-            controller.setSyncStateForTesting(.synced(summary))
-            // No suspension point between the call and these reads.
-            #expect(defaults.writes == [timestampKey, summaryKey])
+            await controller.completeSyncForTesting(operation, summary: progress)
+            let published = try #require(controller.lastSyncSummary)
+            #expect(controller.syncState == .synced(published))
+            #expect(published.perCourse == progress.perCourse)
+            // Each key written once, the time first; the sync also saves unrelated keys.
+            #expect(defaults.writes.filter { [timestampKey, summaryKey].contains($0) } == [timestampKey, summaryKey], "\(defaults.writes)")
             let bytes = try #require(defaults.data(forKey: summaryKey))
-            #expect(try JSONDecoder().decode(SyncCompletionSummary.self, from: bytes) == summary)
-            #expect(defaults.double(forKey: timestampKey) == summary.completedAt.timeIntervalSince1970)
+            #expect(try JSONDecoder().decode(SyncCompletionSummary.self, from: bytes) == published)
+            #expect(defaults.double(forKey: timestampKey) == published.completedAt.timeIntervalSince1970)
         }
-        // The next launch: a new controller on a second handle of the same suite shows the newest.
+        let newest = controller.lastSyncSummary
+        // The next launch: a new controller on a second handle of the same suite.
         let relaunched = WeBeepAuthenticationController(testRootURL: root, database: database, rootID: rootID, defaults: try #require(UserDefaults(suiteName: suite)))
         await relaunched.restorePersistedSyncStateForTesting()
-        #expect(relaunched.lastSyncSummary == second)
+        #expect(relaunched.lastSyncSummary == newest)
+        #expect(relaunched.lastSyncSummary?.added == 3)
     }
 
-    /// On-demand Release measurement of the exact path that saves a new result (R01, #109):
-    /// `setSyncState(.synced)` encodes `SyncCompletionSummary` with `JSONEncoder` and writes the
-    /// timestamp and the JSON to UserDefaults, synchronously on the main actor. Synthetic details,
-    /// a throwaway suite in a temporary folder (docs/benchmarks.md, "Persisted Activity summary
-    /// save"). Each sample also times the encode alone and the two writes alone, with a different
-    /// `completedAt` each time, as every real sync has, so no write repeats identical bytes.
-    /// A sync with nothing new still saves a summary with every enabled course and no items:
-    /// that is the `details=0` case, the frequent one.
+    /// A sync's new result is encoded off the main thread (R01, #109): the encode of 15,000 file
+    /// details takes longer than a frame. Fails if the completion path goes back to encoding
+    /// inside the main-actor turn (`setSyncState(.synced)`), or encodes in a task that inherits
+    /// the main actor.
+    @Test @MainActor func newResultIsEncodedOffTheMainThread() async throws {
+        let root = FileManager.default.temporaryDirectory.appending(path: UUID().uuidString)
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let rootID = UUID()
+        let database = try SyncDatabase(url: root.appending(path: "state.sqlite"))
+        try await database.registerRoot(id: rootID, canonicalPath: root.path)
+        let controller = WeBeepAuthenticationController(testRootURL: root, database: database, rootID: rootID, defaults: MemoryCountingDefaults.isolated())
+        let operation = UUID()
+        controller.setOperationForTesting(operation)
+        await controller.completeSyncForTesting(operation, summary: Self.syntheticProgress(details: 50, courses: 3))
+        #expect(controller.lastSyncSummary?.added == 50)
+        #expect(controller.summaryEncodedOnMainThreadForTesting == false)
+    }
+
+    /// A sync cancelled while its result is being encoded publishes nothing and saves nothing: the
+    /// previous result stays, whole, for the next launch (R01, #109). This is what "Esci" relies
+    /// on, since it cancels the sync and waits for it. Fails if the new result is saved before the
+    /// operation's guard, or if the guard stops covering the time spent encoding.
+    @Test @MainActor func syncCancelledDuringTheEncodeKeepsThePreviousResult() async throws {
+        let root = FileManager.default.temporaryDirectory.appending(path: UUID().uuidString)
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let rootID = UUID()
+        let database = try SyncDatabase(url: root.appending(path: "state.sqlite"))
+        try await database.registerRoot(id: rootID, canonicalPath: root.path)
+        let suite = WeBeepAuthenticationController.throwawayDefaultsSuite()
+        defer { removeTestDefaults(suite) }
+        let defaults = CountingDefaults(suiteName: suite)!
+        let summaryKey = "io.github.tvaccari.beepbar.last-successful-summary.v1." + rootID.uuidString
+        let timestampKey = "io.github.tvaccari.beepbar.last-successful-reconciliation.v1." + rootID.uuidString
+        let previous = Self.syntheticSummary(details: 4, courses: 2, completedAt: Date(timeIntervalSince1970: 123))
+        let previousBytes = try JSONEncoder().encode(previous)
+        defaults.set(123.0, forKey: timestampKey)
+        defaults.set(previousBytes, forKey: summaryKey)
+        let controller = WeBeepAuthenticationController(testRootURL: root, database: database, rootID: rootID, defaults: defaults)
+        let operation = UUID()
+        controller.setOperationForTesting(operation)
+        // The hook runs after the encode and before the operation's guard.
+        let encoded = AsyncStream<Void>.makeStream()
+        let resume = AsyncStream<Void>.makeStream()
+        controller.setBeforeReconciliationStateForTesting {
+            encoded.continuation.yield()
+            for await _ in resume.stream { break }
+        }
+        defaults.resetWrites()
+        let completion = Task { await controller.completeSyncForTesting(operation, summary: Self.syntheticProgress(details: 2000, courses: 10)) }
+        controller.setOperationForTesting(operation, task: completion)
+        var started = encoded.stream.makeAsyncIterator()
+        _ = await started.next()
+        #expect(controller.summaryEncodedOnMainThreadForTesting == false)
+        controller.cancelSynchronization()
+        resume.continuation.yield()
+        await completion.value
+        #expect(controller.syncState == .readyUnchecked)
+        #expect(defaults.writes.isEmpty)
+        #expect(defaults.data(forKey: summaryKey) == previousBytes)
+        #expect(defaults.double(forKey: timestampKey) == 123)
+        let relaunched = WeBeepAuthenticationController(testRootURL: root, database: database, rootID: rootID, defaults: try #require(UserDefaults(suiteName: suite)))
+        await relaunched.restorePersistedSyncStateForTesting()
+        #expect(relaunched.lastSyncSummary == previous)
+    }
+
+    /// On-demand Release measurement of the save of a sync's new result (R01, #109), with
+    /// synthetic details and a throwaway suite in a temporary folder (docs/benchmarks.md,
+    /// "Persisted Activity summary save"). Per sample, each with its own `completedAt` as every
+    /// real sync has, so no write repeats identical bytes:
+    /// - `inline_turn`: `setSyncState(.synced)`, the main-actor turn that encodes and writes. This
+    ///   was the completion path before R01 and stays the legacy-migration path;
+    /// - `encode` and `writes`: its two parts alone;
+    /// - `off_main_encode`: `EncodedSyncSummary.encode`, awaited from the main actor;
+    /// - `turn`: `setSyncState(synced:)`, the main-actor turn of the completion path since R01,
+    ///   which publishes and writes bytes already encoded.
+    /// `details=0` has no course entries, as a sync with nothing new; it is the frequent case.
     @Test(.enabled(if: ProcessInfo.processInfo.environment["BEEPBAR_PERSIST_BENCHMARK"] == "1")) @MainActor
     func benchmarkSummaryPersist() async throws {
         let runs = 5
@@ -202,36 +277,50 @@ struct SyncFinalizationTests {
             let controller = WeBeepAuthenticationController(testRootURL: root, database: database, rootID: rootID, defaults: defaults)
             let summaryKey = "io.github.tvaccari.beepbar.last-successful-summary.v1." + rootID.uuidString
             let timestampKey = "io.github.tvaccari.beepbar.last-successful-reconciliation.v1." + rootID.uuidString
-            var encode: [Double] = [], write: [Double] = [], whole: [Double] = []
+            let courses = details == 0 ? 0 : 10
+            var samples: [String: [Double]] = [:]
             var bytes = 0
+            /// Validity, outside the timed windows: two writes, holding every detail.
+            func check(_ summary: SyncCompletionSummary) throws {
+                #expect(defaults.writes == [timestampKey, summaryKey])
+                let saved = try #require(defaults.data(forKey: summaryKey))
+                #expect(try JSONDecoder().decode(SyncCompletionSummary.self, from: saved) == summary)
+                #expect(controller.lastSyncSummary == summary)
+                bytes = saved.count
+            }
             // One warm-up, then `runs` samples.
             for run in 0...runs {
-                let base = Double(run * 2 + 1)
-                // Encode and the two writes alone, as `setSyncState` does them.
-                let parts = Self.syntheticSummary(details: details, courses: 10, completedAt: Date(timeIntervalSince1970: base))
-                let encodeStart = ContinuousClock.now
+                let base = Double(run * 3 + 1)
+                var timings: [String: Double] = [:]
+                let inline = Self.syntheticSummary(details: details, courses: courses, completedAt: Date(timeIntervalSince1970: base))
+                defaults.resetWrites()
+                var start = ContinuousClock.now
+                controller.setSyncStateForTesting(.synced(inline))
+                timings["inline_turn"] = Self.milliseconds(ContinuousClock.now - start)
+                try check(inline)
+
+                let parts = Self.syntheticSummary(details: details, courses: courses, completedAt: Date(timeIntervalSince1970: base + 1))
+                start = ContinuousClock.now
                 let data = try JSONEncoder().encode(parts)
                 let encodeEnd = ContinuousClock.now
                 defaults.set(parts.completedAt.timeIntervalSince1970, forKey: timestampKey)
                 defaults.set(data, forKey: summaryKey)
-                let writeEnd = ContinuousClock.now
-                // The whole path, publication included, with a newer result.
-                let summary = Self.syntheticSummary(details: details, courses: 10, completedAt: Date(timeIntervalSince1970: base + 1))
+                timings["encode"] = Self.milliseconds(encodeEnd - start)
+                timings["writes"] = Self.milliseconds(ContinuousClock.now - encodeEnd)
+
+                let summary = Self.syntheticSummary(details: details, courses: courses, completedAt: Date(timeIntervalSince1970: base + 2))
+                start = ContinuousClock.now
+                let encoded = await EncodedSyncSummary.encode(summary)
+                timings["off_main_encode"] = Self.milliseconds(ContinuousClock.now - start)
+                #expect(!encoded.encodedOnMainThread)
                 defaults.resetWrites()
-                let start = ContinuousClock.now
-                controller.setSyncStateForTesting(.synced(summary))
-                let end = ContinuousClock.now
-                // Validity, outside the timed windows: two writes, holding every detail.
-                #expect(defaults.writes == [timestampKey, summaryKey])
-                let saved = try #require(defaults.data(forKey: summaryKey))
-                #expect(try JSONDecoder().decode(SyncCompletionSummary.self, from: saved) == summary)
-                #expect(summary.perCourse.reduce(0) { $0 + $1.items.count } == details)
-                bytes = saved.count
+                start = ContinuousClock.now
+                controller.setSyncStateForTesting(synced: encoded)
+                timings["turn"] = Self.milliseconds(ContinuousClock.now - start)
+                try check(summary)
                 guard run > 0 else { continue }
-                encode.append(Self.milliseconds(encodeEnd - encodeStart))
-                write.append(Self.milliseconds(writeEnd - encodeEnd))
-                whole.append(Self.milliseconds(end - start))
-                print("PERSIST_BENCH details=\(details) bytes=\(bytes) set_sync_state_ms=\(whole.last!) encode_ms=\(encode.last!) defaults_write_ms=\(write.last!)")
+                for (name, value) in timings { samples[name, default: []].append(value) }
+                print("PERSIST_BENCH details=\(details) bytes=\(bytes) " + timings.keys.sorted().map { "\($0)_ms=\(String(format: "%.3f", timings[$0]!))" }.joined(separator: " "))
             }
             func stats(_ values: [Double]) -> String {
                 let sorted = values.sorted()
@@ -239,18 +328,23 @@ struct SyncFinalizationTests {
                 let p95 = sorted[min(sorted.count - 1, Int((0.95 * Double(sorted.count)).rounded(.up)) - 1)]
                 return String(format: "median=%.3f p95=%.3f", sorted[sorted.count / 2], p95)
             }
-            print("PERSIST_SUMMARY details=\(details) bytes=\(bytes) runs=\(runs) set_sync_state_ms[\(stats(whole))] encode_ms[\(stats(encode))] defaults_write_ms[\(stats(write))]")
+            print("PERSIST_SUMMARY details=\(details) bytes=\(bytes) runs=\(runs) " + ["inline_turn", "encode", "writes", "off_main_encode", "turn"].map { "\($0)_ms[\(stats(samples[$0]!))]" }.joined(separator: " "))
         }
     }
 
-    /// A first sync's summary: `details` added files spread over `courses` courses, with ids of the
+    /// A first sync's result: `details` added files spread over `courses` courses, with ids of the
     /// coordinator's `course:module:/folder:name` form, the shape the D05 restore benchmark uses.
     private static func syntheticSummary(details: Int, courses: Int, completedAt: Date) -> SyncCompletionSummary {
-        let perCourse = (1...courses).map { course -> CourseSyncCount in
-            let items = stride(from: course - 1, to: details, by: courses).map { SyncedItem(id: "\(course):100:/:file-\($0).pdf", name: "file-\($0).pdf", kind: .added) }
+        SyncCompletionSummary(progress: syntheticProgress(details: details, courses: courses), completedAt: completedAt)
+    }
+
+    private static func syntheticProgress(details: Int, courses: Int) -> SyncProgress {
+        let perCourse = (0..<courses).map { index -> CourseSyncCount in
+            let course = index + 1
+            let items = stride(from: index, to: details, by: courses).map { SyncedItem(id: "\(course):100:/:file-\($0).pdf", name: "file-\($0).pdf", kind: .added) }
             return CourseSyncCount(courseID: Int64(course), courseFolder: "Course \(course)", added: items.count, updated: 0, items: items)
         }
-        return SyncCompletionSummary(completedAt: completedAt, added: details, updated: 0, unchanged: 0, preservedLocal: 0, conflicts: 0, failures: 0, perCourse: perCourse)
+        return SyncProgress(completed: details, total: details, added: details, updated: 0, preservedLocal: 0, unchanged: 0, conflicts: 0, failures: 0, perCourse: perCourse)
     }
 
     private static func milliseconds(_ duration: Duration) -> Double {

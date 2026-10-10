@@ -5,6 +5,8 @@ import importlib.util
 from pathlib import Path
 import tempfile
 import unittest
+from unittest import mock
+import xml.etree.ElementTree as ET
 
 spec = importlib.util.spec_from_file_location("ui_benchmark", Path(__file__).with_name("ui-benchmark.py"))
 driver = importlib.util.module_from_spec(spec)
@@ -94,6 +96,62 @@ class ReportValidationTests(unittest.TestCase):
         value["cycles"][1]["keyMilliseconds"] = 101
         driver.validate_sample(value, "launch-warm")
         self.assertFalse(driver.window_budget([value], "launch-warm")["allObservedSamplesWithinBudget"])
+
+    def test_changed_power_after_the_final_run_invalidates_the_series(self):
+        driver.validate_power_source("AC Power", "AC Power")
+        with self.assertRaisesRegex(ValueError, "power source changed"):
+            driver.validate_power_source("AC Power", "Battery Power")
+
+    def test_missing_empty_and_unreadable_trace_are_refused(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary); trace = root / "sample.trace"
+            for exists in (False, True):
+                if exists:
+                    trace.mkdir()
+                with self.assertRaisesRegex(ValueError, "missing or empty"):
+                    driver.validate_trace(trace, "courses-100", root, root / "sample")
+            (trace / "junk").write_text("not an Instruments recording")
+            with mock.patch.object(driver, "command", side_effect=RuntimeError("unreadable trace")):
+                with self.assertRaisesRegex(RuntimeError, "unreadable trace"):
+                    driver.validate_trace(trace, "courses-100", root, root / "sample")
+
+    def test_trace_requires_fixture_target_and_strips_device_identity(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            toc = Path(temporary) / "toc.xml"
+            xml = '<trace-toc><run number="1"><info><target><device name="private" uuid="private" model="M5"/><process name="beepbar-ui-fixture" pid="7" return-exit-status="0"/></target></info><data><table schema="time-profile"/></data></run></trace-toc>'
+            toc.write_text(xml)
+            self.assertEqual(driver.trace_target(toc), "7")
+            device = ET.parse(toc).find(".//device")
+            self.assertEqual(device.attrib, {"model": "M5"})
+            toc.write_text(xml.replace('name="beepbar-ui-fixture"', 'name="another-process"'))
+            with self.assertRaisesRegex(ValueError, "successful isolated fixture"):
+                driver.trace_target(toc)
+
+    def test_cpu_profile_requires_main_thread_stacks_and_resolves_references(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "cpu.xml"
+            xml = '<trace-query-result><node><row><thread id="1" fmt="Main Thread"><process id="2"><pid>7</pid></process></thread><process ref="2"/><tagged-backtrace id="3"><frame name="render"/></tagged-backtrace></row><row><thread ref="1"/><process ref="2"/><tagged-backtrace ref="3"/></row></node></trace-query-result>'
+            path.write_text(xml)
+            self.assertEqual(driver.profile_summary(path, "7")["fixtureMainThreadSamplesWithStacks"], 2)
+            for bad in (xml.replace('fmt="Main Thread"', 'fmt="worker"'), xml.replace('<frame name="render"/>', ''), xml.replace('<pid>7</pid>', '<pid>8</pid>')):
+                path.write_text(bad)
+                with self.assertRaisesRegex(ValueError, "main-thread CPU samples"):
+                    driver.profile_summary(path, "7")
+
+    def test_trace_requires_ui_markers_for_the_requested_content(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "signposts.xml"
+            rows = '<row><subsystem id="1">io.github.tvaccari.beepbar.performance</subsystem><category id="2">ui</category><signpost-name id="3">ui.iconReady</signpost-name></row>'
+            for index, name in enumerate(("ui.fixtureOpen", "ui.windowKey", "ui.firstCourseContent"), 4):
+                rows += '<row><subsystem ref="1"/><category ref="2"/><signpost-name id="%d">%s</signpost-name></row>' % (index, name)
+            xml = '<trace-query-result><node>' + rows + '</node></trace-query-result>'
+            path.write_text(xml)
+            self.assertEqual(driver.signpost_summary(path, "courses-100")["ui.windowKey"], 1)
+            with self.assertRaisesRegex(ValueError, "required fixture UI signposts"):
+                driver.signpost_summary(path, "recordings-1000")
+            path.write_text(xml.replace("ui.firstCourseContent", "unrelated"))
+            with self.assertRaisesRegex(ValueError, "required fixture UI signposts"):
+                driver.signpost_summary(path, "courses-100")
 
 
 if __name__ == "__main__":

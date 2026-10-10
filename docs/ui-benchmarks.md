@@ -23,7 +23,8 @@ scripts/ui-benchmark.py --ref HEAD --out PerformanceReports/ui-d07 --runs 5 --wa
 
 The default covers all scenarios below, including one **30-minute unprofiled idle observation**.
 UI scenarios get one warm-up and five measured fresh fixture processes, each with a retained
-Time Profiler trace. Each `launch-warm` and `reopen-sync` process opens/closes twice; reported warm
+Time Profiler trace plus `os_signpost` recording. Each `launch-warm` and `reopen-sync` process
+opens/closes twice; reported warm
 latency uses the second window. `memory-cycles` performs ten actual open/sync/close cycles per
 process and records footprint after each closed-window settling period. UI controls are disabled
 so an accidental click/shortcut cannot enter real login, Settings, updater or external actions.
@@ -72,8 +73,12 @@ There is a fixed 300ms shown settling period after refresh and 3s after each clo
 not readiness estimates: key/content callbacks provide the reported latencies. A missing key
 window or populated-content marker times out and invalidates the sample; a valid empty window
 cannot substitute for a data row. A reduced/wrong corpus, wrong cycle count, nonfinite timing,
-failed run, Low Power Mode or nonnominal end thermal state invalidates the series. Trace failure
-also fails the command; no timing table should be cited from an invalid series.
+failed run, Low Power Mode or nonnominal end thermal state invalidates the series. Power is
+checked before and after every process and after trace export. These are endpoint checks;
+keep power unchanged throughout the run. Trace failure also fails the command: each required
+trace must be nonempty and readable by Instruments export, identify the successful fixture,
+and contain main-thread CPU samples with stacks plus all required UI signposts.
+No timing table should be cited from an invalid series.
 
 ## Signals, budgets and interpretation
 
@@ -137,7 +142,8 @@ refresh test must fail while every request still remains intercepted. Never muta
 network protocol injection and then run tests against a real Moodle host.
 
 Outputs: `series.json`, `series.md`, `build.log`, and one directory per scenario with raw fixture
-JSON, process/trace logs, and traces for UI samples. Runtime failures retain `valid: false`; a
+JSON, process/trace logs, traces, and exported TOC/CPU/signpost XML for UI samples. Exported TOCs
+remove the device owner name/UUID. Runtime failures retain `valid: false`; a
 single failing scenario invalidates the full series. Raw reports/traces are ignored by Git and
-must be preserved locally or attached to the PR; only curated synthetic summaries belong in
-shared documentation.
+must be preserved locally. Original Instruments traces can contain device identity metadata;
+share only reviewed, sanitized exports/summaries in the PR and shared documentation.

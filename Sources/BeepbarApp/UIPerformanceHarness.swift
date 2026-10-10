@@ -33,6 +33,17 @@ struct UIFixtureScenario: Equatable {
 
 enum UIFixtureError: Error { case invalidArguments, existingReport, missingContent, noKeyWindow, unexpectedResponse, missingAccount }
 
+/// A later activation is not the first key event. Keep the first timestamp for this open;
+/// a new value is created for each window generation rather than reusing a focus transition.
+struct UIFixtureWindowTiming {
+    private(set) var keyMilliseconds: Double?
+    mutating func becameKey(milliseconds: Double) -> Bool {
+        guard keyMilliseconds == nil else { return false }
+        keyMilliseconds = milliseconds
+        return true
+    }
+}
+
 /// A fail-closed Moodle: *all* URLSession requests are intercepted, including an unknown URL.
 /// Accounts are keyed by synthetic token so parallel isolation tests cannot cross workloads.
 final class UIFixtureProtocol: URLProtocol, @unchecked Sendable {
@@ -303,7 +314,8 @@ struct UIFixtureReport: Encodable {
     var icon: StatusItemController?
     var router: ShellRouter?
     var openedAt: UInt64 = 0
-    var keyMilliseconds: Double?
+    var timing = UIFixtureWindowTiming()
+    var keyMilliseconds: Double? { timing.keyMilliseconds }
     var contentMilliseconds: [String: Double] = [:]
     var ready: CheckedContinuation<Void, Error>?
     var timedOut = false
@@ -326,7 +338,7 @@ struct UIFixtureReport: Encodable {
         let identifier = (notification.object as? NSWindow).map(ObjectIdentifier.init)
         Task { @MainActor [weak self] in
             guard let self, let window = self.window, identifier == ObjectIdentifier(window) else { return }
-            self.keyMilliseconds = self.elapsed(since: self.openedAt, until: timestamp)
+            guard self.timing.becameKey(milliseconds: self.elapsed(since: self.openedAt, until: timestamp)) else { return }
             PerformanceTrace.shared.event("ui.windowKey", category: .ui)
             self.signalReady()
         }
@@ -342,7 +354,7 @@ struct UIFixtureReport: Encodable {
     private func open(_ fixture: UIFixture) async throws {
         generation += 1
         let generation = generation
-        keyMilliseconds = nil; contentMilliseconds = [:]; timedOut = false
+        timing = UIFixtureWindowTiming(); contentMilliseconds = [:]; timedOut = false
         let router = ShellRouter(); router.page = scenario.page; self.router = router
         openedAt = DispatchTime.now().uptimeNanoseconds
         PerformanceTrace.shared.event("ui.fixtureOpen", category: .ui)

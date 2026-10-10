@@ -17,6 +17,17 @@ import BeepbarCore
         }
     }
 
+    /// Returning focus must not turn a late activation into the reported initial key latency.
+    @Test func firstKeyTimestampSurvivesLaterFocusChanges() {
+        var timing = UIFixtureWindowTiming()
+        #expect(timing.becameKey(milliseconds: 4))
+        #expect(!timing.becameKey(milliseconds: 100))
+        #expect(timing.keyMilliseconds == 4)
+        timing = UIFixtureWindowTiming()
+        #expect(timing.becameKey(milliseconds: 7))
+        #expect(timing.keyMilliseconds == 7)
+    }
+
     /// Retained evidence is immutable: the fixture must not overwrite a previous output file.
     @Test func existingReportIsRefusedWithoutChangingIt() throws {
         let file = FileManager.default.temporaryDirectory.appending(path: "UIFixtureReport-\(UUID().uuidString)")

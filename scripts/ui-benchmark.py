@@ -22,6 +22,7 @@ import tarfile
 import tempfile
 import time
 import uuid
+import xml.etree.ElementTree as ET
 
 SHORT_SCENARIOS = (
     "launch-cold", "launch-warm", "launch-offline", "courses-100", "courses-500",
@@ -145,6 +146,103 @@ def window_budget(samples, scenario):
             "allObservedSamplesWithinBudget": maximum <= target}
 
 
+def validate_power_source(initial, observed):
+    if observed != initial:
+        raise ValueError("power source changed during run")
+
+
+def trace_target(toc):
+    root = ET.parse(toc).getroot()
+    target = root.find("./run[@number='1']/info/target/process")
+    if target is None or target.get("name") != "beepbar-ui-fixture" or target.get("return-exit-status") != "0":
+        raise ValueError("trace does not identify a successful isolated fixture")
+    pid = target.get("pid")
+    if not pid or not pid.isdecimal() or int(pid) <= 0 or root.find(".//table[@schema='time-profile']") is None:
+        raise ValueError("trace has no fixture CPU profile")
+    # Exported evidence may be shared; hardware owner name/UUID are irrelevant to the workload.
+    # The original .trace stays local because Instruments can retain device identity metadata.
+    for device in root.findall(".//device"):
+        device.attrib.pop("name", None); device.attrib.pop("uuid", None)
+    ET.ElementTree(root).write(toc, encoding="utf-8", xml_declaration=True)
+    return pid
+
+
+def profile_summary(path, target_pid):
+    """Stream CPU rows so large traces do not need another full in-memory XML hierarchy."""
+    processes, threads, stacks = {}, {}, {}
+    samples = main_samples = 0
+    for _, row in ET.iterparse(path, events=("end",)):
+        if row.tag != "row":
+            continue
+        for process in row.iter("process"):
+            if process.get("id"):
+                processes[process.get("id")] = process.findtext("pid")
+        for thread in row.iter("thread"):
+            if thread.get("id"):
+                threads[thread.get("id")] = thread.get("fmt", "").startswith("Main Thread")
+        for stack in row.iter("tagged-backtrace"):
+            if stack.get("id"):
+                stacks[stack.get("id")] = stack.find("frame") is not None
+        process = row.find("process"); thread = row.find("thread"); stack = row.find("tagged-backtrace")
+        if process is not None and thread is not None and stack is not None:
+            samples += 1
+            pid = processes.get(process.get("ref") or process.get("id"))
+            main = threads.get(thread.get("ref") or thread.get("id"), False)
+            has_stack = stacks.get(stack.get("ref") or stack.get("id"), False)
+            if pid == target_pid and main and has_stack:
+                main_samples += 1
+        row.clear()
+    if main_samples == 0:
+        raise ValueError("trace has no usable fixture main-thread CPU samples")
+    return {"cpuSamples": samples, "fixtureMainThreadSamplesWithStacks": main_samples}
+
+
+def signpost_summary(path, scenario):
+    values, names = {}, {}
+    for _, row in ET.iterparse(path, events=("end",)):
+        if row.tag != "row":
+            continue
+        for value in row:
+            if value.tag in ("subsystem", "category", "signpost-name") and value.get("id"):
+                values[value.get("id")] = value.text
+        def field(name):
+            value = row.find(name)
+            return None if value is None else values.get(value.get("ref") or value.get("id"))
+        if field("subsystem") == "io.github.tvaccari.beepbar.performance" and field("category") == "ui":
+            name = field("signpost-name")
+            if name:
+                names[name] = names.get(name, 0) + 1
+        row.clear()
+    cycles = 10 if scenario == "memory-cycles" else 2 if scenario in ("launch-warm", "reopen-sync") else 1
+    content = "ui.firstExpandedActivityContent" if scenario.startswith("activity-") else "ui.firstRecordingsContent" if scenario.startswith("recordings-") else "ui.firstCourseContent"
+    required = {"ui.iconReady": 1, "ui.fixtureOpen": cycles, "ui.windowKey": cycles, content: cycles}
+    if scenario.startswith("activity-"):
+        required["ui.firstActivityContent"] = cycles
+    if scenario == "progress-burst":
+        required["ui.fixtureProgressBurst"] = 2  # begin and end of the interval
+    if any(names.get(name, 0) < count for name, count in required.items()):
+        raise ValueError("trace lacks required fixture UI signposts")
+    return names
+
+
+def validate_trace(trace, scenario, cwd, output_prefix):
+    if not trace.is_dir() or not any(path.is_file() and path.stat().st_size > 0 for path in trace.rglob("*")):
+        raise ValueError("missing or empty required trace")
+    toc = output_prefix.with_suffix(".toc.xml")
+    profile = output_prefix.with_suffix(".cpu.xml")
+    signposts = output_prefix.with_suffix(".signposts.xml")
+    command(["xcrun", "xctrace", "export", "--input", str(trace), "--toc", "--output", str(toc)], cwd,
+            output_prefix.with_suffix(".toc.log"), timeout=60)
+    pid = trace_target(toc)
+    for schema, output in (("time-profile", profile), ("os-signpost", signposts)):
+        command(["xcrun", "xctrace", "export", "--input", str(trace), "--xpath",
+                 "/trace-toc/run[@number='1']/data/table[@schema='%s']" % schema, "--output", str(output)], cwd,
+                output.with_suffix(".log"), timeout=180)
+    result = profile_summary(profile, pid)
+    result["uiSignposts"] = signpost_summary(signposts, scenario)
+    return result
+
+
 def power(repo):
     output = command(["pmset", "-g", "batt"], repo)
     if "'AC Power'" not in output:
@@ -229,13 +327,18 @@ def run(args):
                     launch = [str(executable), "--scenario", scenario, "--report", str(report)]
                     if scenario != "idle":
                         trace = scenario_out / (name + ".trace")
-                        launch = ["xcrun", "xctrace", "record", "--template", "Time Profiler", "--output", str(trace), "--target-stdout", str(stdout), "--env", "BEEPBAR_UI_FIXTURE_TEMP_ROOT=" + str(fixture_parent), "--launch", "--"] + launch
+                        launch = ["xcrun", "xctrace", "record", "--template", "Time Profiler", "--instrument", "os_signpost", "--output", str(trace), "--target-stdout", str(stdout), "--env", "BEEPBAR_UI_FIXTURE_TEMP_ROOT=" + str(fixture_parent), "--launch", "--"] + launch
                     if power(repo) != initial_power:
                         raise RuntimeError("power source changed")
                     print("%s %s" % (scenario, name), flush=True)
                     started = time.time()
                     command(launch, source, scenario_out / (name + ".log"), timeout=1900 if scenario == "idle" else 180, env=fixture_env)
                     series["commands"].append({"argv": launch, "elapsedSeconds": time.time() - started, "exit": 0})
+                    # A final idle run must not make a series valid after switching to battery.
+                    validate_power_source(initial_power, power(repo))
+                    if scenario != "idle":
+                        series["commands"][-1]["trace"] = validate_trace(trace, scenario, source, scenario_out / name)
+                        validate_power_source(initial_power, power(repo))
                     sample = validate_sample(json.loads(report.read_text()), scenario)
                     if not warmup:
                         samples.append(sample)
@@ -289,7 +392,7 @@ def main():
         parser.error("duplicate scenarios")
     try:
         run(args)
-    except (RuntimeError, OSError, ValueError, subprocess.SubprocessError) as error:
+    except (RuntimeError, OSError, ValueError, ET.ParseError, subprocess.SubprocessError) as error:
         print("UI benchmark failed: " + str(error), file=sys.stderr)
         return 1
     except KeyboardInterrupt:

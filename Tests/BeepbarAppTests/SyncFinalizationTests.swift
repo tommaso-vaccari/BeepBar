@@ -214,10 +214,10 @@ struct SyncFinalizationTests {
 
     /// A sync cancelled, or replaced by a newer operation, while its result is being encoded
     /// publishes nothing and saves nothing: the previous result stays, whole, for the next launch
-    /// (R01, #109). Cancelling is what "Esci" does before waiting for the sync. Signing out and
-    /// choosing another folder are refused while a sync is active (`signOut` and the folder
-    /// picker check `isSyncActive`), so these are the two ways a sync loses its operation here.
-    /// Fails if the new result is saved before the operation's guard, or if the guard stops
+    /// (R01, #109). Cancelling is what "Esci" does before waiting for the sync. `signOut` is
+    /// refused while a sync is active; the folder picker checks `isSyncActive` only when it
+    /// starts, before its own awaits, a window that predates R01 and that this test does not
+    /// cover. Fails if the new result is saved before the operation's guard, or if the guard stops
     /// covering the time spent encoding.
     @Test(arguments: ["cancel", "superseded"]) @MainActor
     func syncCancelledDuringTheEncodeKeepsThePreviousResult(_ invalidation: String) async throws {
@@ -268,6 +268,89 @@ struct SyncFinalizationTests {
         let relaunched = WeBeepAuthenticationController(testRootURL: root, database: database, rootID: rootID, defaults: try #require(UserDefaults(suiteName: suite)))
         await relaunched.restorePersistedSyncStateForTesting()
         #expect(relaunched.lastSyncSummary == previous)
+    }
+
+    /// A sync with a failure or an open conflict is shown as such and saves nothing: neither key
+    /// is written, the previous result stays for the next launch, and nothing is encoded (R01,
+    /// #109). A failure takes precedence over a conflict, as before R01. Fails if the encode
+    /// condition stops requiring both no failures and no open conflicts, which would end such a
+    /// sync as "synced" and overwrite the last successful result.
+    @Test(arguments: [(1, false), (0, true), (1, true)]) @MainActor
+    func syncWithFailuresOrConflictsSavesNothing(failures: Int, openConflict: Bool) async throws {
+        let root = FileManager.default.temporaryDirectory.appending(path: UUID().uuidString)
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let rootID = UUID()
+        let database = try SyncDatabase(url: root.appending(path: "state.sqlite"))
+        try await database.registerRoot(id: rootID, canonicalPath: root.path)
+        if openConflict {
+            try await database.insertConflict(ConflictRecord(id: UUID(), rootID: rootID, remoteID: "pending",
+                relativePath: try RelativePath("Course/pending.pdf"), incomingPath: try RelativePath(internal: ".beepbar/conflicts/pending.pdf"),
+                baseSHA256: "base", localSHA256: "local", remoteSHA256: "remote", remoteRevision: "2", detectedAt: .now, status: .open))
+        }
+        let suite = WeBeepAuthenticationController.throwawayDefaultsSuite()
+        defer { removeTestDefaults(suite) }
+        let defaults = CountingDefaults(suiteName: suite)!
+        let summaryKey = "io.github.tvaccari.beepbar.last-successful-summary.v1." + rootID.uuidString
+        let timestampKey = "io.github.tvaccari.beepbar.last-successful-reconciliation.v1." + rootID.uuidString
+        let previous = Self.syntheticSummary(details: 4, courses: 2, completedAt: Date(timeIntervalSince1970: 123))
+        let previousBytes = try JSONEncoder().encode(previous)
+        defaults.set(123.0, forKey: timestampKey)
+        defaults.set(previousBytes, forKey: summaryKey)
+        let controller = WeBeepAuthenticationController(testRootURL: root, database: database, rootID: rootID, defaults: defaults)
+        let operation = UUID()
+        controller.setOperationForTesting(operation)
+        defaults.resetWrites()
+        let progress = SyncProgress(completed: 3, total: 3, added: 2, updated: 0, preservedLocal: 0, unchanged: 0, conflicts: openConflict ? 1 : 0, failures: failures)
+        await controller.completeSyncForTesting(operation, summary: progress)
+        switch controller.syncState {
+        case .partial(let summary) where failures > 0: #expect(summary.added == 2)
+        case .conflicts(1, let summary?) where failures == 0: #expect(summary.added == 2)
+        default: Issue.record("Unexpected state \(controller.syncState)")
+        }
+        #expect(defaults.writes.filter { [timestampKey, summaryKey].contains($0) }.isEmpty, "\(defaults.writes)")
+        #expect(defaults.data(forKey: summaryKey) == previousBytes)
+        #expect(defaults.double(forKey: timestampKey) == 123)
+        #expect(controller.summaryEncodedOnMainThreadForTesting == nil)
+    }
+
+    /// A sync cancelled, or replaced, while its pending choices are read never encodes its result
+    /// (R01, #109): the check before the encode spares a cancelled sync the work, about 19 ms at
+    /// 15,000 details, which a quit would otherwise wait for. Nothing is published or saved.
+    /// Fails if that check is removed, since the encode then runs and records where it ran.
+    @Test(arguments: ["cancel", "superseded"]) @MainActor
+    func syncCancelledBeforeTheEncodeSkipsIt(_ invalidation: String) async throws {
+        let root = FileManager.default.temporaryDirectory.appending(path: UUID().uuidString)
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let rootID = UUID()
+        let database = try SyncDatabase(url: root.appending(path: "state.sqlite"))
+        try await database.registerRoot(id: rootID, canonicalPath: root.path)
+        let defaults = MemoryCountingDefaults.isolated()
+        let controller = WeBeepAuthenticationController(testRootURL: root, database: database, rootID: rootID, defaults: defaults)
+        let operation = UUID()
+        controller.setOperationForTesting(operation)
+        let reading = AsyncStream<Void>.makeStream()
+        let resume = AsyncStream<Void>.makeStream()
+        controller.setBeforePendingChoicesForTesting {
+            reading.continuation.yield()
+            for await _ in resume.stream { break }
+        }
+        let completion = Task { await controller.completeSyncForTesting(operation, summary: Self.syntheticProgress(details: 2000, courses: 10)) }
+        controller.setOperationForTesting(operation, task: completion)
+        var started = reading.stream.makeAsyncIterator()
+        _ = await started.next()
+        if invalidation == "cancel" {
+            controller.cancelSynchronization()
+        } else {
+            controller.setOperationForTesting(UUID())
+            controller.setSyncStateForTesting(.syncing)
+        }
+        resume.continuation.yield()
+        await completion.value
+        #expect(controller.summaryEncodedOnMainThreadForTesting == nil)
+        #expect(controller.syncState == (invalidation == "cancel" ? .readyUnchecked : .syncing))
+        #expect(controller.lastSyncSummary == nil)
     }
 
     /// On-demand Release measurement of the save of a sync's new result (R01, #109), with

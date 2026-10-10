@@ -123,16 +123,6 @@ def metrics(harness):
     return dict(found)
 
 
-# Metrics only some scenarios report; every other metric must be present in every report.
-SCENARIO_METRICS = {'cancel.latency': {'cancel'},
-                    'summary.encode': {'summary-persist'}, 'summary.write': {'summary-persist'},
-                    'summary.bytes': {'summary-persist'}}
-
-
-def expected_metrics(units, scenario_name):
-    return {m for m in units if scenario_name in SCENARIO_METRICS.get(m, {scenario_name})}
-
-
 def sample_metric(sample, metric):
     fields = {
         'wall': ('wallMilliseconds', 1), 'cpu': ('resources.cpuNanoseconds', 1e6),
@@ -147,9 +137,7 @@ def sample_metric(sample, metric):
         'db.moduleOverride.updates': ('moduleOverrideUpdates', 1),
         'fs.filesHashed': ('fileStore.filesHashed', 1), 'fs.bytesHashed': ('fileStore.bytesHashed', 1048576),
         'fs.pathLookups': ('fileStore.pathLookups', 1), 'net.metadata': ('upstream.metadataBytes', 1024),
-        'net.downloaded': ('upstream.downloadBytes', 1048576), 'cancel.latency': ('cancelLatencyMilliseconds', 1),
-        'summary.encode': ('summaryEncodeMilliseconds', 1), 'summary.write': ('summaryWriteMilliseconds', 1),
-        'summary.bytes': ('summaryBytes', 1024)}
+        'net.downloaded': ('upstream.downloadBytes', 1048576), 'cancel.latency': ('cancelLatencyMilliseconds', 1)}
     if metric == 'net.requests':
         values = [sample['upstream'][key] for key in
                   ('contentsRequests', 'courseListRequests', 'downloads', 'otherRequests', 'siteInfoRequests')]
@@ -180,7 +168,8 @@ def validate(report, sha, runs, warmup, units, dirty=False):
     if (not scenario['checks'] or any(x is not True for x in scenario['checks'].values())
             or len(scenario['samples']) != runs or scenario['warmupRuns'] != warmup):
         raise InvalidComparison('failed/empty checks or mismatched sampling')
-    if set(scenario['summary']) != expected_metrics(units, scenario['name']):
+    expected = set(units) - ({'cancel.latency'} if scenario['name'] != 'cancel' else set())
+    if set(scenario['summary']) != expected:
         raise InvalidComparison('missing/unknown metrics')
     for metric, summary in scenario['summary'].items():
         calculated = distribution([sample_metric(sample, metric) for sample in scenario['samples']])
@@ -325,8 +314,7 @@ def execute(args):
                     ('unchanged-15k', ['unchanged', '--files', '15000']),
                     ('large-update-64mb', ['large-update', '--size-mb', '64']),
                     ('large-update-256mb', ['large-update', '--size-mb', '256']),
-                    ('cancel-mid', ['cancel', '--size-mb', '256', '--fraction', '0.5']),
-                    ('summary-persist-15k', ['summary-persist', '--details', '15000'])]
+                    ('cancel-mid', ['cancel', '--size-mb', '256', '--fraction', '0.5'])]
             if args.smoke:
                 plan = [('unchanged-smoke', ['unchanged', '--files', '10']),
                         ('update-smoke', ['large-update', '--size-mb', '1']),

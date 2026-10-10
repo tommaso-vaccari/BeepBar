@@ -56,9 +56,7 @@ let package = Package(
         .executableTarget(name: "BeepbarBenchmarks", dependencies: ["BeepbarBenchmarkKit"]),
         .testTarget(name: "BeepbarCoreTests", dependencies: ["BeepbarCore"]),
         .testTarget(name: "BeepbarBenchmarkKitTests", dependencies: ["BeepbarBenchmarkKit", "BeepbarCore"]),
-        // BenchmarkKit only for the drift guard between `SyncCompletionSummary` and the harness probe
-        // that measures its encoding (R01, #109).
-        .testTarget(name: "BeepbarAppTests", dependencies: ["BeepbarApp", "BeepbarBenchmarkKit"]),
+        .testTarget(name: "BeepbarAppTests", dependencies: ["BeepbarApp"]),
     ]
 )
 #endif

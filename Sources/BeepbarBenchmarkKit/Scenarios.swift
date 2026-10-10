@@ -30,11 +30,6 @@ package struct RunSample: Sendable, Codable {
     package var cancelLatencyMilliseconds: Double?
     /// Cancel scenario only: the local file still holds the last installed revision's bytes.
     package var localFilePreserved: Bool?
-    /// Summary-persist scenario only (R01, #109): JSON encoding of the summary, the atomic write of
-    /// those bytes, and their size. Optional so the other scenarios' reports stay as they were.
-    package var summaryEncodeMilliseconds: Double?
-    package var summaryWriteMilliseconds: Double?
-    package var summaryBytes: Int?
 
     package init(wallMilliseconds: Double, resources: ResourceUsage, peakFootprintGrowth: Int64, peakFootprint: UInt64 = 0, database: SyncDatabaseWriteCounters, ownershipBackfill: OwnershipBackfillCounters = OwnershipBackfillCounters(), moduleOverrideUpdates: Int = 0, fileStore: FileStoreCounters, upstream: UpstreamCounters, installed: Int, conflicts: Int, failures: Int, outcome: String? = nil, cancelLatencyMilliseconds: Double? = nil, localFilePreserved: Bool? = nil) {
         self.wallMilliseconds = wallMilliseconds
@@ -113,9 +108,6 @@ package struct Metric: Sendable {
         Metric(name: "net.metadata", unit: "KiB") { Double($0.upstream.metadataBytes) / 1024 },
         Metric(name: "net.downloaded", unit: "MiB") { Double($0.upstream.downloadBytes) / 1_048_576 },
         Metric(name: "cancel.latency", unit: "ms") { $0.cancelLatencyMilliseconds },
-        Metric(name: "summary.encode", unit: "ms") { $0.summaryEncodeMilliseconds },
-        Metric(name: "summary.write", unit: "ms") { $0.summaryWriteMilliseconds },
-        Metric(name: "summary.bytes", unit: "KiB") { $0.summaryBytes.map { Double($0) / 1024 } },
     ]
 }
 

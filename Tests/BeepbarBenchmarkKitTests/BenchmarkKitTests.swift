@@ -187,38 +187,6 @@ struct BenchmarkKitTests {
         #expect(result.samples.allSatisfy { $0.upstream.downloadBytes == size && $0.fileStore.bytesHashed >= size })
     }
 
-    /// A small summary-persist run reports encode, write and size per run, keeps every detail and
-    /// passes its checks (R01, #109). A run that silently dropped details would fail the first
-    /// check, so the numbers a PR quotes always cover the whole payload.
-    @Test func summaryPersistScenarioPassesItsChecks() async throws {
-        let result = try await Scenarios.summaryPersist(details: 50, courses: 3, runs: 2, warmup: 1)
-        #expect(result.passed, "\(result.checks)")
-        #expect(result.samples.count == 2)
-        #expect(result.parameters == ["details": "50", "courses": "3"])
-        for sample in result.samples {
-            let encode = try #require(sample.summaryEncodeMilliseconds)
-            let write = try #require(sample.summaryWriteMilliseconds)
-            #expect(encode >= 0 && write >= 0 && encode + write <= sample.wallMilliseconds + 0.001)
-            #expect(try #require(sample.summaryBytes) > 0)
-        }
-        #expect(result.summary["summary.encode"] != nil && result.summary["summary.bytes"] != nil)
-        #expect(result.summary["cancel.latency"] == nil)
-        #expect(result.notes.contains { $0.hasPrefix("budget, encode + write on the main actor ≤ 16 ms:") })
-    }
-
-    /// The synthetic summary spreads its details over every course and encodes to a payload the
-    /// D05 calibration can be compared with: ids of the coordinator's shape, one item per detail.
-    @Test func syntheticSummarySpreadsDetailsOverCourses() throws {
-        let probe = SyncSummaryProbe.synthetic(details: 10, courses: 3)
-        #expect(probe.detailCount == 10 && probe.added == 10)
-        #expect(probe.perCourse.map(\.items.count) == [4, 3, 3])
-        #expect(Set(probe.perCourse.flatMap { $0.items.map(\.id) }).count == 10)
-        #expect(probe.perCourse.first?.items.first?.id == "1:100:/:file-0.pdf")
-        let bytes = try JSONEncoder().encode(probe)
-        #expect(try JSONDecoder().decode(SyncSummaryProbe.self, from: bytes) == probe)
-        #expect(SyncSummaryProbe.synthetic(details: 0, courses: 2).detailCount == 0)
-    }
-
     /// A throttled download is cancelled halfway, the run stops, and the local file keeps the
     /// previous revision. The latency is measured from the cancel, not from the run's start.
     @Test func cancelScenarioCancelsMidTransferAndKeepsTheLocalFile() async throws {
@@ -243,10 +211,6 @@ struct BenchmarkOptionsTests {
         ("idle", ["--files", "1"]),
         ("large-update", ["--fraction", "0.5"]),
         ("cancel", ["--files", "1"]),
-        ("summary-persist", ["--files", "1"]),
-        ("summary-persist", ["--details", "0"]),
-        ("summary-persist", ["--courses", "0"]),
-        ("summary-persist", ["--details", "x"]),
         ("unknown", []),
         ("baseline", ["--out"]),
         ("baseline", ["--out", "--runs", "1"]),
@@ -276,7 +240,7 @@ struct BenchmarkOptionsTests {
     }
 
     /// Defaults, zero warmup, each command's options and literal paths remain usable.
-    @Test(arguments: ["unchanged", "large-update", "cancel", "summary-persist", "baseline"])
+    @Test(arguments: ["unchanged", "large-update", "cancel", "baseline"])
     func defaultsAndCommonMetadata(command: String) throws {
         let defaults = try BenchmarkOptions([][...], command: command)
         #expect(try defaults.int("runs", 5) == 5)
@@ -291,7 +255,6 @@ struct BenchmarkOptionsTests {
         ("unchanged", ["--files", "1", "--courses", "1", "--json", "a b.json"]),
         ("large-update", ["--size-mb", "1"]),
         ("cancel", ["--size-mb", "1", "--fraction", "1", "--rate-mbps", "1"]),
-        ("summary-persist", ["--details", "15000", "--courses", "10", "--json", "s.json"]),
         ("baseline", ["--out", "a b"]),
         ("baseline", ["--runs", String(Int.max), "--warmup", "0"]),
         ("idle", ["--pid", "1", "--minutes", "0.01", "--interval-seconds", "0.1", "--json", "idle.json", "--commit", "sha", "--dirty"]),

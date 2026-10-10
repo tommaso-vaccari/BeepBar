@@ -106,8 +106,25 @@ These results address the first independent review's four code findings: synchro
 I/O, reset after deletion failure, mismatched list/history snapshots, and the duplicated global
 aggregate. Subsequent code review requested only this report's historical/current gate correction.
 That documentation-only correction does not alter the verified implementation above or claim a
-new test run on its documentation commit. Independent approval and online PR CI remain pending;
+new test run on its documentation commit. The earlier independent review approved this implementation; online PR CI remained pending at that checkpoint;
 the **local full suite and Release app build have passed**.
+
+### PR #131: integration with current `dev`
+
+[PR #131](https://github.com/tommaso-vaccari/BeepBar/pull/131) remains open against `dev`.
+Merge commit `b0a5477` incorporates `dev 713033c` without rewriting the shared branch.
+The controller conflict preserves scoped Watchlist state and reconciliation after a successful
+atomic list/history publication, alongside the off-main history worker and namespace reset.
+Both behavior specifications retain Watchlist and history guarantees and now link PR #131.
+The isolated fixture includes the unchanged study state and extracts the unchanged pure
+presentation rules from `RecordingsPage.swift`, keeping the new dependency reproducible.
+
+Standard `swift test` on `b0a5477` passed **696 tests** (362 Core, 27 Benchmark,
+293 App Swift Testing and 14 XCTest), logged at `/tmp/pr131-full-b0a5477.log`.
+The fixture dependency correction `8b1e67e` changes only the fixture script;
+its isolated suite passed **57 tests** in two suites (`/tmp/pr131-isolated-current.log`).
+The integration is undergoing another independent review and final Release/online CI gates.
+Live account validation and UI latency comparisons remain unmeasured as described below.
 
 ### Historical environment: checkpoint `30c7f14`
 

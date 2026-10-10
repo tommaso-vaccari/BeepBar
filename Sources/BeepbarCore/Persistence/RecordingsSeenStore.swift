@@ -1,5 +1,10 @@
 import CSQLite
 import Foundation
+#if canImport(Darwin)
+import Darwin
+#else
+import Glibc
+#endif
 
 /// Exact recording history scoped to the WeBeep account, course and academic year (#106).
 /// Only IDs supplied by the current listing are queried: old history stays on disk, never in

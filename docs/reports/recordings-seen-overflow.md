@@ -123,7 +123,11 @@ Standard `swift test` on `b0a5477` passed **696 tests** (362 Core, 27 Benchmark,
 293 App Swift Testing and 14 XCTest), logged at `/tmp/pr131-full-b0a5477.log`.
 The fixture dependency correction `8b1e67e` changes only the fixture script;
 its isolated suite passed **57 tests** in two suites (`/tmp/pr131-isolated-current.log`).
-The integration is undergoing another independent review and final Release/online CI gates.
+The independent review approved integration candidate `7491f27`. Its full suite passed 696 tests
+(`/tmp/pr131-full-final.log`) and unsigned Release build succeeded (`/tmp/pr131-release-final.log`).
+The benchmark comparison script tests and release-note checks also passed. A final portability-only
+follow-up explicitly imports Darwin/Glibc for the store’s POSIX calls introduced after Linux Core
+support landed in `dev`; Linux execution was not available locally. Online CI remains pending.
 Live account validation and UI latency comparisons remain unmeasured as described below.
 
 ### Historical environment: checkpoint `30c7f14`

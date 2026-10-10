@@ -87,28 +87,35 @@ struct DailyTelemetryTests {
     }
 
     /// First launches and updates send by default, but a saved opt-out survives relaunch and later opt-in.
-    @Test func defaultOnAndSavedOptOutSurviveRelaunch() async {
+    @Test func defaultOnAndSavedOptOutSurviveRelaunch() async throws {
         let harness = Harness()
         defer { harness.remove() }
         let recorder = Recorder()
-        let controller = harness.controller(configuration, recorder: recorder)
+        let clock = Clock(Date(timeIntervalSince1970: 1_800_000_000))
+        let controller = harness.controller(configuration, clock: clock, recorder: recorder)
         #expect(controller.isEnabled)
         await controller.start()
         #expect(await recorder.count == 1)
         controller.setEnabled(false)
-        let relaunched = harness.controller(configuration, recorder: recorder)
+        let relaunched = harness.controller(configuration, clock: clock, recorder: recorder)
         #expect(!relaunched.isEnabled)
         await relaunched.start()
         #expect(await recorder.count == 1)
+        clock.date += 86_400
         relaunched.setEnabled(true)
-        for _ in 0..<1_000 { await Task.yield() }
-        #expect(await recorder.count == 1)
+        for _ in 0..<1_000 {
+            if await recorder.count == 2 { break }
+            await Task.yield()
+        }
+        #expect(await recorder.count == 2)
+        let requests = await recorder.requests
+        #expect(try identity(requests[0]) == identity(requests[1]))
         #expect(harness.defaults.bool(forKey: DailyTelemetryController.enabledKey))
         relaunched.stop()
-        let enabledAgain = harness.controller(configuration, recorder: recorder)
+        let enabledAgain = harness.controller(configuration, clock: clock, recorder: recorder)
         #expect(enabledAgain.isEnabled)
         await enabledAgain.start()
-        #expect(await recorder.count == 1)
+        #expect(await recorder.count == 2)
         enabledAgain.stop()
     }
 

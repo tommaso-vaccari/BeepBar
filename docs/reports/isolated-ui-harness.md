@@ -1,10 +1,14 @@
 # D07 isolated UI tooling — #95
 
 Branch: `perf/isolated-ui-harness`, base `origin/dev` `ac68333`.
-Verified implementation: `0666707962ba386c075a9087e062217dee95701b`.
-The earlier candidate `281cb94` passed ordinary app tests/build but failed the opt-in fixture
-compilation: an explicitly typed `CheckedContinuation<Void, Error>` fixed its inference failure.
-The final fixture report is encode-only. Results below refer to the corrected implementation.
+Verified implementation: `fe47bb571cd3d05ac4c8013df8c05e6b849bb259`.
+The earlier candidate `281cb94` failed the opt-in fixture compilation; `0666707` corrected
+its continuation type and passed the initial gates. Independent review of `a1496b2` found
+three P2 issues: repeated key-window events overwrote the first timestamp, power changes
+were not checked after recording, and trace success did not prove usable artifacts.
+`f32a07e` fixed these with regressions and explicit CPU/signpost exports; `fe47bb5` corrected
+the first-key test's Swift Testing expression. Results below refer to this corrected code,
+except the historical functional batch explicitly identified below.
 
 ## Local code gates
 
@@ -13,12 +17,12 @@ Developer directory `/Applications/Xcode.app/Contents/Developer`, xctrace 27.0.
 
 | Gate | Result | Retained local evidence |
 |---|---|---|
-| `PYTHONDONTWRITEBYTECODE=1 python3 scripts/test_ui_benchmark.py` | 8 Python evidence safeguards PASS | Test stdout; no app/network/build |
-| `swift test --filter UIFixtureTests` | 7 fixture tests PASS; included again in the full final suite | `/tmp/issue95-targeted-second.log` |
-| `swift test` on `0666707` | 358 Core + 27 Benchmark + 264 App Swift Testing + 14 XCTest = **663 PASS**, zero failures | `/tmp/issue95-full-0666707.log` |
-| Ordinary Xcode Release app build, signing disabled | **BUILD SUCCEEDED** on `0666707` | `/tmp/issue95-release-0666707.log` |
-| Opt-in fixture Release arm64 build | PASS on `0666707`; Mach-O arm64; identity is `beepbar-isolated-ui-fixture-v1` | `/tmp/issue95-fixture-build-second.log` |
-| Offline guard mutation in a disposable source copy | Compiled RED: offline-refresh assertion fails; original fixture PASS | `/tmp/issue95-offline-mutation-0666707.log` |
+| `PYTHONDONTWRITEBYTECODE=1 python3 scripts/test_ui_benchmark.py` | **13 PASS** including post-run power and missing/unusable trace safeguards | `/tmp/issue95-python-judge-fixes.log` |
+| `swift test --filter UIFixtureTests` on the restored disposable copy | **8 PASS**, also included in the full suite | `/tmp/issue95-offline-mutation-fe47bb5-restored-green.log` |
+| `swift test` on `fe47bb5` | 358 Core + 27 Benchmark + 265 App Swift Testing + 14 XCTest = **664 PASS**, zero failures | `/tmp/issue95-full-judge-fixes.log` |
+| Ordinary Xcode Release app build, signing disabled | **BUILD SUCCEEDED** on `fe47bb5` | `/tmp/issue95-release-judge-fixes.log` |
+| Opt-in fixture Release arm64 build | **BUILD SUCCEEDED** on `fe47bb5` (14.41 s); Mach-O arm64; identity `beepbar-isolated-ui-fixture-v1` | `/tmp/issue95-fixture-build-judge-fixes.log` |
+| Offline and first-key mutations in a disposable source copy | Compiled **RED**, two tests with three issues; restored original **8 GREEN** | `/tmp/issue95-offline-mutation-fe47bb5.log`, restored log above |
 
 The standard Release command was:
 
@@ -35,12 +39,12 @@ swift build --disable-sandbox --scratch-path /tmp/BeepbarUICompile-281cb94 \
   -Xswiftc -DUI_PERFORMANCE_HARNESS
 ```
 
-The scratch directory's name records its first attempt; the successful second build above
-compiled the corrected `0666707` source. Identity verification uses `--harness-identity`, which
+The scratch directory's name records its first attempt; the latest successful build above
+compiled `fe47bb5`. Identity verification uses `--harness-identity`, which
 returns before constructing `NSApplication`. No ordinary app, installed app, signing identity,
 real account or production data directory was launched or changed by these gates.
 
-To reproduce the sensitivity check, export `0666707` with `git archive` into a fresh owned
+To reproduce the offline sensitivity check, export `fe47bb5` with `git archive` into a fresh owned
 temporary directory, change exactly the fixture's
 `if account.offline { throw URLError(.notConnectedToInternet) }` to
 `if false && account.offline { throw URLError(.notConnectedToInternet) }`, then run:
@@ -51,12 +55,17 @@ swift test --filter offlineRefreshRetainsKnownCoursesAndReportsFailure
 
 It must compile and fail because `courseLoadError` is nil. Keep all URLProtocol injection,
 unknown-host/token rejection and synthetic credentials unchanged. Run the unmodified fixture
-suite for the green side; never remove the network interception as a mutation. The recorded
-mutation used a disposable copy and deleted only that owned copy after preserving its log.
+suite for the green side; never remove the network interception as a mutation. A second
+mutation changes `UIFixtureWindowTiming.becameKey`'s `guard keyMilliseconds == nil` to
+`if false`; `firstKeyTimestampSurvivesLaterFocusChanges` must then fail because later focus
+changes overwrite the first timestamp. The recorded combined mutation used a disposable
+copy, restored both guards for the green side, and deleted only that owned copy after logs
+were retained.
 
 ## Functional UI smoke, separate from measurements
 
-All twelve short scenarios produced valid reports: cold/warm/offline, 100/500 courses,
+Historical batch on `0666707`, before the review fixes: all twelve short scenarios produced
+valid reports: cold/warm/offline, 100/500 courses,
 reopen during a genuine held sync, expanded Activity 1k/15k, Recordings 1k/5k,
 progress burst, and ten open/sync/close cycles. Each scenario was run once in a fresh process
 inside an owned temporary bundle with a unique bundle ID, the renamed fixture executable,
@@ -69,6 +78,27 @@ Evidence: `/tmp/issue95-functional-scenarios-0666707/` contains each raw report 
 at `/tmp/issue95-functional-smoke-0666707/`. During Activity 15k construction, a process snapshot
 showed substantial CPU/RSS use. That is retained as a qualitative finding for D11, not an AC
 latency/memory benchmark, measured benefit, population p95 or responsiveness claim.
+
+### Trace decoder and current-code probe
+
+A historical functional trace on `0666707` with Time Profiler and the explicit `os_signpost`
+instrument passed the new decoder: 233 fixture main-thread samples with stacks and all four
+required course-window UI markers. Evidence is local at
+`/tmp/issue95-functional-signposts-0666707/`; it is not a comparable measurement series.
+
+On `fe47bb5`, one isolated `launch-warm` process completed both opens successfully and emitted
+a report. The evidence validator **rejected the sample**: `thermalState = 1` (fair), rather
+than required nominal `0`; Low Power Mode was off. It ran on battery and cannot be accepted
+as an AC benchmark. No timing or memory budget pass is claimed for it. Its trace nevertheless
+passed the artifact decoder: 491 CPU samples, 431 fixture main-thread samples with stacks,
+`ui.iconReady` once, and `ui.fixtureOpen`, `ui.windowKey`, `ui.firstCourseContent` twice each.
+Evidence: `/tmp/issue95-functional-warm-fe47bb5/` (the raw report is named `courses-100.json`,
+while its scenario field is correctly `launch-warm`). Artifact decoding proves retained,
+readable evidence; it does not override the rejected environment metadata.
+
+Raw `.trace` files can contain device names/identifiers and stay local. Exported TOC metadata
+is sanitized by the driver before use in the evidence summary. Synthetic workload reports
+contain no real account data. No raw trace is committed or attached to the PR.
 
 ## Measurement blocker and remaining acceptance
 

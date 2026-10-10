@@ -1,6 +1,12 @@
+#if canImport(Darwin)
 import Darwin
+#else
+import Glibc
+#endif
 import Foundation
+#if canImport(os)
 import os
+#endif
 import Testing
 @testable import BeepbarCore
 

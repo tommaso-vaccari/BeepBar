@@ -7,6 +7,7 @@
 	objects = {
 
 /* Begin PBXBuildFile section */
+		D781C25133AC471FAB128002 /* DailyTelemetry.swift in Sources */ = {isa = PBXBuildFile; fileRef = D781C25133AC471FAB128001 /* DailyTelemetry.swift */; };
 		A10000000000000000000001 /* BeepbarApp.swift in Sources */ = {isa = PBXBuildFile; fileRef = A10000000000000000000011 /* BeepbarApp.swift */; };
 		A10000000000000000000002 /* WeBeepAuthenticationController.swift in Sources */ = {isa = PBXBuildFile; fileRef = A10000000000000000000012 /* WeBeepAuthenticationController.swift */; };
 		A10000000000000000000006 /* BeepbarShellView.swift in Sources */ = {isa = PBXBuildFile; fileRef = A10000000000000000000014 /* BeepbarShellView.swift */; };
@@ -32,9 +33,11 @@
 		A100000000000000000000B4 /* RecordingsSessionStore.swift in Sources */ = {isa = PBXBuildFile; fileRef = A100000000000000000000B5 /* RecordingsSessionStore.swift */; };
 		A100000000000000000000C0 /* UIContentReadiness.swift in Sources */ = {isa = PBXBuildFile; fileRef = A100000000000000000000C1 /* UIContentReadiness.swift */; };
 		A100000000000000000000C2 /* UIPerformanceHarness.swift in Sources */ = {isa = PBXBuildFile; fileRef = A100000000000000000000C3 /* UIPerformanceHarness.swift */; };
+		B12300000000000000000001 /* RecordingsStudyState.swift in Sources */ = {isa = PBXBuildFile; fileRef = B12300000000000000000002 /* RecordingsStudyState.swift */; };
 /* End PBXBuildFile section */
 
 /* Begin PBXFileReference section */
+		D781C25133AC471FAB128001 /* DailyTelemetry.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DailyTelemetry.swift; sourceTree = "<group>"; };
 		A10000000000000000000010 /* Beepbar.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = Beepbar.app; sourceTree = BUILT_PRODUCTS_DIR; };
 		A10000000000000000000011 /* BeepbarApp.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = BeepbarApp.swift; sourceTree = "<group>"; };
 		A10000000000000000000012 /* WeBeepAuthenticationController.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = WeBeepAuthenticationController.swift; sourceTree = "<group>"; };
@@ -61,6 +64,7 @@
 		A100000000000000000000B5 /* RecordingsSessionStore.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = RecordingsSessionStore.swift; sourceTree = "<group>"; };
 		A100000000000000000000C1 /* UIContentReadiness.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = UIContentReadiness.swift; sourceTree = "<group>"; };
 		A100000000000000000000C3 /* UIPerformanceHarness.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = UIPerformanceHarness.swift; sourceTree = "<group>"; };
+		B12300000000000000000002 /* RecordingsStudyState.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = RecordingsStudyState.swift; sourceTree = "<group>"; };
 /* End PBXFileReference section */
 
 /* Begin PBXFrameworksBuildPhase section */
@@ -107,6 +111,7 @@
 				A10000000000000000000012 /* WeBeepAuthenticationController.swift */,
 				A10000000000000000000014 /* BeepbarShellView.swift */,
 				A10000000000000000000017 /* UpdaterController.swift */,
+				D781C25133AC471FAB128001 /* DailyTelemetry.swift */,
 				A100000000000000000000AD /* LaunchAtLogin.swift */,
 				A100000000000000000000AF /* SyncNotifications.swift */,
 				A10000000000000000000091 /* OnboardingView.swift */,
@@ -122,6 +127,7 @@
 				A100000000000000000000B9 /* RecordingsPage.swift */,
 				A100000000000000000000B7 /* RecordingsController.swift */,
 				A100000000000000000000B5 /* RecordingsSessionStore.swift */,
+				B12300000000000000000002 /* RecordingsStudyState.swift */,
 			);
 			name = Sources;
 			path = Sources/BeepbarApp;
@@ -218,6 +224,7 @@
 				A10000000000000000000002 /* WeBeepAuthenticationController.swift in Sources */,
 				A10000000000000000000006 /* BeepbarShellView.swift in Sources */,
 				A10000000000000000000009 /* UpdaterController.swift in Sources */,
+				D781C25133AC471FAB128002 /* DailyTelemetry.swift in Sources */,
 				A100000000000000000000AC /* LaunchAtLogin.swift in Sources */,
 				A100000000000000000000AE /* SyncNotifications.swift in Sources */,
 				A10000000000000000000090 /* OnboardingView.swift in Sources */,
@@ -233,6 +240,7 @@
 				A100000000000000000000B8 /* RecordingsPage.swift in Sources */,
 				A100000000000000000000B6 /* RecordingsController.swift in Sources */,
 				A100000000000000000000B4 /* RecordingsSessionStore.swift in Sources */,
+				B12300000000000000000001 /* RecordingsStudyState.swift in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};

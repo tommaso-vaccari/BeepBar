@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+### New
+
+- Save lessons from different courses in a single Watchlist inside Recordings. Add or remove bookmarks and find your saved list again after restarting.
+- Telemetry is enabled by default to count active installations and app versions with one daily ping. Turn it off in Settings; the info button explains what is sent. No account, course or file information is included.
+
 ### Improved
 
 - Cancelling sync stops large local file checks promptly while file changes already underway still finish safely.

@@ -5,7 +5,7 @@
 ### New
 
 - Save lessons from different courses in a single Watchlist inside Recordings. Add or remove bookmarks and find your saved list again after restarting.
-- An optional daily signal to TelemetryDeck helps measure active installations and app versions; it can be disabled in Settings and contains no account, course or file information.
+- An optional daily signal to TelemetryDeck helps measure active installations and app versions; it is off until enabled in Settings and contains no account, course or file information.
 
 ### Improved
 

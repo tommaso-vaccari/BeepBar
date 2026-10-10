@@ -4,7 +4,7 @@ BeepBar uses TelemetryDeck's [Ingest API v2](https://telemetrydeck.com/docs/inge
 
 ## Configuration and user choice
 
-`App/Info.plist` holds the public App ID and organization namespace (`com.beepbar`). These are ingest identifiers, not credentials. Missing or invalid configuration disables telemetry. `BeepBarTelemetryDefaultEnabled` currently remains false pending the owner's choice of the initial setting. The Statistics section in Settings lets users change the saved preference; a saved opt-out always takes precedence over the build default. The toggle and explanation are available in Italian and English.
+`App/Info.plist` holds the public App ID and organization namespace (`com.beepbar`). These are ingest identifiers, not credentials. Missing or invalid configuration disables telemetry. `BeepBarTelemetryDefaultEnabled` is false: new and existing installations send nothing until the user enables the setting. The Statistics section in Settings lets users change the saved preference; a saved opt-out always takes precedence over the build default. The toggle and explanation are available in Italian and English.
 
 Debug builds, tests and UI previews do not use production configuration. Release builds send only when the setting is enabled. Tests inject their own isolated preferences, sender, clock and scheduler. Nothing requires the installed app or its data.
 
@@ -41,4 +41,6 @@ Custom payload keys are intentional: predefined SDK dashboards expecting `Teleme
 
 ## Verification
 
-A manually authorized test signal `BeepBar.integrationTest`, `isTestMode = true`, with version `integration-test` was accepted by the configured endpoint with HTTP 200 / `OK` on 2026-10-09. This establishes ingest acceptance, not dashboard processing; the owner must verify it in Test Mode. Production signals were not submitted during development.
+On 2026-10-10 the owner confirmed two manually authorized synthetic signals in Explore → Recent Events with Test Mode enabled: `BeepBar.integrationCheck` (namespaced endpoint, boolean `isTestMode = true`) and `BeepBar.sdkFormatTest` (generic endpoint, string `isTestMode = "true"`). Both used the configured App ID. This verifies ingestion, processing and dashboard visibility without an SDK; the earlier empty results did not establish a payload-format failure. No production signal was submitted during development.
+
+The free namespace status warns that processing occurs between once an hour and once a day. HTTP 200 / `OK` means the ingest endpoint accepted the request; dashboard visibility can lag. Default dashboards for device/system/app-version metadata can remain empty because the minimal payload omits those SDK fields. Use the custom version query above.

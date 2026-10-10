@@ -18,6 +18,7 @@ struct DailyTelemetryTests {
         let signal = try #require(signals.first)
         #expect(signals.count == 1)
         #expect(Set(signal.keys) == ["appID", "clientUser", "type", "payload"])
+        #expect(signal["appID"] as? String == "AD3B2F70-8FAE-47B1-A58B-4870921E2398")
         #expect(signal["type"] as? String == "BeepBar.dailyActive")
         #expect(signal["payload"] as? [String: String] == ["BeepBar.appVersion": "1.2.3"])
         #expect((signal["clientUser"] as? String)?.count == 64)
@@ -83,6 +84,35 @@ struct DailyTelemetryTests {
         #expect(harness.callbacks.isEmpty)
         #expect(harness.defaults.object(forKey: DailyTelemetryController.installationKey) == nil)
         #expect(await recorder.count == 0)
+    }
+
+    /// First launches and updates remain silent until enabled; the saved choice survives reconstruction.
+    @Test func optInStartsAndPersistsAcrossRelaunch() async {
+        let harness = Harness()
+        defer { harness.remove() }
+        let recorder = Recorder()
+        let controller = DailyTelemetryController(defaults: harness.defaults, configuration: configuration,
+            defaultEnabled: false, send: { try await recorder.send($0) }, schedule: { _, _ in
+                BackgroundActivityRegistration(invalidate: {})
+            })
+        await controller.start()
+        #expect(!controller.isEnabled)
+        #expect(await recorder.count == 0)
+        #expect(harness.defaults.object(forKey: DailyTelemetryController.installationKey) == nil)
+        controller.setEnabled(true)
+        for _ in 0..<1_000 {
+            if await recorder.count == 1 { break }
+            await Task.yield()
+        }
+        #expect(await recorder.count == 1)
+        controller.stop()
+        let relaunched = harness.controller(configuration, recorder: recorder)
+        #expect(relaunched.isEnabled)
+        await relaunched.start()
+        #expect(await recorder.count == 1)
+        relaunched.setEnabled(false)
+        let optedOut = harness.controller(configuration, recorder: recorder)
+        #expect(!optedOut.isEnabled)
     }
 
     /// A failed request consumes the daily attempt and resumes the next day, without retrying on wake.

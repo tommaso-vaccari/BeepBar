@@ -14,7 +14,7 @@ struct DailyTelemetryConfiguration: Sendable {
         guard UUID(uuidString: appID) != nil, !namespace.isEmpty,
               namespace.utf8.allSatisfy({ (48...57).contains($0) || (65...90).contains($0) || (97...122).contains($0) || $0 == 45 || $0 == 95 || $0 == 46 }),
               !version.isEmpty else { return nil }
-        self.appID = appID.lowercased()
+        self.appID = appID
         self.namespace = namespace
         self.version = version
     }

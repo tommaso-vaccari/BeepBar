@@ -3,6 +3,8 @@
 `scripts/ui-benchmark.py` builds an opt-in fixture from a **committed source revision** and
 runs the real Courses, Activity and Recordings SwiftUI views in the application's normal
 configuration window. It never launches the normal BeepBar entry point or an installed app.
+Current code gates, functional checks and unmeasured acceptance are in the
+[D07 validation report](reports/isolated-ui-harness.md).
 
 ## Single command
 

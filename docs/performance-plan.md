@@ -110,9 +110,12 @@ Non lavorare contemporaneamente sugli stessi percorsi senza concordare l’ordin
 | D03 / I2b | [#91](https://github.com/tommaso-vaccari/BeepBar/pull/91) | Backfill indicizzato soltanto quando esistono candidati legacy; nessuna cache permanente. |
 | D04 / I2c | [#92](https://github.com/tommaso-vaccari/BeepBar/pull/92) | Zero UPDATE per override invariati; al massimo uno per modulo rinominato con nomi concordi. |
 | D05 / I6 riepilogo | [#93](https://github.com/tommaso-vaccari/BeepBar/pull/93) | Restore senza riscritture, decode fuori dal main, migrazione legacy e nuovi risultati conservati. |
+| D08 / I3 | [#133](https://github.com/tommaso-vaccari/BeepBar/pull/133) | Throttle del progresso prima del main actor: ingressi solo per aggiornamenti accettati e totali finali, run superate e tardive ignorate, cadenze 200 ms/1 s conservate. |
 | D11 / I10 Attività | [#139](https://github.com/tommaso-vaccari/BeepBar/pull/139) | Corso espanso paginato: prime 200 righe, «Mostra altri» fino all’ultima, ID stabili e univoci, ritorno a una pagina alla chiusura o con un nuovo riepilogo. Ultima riga ancora raggiungibile solo costruendo le precedenti. |
 
 Verificate su dev `81ee436749b6a11eebf75fdabd247639310563c7`: suite finale 620 test, build Release, review indipendenti e CI pre/post-merge verdi. Le PR integrate non equivalgono a una release installata.
+
+D08 / I3 ([#133](https://github.com/tommaso-vaccari/BeepBar/pull/133)): verificata su `bb5943b` con 685 test, build Release, review indipendente CLEAN al terzo round, mutazioni macOS (hop prima del throttle: 10.000 ingressi per 10.000 eventi contro un massimo di 2; cadenze unificate o invertite rilevate) e CI verde; fluidità UI non misurata (D07 non integrata).
 
 D11 / I10 Attività ([#139](https://github.com/tommaso-vaccari/BeepBar/pull/139)): verificata su `9543abe` con 678 test, build Release, review indipendente CLEAN al secondo round e CI verde; budget UI non misurati (D07 non integrata).
 
@@ -125,7 +128,6 @@ Misure sintetiche Release arm64, M5/32 GB, AC, una warm-up e sette run: D04, cor
 | Task | Branch | Dipendenze | Issue |
 |---|---|---|---|
 | D07 | `perf/isolated-ui-harness` | Nessuna | [#95](https://github.com/tommaso-vaccari/BeepBar/issues/95) |
-| D08 | `perf/progress-before-main` | D06, D07 | [#96](https://github.com/tommaso-vaccari/BeepBar/issues/96) |
 | D09 | `perf/recordings-session-io` | D01, D07 | [#97](https://github.com/tommaso-vaccari/BeepBar/issues/97) |
 | D10 | `feature/cached-course-list` | D06, D07, D08 | [#98](https://github.com/tommaso-vaccari/BeepBar/issues/98) |
 | D12 | `perf/recordings-derived-state` | D07, D09 | [#100](https://github.com/tommaso-vaccari/BeepBar/issues/100) |
@@ -170,7 +172,9 @@ I percorsi sono relativi al repository. Le righe si riferiscono al commit dell�
 
 ### I3 — Applicare il throttle prima del main actor
 
-**Evidenza:** entrambe le callback sync chiamano `publishProgress` del controller main-actor (`Sources/BeepbarApp/WeBeepAuthenticationController.swift:2303`) prima del relay/throttle di `SyncProgressStore`. Anche gli eventi scartati fanno quindi il primo salto sul main actor.
+**Implementata tramite D08 (#96, [PR #133](https://github.com/tommaso-vaccari/BeepBar/pull/133)):** il throttle e il token di run (`SyncProgressRun`) vivono in un relay protetto da lock, consultato dalla callback sul task del sync; il main actor viene attraversato soltanto per gli aggiornamenti accettati e per i totali finali. `endOperation` ritira il token, quindi callback tardive di una run annullata o conclusa, e le run rifiutate da `beginTransfer`, non toccano più lo store. Prova in `SyncProgressStoreTests`: 10.000 eventi da un task detached producono al massimo 2 + ⌊durata/200 ms⌋ ingressi sul main actor (contatore `mainActorEntries`, incrementato all'ingresso di `progressAccepted` prima di ogni guardia, così un hop spostato prima del throttle lo fa salire a 10.000), cadenze 200 ms manuale e 1 s automatica distinte da un intervallo di 400 ms tra due eventi, totali finali consegnati, eventi fuori ordine, di run superate (anche dopo la chiusura della run attiva) e successivi alla chiusura ignorati. Nessuna misura di fluidità UI: il contatore prova il numero di salti, non la reattività (I7). Non eseguibile su Linux: suite completa e build Release verificate su macOS (Apple M2) e in CI su `bb5943b`.
+
+**Evidenza originale:** entrambe le callback sync chiamano `publishProgress` del controller main-actor (`Sources/BeepbarApp/WeBeepAuthenticationController.swift:2303`) prima del relay/throttle di `SyncProgressStore`. Anche gli eventi scartati fanno quindi il primo salto sul main actor.
 
 **Intervento:** alimentare direttamente relay/store fuori dal main; entrarvi soltanto per gli aggiornamenti accettati e lo stato terminale. Conservare identità dell’operazione, cadenza manuale/automatica e aggiornamento del menu. Un progresso accodato di una vecchia run non deve sovrascrivere completamento o run successiva.
 

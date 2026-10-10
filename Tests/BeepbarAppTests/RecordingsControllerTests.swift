@@ -111,6 +111,20 @@ final class CountingDefaults: UserDefaults, @unchecked Sendable {
     func resetWrites() { writes = [] }
 }
 
+/// Thread-safe fixture faults/probe for the history executor; session counters stay separate.
+final class HistoryFileProbe: @unchecked Sendable {
+    private let lock = NSLock()
+    private var removalFails = false
+    private var mainThreadReads: [Bool] = []
+    func setRemovalFailure(_ value: Bool) { lock.withLock { removalFails = value } }
+    func recordIO() { lock.withLock { mainThreadReads.append(Thread.isMainThread) } }
+    var allIOWasOffMain: Bool { lock.withLock { !mainThreadReads.isEmpty && !mainThreadReads.contains(true) } }
+    func remove(_ url: URL) throws {
+        if lock.withLock({ removalFails }) { throw CocoaError(.fileWriteNoPermission) }
+        try FileManager.default.removeItem(at: url)
+    }
+}
+
 /// Mutable from a test: the WeBeep account, Polimi or not, the clock, and what was opened.
 @MainActor final class RecordingsWorld {
     var owner: Int? = 42
@@ -120,6 +134,15 @@ final class CountingDefaults: UserDefaults, @unchecked Sendable {
     var copied: [URL] = []
     var storeAccesses = 0
     var browsersMade = 0
+    let historyFiles = HistoryFileProbe()
+    var historyActors: [RecordingsSeenHistory] = []
+    var historyReadGate: FakeRecmanBrowser.Gate?
+    var historyAcknowledgeGate: FakeRecmanBrowser.Gate?
+    var historyAfterReadGate: FakeRecmanBrowser.Gate?
+    var historyAcknowledgementsStarted = 0
+    func waitAfterHistoryRead() async { await historyAfterReadGate?.wait() }
+    func waitForHistoryRead() async { await historyReadGate?.wait() }
+    func waitForHistoryAcknowledge() async { historyAcknowledgementsStarted += 1; await historyAcknowledgeGate?.wait() }
 }
 
 /// The Recordings controller against a scripted browser, a throwaway session folder and throwaway
@@ -155,6 +178,14 @@ struct RecordingsControllerTests {
             makeBrowser: { world.browsersMade += 1; return browser },
             store: store,
             defaults: defaults,
+            makeSeenHistory: { namespace in
+                let files = world.historyFiles
+                let folder = self.folder
+                let storage = RecordingsSeenStore(directory: { files.recordIO(); return folder }, namespace: namespace, removeFile: { try files.remove($0) })
+                let history = RecordingsSeenHistory(store: storage, beforeRead: { await world.waitForHistoryRead() }, beforeAcknowledge: { await world.waitForHistoryAcknowledge() }, afterRead: { await world.waitAfterHistoryRead() })
+                world.historyActors.append(history)
+                return history
+            },
             ownerUserID: { world.owner },
             isAvailable: { world.polimi },
             openURL: { world.opened.append($0) },
@@ -210,7 +241,13 @@ struct RecordingsControllerTests {
     }
 
     private func cleanUp() {
-        try? FileManager.default.removeItem(at: folder)
+        let actors = world.historyActors
+        actors.forEach { $0.invalidate() }
+        let folder = folder
+        Task {
+            for history in actors { try? await history.invalidateAndDelete() }
+            try? FileManager.default.removeItem(at: folder)
+        }
     }
 
     // MARK: Switch
@@ -319,8 +356,7 @@ struct RecordingsControllerTests {
         controller.refresh([course], selected: course)
         await settle("listed") { controller.listing(for: course)?.recordings != nil }
         #expect(try store.load() != nil)
-        #expect(defaults.object(forKey: RecordingsController.acknowledgedKey) != nil)
-        #expect(defaults.object(forKey: RecordingsController.baselinedKey) != nil)
+        #expect(FileManager.default.fileExists(atPath: folder.appendingPathComponent(RecordingsSeenStore.fileName).path))
 
         controller.setEnabled(false)
         #expect(!controller.isEnabled)
@@ -328,6 +364,8 @@ struct RecordingsControllerTests {
         #expect(!browser.isOpen)
         #expect(controller.listings.isEmpty)
         #expect(try store.load() == nil)
+        await settle("history cleanup finished") { !FileManager.default.fileExists(atPath: folder.appendingPathComponent(RecordingsSeenStore.fileName).path) }
+        #expect(defaults.string(forKey: RecordingsController.historyNamespaceKey) != nil)
         #expect(defaults.object(forKey: RecordingsController.enabledKey) as? Bool == false)
         for key in [RecordingsController.acknowledgedKey, RecordingsController.baselinedKey] {
            #expect(defaults.object(forKey: key) == nil, "\(key) left behind")
@@ -791,7 +829,7 @@ struct RecordingsControllerTests {
         #expect(controller.openingRecordingID == "b")
         await settle("opened") { world.opened == [player] }
         #expect(controller.openingRecordingID == nil)
-        #expect(controller.newCount(for: course) == 0)
+        await settle("opened recording durably acknowledged") { controller.newCount(for: course) == 0 }
         controller.copyLink(fresh)
         #expect(world.copied == [player])
         #expect(browser.playCalls == ["play b"])
@@ -835,7 +873,7 @@ struct RecordingsControllerTests {
         #expect(world.copied == [latest, latest])
         #expect(controller.openingRecordingID == nil)
         #expect(controller.openingProblem == nil)
-        #expect(!controller.acknowledged.contains("a"))
+        #expect(controller.isNew(recording("a")))
     }
 
     /// A second Play while lookup is held opens only the last choice, including a repeated Play
@@ -874,38 +912,373 @@ struct RecordingsControllerTests {
         controller.refresh([course], selected: course)
         await settle("listed") { controller.listing(for: course)?.recordings != nil }
         #expect(controller.newCount(for: course) == 0)
-        let seen = defaults.stringArray(forKey: RecordingsController.acknowledgedKey)
-        #expect(Set(seen ?? []) == ["a", "b"])
+        #expect(controller.listing(for: course)?.seenIDs == ["a", "b"])
 
         browser.listResults[course.courseCode] = .success([recording("c", daysAgo: 0), recording("a"), recording("b")])
         controller.refresh([course], selected: course, force: true)
         await settle("new recording") { controller.newCount(for: course) == 1 }
         #expect(controller.isNew(recording("c")))
-        #expect(defaults.stringArray(forKey: RecordingsController.acknowledgedKey) == seen, "a new recording was marked seen without being opened")
+        #expect(controller.listing(for: course)?.seenIDs == ["a", "b"], "a new recording was marked seen without being opened")
 
         let relaunched = makeController()
+        relaunched.pageAppeared()
+        relaunched.refresh([course], selected: course)
+        await settle("relaunch history loaded") { relaunched.listing(for: course)?.recordings != nil }
         #expect(relaunched.isNew(recording("c")))
         #expect(!relaunched.isNew(recording("a")))
         // A course never listed has no baseline, so nothing in it counts as new.
         #expect(!relaunched.isNew(recording("z", other)))
 
-        controller.markSeen(course)
-        #expect(controller.newCount(for: course) == 0)
-        #expect(!makeController().isNew(recording("c")))
+        relaunched.markSeen(course)
+        await settle("acknowledgement committed") { relaunched.newCount(for: course) == 0 }
+        let acknowledgedRelaunch = makeController()
+        acknowledgedRelaunch.pageAppeared()
+        acknowledgedRelaunch.refresh([course], selected: course)
+        await settle("acknowledged relaunch loaded") { acknowledgedRelaunch.listing(for: course)?.recordings != nil }
+        #expect(!acknowledgedRelaunch.isNew(recording("c")))
     }
 
-    /// The seen list is capped, oldest first, so it can't grow without end over the years.
-    @Test func theSeenListIsCapped() async {
+    /// Guards #106: first baseline, cumulative cross-course history, mark seen and restart
+    /// must not rotate an old recording into New when the former global cap is exceeded.
+    @Test func historyBeyondFiveThousandSurvivesOtherCoursesAndRelaunch() async {
         defer { cleanUp() }
-        let many = (0..<(RecordingsController.acknowledgedLimit + 10)).map { recording("id\($0)") }
+        let many = (0..<5_010).map { recording("id\($0)") }
         browser.listResults[course.courseCode] = .success(many)
+        browser.listResults[other.courseCode] = .success((0..<3_000).map { recording("other\($0)", other) })
+        let controller = await readyController()
+        controller.refresh([course, other], selected: course)
+        await settle("both listed") { controller.listing(for: other)?.recordings != nil }
+        #expect(controller.newCount(for: course) == 0)
+        #expect(controller.newCount(for: other) == 0)
+        #expect(controller.listing(for: course)?.seenIDs?.count == 5_010)
+        #expect(controller.listing(for: other)?.seenIDs?.count == 3_000)
+        // An old lecture published later is still a new ID: lecture dates aren't checkpoints.
+        let late = recording("late", daysAgo: 500)
+        browser.listResults[course.courseCode] = .success(many + [late])
+        controller.refresh([course], selected: course, force: true)
+        await settle("late publication") { controller.newCount(for: course) == 1 }
+        #expect(controller.isNew(late))
+        controller.markSeen(course)
+        await settle("all acknowledged") { controller.newCount(for: course) == 0 }
+        let relaunched = makeController()
+        relaunched.pageAppeared()
+        relaunched.refresh([course, other], selected: course)
+        await settle("all history reloaded") { relaunched.listing(for: other)?.recordings != nil }
+        #expect(!relaunched.isNew(recording("id0")))
+        #expect(!relaunched.isNew(late))
+        #expect(!relaunched.isNew(recording("other0", other)))
+        browser.listResults[course.courseCode] = .success(many + [late, recording("really-new")])
+        relaunched.refresh([course], selected: course, force: true)
+        await settle("real arrival") { relaunched.newCount(for: course) == 1 }
+        #expect(relaunched.isNew(recording("really-new")))
+        // Disappearance from a refresh must not prune history needed on reappearance.
+        browser.listResults[course.courseCode] = .success([])
+        controller.refresh([course], selected: course, force: true)
+        await settle("empty refresh") { controller.listing(for: course)?.recordings == [] }
+        browser.listResults[course.courseCode] = .success(many)
+        controller.refresh([course], selected: course, force: true)
+        await settle("old recordings return") { controller.listing(for: course)?.recordings?.count == many.count }
+        #expect(controller.newCount(for: course) == 0)
+    }
+
+    /// A v1 upgrade preserves surviving IDs and baselines; previously evicted IDs are
+    /// indistinguishable from new publications and stay New until explicitly acknowledged.
+    @Test func migrationPreservesSurvivorsWithoutInventingLostHistory() async throws {
+        defer { cleanUp() }
+        defaults.set(true, forKey: RecordingsController.enabledKey)
+        defaults.set(["survivor"], forKey: RecordingsController.acknowledgedKey)
+        defaults.set([RecordingsController.baselineID(courseCode: course.courseCode, academicYear: course.academicYear)], forKey: RecordingsController.baselinedKey)
+        try saveSession(owner: 42)
+        browser.listResults[course.courseCode] = .success([recording("survivor"), recording("lost"), recording("new", daysAgo: 300)])
+        let controller = makeController()
+        controller.pageAppeared()
+        controller.refresh([course], selected: course)
+        await settle("migrated listing") { controller.listing(for: course)?.recordings != nil }
+        #expect(!controller.isNew(recording("survivor")))
+        #expect(controller.newCount(for: course) == 2)
+        #expect(defaults.object(forKey: RecordingsController.acknowledgedKey) == nil)
+        let relaunched = makeController()
+        relaunched.pageAppeared()
+        relaunched.refresh([course], selected: course)
+        await settle("migrated relaunch loaded") { relaunched.listing(for: course)?.recordings != nil }
+        #expect(!relaunched.isNew(recording("survivor")))
+        #expect(relaunched.isNew(recording("lost")))
+        relaunched.markSeen(course)
+        await settle("migrated recordings acknowledged") { relaunched.newCount(for: course) == 0 }
+        let acknowledgedRelaunch = makeController()
+        acknowledgedRelaunch.pageAppeared()
+        acknowledgedRelaunch.refresh([course], selected: course)
+        await settle("migrated acknowledgement reloaded") { acknowledgedRelaunch.listing(for: course)?.recordings != nil }
+        #expect(!acknowledgedRelaunch.isNew(recording("lost")))
+    }
+
+    /// v1 preferences contain no account ID. A missing saved session cannot prove whose
+    /// history survived, so a new account's first listing must establish a clean baseline.
+    @Test func migrationWithoutOwnedSessionDoesNotInheritLegacyBaseline() async {
+        defer { cleanUp() }
+        defaults.set(true, forKey: RecordingsController.enabledKey)
+        defaults.set(["old-owner"], forKey: RecordingsController.acknowledgedKey)
+        defaults.set([RecordingsController.baselineID(courseCode: course.courseCode, academicYear: course.academicYear)], forKey: RecordingsController.baselinedKey)
+        let controller = makeController()
+        controller.pageAppeared()
+        #expect(defaults.object(forKey: RecordingsController.acknowledgedKey) == nil)
+        controller.signIn()
+        await settle("signed in") { controller.access == .ready }
+        browser.listResults[course.courseCode] = .success([recording("fresh-owner")])
+        controller.refresh([course], selected: course)
+        await settle("clean first listing") { controller.listing(for: course)?.recordings != nil }
+        #expect(controller.newCount(for: course) == 0)
+        #expect(controller.listing(for: course)?.seenIDs == ["fresh-owner"])
+    }
+
+    /// Disk failure leaves legacy data available for retry and reports it instead of
+    /// publishing a false saved baseline. Recovery must preserve the surviving v1 IDs.
+    @Test func failedMigrationPreservesLegacyForRetry() async throws {
+        defer { cleanUp() }
+        defaults.set(true, forKey: RecordingsController.enabledKey)
+        defaults.set(["survivor"], forKey: RecordingsController.acknowledgedKey)
+        defaults.set([RecordingsController.baselineID(courseCode: course.courseCode, academicYear: course.academicYear)], forKey: RecordingsController.baselinedKey)
+        try saveSession(owner: 42)
+        let database = folder.appendingPathComponent(RecordingsSeenStore.fileName)
+        try Data("not sqlite".utf8).write(to: database)
+        browser.listResults[course.courseCode] = .success([recording("survivor"), recording("lost")])
+        let controller = makeController()
+        controller.pageAppeared()
+        controller.refresh([course], selected: course)
+        await settle("history failure") { controller.listing(for: course)?.problem == .historyUnavailable }
+        #expect(defaults.stringArray(forKey: RecordingsController.acknowledgedKey) == ["survivor"])
+        try FileManager.default.removeItem(at: database)
+        controller.refresh([course], selected: course, force: true)
+        await settle("retry recovered") { controller.newCount(for: course) == 1 }
+        #expect(!controller.isNew(recording("survivor")))
+        #expect(controller.isNew(recording("lost")))
+    }
+
+    /// Slow disk work must neither run on main nor delay page close. A late history result
+    /// from the closed page's generation must not replace its previous successful listing.
+    @Test func historyRunsOffMainAndLateResultCannotReviveClosedPage() async {
+        defer { cleanUp() }
+        browser.listResults[course.courseCode] = .success([recording("old")])
         let controller = await readyController()
         controller.refresh([course], selected: course)
-        await settle("listed") { controller.listing(for: course)?.recordings != nil }
-        let seen = defaults.stringArray(forKey: RecordingsController.acknowledgedKey) ?? []
-        #expect(seen.count == RecordingsController.acknowledgedLimit)
-        #expect(seen.first == "id10")
-        #expect(seen.last == "id\(RecordingsController.acknowledgedLimit + 9)")
+        await settle("baseline") { controller.listing(for: course)?.recordings != nil }
+        let gate = FakeRecmanBrowser.Gate()
+        defer { gate.release() }
+        world.historyReadGate = gate
+        browser.listResults[course.courseCode] = .success([recording("old"), recording("late")])
+        controller.refresh([course], selected: course, force: true)
+        await settle("history worker held") { gate.isWaiting }
+        #expect(controller.listing(for: course)?.recordings == [recording("old")])
+        controller.windowClosed()
+        #expect(!browser.isOpen)
+        #expect(controller.listing(for: course)?.isLoading == false)
+        gate.release()
+        await drainTasks()
+        #expect(controller.listing(for: course)?.recordings == [recording("old")])
+        #expect(controller.newCount(for: course) == 0)
+        #expect(world.historyFiles.allIOWasOffMain)
+    }
+
+    /// A transient history read error must keep the list and its matching seen snapshot
+    /// together. A fresh network list paired with the old snapshot would invent new dots.
+    @Test func transientHistoryFailureRetainsPreviousListAndRetries() async throws {
+        defer { cleanUp() }
+        browser.listResults[course.courseCode] = .success([recording("old"), recording("seenPreviously")])
+        let controller = await readyController()
+        controller.refresh([course], selected: course)
+        await settle("baseline") { controller.listing(for: course)?.recordings != nil }
+        // This seen ID disappears from the current snapshot but remains in durable history.
+        browser.listResults[course.courseCode] = .success([recording("old")])
+        controller.refresh([course], selected: course, force: true)
+        await settle("only old remains visible") { controller.listing(for: course)?.recordings?.count == 1 }
+        let database = folder.appendingPathComponent(RecordingsSeenStore.fileName)
+        let backup = folder.appendingPathComponent("saved-history.fixture")
+        try FileManager.default.moveItem(at: database, to: backup)
+        try Data("broken database".utf8).write(to: database)
+        browser.listResults[course.courseCode] = .success([recording("old"), recording("seenPreviously"), recording("arrival")])
+        controller.refresh([course], selected: course, force: true)
+        await settle("history failure") { controller.listing(for: course)?.problem == .historyUnavailable }
+        #expect(controller.listing(for: course)?.recordings == [recording("old")])
+        #expect(controller.listing(for: course)?.seenIDs == ["old"])
+        #expect(controller.newCount(for: course) == 0)
+        try FileManager.default.removeItem(at: database)
+        try FileManager.default.moveItem(at: backup, to: database)
+        // A failed history load is retryable even within the normal five-minute freshness.
+        controller.refresh([course], selected: course)
+        await settle("retry classified arrival") { controller.newCount(for: course) == 1 }
+        #expect(!controller.isNew(recording("old")))
+        #expect(!controller.isNew(recording("seenPreviously")))
+        #expect(controller.isNew(recording("arrival")))
+        #expect(controller.listing(for: course)?.problem == nil)
+    }
+
+    /// Saving visible acknowledgements after recovering the disk must not clear a failed
+    /// list refresh's error/freshness state; the next refresh still needs to classify new IDs.
+    @Test func acknowledgementSuccessDoesNotHideFailedListRefresh() async throws {
+        defer { cleanUp() }
+        browser.listResults[course.courseCode] = .success([recording("old")])
+        let controller = await readyController()
+        controller.refresh([course], selected: course)
+        await settle("baseline") { controller.listing(for: course)?.recordings != nil }
+        browser.listResults[course.courseCode] = .success([recording("old"), recording("first")])
+        controller.refresh([course], selected: course, force: true)
+        await settle("first arrival") { controller.newCount(for: course) == 1 }
+        let database = folder.appendingPathComponent(RecordingsSeenStore.fileName)
+        let backup = folder.appendingPathComponent("saved-history.fixture")
+        try FileManager.default.moveItem(at: database, to: backup)
+        try Data("broken".utf8).write(to: database)
+        browser.listResults[course.courseCode] = .success([recording("old"), recording("first"), recording("second")])
+        controller.refresh([course], selected: course, force: true)
+        await settle("failed read") { controller.listing(for: course)?.problem == .historyUnavailable }
+        try FileManager.default.removeItem(at: database)
+        try FileManager.default.moveItem(at: backup, to: database)
+        controller.markSeen(course)
+        await settle("visible recordings acknowledged") { controller.newCount(for: course) == 0 }
+        #expect(controller.listing(for: course)?.problem == .historyUnavailable)
+        #expect(controller.listing(for: course)?.recordings?.count == 2)
+        controller.refresh([course], selected: course)
+        await settle("failed refresh still retryable") { controller.newCount(for: course) == 1 }
+        #expect(controller.isNew(recording("second")))
+    }
+
+    /// Failed cleanup leaves an obsolete file, but the persisted namespace tombstone keeps
+    /// it inaccessible on same-account re-enable and relaunch. Later work retries deletion.
+    @Test func failedCleanupNeverReusesOldBaselineAfterReenableAndRelaunch() async {
+        defer { world.historyFiles.setRemovalFailure(false); cleanUp() }
+        browser.listResults[course.courseCode] = .success([recording("old")])
+        let controller = await readyController()
+        controller.refresh([course], selected: course)
+        await settle("old baseline") { controller.listing(for: course)?.recordings != nil }
+        let oldDatabase = folder.appendingPathComponent(RecordingsSeenStore.fileName)
+        world.historyFiles.setRemovalFailure(true)
+        controller.setEnabled(false)
+        await drainTasks()
+        #expect(FileManager.default.fileExists(atPath: oldDatabase.path))
+        #expect(defaults.string(forKey: RecordingsController.historyNamespaceKey) != nil)
+        browser.listResults[course.courseCode] = .success([recording("fresh")])
+        controller.setEnabled(true)
+        await settle("reenabled sign-in") { controller.access == .ready }
+        controller.refresh([course], selected: course)
+        await settle("new namespace baseline") { controller.listing(for: course)?.recordings != nil }
+        #expect(controller.newCount(for: course) == 0)
+        #expect(controller.listing(for: course)?.seenIDs == ["fresh"])
+        let relaunched = makeController()
+        relaunched.pageAppeared()
+        relaunched.refresh([course], selected: course)
+        await settle("new namespace relaunched") { relaunched.listing(for: course)?.recordings != nil }
+        #expect(relaunched.newCount(for: course) == 0)
+        browser.listResults[course.courseCode] = .success([recording("fresh"), recording("arrival")])
+        relaunched.refresh([course], selected: course, force: true)
+        await settle("new namespace arrival") { relaunched.newCount(for: course) == 1 }
+        world.historyFiles.setRemovalFailure(false)
+        relaunched.refresh([course], selected: course, force: true)
+        await settle("obsolete file removal retried") { !FileManager.default.fileExists(atPath: oldDatabase.path) }
+        #expect(relaunched.newCount(for: course) == 1)
+    }
+
+    /// A user action held before its disk write must be rejected after reset; releasing it
+    /// must not recreate the deleted old file or put its acknowledgement in the new namespace.
+    @Test func heldAcknowledgementCannotRecreateHistoryAfterReset() async {
+        defer { cleanUp() }
+        browser.listResults[course.courseCode] = .success([recording("old")])
+        let controller = await readyController()
+        controller.refresh([course], selected: course)
+        await settle("baseline") { controller.listing(for: course)?.recordings != nil }
+        browser.listResults[course.courseCode] = .success([recording("old"), recording("new")])
+        controller.refresh([course], selected: course, force: true)
+        await settle("new recording") { controller.newCount(for: course) == 1 }
+        let gate = FakeRecmanBrowser.Gate()
+        defer { gate.release() }
+        world.historyAcknowledgeGate = gate
+        controller.markSeen(course)
+        await settle("acknowledgement held") { gate.isWaiting }
+        controller.setEnabled(false)
+        let oldDatabase = folder.appendingPathComponent(RecordingsSeenStore.fileName)
+        await settle("old namespace removed") { !FileManager.default.fileExists(atPath: oldDatabase.path) }
+        controller.setEnabled(true)
+        await settle("reenabled") { controller.access == .ready }
+        browser.listResults[course.courseCode] = .success([recording("fresh")])
+        controller.refresh([course], selected: course)
+        await settle("new baseline") { controller.listing(for: course)?.recordings != nil }
+        gate.release()
+        await drainTasks()
+        #expect(!FileManager.default.fileExists(atPath: oldDatabase.path))
+        #expect(controller.listing(for: course)?.seenIDs == ["fresh"])
+    }
+
+    /// Page closure changes the generation but a requested, scoped acknowledgement is still
+    /// durable. Reopening while it commits must eventually show the committed seen state.
+    @Test func pendingAcknowledgementSurvivesPageCloseAndReopen() async {
+        defer { cleanUp() }
+        browser.listResults[course.courseCode] = .success([recording("old")])
+        let controller = await readyController()
+        controller.refresh([course], selected: course)
+        await settle("baseline") { controller.listing(for: course)?.recordings != nil }
+        browser.listResults[course.courseCode] = .success([recording("old"), recording("new")])
+        controller.refresh([course], selected: course, force: true)
+        await settle("new recording") { controller.newCount(for: course) == 1 }
+        let gate = FakeRecmanBrowser.Gate()
+        defer { gate.release() }
+        world.historyAcknowledgeGate = gate
+        controller.markSeen(course)
+        await settle("acknowledgement held") { gate.isWaiting }
+        controller.windowClosed()
+        controller.pageAppeared()
+        controller.refresh([course], selected: course)
+        await settle("reopened listing loaded") { controller.listing(for: course)?.isLoading == false }
+        gate.release()
+        await settle("pending acknowledgement published") { controller.newCount(for: course) == 0 }
+        let relaunched = makeController()
+        relaunched.pageAppeared()
+        relaunched.refresh([course], selected: course)
+        await settle("durable acknowledgement after relaunch") { relaunched.listing(for: course)?.recordings != nil }
+        #expect(relaunched.newCount(for: course) == 0)
+    }
+
+    /// Repeated Mark as seen clicks while storage is slow must share the pending IDs,
+    /// rather than queue one identical task and retained list per click.
+    @Test func repeatedAcknowledgementsAreCoalescedWhileDiskIsSlow() async {
+        defer { cleanUp() }
+        browser.listResults[course.courseCode] = .success([recording("old")])
+        let controller = await readyController()
+        controller.refresh([course], selected: course)
+        await settle("baseline") { controller.listing(for: course)?.recordings != nil }
+        browser.listResults[course.courseCode] = .success([recording("old"), recording("new")])
+        controller.refresh([course], selected: course, force: true)
+        await settle("new recording") { controller.newCount(for: course) == 1 }
+        let gate = FakeRecmanBrowser.Gate()
+        defer { gate.release() }
+        world.historyAcknowledgeGate = gate
+        for _ in 0..<100 { controller.markSeen(course) }
+        await settle("one acknowledgement held") { gate.isWaiting }
+        await drainTasks()
+        #expect(world.historyAcknowledgementsStarted == 1)
+        gate.release()
+        await settle("acknowledgement committed") { controller.newCount(for: course) == 0 }
+        #expect(world.historyAcknowledgementsStarted == 1)
+    }
+
+    /// A read snapshot can return after a newer acknowledgement. Revision validation must
+    /// requery rather than resurrect that recording's dot with the earlier snapshot.
+    @Test func delayedReadCannotOverwriteNewerAcknowledgement() async {
+        defer { cleanUp() }
+        browser.listResults[course.courseCode] = .success([recording("old")])
+        let controller = await readyController()
+        controller.refresh([course], selected: course)
+        await settle("baseline") { controller.listing(for: course)?.recordings != nil }
+        browser.listResults[course.courseCode] = .success([recording("old"), recording("new")])
+        controller.refresh([course], selected: course, force: true)
+        await settle("new recording") { controller.newCount(for: course) == 1 }
+        let gate = FakeRecmanBrowser.Gate()
+        defer { gate.release() }
+        world.historyAfterReadGate = gate
+        controller.refresh([course], selected: course, force: true)
+        await settle("old snapshot held") { gate.isWaiting }
+        controller.markSeen(course)
+        await settle("new acknowledgement committed") { controller.newCount(for: course) == 0 }
+        gate.release()
+        await settle("delayed refresh finished") { controller.listing(for: course)?.isLoading == false }
+        #expect(controller.newCount(for: course) == 0)
     }
 
     /// Every Recman failure maps to a message; a lapsed session or an unknown error reads as an

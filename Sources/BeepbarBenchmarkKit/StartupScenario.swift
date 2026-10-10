@@ -3,8 +3,8 @@ import Foundation
 
 /// Which launch the `startup` scenario measures (R02, issue #110).
 package enum StartupPhase: String, Sendable, CaseIterable {
-    /// The first launch after updating from an older release: the migration repairs a degraded
-    /// database (missing tables and index, half-attributed rows, no recorded versions).
+    /// A launch with repairs to do, as the first one after updating: the migration repairs a
+    /// degraded database (missing tables and index, half-attributed rows, no recorded versions).
     case first
     /// Every launch after that, on the database the first launch left: what each app start costs.
     case later
@@ -12,8 +12,8 @@ package enum StartupPhase: String, Sendable, CaseIterable {
 
 extension Scenarios {
     /// One launch's database work as `BootstrapService.prepare` runs it in the app (open, which
-    /// migrates; `registerRoot`; recovery), on a `files`-row database an older release could have
-    /// left behind (`LegacyDatabaseFixture`). In the app this runs on `BootstrapService`'s own
+    /// migrates; `registerRoot`; recovery), on a degraded `files`-row database with today's
+    /// schema (`LegacyDatabaseFixture`). In the app this runs on `BootstrapService`'s own
     /// actor while the menu shows "starting", never on the main actor.
     ///
     /// `.first` builds a fresh degraded fixture for every run, warm-up included, so each sample is

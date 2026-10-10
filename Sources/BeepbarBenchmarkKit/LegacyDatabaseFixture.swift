@@ -2,16 +2,18 @@ import BeepbarCore
 import CSQLite
 import Foundation
 
-/// A `sync.sqlite` an older release could have left behind, for the `startup` scenario (R02,
-/// issue #110): what the first launch after updating repairs, and what every later launch costs.
+/// A degraded `sync.sqlite` with today's schema, for the `startup` scenario (R02, issue #110):
+/// what a launch that has repairs to do costs, and what every later launch costs. It is not the
+/// schema of a real older release; the upgrade from v2.0.106 is covered by
+/// `StartupMigrationTests` in Core.
 ///
 /// The database is built through today's `SyncDatabase` (folder, courses, `files` tracked files)
-/// and then degraded behind its back on a raw connection, the way `StartupMigrationTests` does:
-/// `legacyFraction` of the tracked files lose their owning course and module, as releases before
-/// module ownership left them; `partialRows` of the remaining ones keep the course but lose the
-/// module, a half attribution today's `CHECK` forbids (written with constraints off, as an old
-/// table without the constraint would hold it); the recorded migration versions are deleted; and
-/// the tables and the index added by later releases are dropped. The next open must put all of
+/// and then degraded behind its back on a raw connection: `legacyFraction` of the tracked files
+/// lose their owning course and module; `partialRows` of the remaining ones keep the course but
+/// lose the module, a half attribution today's `CHECK` forbids (written with constraints off, as
+/// a table upgraded by `ADD COLUMN`, which has no such `CHECK`, could hold it); the recorded
+/// migration versions are deleted; and the tables and the index added by later releases are
+/// dropped. The next open must put all of
 /// it back in one transaction, and the opens after that must find nothing to do.
 ///
 /// Safety: everything lives in a new temporary folder that `remove()` deletes; the user's

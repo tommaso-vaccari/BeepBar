@@ -167,11 +167,20 @@ class ComparisonTests(unittest.TestCase):
                     path.write_text(json.dumps(report()))
                     raise b.InvalidComparison('failed despite emitted report')
                 return 'toolchain'
+            limits = list(b.LIMITS)
             with patch.object(b.subprocess, 'check_output', return_value='a' * 40 + '\n') as resolve, \
                     patch.object(b, 'run', fake_run):
                 self.assertEqual(b.execute(args), 1)
                 self.assertEqual(resolve.call_count, 2)
             result = json.loads((out / 'comparison.json').read_text())
+            # The run's notes (smoke corpus; a harness without the startup scenario) land in this
+            # result and its report, never in the module's constant shared by later runs.
+            self.assertEqual(b.LIMITS, limits)
+            notes = [n for n in result['limitations'] if n not in limits]
+            self.assertTrue(any('Smoke corpus only' in n for n in notes))
+            self.assertTrue(any('not measured' in n and 'startup-smoke' in n for n in notes))
+            markdown = (out / 'comparison.md').read_text()
+            self.assertTrue(all(n in markdown for n in notes))
             self.assertFalse(result['valid'])
             self.assertTrue(result['cleaned'])
             self.assertEqual(len(result['scenarios']), 3)
@@ -195,8 +204,6 @@ class ComparisonTests(unittest.TestCase):
             self.assertFalse(any('not measured' in note for note in notes))
             plan, notes = b.scenario_plan(root, True)
             self.assertEqual([name for name, _ in plan][-1], 'startup-smoke')
-            # The run's own notes stay in its result: the module's constant is never extended.
-            self.assertNotIn('Smoke corpus only; not the standard performance baseline.', b.LIMITS)
             self.assertEqual(notes, ['Smoke corpus only; not the standard performance baseline.'])
 
     def test_saved_folder_adjustment_is_explicit_and_non_repeatable(self):

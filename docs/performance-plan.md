@@ -112,7 +112,7 @@ Non lavorare contemporaneamente sugli stessi percorsi senza concordare l’ordin
 | D05 / I6 riepilogo | [#93](https://github.com/tommaso-vaccari/BeepBar/pull/93) | Restore senza riscritture, decode fuori dal main, migrazione legacy e nuovi risultati conservati. |
 | D08 / I3 | [#133](https://github.com/tommaso-vaccari/BeepBar/pull/133) | Throttle del progresso prima del main actor: ingressi solo per aggiornamenti accettati e totali finali, run superate e tardive ignorate, cadenze 200 ms/1 s conservate. |
 | D11 / I10 Attività | [#139](https://github.com/tommaso-vaccari/BeepBar/pull/139) | Corso espanso paginato: prime 200 righe, «Mostra altri» fino all’ultima, ID stabili e univoci, ritorno a una pagina alla chiusura o con un nuovo riepilogo. Ultima riga ancora raggiungibile solo costruendo le precedenti. |
-| R05 / metadati incrementali Moodle | [#143](https://github.com/tommaso-vaccari/BeepBar/pull/143) | Indagine conclusa con esito negativo: le API «aggiornamenti da» di Moodle non segnalano moduli rimossi, spostamenti, rinomine di sezione e visibilità né riducono le richieste; la scansione completa per corso resta. Nessun cambiamento al codice. |
+| R05 / metadati incrementali Moodle | [#143](https://github.com/tommaso-vaccari/BeepBar/pull/143) | Indagine conclusa con esito negativo: le API «aggiornamenti da» di Moodle non segnalano moduli rimossi, spostamenti, rinomine di sezione e visibilità né riducono le richieste; la scansione completa per corso resta. Solo documentazione: nessun cambiamento al codice, nessuna verifica di test o build. |
 
 Verificate su dev `81ee436749b6a11eebf75fdabd247639310563c7`: suite finale 620 test, build Release, review indipendenti e CI pre/post-merge verdi. Le PR integrate non equivalgono a una release installata.
 

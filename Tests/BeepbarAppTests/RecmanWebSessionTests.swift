@@ -149,8 +149,14 @@ struct RecmanWebSessionTests {
 /// Promise, which is how a script is made to never answer.
 @MainActor
 struct RecmanWebSessionScriptTests {
-    /// A Promise that never settles: WebKit never calls back.
+    /// A Promise that never settles. WebKit never answers it on its own within `interruptBound`
+    /// (`aStalledScriptStaysPendingWithoutAnInterruption` checks that premise).
     private static let stalled = "return new Promise(() => {})"
+
+    /// How soon an interruption must end a stalled script. Interrupted calls end in milliseconds;
+    /// without the interruption WebKit has been seen to give up on a stalled Promise by itself
+    /// only after about 6 s, so a looser bound could let a removed interruption go unnoticed.
+    private static let interruptBound: Duration = .seconds(1)
 
     private func openSession(scriptTimeout: Duration) async -> RecmanWebSession {
         let session = RecmanWebSession()
@@ -178,6 +184,20 @@ struct RecmanWebSessionScriptTests {
         case .failure(is CancellationError): "cancelled"
         case .failure(let error): "\(error)"
         }
+    }
+
+    /// The premise the interruption tests stand on: left alone, a stalled script is still waiting
+    /// for WebKit after `interruptBound`. If a WebKit release started answering it sooner, this
+    /// fails, rather than the interruption tests passing with their interruption removed.
+    @Test(.timeLimit(.minutes(1))) func aStalledScriptStaysPendingWithoutAnInterruption() async throws {
+        let session = await openSession(scriptTimeout: .seconds(20))
+        defer { session.close() }
+        let task = start(Self.stalled, in: session)
+        try await untilPending(session)
+        try await Task.sleep(for: Self.interruptBound + .milliseconds(500))
+        #expect(session.hasPendingScript)
+        task.cancel()
+        _ = await task.result
     }
 
     /// The bounded wait changes nothing for scripts that answer: a string comes back from both
@@ -216,7 +236,7 @@ struct RecmanWebSessionScriptTests {
         let started = clock.now
         session.close()
         #expect(await outcome(task) == "cancelled")
-        #expect(clock.now - started < .seconds(5))
+        #expect(clock.now - started < Self.interruptBound)
         #expect(!session.hasPendingScript)
     }
 
@@ -231,7 +251,7 @@ struct RecmanWebSessionScriptTests {
         let started = clock.now
         let second = start("return 'second'", in: session)
         #expect(await outcome(first) == "cancelled")
-        #expect(clock.now - started < .seconds(5))
+        #expect(clock.now - started < Self.interruptBound)
         #expect(await outcome(second) == "answered second")
         #expect(!session.hasPendingScript)
     }
@@ -247,20 +267,27 @@ struct RecmanWebSessionScriptTests {
         let started = clock.now
         task.cancel()
         #expect(await outcome(task) == "cancelled")
-        #expect(clock.now - started < .seconds(5))
+        #expect(clock.now - started < Self.interruptBound)
         #expect(!session.hasPendingScript)
         #expect(try await session.runScript("return 'next'", arguments: [:]) == "next")
     }
 
-    /// An answer WebKit delivers after the call ended (here, after the timeout) is dropped: it
-    /// neither resumes anything twice nor reaches the next operation.
+    /// An answer WebKit delivers after the call ended (here, after the timeout) is dropped: the
+    /// ended call keeps its timeout and records the answer as late, and the next operation gets
+    /// its own answer.
     @Test(.timeLimit(.minutes(1))) func anAnswerAfterTheCallEndedIsDropped() async throws {
         let session = await openSession(scriptTimeout: .milliseconds(100))
         defer { session.close() }
         let late = "return new Promise(resolve => setTimeout(() => resolve('late'), 400))"
         await #expect(throws: RecmanBrowserError.unavailable) { try await session.runScript(late, arguments: [:]) }
+        let ended = try #require(session.lastScriptCall)
+        for _ in 0..<300 where ended.lateSignals.isEmpty {
+            try await Task.sleep(for: .milliseconds(10))
+        }
+        #expect(ended.outcome == .timedOut)
+        #expect(ended.lateSignals == [.answered("late")])
         session.scriptTimeout = .seconds(10)
-        let next = start("return new Promise(resolve => setTimeout(() => resolve('next'), 700))", in: session)
+        let next = start("return 'next'", in: session)
         #expect(await outcome(next) == "answered next")
     }
 
@@ -278,5 +305,33 @@ struct RecmanWebSessionScriptTests {
             try await Task.sleep(for: .milliseconds(10))
         }
         #expect(webView == nil)
+    }
+
+    /// A page probe that answered is a page with those facts, an unreadable answer a page with
+    /// none; one that timed out or was interrupted is fed to the entry as nothing at all.
+    @Test func aProbeThatGaveNoAnswerSaysNothingAboutThePage() {
+        let url = URL(string: "https://aunicalogin.polimi.it/aunicalogin/aunicalogin.jsp")
+        var facts = PolimiPageFacts()
+        facts.asksForCredentials = true
+        #expect(RecmanWebSession.entryEvent(afterProbe: .success(facts), load: 3, url: url) == .loadFinished(id: 3, url: url, facts: facts))
+        #expect(RecmanWebSession.entryEvent(afterProbe: .failure(RecmanBrowserError.unrecognized), load: 3, url: url) == .loadFinished(id: 3, url: url, facts: PolimiPageFacts()))
+        #expect(RecmanWebSession.entryEvent(afterProbe: .failure(RecmanBrowserError.unavailable), load: 3, url: url) == nil)
+        #expect(RecmanWebSession.entryEvent(afterProbe: .failure(CancellationError()), load: 3, url: url) == nil)
+    }
+
+    /// A background entry whose probe of the login page stalls ends as "Polimi isn't responding"
+    /// at the deadline, as before scripts were bounded, not as "sign in again": treating the
+    /// timeout as a page with no facts would make the login page look like a dead end (#112 review).
+    @Test func aStalledProbeOnTheLoginPageEndsAtTheDeadline() {
+        let url = URL(string: "https://aunicalogin.polimi.it/aunicalogin/aunicalogin.jsp")
+        var navigator = RecmanEntryNavigator(mode: .background)
+        #expect(navigator.handle(.loadStarted(id: 1)).isEmpty)
+        if let event = RecmanWebSession.entryEvent(afterProbe: .failure(RecmanBrowserError.unavailable), load: 1, url: url) {
+            for command in navigator.handle(event) {
+                if case .schedulePatience(let id, _) = command { _ = navigator.handle(.patienceElapsed(id: id)) }
+            }
+        }
+        #expect(!navigator.isFinished)
+        #expect(navigator.handle(.deadlineElapsed) == [.finish(.timedOut)])
     }
 }

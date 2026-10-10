@@ -107,13 +107,15 @@ struct BoundedScriptCallTests {
         #expect(call.lateSignals == [.answered("late")])
     }
 
-    /// An answer in time is not turned into a timeout by the timer firing later.
+    /// An answer in time is not turned into a timeout by the timer firing later. The timer is
+    /// long enough that a loaded machine cannot fire it before the wait ends and cancels it; the
+    /// sleep outlasts it, so a timer left running would show up as a late `.timedOut`.
     @Test func anAnswerInTimeIsNotOvertakenByTheTimer() async throws {
         let call = Call()
-        let waiting = Task { await call.wait(timeout: .milliseconds(40)) }
+        let waiting = Task { await call.wait(timeout: .milliseconds(300)) }
         call.answer("fast")
         #expect(await waiting.value == .answered("fast"))
-        try await Task.sleep(for: .milliseconds(120))
+        try await Task.sleep(for: .milliseconds(600))
         #expect(call.outcome == .answered("fast"))
         #expect(call.lateSignals.isEmpty)
     }
@@ -121,11 +123,11 @@ struct BoundedScriptCallTests {
     /// After an interrupt, both the late native answer and a late timer leave the outcome alone.
     @Test func lateSignalsAfterAnInterruptAreIgnored() async throws {
         let call = Call()
-        let waiting = Task { await call.wait(timeout: .milliseconds(40)) }
+        let waiting = Task { await call.wait(timeout: .milliseconds(300)) }
         call.interrupt()
         #expect(await waiting.value == .interrupted)
         call.answer("late")
-        try await Task.sleep(for: .milliseconds(120))
+        try await Task.sleep(for: .milliseconds(600))
         #expect(call.outcome == .interrupted)
         #expect(call.lateSignals == [.answered("late")])
     }

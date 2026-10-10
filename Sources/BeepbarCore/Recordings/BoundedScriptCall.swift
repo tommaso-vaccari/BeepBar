@@ -54,7 +54,7 @@ public struct ScriptCallState<Answer: Sendable & Equatable>: Sendable, Equatable
 /// is cancelled, and a hop to the main actor there would be one more thing that cannot run while
 /// the awaiting task is what blocks it. WebKit's completion handlers arrive on the main actor; the
 /// lock makes that irrelevant to correctness.
-public final class BoundedScriptCall<Answer: Sendable & Equatable>: @unchecked Sendable {
+public final class BoundedScriptCall<Answer: Sendable & Equatable>: Sendable {
     public typealias Outcome = ScriptCallOutcome<Answer>
 
     private struct Storage {
@@ -90,6 +90,8 @@ public final class BoundedScriptCall<Answer: Sendable & Equatable>: @unchecked S
             await withCheckedContinuation { continuation in
                 let settled: Outcome? = storage.withLock { box in
                     if let outcome = box.state.outcome { return outcome }
+                    // A second waiter would replace the first, which would then never resume.
+                    precondition(box.continuation == nil, "BoundedScriptCall.wait called twice")
                     box.continuation = continuation
                     return nil
                 }

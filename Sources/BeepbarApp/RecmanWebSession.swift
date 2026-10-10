@@ -100,6 +100,9 @@ enum RecmanBrowserError: Error, Equatable {
     /// (#112). Normally one at a time; a list rather than a single slot, so a call could never
     /// interrupt another one by taking its place.
     private var pendingScripts: [BoundedScriptCall<String?>] = []
+    /// The most recent script call, kept after it ends so `RecmanWebSessionTests` can see what
+    /// WebKit delivered late. Holds only that call's outcome, never the page or the web view.
+    private(set) var lastScriptCall: BoundedScriptCall<String?>?
 
     var isOpen: Bool { store != nil }
 
@@ -343,6 +346,22 @@ enum RecmanBrowserError: Error, Equatable {
         return PolimiPage.classify(webView.url, facts: try await pageFacts(operation: operation)) == .archive
     }
 
+    /// What a finished load tells the entry's navigator, given how its page probe ended.
+    ///
+    /// A probe that answered, even with something unreadable, is a page with those facts (an
+    /// unreadable one has none). A probe that timed out or was interrupted says nothing about the
+    /// page, so nothing is fed: the entry then ends as it did before page scripts were bounded,
+    /// at `RecmanEntryNavigator.deadline` for a background entry ("Polimi isn't responding") or
+    /// with the window for an interactive one. Feeding empty facts instead would classify a
+    /// stalled login page as "sign in again", or the archive as "looks different" (#112 review).
+    nonisolated static func entryEvent(afterProbe probe: Result<PolimiPageFacts, Error>, load id: Int, url: URL?) -> RecmanEntryNavigator.Event? {
+        switch probe {
+        case .success(let facts): .loadFinished(id: id, url: url, facts: facts)
+        case .failure(RecmanBrowserError.unrecognized): .loadFinished(id: id, url: url, facts: PolimiPageFacts())
+        case .failure: nil
+        }
+    }
+
     private func pageFacts(operation: Int) async throws -> PolimiPageFacts {
         PolimiPageFacts.decode(try await evaluate(RecmanScripts.pageFacts, operation: operation)) ?? PolimiPageFacts()
     }
@@ -426,6 +445,7 @@ enum RecmanBrowserError: Error, Equatable {
         guard let webView else { throw CancellationError() }
         let call = BoundedScriptCall<String?>()
         pendingScripts.append(call)
+        lastScriptCall = call
         defer { pendingScripts.removeAll { $0 === call } }
         // The completion captures `call` and nothing else: a callback WebKit keeps for a Promise
         // that never settles must not keep this session or its web view alive after `close()`.
@@ -578,9 +598,16 @@ enum RecmanBrowserError: Error, Equatable {
         let operation = operationID
         Task { [weak self] in
             guard let self else { return }
-            let facts = (try? await self.pageFacts(operation: operation)) ?? PolimiPageFacts()
-            self.trace("loaded \(Self.redacted(url)) — \(PolimiPage.classify(url, facts: facts)), archive form \(facts.hasArchiveForm), redirect form \(facts.hasAutomaticRedirectForm), asks credentials \(facts.asksForCredentials)")
-            self.feed(.loadFinished(id: id, url: url, facts: facts), to: entry)
+            let probe: Result<PolimiPageFacts, Error>
+            do { probe = .success(try await self.pageFacts(operation: operation)) } catch { probe = .failure(error) }
+            guard let event = Self.entryEvent(afterProbe: probe, load: id, url: url) else {
+                self.trace("loaded \(Self.redacted(url)) — page probe gave no answer")
+                return
+            }
+            if case .loadFinished(_, _, let facts) = event {
+                self.trace("loaded \(Self.redacted(url)) — \(PolimiPage.classify(url, facts: facts)), archive form \(facts.hasArchiveForm), redirect form \(facts.hasAutomaticRedirectForm), asks credentials \(facts.asksForCredentials)")
+            }
+            self.feed(event, to: entry)
         }
     }
 

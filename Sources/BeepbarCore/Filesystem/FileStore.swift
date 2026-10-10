@@ -88,8 +88,11 @@ public actor FileStore {
     private(set) var hashCount = 0
     /// Bytes read to compute those digests: tells one large file read twice from two small ones.
     private var bytesHashed: Int64 = 0
-    /// Paths resolved from the root, one directory `openat` per component, before any per-file
-    /// call (`inspect`, `containsRegularFile`, occupancy checks, moves) touches the file itself.
+    /// Directory resolutions from the root, one `openat` per component, before a call touches the
+    /// files in that directory. Per-file calls (`inspect`, `containsRegularFile`, occupancy checks,
+    /// moves) resolve once per path; `existingRegularFiles` resolves once per distinct parent
+    /// directory per call (R03, #111), so for a run with nothing new this counts module folders,
+    /// not tracked files.
     private var pathLookups = 0
     /// Hashes `inspect` computed during this store's life, keyed by the exact state of the file
     /// they were read from. Only `install`'s check before replacing a file consults them, through
@@ -411,18 +414,27 @@ public actor FileStore {
     /// as absent rather than thrown.
     ///
     /// Each distinct parent directory is resolved once per call and its descriptor reused for the
-    /// files it holds (#111): a run with nothing new checks every tracked file this way, and
-    /// resolving `Corso/Sezione/Modulo` again for each of its files cost one `dup`, one `openat` per
-    /// component and as many `close` calls per file, several times the one `fstatat` that answers
-    /// the question. The checks are the same as before: every directory is still reached from the
-    /// pinned root descriptor through `O_NOFOLLOW` opens, and each name is still looked at with
-    /// `AT_SYMLINK_NOFOLLOW`, so no symbolic link is ever followed and nothing outside the root is
-    /// ever seen. What changes is only that a directory replaced while this call is looking at its
-    /// files is noticed at the next call rather than at the next file. That is as safe as before:
-    /// this is a planning answer, and every action a caller takes on a path (`install`,
-    /// `moveRegularFile`, `snapshotRegularFile`, …) resolves it again from the root at that moment.
-    /// The descriptors live only for the duration of this call: there is no cache across calls, so
-    /// a later call never trusts a directory it did not open itself.
+    /// files it holds (R03, #111, PR #142). A run with nothing new checks every tracked file this
+    /// way, and resolving `Corso/Modulo` again for each of its files cost one `dup`, one `openat`
+    /// per component and as many `close` calls per file, several times the one `fstatat` that
+    /// answers the question (unchanged 15k benchmark: CPU 424 → 184 ms on Apple M5).
+    ///
+    /// The checks are the ones the per-file version made: every directory is reached from the
+    /// root descriptor pinned at `init` through `O_NOFOLLOW` opens, and each name is looked at
+    /// with `AT_SYMLINK_NOFOLLOW`, so no symbolic link is followed and nothing outside the root is
+    /// seen. A missing directory, a file where a directory should be, or a symbolic link in the
+    /// path makes only that directory's files absent; any other error (a folder that cannot be
+    /// opened or searched) still fails the whole call rather than being read as a deletion.
+    /// `ExistingRegularFilesSafetyTests` pins each of these.
+    ///
+    /// The one difference is timing: a directory replaced while this call is checking its files
+    /// is noticed by the next call instead of at the next file. The answer was already a snapshot
+    /// that can go stale right after the `fstatat`, and every caller tolerates staleness both
+    /// ways: a stale "present" only skips reconciliation until the next run, reserves a name, or
+    /// opens a Conflicts entry whose action re-checks the file; a stale "absent" sends the item to
+    /// `inspect`/`install`, whose expected-state checks refuse to overwrite anything. Descriptors
+    /// live only for this call, never in a cache, so a later call never trusts a directory it did
+    /// not open itself.
     public func existingRegularFiles(_ paths: [RelativePath]) throws -> Set<RelativePath> {
         var existing: Set<RelativePath> = []
         var namesByParent: [[String]: [(path: RelativePath, name: String)]] = [:]

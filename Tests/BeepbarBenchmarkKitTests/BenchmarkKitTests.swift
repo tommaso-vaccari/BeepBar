@@ -172,9 +172,10 @@ struct BenchmarkKitTests {
         #expect(result.samples.count == 2)
         #expect(result.samples.allSatisfy { $0.fileStore.filesHashed == 0 && $0.upstream.downloads == 0 })
         #expect(result.samples.allSatisfy { $0.upstream.contentsRequests == 3 && $0.upstream.courseListRequests == 1 })
-        // One lookup per tracked file is today's cost, not a requirement: a PR that makes the
-        // check cheaper updates this number.
-        #expect(result.summary["wall"] != nil && result.summary["fs.pathLookups"]?.median == 30)
+        // One lookup per module folder (3 courses × 5 modules), not per tracked file (30): since
+        // R03 (#111) the existence check resolves each distinct parent folder once per run. This
+        // is today's cost, not a requirement: a PR that makes the check cheaper updates it.
+        #expect(result.summary["wall"] != nil && result.summary["fs.pathLookups"]?.median == 15)
         #expect(result.notes.contains("budget, no file hashing: met"))
     }
 

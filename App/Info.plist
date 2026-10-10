@@ -2,6 +2,12 @@
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
 <dict>
+    <key>BeepBarTelemetryAppID</key>
+    <string>AD3B2F70-8FAE-47B1-A58B-4870921E2398</string>
+    <key>BeepBarTelemetryNamespace</key>
+    <string>com.beepbar</string>
+    <key>BeepBarTelemetryDefaultEnabled</key>
+    <false/>
 	<key>CFBundleDevelopmentRegion</key>
 	<string>$(DEVELOPMENT_LANGUAGE)</string>
 	<key>CFBundleExecutable</key>

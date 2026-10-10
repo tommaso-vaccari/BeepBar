@@ -112,12 +112,15 @@ Non lavorare contemporaneamente sugli stessi percorsi senza concordare l’ordin
 | D05 / I6 riepilogo | [#93](https://github.com/tommaso-vaccari/BeepBar/pull/93) | Restore senza riscritture, decode fuori dal main, migrazione legacy e nuovi risultati conservati. |
 | D08 / I3 | [#133](https://github.com/tommaso-vaccari/BeepBar/pull/133) | Throttle del progresso prima del main actor: ingressi solo per aggiornamenti accettati e totali finali, run superate e tardive ignorate, cadenze 200 ms/1 s conservate. |
 | D11 / I10 Attività | [#139](https://github.com/tommaso-vaccari/BeepBar/pull/139) | Corso espanso paginato: prime 200 righe, «Mostra altri» fino all’ultima, ID stabili e univoci, ritorno a una pagina alla chiusura o con un nuovo riepilogo. Ultima riga ancora raggiungibile solo costruendo le precedenti. |
+| R05 / metadati incrementali Moodle | [#143](https://github.com/tommaso-vaccari/BeepBar/pull/143) | Indagine conclusa con esito negativo: le API «aggiornamenti da» di Moodle non segnalano moduli rimossi, spostamenti, rinomine di sezione e visibilità né riducono le richieste; la scansione completa per corso resta. Solo documentazione: nessun cambiamento al codice, nessuna verifica di test o build. |
 
 Verificate su dev `81ee436749b6a11eebf75fdabd247639310563c7`: suite finale 620 test, build Release, review indipendenti e CI pre/post-merge verdi. Le PR integrate non equivalgono a una release installata.
 
 D08 / I3 ([#133](https://github.com/tommaso-vaccari/BeepBar/pull/133)): verificata su `bb5943b` con 685 test, build Release, review indipendente CLEAN al terzo round, mutazioni macOS (hop prima del throttle: 10.000 ingressi per 10.000 eventi contro un massimo di 2; cadenze unificate o invertite rilevate) e CI verde; fluidità UI non misurata (D07 non integrata).
 
 D11 / I10 Attività ([#139](https://github.com/tommaso-vaccari/BeepBar/pull/139)): verificata su `9543abe` con 678 test, build Release, review indipendente CLEAN al secondo round e CI verde; budget UI non misurati (D07 non integrata).
+
+R05 ([#143](https://github.com/tommaso-vaccari/BeepBar/pull/143)): [rapporto](moodle-incremental-metadata.md) basato sul sorgente Moodle `main` `f20534726a59`, con review indipendente dei riferimenti. Nessun dato reale o account usato; confronti prestazionali base dev → HEAD / main → HEAD non applicabili (nessun codice). Restano possibili solo indagini future distinte, ciascuna da misurare prima: batching via `tool_mobile_call_external_functions` e presenza di `contenthash` su WeBeep (solo con autorizzazione esplicita).
 
 Misure sintetiche Release arm64, M5/32 GB, AC, una warm-up e sette run: D04, corpus invariato con override da 15k, CPU mediana 474,867→413,631 ms, p95 478,502→416,123; UPDATE/commit 15.000→0. Picco memoria mediano 44,376→47,063 MiB: aumento registrato, nessun risparmio memoria rivendicato; la memoria stabilizzata dopo dieci sync non è stata misurata. D05, JSON da 1.133.014 byte/15k dettagli, restore async mediana 42,622→21,986 ms, p95 43,028→22,382; scritture 2→0. Sono misure con fixture, non fluidità UI, main occupancy, energia o servizio reale. Non confrontare corpus differenti. Vedere [comandi benchmark](benchmarks.md).
 
@@ -139,7 +142,6 @@ Misure sintetiche Release arm64, M5/32 GB, AC, una warm-up e sette run: D04, cor
 | R02 | `perf/startup-migration-profile` | Nessuna | [#110](https://github.com/tommaso-vaccari/BeepBar/issues/110) |
 | R03 | `perf/directory-traversal-profile` | Nessuna | [#111](https://github.com/tommaso-vaccari/BeepBar/issues/111) |
 | R04 | `fix/recordings-javascript-lifecycle` | Nessuna | [#112](https://github.com/tommaso-vaccari/BeepBar/issues/112) |
-| R05 | `research/moodle-incremental-metadata` | Nessuna | [#113](https://github.com/tommaso-vaccari/BeepBar/issues/113) |
 | R06 | `test/recordings-acknowledgement-race` | Nessuna | [#114](https://github.com/tommaso-vaccari/BeepBar/issues/114) |
 | R07 | `docs/recordings-live-validation` | Nessuna | [#115](https://github.com/tommaso-vaccari/BeepBar/issues/115) |
 
@@ -266,7 +268,7 @@ Sono attività concrete di verifica, non ottimizzazioni già giustificate.
 | Migrazioni ripetute all’avvio | Strumentare `SyncDatabase.migrate` (implementazione privata a 1057), riparazione ownership parziale e controlli schema. Misurare apertura DB corrente vuoto/15k/grande. Spostare lavoro dietro versioni solo se il costo è significativo; test release saltate, ownership vecchia/parziale e downgrade/riapertura. Le scritture `registerRoot` sono già corrette. |
 | Attraversamento directory e flag | Contare `openat`/stat/fchflags in `FileStore.directoryFD` ed `existingRegularFiles` su percorsi profondi/condivisi. Provare un riuso limitato all’operazione solo con beneficio CPU misurato. Preservare no-follow, contenimento, sostituzione root e permessi; non eliminare i controlli di esistenza locale. |
 | JavaScript dopo chiusura/annullamento | `RecmanWebSession.run` (419) usa una continuation per `callAsyncJavaScript` senza timeout/cancellazione propri. Riprodurre Promise irrisolta e chiusura in WebView isolato; verificare se le callback native liberano il task. Introdurre completamento limitato e una sola volta se emerge hang/retention. Non è un leak di produzione già confermato. |
-| Metadati incrementali Moodle | Verificare disponibilità, permessi e copertura tramite fonti ufficiali e capacità del sito fornite dall’utente senza esporre token. Confrontare scansioni complete per aggiunte/rimozioni/rinomine/spostamenti, visibilità/gruppi, risposte incomplete e confini checkpoint dopo errori. Conservare fallback completo e controlli dei file locali. Nessuna API verificata da questo audit: non saltare scansioni. |
+| Metadati incrementali Moodle | Concluso da R05 ([#143](https://github.com/tommaso-vaccari/BeepBar/pull/143)): non implementare cursori temporali né `core_course_check_updates`/`core_course_get_updates_since`. Non vedono moduli rimossi, spostamenti, rinomine di sezione, visibilità/gruppi e non riducono le richieste; la scansione completa per corso resta il contratto. Nessuna riduzione di frequenza. |
 
 ## Garanzie tecniche da preservare
 

@@ -258,9 +258,12 @@ struct EncodedSyncSummary: Sendable {
 #endif
     }
 
-    /// Encodes on a detached task, never on the caller's executor (a plain `Task` would inherit
-    /// the main actor). Not interruptible: a sync cancelled meanwhile waits for it, about 20 ms
-    /// at 15,000 details, and then drops the result at its own guard.
+    /// Encodes on a detached task, never on the caller's actor. Today a nonisolated async function
+    /// already leaves the main actor, but under `nonisolated(nonsending)`, the default that
+    /// Swift's approachable-concurrency setting turns on, it would run on its caller's: the
+    /// detached task keeps the encode off the main actor either way. Not interruptible: a sync
+    /// cancelled meanwhile waits for it, about 20 ms at 15,000 details, and then drops the result
+    /// at its own guard.
     static func encode(_ summary: SyncCompletionSummary) async -> EncodedSyncSummary {
         await Task.detached(priority: .userInitiated) { encodeNow(summary) }.value
     }

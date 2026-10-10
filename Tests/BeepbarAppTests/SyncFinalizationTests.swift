@@ -195,8 +195,8 @@ struct SyncFinalizationTests {
 
     /// A sync's new result is encoded off the main thread (R01, #109): the encode of 15,000 file
     /// details takes longer than a frame. Fails if the completion path goes back to encoding
-    /// inside the main-actor turn (`setSyncState(.synced)`), or encodes in a task that inherits
-    /// the main actor.
+    /// inside the main-actor turn (`setSyncState(.synced)`), or if `EncodedSyncSummary.encode`
+    /// runs on the main actor.
     @Test @MainActor func newResultIsEncodedOffTheMainThread() async throws {
         let root = FileManager.default.temporaryDirectory.appending(path: UUID().uuidString)
         try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)

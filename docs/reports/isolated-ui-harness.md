@@ -157,3 +157,12 @@ CPU resource counters use Mach-time conversion. The Apple kernel assigns rusage 
 task power times, whose values are `rm_time_mach`; see
 [Apple XNU rusage implementation](https://github.com/apple-oss-distributions/xnu/blob/main/osfmk/kern/bsd_kern.c)
 and [task power implementation](https://github.com/apple-oss-distributions/xnu/blob/main/osfmk/kern/task.c).
+
+## Delivery permission checkpoint
+
+The initial push of docs-only `e93d951` was rejected by GitHub because the current OAuth
+credential lacks workflow scope. The optional two-line CI step for the Python UI evidence
+guards was removed; the workflow now matches current dev, and all 13 tests plus their
+documented command remain available locally. No new credential scope was requested.
+The full 689-test suite and ordinary Release were repeated successfully on `e93d951`;
+the delivery delta changes only this CI registration and documentation.

@@ -37,7 +37,8 @@ public struct BenchmarkOptions {
         }
         // Validate eagerly: baseline creates its directory before reading its sampling values.
         for name in ["runs", "warmup", "files", "courses", "size-mb", "rate-mbps"] where values[name] != nil {
-            let value = try int(name, 1, allowZero: name == "warmup")
+            // An empty database is a startup case R02 measures; a sync of zero files measures nothing.
+            let value = try int(name, 1, allowZero: name == "warmup" || (name == "files" && command == "startup"))
             if ["size-mb", "rate-mbps"].contains(name), value > Int64.max / 1_048_576 {
                 throw CLIError.usage("--\(name) is too large")
             }

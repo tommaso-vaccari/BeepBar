@@ -56,7 +56,7 @@ func runScenario(_ command: String, _ options: BenchmarkOptions) async throws ->
         return try await Scenarios.cancel(size: Int64(try options.int("size-mb", 256)) * megabyte, fraction: fraction, bytesPerSecond: Int64(try options.int("rate-mbps", 100)) * megabyte, runs: runs, warmup: warmup)
     case "startup":
         let phase = StartupPhase(rawValue: options.values["phase"] ?? "later") ?? .later
-        return try await Scenarios.startup(files: try options.int("files", 15000), phase: phase, runs: runs, warmup: warmup)
+        return try await Scenarios.startup(files: try options.int("files", 15000, allowZero: true), phase: phase, runs: runs, warmup: warmup)
     default:
         throw CLIError.usage("unknown command \(command)")
     }

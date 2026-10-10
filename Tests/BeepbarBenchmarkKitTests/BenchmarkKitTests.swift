@@ -258,12 +258,25 @@ struct BenchmarkOptionsTests {
         ("idle", []),
         ("idle", ["--pid", "2147483648"]),
         ("idle", ["--pid", "1", "--minutes", "inf"]),
+    ])
+    func rejectsBeforeWork(command: String, arguments: [String]) {
+        #expect(throws: CLIError.self) {
+            try BenchmarkOptions(arguments[...], command: command)
+        }
+    }
+
+    /// `startup` takes only a known phase and a non-negative file count (zero is the empty
+    /// database R02 measures); `--phase` belongs to `startup` alone, and other scenarios still
+    /// reject zero files.
+    @Test(arguments: [
         ("startup", ["--phase", "second"]),
         ("startup", ["--phase"]),
         ("startup", ["--size-mb", "1"]),
+        ("startup", ["--files", "-1"]),
         ("unchanged", ["--phase", "first"]),
-    ])
-    func rejectsBeforeWork(command: String, arguments: [String]) {
+        ("unchanged", ["--files", "0"]),
+    ] as [(String, [String])])
+    func rejectsInvalidStartupOptions(command: String, arguments: [String]) {
         #expect(throws: CLIError.self) {
             try BenchmarkOptions(arguments[...], command: command)
         }
@@ -287,6 +300,7 @@ struct BenchmarkOptionsTests {
         ("cancel", ["--size-mb", "1", "--fraction", "1", "--rate-mbps", "1"]),
         ("startup", ["--files", "10", "--phase", "first", "--json", "s.json"]),
         ("startup", ["--phase", "later"]),
+        ("startup", ["--files", "0", "--phase", "later"]),
         ("baseline", ["--out", "a b"]),
         ("baseline", ["--runs", String(Int.max), "--warmup", "0"]),
         ("idle", ["--pid", "1", "--minutes", "0.01", "--interval-seconds", "0.1", "--json", "idle.json", "--commit", "sha", "--dirty"]),

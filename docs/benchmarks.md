@@ -116,7 +116,9 @@ The database and filesystem counters are `package`-level API in `BeepbarCore`. T
 
 **Not covered**, because it lives in the app:
 - the keychain read;
-- the UserDefaults writes of the sync state (the last summary and the reconciliation time);
+- the UserDefaults writes of the sync state (the last summary and the reconciliation time): the
+  controller benchmark in [Persisted Activity summary save](#persisted-activity-summary-save)
+  measures them;
 - the "Risparmio dati" setting: runs always use `.unrestricted`;
 - notifications;
 - UI updates.
@@ -156,7 +158,36 @@ Run the on-demand controller benchmark without launching the app:
 BEEPBAR_RESTORE_BENCHMARK=1 swift test -c release --arch arm64 -Xswiftc -DDEBUG --filter SyncFinalizationTests/benchmarkSummaryRestore
 ```
 
-Release optimization remains enabled; `DEBUG` enables the existing isolated controller constructor and test hooks. All data, defaults and SQLite are temporary; no account, real preferences or network is used. The test is disabled in regular CI. It restores synthetic summaries containing 1,000 and 15,000 file details, warms up once and prints seven samples, JSON size, write attempts, end-to-end restore latency and separate synchronous codec timings. Compare the same configuration on the same machine and power source, without concurrent builds/tests. End-to-end async latency is not main-thread occupancy: use the codec timings to justify moving decode work and Instruments to validate UI latency. New-result encoding remains a separate path.
+Release optimization remains enabled; `DEBUG` enables the existing isolated controller constructor and test hooks. All data, defaults and SQLite are temporary; no account, real preferences or network is used. The test is disabled in regular CI. It restores synthetic summaries containing 1,000 and 15,000 file details, warms up once and prints seven samples, JSON size, write attempts, end-to-end restore latency and separate synchronous codec timings. Compare the same configuration on the same machine and power source, without concurrent builds/tests. End-to-end async latency is not main-thread occupancy: use the codec timings to justify moving decode work and Instruments to validate UI latency. New-result encoding is measured by the save benchmark below.
+
+## Persisted Activity summary save
+
+Run the on-demand controller benchmark of a sync's new result (R01, #109) without launching the app:
+
+```sh
+BEEPBAR_PERSIST_BENCHMARK=1 swift test -c release --arch arm64 -Xswiftc -DDEBUG --filter SyncFinalizationTests/benchmarkSummaryPersist
+```
+
+The same conditions as the restore benchmark apply: Release optimization with `DEBUG` for the
+isolated controller and its hooks, a throwaway defaults suite in a temporary folder, temporary
+SQLite, no account, real preferences or network, and disabled in regular CI. It saves synthetic
+results with 0 (no course entries, as a sync with nothing new), 1,000, 5,000 and 15,000 file
+details over ten courses, warms up once and prints five samples per size (`PERSIST_BENCH`) and
+their median and nearest-rank p95 (`PERSIST_SUMMARY`) for:
+
+- `inline_turn`: `setSyncState(.synced)`, the main-actor turn that encodes and writes. It was the
+  completion path before R01 and is still the legacy-migration path;
+- `encode` and `writes`: its two parts alone;
+- `off_main_encode`: `EncodedSyncSummary.encode`, awaited from the main actor; it lengthens the end
+  of the sync but does not occupy the main actor;
+- `turn`: `setSyncState(synced:)`, the main-actor turn of the completion path since R01, which
+  publishes and writes bytes already encoded.
+
+Each sample checks, outside the timed windows, that exactly the two keys were written and that the
+saved bytes decode to the published result. The turn excludes SwiftUI rendering, which needs the
+isolated UI harness. Refs without `EncodedSyncSummary` (before R01) can be measured for
+`inline_turn`, `encode` and `writes` with a measurement-only copy of the benchmark limited to those
+three timings; record such a copy as a measurement-only adjustment.
 
 ## Directory traversal profile
 

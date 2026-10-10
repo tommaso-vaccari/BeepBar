@@ -234,6 +234,47 @@ struct SyncCompletionSummary: Codable, Equatable, Sendable {
     }
 }
 
+/// A sync's new successful result with its JSON, encoded off the main actor before it is published
+/// (R01, #109). Encoding 15,000 file details takes about 19 ms on an M5, more than a frame, and
+/// used to run on the main actor at the end of the sync. Publishing and saving still happen
+/// together, in one main-actor turn (`setSyncState(synced:)`), so no published result ever waits
+/// to be saved and no write can land after a newer one. Only `encode(_:)` builds it, so the bytes
+/// always belong to `summary`.
+struct EncodedSyncSummary: Sendable {
+    let summary: SyncCompletionSummary
+    /// nil when encoding failed. As before R01, the time of the sync is still saved and the
+    /// previous summary is left in place; nothing is encoded again on the main actor.
+    let data: Data?
+#if DEBUG
+    /// Where the encode ran; `SyncFinalizationTests` proves it is never the main thread.
+    let encodedOnMainThread: Bool
+#endif
+
+    private init(summary: SyncCompletionSummary, data: Data?, encodedOnMainThread: Bool) {
+        self.summary = summary
+        self.data = data
+#if DEBUG
+        self.encodedOnMainThread = encodedOnMainThread
+#endif
+    }
+
+    /// Encodes on a detached task, never on the caller's actor. Today a nonisolated async function
+    /// already leaves the main actor, but under `nonisolated(nonsending)`, the default that
+    /// Swift's approachable-concurrency setting turns on, it would run on its caller's: the
+    /// detached task keeps the encode off the main actor either way. It keeps the sync's own
+    /// priority, so an automatic sync in the background does not encode at user-initiated
+    /// priority. Not interruptible: a sync cancelled meanwhile waits for it, about 20 ms at 15,000
+    /// details, and then drops the result at its own guard.
+    static func encode(_ summary: SyncCompletionSummary) async -> EncodedSyncSummary {
+        await Task.detached(priority: Task.currentPriority) { encodeNow(summary) }.value
+    }
+
+    /// Synchronous, so it can tell which thread it runs on.
+    private static func encodeNow(_ summary: SyncCompletionSummary) -> EncodedSyncSummary {
+        EncodedSyncSummary(summary: summary, data: try? JSONEncoder().encode(summary), encodedOnMainThread: Thread.isMainThread)
+    }
+}
+
 /// User-facing counts, with Italian singular and plural forms.
 enum SyncCopy {
     /// What happened after a choice about a file Moodle moved or removed.
@@ -511,6 +552,11 @@ struct MenuBarSnapshot: Sendable {
     private var recordingsStoreForTesting: RecordingsSessionStore?
     private var recordingsBrowserForTesting: (@MainActor () -> RecmanBrowsing)?
     private var beforeReconciliationStateForTesting: (@MainActor () async -> Void)?
+    /// Whether the last sync result to be encoded was encoded on the main thread; nil until one
+    /// is (R01, #109). Set by the pre-encode in `finishReconciliation` and by the inline
+    /// `setSyncState(_:)` save, which always encodes on the main actor, so a completion path that
+    /// goes back to the inline save shows up as `true`.
+    private(set) var summaryEncodedOnMainThreadForTesting: Bool?
     private var beforeRestoredSummaryPublicationForTesting: (@MainActor () async -> Void)?
     private var beforePendingChoicesForTesting: (@MainActor () async -> Void)?
     private var courseLoadTaskForTesting: Task<Void, Never>?
@@ -711,6 +757,10 @@ struct MenuBarSnapshot: Sendable {
 
     func setSyncStateForTesting(_ state: AppSyncState) {
         setSyncState(state)
+    }
+
+    func setSyncStateForTesting(synced result: EncodedSyncSummary) {
+        setSyncState(synced: result)
     }
 
     func setCoursesForTesting(_ courses: [RemoteCourseSummary]) {
@@ -1120,13 +1170,33 @@ struct MenuBarSnapshot: Sendable {
     }
 
     /// New successful results and explicit legacy migration retain their durable timestamp and detail.
+    /// Encodes on the main actor, which only small summaries may do (legacy migration, previews):
+    /// a sync's new result goes through `setSyncState(synced:)`, already encoded (R01, #109).
     private func setSyncState(_ newState: AppSyncState) {
         publishSyncState(newState)
-        if case .synced(let summary) = newState, let rootID {
-            operationDefaults.set(summary.completedAt.timeIntervalSince1970, forKey: Self.lastSuccessfulReconciliationKey + rootID.uuidString)
-            if let data = try? JSONEncoder().encode(summary) {
-                operationDefaults.set(data, forKey: Self.lastSuccessfulSummaryKey + rootID.uuidString)
-            }
+        if case .synced(let summary) = newState, rootID != nil {
+#if DEBUG
+            summaryEncodedOnMainThreadForTesting = true
+#endif
+            saveSuccessfulResult(summary, data: try? JSONEncoder().encode(summary))
+        }
+    }
+
+    /// Publishes a sync's new successful result and saves it in the same main-actor turn, with the
+    /// bytes encoded off the main actor (R01, #109). Keep both in this one synchronous function:
+    /// saving later, from a task, would let a quit or a newer result find the shown result unsaved,
+    /// or let an older write land last.
+    private func setSyncState(synced result: EncodedSyncSummary) {
+        publishSyncState(.synced(result.summary))
+        saveSuccessfulResult(result.summary, data: result.data)
+    }
+
+    /// Both keys of a successful result, the time first, as releases before R01 wrote them.
+    private func saveSuccessfulResult(_ summary: SyncCompletionSummary, data: Data?) {
+        guard let rootID else { return }
+        operationDefaults.set(summary.completedAt.timeIntervalSince1970, forKey: Self.lastSuccessfulReconciliationKey + rootID.uuidString)
+        if let data {
+            operationDefaults.set(data, forKey: Self.lastSuccessfulSummaryKey + rootID.uuidString)
         }
     }
 
@@ -2194,7 +2264,17 @@ struct MenuBarSnapshot: Sendable {
         let pending = try await loadPendingChoices()
         let open = pending.conflicts
         let changes = pending.changes
+        // The same check as the guard below, before paying for the encode: a sync cancelled or
+        // replaced while its pending choices were read has nothing left to encode (R01, #109).
+        guard activeOperationID == operationID, !Task.isCancelled else { return }
+        let summary = SyncCompletionSummary(progress: progress)
+        // Only a successful result is saved. Its encode runs off the main actor here, while this
+        // operation is still the active one, and before the guard below, which then also drops a
+        // result superseded or cancelled during the encode (R01, #109). Encoding after the guard
+        // would publish across a suspension the guard no longer covers.
+        let encoded = progress.failures == 0 && open.isEmpty ? await EncodedSyncSummary.encode(summary) : nil
 #if DEBUG
+        if let encoded { summaryEncodedOnMainThreadForTesting = encoded.encodedOnMainThread }
         await beforeReconciliationStateForTesting?()
 #endif
         // Cancellation keeps the operation ID until its task unwinds. Checking the ID alone
@@ -2204,13 +2284,12 @@ struct MenuBarSnapshot: Sendable {
         remoteChanges = changes
         let ordered = Self.orderedForDisplay(courses, enabledCourseIDs: enabledCourseIDs)
         if courses != ordered { courses = ordered }
-        let summary = SyncCompletionSummary(progress: progress)
-        if progress.failures > 0 {
+        if let encoded {
+            setSyncState(synced: encoded)
+        } else if progress.failures > 0 {
             setSyncState(.partial(summary))
-        } else if !open.isEmpty {
-            setSyncState(.conflicts(open.count, summary))
         } else {
-            setSyncState(.synced(summary))
+            setSyncState(.conflicts(open.count, summary))
         }
     }
 

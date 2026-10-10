@@ -89,6 +89,91 @@ import Testing
         await #expect(throws: CancellationError.self) { try await cancelled.value }
     }
 
+    /// Force the exact handoff order from #127: cancellation's terminal delegate callback
+    /// arrives before a consumer is installed. The watchdog only releases a broken receiver.
+    @Test func terminalCancellationBeforeContinuationInstallationIsRetained() async throws {
+        let session = URLSession(configuration: .ephemeral)
+        defer { session.invalidateAndCancel() }
+        let task = session.dataTask(with: URL(string: "https://synthetic.invalid/metadata")!)
+        let receiver = BoundedMetadataResponse(limit: 1024)
+        let completion = DispatchGroup()
+        completion.enter()
+        receiver.urlSession(session, task: task, didCompleteWithError: URLError(.cancelled))
+        let consumer = Task {
+            defer { completion.leave() }
+            return try await receiver.receive { Issue.record("An already completed transport must not start") }
+        }
+        let finished = await withCheckedContinuation { continuation in
+            DispatchQueue.global().async {
+                continuation.resume(returning: completion.wait(timeout: .now() + 2) == .success)
+            }
+        }
+        #expect(finished, "Terminal cancellation was lost before continuation installation")
+        // A broken bridge discards the first callback. Replay only after the failed watchdog
+        // to release its checked continuation; ordering above comes from direct callback delivery.
+        if !finished { receiver.urlSession(session, task: task, didCompleteWithError: URLError(.cancelled)) }
+        await #expect(throws: URLError(.cancelled)) { try await consumer.value }
+    }
+
+    /// Success/error callbacks can precede installation, and a later duplicate cannot replace
+    /// the first terminal result or resume the consumer twice. No live endpoint is contacted.
+    @Test(arguments: [false, true]) func terminalResultWinsOnceBeforeAndAfterInstallation(_ early: Bool) async throws {
+        let session = URLSession(configuration: .ephemeral)
+        defer { session.invalidateAndCancel() }
+        let task = session.dataTask(with: URL(string: "https://synthetic.invalid/metadata")!)
+        let receiver = BoundedMetadataResponse(limit: 1024)
+        let payload = Data("[]".utf8)
+        let response = HTTPURLResponse(url: task.originalRequest!.url!, statusCode: 200,
+                                       httpVersion: "HTTP/1.1", headerFields: ["Content-Type": "application/json"])!
+        let deliver: @Sendable () -> Void = {
+            receiver.urlSession(session, dataTask: task, didReceive: response) { disposition in
+                #expect(disposition == .allow)
+            }
+            receiver.urlSession(session, dataTask: task, didReceive: payload)
+            receiver.urlSession(session, task: task, didCompleteWithError: nil)
+            receiver.urlSession(session, task: task, didCompleteWithError: URLError(.cancelled))
+        }
+        if early { deliver() }
+        let received = try await receiver.receive {
+            #expect(!early, "Transport completed before installation must not start")
+            if !early { deliver() }
+        }
+        #expect(received == payload)
+        receiver.urlSession(session, task: task, didCompleteWithError: URLError(.timedOut))
+    }
+
+    /// Two concurrent terminal callbacks may race with installation; only one result survives.
+    /// Repetition covers both winners without making either scheduling order an expectation.
+    @Test func concurrentSuccessAndCancellationCompleteOnce() async throws {
+        let session = URLSession(configuration: .ephemeral)
+        defer { session.invalidateAndCancel() }
+        for _ in 0..<30 {
+            let task = session.dataTask(with: URL(string: "https://synthetic.invalid/metadata")!)
+            let receiver = BoundedMetadataResponse(limit: 1024)
+            let payload = Data("[]".utf8)
+            let response = HTTPURLResponse(url: task.originalRequest!.url!, statusCode: 200,
+                                           httpVersion: "HTTP/1.1", headerFields: ["Content-Type": "application/json"])!
+            receiver.urlSession(session, dataTask: task, didReceive: response) { _ in }
+            receiver.urlSession(session, dataTask: task, didReceive: payload)
+            let group = DispatchGroup()
+            let start = DispatchSemaphore(value: 0)
+            for failure in [nil, URLError(.cancelled)] as [URLError?] {
+                group.enter()
+                DispatchQueue.global().async {
+                    start.wait()
+                    receiver.urlSession(session, task: task, didCompleteWithError: failure)
+                    group.leave()
+                }
+            }
+            start.signal(); start.signal()
+            do { #expect(try await receiver.receive {} == payload) }
+            catch { #expect((error as? URLError)?.code == .cancelled) }
+            await withCheckedContinuation { continuation in
+                group.notify(queue: .global()) { continuation.resume() }
+            }
+        }
+    }
+
     /// Opt-in probe runs in a fresh Release test process for each advertised body size/ref.
     @Test func memoryProbe() async throws {
         guard let raw = ProcessInfo.processInfo.environment["BEEPBAR_METADATA_PROBE_MIB"], let mib = Int(raw), mib > 1 else { return }

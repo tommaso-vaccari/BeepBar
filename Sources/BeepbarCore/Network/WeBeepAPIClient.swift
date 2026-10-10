@@ -385,13 +385,16 @@ public final class WeBeepAPIClient: @unchecked Sendable {
 /// Accumulates metadata only up to the caller's cap, cancelling reception at the first overrun (#102).
 /// The task uses the original session, including injected URLProtocols and credentials. Redirect and
 /// authentication methods remain on its session delegate, as with the bounded file downloader.
-private final class BoundedMetadataResponse: NSObject, URLSessionDataDelegate, @unchecked Sendable {
+final class BoundedMetadataResponse: NSObject, URLSessionDataDelegate, @unchecked Sendable {
     private let limit: Int
     private let lock = NSLock()
     private var body = Data()
     private var receivedResponse = false
     private var rejection: Error?
     private var continuation: CheckedContinuation<Data, Error>?
+    private var completed = false
+    private var consumerInstalled = false
+    private var earlyResult: Result<Data, Error>?
 
     init(limit: Int) { self.limit = limit }
 
@@ -401,12 +404,29 @@ private final class BoundedMetadataResponse: NSObject, URLSessionDataDelegate, @
         let task = session.dataTask(with: request)
         task.delegate = self
         return try await withTaskCancellationHandler {
-            try await withCheckedThrowingContinuation { continuation in
-                lock.withLock { self.continuation = continuation }
-                task.resume()
-            }
+            try await receive { task.resume() }
         } onCancel: {
             task.cancel()
+        }
+    }
+
+    /// Install the consumer or deliver a terminal result received before installation (#127).
+    /// Callback completion and installation share one lock; resume/start happen outside it.
+    func receive(start: @Sendable () -> Void) async throws -> Data {
+        try await withCheckedThrowingContinuation { continuation in
+            let result = lock.withLock { () -> Result<Data, Error>? in
+                precondition(!consumerInstalled, "Metadata reception has one consumer")
+                consumerInstalled = true
+                if completed {
+                    let result = earlyResult
+                    earlyResult = nil
+                    return result
+                }
+                self.continuation = continuation
+                return nil
+            }
+            if let result { continuation.resume(with: result) }
+            else { start() }
         }
     }
 
@@ -418,16 +438,18 @@ private final class BoundedMetadataResponse: NSObject, URLSessionDataDelegate, @
             else if http.expectedContentLength > Int64(limit) { failure = .responseTooLarge }
             else { failure = nil }
         } else { failure = .invalidResponse }
-        lock.withLock {
+        let allow = lock.withLock { () -> Bool in
+            guard !completed else { return false }
             receivedResponse = true
             if let failure { rejection = failure }
+            return failure == nil
         }
-        completionHandler(failure == nil ? .allow : .cancel)
+        completionHandler(allow ? .allow : .cancel)
     }
 
     func urlSession(_ session: URLSession, dataTask: URLSessionDataTask, didReceive data: Data) {
         let stop = lock.withLock { () -> Bool in
-            guard rejection == nil else { return true }
+            guard !completed, rejection == nil else { return true }
             // Count the bytes URLSession delivers after decompression. Header lengths can be absent,
             // false, or compressed; they never replace this check or permit an oversized allocation.
             guard data.count <= limit - body.count else {
@@ -442,17 +464,22 @@ private final class BoundedMetadataResponse: NSObject, URLSessionDataDelegate, @
     }
 
     func urlSession(_ session: URLSession, task: URLSessionTask, didCompleteWithError error: Error?) {
-        let (pending, data, failure) = lock.withLock { () -> (CheckedContinuation<Data, Error>?, Data, Error?) in
-            let pending = continuation
-            continuation = nil
-            // Transport cancellation caused by our cap must remain responseTooLarge, not user cancellation.
+        let completion = lock.withLock { () -> (CheckedContinuation<Data, Error>, Result<Data, Error>)? in
+            guard !completed else { return nil }
+            completed = true
+            // Retain a terminal result even when cancellation of a suspended task completes
+            // before receive installs its continuation. No callback may complete twice.
             let failure = rejection ?? error ?? (receivedResponse ? nil : WeBeepAPIError.invalidResponse)
-            let data = failure == nil ? body : Data()
+            let result: Result<Data, Error> = failure.map { .failure($0) } ?? .success(body)
             body = Data()
-            return (pending, data, failure)
+            guard let pending = continuation else {
+                earlyResult = result
+                return nil
+            }
+            continuation = nil
+            return (pending, result)
         }
-        if let failure { pending?.resume(throwing: failure) }
-        else { pending?.resume(returning: data) }
+        if let (pending, result) = completion { pending.resume(with: result) }
     }
 }
 

@@ -106,7 +106,8 @@ public final class BoundedScriptCall<Answer: Sendable & Equatable>: @unchecked S
             defer { box.continuation = nil }
             return box.continuation
         }
-        // Outside the lock: resuming may run the awaiting code at once on this thread.
+        // Outside the lock: the state is already settled, so later signals need not wait while the
+        // waiting task is handed back to the runtime.
         continuation?.resume(returning: signal)
     }
 }

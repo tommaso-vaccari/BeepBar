@@ -200,6 +200,32 @@ struct BenchmarkKitTests {
             #expect(latency >= 0 && latency < sample.wallMilliseconds)
         }
     }
+
+    /// The first launch after updating repairs a small legacy database in every measured run:
+    /// each run gets a fresh degraded fixture, so the warm-up cannot absorb the repair. Guards the
+    /// scenario against measuring a launch with nothing to repair, and its checks against a
+    /// migration that stops repairing (the "repaired" check would turn false; see R02 in
+    /// docs/performance-plan.md for the mutation run).
+    @Test func startupFirstLaunchRepairsInEveryRun() async throws {
+        let result = try await Scenarios.startup(files: 200, phase: .first, runs: 2, warmup: 1)
+        #expect(result.passed, "\(result.checks)")
+        #expect(result.name == "startup-first" && result.samples.count == 2)
+        #expect(result.checks.count == 5)
+        #expect(result.samples.allSatisfy { $0.database.rowChanges > 7 && $0.database.pagesWritten > 0 })
+        #expect(result.samples.allSatisfy { $0.upstream == UpstreamCounters() && $0.installed == 0 })
+        #expect(result.summary["wall"] != nil && result.summary["cancel.latency"] == nil)
+    }
+
+    /// Every later launch on the repaired database writes no row and no page, run after run: the
+    /// "nearly free at rest" property for app starts. Guards against a startup step that writes
+    /// on a current database (the "no rows or pages written" check would turn false).
+    @Test func startupLaterLaunchesWriteNothing() async throws {
+        let result = try await Scenarios.startup(files: 200, phase: .later, runs: 3, warmup: 1)
+        #expect(result.passed, "\(result.checks)")
+        #expect(result.name == "startup-later" && result.samples.count == 3)
+        #expect(result.samples.allSatisfy { $0.database.rowChanges == 0 && $0.database.pagesWritten == 0 })
+        #expect(result.notes.contains { $0.hasPrefix("open+migrate median") })
+    }
 }
 
 /// Invalid CLI input must fail before creating a corpus, report directory or idle observer.
@@ -232,6 +258,10 @@ struct BenchmarkOptionsTests {
         ("idle", []),
         ("idle", ["--pid", "2147483648"]),
         ("idle", ["--pid", "1", "--minutes", "inf"]),
+        ("startup", ["--phase", "second"]),
+        ("startup", ["--phase"]),
+        ("startup", ["--size-mb", "1"]),
+        ("unchanged", ["--phase", "first"]),
     ])
     func rejectsBeforeWork(command: String, arguments: [String]) {
         #expect(throws: CLIError.self) {
@@ -240,7 +270,7 @@ struct BenchmarkOptionsTests {
     }
 
     /// Defaults, zero warmup, each command's options and literal paths remain usable.
-    @Test(arguments: ["unchanged", "large-update", "cancel", "baseline"])
+    @Test(arguments: ["unchanged", "large-update", "cancel", "startup", "baseline"])
     func defaultsAndCommonMetadata(command: String) throws {
         let defaults = try BenchmarkOptions([][...], command: command)
         #expect(try defaults.int("runs", 5) == 5)
@@ -255,6 +285,8 @@ struct BenchmarkOptionsTests {
         ("unchanged", ["--files", "1", "--courses", "1", "--json", "a b.json"]),
         ("large-update", ["--size-mb", "1"]),
         ("cancel", ["--size-mb", "1", "--fraction", "1", "--rate-mbps", "1"]),
+        ("startup", ["--files", "10", "--phase", "first", "--json", "s.json"]),
+        ("startup", ["--phase", "later"]),
         ("baseline", ["--out", "a b"]),
         ("baseline", ["--runs", String(Int.max), "--warmup", "0"]),
         ("idle", ["--pid", "1", "--minutes", "0.01", "--interval-seconds", "0.1", "--json", "idle.json", "--commit", "sha", "--dirty"]),

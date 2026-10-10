@@ -18,6 +18,7 @@ public struct BenchmarkOptions {
         case "unchanged": allowed = metadata.union(sampling).union(["files", "courses", "json"])
         case "large-update": allowed = metadata.union(sampling).union(["size-mb", "json"])
         case "cancel": allowed = metadata.union(sampling).union(["size-mb", "fraction", "rate-mbps", "json"])
+        case "startup": allowed = metadata.union(sampling).union(["files", "phase", "json"])
         case "baseline": allowed = metadata.union(sampling).union(["out"])
         case "idle": allowed = metadata.union(["pid", "minutes", "interval-seconds", "json"])
         default: throw CLIError.usage("unknown command \(command)")
@@ -66,6 +67,9 @@ public struct BenchmarkOptions {
             guard !files.addingReportingOverflow(courses).overflow else {
                 throw CLIError.usage("--files plus --courses is too large")
             }
+        }
+        if let phase = values["phase"], StartupPhase(rawValue: phase) == nil {
+            throw CLIError.usage("--phase must be first or later")
         }
         if command == "idle" {
             guard let text = values["pid"], let pid = Int32(text), pid > 0 else {

@@ -314,11 +314,14 @@ def execute(args):
                     ('unchanged-15k', ['unchanged', '--files', '15000']),
                     ('large-update-64mb', ['large-update', '--size-mb', '64']),
                     ('large-update-256mb', ['large-update', '--size-mb', '256']),
-                    ('cancel-mid', ['cancel', '--size-mb', '256', '--fraction', '0.5'])]
+                    ('cancel-mid', ['cancel', '--size-mb', '256', '--fraction', '0.5']),
+                    ('startup-first-15k', ['startup', '--files', '15000', '--phase', 'first']),
+                    ('startup-later-15k', ['startup', '--files', '15000', '--phase', 'later'])]
             if args.smoke:
                 plan = [('unchanged-smoke', ['unchanged', '--files', '10']),
                         ('update-smoke', ['large-update', '--size-mb', '1']),
-                        ('cancel-smoke', ['cancel', '--size-mb', '4', '--fraction', '0.5', '--rate-mbps', '1'])]
+                        ('cancel-smoke', ['cancel', '--size-mb', '4', '--fraction', '0.5', '--rate-mbps', '1']),
+                        ('startup-smoke', ['startup', '--files', '100', '--phase', 'first'])]
                 result['limitations'].append('Smoke corpus only; not the standard performance baseline.')
             for name, workload in plan:
                 reports = {}

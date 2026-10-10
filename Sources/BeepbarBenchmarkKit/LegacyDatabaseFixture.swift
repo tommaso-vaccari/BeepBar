@@ -101,15 +101,16 @@ package final class LegacyDatabaseFixture: Sendable {
     /// migrates), register the folder, recover. The connection closes when `database` goes away,
     /// so each call is a cold open of the file, as a relaunch is. `open` is the open alone, the
     /// part whose cost the migration decides.
-    package func launch() async throws -> (open: Duration, total: Duration, written: SyncDatabaseWriteCounters, report: RecoveryReport) {
+    package func launch() async throws -> (open: Duration, total: Duration, written: SyncDatabaseWriteCounters, fileStore: FileStoreCounters, report: RecoveryReport) {
         let clock = ContinuousClock()
         let start = clock.now
         let database = try SyncDatabase(url: databaseURL)
         let opened = clock.now
         try await database.registerRoot(id: rootID, canonicalPath: root.path)
-        let report = try await RecoveryCoordinator(rootID: rootID, database: database, fileStore: try FileStore(root: root) { _ in }).recover()
+        let fileStore = try FileStore(root: root) { _ in }
+        let report = try await RecoveryCoordinator(rootID: rootID, database: database, fileStore: fileStore).recover()
         let end = clock.now
-        return (opened - start, end - start, await database.writeCounters(), report)
+        return (opened - start, end - start, await database.writeCounters(), await fileStore.counters(), report)
     }
 }
 

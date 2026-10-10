@@ -25,6 +25,23 @@ package final class LegacyDatabaseFixture: Sendable {
     /// Half-attributed rows the fixture actually produced: at most `partialRows`, and never more
     /// than the rows that kept an owner.
     package let partialRows: Int
+    /// Migration versions the database had recorded before the fixture deleted them: what the
+    /// first launch must record again. Counted, not assumed, so the scenario still checks the
+    /// right number on a ref with fewer or more migrations than today's.
+    package let recordedVersions: Int
+    /// The later releases' tables and index the fixture actually dropped (`IF EXISTS`: an older
+    /// ref may not have them all): what the first launch must recreate.
+    package let droppedObjects: [String]
+
+    /// The smallest `files` that leaves a half-attributed row to repair with the default
+    /// `legacyFraction` (rows 5 to 9 of every ten keep an owner): below it, `--phase first`
+    /// would pass its repair checks with nothing to repair.
+    package static let smallestRepairableCorpus = 6
+    /// The most `files` the options accept: well beyond any real database (R02 measured 100k).
+    package static let largestCorpus = 1_000_000
+
+    /// What older releases lack and the fixture drops when present.
+    private static let laterReleaseObjectNames = [("table", "detached_items"), ("table", "remote_changes"), ("table", "pending_remote_moves"), ("index", "items_root_course_module")]
 
     package init(files: Int, legacyFraction: Double = 0.5, partialRows: Int = 40, courses: Int = 15) async throws {
         precondition(files >= 0 && courses > 0 && (0...1).contains(legacyFraction) && partialRows >= 0)
@@ -32,9 +49,14 @@ package final class LegacyDatabaseFixture: Sendable {
         // every stored property is set before the fixture starts creating anything.
         // Decided per ten rows, so a corpus as small as a smoke test's still gets both kinds.
         func hasOwner(_ index: Int) -> Bool { Double(index % 10) >= legacyFraction * 10 }
-        let owned = (0..<files).filter(hasOwner).count
+        // Counted per ten rows rather than by visiting every index, so a huge `--files` is
+        // refused by the options rather than exhausting memory here.
+        let owned = files / 10 * (0..<10).filter(hasOwner).count + (0..<files % 10).filter(hasOwner).count
+        let partial = min(partialRows, owned)
         self.files = files
-        self.partialRows = min(partialRows, owned)
+        self.partialRows = partial
+        var recorded = 0
+        var dropped: [String] = []
         let container = FileManager.default.temporaryDirectory.appending(path: "beepbar-bench-\(UUID().uuidString)", directoryHint: .isDirectory)
         let root = container.appending(path: "Sync", directoryHint: .isDirectory)
         let databaseURL = container.appending(path: "sync.sqlite")
@@ -64,14 +86,21 @@ package final class LegacyDatabaseFixture: Sendable {
                 try raw.execute("INSERT INTO items(root_id, remote_id, relative_path, base_sha256, remote_revision, last_seen_at, course_id, module_id) VALUES ('\(rootID.uuidString)', '\(course):\(course * 100):/:\(index).pdf', 'Corso \(course)/\(index).pdf', '\(String(repeating: "a", count: 64))', '1', 0, \(ownership))")
             }
             try raw.execute("COMMIT")
-            if self.partialRows > 0 {
-                try raw.execute("PRAGMA ignore_check_constraints = ON; UPDATE items SET module_id = NULL WHERE rowid IN (SELECT rowid FROM items WHERE course_id IS NOT NULL LIMIT \(self.partialRows)); PRAGMA ignore_check_constraints = OFF")
+            if partial > 0 {
+                try raw.execute("PRAGMA ignore_check_constraints = ON; UPDATE items SET module_id = NULL WHERE rowid IN (SELECT rowid FROM items WHERE course_id IS NOT NULL LIMIT \(partial)); PRAGMA ignore_check_constraints = OFF")
             }
-            try raw.execute("DELETE FROM schema_migrations; DROP TABLE detached_items; DROP TABLE remote_changes; DROP TABLE pending_remote_moves; DROP INDEX items_root_course_module")
+            recorded = try raw.count("SELECT count(*) FROM schema_migrations")
+            try raw.execute("DELETE FROM schema_migrations")
+            for (kind, name) in Self.laterReleaseObjectNames where try raw.count("SELECT count(*) FROM sqlite_master WHERE type = '\(kind)' AND name = '\(name)'") == 1 {
+                try raw.execute("DROP \(kind.uppercased()) \(name)")
+                dropped.append(name)
+            }
         } catch {
             try? FileManager.default.removeItem(at: container)
             throw error
         }
+        recordedVersions = recorded
+        droppedObjects = dropped
     }
 
     /// Deletes everything the fixture created.
@@ -90,18 +119,32 @@ package final class LegacyDatabaseFixture: Sendable {
         try RawConnection(url: databaseURL).count("SELECT count(*) FROM items")
     }
 
-    /// The objects the fixture dropped, counted back: 4 once the migration has recreated the
-    /// three tables and the index, plus the 7 recorded versions.
+    /// How many of `droppedObjects` exist again and how many versions are recorded: once the
+    /// first launch has run, `droppedObjects.count` and `recordedVersions`.
     package func laterReleaseObjects() throws -> (tables: Int, versions: Int) {
         let raw = try RawConnection(url: databaseURL)
-        return (try raw.count("SELECT count(*) FROM sqlite_master WHERE name IN ('detached_items', 'remote_changes', 'pending_remote_moves', 'items_root_course_module')"), try raw.count("SELECT count(*) FROM schema_migrations"))
+        let names = droppedObjects.map { "'\($0)'" }.joined(separator: ", ")
+        return (try raw.count("SELECT count(*) FROM sqlite_master WHERE name IN (\(names.isEmpty ? "''" : names))"), try raw.count("SELECT count(*) FROM schema_migrations"))
+    }
+
+    /// One measured launch: its open alone, the whole of it, and everything its connection did.
+    package struct Launch: Sendable {
+        package var open: Duration
+        package var total: Duration
+        package var written: SyncDatabaseWriteCounters
+        /// Ownership backfill and module-override work the launch's connection did; zero today,
+        /// reported so a launch that starts backfilling shows up in `compare`.
+        package var ownershipBackfill: OwnershipBackfillCounters
+        package var moduleOverrideUpdates: Int
+        package var fileStore: FileStoreCounters
+        package var report: RecoveryReport
     }
 
     /// One launch's database work, as `BootstrapService.prepare` runs it in the app: open (which
     /// migrates), register the folder, recover. The connection closes when `database` goes away,
     /// so each call is a cold open of the file, as a relaunch is. `open` is the open alone, the
     /// part whose cost the migration decides.
-    package func launch() async throws -> (open: Duration, total: Duration, written: SyncDatabaseWriteCounters, fileStore: FileStoreCounters, report: RecoveryReport) {
+    package func launch() async throws -> Launch {
         let clock = ContinuousClock()
         let start = clock.now
         let database = try SyncDatabase(url: databaseURL)
@@ -110,7 +153,11 @@ package final class LegacyDatabaseFixture: Sendable {
         let fileStore = try FileStore(root: root) { _ in }
         let report = try await RecoveryCoordinator(rootID: rootID, database: database, fileStore: fileStore).recover()
         let end = clock.now
-        return (opened - start, end - start, await database.writeCounters(), await fileStore.counters(), report)
+        return Launch(
+            open: opened - start, total: end - start, written: await database.writeCounters(),
+            ownershipBackfill: await database.ownershipBackfillCounters, moduleOverrideUpdates: await database.moduleOverrideUpdateAttempts,
+            fileStore: await fileStore.counters(), report: report
+        )
     }
 }
 

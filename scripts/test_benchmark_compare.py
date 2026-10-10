@@ -195,6 +195,8 @@ class ComparisonTests(unittest.TestCase):
             self.assertFalse(any('not measured' in note for note in notes))
             plan, notes = b.scenario_plan(root, True)
             self.assertEqual([name for name, _ in plan][-1], 'startup-smoke')
+            # The run's own notes stay in its result: the module's constant is never extended.
+            self.assertNotIn('Smoke corpus only; not the standard performance baseline.', b.LIMITS)
             self.assertEqual(notes, ['Smoke corpus only; not the standard performance baseline.'])
 
     def test_saved_folder_adjustment_is_explicit_and_non_repeatable(self):

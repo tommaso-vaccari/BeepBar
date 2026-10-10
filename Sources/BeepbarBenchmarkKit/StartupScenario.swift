@@ -38,6 +38,8 @@ extension Scenarios {
             for index in 0..<(warmup + runs) {
                 let fixture = try await LegacyDatabaseFixture(files: files)
                 defer { fixture.remove() }
+                // Without a row to repair, "repaired" would hold with the repair removed.
+                guard fixture.partialRows > 0 else { throw BenchmarkError.setup("\(files) files leave no half-attributed row to repair; use --files \(LegacyDatabaseFixture.smallestRepairableCorpus) or more") }
                 guard try fixture.halfAttributedRows() == fixture.partialRows else { throw BenchmarkError.setup("fixture has \(try fixture.halfAttributedRows()) half-attributed rows, expected \(fixture.partialRows)") }
                 let (sample, open, launch) = try await measuredLaunch(fixture)
                 guard index >= warmup else { continue }
@@ -47,11 +49,11 @@ extension Scenarios {
                 let objects = try fixture.laterReleaseObjects()
                 let tracked = try fixture.trackedRows()
                 repaired = repaired && halfAttributed == 0
-                restored = restored && objects.tables == 4 && objects.versions == 7
+                restored = restored && !fixture.droppedObjects.isEmpty && objects.tables == fixture.droppedObjects.count && objects.versions == fixture.recordedVersions
                 kept = kept && tracked == files
-                // The repair's UPDATE is the only statement that changes rows besides the 7
+                // The repair's UPDATE is the only statement that changes rows besides the
                 // re-recorded versions; DDL is not counted by `total_changes`.
-                exactRepair = exactRepair && launch.written.rowChanges == fixture.partialRows + 7
+                exactRepair = exactRepair && launch.written.rowChanges == Int64(fixture.partialRows + fixture.recordedVersions)
                 nothingToRecover = nothingToRecover && launch.report == RecoveryReport()
             }
             checks = [
@@ -67,6 +69,7 @@ extension Scenarios {
             let setup = try await fixture.launch()
             guard try fixture.halfAttributedRows() == 0, setup.report == RecoveryReport() else { throw BenchmarkError.setup("the first launch did not repair the fixture") }
             var writes: [SyncDatabaseWriteCounters] = []
+            var noBackfill = true
             var nothingToRecover = true
             for index in 0..<(warmup + runs) {
                 let (sample, open, launch) = try await measuredLaunch(fixture)
@@ -74,6 +77,7 @@ extension Scenarios {
                 samples.append(sample)
                 opens.append(open)
                 writes.append(launch.written)
+                noBackfill = noBackfill && launch.ownershipBackfill == OwnershipBackfillCounters() && launch.moduleOverrideUpdates == 0
                 nothingToRecover = nothingToRecover && launch.report == RecoveryReport()
             }
             let tracked = try fixture.trackedRows()
@@ -82,6 +86,7 @@ extension Scenarios {
                 // migration's and `registerRoot`'s empty transactions (`LaunchWritesTests`).
                 "no rows or pages written": writes.allSatisfy { $0.rowChanges == 0 && $0.pagesWritten == 0 },
                 "same work every run": writes.allSatisfy { $0 == writes.first },
+                "no ownership backfill or module override work": noBackfill,
                 "tracked files kept": tracked == files,
                 "recovery found nothing": nothingToRecover,
             ]
@@ -102,7 +107,7 @@ extension Scenarios {
 
     /// One launch with the process counters around it. Returns the sample, the open-and-migrate
     /// part in milliseconds, and the launch's own result for the checks.
-    private static func measuredLaunch(_ fixture: LegacyDatabaseFixture) async throws -> (RunSample, Double, (open: Duration, total: Duration, written: SyncDatabaseWriteCounters, fileStore: FileStoreCounters, report: RecoveryReport)) {
+    private static func measuredLaunch(_ fixture: LegacyDatabaseFixture) async throws -> (RunSample, Double, LegacyDatabaseFixture.Launch) {
         let footprint = PeakFootprintSampler.footprint()
         guard let resources = ResourceUsage.current() else { throw BenchmarkError.setup("proc_pid_rusage failed") }
         let sampler = PeakFootprintSampler()
@@ -115,6 +120,8 @@ extension Scenarios {
             peakFootprintGrowth: Int64(peak) - Int64(footprint),
             peakFootprint: peak,
             database: launch.written,
+            ownershipBackfill: launch.ownershipBackfill,
+            moduleOverrideUpdates: launch.moduleOverrideUpdates,
             fileStore: launch.fileStore,
             upstream: UpstreamCounters(),
             installed: 0, conflicts: 0, failures: 0

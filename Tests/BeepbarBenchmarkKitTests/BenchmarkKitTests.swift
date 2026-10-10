@@ -213,7 +213,20 @@ struct BenchmarkKitTests {
         #expect(result.checks.count == 5)
         #expect(result.samples.allSatisfy { $0.database.rowChanges > 7 && $0.database.pagesWritten > 0 })
         #expect(result.samples.allSatisfy { $0.upstream == UpstreamCounters() && $0.installed == 0 })
-        #expect(result.summary["wall"] != nil && result.summary["cancel.latency"] == nil)
+        // `compare` validates every scenario against the shared metric set; a missing metric
+        // would invalidate the whole comparison.
+        #expect(Set(result.summary.keys) == Set(Metric.all.map(\.name)).subtracting(["cancel.latency"]))
+    }
+
+    /// A corpus too small to hold a half-attributed row is refused, not reported as a repair: the
+    /// repair checks would otherwise pass with the repair removed. The options reject it first;
+    /// this guards direct callers.
+    @Test func startupFirstLaunchRefusesACorpusWithNothingToRepair() async {
+        await #expect(throws: BenchmarkError.self) {
+            try await Scenarios.startup(files: LegacyDatabaseFixture.smallestRepairableCorpus - 1, phase: .first, runs: 1, warmup: 0)
+        }
+        let smallest = try? await Scenarios.startup(files: LegacyDatabaseFixture.smallestRepairableCorpus, phase: .first, runs: 1, warmup: 0)
+        #expect(smallest?.passed == true)
     }
 
     /// Every later launch on the repaired database writes no row and no page, run after run: the
@@ -225,6 +238,8 @@ struct BenchmarkKitTests {
         #expect(result.name == "startup-later" && result.samples.count == 3)
         #expect(result.samples.allSatisfy { $0.database.rowChanges == 0 && $0.database.pagesWritten == 0 })
         #expect(result.notes.contains { $0.hasPrefix("open+migrate median") })
+        #expect(result.checks["no ownership backfill or module override work"] == true)
+        #expect(Set(result.summary.keys) == Set(Metric.all.map(\.name)).subtracting(["cancel.latency"]))
     }
 }
 
@@ -273,6 +288,11 @@ struct BenchmarkOptionsTests {
         ("startup", ["--phase"]),
         ("startup", ["--size-mb", "1"]),
         ("startup", ["--files", "-1"]),
+        // Too few files leave nothing to repair: the first launch's checks would prove nothing.
+        ("startup", ["--files", "0", "--phase", "first"]),
+        ("startup", ["--files", "5", "--phase", "first"]),
+        ("startup", ["--files", "1000001"]),
+        ("startup", ["--files", "9223372036854775807"]),
         ("unchanged", ["--phase", "first"]),
         ("unchanged", ["--files", "0"]),
     ] as [(String, [String])])

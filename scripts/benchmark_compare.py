@@ -257,7 +257,7 @@ def markdown(result):
                 cells.append(' / '.join(parts))
             cells.append(', '.join(regressions) or 'none')
             lines.append('| ' + ' | '.join(cells) + ' |')
-    lines += ['', 'Limitations:', *['- ' + limit for limit in LIMITS]]
+    lines += ['', 'Limitations:', *['- ' + limit for limit in result.get('limitations', LIMITS)]]
     return '\n'.join(lines) + '\n'
 
 
@@ -281,7 +281,7 @@ def execute(args):
     out = Path(args.out).resolve()
     out.mkdir(parents=True, exist_ok=False)
     result = {'schemaVersion': 1, 'shas': shas, 'runs': args.runs, 'warmup': args.warmup,
-              'commands': [], 'harnesses': {}, 'scenarios': {}, 'limitations': LIMITS,
+              'commands': [], 'harnesses': {}, 'scenarios': {}, 'limitations': list(LIMITS),
               'valid': False, 'savedFolderOverrides': args.saved_folder_overrides,
               'driverSHA256': hashlib.sha256(Path(__file__).read_bytes()).hexdigest(),
               'refs': {'main': args.main, 'base-dev': args.base_dev, 'candidate': args.candidate,

@@ -72,6 +72,16 @@ public struct BenchmarkOptions {
         if let phase = values["phase"], StartupPhase(rawValue: phase) == nil {
             throw CLIError.usage("--phase must be first or later")
         }
+        if command == "startup" {
+            let files = try int("files", 15000, allowZero: true)
+            guard files <= LegacyDatabaseFixture.largestCorpus else {
+                throw CLIError.usage("--files must be at most \(LegacyDatabaseFixture.largestCorpus) for startup")
+            }
+            // A first launch needs a row to repair, or its repair checks would prove nothing.
+            if values["phase"] == StartupPhase.first.rawValue, files < LegacyDatabaseFixture.smallestRepairableCorpus {
+                throw CLIError.usage("--phase first needs --files \(LegacyDatabaseFixture.smallestRepairableCorpus) or more")
+            }
+        }
         if command == "idle" {
             guard let text = values["pid"], let pid = Int32(text), pid > 0 else {
                 throw CLIError.usage("idle needs --pid with a positive 32-bit integer")

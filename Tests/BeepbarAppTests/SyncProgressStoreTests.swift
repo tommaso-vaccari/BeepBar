@@ -81,11 +81,13 @@ struct SyncProgressStoreTests {
         #expect(controller.progressStore.mainActorEntries == 1, "the refused sink must be dropped off the main actor, also after close")
     }
 
-    /// Automatic runs use the 1 s cadence (#96: manual 200 ms, automatic 1 s). Back-to-back
-    /// events after the first are held for a second, so the second event sent within
-    /// milliseconds is not shown, and the bound is per second, not per 200 ms. Swapping the
-    /// cadence mapping in `reset` fails the second-event expectation.
-    @Test func automaticRunUsesTheOneSecondCadence() async {
+    /// Automatic runs use the 1 s cadence (#96: manual 200 ms, automatic 1 s). A second event
+    /// sent 400 ms after the first falls between the two windows: an automatic run must still
+    /// hold it, so a 200 ms cadence for automatic runs (swapped or unified mapping in `reset`)
+    /// fails here. Back-to-back events alone cannot tell the cadences apart, since both drop
+    /// them. The sleep only bounds the gap from below; the gap is checked against 1 s so a
+    /// stalled runner skips the check instead of failing it.
+    @Test func automaticRunUsesTheOneSecondCadence() async throws {
         let controller = controller()
         let operationID = UUID()
         controller.setOperationForTesting(operationID)
@@ -93,10 +95,11 @@ struct SyncProgressStoreTests {
         let total = 2_000
         let start = ContinuousClock.now
         await sink(Self.progress(1, total: total))
+        try await Task.sleep(for: .milliseconds(400))
         await sink(Self.progress(2, total: total))
-        let afterTwo = start.duration(to: .now)
-        if afterTwo < .milliseconds(200) {
-            #expect(controller.progressStore.progress.completed == 1, "the second event within \(afterTwo) must wait for the 1 s window")
+        let gap = start.duration(to: .now)
+        if gap < .seconds(1) {
+            #expect(controller.progressStore.progress.completed == 1, "an automatic run must hold an event \(gap) after the first until the 1 s window ends")
         }
         await Task.detached {
             for completed in 3...total {
@@ -108,6 +111,20 @@ struct SyncProgressStoreTests {
         let entries = controller.progressStore.mainActorEntries
         #expect(entries <= allowed, "\(entries) main-actor entries for \(total) events in \(elapsed); at most \(allowed) allowed at 1 s")
         #expect(controller.progressStore.progress.completed == total)
+    }
+
+    /// The mirror of the automatic case: a manual run shows an event sent 400 ms after the first,
+    /// because its window is 200 ms. A 1 s cadence for manual runs (the mapping swapped) fails
+    /// here. Only a lower bound on the gap matters, which `Task.sleep` guarantees.
+    @Test func manualRunUsesTheTwoHundredMillisecondCadence() async throws {
+        let controller = controller()
+        let operationID = UUID()
+        controller.setOperationForTesting(operationID)
+        let sink = controller.beginTransferForTesting(operationID, automatic: false)
+        await sink(Self.progress(1, total: 10))
+        try await Task.sleep(for: .milliseconds(400))
+        await sink(Self.progress(2, total: 10))
+        #expect(controller.progressStore.progress.completed == 2)
     }
 
     /// Once the operation ends, late progress from its still-unwinding tasks is dropped at the

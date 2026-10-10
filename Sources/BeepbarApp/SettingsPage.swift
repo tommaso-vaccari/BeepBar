@@ -8,6 +8,8 @@ struct SettingsPage: View {
     @State private var showSignOutConfirmation = false
     @ObservedObject private var launchAtLogin = LaunchAtLoginController.shared
 
+    @ObservedObject private var telemetry = DailyTelemetryController.shared
+
     var body: some View {
         Form {
             languageSection
@@ -20,6 +22,7 @@ struct SettingsPage: View {
             automaticSection
             notificationsSection
             updatesSection
+            telemetrySection
         }
         .formStyle(.grouped)
         // On the Form, not on the startup Section: modifiers on a Section inside a Form can be
@@ -39,6 +42,18 @@ struct SettingsPage: View {
             Button(tr("Annulla", "Cancel"), role: .cancel) {}
         } message: {
             Text(tr("Il token salvato viene eliminato da questo Mac. La cartella dei materiali e i file restano dove sono.", "The saved token is removed from this Mac. The materials folder and files stay where they are."))
+        }
+    }
+
+    private var telemetrySection: some View {
+        Section("Telemetry") {
+            Toggle(isOn: Binding(
+                get: { telemetry.isEnabled },
+                set: { telemetry.setEnabled($0) }
+            )) {
+                SettingLabel("Telemetry", explanation: tr("Serve solo a contare gli utenti attivi giornalieri di BeepBar. Invia a TelemetryDeck un ping al giorno con un identificativo casuale dell’installazione e la versione dell’app. Nessun dato dell’account, corso o file.", "Used only to count BeepBar’s daily active users. Sends TelemetryDeck one daily ping with a random installation identifier and the app version. No account, course or file data."))
+            }
+            .disabled(!telemetry.isConfigured)
         }
     }
 

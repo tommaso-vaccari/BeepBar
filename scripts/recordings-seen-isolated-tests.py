@@ -29,7 +29,7 @@ with tempfile.TemporaryDirectory(prefix="beepbar-seen-fixture-") as scratch:
         shutil.copytree(root / name, fixture / name)
     app = fixture / "Sources/BeepbarApp"
     app.mkdir(parents=True)
-    for name in ("RecordingsController.swift", "RecordingsSessionStore.swift", "RecmanWebSession.swift", "RecmanScripts.swift"):
+    for name in ("RecordingsController.swift", "RecordingsSessionStore.swift", "RecordingsStudyState.swift", "RecmanWebSession.swift", "RecmanScripts.swift"):
         shutil.copy(root / "Sources/BeepbarApp" / name, app / name)
     (app / "FixtureSupport.swift").write_text('''import Foundation
 // App settings providers only: fixtures never use installed data or UI.

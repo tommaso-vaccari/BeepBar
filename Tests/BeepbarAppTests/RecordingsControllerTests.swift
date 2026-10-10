@@ -1291,6 +1291,159 @@ struct RecordingsControllerTests {
             #expect(!problem.message.isEmpty)
         }
     }
+    /// Explicit study choices survive a restart without waiting for any course listing.
+    @Test func watchlistRestoresMetadataAndNavigationWithoutNetwork() async {
+        defer { cleanUp() }
+        let controller = await readyController()
+        let a = recording("lesson", course)
+        let b = recording("other", other)
+        controller.toggleWatchlist(a, courseName: "NLA")
+        controller.toggleWatchlist(b, courseName: "HPC")
+        controller.selectDestination(.watchlist)
+        let restored = makeController(useDefault: true)
+        let calls = browser.calls
+        restored.pageAppeared()
+        #expect(restored.study.bookmarks.map(\.courseName) == ["NLA", "HPC"])
+        #expect(restored.study.bookmarks.first?.recording == a)
+        #expect(Set(restored.study.visibleBookmarks(query: "").map(\.recording.id)) == ["lesson", "other"])
+        #expect(restored.study.destination == .watchlist)
+        #expect(restored.listings.isEmpty)
+        #expect(browser.calls == calls)
+        restored.turnOff()
+    }
+
+    /// Reused recording IDs in another course or year never share bookmarked state.
+    @Test func studyIdentitySeparatesCoursesYearsAndSupportsReversibleActions() async {
+        defer { cleanUp() }
+        let controller = await readyController()
+        let a = recording("shared", course)
+        let b = recording("shared", other)
+        let c = recording("shared", RecmanCourseKey(courseCode: course.courseCode, academicYear: 2025)!)
+        controller.toggleWatchlist(a, courseName: "NLA")
+        controller.toggleWatchlist(b, courseName: "HPC")
+        #expect(controller.study.contains(a) && controller.study.contains(b))
+        #expect(!controller.study.contains(c))
+        controller.toggleWatchlist(a, courseName: "NLA")
+        #expect(!controller.study.contains(a) && controller.study.contains(b))
+        controller.toggleWatchlist(a, courseName: "NLA")
+        #expect(controller.study.bookmarks.count == 2)
+        controller.turnOff()
+    }
+
+    /// Reading novelties, copying and playing never add or remove personal bookmarks.
+    @Test func playbackCopyAndBaselineNeverChangeBookmarks() async {
+        defer { cleanUp() }
+        let controller = await readyController()
+        let a = recording("lecture")
+        browser.listResults[course.courseCode] = .success([a])
+        browser.playbackResults[a.id] = .success(URL(string: "https://politecnicomilano.webex.com/ldr.php?RCID=lecture")!)
+        controller.pageAppeared()
+        controller.refresh([course], selected: course)
+        await settle("course loaded") { controller.listing(for: course)?.recordings != nil }
+        controller.toggleWatchlist(a, courseName: "NLA")
+        controller.markSeen(course)
+        controller.copyLink(a)
+        await settle("copied") { !world.copied.isEmpty }
+        controller.play(a)
+        await settle("played") { !world.opened.isEmpty }
+        #expect(controller.study.contains(a))
+        #expect(controller.study.bookmarks.count == 1)
+        controller.turnOff()
+    }
+
+    /// A different account loads its own choices even if there is no saved browser-session owner.
+    @Test func studyAccountChangesNeverLeakAndReturnRestoresChoices() async {
+        defer { cleanUp() }
+        let controller = makeController(useDefault: true)
+        controller.pageAppeared()
+        let a = recording("private")
+        controller.toggleWatchlist(a, courseName: "NLA")
+        let b = recording("other-account")
+        world.owner = 99
+        controller.webBeepAccountChanged(to: 99)
+        #expect(controller.study.bookmarks.isEmpty)
+        controller.toggleWatchlist(b, courseName: "HPC")
+        world.owner = 42
+        controller.webBeepAccountChanged(to: 42)
+        #expect(controller.study.contains(a))
+        #expect(!controller.study.contains(b))
+        world.owner = 99
+        controller.webBeepAccountChanged(to: 99)
+        #expect(controller.study.contains(b))
+        #expect(!controller.study.contains(a))
+        controller.turnOff()
+    }
+
+    /// Disabling or renewing browser credentials must not erase the personal study queue.
+    @Test func disablingAndFailedSignInPreserveStudyChoices() async {
+        defer { cleanUp() }
+        let controller = await readyController()
+        let a = recording("keep")
+        controller.toggleWatchlist(a, courseName: "NLA")
+        controller.turnOff()
+        #expect(controller.study.bookmarks.isEmpty)
+        browser.signInError = RecmanBrowserError.unavailable
+        controller.setEnabled(true)
+        await settle("sign-in failed") { controller.access == .needsSignIn(.unavailable) }
+        controller.pageAppeared()
+        #expect(controller.study.contains(a))
+        #expect(controller.studyProblem == nil)
+        controller.turnOff()
+    }
+
+    /// Bad saved data is reported and preserved rather than overwritten by an empty watchlist.
+    @Test func unreadableStudyPreservesOriginalAndRejectsEdits() {
+        defer { cleanUp() }
+        let key = RecordingsController.studyKey(owner: 42)
+        let original = Data("not a plist".utf8)
+        defaults.set(original, forKey: key)
+        let controller = makeController(useDefault: true)
+        controller.pageAppeared()
+        #expect(controller.studyProblem != nil)
+        #expect(!controller.canEditStudy)
+        controller.toggleWatchlist(recording("lost"), courseName: "NLA")
+        controller.selectDestination(.course(17))
+        #expect(controller.study.destination == .course(17))
+        #expect(defaults.data(forKey: key) == original)
+        controller.turnOff()
+    }
+
+    /// Only successful listings update snapshots or availability; failures/cancellation cannot drop a bookmark.
+    @Test func refreshUpdatesBookmarksAndMarksMissingWithoutDeleting() async {
+        defer { cleanUp() }
+        let controller = await readyController()
+        let a = recording("keep")
+        controller.toggleWatchlist(a, courseName: "NLA")
+        controller.pageAppeared()
+        browser.listResults[course.courseCode] = .failure(RecmanBrowserError.unavailable)
+        controller.refresh([course], selected: course, force: true)
+        await settle("failed") { controller.listing(for: course)?.problem == .unavailable }
+        #expect(controller.study.bookmarks.first?.unavailable == false)
+        browser.listResults[course.courseCode] = .success([])
+        controller.refresh([course], selected: course, force: true)
+        await settle("missing") { controller.study.bookmarks.first?.unavailable == true }
+        #expect(controller.study.contains(a))
+        let updated = RecmanRecording(id: a.id, courseCode: a.courseCode, academicYear: a.academicYear, title: "Renamed", recordedAt: a.recordedAt, kind: a.kind, duration: "70 min", size: a.size, previewURL: a.previewURL)
+        browser.listResults[course.courseCode] = .success([updated])
+        controller.refresh([course], selected: course, force: true)
+        await settle("returned") { controller.study.bookmarks.first?.recording.title == "Renamed" }
+        #expect(controller.study.bookmarks.first?.unavailable == false)
+        controller.turnOff()
+    }
+
+    /// No valid account means no personal state can be written or borrowed from another account.
+    @Test func unknownOwnerCannotEditStudy() {
+        defer { cleanUp() }
+        world.owner = nil
+        let controller = makeController(useDefault: true)
+        controller.pageAppeared()
+        defaults.resetWrites()
+        controller.toggleWatchlist(recording("a"), courseName: "NLA")
+        #expect(controller.study.bookmarks.isEmpty)
+        #expect(defaults.writes.isEmpty)
+        controller.turnOff()
+    }
+
 }
 
 /// Recordings through the real account controller: disconnecting, switching university and a
@@ -1376,4 +1529,5 @@ struct RecordingsAccountTests {
         #expect(recordings.access == .needsSignIn(nil))
         #expect(!browser.isOpen)
     }
+
 }

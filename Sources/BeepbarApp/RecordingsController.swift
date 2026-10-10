@@ -66,7 +66,8 @@ struct RecordingsListing: Equatable {
 /// Promises this class keeps, each guarded by `RecordingsControllerTests`:
 /// - **On by default for Polimi, and gone when off.** Turning it off, disconnecting the WeBeep account or
 ///   switching university (`turnOff()`) closes the browser and deletes the saved session and
-///   its user data (an opaque reset namespace remains). Another WeBeep account never inherits a Polimi session:
+///   its notification settings and history (an opaque reset namespace remains). Personal study choices
+///   remain account-scoped. Another WeBeep account never inherits a Polimi session:
 ///   the saved one names its owner and is dropped when the known account differs.
 /// - **Quiet at rest.** Nothing runs and no file is read until the Recordings page is shown or a
 ///   sign-in starts; the browser is closed as soon as the page is gone, unless a sign-in is on
@@ -188,6 +189,63 @@ struct RecordingsListing: Equatable {
         legacySeen = .init(ids: enabled ? defaults.stringArray(forKey: Self.acknowledgedKey) ?? [] : [], baselines: enabled ? defaults.stringArray(forKey: Self.baselinedKey) ?? [] : [])
     }
 
+    // MARK: Personal study state
+
+    @Published private(set) var study = RecordingsStudyState()
+    @Published private(set) var studyProblem: BilingualText?
+    private var studyOwner: Int?
+    private var studyLoaded = false
+    private var studyUnreadable = false
+    nonisolated static func studyKey(owner: Int) -> String { "io.github.tvaccari.beepbar.recordings-study.v1.\(owner)" }
+
+    /// Account isolation applies even when there is no saved Polimi session to invalidate.
+    private func loadStudy() {
+        let owner = isEnabled ? ownerUserID() : nil
+        guard !studyLoaded || studyOwner != owner else { return }
+        studyLoaded = true
+        studyOwner = owner
+        study = RecordingsStudyState()
+        studyProblem = nil
+        studyUnreadable = false
+        guard let owner, let data = defaults.data(forKey: Self.studyKey(owner: owner)) else { return }
+        do { study = try PropertyListDecoder().decode(RecordingsStudyState.self, from: data) }
+        catch {
+            studyUnreadable = true
+            studyProblem = BilingualText("La watchlist salvata non è leggibile. I dati originali sono stati conservati.", "The saved watchlist couldn't be read. The original data has been preserved.")
+        }
+    }
+
+    /// Never overwrite unreadable saved choices or write personal data before the account is known.
+    private func updateStudy(_ change: (inout RecordingsStudyState) -> Void) {
+        loadStudy()
+        guard isEnabled, let owner = studyOwner, owner == ownerUserID(), !studyUnreadable else { return }
+        var updated = study
+        change(&updated)
+        guard updated != study else { return }
+        do {
+            let data = try PropertyListEncoder().encode(updated)
+            defaults.set(data, forKey: Self.studyKey(owner: owner))
+            study = updated
+        } catch {
+            studyProblem = BilingualText("Non è stato possibile salvare la watchlist. Riprova.", "Couldn't save the watchlist. Try again.")
+        }
+    }
+
+    var canEditStudy: Bool { isEnabled && studyOwner != nil && !studyUnreadable }
+
+    func toggleWatchlist(_ recording: RecmanRecording, courseName: String) {
+        updateStudy { state in
+            if state.contains(recording) { state.bookmarks.removeAll { $0.id == RecordingsStudyState.identity(recording) } }
+            else { state.bookmarks.append(.init(recording: recording, courseName: courseName)) }
+        }
+    }
+
+    func selectDestination(_ destination: RecordingsDestination) {
+        loadStudy()
+        if !canEditStudy { study.destination = destination }
+        else { updateStudy { $0.destination = destination } }
+    }
+
     // MARK: Switch
 
     /// Whether the switch can be turned on: Polimi only, and once the WeBeep account is known,
@@ -210,8 +268,8 @@ struct RecordingsListing: Equatable {
         }
     }
 
-    /// Off and forgotten: session/history removed; a persisted opaque namespace prevents reuse
-    /// if history file cleanup fails. It contains no account or recording IDs.
+    /// Browser closed and session/history forgotten; a persisted opaque namespace prevents reuse
+    /// if history cleanup fails. Account-scoped study choices survive disabling the feature.
     /// Also called when the WeBeep account is disconnected or the university changes, whether or
     /// not the feature was on, so no session outlives the account it was made for.
     func turnOff() {
@@ -225,6 +283,8 @@ struct RecordingsListing: Equatable {
         pageKeys = []
         selectedKey = nil
         forgetSeen()
+        studyLoaded = false
+        loadStudy()
         defaults.removeObject(forKey: Self.enabledKey)
         discardSessionFile()
     }
@@ -276,6 +336,7 @@ struct RecordingsListing: Equatable {
     /// Called when the WeBeep account becomes known or changes. A session made for another
     /// account is dropped together with what that account had seen.
     func webBeepAccountChanged(to userID: Int) {
+        loadStudy()
         guard let sessionOwner, sessionOwner != userID else { return }
         log.notice("Polimi session belongs to another WeBeep account: dropped")
         invalidate()
@@ -290,6 +351,7 @@ struct RecordingsListing: Equatable {
     // MARK: Page
 
     func pageAppeared() {
+        loadStudy()
         visiblePages += 1
         // Keep launch and disabled recordings quiet; check only the first visit, before refresh
         // can open WebKit. Later visits must preserve a session established by explicit sign-in.
@@ -608,6 +670,7 @@ struct RecordingsListing: Equatable {
             // Publish the list and its history together. A failed refresh retains the previous
             // pair, so a newly returned list cannot use an incomplete/stale membership cache.
             listings[key] = listing
+            updateStudy { $0.reconcile(recordings, for: key) }
         } catch {
             guard isCurrentHistory(history, owner: owner, generation: generation) else { return }
             listings[key, default: RecordingsListing()].isLoading = queue.contains(.list(key))

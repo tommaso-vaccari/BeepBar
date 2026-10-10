@@ -31,6 +31,13 @@ with tempfile.TemporaryDirectory(prefix="beepbar-seen-fixture-") as scratch:
     app.mkdir(parents=True)
     for name in ("RecordingsController.swift", "RecordingsSessionStore.swift", "RecordingsStudyState.swift", "RecmanWebSession.swift", "RecmanScripts.swift"):
         shutil.copy(root / "Sources/BeepbarApp" / name, app / name)
+    # Watchlist reconciliation now depends on the unchanged pure presentation rules.
+    # Extract their source before the SwiftUI page rather than substitute the matcher.
+    presentation = (root / "Sources/BeepbarApp/RecordingsPage.swift").read_text()
+    marker = "/// Registrazioni: the synced courses"
+    if presentation.count(marker) != 1:
+        raise SystemExit("Presentation extraction anchor changed; update the isolated fixture")
+    (app / "RecordingsPresentation.swift").write_text(presentation.split(marker, 1)[0])
     (app / "FixtureSupport.swift").write_text('''import Foundation
 // App settings providers only: fixtures never use installed data or UI.
 enum PreviewMode { static let isActive = true }

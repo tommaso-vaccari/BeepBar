@@ -1548,6 +1548,7 @@ struct MenuBarSnapshot: Sendable {
                 self.setSyncState(.synced(SyncCompletionSummary(completedAt: Date(), added: 5, updated: 2, unchanged: 93, preservedLocal: 0, conflicts: 0, failures: 0, perCourse: previous?.perCourse ?? [])))
             }
             await Task.yield()
+            self.progressStore.closeCurrentRun()
             self.activeOperationID = nil
         }
     }
@@ -2408,6 +2409,10 @@ struct MenuBarSnapshot: Sendable {
     /// Main actor: applies an accepted update when the operation is still the active one, and
     /// keeps the menu bar detail in the same turn as the state (AGENTS.md hard rules).
     private func progressAccepted(_ update: SyncProgress, run: SyncProgressRun, operationID: UUID) {
+        // Counted before any guard: this measures main-actor entries, not accepted updates.
+        // Moving it behind a guard, or into `receive`, blinds the D08 regression test to a hop
+        // placed before `accept` (the test would then count the throttle instead of the actor).
+        progressStore.recordMainActorEntry()
         guard activeOperationID == operationID, progressStore.receive(update, run: run) else { return }
         refreshMenuBarSnapshot()
     }
@@ -2608,8 +2613,9 @@ private struct BackgroundScheduleConfiguration: Equatable {
 /// next run's first ticks.
 @MainActor final class SyncProgressStore: ObservableObject {
     @Published private(set) var progress = SyncProgress(completed: 0, total: 0, installed: 0, preservedLocal: 0, unchanged: 0, conflicts: 0, failures: 0)
-    /// Main-actor entries since the last `reset`: one per accepted update. What D08's regression
-    /// test measures; not shown anywhere.
+    /// Main-actor entries on the progress path since the last `reset`, recorded by the controller
+    /// at the top of `progressAccepted` before any guard. What D08's regression test measures;
+    /// not shown anywhere.
     private(set) var mainActorEntries = 0
     private let relay = SyncProgressRelay()
 
@@ -2627,6 +2633,12 @@ private struct BackgroundScheduleConfiguration: Equatable {
         relay.closeCurrent()
     }
 
+    /// Called by the controller the moment the progress path enters the main actor, before it
+    /// decides whether the update is still wanted. See `progressAccepted`.
+    func recordMainActorEntry() {
+        mainActorEntries += 1
+    }
+
     /// Off the main actor: the throttle's verdict for one event. `nil` means nothing to show.
     nonisolated func accept(_ value: SyncProgress, run: SyncProgressRun) -> SyncProgress? {
         relay.next(value, run: run)
@@ -2636,7 +2648,6 @@ private struct BackgroundScheduleConfiguration: Equatable {
     /// between `accept` and this call, which leaves the shown progress untouched.
     func receive(_ update: SyncProgress, run: SyncProgressRun) -> Bool {
         guard relay.isCurrent(run) else { return false }
-        mainActorEntries += 1
         progress = update
         return true
     }
@@ -2670,6 +2681,9 @@ private final class SyncProgressRelay: Sendable {
         }
     }
 
+    /// Closing sets `current` to `.superseded`. That is why `isCurrent` and `next` also refuse
+    /// `run == .superseded` explicitly: otherwise a sink handed the superseded token (a run refused
+    /// by `beginTransfer`) would match the closed state and pass the relay after any run ended.
     func closeCurrent() {
         state.withLock { $0.current = .superseded }
     }

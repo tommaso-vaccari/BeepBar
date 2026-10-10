@@ -59,6 +59,9 @@ struct SyncProgressStoreTests {
 
     /// Events of a run that `beginTransfer` refused (its operation was no longer active) carry
     /// the superseded token and never touch the store, so a stale task cannot repaint the UI.
+    /// The second half guards the relay's explicit `.superseded` exclusion: closing a run sets
+    /// the current token to `.superseded` too, so without that check the refused sink would
+    /// match the closed state and start reaching the main actor once any run ended.
     @Test func supersededRunNeverReachesTheStore() async {
         let controller = controller()
         let active = UUID()
@@ -70,6 +73,41 @@ struct SyncProgressStoreTests {
         await staleSink(Self.progress(100, total: 100))
         #expect(controller.progressStore.progress.completed == 5)
         #expect(controller.progressStore.mainActorEntries == 1)
+
+        await controller.completeSyncForTesting(active, summary: Self.progress(100, total: 100))
+        await staleSink(Self.progress(95, total: 100))
+        await staleSink(Self.progress(100, total: 100))
+        #expect(controller.progressStore.progress.completed == 5, "a refused sink stays dead after the run closed")
+        #expect(controller.progressStore.mainActorEntries == 1, "the refused sink must be dropped off the main actor, also after close")
+    }
+
+    /// Automatic runs use the 1 s cadence (#96: manual 200 ms, automatic 1 s). Back-to-back
+    /// events after the first are held for a second, so the second event sent within
+    /// milliseconds is not shown, and the bound is per second, not per 200 ms. Swapping the
+    /// cadence mapping in `reset` fails the second-event expectation.
+    @Test func automaticRunUsesTheOneSecondCadence() async {
+        let controller = controller()
+        let operationID = UUID()
+        controller.setOperationForTesting(operationID)
+        let sink = controller.beginTransferForTesting(operationID, automatic: true)
+        let total = 2_000
+        let start = ContinuousClock.now
+        await sink(Self.progress(1, total: total))
+        await sink(Self.progress(2, total: total))
+        let afterTwo = start.duration(to: .now)
+        if afterTwo < .milliseconds(200) {
+            #expect(controller.progressStore.progress.completed == 1, "the second event within \(afterTwo) must wait for the 1 s window")
+        }
+        await Task.detached {
+            for completed in 3...total {
+                await sink(Self.progress(completed, total: total))
+            }
+        }.value
+        let elapsed = start.duration(to: .now)
+        let allowed = 2 + Int(elapsed / .seconds(1))
+        let entries = controller.progressStore.mainActorEntries
+        #expect(entries <= allowed, "\(entries) main-actor entries for \(total) events in \(elapsed); at most \(allowed) allowed at 1 s")
+        #expect(controller.progressStore.progress.completed == total)
     }
 
     /// Once the operation ends, late progress from its still-unwinding tasks is dropped at the

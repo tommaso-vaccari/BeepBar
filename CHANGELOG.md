@@ -14,7 +14,7 @@
 - Refreshing unchanged courses avoids unnecessary interface updates while renamed courses and changed selections still appear normally.
 - Opening BeepBar restores the previous sync result with less work, keeping the interface available while a large Activity summary is read.
 - Repeated synchronization uses less memory and does less work when many materials are already saved.
-- The menu bar and the window stay responsive while a large sync is running: progress is drawn at a steady pace instead of once per file.
+- During a large sync the menu bar and the window have less work to do: progress is handled off the interface and only the updates that are shown reach it.
 
 ### Fixed
 

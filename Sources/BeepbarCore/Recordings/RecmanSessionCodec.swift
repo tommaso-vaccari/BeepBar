@@ -25,7 +25,7 @@ public enum RecmanSessionCodec {
         case unsupportedVersion
     }
 
-    public struct Snapshot {
+    public struct Snapshot: Sendable {
         /// The WeBeep user id of the account that signed in to Polimi.
         public let ownerUserID: Int
         public let cookies: [HTTPCookie]
@@ -56,5 +56,15 @@ public enum RecmanSessionCodec {
         let domain = cookie.domain.lowercased().trimmingCharacters(in: CharacterSet(charactersIn: "."))
         guard PolimiPage.isPolimiHost(domain) else { return false }
         return cookie.expiresDate.map { $0 > now } ?? true
+    }
+
+    /// What decides whether the file needs rewriting (`RecmanSessionVault`): every cookie
+    /// attribute that is saved, order-independent. Two cookie sets with the same fingerprint
+    /// encode to the same session.
+    public static func fingerprint(_ cookies: [HTTPCookie]) -> [String] {
+        cookies.map { cookie in
+            let expiry = cookie.expiresDate.map { String($0.timeIntervalSince1970) } ?? "session"
+            return [cookie.name, cookie.domain, cookie.path, cookie.value, expiry, String(cookie.isSecure), String(cookie.isHTTPOnly)].joined(separator: "\u{1F}")
+        }.sorted()
     }
 }

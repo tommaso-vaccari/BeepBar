@@ -239,3 +239,10 @@ state that the reduced corpus does not establish the standard baseline.
 
 Run safeguards locally with `python3 scripts/test_benchmark_compare.py`; CI runs these alongside
 `swift test`. Mutation checks must use a disposable copy, especially for cleanup changes.
+
+## Isolated UI and launch measurements
+
+D07's opt-in fixture and single-command scenario runner are documented in
+[UI benchmarks](ui-benchmarks.md). It hosts the actual pages with synthetic dependencies and
+reports window key separately from populated-content readiness. Its timings and traces must
+not be confused with the Core comparison harness or production launch/scheduler evidence.

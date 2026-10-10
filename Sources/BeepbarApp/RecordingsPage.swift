@@ -453,6 +453,7 @@ private struct CourseRecordings: View {
                             isOpening: recordings.openingRecordingID == recording.id,
                             play: { recordings.play(recording) }
                         )
+                        .uiContentReady(.recordings, enabled: recording.id == shown.first?.id)
                         .tag(recording.id)
                     }
                 }

@@ -10,6 +10,7 @@ enum BeepbarLog {
     static let sync = Logger(subsystem: "io.github.tvaccari.beepbar", category: "sync")
 }
 
+#if !UI_PERFORMANCE_HARNESS
 @main
 struct BeepbarApp: App {
     @NSApplicationDelegateAdaptor(AppDelegate.self) private var appDelegate
@@ -23,6 +24,8 @@ struct BeepbarApp: App {
         Settings { EmptyView() }
     }
 }
+
+#endif
 
 @MainActor final class AppDelegate: NSObject, NSApplicationDelegate {
     // Owned here, not by the SwiftUI App struct: for a window-less scene, SwiftUI doesn't
@@ -132,9 +135,12 @@ final class StatusItemController: NSObject, NSMenuDelegate {
         // Updates arrive from the main actor (see `onMenuBarSymbolChange`), never from an AppKit
         // callback into this class.
         authentication.onMenuBarSymbolChange = { [statusItem] symbol in Self.setSymbol(symbol, on: statusItem) }
+#if !UI_PERFORMANCE_HARNESS
         let menu = NSMenu()
         menu.delegate = self
         statusItem.menu = menu
+#endif
+        PerformanceTrace.shared.event("ui.iconReady", category: .ui)
     }
 
     @MainActor private static func setSymbol(_ symbol: String, on statusItem: NSStatusItem) {
@@ -245,7 +251,12 @@ final class StatusItemController: NSObject, NSMenuDelegate {
     /// Builds the window `show` opens, apart from its delegate and saved frame, so tests can host
     /// the real shell in exactly this window.
     static func makeWindow(authentication: WeBeepAuthenticationController, router: ShellRouter) -> ConfigurationWindow {
-        let controller = NSHostingController(rootView: BeepbarShellView(authentication: authentication, recordings: authentication.recordings, router: router))
+        makeWindow(content: BeepbarShellView(authentication: authentication, recordings: authentication.recordings, router: router))
+    }
+
+    /// Shared window chrome and hosting options for the real app and isolated performance shell.
+    static func makeWindow<Content: View>(content: Content) -> ConfigurationWindow {
+        let controller = NSHostingController(rootView: content)
         // Only let SwiftUI enforce the minimum size; otherwise the window keeps resizing
         // itself to the content's ideal size on every page switch.
         controller.sizingOptions = [.minSize]

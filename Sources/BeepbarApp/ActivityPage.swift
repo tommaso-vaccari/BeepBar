@@ -66,6 +66,7 @@ struct ActivityPage: View {
             VStack(alignment: .leading, spacing: 16) {
                 if let summary = authentication.lastSyncSummary {
                     SectionHeader(title: tr("Ultima sincronizzazione", "Last sync"), subtitle: summary.completedAt.shortText)
+                        .uiContentReady(.activity)
                     HStack(spacing: 8) {
                         MetricTile(value: summary.added, label: tr("Nuovi", "New"), systemImage: "plus.circle.fill", tint: .green)
                         MetricTile(value: summary.updated, label: tr("Aggiornati", "Updated"), systemImage: "arrow.triangle.2.circlepath.circle.fill", tint: .blue)
@@ -113,6 +114,9 @@ private struct CourseActivityCard: View {
     /// (remote id, name, show in Finder instead of opening).
     let openItem: (String, String, Bool) -> Void
     @State private var isExpanded = false
+#if DEBUG
+    @Environment(\.uiFixtureExpandedActivity) private var fixtureExpanded
+#endif
 
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
@@ -141,6 +145,11 @@ private struct CourseActivityCard: View {
             .buttonStyle(.plain)
             .accessibilityHint(isExpanded ? tr("Comprimi", "Collapse") : tr("Espandi", "Expand"))
 
+#if DEBUG
+            Color.clear.frame(height: 0).onAppear {
+                if fixtureExpanded { isExpanded = true }
+            }
+#endif
             if isExpanded {
                 Divider().padding(.leading, 56)
                 VStack(alignment: .leading, spacing: 7) {
@@ -158,6 +167,7 @@ private struct CourseActivityCard: View {
                             Image(systemName: item.kind == .added ? "plus.circle.fill" : "arrow.triangle.2.circlepath.circle.fill")
                                 .foregroundStyle(item.kind == .added ? .green : .blue)
                         }
+                        .uiContentReady(.expandedActivity, enabled: item.id == course.items.first?.id)
                     }
                     ForEach(course.movedItems) { item in
                         fileRow(id: item.id, name: item.name) {

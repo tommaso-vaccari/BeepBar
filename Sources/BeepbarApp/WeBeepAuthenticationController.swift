@@ -712,6 +712,10 @@ struct MenuBarSnapshot: Sendable {
         setSyncState(state)
     }
 
+    /// Feeds the existing sync callback from a synthetic producer (#95), retaining the relay
+    /// and menu publication. Its trace can guide D08; it is not a deterministic hop-count test.
+    func publishProgressForTesting(_ value: SyncProgress) async { await publishProgress(value) }
+
     func setCoursesForTesting(_ courses: [RemoteCourseSummary]) {
         self.courses = courses
     }
@@ -1166,13 +1170,18 @@ struct MenuBarSnapshot: Sendable {
         }
     }
 
-    func refreshOnWindowOpen() {
-        Task { [weak self] in
+    @discardableResult func refreshOnWindowOpen() -> Task<Void, Never> {
+        let refresh = Task { [weak self] in
             guard let self else { return }
             await self.bootstrapTask?.value
             self.loadCourses()
+#if DEBUG
+            // The isolated UI harness awaits the real refresh completion instead of sleeping.
+            await self.courseLoadTaskForTesting?.value
+#endif
         }
         refreshConflicts()
+        return refresh
     }
 
     func chooseRoot() {

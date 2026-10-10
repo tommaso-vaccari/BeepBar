@@ -116,6 +116,7 @@ Non lavorare contemporaneamente sugli stessi percorsi senza concordare l’ordin
 | R04 / script delle registrazioni | [#135](https://github.com/tommaso-vaccari/BeepBar/pull/135) | Ogni script di pagina termina una sola volta con la prima tra risposta di WebKit, chiusura, nuova operazione, annullamento del task o timeout di 10 s (`unavailable`); la WebView non resta trattenuta dopo `close()`. Nessun cambiamento visibile quando WebKit risponde. |
 | R05 / metadati incrementali Moodle | [#143](https://github.com/tommaso-vaccari/BeepBar/pull/143) | Indagine conclusa con esito negativo: le API «aggiornamenti da» di Moodle non segnalano moduli rimossi, spostamenti, rinomine di sezione e visibilità né riducono le richieste; la scansione completa per corso resta. Solo documentazione: nessun cambiamento al codice, nessuna verifica di test o build. |
 | R01 / salvataggio del riepilogo di sync | [#140](https://github.com/tommaso-vaccari/BeepBar/pull/140) | Encoding del nuovo risultato riuscito fuori dal main actor, prima della pubblicazione; pubblicazione e due scritture restano nello stesso turno. Turno main a 15k dettagli 21,1→2,0 ms (mediana); stesse chiavi e stessi byte, nessuna migrazione. CPU totale invariata e fine sync più lunga della durata dell’encoding; rendering UI non misurato (D07). |
+| R03 / attraversamento directory | [#142](https://github.com/tommaso-vaccari/BeepBar/pull/142) | `FileStore.existingRegularFiles` risolve ogni cartella genitore una volta per chiamata invece di un percorso completo per file: sync senza novità a 15k file con CPU mediana −63% e −57% rispetto a base dev nei due confronti validi e risoluzioni 15.000→75; nessuna differenza misurabile nel caso peggiore (un file per cartella). Un primo confronto valido ha segnalato `cancel-mid` più lento (CPU 196 contro 130 ms di base dev), non riprodotto nel secondo confronto valido. No-follow, contenimento, root fissata, errori di permesso e rilevazione dei file eliminati localmente restano invariati e coperti da test di regressione con mutazioni. |
 
 D01–D05 verificate su dev `81ee436749b6a11eebf75fdabd247639310563c7`: suite finale 620 test, build Release, review indipendenti e CI pre/post-merge verdi. Le PR integrate non equivalgono a una release installata.
 
@@ -169,6 +170,81 @@ Prove di regressione in `SyncFinalizationTests`: `newestCompletedResultIsSavedWi
 
 Non esercitati: rendering SwiftUI e occupazione main nell’app reale (D07); la latenza di «Esci» durante l’encoding (al più ~20 ms in più dentro l’attesa esistente di 5 s; percorso di quit non modificato; `scripts/quit-probe.sh` rieseguito e verde, ma è un probe AppKit autonomo che non esegue il codice di BeepBar); un encoding che fallisce davvero (non accade con date finite), il cui ramo salva solo l’ora come prima. Verificata su `18a2bc6` (i commit successivi cambiano solo questa documentazione) con la suite completa (746 test Swift Testing nei tre bundle, con i due benchmark su richiesta saltati, e 14 XCTest), i test Python di `benchmark_compare.py`, la build Release e le mutazioni sopra.
 
+R03 ([#142](https://github.com/tommaso-vaccari/BeepBar/pull/142), [#111](https://github.com/tommaso-vaccari/BeepBar/issues/111)): misurato l’attraversamento delle directory in una sync senza novità. L’unica chiamata per file di quella run è `existingRegularFiles` (da `SyncCoordinator.itemsRequiringReconciliation`; la usano anche la riserva dei nomi, gli spostamenti e i candidati alla rimozione). Prima di R03 ogni file tracciato ripartiva dalla root fissata (`dup`, un `openat(O_NOFOLLOW)` per cartella, le `close`) prima del suo `fstatat`: con cartelle a due livelli, 7 syscall per file. Ora i percorsi sono raggruppati per cartella genitore completa, ogni genitore è risolto una volta per chiamata nello stesso modo e i file sono letti con `fstatat(AT_SYMLINK_NOFOLLOW)`. Per 15.000 file in 75 cartelle si passa da circa 105.000 a 15.450 syscall (conteggio ricavato dal codice, non tracciato con dtruss). Nessun descrittore o risposta sopravvive alla chiamata. `fchflags` scatta solo su un componente `.beepbar`, come prima di R03. Il contatore `fs.pathLookups` ora conta le risoluzioni di directory ([benchmark](benchmarks.md)).
+
+Ambiente: Release arm64, Mac17,3 Apple M5/32 GB, macOS 27.0.1, alimentazione AC, Low Power Mode spento. Una warm-up e cinque run; p95 = massimo. Primo confronto `scripts/benchmark.sh compare --main 3ce0ba0 --base-dev eb0dcab --candidate 5d9343a --harness-ref origin/main --saved-folder-overrides`, con harness di main `3ce0ba0` per tutti e tre i ref e stato termico nominale. `dirty` su tutti e tre i ref è la patch di misura che il confronto applica con `--saved-folder-overrides`, non una build contaminata. Rapporti locali non versionati in `PerformanceReports/r03-matched`. Questo è il primo confronto; il secondo, sulla base dev aggiornata, segue la tabella.
+
+| Scenario `unchanged` | Metrica | main `3ce0ba0` | base dev `eb0dcab` | R03 `5d9343a` | base dev → R03 | main → R03 |
+|---|---|---|---|---|---|---|
+| 15k file | CPU mediana / p95 | 636,2 / 667,0 ms | 623,0 / 667,4 ms | 232,7 / 237,6 ms | −62,7% / −64,4% | −63,4% / −64,4% |
+| 15k file | tempo reale mediana / p95 | 580,7 / 614,1 ms | 543,4 / 610,2 ms | 171,9 / 175,8 ms | −68,4% / −71,2% | −70,4% / −71,4% |
+| 15k file | istruzioni mediana | 11.030 M | 8285 M | 3597 M | −56,6% | −67,4% |
+| 15k file | `fs.pathLookups` | 15.000 | 15.000 | 75 | −99,5% | −99,5% |
+| 15k file | picco memoria mediana | 57,27 MiB | 48,66 MiB | 47,03 MiB | −3,3% | −17,9% |
+| 1k file | CPU mediana / p95 | 37,51 / 38,19 ms | 29,81 / 30,30 ms | 14,97 / 15,16 ms | −49,8% / −50,0% | −60,1% / −60,3% |
+| 1k file | tempo reale mediana / p95 | 33,02 / 33,67 ms | 25,30 / 25,70 ms | 10,51 / 10,63 ms | −58,5% / −58,6% | −68,2% / −68,4% |
+| 1k file | `fs.pathLookups` | 1000 | 1000 | 50 | −95% | −95% |
+
+Secondo confronto valido, dopo l’integrazione di R01 e R04 in dev: stesso comando con `--base-dev 53238bb --candidate 369c3b3`. Il candidato `369c3b3` ha lo stesso codice di produzione della testa della PR. Stato termico nominale in tutti i 15 rapporti (tre ref, cinque scenari); rapporti locali in `PerformanceReports/r03-review-1`.
+
+| Scenario | Metrica | main `3ce0ba0` | base dev `53238bb` | R03 `369c3b3` | base dev → R03 | main → R03 |
+|---|---|---|---|---|---|---|
+| `unchanged` 15k | CPU mediana / p95 | 555,4 / 556,1 ms | 420,5 / 421,7 ms | 182,7 / 188,0 ms | −56,6% / −55,4% | −67,1% / −66,2% |
+| `unchanged` 15k | tempo reale mediana | 505,9 ms | 371,0 ms | 133,4 ms | −64,0% | −73,6% |
+| `unchanged` 15k | istruzioni mediana | 11.030 M | 8274 M | 3595 M | −56,6% | −67,4% |
+| `unchanged` 15k | `fs.pathLookups` | 15.000 | 15.000 | 75 | −99,5% | −99,5% |
+| `unchanged` 1k | CPU mediana | 37,55 ms | 29,69 ms | 14,74 ms | −50,4% | −60,8% |
+| `cancel-mid` | CPU mediana / p95 | 231,3 / 234,7 ms | 235,0 / 236,6 ms | 234,8 / 235,4 ms | −0,1% / −0,5% | +1,5% / +0,3% |
+| `cancel-mid` | latenza di annullamento mediana / p95 | 6,41 / 6,59 ms | 6,66 / 6,78 ms | 6,39 / 6,91 ms | −4,1% / +2,0% | −0,3% / +4,9% |
+| `cancel-mid` | istruzioni mediana | 845,5 M | 847,7 M | 846,8 M | −0,1% | +0,2% |
+| `cancel-mid` | tempo reale mediana | 1375 ms | 1375 ms | 1375 ms | 0% | 0% |
+
+Il comparatore segnala come regressione ogni aumento, anche minimo. Nel secondo confronto, tra gli aumenti segnalati per il candidato i principali sono: picco di memoria `unchanged` 15k +0,25 MiB (+0,6%) su base dev; `cancel-mid` latenza p95 +2,0% su base dev e +4,9% su main, CPU mediana +1,5% su main; `large-update` sotto l’1% per CPU e istruzioni ed entro il 5% per il picco di memoria, che varia in entrambe le direzioni come nel primo confronto. Gli altri segnali sono piccoli in valore assoluto: picco di memoria al massimo +0,8 MiB (+4,7%), crescita del picco al massimo +0,75 MiB (percentuali alte solo perché la base è sotto 1 MiB), istruzioni, CPU e tempo reale entro lo 0,3% oltre a quelli già citati, scritture logiche al massimo +128 KiB. Dettaglio completo in `comparison.md` del rapporto.
+
+Richieste, byte di rete, file hashati e scritture su disco sono identici nei tre ref. Commit e righe DB sono zero su base dev e R03; i 1001/15.000 commit di main sono il lavoro rimosso da D02–D04, non da R03. Il profilo opt-in `DirectoryTraversalProfileTests` ([comando](benchmarks.md#directory-traversal-profile)) isola `existingRegularFiles` su 15.000 file vuoti. Ha girato in tre round alternati tra base dev `eb0dcab` e R03 `5d9343a` (stessa macchina, mediana di cinque chiamate per round):
+
+| Disposizione | Base dev: mediane dei 3 round | R03: mediane dei 3 round | Risoluzioni per chiamata |
+|---|---|---|---|
+| 50 cartelle, profondità 2 (come `unchanged`) | 297,7 / 259,5 / 260,3 ms | 27,3 / 26,4 / 26,1 ms | 15.000 → 50 |
+| 500 cartelle, profondità 4 | 574,5 / 533,2 / 536,1 ms | 54,3 / 54,3 / 58,0 ms | 15.000 → 500 |
+| un file per cartella, profondità 3 (caso peggiore) | 601,3 / 529,0 / 531,3 ms | 531,2 / 532,3 / 532,7 ms | 15.000 → 15.000 |
+
+Nel caso peggiore il raggruppamento non risparmia risoluzioni e il suo costo resta entro il rumore.
+
+Altri scenari dello stesso confronto:
+- `large-update-64mb` / `256mb`: istruzioni entro ±0,6% e `fs.pathLookups` uguali (6). Il picco di memoria segnalato varia in entrambe le direzioni tra i ref (64 MiB: 27,8 contro 24,1 MiB; 256 MiB: 23,8 contro 27,8 MiB) senza codice R03 sul percorso. Nel secondo confronto CPU, tempo reale e istruzioni sono entro l’1,5% tra i tre ref.
+- `cancel-mid`: il primo confronto valido segnala il candidato `5d9343a` peggiore di base dev `eb0dcab` su tutti e cinque i campioni: CPU mediana 196 contro 130 ms (main 142,8 ms), tempo reale 1405 contro 1375 ms (main 1375 ms), latenza di annullamento 3,5 contro 1,9 ms (main 1,8 ms), istruzioni 858 contro 843 M (main 843 M). Lo scenario conta una risoluzione e un file hashato in tutti i ref. È l’`inspect` del file installato, che da solo vale una risoluzione (`WorkCountersTests`), quindi `existingRegularFiles` non risolve alcuna cartella in questo scenario. Tre ripetizioni (`r03-matched-2`, `-3`, `-4`) sono state invalidate dall’harness per stato termico «fair», con altre build in parallelo, e non sono usate come prova. **Il secondo confronto valido (`r03-review-1`, tabella sopra) non riproduce lo spostamento:** il candidato `369c3b3` è entro lo 0,5% di base dev `53238bb` per CPU, istruzioni e tempo reale, e la latenza è 6,39 contro 6,66 ms. Tra sessioni la CPU di `cancel-mid` cambia livello per tutti i ref: ~130–143 ms per base dev e main nel primo confronto, ~231–235 ms nel secondo, ~130 o ~230 ms nelle ripetizioni invalidate. Lo spostamento del primo confronto resta senza causa identificata: non riprodotto nel secondo confronto valido, dove tutti i ref erano al livello ~235 ms; non attribuito a R03, ma nemmeno escluso. La latenza resta molto sotto il budget di 1 s.
+
+Gli scenari `startup` non sono misurati: l’harness di main non li contiene.
+
+**Decisione:** mantenere il raggruppamento per cartella, limitato alla singola chiamata. Garanzie e test di regressione in `ExistingRegularFilesSafetyTests`, salvo dove indicato:
+- intermedio sostituito da un link simbolico, mai seguito (`neverFollowsASymlinkedIntermediateDirectoryInsideTheRoot`);
+- contenimento rispetto a link che escono dalla root, come cartella o come file (`neverReportsAFileOutsideTheRoot`);
+- root rinominata e sostituita dopo l’apertura (`resolvesFromThePinnedRootAfterTheRootIsReplaced`);
+- intermedi mancanti, file al posto di una cartella, link a file regolari e directory al posto di un file in un lotto misto (`reportsExactlyTheRegularFilesInAMixedBatch` e `FileStoreTests.bulkExistenceCheckTreatsNonRegularEntriesAsAbsentWithoutHashing`);
+- cartelle omonime sotto genitori diversi (`keepsSameNamedDirectoriesUnderDifferentParentsApart`);
+- cartella sostituita da un link, file sostituito da una directory o da un link, file eliminato tra due chiamate (`reresolvesEveryDirectoryOnEachCall`);
+- permesso negato su un intermedio o sulla cartella del file: fallisce l’intera chiamata, come prima, invece di dichiarare assenti i file (`permissionDeniedFailsTheWholeCheck`);
+- annullamento (`stopsWhenCancelled`);
+- file eliminati in una cartella condivisa, riscaricati senza toccare il file modificato accanto (`SyncCoordinatorEndToEndTests.filesDeletedFromASharedFolderAreDownloadedAgainWhenNothingChanged`);
+- una risoluzione per genitore per chiamata (`WorkCountersTests.bulkExistenceCheckResolvesEachParentOncePerCall`, `BenchmarkKitTests`: 15 nello scenario `unchanged`).
+
+Mutazioni in worktree usa e getta, tutte rilevate da fallimenti di asserzioni:
+- senza `O_NOFOLLOW` nelle cartelle;
+- senza `AT_SYMLINK_NOFOLLOW`;
+- risoluzione dal percorso `rootURL`;
+- uscita al primo genitore non valido;
+- cartella esistente considerata prova dei file;
+- descrittori riusati tra chiamate;
+- errori di `directoryFD` o di `fstatat` ignorati;
+- nessun controllo `S_IFREG`;
+- raggruppamento per sola ultima cartella;
+- senza i controlli di annullamento, sia per cartella sia per file insieme. `stopsWhenCancelled` parte già annullato con un solo file, quindi togliere uno solo dei due controlli non lo fa fallire: quel caso non è coperto.
+
+Il codice precedente, una risoluzione per file, fa fallire solo i test dei contatori: questo mostra che i test di sicurezza valgono anche sul codice precedente. L’unica differenza è la tempistica descritta nel commento di `existingRegularFiles`: cosa fa una risposta superata per ciascun chiamante, e la cartella spostata fuori dalla root durante la chiamata. La sicurezza dei dati locali non cambia. Non esercitati: sostituzione della root a metà di una singola chiamata (nessun punto di aggancio; ogni risoluzione parte dal descrittore fissato), perdita di descrittori, tracciamento syscall con dtruss. Misure su M5, non sulla macchina di riferimento M2. Fluidità UI non misurata (D07). Nessun cambiamento di comportamento utente: specifiche di sync e CHANGELOG invariati.
+
+Verificata su `369c3b3` (codice uguale alla testa della PR; i commit successivi cambiano solo la documentazione): `swift test` completo (757 test Swift Testing e 14 XCTest, 3 benchmark opt-in saltati), `scripts/test_benchmark_compare.py` (11 test) e build Release verdi.
+
 Misure sintetiche Release arm64, M5/32 GB, AC, una warm-up e sette run: D04, corpus invariato con override da 15k, CPU mediana 474,867→413,631 ms, p95 478,502→416,123; UPDATE/commit 15.000→0. Picco memoria mediano 44,376→47,063 MiB: aumento registrato, nessun risparmio memoria rivendicato; la memoria stabilizzata dopo dieci sync non è stata misurata. D05, JSON da 1.133.014 byte/15k dettagli, restore async mediana 42,622→21,986 ms, p95 43,028→22,382; scritture 2→0. Sono misure con fixture, non fluidità UI, main occupancy, energia o servizio reale. Non confrontare corpus differenti. Vedere [comandi benchmark](benchmarks.md).
 
 ## Lavoro aperto e issue
@@ -185,7 +261,6 @@ Misure sintetiche Release arm64, M5/32 GB, AC, una warm-up e sette run: D04, cor
 | I1 | `fix/bounded-metadata-response` | Nessuna | [#102](https://github.com/tommaso-vaccari/BeepBar/issues/102) |
 | I9b | `fix/recordings-seen-overflow` | Nessuna | [#106](https://github.com/tommaso-vaccari/BeepBar/issues/106) |
 | I9d | `perf/recordings-play-priority` | D07 | [#107](https://github.com/tommaso-vaccari/BeepBar/issues/107) |
-| R03 | `perf/directory-traversal-profile` | Nessuna | [#111](https://github.com/tommaso-vaccari/BeepBar/issues/111) |
 | R06 | `test/recordings-acknowledgement-race` | Nessuna | [#114](https://github.com/tommaso-vaccari/BeepBar/issues/114) |
 | R07 | `docs/recordings-live-validation` | Nessuna | [#115](https://github.com/tommaso-vaccari/BeepBar/issues/115) |
 
@@ -310,7 +385,7 @@ Sono attività concrete di verifica, non ottimizzazioni già giustificate.
 | Candidato | Prossimo esperimento e criterio decisionale |
 |---|---|
 | Migrazioni ripetute all’avvio | Concluso da R02 ([#134](https://github.com/tommaso-vaccari/BeepBar/pull/134)): nessuna guardia di versione. Le aperture successive costano ~1,1 ms a 15k file (~5,7 ms a 100k) senza scritture di righe o pagine, fuori dal main actor; la riparazione una tantum ~7,5 ms a 15k. Riaprire solo se lo scenario `startup` supera i budget o se la migrazione inizia a scrivere ad ogni avvio. |
-| Attraversamento directory e flag | Contare `openat`/stat/fchflags in `FileStore.directoryFD` ed `existingRegularFiles` su percorsi profondi/condivisi. Provare un riuso limitato all’operazione solo con beneficio CPU misurato. Preservare no-follow, contenimento, sostituzione root e permessi; non eliminare i controlli di esistenza locale. |
+| Attraversamento directory e flag | Concluso da R03 ([#142](https://github.com/tommaso-vaccari/BeepBar/pull/142)): `existingRegularFiles` risolve ogni cartella genitore una volta per chiamata, senza cache tra chiamate: sync senza novità a 15k file −63% e −57% CPU rispetto a base dev nei due confronti validi, risoluzioni 15.000→75, caso peggiore invariato. `cancel-mid` segnalato più lento in un primo confronto valido e non riprodotto nel secondo; in quello scenario `existingRegularFiles` non risolve alcuna cartella. `fchflags` scatta solo su un componente `.beepbar`, come prima. No-follow, contenimento, root fissata, permessi e controlli di esistenza locale conservati, con test di regressione. Riaprire solo con un riuso tra chiamate, che richiederebbe una nuova prova di sicurezza contro le sostituzioni tra run. |
 | JavaScript dopo chiusura/annullamento | Concluso da R04 ([#135](https://github.com/tommaso-vaccari/BeepBar/pull/135)): l’attesa infinita e la ritenzione della WebView erano reali sul codice precedente. Ogni chiamata è ora limitata da `BoundedScriptCall` (risposta, interruzione o timeout di 10 s, una sola volta). Riaprire solo se compaiono timeout `unavailable` su pagine che rispondono, o se una nuova chiamata a WebKit aggira `evaluate`. |
 | Metadati incrementali Moodle | Concluso da R05 ([#143](https://github.com/tommaso-vaccari/BeepBar/pull/143)): non implementare cursori temporali né `core_course_check_updates`/`core_course_get_updates_since`. Non vedono moduli rimossi, spostamenti, rinomine di sezione, visibilità/gruppi e non riducono le richieste; la scansione completa per corso resta il contratto. Nessuna riduzione di frequenza. |
 

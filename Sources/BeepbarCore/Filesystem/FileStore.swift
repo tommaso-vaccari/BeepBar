@@ -88,8 +88,11 @@ public actor FileStore {
     private(set) var hashCount = 0
     /// Bytes read to compute those digests: tells one large file read twice from two small ones.
     private var bytesHashed: Int64 = 0
-    /// Paths resolved from the root, one directory `openat` per component, before any per-file
-    /// call (`inspect`, `containsRegularFile`, occupancy checks, moves) touches the file itself.
+    /// Directory resolutions from the root, one `openat` per component, before a call touches the
+    /// files in that directory. Per-file calls (`inspect`, `containsRegularFile`, occupancy checks,
+    /// moves) resolve once per path; `existingRegularFiles` resolves once per distinct parent
+    /// directory per call (R03, #111), so for a run with nothing new this counts module folders,
+    /// not tracked files.
     private var pathLookups = 0
     /// Hashes `inspect` computed during this store's life, keyed by the exact state of the file
     /// they were read from. Only `install`'s check before replacing a file consults them, through
@@ -405,35 +408,79 @@ public actor FileStore {
         }
     }
 
-    /// Returns the subset of `paths` that currently exist as regular files, using one `stat` per path and
-    /// never reading file contents. Directories, symbolic links and other non-regular entries, as well as
-    /// paths whose parent is missing or is no longer a directory, are reported as absent rather than thrown.
+    /// Returns the subset of `paths` that currently exist as regular files, using one `fstatat` per
+    /// path and never reading file contents. Directories, symbolic links and other non-regular
+    /// entries, as well as paths whose parent is missing or is no longer a directory, are reported
+    /// as absent rather than thrown.
+    ///
+    /// Each distinct parent directory is resolved once per call and its descriptor reused for the
+    /// files it holds (R03, #111, PR #142). A run with nothing new checks every tracked file this
+    /// way, and resolving `Corso/Modulo` again for each of its files cost one `dup`, one `openat`
+    /// per component and as many `close` calls per file, several times the one `fstatat` that
+    /// answers the question (measurements in the R03 section of `docs/performance-plan.md`).
+    ///
+    /// The checks are the ones the per-file version made: every directory is reached from the
+    /// root descriptor pinned at `init` through `O_NOFOLLOW` opens, and each name is looked at
+    /// with `AT_SYMLINK_NOFOLLOW`, so no symbolic link is followed and no path is resolved outside
+    /// the root. A missing directory, a file where a directory should be, or a symbolic link in the
+    /// path makes only that directory's files absent; any other error (a folder that cannot be
+    /// opened or searched) still fails the whole call rather than being read as a deletion.
+    /// `ExistingRegularFilesSafetyTests` pins each of these.
+    ///
+    /// The one difference is timing. A directory replaced or moved while this call is checking
+    /// its files is noticed by the next call instead of at the next file, and a folder moved out
+    /// of the root during the call still has its files checked through the descriptor already
+    /// held. The per-file version had the same window for one file at a time. The answer was
+    /// already a snapshot that can go stale right after the `fstatat`; what a stale answer does
+    /// depends on the caller in `SyncCoordinator`:
+    /// - reconciliation (`itemsRequiringReconciliation`): a stale "present" skips the item until
+    ///   the next run; a stale "absent" sends it to `inspect`/`install`, whose expected-state
+    ///   checks refuse to overwrite anything;
+    /// - files removed from Moodle (`vanishedFiles`): a stale "absent" drops the open entry for
+    ///   that file (the next run that sees the file creates it again, with a new id and detection
+    ///   date) or skips adopting it for a re-upload, which is then downloaded as usual; a stale
+    ///   "present" reads the file again before opening an entry, or keeps an open one whose action
+    ///   re-checks the file;
+    /// - ghost name reservation: a stale "absent" frees a name a newcomer may pick, and installing
+    ///   there still goes through `RENAME_EXCL`, so an existing file is never replaced; a stale
+    ///   "present" only reserves a name for one run;
+    /// - an open "moved" entry: a stale "present" keeps the entry, whose action re-checks the file;
+    ///   a stale "absent" reads the source again.
+    /// Local data safety is therefore unchanged: no answer of this call can make sync overwrite or
+    /// delete a file. Descriptors live only for this call, never in a cache, so a later call never
+    /// trusts a directory it did not open itself.
     public func existingRegularFiles(_ paths: [RelativePath]) throws -> Set<RelativePath> {
         var existing: Set<RelativePath> = []
+        var namesByParent: [[String]: [(path: RelativePath, name: String)]] = [:]
+        var parents: [[String]] = []
         for path in paths {
+            let components = path.components
+            let parent = Array(components.dropLast())
+            if namesByParent[parent] == nil { parents.append(parent) }
+            namesByParent[parent, default: []].append((path, components.last!))
+        }
+        for parent in parents {
             try Task.checkCancellation()
-            if try isRegularFile(at: path) { existing.insert(path) }
+            let directory: Int32
+            do {
+                directory = try directoryFD(for: parent, create: false)
+            } catch FileStoreError.symbolicLink {
+                continue
+            } catch where errno == ENOENT || errno == ENOTDIR {
+                continue
+            }
+            defer { close(directory) }
+            for (path, name) in namesByParent[parent]! {
+                try Task.checkCancellation()
+                var metadata = stat()
+                guard fstatat(directory, name, &metadata, AT_SYMLINK_NOFOLLOW) == 0 else {
+                    if errno == ENOENT || errno == ENOTDIR { continue }
+                    throw fileStoreError()
+                }
+                if (metadata.st_mode & S_IFMT) == S_IFREG { existing.insert(path) }
+            }
         }
         return existing
-    }
-
-    private func isRegularFile(at path: RelativePath) throws -> Bool {
-        let parentAndName: (Int32, String)
-        do {
-            parentAndName = try parentDirectory(for: path, create: false)
-        } catch FileStoreError.symbolicLink {
-            return false
-        } catch where errno == ENOENT || errno == ENOTDIR {
-            return false
-        }
-        let (parent, name) = parentAndName
-        defer { close(parent) }
-        var metadata = stat()
-        guard fstatat(parent, name, &metadata, AT_SYMLINK_NOFOLLOW) == 0 else {
-            if errno == ENOENT || errno == ENOTDIR { return false }
-            throw fileStoreError()
-        }
-        return (metadata.st_mode & S_IFMT) == S_IFREG
     }
 
     public func renameTopLevelDirectory(from old: String, to new: String) throws {

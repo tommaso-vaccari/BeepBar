@@ -109,6 +109,7 @@ struct DailyTelemetryTests {
         }
         #expect(await recorder.count == 2)
         let requests = await recorder.requests
+        try #require(requests.count == 2)
         #expect(try identity(requests[0]) == identity(requests[1]))
         #expect(harness.defaults.bool(forKey: DailyTelemetryController.enabledKey))
         relaunched.stop()

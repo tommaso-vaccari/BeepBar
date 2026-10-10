@@ -750,6 +750,12 @@ struct MenuBarSnapshot: Sendable {
         notificationCoordinator.beforeNotificationForTesting = action
     }
 
+    /// Starts `operationID`'s progress stream exactly as a sync does and returns the callback the
+    /// coordinator would receive, so a test can drive it from off the main actor.
+    func beginTransferForTesting(_ operationID: UUID, automatic: Bool) -> @Sendable (SyncProgress) async -> Void {
+        progressSink(operationID, run: beginTransfer(operationID, automatic: automatic))
+    }
+
     func completeSyncForTesting(_ operationID: UUID, summary: SyncProgress, automatic: Bool = false) async {
         await completeSync(operationID, summary: summary, automatic: automatic)
     }
@@ -1498,10 +1504,8 @@ struct MenuBarSnapshot: Sendable {
                 let targets = selected.map { SyncTarget(courseID: $0.id, localFolder: self.folder(for: $0)) }
                 let token = try await self.credentialVault.load()
                 let coordinator = try SyncCoordinator(rootID: rootID, rootURL: rootURL, database: database, gate: self.operationGate, apiClient: self.apiClient, downloader: self.downloader, platformName: self.selectedSite.platformName)
-                await self.beginTransfer(operationID, automatic: false)
-                let summary = try await coordinator.synchronize(targets: targets, token: token, mode: .manual, networkAccess: .unrestricted) { [weak self] progress in
-                    await self?.publishProgress(progress)
-                }
+                let run = self.beginTransfer(operationID, automatic: false)
+                let summary = try await coordinator.synchronize(targets: targets, token: token, mode: .manual, networkAccess: .unrestricted, progress: self.progressSink(operationID, run: run))
                 await self.completeSync(operationID, summary: summary, automatic: false)
             } catch is CancellationError {
                 self?.cancelledSync(operationID)
@@ -1524,16 +1528,17 @@ struct MenuBarSnapshot: Sendable {
     private func simulatePreviewSync() {
         guard activeOperationID == nil else { return }
         let previous = lastSyncSummary
-        activeOperationID = UUID()
+        let operationID = UUID()
+        activeOperationID = operationID
         setSyncState(.syncing)
         syncTask = Task { [weak self] in
             guard let self else { return }
-            await self.progressStore.reset(automatic: false)
+            let sink = self.progressSink(operationID, run: self.progressStore.reset(automatic: false))
             let total = 40
             for completed in 1...total {
                 try? await Task.sleep(for: .milliseconds(90))
                 if Task.isCancelled { break }
-                await self.publishProgress(SyncProgress(completed: completed, total: total, added: completed / 8, updated: completed / 20, preservedLocal: 0, unchanged: completed, conflicts: 0, failures: 0))
+                await sink(SyncProgress(completed: completed, total: total, added: completed / 8, updated: completed / 20, preservedLocal: 0, unchanged: completed, conflicts: 0, failures: 0))
             }
             let cancelled = Task.isCancelled
             self.syncTask = nil
@@ -2350,10 +2355,8 @@ struct MenuBarSnapshot: Sendable {
                 let enrolled = Set(try await self.fetchEnrolledCourses(token: token).map(\.id))
                 let targets = Self.automaticTargets(scopes: automaticScopes, enrolledCourseIDs: enrolled)
                 let coordinator = try SyncCoordinator(rootID: rootID, rootURL: rootURL, database: database, gate: gate, apiClient: apiClient, downloader: downloader, platformName: platformName)
-                await self.beginTransfer(operationID, automatic: true)
-                let summary = try await coordinator.synchronize(targets: targets, token: token, mode: .automatic, networkAccess: networkAccess) { [weak self] progress in
-                    await self?.publishProgress(progress)
-                }
+                let run = self.beginTransfer(operationID, automatic: true)
+                let summary = try await coordinator.synchronize(targets: targets, token: token, mode: .automatic, networkAccess: networkAccess, progress: self.progressSink(operationID, run: run))
                 await self.completeSync(operationID, summary: summary, automatic: true)
             } catch is CancellationError {
                 self?.cancelledSync(operationID)
@@ -2380,15 +2383,32 @@ struct MenuBarSnapshot: Sendable {
             .map { SyncTarget(courseID: $0.courseID, localFolder: $0.localFolder) }
     }
 
-    private func beginTransfer(_ operationID: UUID, automatic: Bool) async {
-        guard activeOperationID == operationID else { return }
-        await progressStore.reset(automatic: automatic)
-        guard activeOperationID == operationID, !Task.isCancelled else { return }
+    /// Opens the progress stream of `operationID` and shows the sync as running. Returns the run
+    /// token its events carry; `.superseded` when the operation is no longer the active one, so
+    /// nothing it reports is ever shown.
+    private func beginTransfer(_ operationID: UUID, automatic: Bool) -> SyncProgressRun {
+        guard activeOperationID == operationID, !Task.isCancelled else { return .superseded }
+        let run = progressStore.reset(automatic: automatic)
         setSyncState(.syncing)
+        return run
     }
 
-    private func publishProgress(_ progress: SyncProgress) async {
-        guard await progressStore.publish(progress) else { return }
+    /// The progress callback handed to `SyncCoordinator`. It runs on the sync's own tasks: the
+    /// throttle decides there, and the main actor is entered only for the updates it keeps and
+    /// for the final totals (D08, #96). Moving the hop before `accept` brings back one main-queue
+    /// turn per file; `SyncProgressStoreTests` counts them.
+    nonisolated private func progressSink(_ operationID: UUID, run: SyncProgressRun) -> @Sendable (SyncProgress) async -> Void {
+        let store = progressStore
+        return { [weak self] progress in
+            guard let update = store.accept(progress, run: run) else { return }
+            await self?.progressAccepted(update, run: run, operationID: operationID)
+        }
+    }
+
+    /// Main actor: applies an accepted update when the operation is still the active one, and
+    /// keeps the menu bar detail in the same turn as the state (AGENTS.md hard rules).
+    private func progressAccepted(_ update: SyncProgress, run: SyncProgressRun, operationID: UUID) {
+        guard activeOperationID == operationID, progressStore.receive(update, run: run) else { return }
         refreshMenuBarSnapshot()
     }
 
@@ -2552,6 +2572,7 @@ struct MenuBarSnapshot: Sendable {
 
     private func endOperation(_ operationID: UUID) {
         guard activeOperationID == operationID else { return }
+        progressStore.closeCurrentRun()
         activeOperationID = nil
         syncTask = nil
     }
@@ -2572,35 +2593,97 @@ private struct BackgroundScheduleConfiguration: Equatable {
     let recoveryBlocked: Bool
 }
 
+/// Shows the running sync's progress. Only `SyncProgressLine` observes it, so a tick re-renders
+/// that line and nothing else.
+///
+/// Progress arrives from the sync's own tasks, thousands of times per run. The decision whether
+/// an event is worth showing is taken where it arrives, in `accept`, behind a lock and off the
+/// main actor; the main actor is entered in `receive` only for the events that survived the
+/// throttle (D08, #96). Before that change every event hopped to the main actor first and most
+/// were then thrown away there, so a big run cost the UI one main-queue turn per file.
+///
+/// Each run gets a `SyncProgressRun` token from `reset`; `close` retires it when the run reaches
+/// its terminal state. An event carrying another run's token is dropped at both steps, so a late
+/// callback from a cancelled or finished run can never overwrite the completed state, nor the
+/// next run's first ticks.
 @MainActor final class SyncProgressStore: ObservableObject {
     @Published private(set) var progress = SyncProgress(completed: 0, total: 0, installed: 0, preservedLocal: 0, unchanged: 0, conflicts: 0, failures: 0)
+    /// Main-actor entries since the last `reset`: one per accepted update. What D08's regression
+    /// test measures; not shown anywhere.
+    private(set) var mainActorEntries = 0
     private let relay = SyncProgressRelay()
 
-    func reset(automatic: Bool) async {
-        await relay.reset(interval: automatic ? .seconds(1) : .milliseconds(200))
+    /// Starts a run with the cadence its kind deserves (200 ms manual, 1 s automatic) and returns
+    /// the token its events must carry. Any earlier run is retired.
+    func reset(automatic: Bool) -> SyncProgressRun {
         progress = SyncProgress(completed: 0, total: 0, installed: 0, preservedLocal: 0, unchanged: 0, conflicts: 0, failures: 0)
-    }
-    nonisolated func publish(_ value: SyncProgress) async -> Bool {
-        guard let update = await relay.next(value) else { return false }
-        await receive(update)
-        return true
+        mainActorEntries = 0
+        return relay.reset(interval: automatic ? .seconds(1) : .milliseconds(200))
     }
 
-    private func receive(_ update: SyncProgress) {
+    /// Retires whatever run is open. `endOperation` calls it for every way an operation ends,
+    /// including cancellation, so a token kept by a still-running sync task goes dead.
+    func closeCurrentRun() {
+        relay.closeCurrent()
+    }
+
+    /// Off the main actor: the throttle's verdict for one event. `nil` means nothing to show.
+    nonisolated func accept(_ value: SyncProgress, run: SyncProgressRun) -> SyncProgress? {
+        relay.next(value, run: run)
+    }
+
+    /// On the main actor, for accepted updates only. Returns `false` when `run` was retired
+    /// between `accept` and this call, which leaves the shown progress untouched.
+    func receive(_ update: SyncProgress, run: SyncProgressRun) -> Bool {
+        guard relay.isCurrent(run) else { return false }
+        mainActorEntries += 1
         progress = update
+        return true
     }
 }
 
-private actor SyncProgressRelay {
-    private let clock = ContinuousClock()
-    private var throttle = SyncProgressThrottle(minimumInterval: .milliseconds(200))
+/// Identifies one sync run's progress stream; see `SyncProgressStore`.
+struct SyncProgressRun: Sendable, Equatable {
+    fileprivate let generation: Int
+    /// A token no event is ever accepted for: handed out when a run was superseded before it
+    /// could start.
+    static let superseded = SyncProgressRun(generation: -1)
+}
 
-    func reset(interval: Duration) {
-        throttle = SyncProgressThrottle(minimumInterval: interval)
+/// The throttle and the current run token, behind a lock so sync tasks can consult them without
+/// entering any actor. Not an actor on purpose: an actor hop would be the very cost D08 removes.
+private final class SyncProgressRelay: Sendable {
+    private struct State {
+        var throttle = SyncProgressThrottle(minimumInterval: .milliseconds(200))
+        var current = SyncProgressRun.superseded
+        var generation = 0
+    }
+    private let clock = ContinuousClock()
+    private let state = OSAllocatedUnfairLock(initialState: State())
+
+    func reset(interval: Duration) -> SyncProgressRun {
+        state.withLock { state in
+            state.generation += 1
+            state.current = SyncProgressRun(generation: state.generation)
+            state.throttle = SyncProgressThrottle(minimumInterval: interval)
+            return state.current
+        }
     }
 
-    func next(_ progress: SyncProgress) -> SyncProgress? {
-        throttle.accept(progress, now: clock.now)
+    func closeCurrent() {
+        state.withLock { $0.current = .superseded }
+    }
+
+    func isCurrent(_ run: SyncProgressRun) -> Bool {
+        state.withLock { $0.current == run && run != .superseded }
+    }
+
+    func next(_ progress: SyncProgress, run: SyncProgressRun) -> SyncProgress? {
+        let now = clock.now
+        return state.withLock { state in
+            guard state.current == run, run != .superseded else { return nil }
+            return state.throttle.accept(progress, now: now)
+        }
     }
 }
 

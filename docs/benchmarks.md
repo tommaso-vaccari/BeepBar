@@ -100,7 +100,7 @@ Every counter is the change during one run.
 | `db.rowChanges` | `sqlite3_total_changes64` | Rows inserted, updated or deleted, identical rewrites included |
 | `db.pagesWritten` | `SQLITE_DBSTATUS_CACHE_WRITE` | WAL frames. An `UPDATE` that leaves a page byte-identical writes none |
 | `fs.filesHashed`, `fs.bytesHashed` | `FileStore.counters()` | Full-content SHA-256 reads, and the bytes they read |
-| `fs.pathLookups` | `FileStore.counters()` | Directory resolutions from the sync root before touching the files in them. Per-file calls resolve once per path; the bulk existence check of a run with nothing new resolves each distinct parent folder once per run (R03, #111), so `unchanged` counts module folders, not tracked files. Reports from before R03 count one per tracked file |
+| `fs.pathLookups` | `FileStore.counters()` | Directory resolutions from the sync root before touching the files in them. Per-file calls resolve once per path; the bulk existence check of a run with nothing new resolves each distinct parent folder once per call, and a run makes a few such calls (R03, #111), so `unchanged` counts module folders, not tracked files. Reports from before R03 count one per tracked file |
 | `net.*` | mock counters | Requests by kind, metadata bytes, downloaded bytes |
 
 The database and filesystem counters are `package`-level API in `BeepbarCore`. Tests use them to prove properties like "a run with nothing new writes nothing" (`WorkCountersTests` shows what each one counts).

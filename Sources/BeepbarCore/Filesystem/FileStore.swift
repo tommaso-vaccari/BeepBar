@@ -421,20 +421,34 @@ public actor FileStore {
     ///
     /// The checks are the ones the per-file version made: every directory is reached from the
     /// root descriptor pinned at `init` through `O_NOFOLLOW` opens, and each name is looked at
-    /// with `AT_SYMLINK_NOFOLLOW`, so no symbolic link is followed and nothing outside the root is
-    /// seen. A missing directory, a file where a directory should be, or a symbolic link in the
+    /// with `AT_SYMLINK_NOFOLLOW`, so no symbolic link is followed and no path is resolved outside
+    /// the root. A missing directory, a file where a directory should be, or a symbolic link in the
     /// path makes only that directory's files absent; any other error (a folder that cannot be
     /// opened or searched) still fails the whole call rather than being read as a deletion.
     /// `ExistingRegularFilesSafetyTests` pins each of these.
     ///
-    /// The one difference is timing: a directory replaced while this call is checking its files
-    /// is noticed by the next call instead of at the next file. The answer was already a snapshot
-    /// that can go stale right after the `fstatat`, and every caller tolerates staleness both
-    /// ways: a stale "present" only skips reconciliation until the next run, reserves a name, or
-    /// opens a Conflicts entry whose action re-checks the file; a stale "absent" sends the item to
-    /// `inspect`/`install`, whose expected-state checks refuse to overwrite anything. Descriptors
-    /// live only for this call, never in a cache, so a later call never trusts a directory it did
-    /// not open itself.
+    /// The one difference is timing. A directory replaced or moved while this call is checking
+    /// its files is noticed by the next call instead of at the next file, and a folder moved out
+    /// of the root during the call still has its files checked through the descriptor already
+    /// held. The per-file version had the same window for one file at a time. The answer was
+    /// already a snapshot that can go stale right after the `fstatat`; what a stale answer does
+    /// depends on the caller in `SyncCoordinator`:
+    /// - reconciliation (`itemsRequiringReconciliation`): a stale "present" skips the item until
+    ///   the next run; a stale "absent" sends it to `inspect`/`install`, whose expected-state
+    ///   checks refuse to overwrite anything;
+    /// - files removed from Moodle (`vanishedFiles`): a stale "absent" drops the open entry for
+    ///   that file (the next run that sees the file creates it again, with a new id and detection
+    ///   date) or skips adopting it for a re-upload, which is then downloaded as usual; a stale
+    ///   "present" reads the file again before opening an entry, or keeps an open one whose action
+    ///   re-checks the file;
+    /// - ghost name reservation: a stale "absent" frees a name a newcomer may pick, and installing
+    ///   there still goes through `RENAME_EXCL`, so an existing file is never replaced; a stale
+    ///   "present" only reserves a name for one run;
+    /// - an open "moved" entry: a stale "present" keeps the entry, whose action re-checks the file;
+    ///   a stale "absent" reads the source again.
+    /// Local data safety is therefore unchanged: no answer of this call can make sync overwrite or
+    /// delete a file. Descriptors live only for this call, never in a cache, so a later call never
+    /// trusts a directory it did not open itself.
     public func existingRegularFiles(_ paths: [RelativePath]) throws -> Set<RelativePath> {
         var existing: Set<RelativePath> = []
         var namesByParent: [[String]: [(path: RelativePath, name: String)]] = [:]

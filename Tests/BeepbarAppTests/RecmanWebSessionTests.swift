@@ -137,3 +137,146 @@ struct RecmanWebSessionTests {
     }
 }
 
+
+/// A page script that never answers no longer holds an operation hostage (#112). Before, the
+/// session waited for WebKit's callback alone: a Promise that never settled kept a search or a
+/// playback request suspended, and `close()`, a newer operation or the controller cancelling its
+/// worker could not end it.
+///
+/// Each test opens an isolated session on its blank page (a non-persistent store, no network, no
+/// Polimi session) and runs scripts through `runScript`, which starts an operation exactly as the
+/// archive operations do. `callAsyncJavaScript` (the form with arguments) waits for a returned
+/// Promise, which is how a script is made to never answer.
+@MainActor
+struct RecmanWebSessionScriptTests {
+    /// A Promise that never settles: WebKit never calls back.
+    private static let stalled = "return new Promise(() => {})"
+
+    private func openSession(scriptTimeout: Duration) async -> RecmanWebSession {
+        let session = RecmanWebSession()
+        session.scriptTimeout = scriptTimeout
+        await session.open(cookies: [])
+        return session
+    }
+
+    private func start(_ script: String, in session: RecmanWebSession) -> Task<String, Error> {
+        Task { try await session.runScript(script, arguments: [:]) }
+    }
+
+    /// Returns once `session` is waiting for a script's answer, so an interruption hits a call in
+    /// flight rather than one that has not started.
+    private func untilPending(_ session: RecmanWebSession) async throws {
+        for _ in 0..<300 where !session.hasPendingScript {
+            try await Task.sleep(for: .milliseconds(10))
+        }
+        try #require(session.hasPendingScript, "the script never started")
+    }
+
+    private func outcome(_ task: Task<String, Error>) async -> String {
+        switch await task.result {
+        case .success(let answer): "answered \(answer)"
+        case .failure(is CancellationError): "cancelled"
+        case .failure(let error): "\(error)"
+        }
+    }
+
+    /// The bounded wait changes nothing for scripts that answer: a string comes back from both
+    /// WebKit forms, and anything else is still `unrecognized`.
+    @Test func scriptsThatAnswerStillAnswer() async throws {
+        let session = await openSession(scriptTimeout: .seconds(10))
+        defer { session.close() }
+        #expect(try await session.runScript("return 'ok'", arguments: [:]) == "ok")
+        #expect(try await session.runScript("'plain'") == "plain")
+        #expect(try await session.runScript("return Promise.resolve('later')", arguments: [:]) == "later")
+        await #expect(throws: RecmanBrowserError.unrecognized) { try await session.runScript("return 42", arguments: [:]) }
+        #expect(!session.hasPendingScript)
+    }
+
+    /// A script that never answers ends at `scriptTimeout` as `unavailable`, the error a page load
+    /// that never finishes gives, so the controller stops instead of waiting forever.
+    @Test(.timeLimit(.minutes(1))) func aScriptThatNeverAnswersEndsAtTheTimeout() async throws {
+        let session = await openSession(scriptTimeout: .milliseconds(300))
+        defer { session.close() }
+        let clock = ContinuousClock()
+        let started = clock.now
+        await #expect(throws: RecmanBrowserError.unavailable) { try await session.runScript(Self.stalled, arguments: [:]) }
+        let elapsed = clock.now - started
+        #expect(elapsed >= .milliseconds(300))
+        #expect(elapsed < .seconds(5))
+        #expect(!session.hasPendingScript)
+    }
+
+    /// `close()` (Recordings turned off, sign-out, another account) ends a script in flight at
+    /// once, well before the timeout.
+    @Test(.timeLimit(.minutes(1))) func closingEndsAScriptInFlight() async throws {
+        let session = await openSession(scriptTimeout: .seconds(20))
+        let task = start(Self.stalled, in: session)
+        try await untilPending(session)
+        let clock = ContinuousClock()
+        let started = clock.now
+        session.close()
+        #expect(await outcome(task) == "cancelled")
+        #expect(clock.now - started < .seconds(5))
+        #expect(!session.hasPendingScript)
+    }
+
+    /// A newer operation (another course, a playback request) ends the previous operation's script
+    /// and gets its own answer, not the old one.
+    @Test(.timeLimit(.minutes(1))) func aNewOperationEndsThePreviousScript() async throws {
+        let session = await openSession(scriptTimeout: .seconds(20))
+        defer { session.close() }
+        let first = start(Self.stalled, in: session)
+        try await untilPending(session)
+        let clock = ContinuousClock()
+        let started = clock.now
+        let second = start("return 'second'", in: session)
+        #expect(await outcome(first) == "cancelled")
+        #expect(clock.now - started < .seconds(5))
+        #expect(await outcome(second) == "answered second")
+        #expect(!session.hasPendingScript)
+    }
+
+    /// Cancelling the task that awaits the script (the controller's `worker?.cancel()`) ends it
+    /// at once, and the session keeps working for the next operation.
+    @Test(.timeLimit(.minutes(1))) func cancellingTheAwaitingTaskEndsTheScript() async throws {
+        let session = await openSession(scriptTimeout: .seconds(20))
+        defer { session.close() }
+        let task = start(Self.stalled, in: session)
+        try await untilPending(session)
+        let clock = ContinuousClock()
+        let started = clock.now
+        task.cancel()
+        #expect(await outcome(task) == "cancelled")
+        #expect(clock.now - started < .seconds(5))
+        #expect(!session.hasPendingScript)
+        #expect(try await session.runScript("return 'next'", arguments: [:]) == "next")
+    }
+
+    /// An answer WebKit delivers after the call ended (here, after the timeout) is dropped: it
+    /// neither resumes anything twice nor reaches the next operation.
+    @Test(.timeLimit(.minutes(1))) func anAnswerAfterTheCallEndedIsDropped() async throws {
+        let session = await openSession(scriptTimeout: .milliseconds(100))
+        defer { session.close() }
+        let late = "return new Promise(resolve => setTimeout(() => resolve('late'), 400))"
+        await #expect(throws: RecmanBrowserError.unavailable) { try await session.runScript(late, arguments: [:]) }
+        session.scriptTimeout = .seconds(10)
+        let next = start("return new Promise(resolve => setTimeout(() => resolve('next'), 700))", in: session)
+        #expect(await outcome(next) == "answered next")
+    }
+
+    /// `close()` lets the web view go even while WebKit still holds the callback of a Promise that
+    /// never settles: the callback captures the pending call, not the session or its web view.
+    @Test(.timeLimit(.minutes(1))) func closingReleasesTheWebViewDespiteAStalledScript() async throws {
+        let session = await openSession(scriptTimeout: .seconds(20))
+        weak var webView = session.webView
+        #expect(webView != nil)
+        let task = start(Self.stalled, in: session)
+        try await untilPending(session)
+        session.close()
+        #expect(await outcome(task) == "cancelled")
+        for _ in 0..<300 where webView != nil {
+            try await Task.sleep(for: .milliseconds(10))
+        }
+        #expect(webView == nil)
+    }
+}

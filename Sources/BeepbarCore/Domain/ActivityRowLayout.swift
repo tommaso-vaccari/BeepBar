@@ -132,7 +132,7 @@ public enum ActivityRowLayout {
         return tr("Mostra altri \(page.nextIncrement)", "Show \(page.nextIncrement) more")
     }
 
-    /// What the button leaves out, for the caption beside it ("1.800 elementi non mostrati"), or
+    /// What the button leaves out, for the caption beside it ("1800 elementi non mostrati"), or
     /// `nil` when nothing is hidden.
     public nonisolated static func hiddenCaption(for page: ActivityRowPage) -> String? {
         guard !page.isComplete else { return nil }

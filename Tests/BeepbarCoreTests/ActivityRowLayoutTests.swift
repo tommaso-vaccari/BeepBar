@@ -79,6 +79,14 @@ struct ActivityRowLayoutTests {
 
         #expect(ids.count == 8)
         #expect(Set(ids).count == ids.count, "\(ids)")
+
+        // Uniqueness must come from the kind, not from the repeat suffix: a moved row keeps its id
+        // whether or not a file row with the same remote id precedes it, otherwise SwiftUI would
+        // re-identify (and rebuild) the moved row when the file row disappears.
+        let onlyMoved = course(id: 1, moved: [MovedSyncItem(id: shared, name: "a.pdf", folder: "", outcome: .moved)])
+        let movedIDs = { (page: ActivityRowPage) in page.rows.filter { if case .moved = $0.content { true } else { false } }.map(\.id) }
+        #expect(movedIDs(ActivityRowLayout.page(for: a, visible: 10)) == movedIDs(ActivityRowLayout.page(for: onlyMoved, visible: 10)))
+        #expect(movedIDs(ActivityRowLayout.page(for: a, visible: 10)).allSatisfy { !$0.contains("#") }, "no suffix is needed when kinds differ")
     }
 
     /// Even when Core reports one remote id twice inside the same group (a file retried in one

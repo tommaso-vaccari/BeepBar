@@ -1,16 +1,43 @@
 # D07 isolated UI tooling — #95
 
-Branch: `perf/isolated-ui-harness`, base `origin/dev` `ac68333`.
-Verified implementation: `fe47bb571cd3d05ac4c8013df8c05e6b849bb259`.
+Branch: `perf/isolated-ui-harness`, initial base `ac68333`, current integrated `origin/dev` `713033c`.
+Verified current implementation: `17a9a00234b4e658381e14908f7d88717bb2112c`.
 The earlier candidate `281cb94` failed the opt-in fixture compilation; `0666707` corrected
 its continuation type and passed the initial gates. Independent review of `a1496b2` found
 three P2 issues: repeated key-window events overwrote the first timestamp, power changes
 were not checked after recording, and trace success did not prove usable artifacts.
 `f32a07e` fixed these with regressions and explicit CPU/signpost exports; `fe47bb5` corrected
-the first-key test's Swift Testing expression. Results below refer to this corrected code,
-except the historical functional batch explicitly identified below.
+the first-key test's Swift Testing expression. The pre-integration gates below refer to `fe47bb5`; the current-dev merge has its own ledger.
+Historical functional batches are explicitly identified.
 
-## Local code gates
+## Current-dev integration gates
+
+Merge `17a9a00` integrates dev `713033c`. The only conflict was additive Xcode source
+registration: both fixture files and RecordingsStudyState were retained. The new recording
+row retains the content marker; the new telemetry launch remains inside the ordinary app
+entry point, excluded from the fixture. Independent post-merge review returned **APPROVED**
+for this partial tooling delivery with no P0/P1/P2 findings.
+
+| Gate on `17a9a00` | Result | Retained local evidence |
+|---|---|---|
+| Full `swift test` | **689 PASS**, 358 Core + 27 Benchmark + 290 App + 14 XCTest | `/tmp/issue95-full-17a9a00.log` |
+| Ordinary Xcode Release, signing disabled | **BUILD SUCCEEDED** | `/tmp/issue95-release-17a9a00.log` |
+| Opt-in fixture Release arm64 | **BUILD SUCCEEDED**, 24.99 s | `/tmp/issue95-fixture-build-17a9a00.log` |
+| Python evidence guards | **13 PASS** | Same test command below |
+| Disposable offline and first-key mutations | Compiled **RED**, two tests/three issues, restored **8 GREEN** | `/tmp/issue95-offline-mutation-17a9a00.log`, `/tmp/issue95-offline-mutation-17a9a00-restored-green.log` |
+| Actual launch-warm and Recordings 5k functional processes | Completed with expected key/content markers and usable traces; **benchmark samples rejected** | `/tmp/issue95-functional-merge-17a9a00-retry/` |
+
+The warm trace decodes 542 fixture main-thread samples with stacks and two occurrences each
+of open/key/first-course-content. The 5k-recording trace decodes 593 main-thread samples with
+stacks and one open/key/first-recordings-content. Both have an icon marker. Both evidence
+samples are rejected for non-nominal thermal state (fair, `1`) and Battery Power; no timing,
+memory or frame-budget pass is claimed. At this preflight battery was 86%, discharging.
+One earlier local smoke helper stopped while collecting power metadata through the AC-only
+measurement guard; its logs are retained at `/tmp/issue95-functional-merge-17a9a00/`.
+The retry corrected only the disposable helper's metadata collection; the benchmark driver
+still requires AC. Temporary bundle/data identities were removed after each helper run.
+
+## Pre-integration code gates
 
 Host: Apple M5, `Mac17,3`, 24 GiB RAM, macOS 27.0.1 (`26A434`), Xcode 27.0 (`27A266a`),
 Developer directory `/Applications/Xcode.app/Contents/Developer`, xctrace 27.0.

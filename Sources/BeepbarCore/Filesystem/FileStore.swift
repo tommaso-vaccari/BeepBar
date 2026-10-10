@@ -417,7 +417,7 @@ public actor FileStore {
     /// files it holds (R03, #111, PR #142). A run with nothing new checks every tracked file this
     /// way, and resolving `Corso/Modulo` again for each of its files cost one `dup`, one `openat`
     /// per component and as many `close` calls per file, several times the one `fstatat` that
-    /// answers the question (unchanged 15k benchmark: CPU 424 → 184 ms on Apple M5).
+    /// answers the question (measurements in the R03 section of `docs/performance-plan.md`).
     ///
     /// The checks are the ones the per-file version made: every directory is reached from the
     /// root descriptor pinned at `init` through `O_NOFOLLOW` opens, and each name is looked at

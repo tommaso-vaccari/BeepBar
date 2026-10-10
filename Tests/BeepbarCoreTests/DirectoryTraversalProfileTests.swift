@@ -2,9 +2,17 @@ import Foundation
 import Testing
 @testable import BeepbarCore
 
-/// R03 (#111): what a run with nothing new costs in directory traversal. `existingRegularFiles` is
-/// the only per-file filesystem call such a run makes (`SyncCoordinator.itemsRequiringReconciliation`),
-/// so its syscalls per tracked file are the whole local filesystem cost of an unchanged check.
+/// R03 (#111, PR #142): what a run with nothing new costs in directory traversal, isolated from
+/// the rest of the sync. `existingRegularFiles` is the only per-file filesystem call such a run
+/// makes (`SyncCoordinator.itemsRequiringReconciliation`), so its cost per tracked file is the
+/// whole local filesystem cost of an unchanged check. It complements the harness `unchanged`
+/// scenario, whose corpus has one layout (module folders two levels deep), with a deep shared
+/// layout and the worst case for grouping (one file per folder).
+///
+/// Measurement only, disabled unless asked for, so the regular `swift test` never runs it: it
+/// proves nothing about correctness (`ExistingRegularFilesSafetyTests` does). It uses only API
+/// that predates R03, so the same file can be copied onto an older commit to measure it the same
+/// way (docs/benchmarks.md, "Directory traversal profile").
 struct DirectoryTraversalProfileTests {
     private func temporaryRoot() throws -> URL {
         let root = FileManager.default.temporaryDirectory.appending(path: UUID().uuidString, directoryHint: .isDirectory)

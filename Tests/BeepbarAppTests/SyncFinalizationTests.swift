@@ -212,11 +212,15 @@ struct SyncFinalizationTests {
         #expect(controller.summaryEncodedOnMainThreadForTesting == false)
     }
 
-    /// A sync cancelled while its result is being encoded publishes nothing and saves nothing: the
-    /// previous result stays, whole, for the next launch (R01, #109). This is what "Esci" relies
-    /// on, since it cancels the sync and waits for it. Fails if the new result is saved before the
-    /// operation's guard, or if the guard stops covering the time spent encoding.
-    @Test @MainActor func syncCancelledDuringTheEncodeKeepsThePreviousResult() async throws {
+    /// A sync cancelled, or replaced by a newer operation, while its result is being encoded
+    /// publishes nothing and saves nothing: the previous result stays, whole, for the next launch
+    /// (R01, #109). Cancelling is what "Esci" does before waiting for the sync. Signing out and
+    /// choosing another folder are refused while a sync is active (`signOut` and the folder
+    /// picker check `isSyncActive`), so these are the two ways a sync loses its operation here.
+    /// Fails if the new result is saved before the operation's guard, or if the guard stops
+    /// covering the time spent encoding.
+    @Test(arguments: ["cancel", "superseded"]) @MainActor
+    func syncCancelledDuringTheEncodeKeepsThePreviousResult(_ invalidation: String) async throws {
         let root = FileManager.default.temporaryDirectory.appending(path: UUID().uuidString)
         try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
         defer { try? FileManager.default.removeItem(at: root) }
@@ -247,11 +251,17 @@ struct SyncFinalizationTests {
         controller.setOperationForTesting(operation, task: completion)
         var started = encoded.stream.makeAsyncIterator()
         _ = await started.next()
+        // Set when the encode finished: proves the encode ran before the hook, so before the guard.
         #expect(controller.summaryEncodedOnMainThreadForTesting == false)
-        controller.cancelSynchronization()
+        if invalidation == "cancel" {
+            controller.cancelSynchronization()
+        } else {
+            controller.setOperationForTesting(UUID())
+            controller.setSyncStateForTesting(.syncing)
+        }
         resume.continuation.yield()
         await completion.value
-        #expect(controller.syncState == .readyUnchecked)
+        #expect(controller.syncState == (invalidation == "cancel" ? .readyUnchecked : .syncing))
         #expect(defaults.writes.isEmpty)
         #expect(defaults.data(forKey: summaryKey) == previousBytes)
         #expect(defaults.double(forKey: timestampKey) == 123)

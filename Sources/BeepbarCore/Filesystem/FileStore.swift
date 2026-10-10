@@ -405,35 +405,56 @@ public actor FileStore {
         }
     }
 
-    /// Returns the subset of `paths` that currently exist as regular files, using one `stat` per path and
-    /// never reading file contents. Directories, symbolic links and other non-regular entries, as well as
-    /// paths whose parent is missing or is no longer a directory, are reported as absent rather than thrown.
+    /// Returns the subset of `paths` that currently exist as regular files, using one `fstatat` per
+    /// path and never reading file contents. Directories, symbolic links and other non-regular
+    /// entries, as well as paths whose parent is missing or is no longer a directory, are reported
+    /// as absent rather than thrown.
+    ///
+    /// Each distinct parent directory is resolved once per call and its descriptor reused for the
+    /// files it holds (#111): a run with nothing new checks every tracked file this way, and
+    /// resolving `Corso/Sezione/Modulo` again for each of its files cost one `dup`, one `openat` per
+    /// component and as many `close` calls per file, several times the one `fstatat` that answers
+    /// the question. The checks are the same as before: every directory is still reached from the
+    /// pinned root descriptor through `O_NOFOLLOW` opens, and each name is still looked at with
+    /// `AT_SYMLINK_NOFOLLOW`, so no symbolic link is ever followed and nothing outside the root is
+    /// ever seen. What changes is only that a directory replaced while this call is looking at its
+    /// files is noticed at the next call rather than at the next file. That is as safe as before:
+    /// this is a planning answer, and every action a caller takes on a path (`install`,
+    /// `moveRegularFile`, `snapshotRegularFile`, …) resolves it again from the root at that moment.
+    /// The descriptors live only for the duration of this call: there is no cache across calls, so
+    /// a later call never trusts a directory it did not open itself.
     public func existingRegularFiles(_ paths: [RelativePath]) throws -> Set<RelativePath> {
         var existing: Set<RelativePath> = []
+        var namesByParent: [[String]: [(path: RelativePath, name: String)]] = [:]
+        var parents: [[String]] = []
         for path in paths {
+            let components = path.components
+            let parent = Array(components.dropLast())
+            if namesByParent[parent] == nil { parents.append(parent) }
+            namesByParent[parent, default: []].append((path, components.last!))
+        }
+        for parent in parents {
             try Task.checkCancellation()
-            if try isRegularFile(at: path) { existing.insert(path) }
+            let directory: Int32
+            do {
+                directory = try directoryFD(for: parent, create: false)
+            } catch FileStoreError.symbolicLink {
+                continue
+            } catch where errno == ENOENT || errno == ENOTDIR {
+                continue
+            }
+            defer { close(directory) }
+            for (path, name) in namesByParent[parent]! {
+                try Task.checkCancellation()
+                var metadata = stat()
+                guard fstatat(directory, name, &metadata, AT_SYMLINK_NOFOLLOW) == 0 else {
+                    if errno == ENOENT || errno == ENOTDIR { continue }
+                    throw fileStoreError()
+                }
+                if (metadata.st_mode & S_IFMT) == S_IFREG { existing.insert(path) }
+            }
         }
         return existing
-    }
-
-    private func isRegularFile(at path: RelativePath) throws -> Bool {
-        let parentAndName: (Int32, String)
-        do {
-            parentAndName = try parentDirectory(for: path, create: false)
-        } catch FileStoreError.symbolicLink {
-            return false
-        } catch where errno == ENOENT || errno == ENOTDIR {
-            return false
-        }
-        let (parent, name) = parentAndName
-        defer { close(parent) }
-        var metadata = stat()
-        guard fstatat(parent, name, &metadata, AT_SYMLINK_NOFOLLOW) == 0 else {
-            if errno == ENOENT || errno == ENOTDIR { return false }
-            throw fileStoreError()
-        }
-        return (metadata.st_mode & S_IFMT) == S_IFREG
     }
 
     public func renameTopLevelDirectory(from old: String, to new: String) throws {

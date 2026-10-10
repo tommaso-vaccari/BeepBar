@@ -2,6 +2,7 @@ import Foundation
 import CryptoKit
 import Testing
 import SQLite3
+import BeepbarBenchmarkKit
 @testable import BeepbarCore
 @testable import BeepbarApp
 
@@ -138,6 +139,57 @@ struct SyncFinalizationTests {
         await restore.value
         #expect(controller.syncState == expected)
         #expect(defaults.writes.isEmpty)
+    }
+
+    /// The harness measures the encoding of `SyncSummaryProbe`, a mirror of `SyncCompletionSummary`
+    /// (R01, #109). This fails when a field is added to one type and not the other, so
+    /// `summary-persist` keeps measuring the bytes the app really writes. Same size and each type
+    /// decoding the other's bytes, rather than byte equality, so a JSON key-order difference between
+    /// Foundation versions cannot fail it.
+    @Test func harnessSummaryProbeMatchesTheAppType() throws {
+        let probe = SyncSummaryProbe.synthetic(details: 50, courses: 3)
+        let summary = SyncCompletionSummary(completedAt: probe.completedAt, added: probe.added, updated: probe.updated, unchanged: probe.unchanged, preservedLocal: probe.preservedLocal, conflicts: probe.conflicts, failures: probe.failures, perCourse: probe.perCourse)
+        let probeBytes = try JSONEncoder().encode(probe)
+        let summaryBytes = try JSONEncoder().encode(summary)
+        #expect(probeBytes.count == summaryBytes.count)
+        #expect(try JSONDecoder().decode(SyncCompletionSummary.self, from: probeBytes) == summary)
+        #expect(try JSONDecoder().decode(SyncSummaryProbe.self, from: summaryBytes) == probe)
+        let probeKeys = try #require(JSONSerialization.jsonObject(with: probeBytes) as? [String: Any]).keys
+        let summaryKeys = try #require(JSONSerialization.jsonObject(with: summaryBytes) as? [String: Any]).keys
+        #expect(Set(probeKeys) == Set(summaryKeys))
+    }
+
+    /// On-demand Release measurement of the exact `setSyncState(.synced)` path (R01, #109): encode
+    /// plus both UserDefaults writes, synchronously on the main actor, with synthetic details in a
+    /// throwaway suite. `summary-persist` measures the encode and an atomic file write outside the
+    /// app; this is the number for today's UserDefaults path.
+    @Test(.enabled(if: ProcessInfo.processInfo.environment["BEEPBAR_PERSIST_BENCHMARK"] == "1")) @MainActor
+    func benchmarkSummaryPersist() async throws {
+        for count in [1000, 15000] {
+            let root = FileManager.default.temporaryDirectory.appending(path: UUID().uuidString)
+            try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+            defer { try? FileManager.default.removeItem(at: root) }
+            let rootID = UUID()
+            let database = try SyncDatabase(url: root.appending(path: "state.sqlite"))
+            try await database.registerRoot(id: rootID, canonicalPath: root.path)
+            let suite = WeBeepAuthenticationController.throwawayDefaultsSuite()
+            defer { removeTestDefaults(suite) }
+            let defaults = CountingDefaults(suiteName: suite)!
+            let probe = SyncSummaryProbe.synthetic(details: count, courses: 10)
+            let controller = WeBeepAuthenticationController(testRootURL: root, database: database, rootID: rootID, defaults: defaults)
+            let key = "io.github.tvaccari.beepbar.last-successful-summary.v1." + rootID.uuidString
+            for run in 0..<8 {
+                // A new completedAt per run, as every real sync has, so no write is a no-op.
+                let summary = SyncCompletionSummary(completedAt: Date(timeIntervalSince1970: Double(run + 1)), added: probe.added, updated: 0, unchanged: 0, preservedLocal: 0, conflicts: 0, failures: 0, perCourse: probe.perCourse)
+                defaults.resetWrites()
+                let start = ContinuousClock.now
+                controller.setSyncStateForTesting(.synced(summary))
+                let elapsed = ContinuousClock.now - start
+                #expect(defaults.writes.count == 2)
+                let bytes = try #require(defaults.data(forKey: key))
+                if run > 0 { print("PERSIST_BENCH files=\(count) bytes=\(bytes.count) ms=\(Double(elapsed.components.seconds) * 1000 + Double(elapsed.components.attoseconds) / 1e15) writes=\(defaults.writes.count)") }
+            }
+        }
     }
 
     /// On-demand Release measurement of the actual controller restore, with synthetic file details.

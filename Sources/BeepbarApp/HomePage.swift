@@ -101,6 +101,7 @@ struct HomePage: View {
                         setEditing: { editingCourseID = $0 ? course.id : nil },
                         organize: { organizingCourse = course }
                     )
+                    .uiContentReady(.courses, enabled: course.id == rows.first?.id)
                     if course.id != rows.last?.id {
                         Divider().padding(.leading, 58)
                     }

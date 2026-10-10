@@ -149,14 +149,14 @@ struct RecmanWebSessionTests {
 /// Promise, which is how a script is made to never answer.
 @MainActor
 struct RecmanWebSessionScriptTests {
-    /// A Promise that never settles. WebKit never answers it on its own within `interruptBound`
-    /// (`aStalledScriptStaysPendingWithoutAnInterruption` checks that premise).
+    /// A Promise that never settles. WebKit has been seen to give up on it by itself after about
+    /// 6 s, answering nil, so the interruption tests check how the call ended (`.interrupted`),
+    /// not only how soon: a call that WebKit ended reads `.answered(nil)`, whatever the timing.
     private static let stalled = "return new Promise(() => {})"
 
-    /// How soon an interruption must end a stalled script. Interrupted calls end in milliseconds;
-    /// without the interruption WebKit has been seen to give up on a stalled Promise by itself
-    /// only after about 6 s, so a looser bound could let a removed interruption go unnoticed.
-    private static let interruptBound: Duration = .seconds(1)
+    /// A backstop on how soon an interruption ends a stalled script. Interrupted calls end in
+    /// milliseconds; the bound is loose because a full parallel suite keeps the main actor busy.
+    private static let interruptBound: Duration = .seconds(5)
 
     private func openSession(scriptTimeout: Duration) async -> RecmanWebSession {
         let session = RecmanWebSession()
@@ -178,26 +178,18 @@ struct RecmanWebSessionScriptTests {
         try #require(session.hasPendingScript, "the script never started")
     }
 
+    /// The call `session` is waiting on, once it is waiting.
+    private func pendingCall(_ session: RecmanWebSession) async throws -> BoundedScriptCall<String?> {
+        try await untilPending(session)
+        return try #require(session.lastScriptCall)
+    }
+
     private func outcome(_ task: Task<String, Error>) async -> String {
         switch await task.result {
         case .success(let answer): "answered \(answer)"
         case .failure(is CancellationError): "cancelled"
         case .failure(let error): "\(error)"
         }
-    }
-
-    /// The premise the interruption tests stand on: left alone, a stalled script is still waiting
-    /// for WebKit after `interruptBound`. If a WebKit release started answering it sooner, this
-    /// fails, rather than the interruption tests passing with their interruption removed.
-    @Test(.timeLimit(.minutes(1))) func aStalledScriptStaysPendingWithoutAnInterruption() async throws {
-        let session = await openSession(scriptTimeout: .seconds(20))
-        defer { session.close() }
-        let task = start(Self.stalled, in: session)
-        try await untilPending(session)
-        try await Task.sleep(for: Self.interruptBound + .milliseconds(500))
-        #expect(session.hasPendingScript)
-        task.cancel()
-        _ = await task.result
     }
 
     /// The bounded wait changes nothing for scripts that answer: a string comes back from both
@@ -231,11 +223,12 @@ struct RecmanWebSessionScriptTests {
     @Test(.timeLimit(.minutes(1))) func closingEndsAScriptInFlight() async throws {
         let session = await openSession(scriptTimeout: .seconds(20))
         let task = start(Self.stalled, in: session)
-        try await untilPending(session)
+        let call = try await pendingCall(session)
         let clock = ContinuousClock()
         let started = clock.now
         session.close()
         #expect(await outcome(task) == "cancelled")
+        #expect(call.outcome == .interrupted)
         #expect(clock.now - started < Self.interruptBound)
         #expect(!session.hasPendingScript)
     }
@@ -246,11 +239,12 @@ struct RecmanWebSessionScriptTests {
         let session = await openSession(scriptTimeout: .seconds(20))
         defer { session.close() }
         let first = start(Self.stalled, in: session)
-        try await untilPending(session)
+        let call = try await pendingCall(session)
         let clock = ContinuousClock()
         let started = clock.now
         let second = start("return 'second'", in: session)
         #expect(await outcome(first) == "cancelled")
+        #expect(call.outcome == .interrupted)
         #expect(clock.now - started < Self.interruptBound)
         #expect(await outcome(second) == "answered second")
         #expect(!session.hasPendingScript)
@@ -262,11 +256,12 @@ struct RecmanWebSessionScriptTests {
         let session = await openSession(scriptTimeout: .seconds(20))
         defer { session.close() }
         let task = start(Self.stalled, in: session)
-        try await untilPending(session)
+        let call = try await pendingCall(session)
         let clock = ContinuousClock()
         let started = clock.now
         task.cancel()
         #expect(await outcome(task) == "cancelled")
+        #expect(call.outcome == .interrupted)
         #expect(clock.now - started < Self.interruptBound)
         #expect(!session.hasPendingScript)
         #expect(try await session.runScript("return 'next'", arguments: [:]) == "next")
@@ -298,9 +293,10 @@ struct RecmanWebSessionScriptTests {
         weak var webView = session.webView
         #expect(webView != nil)
         let task = start(Self.stalled, in: session)
-        try await untilPending(session)
+        let call = try await pendingCall(session)
         session.close()
         #expect(await outcome(task) == "cancelled")
+        #expect(call.outcome == .interrupted)
         for _ in 0..<300 where webView != nil {
             try await Task.sleep(for: .milliseconds(10))
         }

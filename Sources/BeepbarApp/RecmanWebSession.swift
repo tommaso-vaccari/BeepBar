@@ -63,10 +63,17 @@ enum RecmanBrowserError: Error, Equatable {
 ///
 /// One operation runs at a time: starting one interrupts the previous (which throws
 /// `CancellationError`), and every step checks it is still the current operation before touching
-/// the page, so two operations never drive the web view at once.
+/// the page, so two operations never drive the web view at once. Interrupting reaches scripts
+/// too: a page script still waiting for WebKit's callback ends with the operation (#112).
 @MainActor final class RecmanWebSession: NSObject, RecmanBrowsing, WKNavigationDelegate, WKUIDelegate, NSWindowDelegate {
     /// How long a script-triggered page load (a search, "prossima", a preview) may take.
     static let loadTimeout: Duration = .seconds(30)
+
+    /// How long one page script may take to answer. The scripts are synchronous reads and clicks,
+    /// so a Promise still pending after this long means a stalled web process or a page the
+    /// script was not written for; the operation then ends as `unavailable` instead of waiting
+    /// for a callback that may never come (#112). A variable so tests can shorten it.
+    var scriptTimeout: Duration = .seconds(10)
 
     /// Receives one line per step, with addresses reduced to host and path: Polimi's query
     /// strings carry login tickets, which must never be printed or logged. The probe prints
@@ -89,6 +96,10 @@ enum RecmanBrowserError: Error, Equatable {
     private var loadWaiter: LoadWaiter?
     private var capturingPlayback = false
     private var capturedPlayback: URL?
+    /// Script calls in flight, so `close()`, a new operation and a cancelled task can end them
+    /// (#112). Normally one at a time; a list rather than a single slot, so a call could never
+    /// interrupt another one by taking its place.
+    private var pendingScripts: [BoundedScriptCall<String?>] = []
 
     var isOpen: Bool { store != nil }
 
@@ -403,29 +414,67 @@ enum RecmanBrowserError: Error, Equatable {
     /// Runs one of `RecmanScripts` in the isolated content world. Every script answers with a
     /// string; anything else (an exception, no page) is `unrecognized`. With `arguments`, `script`
     /// is a function body for `callAsyncJavaScript`.
+    ///
+    /// The call ends exactly once, with the first of WebKit's answer, an interruption (`close()`,
+    /// a newer operation, the awaiting task cancelled) or `scriptTimeout`. Before #112 it waited
+    /// for the callback alone: a Promise that never settled kept the operation suspended for as
+    /// long as WebKit held the callback, and nothing in the session could end it. An answer that
+    /// comes after the call ended reaches a settled `BoundedScriptCall` and is dropped there,
+    /// never handed to the next operation.
     private func evaluate(_ script: String, arguments: [String: Any]? = nil, operation: Int) async throws -> String {
         try ensureCurrent(operation)
         guard let webView else { throw CancellationError() }
-        let answer = await Self.run(script, arguments: arguments, in: webView)
+        let call = BoundedScriptCall<String?>()
+        pendingScripts.append(call)
+        defer { pendingScripts.removeAll { $0 === call } }
+        // The completion captures `call` and nothing else: a callback WebKit keeps for a Promise
+        // that never settles must not keep this session or its web view alive after `close()`.
+        Self.start(script, arguments: arguments, in: webView) { call.answer($0) }
+        let outcome = await call.wait(timeout: scriptTimeout)
         try ensureCurrent(operation)
-        guard let answer else { throw RecmanBrowserError.unrecognized }
-        return answer
+        switch outcome {
+        case .answered(let answer?): return answer
+        case .answered(nil): throw RecmanBrowserError.unrecognized
+        case .interrupted: throw CancellationError()
+        case .timedOut:
+            trace("script timed out")
+            // As a page load that never finishes: the archive isn't answering, and the controller
+            // then stops the other requests instead of letting each wait for the same timeout.
+            throw RecmanBrowserError.unavailable
+        }
     }
 
+    /// Runs `script` as an operation of its own, exactly as the archive operations run theirs.
+    /// For `RecmanWebSessionTests`, which drive the script lifecycle against a local page (#112).
+    func runScript(_ script: String, arguments: [String: Any]? = nil) async throws -> String {
+        let operation = beginOperation()
+        return try await evaluate(script, arguments: arguments, operation: operation)
+    }
+
+    /// Whether a script call is waiting for WebKit; for `RecmanWebSessionTests`.
+    var hasPendingScript: Bool { !pendingScripts.isEmpty }
+
     /// The string `script` answers in `webView`, or nil if it threw or answered something else.
-    /// Shared with `RecmanScriptsTests`, so the fixtures run the scripts exactly as the session
-    /// does. The completion-handler forms are used because the async `evaluateJavaScript` traps
-    /// when a script returns nothing.
+    /// Shared with `RecmanScriptsTests` and the probe, so the fixtures run the scripts exactly as
+    /// the session does. Unbounded on purpose: it waits for WebKit's callback, which the fixtures
+    /// always get; the session itself goes through `evaluate`.
     static func run(_ script: String, arguments: [String: Any]? = nil, in webView: WKWebView) async -> String? {
         await withCheckedContinuation { continuation in
-            let finish: @MainActor (Result<Any, Error>) -> Void = { result in
-                continuation.resume(returning: (try? result.get()) as? String)
-            }
-            if let arguments {
-                webView.callAsyncJavaScript(script, arguments: arguments, in: nil, in: .defaultClient, completionHandler: finish)
-            } else {
-                webView.evaluateJavaScript(script, in: nil, in: .defaultClient, completionHandler: finish)
-            }
+            start(script, arguments: arguments, in: webView) { continuation.resume(returning: $0) }
+        }
+    }
+
+    /// Starts `script` and hands its answer to `completion` when WebKit calls back; WebKit decides
+    /// when, or whether, that is. The completion-handler forms are used because the async
+    /// `evaluateJavaScript` traps when a script returns nothing.
+    private static func start(_ script: String, arguments: [String: Any]?, in webView: WKWebView, completion: @escaping @MainActor (String?) -> Void) {
+        let finish: @MainActor (Result<Any, Error>) -> Void = { result in
+            completion((try? result.get()) as? String)
+        }
+        if let arguments {
+            webView.callAsyncJavaScript(script, arguments: arguments, in: nil, in: .defaultClient, completionHandler: finish)
+        } else {
+            webView.evaluateJavaScript(script, in: nil, in: .defaultClient, completionHandler: finish)
         }
     }
 
@@ -447,6 +496,10 @@ enum RecmanBrowserError: Error, Equatable {
         loadWaiter?.resolve(.failure(CancellationError()))
         loadWaiter = nil
         capturingPlayback = false
+        // Emptied before interrupting: each resumed `evaluate` removes its own call from the list.
+        let scripts = pendingScripts
+        pendingScripts = []
+        scripts.forEach { $0.interrupt() }
     }
 
     private func playbackFound(_ url: URL) {

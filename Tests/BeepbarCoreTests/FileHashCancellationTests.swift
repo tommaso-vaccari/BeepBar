@@ -1,6 +1,12 @@
+#if canImport(CryptoKit)
 import CryptoKit
+#else
+import Crypto
+#endif
 import Foundation
+#if canImport(os)
 import os
+#endif
 import Testing
 @testable import BeepbarCore
 

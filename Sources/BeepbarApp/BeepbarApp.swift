@@ -53,10 +53,11 @@ struct BeepbarApp: App {
         _ = UpdaterController.shared
         // Once per install: on by default, never re-applied after the user turns it off.
         Task { await LaunchAtLoginController.shared.applyDefaultOnLaunch() }
+        Task { await DailyTelemetryController.shared.startForApplication() }
         statusItemController = StatusItemController(authentication: authentication)
 #if DEBUG
         if ProcessInfo.processInfo.arguments.contains("--ui-preview") {
-            ConfigurationWindowController.shared.show(authentication)
+            ConfigurationWindowController.shared.show(authentication, page: ProcessInfo.processInfo.arguments.contains("--watchlist-preview") ? .recordings : .home)
             return
         }
 #endif

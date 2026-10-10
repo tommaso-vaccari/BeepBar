@@ -93,16 +93,18 @@ public enum ActivityRowLayout {
             rows.append(ActivityRow(id: id, content: content))
         }
 
+        // `prefix` stops each walk at the rows still missing, so the hidden tail of a large group
+        // is never visited, not just skipped.
         if let failure = course.courseFailure, rows.count < shown {
             append("failure", "", .courseFailure(failure))
         }
-        for item in course.items where rows.count < shown {
+        for item in course.items.prefix(shown - rows.count) {
             append("file", item.id, .file(item))
         }
-        for item in course.movedItems where rows.count < shown {
+        for item in course.movedItems.prefix(shown - rows.count) {
             append("moved", item.id, .moved(item))
         }
-        for item in course.failedItems where rows.count < shown {
+        for item in course.failedItems.prefix(shown - rows.count) {
             append("failed", item.id, .failed(item))
         }
 
@@ -110,8 +112,17 @@ public enum ActivityRowLayout {
         return ActivityRowPage(rows: rows, hiddenCount: hidden, nextIncrement: nextVisibleCount(after: shown, total: total, pageSize: pageSize) - shown)
     }
 
+    /// How many rows a card shows after it was collapsed or its summary changed. Revealed rows
+    /// are kept only while the same summary stays expanded: a card collapsed after revealing
+    /// 15000 rows, or a new sync summary arriving for the same course id (SwiftUI keeps the
+    /// card's state across both), goes back to one page. Without this a re-expansion would build
+    /// every previously revealed row at once, the unbounded cost #99 removes.
+    public nonisolated static func visibleCount(keeping current: Int, isExpanded: Bool, sameSummary: Bool, pageSize: Int = pageSize) -> Int {
+        isExpanded && sameSummary ? current : pageSize
+    }
+
     /// How many rows are shown after one "Mostra altri" when `visible` are shown now. The step is
-    /// at least a page and at least what is already shown, so a course of 15.000 items is fully
+    /// at least a page and at least what is already shown, so a course of 15000 items is fully
     /// reachable in a handful of clicks (200, 400, 800…) while each step still costs only about as
     /// much as what is already on screen; it never passes `total`.
     public nonisolated static func nextVisibleCount(after visible: Int, total: Int, pageSize: Int = pageSize) -> Int {

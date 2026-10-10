@@ -55,12 +55,15 @@ struct ActivityRowLayoutTests {
 
         var visible = 3
         var seen: [ActivityRow] = []
-        while true {
+        // Bounded so a step that stops growing fails here instead of hanging the suite.
+        for _ in 0..<10 {
             let page = ActivityRowLayout.page(for: course, visible: visible, pageSize: 3)
             #expect(Array(page.rows.prefix(seen.count)) == seen, "a longer page must start with the shorter one")
             seen = page.rows
             if page.isComplete { break }
-            visible = ActivityRowLayout.nextVisibleCount(after: visible, total: ActivityRowLayout.rowCount(for: course), pageSize: 3)
+            let next = ActivityRowLayout.nextVisibleCount(after: visible, total: ActivityRowLayout.rowCount(for: course), pageSize: 3)
+            #expect(next > visible, "every step must reveal at least one row")
+            visible = next
         }
         #expect(seen == all)
         #expect(seen.last.map(itemID) == "x1")
@@ -216,5 +219,18 @@ struct ActivityRowLayoutTests {
         let complete = ActivityRowLayout.page(for: course(files: files(3)), visible: 3)
         #expect(ActivityRowLayout.showMoreTitle(for: complete) == nil)
         #expect(ActivityRowLayout.hiddenCaption(for: complete) == nil)
+    }
+
+    // MARK: Reset
+
+    /// Revealed rows survive only while the same summary stays expanded. A collapse, or a new
+    /// sync summary under the same course id (SwiftUI keeps the card's state for both), goes back
+    /// to one page; keeping 15000 revealed rows would rebuild them all on the next expansion.
+    @Test func revealedRowsResetOnCollapseAndOnANewSummary() {
+        #expect(ActivityRowLayout.visibleCount(keeping: 15_000, isExpanded: true, sameSummary: true) == 15_000)
+        #expect(ActivityRowLayout.visibleCount(keeping: 15_000, isExpanded: false, sameSummary: true) == ActivityRowLayout.pageSize)
+        #expect(ActivityRowLayout.visibleCount(keeping: 15_000, isExpanded: true, sameSummary: false) == ActivityRowLayout.pageSize)
+        #expect(ActivityRowLayout.visibleCount(keeping: 15_000, isExpanded: false, sameSummary: false) == ActivityRowLayout.pageSize)
+        #expect(ActivityRowLayout.visibleCount(keeping: 800, isExpanded: false, sameSummary: true, pageSize: 3) == 3)
     }
 }

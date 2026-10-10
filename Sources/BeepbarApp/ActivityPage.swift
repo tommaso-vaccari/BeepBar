@@ -82,6 +82,7 @@ struct ActivityPage: View {
                             ForEach(summary.affectedCourses) { course in
                                 CourseActivityCard(
                                     course: course,
+                                    summaryCompletedAt: summary.completedAt,
                                     platformName: authentication.selectedSite.platformName,
                                     folderURL: authentication.rootURL?.appending(path: course.courseFolder, directoryHint: .isDirectory),
                                     problems: authentication.activityItemProblems,
@@ -107,20 +108,26 @@ struct ActivityPage: View {
 
 private struct CourseActivityCard: View {
     let course: CourseSyncCount
+    /// Identifies the summary the card belongs to: a new sync replaces the summary but keeps the
+    /// card (same course id), and its revealed rows must not carry over.
+    let summaryCompletedAt: Date
     let platformName: String
     let folderURL: URL?
     let problems: [String: ActivityItemProblem]
     /// (remote id, name, show in Finder instead of opening).
     let openItem: (String, String, Bool) -> Void
     @State private var isExpanded = false
-    /// How many rows of the expanded course exist as views; grows with "Mostra altri" and is
-    /// clamped to the course by `ActivityRowLayout.page`, so a smaller summary under the same
-    /// course id (the card keeps its state across refreshes) still shows a complete page.
+    /// How many rows of the expanded course exist as views; grows with "Mostra altri", goes back
+    /// to one page on collapse and on a new summary (`ActivityRowLayout.visibleCount`), and is
+    /// clamped to the course by `ActivityRowLayout.page`.
     @State private var visibleRows = ActivityRowLayout.pageSize
 
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
-            Button { withAnimation(BeepbarStyle.snappy) { isExpanded.toggle() } } label: {
+            Button {
+                withAnimation(BeepbarStyle.snappy) { isExpanded.toggle() }
+                visibleRows = ActivityRowLayout.visibleCount(keeping: visibleRows, isExpanded: isExpanded, sameSummary: true)
+            } label: {
                 HStack(spacing: 12) {
                     SymbolTile(systemImage: "folder.fill", size: 30)
                     Text(course.courseFolder)
@@ -185,6 +192,9 @@ private struct CourseActivityCard: View {
         }
         .card(padding: 0)
         .clipShape(RoundedRectangle(cornerRadius: BeepbarStyle.cardRadius, style: .continuous))
+        .onChange(of: summaryCompletedAt) {
+            visibleRows = ActivityRowLayout.visibleCount(keeping: visibleRows, isExpanded: isExpanded, sameSummary: false)
+        }
     }
 
     /// One row of the page, drawn as the card always drew it: the course failure and failed items

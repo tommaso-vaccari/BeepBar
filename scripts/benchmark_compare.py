@@ -106,6 +106,31 @@ def saved_overrides(harness):
     path.write_text(text.replace(anchor, anchor + block))
 
 
+def scenario_plan(harness, smoke):
+    """The scenarios to compare and the limitations they imply for the selected harness."""
+    plan = [('unchanged-1k', ['unchanged', '--files', '1000']),
+            ('unchanged-15k', ['unchanged', '--files', '15000']),
+            ('large-update-64mb', ['large-update', '--size-mb', '64']),
+            ('large-update-256mb', ['large-update', '--size-mb', '256']),
+            ('cancel-mid', ['cancel', '--size-mb', '256', '--fraction', '0.5']),
+            ('startup-first-15k', ['startup', '--files', '15000', '--phase', 'first']),
+            ('startup-later-15k', ['startup', '--files', '15000', '--phase', 'later'])]
+    notes = []
+    if smoke:
+        plan = [('unchanged-smoke', ['unchanged', '--files', '10']),
+                ('update-smoke', ['large-update', '--size-mb', '1']),
+                ('cancel-smoke', ['cancel', '--size-mb', '4', '--fraction', '0.5', '--rate-mbps', '1']),
+                ('startup-smoke', ['startup', '--files', '100', '--phase', 'first'])]
+        notes.append('Smoke corpus only; not the standard performance baseline.')
+    # A harness older than R02 (#134) has no `startup` command. Its scenarios are then unmeasured,
+    # not failures that would invalidate every other comparison of the series.
+    if not (harness / MEASUREMENT[0] / 'StartupScenario.swift').is_file():
+        skipped = [name for name, workload in plan if workload[0] == 'startup']
+        plan = [(name, workload) for name, workload in plan if workload[0] != 'startup']
+        notes.append('Selected harness has no startup scenario; not measured: ' + ', '.join(skipped) + '.')
+    return plan, notes
+
+
 def distribution(values):
     if not values or any(type(x) not in (int, float) or not math.isfinite(x) for x in values):
         raise InvalidComparison('empty/non-finite metric samples')
@@ -310,19 +335,8 @@ def execute(args):
                 path = run(['swift', 'build', '-c', 'release', '--arch', 'arm64', '--show-bin-path'], root,
                            out / (label + '-bin-path.log'), result['commands'], env).strip()
                 binaries[label] = (root, Path(path) / 'beepbar-bench', env)
-            plan = [('unchanged-1k', ['unchanged', '--files', '1000']),
-                    ('unchanged-15k', ['unchanged', '--files', '15000']),
-                    ('large-update-64mb', ['large-update', '--size-mb', '64']),
-                    ('large-update-256mb', ['large-update', '--size-mb', '256']),
-                    ('cancel-mid', ['cancel', '--size-mb', '256', '--fraction', '0.5']),
-                    ('startup-first-15k', ['startup', '--files', '15000', '--phase', 'first']),
-                    ('startup-later-15k', ['startup', '--files', '15000', '--phase', 'later'])]
-            if args.smoke:
-                plan = [('unchanged-smoke', ['unchanged', '--files', '10']),
-                        ('update-smoke', ['large-update', '--size-mb', '1']),
-                        ('cancel-smoke', ['cancel', '--size-mb', '4', '--fraction', '0.5', '--rate-mbps', '1']),
-                        ('startup-smoke', ['startup', '--files', '100', '--phase', 'first'])]
-                result['limitations'].append('Smoke corpus only; not the standard performance baseline.')
+            plan, notes = scenario_plan(harness, args.smoke)
+            result['limitations'].extend(notes)
             for name, workload in plan:
                 reports = {}
                 try:

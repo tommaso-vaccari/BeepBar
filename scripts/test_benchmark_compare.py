@@ -178,6 +178,25 @@ class ComparisonTests(unittest.TestCase):
             self.assertTrue(all(not s['valid'] and 'rows' not in s for s in result['scenarios'].values()))
             self.assertTrue((out / 'main' / 'unchanged-smoke.json').exists())
 
+    def test_startup_scenarios_follow_the_selected_harness(self):
+        # An older harness (e.g. --harness-ref origin/main) has no `startup` command: its
+        # scenarios are listed as unmeasured instead of failing and invalidating the series.
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            (root / b.MEASUREMENT[0]).mkdir(parents=True)
+            for smoke, startup in ((False, {'startup-first-15k', 'startup-later-15k'}), (True, {'startup-smoke'})):
+                plan, notes = b.scenario_plan(root, smoke)
+                self.assertFalse({name for name, _ in plan} & startup)
+                self.assertTrue(any('not measured' in note and all(n in note for n in startup) for note in notes))
+            (root / b.MEASUREMENT[0] / 'StartupScenario.swift').write_text('')
+            plan, notes = b.scenario_plan(root, False)
+            self.assertEqual(len(plan), 7)
+            self.assertIn(('startup-later-15k', ['startup', '--files', '15000', '--phase', 'later']), plan)
+            self.assertFalse(any('not measured' in note for note in notes))
+            plan, notes = b.scenario_plan(root, True)
+            self.assertEqual([name for name, _ in plan][-1], 'startup-smoke')
+            self.assertEqual(notes, ['Smoke corpus only; not the standard performance baseline.'])
+
     def test_saved_folder_adjustment_is_explicit_and_non_repeatable(self):
         with tempfile.TemporaryDirectory() as folder:
             root = Path(folder)

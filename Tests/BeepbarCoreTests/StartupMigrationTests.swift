@@ -14,6 +14,10 @@ import Testing
 /// releases left them) for a cost proportional to the database to show. They also print the
 /// measured durations, labelled with the platform and build, as the indicative evidence R02 asks
 /// for where no Mac is available; the Release arm64 numbers come from `scripts/benchmark.sh startup`.
+///
+/// The fixture below duplicates `LegacyDatabaseFixture` in `BeepbarBenchmarkKit` on purpose: this
+/// target depends only on `BeepbarCore` and also runs on Linux, where the benchmark kit is left out
+/// of the manifest. A change to how older releases degraded the database belongs in both copies.
 struct StartupMigrationTests {
     /// A database an older release could have left behind, built through today's schema and then
     /// degraded behind `SyncDatabase`'s back: `files` tracked files, `legacyFraction` of them

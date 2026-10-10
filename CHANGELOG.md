@@ -19,6 +19,8 @@
 
 ### Fixed
 
+- Unexpectedly large course responses stop downloading promptly, keeping memory use bounded while your saved materials remain protected.
+
 - Changing selected courses keeps the next automatic sync on schedule; automatic checks stop while local recovery needs attention and resume once it is resolved.
 
 - Cancelling a network check for Data Saver stops promptly and prevents an automatic sync from starting afterward.

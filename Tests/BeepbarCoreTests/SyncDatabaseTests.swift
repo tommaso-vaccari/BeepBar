@@ -394,8 +394,9 @@ final class RawSQLite {
 
     private var handle: OpaquePointer?
 
-    init(url: URL) throws {
-        guard sqlite3_open_v2(url.path, &handle, SQLITE_OPEN_READWRITE, nil) == SQLITE_OK else {
+    /// `create` makes a new file, for fixtures that build an older release's database themselves.
+    init(url: URL, create: Bool = false) throws {
+        guard sqlite3_open_v2(url.path, &handle, SQLITE_OPEN_READWRITE | (create ? SQLITE_OPEN_CREATE : 0), nil) == SQLITE_OK else {
             defer { sqlite3_close(handle) }
             throw Failure(message: String(cString: sqlite3_errmsg(handle)))
         }

@@ -28,6 +28,7 @@ scripts/benchmark.sh                       # every scenario → PerformanceRepor
 scripts/benchmark.sh unchanged --files 15000
 scripts/benchmark.sh large-update --size-mb 512 --runs 5
 scripts/benchmark.sh cancel --fraction 0.5 --rate-mbps 100
+scripts/benchmark.sh startup --files 15000 --phase first   # or --phase later, --files 0 for an empty database
 scripts/measure-idle.sh                    # 30 min, the installed Beepbar, passive
 ```
 
@@ -75,6 +76,15 @@ Every report records the commit, the machine model, the CPU, the memory, the mac
 - *What it reports:* `cancel.latency`, from `Task.cancel()` until the run returns.
 - *Checks:* every run ended cancelled, before the whole file was sent when `--fraction` is below 1, and the previously installed file still has its exact bytes (SHA-256 compared after every run).
 - *Note:* `--fraction 1` cancels as the last chunk leaves the mock, which is the closest the harness gets to "after the download".
+
+**`startup`: one launch's database work on a degraded database (R02, issue #110).**
+- *What it measures:* what `BootstrapService.prepare` does at every app start: open `sync.sqlite` (which reruns the whole schema migration in one transaction), `registerRoot`, recovery. In the app this runs on `BootstrapService`'s own actor while the menu shows the starting state, not on the main actor.
+- *Setup:* `LegacyDatabaseFixture` builds `--files` tracked files (default 15,000; 0 allowed with `--phase later` only) through today's schema, then degrades it: half the rows without an owning module, 40 rows with a course but no module, no recorded migration versions, the later releases' tables and index dropped.
+- *`--phase first`:* the first launch after updating. Every run, warm-up included, gets a fresh degraded fixture, so every sample is a real repair; it needs `--files 6` or more, since a smaller corpus has no half-attributed row and its checks would pass with the repair removed. *Checks:* the half-attributed rows are repaired, the dropped tables and index and the deleted versions are back (both counted on the fixture, not assumed, so an older or newer ref is checked against its own schema), only those rows and versions changed, every tracked file is kept, recovery finds nothing.
+- *`--phase later`* (default): every launch after that. The repair runs once in setup, unmeasured; each run reopens the file on a new SQLite connection (the OS page cache stays warm). *Checks:* no row or page written, the same work every run, no ownership backfill or module-override work, every tracked file kept, recovery finds nothing.
+- *`--files`* is at most 1,000,000 here. The fixture models a half-attributed `items` table (an upgraded table has no `CHECK` against it); the upgrade from a release without module ownership (v2.0.106) is covered by `StartupMigrationTests` in Core instead.
+- *What it reports:* `wall` is the whole launch and `db.*` the launch's own connection; `notes` split open+migrate from the whole launch. `cpu` includes the 1 ms peak-memory sampler thread, so it can exceed `wall` on sub-millisecond launches. The samples use the common metric set on purpose, so `compare` can validate them like every other scenario.
+- *In `baseline` and `compare`:* `startup-first-15k` and `startup-later-15k`; the smoke comparison runs `startup-smoke` (100 files, first launch). A harness selected with `--harness-ref` that predates this scenario (it has no `StartupScenario.swift`) leaves them out and records them as not measured in the report's limitations, instead of failing every build of the series.
 
 ## Counters
 

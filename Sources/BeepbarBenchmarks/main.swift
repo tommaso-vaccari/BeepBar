@@ -13,6 +13,7 @@ commands:
   unchanged      a run with nothing new        --files N (1000) --courses N
   large-update   one large file changes        --size-mb N (256)
   cancel         cancel during a large update  --size-mb N (256) --fraction F (0.5) --rate-mbps N (100)
+  startup        launch database work on a legacy database   --files N (15000) --phase first|later (later)
   baseline       every scenario, each in its own process   --out DIR (PerformanceReports/baseline-<date>)
   idle           watch a running process passively         --pid N --minutes N (30) --interval-seconds N (60)
 
@@ -53,6 +54,9 @@ func runScenario(_ command: String, _ options: BenchmarkOptions) async throws ->
         let fraction = try options.double("fraction", 0.5)
         guard fraction <= 1 else { throw CLIError.usage("--fraction must be at most 1") }
         return try await Scenarios.cancel(size: Int64(try options.int("size-mb", 256)) * megabyte, fraction: fraction, bytesPerSecond: Int64(try options.int("rate-mbps", 100)) * megabyte, runs: runs, warmup: warmup)
+    case "startup":
+        let phase = StartupPhase(rawValue: options.values["phase"] ?? "later") ?? .later
+        return try await Scenarios.startup(files: try options.int("files", 15000, allowZero: true), phase: phase, runs: runs, warmup: warmup)
     default:
         throw CLIError.usage("unknown command \(command)")
     }
@@ -72,6 +76,8 @@ func baseline(_ options: BenchmarkOptions) throws -> Bool {
         ("large-update-64mb", ["large-update", "--size-mb", "64"]),
         ("large-update-256mb", ["large-update", "--size-mb", "256"]),
         ("cancel-mid", ["cancel", "--size-mb", "256", "--fraction", "0.5"]),
+        ("startup-first-15k", ["startup", "--files", "15000", "--phase", "first"]),
+        ("startup-later-15k", ["startup", "--files", "15000", "--phase", "later"]),
     ]
     // The running binary itself, wherever it was started from (`argv[0]` may be a bare name found
     // through PATH).

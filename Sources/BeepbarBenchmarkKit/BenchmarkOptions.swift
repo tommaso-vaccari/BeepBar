@@ -18,6 +18,7 @@ public struct BenchmarkOptions {
         case "unchanged": allowed = metadata.union(sampling).union(["files", "courses", "json"])
         case "large-update": allowed = metadata.union(sampling).union(["size-mb", "json"])
         case "cancel": allowed = metadata.union(sampling).union(["size-mb", "fraction", "rate-mbps", "json"])
+        case "startup": allowed = metadata.union(sampling).union(["files", "phase", "json"])
         case "baseline": allowed = metadata.union(sampling).union(["out"])
         case "idle": allowed = metadata.union(["pid", "minutes", "interval-seconds", "json"])
         default: throw CLIError.usage("unknown command \(command)")
@@ -36,7 +37,8 @@ public struct BenchmarkOptions {
         }
         // Validate eagerly: baseline creates its directory before reading its sampling values.
         for name in ["runs", "warmup", "files", "courses", "size-mb", "rate-mbps"] where values[name] != nil {
-            let value = try int(name, 1, allowZero: name == "warmup")
+            // An empty database is a startup case R02 measures; a sync of zero files measures nothing.
+            let value = try int(name, 1, allowZero: name == "warmup" || (name == "files" && command == "startup"))
             if ["size-mb", "rate-mbps"].contains(name), value > Int64.max / 1_048_576 {
                 throw CLIError.usage("--\(name) is too large")
             }
@@ -65,6 +67,19 @@ public struct BenchmarkOptions {
             // CorpusSpec rounds up using (files + courses - 1), including the intermediate sum.
             guard !files.addingReportingOverflow(courses).overflow else {
                 throw CLIError.usage("--files plus --courses is too large")
+            }
+        }
+        if let phase = values["phase"], StartupPhase(rawValue: phase) == nil {
+            throw CLIError.usage("--phase must be first or later")
+        }
+        if command == "startup" {
+            let files = try int("files", 15000, allowZero: true)
+            guard files <= LegacyDatabaseFixture.largestCorpus else {
+                throw CLIError.usage("--files must be at most \(LegacyDatabaseFixture.largestCorpus) for startup")
+            }
+            // A first launch needs a row to repair, or its repair checks would prove nothing.
+            if values["phase"] == StartupPhase.first.rawValue, files < LegacyDatabaseFixture.smallestRepairableCorpus {
+                throw CLIError.usage("--phase first needs --files \(LegacyDatabaseFixture.smallestRepairableCorpus) or more")
             }
         }
         if command == "idle" {

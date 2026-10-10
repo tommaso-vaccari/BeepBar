@@ -14,6 +14,7 @@
 - Refreshing unchanged courses avoids unnecessary interface updates while renamed courses and changed selections still appear normally.
 - Opening BeepBar restores the previous sync result with less work, keeping the interface available while a large Activity summary is read.
 - Repeated synchronization uses less memory and does less work when many materials are already saved.
+- Expanding a course in Activity with more than 200 new, moved or failed files now shows the first 200, with a link below them (“Mostra altri…”) that reveals more, down to the last one, so opening a large course stays quick.
 
 ### Fixed
 

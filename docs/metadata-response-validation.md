@@ -110,4 +110,47 @@ battery, and no coordinated AC-powered reference comparison was run. Both standa
 → HEAD and cumulative main → HEAD comparisons remain unmeasured, including normal-response
 throughput, CPU and UI occupancy. The table above is the separate synthetic memory experiment
 only. No benchmark was rerun while the other tasks were running their verification.
-Independent review and online CI must be recorded before readiness.
+Independent review and online CI are recorded below for the resumed PR; the earlier green
+CI on `096570b` did not cover its missing cancellation handoff regression.
+
+## PR #127 cancellation handoff follow-up
+
+The owner’s independent review of `096570b` identified a P1: Foundation can complete a
+cancelled suspended URLSession task before the checked continuation is installed. The old
+callback discarded that terminal result, so the later consumer could remain suspended.
+[PR #127](https://github.com/tommaso-vaccari/BeepBar/pull/127) remains open against `dev`.
+Merge `f23b8ee` incorporates current dev `713033cb164e549dd1ba652d19bb559ec68d8146`.
+
+Fix `1e65515e245c200e31f61fa0789dff5649761aed` retains the first terminal Result under the same
+lock as consumer installation. Installation either receives that stored result or registers
+one continuation; later callbacks cannot replace it. The one-consumer precondition states the
+per-request lifetime. Continuation resume and transport start/cancellation happen outside the
+lock, preventing callback reentrancy from deadlocking. Reception bounds and rejection precedence
+remain unchanged. A completion that wins before installation prevents the transport from starting.
+
+`MetadataCompletionTests/terminalCancellationBeforeContinuationInstallationIsRetained` directly
+delivers the valid terminal-cancellation callback before installing the consumer through the
+same `receive` path used by `run`. That order is deterministic, without a sleep; the two-second
+watchdog only detects a missing completion and replays a callback to release a broken mutant.
+The lower-level bridge delivers URLError.cancelled; the existing public-client cancellation tests
+verify its conversion to CancellationError. Other bridge fixtures cover early/installed success,
+a duplicate error after success, and thirty concurrent success/cancellation callback races.
+
+The controlled mutation restored the `096570b` continuation installation and completion behavior
+while retaining the extraction seam. The test compiled and failed with two issues: a completed
+transport attempted to start and its first cancellation result was lost. Restored code passed
+all ten metadata-response/bridge tests. Exact logs: `/tmp/beepbar-pr127-mutation-red.log` and
+`/tmp/beepbar-pr127-focused-green.log`; commands were `swift test --filter
+MetadataResponseTests/terminalCancellationBeforeContinuationInstallationIsRetained` (mutant)
+and `swift test --filter MetadataResponseTests` (restored, before the portable suite split).
+
+On clean `1e65515`, standard `swift test` passed **694 tests** (371 Core, 27 Benchmark,
+282 App Swift Testing plus 14 XCTest) and the unsigned Release target build succeeded.
+Logs: `/tmp/beepbar-pr127-full-1e65515.log` and `/tmp/beepbar-pr127-release-1e65515.log`.
+The normal app was never launched or installed. A fresh independent review approved the
+completion protocol and identified one integration finding: Darwin-only tests conflicted with
+Linux Core support newly landed in dev. Follow-up `d4c0012` uses conditional imports, retains
+transport-independent bridge tests on Linux, and skips the custom-URLProtocol suite in Linux’s
+existing skip policy. The socket suite and byte-valued RSS probe exercise Apple CFNetwork/Darwin
+and compile only there. Focused macOS metadata tests passed after this adjustment.
+Final independent approval and exact pushed-HEAD gates are recorded in the PR/issue checkpoint.

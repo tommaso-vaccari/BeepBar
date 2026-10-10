@@ -1,0 +1,257 @@
+<!DOCTYPE html>
+<html xmlns="http://www.w3.org/1999/xhtml" lang="en" xml:lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta http-equiv="X-UA-Compatible" content="IE=edge" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <link rel="canonical" href="https://sparkle-project.org/documentation/customization/" />
+    <title> Customizing Sparkle -  Sparkle: open source software update framework for macOS</title>
+
+    <link rel="icon" type="image/png" sizes="40x40" href="/icon-20x20@2x.png" />
+    <link rel="icon" type="image/png" sizes="80x80" href="/icon-40x40@2x.png" />
+    <link rel="icon" type="image/png" sizes="167x167" href="/icon-83.3x83.5@2x.png" />
+    <meta name="msapplication-TileColor" content="#0099f0" />
+    <meta name="theme-color" content="#0099f0" />
+
+    <link href="/css/main.css" media="screen" rel="stylesheet" type="text/css" />
+
+    <!-- HTML5 shim and Respond.js for IE8 support of HTML5 elements and media queries -->
+    <!-- WARNING: Respond.js doesn't work if you view the page via file:// -->
+    <!--[if lt IE 9]>
+      <script src="//oss.maxcdn.com/html5shiv/3.7.2/html5shiv.min.js"></script>
+      <script src="//oss.maxcdn.com/respond/1.4.2/respond.min.js"></script>
+    <![endif]-->
+
+    <script type="text/javascript">
+    //<![CDATA[
+    (function(i,s,o,g,r,a,m){i['GoogleAnalyticsObject']=r;i[r]=i[r]||function(){
+    (i[r].q=i[r].q||[]).push(arguments)},i[r].l=1*new Date();a=s.createElement(o),
+    m=s.getElementsByTagName(o)[0];a.async=1;a.src=g;m.parentNode.insertBefore(a,m)
+    })(window,document,'script','//www.google-analytics.com/analytics.js','ga');
+
+    ga('create', 'UA-52386963-1', 'auto');
+    ga('send', 'pageview');
+
+    // on GitHub pages we can't distinguish server-side between CDN and users' visits
+    if (/^(w{1,3}\.)?sparkle-project\.(com|org|github\.io)$/.test(location.hostname)) {
+        var newValue = 'sparkle-project.org';
+        if (location.hostname !== newValue)
+            location.hostname = newValue;
+    }
+    //]]>
+    </script>
+  </head>
+  <body>
+    <nav class="navbar navbar-inverse ">
+      <div class="container">
+        <div class="navbar-header">
+          <button type="button" class="navbar-toggle collapsed" data-toggle="collapse" data-target="#navbar" aria-expanded="false" aria-controls="navbar">
+            <span class="sr-only">Toggle navigation</span>
+            <span class="icon-bar"></span>
+            <span class="icon-bar"></span>
+            <span class="icon-bar"></span>
+          </button>
+          <a class="navbar-brand" href="/"><img src="/images/icon@2x.png" alt="" /> Sparkle</a>
+        </div>
+        <div id="navbar" class="navbar-collapse collapse">
+          <ul class="nav navbar-nav navbar-right">
+            <li class=""><a href="/">Home</a></li>
+            <li class=""><a href="/about/">About</a></li>
+            <li class=" active "><a href="/documentation/">Documentation</a></li>
+            <li><a href="//github.com/sparkle-project/Sparkle">GitHub Project</a></li>
+          </ul>
+        </div><!--/.navbar-collapse -->
+      </div>
+    </nav>
+
+    <script src="//ajax.googleapis.com/ajax/libs/jquery/1.11.3/jquery.min.js"></script>
+
+    <div class="container">
+  <div class="row">
+    <div class="col-md-12">
+        <h2 id="customizing-sparkle">Customizing Sparkle</h2>
+
+<p>Besides the <code class="language-plaintext highlighter-rouge">SUFeedURL</code> and <code class="language-plaintext highlighter-rouge">SUPublicEDKey</code> options, Sparkle will choose defaults for your app’s update behavior. However you can change these settings if you want different behavior.</p>
+
+<p>For example:</p>
+
+<ul>
+  <li>If you do not want Sparkle to prompt the user (on second app launch) asking for permission if your app can check for updates automatically in the background, set <code class="language-plaintext highlighter-rouge">SUEnableAutomaticChecks</code> in your app’s Info.plist.</li>
+  <li>If you want Sparkle to automatically download and install updates silently in the background instead of notifying users of updates every time by default, enable <code class="language-plaintext highlighter-rouge">SUAutomaticallyUpdate</code> in your app’s Info.plist.</li>
+</ul>
+
+<p>Some of the Info.plist settings below are also paired with an updater API to change the settings at runtime, like <code class="language-plaintext highlighter-rouge">SUEnableAutomaticChecks</code> with <a href="/documentation/api-reference/Classes/SPUUpdater.html#/c:objc(cs)SPUUpdater(py)automaticallyChecksForUpdates">automaticallyChecksForUpdates</a>. The Info.plist settings are meant for default configuration, while the runtime APIs are in response to user setting changes. Please do not use the runtime APIs for setting initial default behavior. Check how to <a href="/documentation/preferences-ui/">add update settings</a> for examples on changing user settings.</p>
+
+<h3 id="general-settings">General Settings</h3>
+
+<table class="table table-bordered">
+  <thead>
+    <tr>
+      <th>Key</th>
+      <th>Type</th>
+      <th>Value</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td><code class="language-plaintext highlighter-rouge">SUFeedURL</code></td>
+      <td>String</td>
+      <td>The URL of your appcast, e.g. <code class="language-plaintext highlighter-rouge">https://example.com/appcast.xml</code>. It’s recommended to set it in Info.plist, even if you change it later programmatically.</td>
+    </tr>
+    <tr>
+      <td><code class="language-plaintext highlighter-rouge">SUPublicEDKey</code></td>
+      <td>String</td>
+      <td>The base64-encoded public EdDSA key. Use Sparkle’s <code class="language-plaintext highlighter-rouge">generate_keys</code> tool to get it.</td>
+    </tr>
+    <tr>
+      <td><code class="language-plaintext highlighter-rouge">SUEnableAutomaticChecks</code></td>
+      <td>Boolean</td>
+      <td>By default when this is not set, automatic checking for updates is initially disabled but users will be prompted for permission for Sparkle to check for updates automatically on second launch. If permission is granted, automatic checks for updates then becomes enabled. As of Sparkle 2.4 or later, the user will also have an option to opt in or out of automatic downloading of updates; the default state is based on the <code class="language-plaintext highlighter-rouge">SUAutomaticallyUpdate</code> setting.<br />Setting this to <code class="language-plaintext highlighter-rouge">YES</code> enables automatic checking for updates (but not installation) by default, without asking your users for permission first.<br />Setting this to <code class="language-plaintext highlighter-rouge">NO</code> disables automatic checking for updates by default, also without asking your users for permission.<br />This default property can later be overridden by setting <a href="/documentation/api-reference/Classes/SPUUpdater.html#/c:objc(cs)SPUUpdater(py)automaticallyChecksForUpdates">automaticallyChecksForUpdates</a> in response to user setting changes.</td>
+    </tr>
+    <tr>
+      <td><code class="language-plaintext highlighter-rouge">SUScheduledCheckInterval</code></td>
+      <td>Number</td>
+      <td>The number of seconds between automatic update checks. The default is <code class="language-plaintext highlighter-rouge">86400</code> (1 day).<br /><br /><strong>Note:</strong> this has a minimum bound of 1 hour in order to keep you from accidentally overloading your servers.</td>
+    </tr>
+    <tr>
+      <td><code class="language-plaintext highlighter-rouge">SUAutomaticallyUpdate</code></td>
+      <td>Boolean</td>
+      <td>Default: <code class="language-plaintext highlighter-rouge">NO</code>. Enables automatic download and installation of updates by default. If set to <code class="language-plaintext highlighter-rouge">YES</code>, Sparkle will attempt to download and install new updates silently in the background. Updates may be downloaded but not installed automatically if authorization is required. If the application hasn’t quit for <code class="language-plaintext highlighter-rouge">SUScheduledImpatientCheckInterval</code> the user will be presented with installing the downloaded update (unless the updater delegate <a href="/documentation/api-reference/Protocols/SPUUpdaterDelegate.html#/c:objc(pl)SPUUpdaterDelegate(im)updater:willInstallUpdateOnQuit:immediateInstallationBlock:">overrides this</a>).<br />This default property can later be overridden by setting <a href="/documentation/api-reference/Classes/SPUUpdater.html#/c:objc(cs)SPUUpdater(py)automaticallyDownloadsUpdates">automaticallyDownloadsUpdates</a> in response to user setting changes (for example, the standard update alert has a checkbox for changing this).</td>
+    </tr>
+    <tr>
+      <td><code class="language-plaintext highlighter-rouge">SUScheduledImpatientCheckInterval</code></td>
+      <td>Number</td>
+      <td>The number of seconds between update checks after an update has been set to install in the background via <code class="language-plaintext highlighter-rouge">SUAutomaticallyUpdate</code>. The default is <code class="language-plaintext highlighter-rouge">604800</code> (1 week). If the user hasn’t quit their app within this interval yet, they may be notified of the update that’s ready to be installed. Note this interval must be bigger than <code class="language-plaintext highlighter-rouge">SUScheduledCheckInterval</code>. This setting is configurable since Sparkle 2.9.</td>
+    </tr>
+    <tr>
+      <td><code class="language-plaintext highlighter-rouge">SUAllowsAutomaticUpdates</code></td>
+      <td>Boolean</td>
+      <td>By default, Sparkle automatically presents your users with the <em>option</em> to allow to automatically download and install any available updates if automatic checking of updates is enabled.<br />Set this to <code class="language-plaintext highlighter-rouge">NO</code> to disallow automatic updates and require manual installation every time.<br />Set this to <code class="language-plaintext highlighter-rouge">YES</code> to always allow automatic updates even if automatic checking of updates is disabled.</td>
+    </tr>
+    <tr>
+      <td><code class="language-plaintext highlighter-rouge">SUEnableSystemProfiling</code></td>
+      <td>Boolean</td>
+      <td>Default: <code class="language-plaintext highlighter-rouge">NO</code>. Enables anonymous system profiling. See <a href="/documentation/system-profiling">System Profiling</a> for more.</td>
+    </tr>
+    <tr>
+      <td><code class="language-plaintext highlighter-rouge">SUShowReleaseNotes</code></td>
+      <td>Boolean</td>
+      <td>Default: <code class="language-plaintext highlighter-rouge">YES</code>. Set this to <code class="language-plaintext highlighter-rouge">NO</code> to hide release notes display from the update alert.</td>
+    </tr>
+    <tr>
+      <td><code class="language-plaintext highlighter-rouge">SUBundleName</code></td>
+      <td>String</td>
+      <td>Optional alternative bundle display name. For example, if your bundle name already has a version number appended to it, setting this may help smooth out certain messages, e.g. “MyApp 3 4.0 is now available” vs “MyApp 4.0 is now available”.</td>
+    </tr>
+    <tr>
+      <td><code class="language-plaintext highlighter-rouge">SUDefaultsDomain</code></td>
+      <td>String</td>
+      <td>Optional alternative <code class="language-plaintext highlighter-rouge">NSUserDefaults</code> domain name if you don’t want to use the standard user defaults, for example when accessing preferences from an App Group suite.</td>
+    </tr>
+    <tr>
+      <td><code class="language-plaintext highlighter-rouge">SURelaunchHostBundle</code></td>
+      <td>Boolean</td>
+      <td>Default: <code class="language-plaintext highlighter-rouge">NO</code>. For plug-ins in Sparkle 2, set this to <code class="language-plaintext highlighter-rouge">YES</code> to re-launch the host targetted bundle instead of the application bundle. For example, this can be used to re-open a System Settings prefpane after an update has been installed.</td>
+    </tr>
+  </tbody>
+</table>
+
+<h3 id="security-settings">Security Settings</h3>
+
+<table class="table table-bordered">
+  <thead>
+    <tr>
+      <th>Key</th>
+      <th>Type</th>
+      <th>Value</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td><code class="language-plaintext highlighter-rouge">SUVerifyUpdateBeforeExtraction</code></td>
+      <td>Boolean</td>
+      <td>Default: <code class="language-plaintext highlighter-rouge">NO</code>. Set this to <code class="language-plaintext highlighter-rouge">YES</code> to force verification of updates before Sparkle extracts the downloaded update. Use this setting if you want stronger update validation and you aren’t likely to lose access to your private EdDSA key (typically stored inside the macOS Keychain). EdDSA signing is required to use this setting. <a href="/documentation/#rotating-signing-keys">Changing EdDSA keys</a> is still possible by using Apple Developer ID code signed disk images as a fallback. This setting is available since Sparkle 2.7.3.</td>
+    </tr>
+    <tr>
+      <td><code class="language-plaintext highlighter-rouge">SURequireSignedFeed</code></td>
+      <td>Boolean</td>
+      <td>Default: <code class="language-plaintext highlighter-rouge">NO</code>. Set this to <code class="language-plaintext highlighter-rouge">YES</code> to make Sparkle validate appcasts and release notes are signed. Use this setting if you want secure validation of the update information presented to the user, and you aren’t likely to lose access to your private EdDSA key (typically stored inside the macOS Keychain). This setting is available since Sparkle 2.9, and also requires enabling <code class="language-plaintext highlighter-rouge">SUVerifyUpdateBeforeExtraction</code> as a prerequisite.</td>
+    </tr>
+    <tr>
+      <td><code class="language-plaintext highlighter-rouge">SUSignedFeedFailureExpirationInterval</code></td>
+      <td>Number</td>
+      <td>The number of seconds it takes for a feed signing validation failure to expire. The default is <code class="language-plaintext highlighter-rouge">1728000</code> (20 days), and a special value of <code class="language-plaintext highlighter-rouge">0</code> disables feed signing failures from expiring. If Sparkle hasn’t successfully validated a feed for this amount of time after the first signing failure, it will finally present new updates to users. This setting is a failsafe in case you lose access to your EdDSA signing keys, but can still serve updates through <a href="/documentation/#rotating-signing-keys">rotating keys</a>. In this scenario, release notes are not shown and informational only updates are not supported. <code class="language-plaintext highlighter-rouge">SURequireSignedFeed</code> must be enabled for this setting to take effect.</td>
+    </tr>
+    <tr>
+      <td><code class="language-plaintext highlighter-rouge">SUAllowedURLSchemes</code></td>
+      <td>Array of Strings</td>
+      <td>An array of custom URL schemes allowed to be clicked from Sparkle’s release notes view. By default, Sparkle only allows clicks to links that have a safe known URL scheme (like <code class="language-plaintext highlighter-rouge">https</code>). This setting is available in Sparkle 2.5 and later.</td>
+    </tr>
+    <tr>
+      <td><code class="language-plaintext highlighter-rouge">SUEnableJavaScript</code></td>
+      <td>Boolean</td>
+      <td>Default: <code class="language-plaintext highlighter-rouge">NO</code>. Set this to <code class="language-plaintext highlighter-rouge">YES</code> if you want to allow JavaScript in your release notes.</td>
+    </tr>
+  </tbody>
+</table>
+
+<h3 id="sandboxing-settings">Sandboxing Settings</h3>
+
+<p>Here are the Info.plist settings relevant to use for Sandboxed applications using Sparkle 2. Applications that are not sandboxed should not customize any of these settings. Please visit the <a href="/documentation/sandboxing">Sandboxing guide</a> for more detailed information.</p>
+
+<table class="table table-bordered">
+  <thead>
+    <tr>
+      <th>Key</th>
+      <th>Type</th>
+      <th>Value</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td><code class="language-plaintext highlighter-rouge">SUEnableInstallerLauncherService</code></td>
+      <td>Boolean</td>
+      <td>Default: <code class="language-plaintext highlighter-rouge">NO</code>. Set this to <code class="language-plaintext highlighter-rouge">YES</code> to enable using the Installer Launcher XPC Service, which is required for all Sandboxed applications. Do not enable this XPC Service if your application is not sandboxed (sandboxed applications must have the <code class="language-plaintext highlighter-rouge">com.apple.security.app-sandbox</code> entitlement).</td>
+    </tr>
+    <tr>
+      <td><code class="language-plaintext highlighter-rouge">SUEnableDownloaderService</code></td>
+      <td>Boolean</td>
+      <td>Default: <code class="language-plaintext highlighter-rouge">NO</code>. Set this to <code class="language-plaintext highlighter-rouge">YES</code> to enable using the Downloader XPC Service. Do not enable this XPC Service if your sandboxed application already requests the <code class="language-plaintext highlighter-rouge">com.apple.security.network.client</code> (Outgoing Network Connections) entitlement.</td>
+    </tr>
+    <tr>
+      <td><code class="language-plaintext highlighter-rouge">SUEnableInstallerConnectionService</code></td>
+      <td>Boolean</td>
+      <td>Default: <code class="language-plaintext highlighter-rouge">NO</code>. Set this to <code class="language-plaintext highlighter-rouge">YES</code> to enable using the Installer Connection Service. This service is usually not needed due to being able to <a href="/documentation/sandboxing#installer-connection--status-services">add a mach name lookup exception entitlement</a> instead. This service is not included in Sparkle’s framework distribution by default.</td>
+    </tr>
+    <tr>
+      <td><code class="language-plaintext highlighter-rouge">SUEnableInstallerStatusService</code></td>
+      <td>Boolean</td>
+      <td>Default: <code class="language-plaintext highlighter-rouge">NO</code>. Set this to <code class="language-plaintext highlighter-rouge">YES</code> to enable using the Installer Status Service. This service is usually not needed due to being able to <a href="/documentation/sandboxing#installer-connection--status-services">add a mach name lookup exception entitlement</a> instead. This service is not included in Sparkle’s framework distribution by default.</td>
+    </tr>
+  </tbody>
+</table>
+
+<h3 id="sparkle-apis">Sparkle APIs</h3>
+
+<p>Please visit the <a href="/documentation/api-reference">Sparkle 2 API Reference</a> for full documentation on class and delegate APIs.</p>
+
+    </div>
+  </div>
+</div>
+
+
+    <div class="container">
+      <div class="row">
+        <div class="col-md-12">
+          <footer>
+            <p>© 2006 - &#8202;2026 Sparkle Project. All Rights Reserved.</p>
+            <p>This website is <a rel="alternate" href="//github.com/sparkle-project/sparkle-project.github.io/blob/master/documentation/customization/index.md">open source</a>.</p>
+          </footer>
+        </div>
+      </div>
+    </div>
+
+    <script src="/javascripts/bootstrap.min.js"></script>
+    <script src="/javascripts/retina.js"></script>
+  </body>
+</html>

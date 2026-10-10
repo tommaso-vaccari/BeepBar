@@ -82,6 +82,7 @@ Every push to `main` that touches production paths publishes a Sparkle release t
 - Releasing is the user's decision alone: never open, approve, or merge a `dev` → `main` PR unless the user explicitly asks for a release. Merge it with a merge commit (not squash or rebase), so `main` and `dev` keep a shared history and later release PRs stay clean.
 - Hotfix for released code: branch from `main`, PR to `main` (this ships immediately, so only on the user's request), then merge `main` back into `dev` right away.
 - Release PR (`dev` → `main`) protocol:
+  - Before release, complete the final GDPR/privacy review against the release code and binary using the Compliance Wiki verification plan. Update its evidence and unresolved findings; integrating the wiki into `dev` does not establish full compliance.
   - `CHANGELOG.md` must be updated in the same PR: it is what users read, since the Sparkle update dialog links to it on `main`.
   - Move the `## Unreleased` entries under a dated heading (`## YYYY-MM-DD`) and leave a fresh, empty `## Unreleased` on top. The version number is assigned by CI at merge time, so it is not written by hand.
   - Write for users, not developers. Describe what changed in what they see and do: what now works, what no longer goes wrong, what to expect after updating. Mention the app's own labels (e.g. "Sincronizza ora") when they help. No type, function, or file names, no database or implementation terms (baseline, hash, lease, journal…), no PR mechanics.
@@ -186,3 +187,7 @@ Being fast, reactive and nearly free in the background is a product feature. Per
   - Adds a regression test when the property is testable (e.g. "a run with nothing new writes nothing", "unchanged files are not hashed", "sync progress doesn't re-render the course list").
   - Explains the *why* in comments.
   - Adds a CHANGELOG entry only when users can notice the change.
+
+## Compliance knowledge
+
+For GDPR, privacy, or compliance work, first read [Compliance Wiki](docs/compliance-wiki/README.md), its [protocol](docs/compliance-wiki/PROTOCOL.md), and [index](docs/compliance-wiki/90%20Operations/Index.md). Reuse source-backed knowledge, verify affected current code, and refresh relevant official sources for legal decisions or stale/change-sensitive claims. Never store personal author data, private chats, credentials, real cookies, or user logs in this wiki.

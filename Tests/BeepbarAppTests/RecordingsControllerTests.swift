@@ -183,6 +183,36 @@ final class HistoryFileProbe: @unchecked Sendable {
     }
 }
 
+/// The controller's accesses to the session file, counted from whatever thread the vault runs
+/// them on. Any made on the main thread is recorded too: every test checks there are none (#97).
+/// `hold(access:)` parks that access (counted from 1) until `release()`, as a slow disk would.
+final class SessionFileProbe: @unchecked Sendable {
+    private let lock = NSLock()
+    private var count = 0
+    private var onMain = 0
+    private var holdAt: Int?
+    private var held = false
+    func record() {
+        let parks = lock.withLock { () -> Bool in
+            count += 1
+            if Thread.isMainThread { onMain += 1 }
+            if count == holdAt { held = true }
+            return held
+        }
+        // Never park the main thread: that is the failure this probe reports, not one to hang on.
+        guard parks, !Thread.isMainThread else { return }
+        while lock.withLock({ held }) { usleep(500) }
+    }
+    func hold(access: Int) { lock.withLock { holdAt = access } }
+    var isHolding: Bool { lock.withLock { held } }
+    func release() { lock.withLock { holdAt = nil; held = false } }
+    var accesses: Int {
+        get { lock.withLock { count } }
+        set { lock.withLock { count = newValue } }
+    }
+    var mainThreadAccesses: Int { lock.withLock { onMain } }
+}
+
 /// Mutable from a test: the WeBeep account, Polimi or not, the clock, and what was opened.
 @MainActor final class RecordingsWorld {
     var owner: Int? = 42
@@ -190,7 +220,12 @@ final class HistoryFileProbe: @unchecked Sendable {
     var now = Date(timeIntervalSince1970: 1_790_000_000)
     var opened: [URL] = []
     var copied: [URL] = []
-    var storeAccesses = 0
+    let sessionFiles = SessionFileProbe()
+    /// How many times the controller resolved the session file's folder: once per read, write or delete.
+    var storeAccesses: Int {
+        get { sessionFiles.accesses }
+        set { sessionFiles.accesses = newValue }
+    }
     var browsersMade = 0
     let historyFiles = HistoryFileProbe()
     var historyActors: [RecordingsSeenHistory] = []
@@ -215,13 +250,19 @@ struct RecordingsControllerTests {
     private let other = RecmanCourseKey(courseCode: "052499", academicYear: 2026)!
     private let third = RecmanCourseKey(courseCode: "099999", academicYear: 2026)!
 
-    private var store: RecordingsSessionStore {
+    /// The controller's store: counts its accesses and the threads they ran on.
+    private var controllerStore: RecordingsSessionStore {
         let folder = folder
-        let world = world
+        let probe = world.sessionFiles
         return RecordingsSessionStore {
-            MainActor.assumeIsolated { world.storeAccesses += 1 }
+            probe.record()
             return folder
         }
+    }
+    /// The same file for the test's own reads and writes, which run on the main thread on purpose.
+    private var store: RecordingsSessionStore {
+        let folder = folder
+        return RecordingsSessionStore { folder }
     }
     private var sessionFile: URL { folder.appendingPathComponent(RecordingsSessionStore.fileName) }
 
@@ -234,7 +275,7 @@ struct RecordingsControllerTests {
         let browser = browser
         return RecordingsController(
             makeBrowser: { world.browsersMade += 1; return browser },
-            store: store,
+            store: controllerStore,
             defaults: defaults,
             makeSeenHistory: { namespace in
                 let files = world.historyFiles
@@ -299,6 +340,7 @@ struct RecordingsControllerTests {
     }
 
     private func cleanUp() {
+        #expect(world.sessionFiles.mainThreadAccesses == 0, "the session file was read, written or deleted on the main thread")
         let actors = world.historyActors
         actors.forEach { $0.invalidate() }
         let folder = folder
@@ -421,6 +463,7 @@ struct RecordingsControllerTests {
         #expect(controller.access == .off)
         #expect(!browser.isOpen)
         #expect(controller.listings.isEmpty)
+        await controller.settleSessionFile()
         #expect(try store.load() == nil)
         await settle("history cleanup finished") { !FileManager.default.fileExists(atPath: folder.appendingPathComponent(RecordingsSeenStore.fileName).path) }
         #expect(defaults.string(forKey: RecordingsController.historyNamespaceKey) != nil)
@@ -438,14 +481,17 @@ struct RecordingsControllerTests {
 
     /// First use shows the explanation before any archive request, even with no synced courses.
     /// Rebuilding or reopening the page keeps the introduction without rereading the session.
+    /// The page asks for its courses at once, while the session file is still being read off the
+    /// main actor: that request must wait for the answer and never open a browser (#97).
     @Test func firstVisitWithoutASessionShowsSignInWithoutOpeningABrowser() async {
         defer { cleanUp() }
         let controller = makeController(useDefault: true)
         #expect(world.storeAccesses == 0)
         controller.pageAppeared()
-        #expect(controller.access == .needsSignIn(nil))
-        #expect(world.storeAccesses == 1)
         controller.refresh([course], selected: course)
+        await settle("the missing session asks for a sign-in") { controller.access == .needsSignIn(nil) }
+        #expect(world.storeAccesses == 1)
+        #expect(controller.listings.isEmpty)
         controller.pageDisappeared()
         controller.pageAppeared()
         controller.windowClosed()
@@ -469,12 +515,14 @@ struct RecordingsControllerTests {
         #expect(world.storeAccesses == 0)
         controller.pageAppeared()
         #expect(controller.access == .ready)
-        #expect(world.storeAccesses == 1)
         #expect(world.browsersMade == 0)
         controller.refresh([course], selected: course)
         await settle("saved session loaded") { controller.listing(for: course)?.recordings != nil }
         #expect(browser.openedWith == [["SSO_LOGIN"]])
         #expect(!browser.calls.contains("signIn"))
+        // The first visit's check and the worker opening the browser share one read (#97); the
+        // unchanged session is not written back.
+        #expect(world.storeAccesses == 1)
         let accesses = world.storeAccesses
         controller.pageDisappeared()
         controller.pageAppeared()
@@ -505,12 +553,156 @@ struct RecordingsControllerTests {
         if expired { world.now = world.now.addingTimeInterval(120) }
         let controller = makeController(useDefault: true)
         controller.pageAppeared()
-        #expect(controller.access == .needsSignIn(nil))
         controller.refresh([course], selected: course)
+        await settle("asks for a sign-in") { controller.access == .needsSignIn(nil) }
         await drainTasks()
         #expect(world.browsersMade == 0)
         #expect(browser.calls.isEmpty)
         #expect(controller.listings.isEmpty)
+    }
+
+    /// A slow disk holding the first visit's read of the session leaves the main actor free, and
+    /// nothing the page asks for meanwhile (its courses, Play on a bookmark) opens a browser before
+    /// the answer is known. With no session the answer is the sign-in; with one, a single read
+    /// serves the check and the worker. Guards the deferred refresh and the worker gate (#97).
+    @Test(arguments: [false, true])
+    func aSlowSessionReadDefersThePageUntilItAnswers(hasSession: Bool) async throws {
+        defer { cleanUp() }
+        if hasSession { try saveSession(owner: 42) }
+        browser.listResults[course.courseCode] = .success([recording("a")])
+        browser.playbackResults["a"] = .success(URL(string: "https://politecnicomilano.webex.com/politecnicomilano/ldr.php?RCID=a")!)
+        let controller = makeController(useDefault: true)
+        controller.toggleWatchlist(recording("a"), courseName: "NLA")
+        world.sessionFiles.hold(access: 1)
+        controller.pageAppeared()
+        controller.refresh([course], selected: course)
+        controller.play(recording("a"))
+        await settle("the read is held by the slow disk") { world.sessionFiles.isHolding }
+        await drainTasks()
+        #expect(controller.access == .ready)
+        #expect(world.browsersMade == 0)
+        #expect(browser.calls.isEmpty)
+        #expect(controller.listings.isEmpty)
+        world.sessionFiles.release()
+        if hasSession {
+            await settle("listed with the saved session") { controller.listing(for: course)?.recordings != nil }
+            await settle("the queued Play ran") { world.opened.count == 1 }
+            #expect(browser.openedWith == [["SSO_LOGIN"]])
+            #expect(world.storeAccesses == 1)
+        } else {
+            await settle("asks for a sign-in") { controller.access == .needsSignIn(nil) }
+            await drainTasks()
+            #expect(world.browsersMade == 0)
+            #expect(controller.listings.isEmpty)
+            #expect(controller.openingRecordingID == nil)
+            #expect(world.opened.isEmpty)
+        }
+    }
+
+    /// Turning the feature off while the session is being written to a slow disk ends with no
+    /// session file: the delete runs after the write, never before it. Turning on again with the
+    /// very same Polimi cookies writes them: the controller must not believe the deleted file still
+    /// holds them, or the user would be asked to sign in at every launch (#97).
+    @Test func turningOffDuringASlowSaveLeavesNoSessionAndASignInSavesAgain() async throws {
+        defer { cleanUp() }
+        let controller = makeController()
+        // Access 1 reads the (missing) file for the sign-in, access 2 is the save after it.
+        world.sessionFiles.hold(access: 2)
+        controller.setEnabled(true)
+        await settle("the save is held by the slow disk") { world.sessionFiles.isHolding }
+        controller.setEnabled(false)
+        world.sessionFiles.release()
+        await controller.settleSessionFile()
+        #expect(try store.load() == nil, "the late write outlived the turn-off")
+
+        controller.setEnabled(true)
+        await settle("signed in again and closed") { controller.access == .ready && !browser.isOpen }
+        await controller.settleSessionFile()
+        #expect(try savedSession()?.cookies.map(\.value) == ["fresh"], "the same cookies were not saved again")
+    }
+
+    /// A read of the saved session that finishes after a turn-off (or a disconnect) must not adopt
+    /// that session's account: a later sign-in that completes while the WeBeep account is unknown
+    /// would otherwise be saved under the account whose session was just deleted. Guards the
+    /// epoch check applied to a finished read (#97).
+    @Test func aReadFinishingAfterTurnOffDoesNotAdoptItsOwner() async throws {
+        defer { cleanUp() }
+        try saveSession(owner: 42)
+        let controller = makeController(useDefault: true)
+        world.sessionFiles.hold(access: 1)
+        controller.pageAppeared()
+        await settle("the read is held by the slow disk") { world.sessionFiles.isHolding }
+        controller.turnOff()
+        world.sessionFiles.release()
+        await controller.settleSessionFile()
+        await drainTasks()
+        #expect(try store.load() == nil)
+
+        let gate = FakeRecmanBrowser.Gate()
+        browser.signInGate = gate
+        controller.setEnabled(true)
+        await settle("sign-in on screen") { gate.isWaiting }
+        world.owner = nil
+        gate.release()
+        await settle("signed in") { controller.access == .ready }
+        await drainTasks()
+        await controller.settleSessionFile()
+        #expect(try store.load() == nil, "the sign-in was saved under the account of a discarded session")
+    }
+
+    /// The WeBeep account changing while the first visit is still reading the saved session: the
+    /// read used to be synchronous, so this window is new (#97). The account change can't drop a
+    /// session whose owner isn't known yet; the finished read must then compare the file's owner
+    /// with the account connected *now*, not when the read began, and drop it unused.
+    @Test func anAccountChangeDuringTheFirstReadDropsTheSession() async throws {
+        defer { cleanUp() }
+        try saveSession(owner: 42)
+        defaults.set(true, forKey: RecordingsController.enabledKey)
+        defaults.set(["old"], forKey: RecordingsController.acknowledgedKey)
+        let controller = makeController()
+        world.sessionFiles.hold(access: 1)
+        controller.pageAppeared()
+        controller.refresh([course], selected: course)
+        await settle("the read is held by the slow disk") { world.sessionFiles.isHolding }
+        world.owner = 7
+        controller.webBeepAccountChanged(to: 7)
+        world.sessionFiles.release()
+        await settle("asks for the sign-in") { controller.access == .needsSignIn(nil) }
+        await controller.settleSessionFile()
+        #expect(try store.load() == nil, "another account's session was kept")
+        #expect(world.browsersMade == 0)
+        #expect(browser.calls.isEmpty)
+        #expect(defaults.object(forKey: RecordingsController.acknowledgedKey) == nil)
+    }
+
+    /// The cycle's shared read is forgotten when it no longer describes the file, so the next
+    /// caller reads again: after a read error (the disk recovered, and the session there is used
+    /// by the sign-in instead of an empty one) and after a save (a sign-in reopening the browser
+    /// gets the renewed cookies, not the ones read before them) (#97).
+    @Test(arguments: ["read error", "save"])
+    func aSharedReadIsForgottenWhenTheFileChanges(after event: String) async throws {
+        defer { cleanUp() }
+        defaults.set(true, forKey: RecordingsController.enabledKey)
+        let controller = makeController()
+        if event == "read error" {
+            try FileManager.default.createDirectory(at: sessionFile, withIntermediateDirectories: true)
+            controller.pageAppeared()
+            await settle("asks for the sign-in") { controller.access == .needsSignIn(nil) }
+            try FileManager.default.removeItem(at: sessionFile)
+            try saveSession(owner: 42, cookies: [FakeRecmanBrowser.cookie("SSO_LOGIN", value: "saved"), FakeRecmanBrowser.cookie("JSESSIONID", value: "kept", domain: "onlineservices.polimi.it")])
+        } else {
+            try saveSession(owner: 42)
+            browser.listResults[course.courseCode] = .success([recording("a")])
+            browser.cookiesAfterListing = [FakeRecmanBrowser.cookie("SSO_LOGIN", value: "renewed"), FakeRecmanBrowser.cookie("JSESSIONID", value: "next", domain: "onlineservices.polimi.it")]
+            controller.pageAppeared()
+            controller.refresh([course], selected: course)
+            await settle("renewed session saved") { (try? savedSession())?.cookies.count == 2 }
+            await drainTasks()
+        }
+        let opens = browser.openedWith.count
+        controller.signIn()
+        await settle("the sign-in opened the browser") { browser.openedWith.count == opens + 1 }
+        #expect(browser.openedWith.last == ["JSESSIONID", "SSO_LOGIN"], "the sign-in reused a read that no longer matched the file")
     }
 
     /// A session saved for another WeBeep account is deleted unused, with what that account had
@@ -525,6 +717,7 @@ struct RecordingsControllerTests {
         controller.pageAppeared()
         controller.refresh([course], selected: course)
         await settle("asks for the sign-in") { controller.access == .needsSignIn(nil) }
+        await controller.settleSessionFile()
         #expect(browser.calls.isEmpty)
         #expect(world.browsersMade == 0)
         #expect(try store.load() == nil)
@@ -562,9 +755,11 @@ struct RecordingsControllerTests {
         await settle("listed") { controller.listing(for: course)?.recordings?.count == 1 }
 
         controller.webBeepAccountChanged(to: 7)
+        await controller.settleSessionFile()
         #expect(try store.load() != nil)
         #expect(controller.listing(for: course) != nil)
         controller.webBeepAccountChanged(to: 8)
+        await controller.settleSessionFile()
         #expect(try store.load() == nil)
         #expect(!browser.isOpen)
         #expect(controller.listings.isEmpty)
@@ -583,6 +778,8 @@ struct RecordingsControllerTests {
         controller.pageAppeared()
         controller.refresh([course], selected: course)
         await settle("asks for the sign-in") { controller.access == .needsSignIn(nil) }
+        // The delete runs after the answer: wait for it, or it could remove the folder below.
+        await controller.settleSessionFile()
         #expect(browser.calls.isEmpty)
         #expect(world.browsersMade == 0)
         #expect(try store.load() == nil)
@@ -593,6 +790,7 @@ struct RecordingsControllerTests {
         second.pageAppeared()
         second.refresh([course], selected: course)
         await settle("asks for the sign-in") { second.access == .needsSignIn(nil) }
+        await second.settleSessionFile()
         var isDirectory: ObjCBool = false
         #expect(FileManager.default.fileExists(atPath: sessionFile.path, isDirectory: &isDirectory) && isDirectory.boolValue)
     }
@@ -801,6 +999,7 @@ struct RecordingsControllerTests {
         controller.setEnabled(false)
         gate.release()
         await drainTasks()
+        await controller.settleSessionFile()
         #expect(controller.listings.isEmpty)
         #expect(try store.load() == nil)
         #expect(defaults.object(forKey: RecordingsController.acknowledgedKey) == nil)
@@ -1079,7 +1278,7 @@ struct RecordingsControllerTests {
         defaults.set([RecordingsController.baselineID(courseCode: course.courseCode, academicYear: course.academicYear)], forKey: RecordingsController.baselinedKey)
         let controller = makeController()
         controller.pageAppeared()
-        #expect(defaults.object(forKey: RecordingsController.acknowledgedKey) == nil)
+        await settle("unowned legacy history dropped") { defaults.object(forKey: RecordingsController.acknowledgedKey) == nil }
         controller.signIn()
         await settle("signed in") { controller.access == .ready }
         browser.listResults[course.courseCode] = .success([recording("fresh-owner")])
@@ -1531,6 +1730,7 @@ struct RecordingsAccountTests {
 
         controller.signOut()
         #expect(!controller.hasStoredCredential)
+        await controller.recordings.settleSessionFile()
         #expect(try store.load() == nil)
         #expect(defaults.object(forKey: RecordingsController.enabledKey) == nil)
         #expect(!controller.recordings.isEnabled)
@@ -1538,6 +1738,7 @@ struct RecordingsAccountTests {
         // Switching university, with nothing connected, drops whatever is saved too.
         try store.save(session(owner: 1))
         controller.selectSite(MoodleSite.unipd[0])
+        await controller.recordings.settleSessionFile()
         #expect(try store.load() == nil)
     }
 
@@ -1584,6 +1785,7 @@ struct RecordingsAccountTests {
 
         await controller.completeLoginForTesting(moodleLoginCallback(token: token))
         #expect(controller.courseLoadError == nil)
+        await recordings.settleSessionFile()
         #expect(try store.load() == nil)
         #expect(recordings.access == .needsSignIn(nil))
         #expect(!browser.isOpen)

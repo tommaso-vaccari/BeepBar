@@ -180,7 +180,7 @@ let webexVideoSource = #"""
     }
 
     /// The first bytes, fetched with no cookies at all: status, type and what kind of file it is.
-    private func fetchHead(_ url: URL) async {
+    func fetchHead(_ url: URL) async {
         var request = URLRequest(url: url, timeoutInterval: 20)
         request.setValue("bytes=0-4095", forHTTPHeaderField: "Range")
         let session = URLSession(configuration: .ephemeral)
@@ -208,7 +208,7 @@ let webexVideoSource = #"""
     }
 
     /// Whether AVPlayer actually advances through `url` (muted), within 25 seconds.
-    private func plays(_ url: URL, cookies: [HTTPCookie]?) async -> String {
+    func plays(_ url: URL, cookies: [HTTPCookie]?) async -> String {
         let asset = cookies.map { AVURLAsset(url: url, options: [AVURLAssetHTTPCookiesKey: $0]) } ?? AVURLAsset(url: url)
         let item = AVPlayerItem(asset: asset)
         let player = AVPlayer(playerItem: item)
@@ -346,7 +346,9 @@ func get(_ url: URL, cookies sent: [HTTPCookie], follow: Bool) async throws -> (
     defer { session.finishTasksAndInvalidate() }
     var request = URLRequest(url: url, timeoutInterval: 20)
     for (name, value) in HTTPCookie.requestHeaderFields(with: sent) { request.setValue(value, forHTTPHeaderField: name) }
-    request.setValue("application/json, text/html", forHTTPHeaderField: "Accept")
+    // Webex answers ldr.php with a 302 to the playback page (uuid in Location) only when Accept
+    // includes */*; with a text/html-only Accept it serves a 200 page instead (Phase 0b).
+    request.setValue("*/*", forHTTPHeaderField: "Accept")
     let (data, response) = try await session.data(for: request)
     return (data, response as! HTTPURLResponse)
 }

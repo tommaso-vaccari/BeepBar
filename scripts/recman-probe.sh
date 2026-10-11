@@ -8,6 +8,10 @@
 #                                   open the n-th newest recording's Webex player (default the
 #                                   newest) in a window, report the way to the stream and whether
 #                                   AVPlayer plays it; run warm or cold first
+#                                   (RECMAN_PROBE_WINDOW_SECONDS limits the window, default 300)
+#   scripts/recman-probe.sh lab <course code> <academic year> [n]
+#                                   unattended, no window, nothing typed: stream API cookie
+#                                   needs and Webex re-login (RECMAN_PROBE_LAB_WAIT_MINUTES, default 10)
 #   scripts/recman-probe.sh clean                                delete the saved session
 #
 # e.g. scripts/recman-probe.sh cold 058167 2026, then scripts/recman-probe.sh warm 058167 2026.
@@ -21,9 +25,9 @@ set -euo pipefail
 mode="${1:-}"
 state="${TMPDIR:-/tmp}/beepbar-recman-probe"
 case "$mode" in
-  cold|warm|play) ;;
+  cold|warm|play|lab) ;;
   clean) rm -rf "$state"; echo "deleted $state"; exit 0 ;;
-  *) sed -n '2,18p' "$0" | sed 's/^# \{0,1\}//'; exit 2 ;;
+  *) sed -n '2,22p' "$0" | sed 's/^# \{0,1\}//'; exit 2 ;;
 esac
 shift
 
@@ -55,6 +59,7 @@ echo "building the probe…"
 swiftc -swift-version 6 -O \
   "$here/recman-probe/main.swift" \
   "$here/recman-probe/webex.swift" \
+  "$here/recman-probe/lab.swift" \
   "${core_files[@]}" \
   "$root/Sources/BeepbarCore/Localization/AppLanguage.swift" \
   "$root/Sources/BeepbarApp/RecmanScripts.swift" \

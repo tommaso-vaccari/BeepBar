@@ -9,26 +9,29 @@ All findings below come from `scripts/recman-probe.sh play` / `lab` runs on 2026
 ## How Webex gets from the player link to the stream
 
 1. The Recman preview gives `https://politecnicomilano.webex.com/<…>/ldr.php?RCID=<id>`.
-2. `ldr.php` answers `200` HTML and redirects **in JavaScript** to `/recordingservice/sites/politecnicomilano/recording/playback/<uuid>` (32 hex). No `Location` header, no uuid in the body, with or without cookies: the uuid needs a web view. In a hidden web view on the session's store the uuid appears in the second main-frame navigation after ~0.8 s; cancelling there loads nothing of the heavy player page.
+2. `ldr.php` answers **`302`** with `Location: …/sites/politecnicomilano/recording/playback/<uuid>` (32 hex) **when the request's `Accept` includes `*/*`** — no cookies needed, any User-Agent. With a `text/html`-only `Accept` it answers `200` with a 15 KB page that does not contain the uuid (this misled the first probe). So **no web view is needed for the uuid**: a no-follow GET with `Accept: */*`. A `200` means "unknown layout" → browser fallback. (If a web view were ever needed, cancelling the main-frame navigation to `/recording/playback/<uuid>` yields it in ~0.8 s.)
 3. Stream API: `GET https://politecnicomilano.webex.com/webappng/api/v1/recordings/<uuid>/stream?siteurl=politecnicomilano`.
    - Signed out: `403` with a JSON body (`requireLogin`, `canPlayback`, `preventPlayback`, `passwordProtected`, `needPassword`, `preventDownload`, …).
    - Signed in: `200`, with `downloadRecordingInfo.downloadInfo.{hlsURL, mp4URL, dashURL, audioURL, playerCoverURL}`, `mp4StreamOption`, `duration`, `recordName`, `chapterLayout`, `transcriptStatus`, `mediaDetectInfo`, `playerPanels`, `showAISummary`, … (shapes only).
-   - Works from a plain `URLSession` with cookies only (no CSRF header, no page context). The **only cookie required is `ticket` on `.webex.com`** (session cookie): without it `403`, with it alone `200`.
-4. `hlsURL` (`https://nfg1wss.webex.com/nbr/…/hls.m3u8?trackingID=…`) is a single-level HLS playlist of byte-range segments of one 1080p mp4. **AVPlayer plays it without any cookie** (ready in ~5 s; 136-min test lecture). Lifetime of the URL: being measured (re-test after 10+ min).
+   - Works from a plain `URLSession` with cookies only (no CSRF header, no Referer, no page context). The **only cookie required is `ticket` on `.webex.com`** (session cookie): without it `403`, with it alone `200` (confirmed again ~25 min after sign-in).
+   - `requireLogin` is **not** a signed-out flag (it reads 1 on the 200 and 0 on the 403): decide on the HTTP status and on the presence of `hlsURL`.
+4. `hlsURL` (`https://nfg1wss.webex.com/nbr/…/hls.m3u8?trackingID=…`) is a single-level HLS playlist of byte-range segments of one 1080p mp4. **AVPlayer plays it without any cookie** (ready in ~5 s; 136-min test lecture). The same URL still played 10 minutes later; longer lifetimes are not measured.
 
 ## Webex sign-in
 
 - Signed-out chain: playback page → `webappng/sites/politecnicomilano/login?siteurl,viewFrom,login_return_url` → `idbroker-eu.webex.com/idb/…` → `doSSO.jsp` **email page** (`input#IDToken1[type=email]`, `button#IDButton2[name=btnOK]`) → `idbroker-eu…/globalLogin` → `shibidp.polimi.it` → `aunicalogin.polimi.it`, which **completes on its own with the Polimi SSO cookies** already in the Recman store → back to the playback page.
 - The email page comes back whenever Webex's session cookies are missing, even with persistent cookies such as `CK_LastLogin` (1 year); it is never prefilled.
 - **Passing the email in the webappng login URL (`…/login?…&email=<address>`) skips the email page** and goes straight to Polimi's IdP (tested with a placeholder address, stopped before the IdP). So no form filling by script is needed.
-- With only idbroker's session cookies the sign-in went through without the email page, but the stream API still answered `403` within the 60 s limit: unresolved.
+- With Polimi cookies plus idbroker's session cookies (`cisPRODEUiPlanetDirectoryPro`, `amlbcookie`, `amlbcookiesm`, idbroker `JSESSIONID`) the sign-in is **silent** (no email page): login → idbroker → server redirect → webappng → playback, stream API `200` after ~7 s, and the new `ticket` works from `URLSession`.
+- The `email` hint routes by domain: with a `mail.polimi.it` placeholder idbroker posts straight to Polimi's IdP; with `example.com` it shows its own password page; `login_hint` alone is ignored. A full sign-in with a **placeholder** address stalled on a blank `idbroker-eu…/idb/Consumer/metaAlias/<id>/sp` after the Polimi SSO completed (probably because the asserted identity differs from the hint). **Whether the hint with the user's real email completes unattended is unverified** and must be confirmed live with the owner's consent; keep the visible-window fallback.
+- Every Webex cookie that matters is a session cookie (`ticket`, `accessToken`, `userHubToken`, the idbroker ones); persistent ones are only `CK_LastLogin`, `wxidIstio`, `CisTrackingID`, `WBX_ttm…`. The v2 session file keeps session cookies, so after a relaunch: `ticket` alive → no sign-in at all; only idbroker alive → silent ~7 s sign-in; nothing alive → hinted sign-in.
 - After sign-in Webex sets ~15 cookies (`.webex.com`, `idbroker-eu.webex.com`, `nfg1wss.webex.com`, `politecnicomilano.webex.com`), mostly session cookies; a few short-lived trackers.
 
 ## Chosen design
 
-1. Hidden Recman web view: load `ldr.php`, capture the uuid in `decidePolicyFor`, cancel. Never load the player page (it pulls u2c catalogs, device registration, KMS, telemetry and Amplitude, and would play audio hidden).
-2. `URLSession` to the stream API with the store's cookies → `hlsURL` → native player (cookie-less).
-3. On `403`: sign in to Webex in the same hidden web view through the webappng login URL with `email=<confirmed Polimi email>`; Polimi SSO completes; retry step 2. If Polimi asks for the user, the existing sign-in window flow applies.
+1. `URLSession`, no cookies, no redirects followed, `Accept: */*`: GET `ldr.php` → `302` → uuid from `Location`. Never load the player page (it pulls u2c catalogs, device registration, KMS, telemetry and Amplitude, and would play audio hidden).
+2. `URLSession` to the stream API with the Webex cookies of the Recman store (only `ticket` matters) → `hlsURL` → native player (cookie-less).
+3. On `403` / no `hlsURL`: sign in to Webex in the hidden Recman web view through the webappng login URL with `email=<confirmed Polimi email>`; Polimi SSO completes; wait for `ticket`; retry step 2 once. If a page asks for the user, the existing sign-in window flow applies.
 4. Any unexpected page, status or shape → open the player link in the browser as today.
 
 ## Packages and decisions
@@ -48,6 +51,6 @@ Requirements recorded for F by reviews: carry the email through the controller's
 
 ## Open items
 
-- Lifetime of `hlsURL` and of the `ticket` cookie.
-- The idbroker-only case (sign-in without email page but API still `403`).
+- Lifetime of `hlsURL` beyond 10 min and server-side lifetime of `ticket` / idbroker sessions beyond ~30 min.
+- Live confirmation (with consent) that the `email=` hint with the real address completes the sign-in unattended.
 - Energy comparison native player vs Webex web page (measurement in progress).

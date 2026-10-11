@@ -15,6 +15,9 @@ import WebKit
 //                              without the user, as BeepBar does after a relaunch
 //   play <state> code year [n] restore the session, find the n-th newest recording's Webex player
 //                              (default the newest) and investigate it (see webex.swift)
+//   lab <state> code year [n]  unattended, no window, nothing typed: the uuid without a web view,
+//                              the stream API's cookie needs, and what a later Webex login asks
+//                              (see lab.swift)
 
 @MainActor func say(_ line: String) {
     print(line)
@@ -118,12 +121,21 @@ let diagnostics = #"""
 
 @MainActor func run() async -> Int32 {
     let arguments = CommandLine.arguments
-    guard arguments.count >= 3, ["cold", "warm", "play"].contains(arguments[1]), arguments[1] != "play" || arguments.count >= 5 else {
+    guard arguments.count >= 3, ["cold", "warm", "play", "lab"].contains(arguments[1]), !["play", "lab"].contains(arguments[1]) || arguments.count >= 5 else {
         say("usage: RecmanProbe cold|warm <state folder> [course code] [academic year] | play <state folder> <course code> <academic year> [n]")
         return 2
     }
     let mode = arguments[1]
     let file = URL(fileURLWithPath: arguments[2]).appendingPathComponent("session.plist")
+    if mode == "lab" {
+        if ProcessInfo.processInfo.environment["RECMAN_PROBE_LAB_PART"] == "3" {
+            return await labThree(state: URL(fileURLWithPath: arguments[2]), code: arguments[3], year: Int(arguments[4]) ?? 0, index: arguments.count >= 6 ? Int(arguments[5]) ?? 1 : 1)
+        }
+        if ProcessInfo.processInfo.environment["RECMAN_PROBE_LAB_PART"] == "2" {
+            return await labTwo(state: URL(fileURLWithPath: arguments[2]), code: arguments[3], year: Int(arguments[4]) ?? 0, index: arguments.count >= 6 ? Int(arguments[5]) ?? 1 : 1)
+        }
+        return await lab(state: URL(fileURLWithPath: arguments[2]), code: arguments[3], year: Int(arguments[4]) ?? 0, index: arguments.count >= 6 ? Int(arguments[5]) ?? 1 : 1)
+    }
     if mode == "play" {
         return await play(state: URL(fileURLWithPath: arguments[2]), code: arguments[3], year: Int(arguments[4]) ?? 0, index: arguments.count >= 6 ? Int(arguments[5]) ?? 1 : 1)
     }
@@ -203,7 +215,9 @@ let diagnostics = #"""
             say("RESULT direct OK stream found in \(elapsed(since: directStart)) without opening Webex's page: \(streamShape(stream))")
         } else {
             let probe = WebexProbe(store: store)
-            await probe.run(player: player, limit: .seconds(300))
+            // RECMAN_PROBE_WINDOW_SECONDS shortens the wait for unattended runs.
+            let seconds = Int(ProcessInfo.processInfo.environment["RECMAN_PROBE_WINDOW_SECONDS"] ?? "") ?? 300
+            await probe.run(player: player, limit: .seconds(seconds))
             // Right after the sign-in: does the direct way work now?
             if let stream = await direct(player: player, store: store) {
                 say("RESULT direct-after-login OK: \(streamShape(stream))")

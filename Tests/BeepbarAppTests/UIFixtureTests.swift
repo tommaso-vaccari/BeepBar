@@ -118,6 +118,26 @@ import BeepbarCore
         #expect(!fixture.browser.isOpen)
     }
 
+    /// The `progress-burst` workload must travel the real sync progress path. The final totals
+    /// prove every event reached the sink; at least one but far fewer main-actor entries than
+    /// events prove D08's throttle decided off the main actor. A burst that writes the store
+    /// directly records no entry, and one that hops per event records thousands. Afterwards
+    /// the run is closed and no sync is shown as active, so the next fixture cycle starts clean.
+    @Test(.timeLimit(.minutes(1))) func progressBurstTravelsTheThrottledSyncPath() async throws {
+        let fixture = try await UIFixture.make(scenario("progress-burst"))
+        defer { fixture.dispose() }
+        let start = ContinuousClock.now
+        await UIFixtureProgressBurst.run(fixture.controller)
+        let elapsed = start.duration(to: .now)
+        let store = fixture.controller.progressStore
+        let allowed = 2 + Int(elapsed / .milliseconds(200))
+        #expect(store.progress.completed == UIFixtureProgressBurst.events)
+        #expect(store.mainActorEntries >= 1)
+        #expect(store.mainActorEntries <= allowed, "\(store.mainActorEntries) main-actor entries in \(elapsed); at most \(allowed) allowed")
+        #expect(!fixture.controller.isSyncActive)
+        #expect(fixture.controller.syncState == .readyUnchecked)
+    }
+
     private func waitUntil(_ condition: () -> Bool) async throws {
         let deadline = ContinuousClock.now.advanced(by: .seconds(10))
         while !condition(), ContinuousClock.now < deadline { await Task.yield() }

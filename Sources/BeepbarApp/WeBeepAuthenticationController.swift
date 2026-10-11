@@ -763,10 +763,6 @@ struct MenuBarSnapshot: Sendable {
         setSyncState(synced: result)
     }
 
-    /// Feeds the existing sync callback from a synthetic producer (#95), retaining the relay
-    /// and menu publication. Its trace can guide D08; it is not a deterministic hop-count test.
-    func publishProgressForTesting(_ value: SyncProgress) async { await publishProgress(value) }
-
     func setCoursesForTesting(_ courses: [RemoteCourseSummary]) {
         self.courses = courses
     }

@@ -228,6 +228,38 @@ final class UIFixtureProtocol: URLProtocol, @unchecked Sendable {
         try? FileManager.default.removeItem(at: root)
     }
 }
+
+/// The `progress-burst` workload: 10,000 events from an off-main producer, fed to the same sink a
+/// real sync hands to `SyncCoordinator`, so D08's throttle decides off the main actor exactly as
+/// in production (#95, #96). Kept outside the opt-in entry point so the normal test build
+/// compiles and runs it: a burst that bypasses the sink, or a seam removed from the controller,
+/// fails `UIFixtureTests` instead of only the fixture build.
+@MainActor enum UIFixtureProgressBurst {
+    nonisolated static let events = 10_000
+
+    static func run(_ controller: WeBeepAuthenticationController) async {
+        let operationID = UUID()
+        controller.setOperationForTesting(operationID)
+        let sink = controller.beginTransferForTesting(operationID, automatic: false)
+        let trace = PerformanceTrace.shared.begin("ui.fixtureProgressBurst", category: .ui)
+        await Task.detached {
+            // Ten bursts of 1,000 separated by a frame, so the throttle sees both back-to-back
+            // events and pauses rather than one uninterrupted stream.
+            for batch in 0..<10 {
+                for index in 1...(events / 10) {
+                    let completed = batch * (events / 10) + index
+                    await sink(SyncProgress(completed: completed, total: events, installed: completed, preservedLocal: 0, unchanged: 0, conflicts: 0, failures: 0))
+                }
+                try? await Task.sleep(for: .milliseconds(16))
+            }
+        }.value
+        PerformanceTrace.shared.end("ui.fixtureProgressBurst", category: .ui, state: trace)
+        // Retire the run as `endOperation` would, so a later cycle starts from a closed stream.
+        controller.progressStore.closeCurrentRun()
+        controller.setOperationForTesting(nil)
+        controller.setSyncStateForTesting(.readyUnchecked)
+    }
+}
 #endif
 
 #if UI_PERFORMANCE_HARNESS
@@ -420,25 +452,7 @@ struct UIFixtureReport: Encodable {
                     guard fixture.controller.isSyncActive else { throw UIFixtureError.unexpectedResponse }
                 }
                 if scenario.name == "progress-burst" {
-                    fixture.controller.setOperationForTesting(UUID())
-                    fixture.controller.setSyncStateForTesting(.syncing)
-                    await fixture.controller.progressStore.reset(automatic: false)
-                    let controller = fixture.controller
-                    let trace = PerformanceTrace.shared.begin("ui.fixtureProgressBurst", category: .ui)
-                    // The producer runs off-main and calls the same publish method as sync.
-                    // Intermediate events retain the application's real throttling behavior.
-                    await Task.detached {
-                        for batch in 0..<10 {
-                            for index in 1...1_000 {
-                                let completed = batch * 1_000 + index
-                                await controller.publishProgressForTesting(SyncProgress(completed: completed, total: 10_000, installed: completed, preservedLocal: 0, unchanged: 0, conflicts: 0, failures: 0))
-                            }
-                            try? await Task.sleep(for: .milliseconds(16))
-                        }
-                    }.value
-                    PerformanceTrace.shared.end("ui.fixtureProgressBurst", category: .ui, state: trace)
-                    fixture.controller.setOperationForTesting(nil)
-                    fixture.controller.setSyncStateForTesting(.readyUnchecked)
+                    await UIFixtureProgressBurst.run(fixture.controller)
                 }
                 if scenario.name != "reopen-sync" || index == scenario.cycles {
                     UIFixtureProtocol.releaseContents(token: fixture.token)

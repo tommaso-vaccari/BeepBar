@@ -115,8 +115,8 @@ struct RecmanSessionCodecTests {
         #expect(Set(snapshot.cookies.map(\.name)) == ["SSO_LOGIN", "JSESSIONID"])
     }
 
-    /// The migration path: a v1 file, decoded and saved again, becomes a v2 file holding the
-    /// same session (and the email once there is one).
+    /// The migration path: a v1 file, decoded and saved again (the controller does so on the next
+    /// save whose contents changed), becomes a v2 file holding the same session and the email.
     @Test func v1FileIsRewrittenAsV2OnNextSave() throws {
         let old = try RecmanSessionCodec.decode(try v1File(owner: 9, cookies: [cookie("SSO_LOGIN", domain: "aunicalogin.polimi.it")]), now: now)
         let data = try RecmanSessionCodec.encode(old.cookies, ownerUserID: old.ownerUserID, email: "a.b@polimi.it", now: now)
@@ -133,7 +133,7 @@ struct RecmanSessionCodecTests {
     @Test func keepsLiveWebexCookiesButNotLookalikes() throws {
         let cookies = [
             cookie("apex", domain: "webex.com"),
-            cookie("dotted", domain: ".webex.com", expires: now.addingTimeInterval(3_600)),
+            cookie("dotted", domain: ".webex.com", expires: now.addingTimeInterval(2 * 86_400)),
             cookie("site", domain: "polimi.webex.com"),
             cookie("deep", domain: "idbroker.eu.webex.com"),
             cookie("upper", domain: "Polimi.WebEx.com"),
@@ -147,6 +147,36 @@ struct RecmanSessionCodecTests {
         // Checked on the raw file too: what is filtered must never be written, not only hidden on read.
         #expect((try plist(data)["cookies"] as? [[String: Any]])?.count == 5)
         #expect(Set(try RecmanSessionCodec.decode(data, now: now).cookies.map(\.name)) == ["apex", "dotted", "site", "deep", "upper"])
+    }
+
+    /// Short-lived Webex cookies (a ~30-minute tracker seen live) are not kept: they can't help
+    /// after a relaunch and would change the save fingerprint, rewriting the file on every Play.
+    /// Session cookies, the 2-day `WBX_*` kind and the 1-year `CK_LastLogin` kind stay. The
+    /// boundary is inclusive: exactly 12 hours left is kept, a second less is not.
+    @Test func shortLivedWebexCookiesAreNotKept() throws {
+        let twelveHours = RecmanSessionCodec.minimumWebexLifetime
+        #expect(twelveHours == 12 * 3_600)
+        let cookies = [
+            cookie("tracker", domain: "nfg1wss.webex.com", expires: now.addingTimeInterval(30 * 60)),
+            cookie("WBX_two_days", domain: "nfg1wss.webex.com", expires: now.addingTimeInterval(2 * 86_400)),
+            cookie("CK_LastLogin", domain: ".webex.com", expires: now.addingTimeInterval(365 * 86_400)),
+            cookie("session", domain: "politecnicomilano.webex.com"),
+            cookie("at_boundary", domain: "webex.com", expires: now.addingTimeInterval(twelveHours)),
+            cookie("just_short", domain: "webex.com", expires: now.addingTimeInterval(twelveHours - 1)),
+        ]
+        let data = try RecmanSessionCodec.encode(cookies, ownerUserID: 1, now: now)
+        #expect(Set(try RecmanSessionCodec.decode(data, now: now).cookies.map(\.name)) == ["WBX_two_days", "CK_LastLogin", "session", "at_boundary"])
+        // Applied on read too: two days later, the 2-day cookie has under 12 hours left.
+        let later = try RecmanSessionCodec.decode(data, now: now.addingTimeInterval(2 * 86_400 - 3_600))
+        #expect(Set(later.cookies.map(\.name)) == ["CK_LastLogin", "session"])
+    }
+
+    /// The 12-hour floor is Webex-only: a Polimi cookie with 30 minutes left is still kept until
+    /// it actually expires, as before v2.
+    @Test func polimiCookiesKeepTheirOwnExpiryRule() {
+        #expect(RecmanSessionCodec.keeps(cookie("short", domain: "aunicalogin.polimi.it", expires: now.addingTimeInterval(30 * 60)), now: now))
+        #expect(RecmanSessionCodec.keeps(cookie("last_second", domain: "polimi.it", expires: now.addingTimeInterval(1)), now: now))
+        #expect(!RecmanSessionCodec.keeps(cookie("expired", domain: "polimi.it", expires: now), now: now))
     }
 
     /// The host predicate on its own, with the label boundary checked on both sides.

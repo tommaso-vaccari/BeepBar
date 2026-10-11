@@ -23,8 +23,10 @@ import FoundationNetworking
 ///   doesn't sign in to Webex again after every relaunch. The other keys are unchanged.
 ///
 /// Migration and rollback, for users who skip releases:
-/// - A v1 file decodes with `email == nil` and needs no user action; the next successful save
-///   (`RecordingsController.saveSession`) rewrites it as v2.
+/// - A v1 file decodes with `email == nil` and needs no user action. It is rewritten as v2 by the
+///   next save whose contents changed: `RecordingsController.saveSession` skips the write while
+///   the kept cookies' fingerprint is unchanged, so a v1 file can stay v1 indefinitely. That is
+///   harmless, because `decode` keeps accepting v1 and a v1 file only lacks what v2 adds.
 /// - An app older than v2 accepts only `version == 1`, so it refuses a v2 file with
 ///   `unsupportedVersion`. Its `RecordingsController.savedCookies` treats every decode error as
 ///   an unreadable session and deletes the file: the user signs in to Polimi again, and no course
@@ -88,13 +90,29 @@ public enum RecmanSessionCodec {
     /// launches. Session cookies (no expiry) are kept: they are the single sign-on session itself.
     /// - polimi.it and its subdomains: the Polimi single sign-on and the Recman archive.
     /// - webex.com and its subdomains (v2): the Webex login made in the same hidden web view for
-    ///   native playback, so it isn't repeated after a relaunch.
+    ///   native playback, so it isn't repeated after a relaunch. Only session cookies and those
+    ///   with at least `minimumWebexLifetime` left are kept (see there).
     /// Every other site's cookies (trackers, CDNs, lookalikes) never reach the file.
     public static func keeps(_ cookie: HTTPCookie, now: Date) -> Bool {
         let domain = cookie.domain.lowercased().trimmingCharacters(in: CharacterSet(charactersIn: "."))
-        guard PolimiPage.isPolimiHost(domain) || isWebexHost(domain) else { return false }
-        return cookie.expiresDate.map { $0 > now } ?? true
+        if PolimiPage.isPolimiHost(domain) {
+            return cookie.expiresDate.map { $0 > now } ?? true
+        }
+        if isWebexHost(domain) {
+            return cookie.expiresDate.map { $0 >= now.addingTimeInterval(minimumWebexLifetime) } ?? true
+        }
+        return false
     }
+
+    /// The least time a Webex cookie with an expiry date must have left to be kept: 12 hours.
+    /// Webex sets short-lived cookies on every player load (a live probe saw a ~30-minute
+    /// tracking cookie next to the 2-day `WBX_*` and 1-year `CK_LastLogin` ones). They can't help
+    /// after a relaunch, and since `RecordingsController.saveSession` fingerprints the cookies
+    /// `keeps` accepts, keeping them would rewrite the session file on every Play. Session
+    /// cookies (no expiry) and long-lived ones stay. Applied on read too, so a kept cookie that
+    /// has since come within 12 hours of expiring is dropped like an expired one. Polimi cookies
+    /// are unaffected: they are kept until they actually expire.
+    public static let minimumWebexLifetime: TimeInterval = 12 * 60 * 60
 
     /// `webex.com` itself or a subdomain of it, matched on a label boundary: `x.webex.com` is
     /// Webex, while `evilwebex.com` and `webex.com.evil.com` are not, so a lookalike site's

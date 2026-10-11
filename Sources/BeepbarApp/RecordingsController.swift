@@ -77,7 +77,10 @@ struct RecordingsListing: Equatable {
 /// - **The session file never touches the main actor (#97).** It is read, written and deleted by
 ///   `RecmanSessionVault`, off the main actor and in call order; it is read once per opening cycle,
 ///   and a save that began before turn-off, logout or an account change is refused at commit
-///   time, so a late save can't bring the deleted session back.
+///   time, so a late save can't bring the deleted session back. The delete itself finishes
+///   after turn-off, logout or an account change has returned: if the process ends first, the
+///   file survives until the next discard, and the owner check on the next read still refuses
+///   it to another account. Quitting never waits for it (see the quit rules in AGENTS.md).
 /// - **One request at a time, and never a stale one.** A single worker drains a queue (opening a
 ///   recording first, then the selected course, then the others for their badges). Turning off,
 ///   signing in and closing the page bump `generation`; a task from an older generation never
@@ -139,8 +142,7 @@ struct RecordingsListing: Equatable {
     /// nothing opens the browser: without a reusable session the page asks for a sign-in instead,
     /// as when the check was synchronous. Sign-in, turn-off and an account change supersede it.
     private var initialSessionCheck: Int?
-    /// A refresh asked for with the refresh button while the initial check was reading.
-    private var deferredForce = false
+    private var initialSessionChecks = 0
     /// Webex players already found, so opening a recording again is instant.
     private var playbackURLs: [String: URL] = [:]
 
@@ -379,8 +381,8 @@ struct RecordingsListing: Equatable {
         // can open WebKit. Later visits must preserve a session established by explicit sign-in.
         guard isEnabled, access == .ready, !hasCheckedInitialSession else { return }
         hasCheckedInitialSession = true
-        sessionLoads += 1
-        let check = sessionLoads
+        initialSessionChecks += 1
+        let check = initialSessionChecks
         initialSessionCheck = check
         // Not tied to `generation`: closing the page while the file is read must not lose the
         // answer, or the next visit would open the browser without a session to show.
@@ -395,10 +397,9 @@ struct RecordingsListing: Equatable {
                 self.access = .needsSignIn(nil)
                 return
             }
-            // What the page and the play buttons asked for while the file was read.
-            let force = self.deferredForce
-            self.deferredForce = false
-            if self.visiblePages > 0 { self.enqueue(self.pageKeys, selected: self.selectedKey, force: force) }
+            // What the page asked for while the file was read. No `force` to carry over: this is
+            // the first visit, so nothing has been listed yet and every key loads anyway.
+            if self.visiblePages > 0 { self.enqueue(self.pageKeys, selected: self.selectedKey, force: false) }
             self.startWorker()
         }
     }
@@ -437,7 +438,7 @@ struct RecordingsListing: Equatable {
         selectedKey = selected
         guard access == .ready else { return }
         // The initial check enqueues these keys itself once it knows a session exists.
-        guard initialSessionCheck == nil else { deferredForce = deferredForce || force; return }
+        guard initialSessionCheck == nil else { return }
         enqueue(keys, selected: selected, force: force)
     }
 
@@ -780,7 +781,6 @@ struct RecordingsListing: Equatable {
     /// must not overrule them when its read finishes.
     private func supersedeInitialSessionCheck() {
         initialSessionCheck = nil
-        deferredForce = false
     }
 
     /// Stops the worker and any sign-in for good: they belong to an older generation from now on.
@@ -872,7 +872,10 @@ struct RecordingsListing: Equatable {
     /// Saves the browser's session after a success, under the account it belongs to, unless it
     /// is what the file already holds. The vault epoch is read before awaiting WebKit: a turn-off,
     /// logout or account change from then on makes this save stale, and the vault refuses it at
-    /// commit time even after the guards below have passed.
+    /// commit time even after the guards below have passed. Today those paths also bump
+    /// `generation`, which stops the save first, and `adopt`'s own discards can't land in this
+    /// window (this cycle's read has already finished, after every earlier one). The epoch is the
+    /// guarantee that doesn't depend on either, so no test can fail without it yet.
     private func saveSession(_ generation: Int) async {
         guard let browser else { return }
         let epoch = vault.epoch

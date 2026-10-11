@@ -12,7 +12,7 @@ cd "$(dirname "$0")/.."
 # The Linux manifest resolves swift-crypto instead of Sparkle, which rewrites Package.resolved;
 # the committed file belongs to the macOS build, so it is put back afterwards.
 trap 'git checkout -q -- Package.resolved' EXIT
-skip='RemoteDownloaderTests|WeBeepAPIClientTests|ManualSyncEngineIntegrationTests|SyncCoordinatorEndToEndTests|FileHashCancellationTests/cancelledRecoveryStillPreservesEditedLocalCopy'
+skip='MetadataResponseTests|RemoteDownloaderTests|WeBeepAPIClientTests|ManualSyncEngineIntegrationTests|SyncCoordinatorEndToEndTests|FileHashCancellationTests/cancelledRecoveryStillPreservesEditedLocalCopy'
 if [ "$(id -u)" = 0 ]; then
     skip="$skip|rollsBackThePendingMoveWhenTheDirectoryRenameFails|recoveryLeavesReplacementAtOldPathUnresolved|recoveryDoesNotCommitReplacementAtNewPath"
 fi

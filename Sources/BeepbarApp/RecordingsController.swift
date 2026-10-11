@@ -11,6 +11,7 @@ enum RecordingsProblem: Equatable {
     case incomplete
     case yearUnavailable
     case playbackUnavailable
+    case historyUnavailable
 
     init(_ error: Error) {
         switch error as? RecmanBrowserError {
@@ -28,6 +29,7 @@ enum RecordingsProblem: Equatable {
         case .unrecognized: tr("L'archivio delle registrazioni è diverso dal solito e BeepBar non riesce a leggerlo.", "The recordings archive looks different from usual and BeepBar can't read it.")
         case .incomplete: tr("L'elenco è arrivato incompleto. Riprova tra poco.", "The list came back incomplete. Try again shortly.")
         case .yearUnavailable: tr("L'archivio non ha ancora le registrazioni di quest'anno accademico.", "The archive doesn't have this academic year's recordings yet.")
+        case .historyUnavailable: tr("Non è stato possibile salvare lo stato delle registrazioni. Riprova.", "Couldn’t save recording history. Try again.")
         case .playbackUnavailable: tr("Non è stato possibile aprire questa registrazione.", "Couldn't open this recording.")
         }
     }
@@ -52,6 +54,10 @@ struct RecordingsListing: Equatable {
     var isLoading = false
     var problem: RecordingsProblem?
     var updatedAt: Date?
+    /// Membership snapshot paired with this exact successfully loaded list.
+    var seenIDs: Set<String>?
+    /// A successful acknowledgement cannot turn a failed list refresh into a fresh one.
+    var historyReadFailed = false
 }
 
 /// The Recordings feature: the switch in Settings, the Polimi session, and the recordings of the
@@ -60,13 +66,21 @@ struct RecordingsListing: Equatable {
 /// Promises this class keeps, each guarded by `RecordingsControllerTests`:
 /// - **On by default for Polimi, and gone when off.** Turning it off, disconnecting the WeBeep account or
 ///   switching university (`turnOff()`) closes the browser and deletes the saved session and
-///   its notification settings. Personal study choices remain account-scoped. Another WeBeep account never inherits a Polimi session:
+///   its notification settings and history (an opaque reset namespace remains). Personal study choices
+///   remain account-scoped. Another WeBeep account never inherits a Polimi session:
 ///   the saved one names its owner and is dropped when the known account differs.
 /// - **Quiet at rest.** Nothing runs and no file is read until the Recordings page is shown or a
 ///   sign-in starts; the browser is closed as soon as the page is gone, unless a sign-in is on
 ///   screen. Nothing here takes part in quitting or in `expireCredential()`.
 /// - **Nothing new writes nothing.** The session file is rewritten only when its cookies changed,
 ///   and the seen-recordings lists only when a recording is first seen or opened.
+/// - **The session file never touches the main actor (#97).** It is read, written and deleted by
+///   `RecmanSessionVault`, off the main actor and in call order; it is read once per opening cycle,
+///   and a save that began before turn-off, logout or an account change is refused at commit
+///   time, so a late save can't bring the deleted session back. The delete itself finishes
+///   after turn-off, logout or an account change has returned: if the process ends first, the
+///   file survives until the next discard, and the owner check on the next read still refuses
+///   it to another account. Quitting never waits for it (see the quit rules in AGENTS.md).
 /// - **One request at a time, and never a stale one.** A single worker drains a queue (opening a
 ///   recording first, then the selected course, then the others for their badges). Turning off,
 ///   signing in and closing the page bump `generation`; a task from an older generation never
@@ -78,8 +92,8 @@ struct RecordingsListing: Equatable {
     static let enabledKey = "io.github.tvaccari.beepbar.recordings-enabled.v1"
     static let acknowledgedKey = "io.github.tvaccari.beepbar.recordings-acknowledged.v1"
     static let baselinedKey = "io.github.tvaccari.beepbar.recordings-baselined.v1"
-    /// Oldest ids are forgotten first; a semester of every course stays well below this.
-    static let acknowledgedLimit = 5_000
+    /// Durable reset tombstone: a failed file removal can never reuse the old namespace.
+    static let historyNamespaceKey = "io.github.tvaccari.beepbar.recordings-history-namespace.v2"
     /// A course shown again within this time isn't asked for again unless the user refreshes.
     static let freshness: TimeInterval = 300
 
@@ -92,12 +106,20 @@ struct RecordingsListing: Equatable {
     @Published private(set) var openingRecordingID: String?
     /// Why the last attempt to open a recording failed, until the next one.
     @Published private(set) var openingProblem: RecordingsProblem?
-    @Published private(set) var acknowledged: Set<String>
-    private var acknowledgedOrder: [String]
-    private var baselined: Set<String>
+    private var seenHistory: RecordingsSeenHistory
+    private let makeSeenHistory: @MainActor (UUID?) -> RecordingsSeenHistory
+    private var historyResetTask: Task<Void, Never>?
+    private var historyRevision: [RecmanCourseKey: Int] = [:]
+    private var pendingAcknowledgements: [UUID: RecmanCourseKey] = [:]
+    /// Coalesce repeated clicks while the same IDs are being committed; no duplicate task queue.
+    private var pendingAcknowledgementIDs: [RecmanCourseKey: Set<String>] = [:]
+    private var legacyOwner: Int?
+    private var legacySeen: RecordingsSeenStore.Legacy
 
     private let makeBrowser: @MainActor () -> RecmanBrowsing
     private let store: RecordingsSessionStore
+    /// Every run-time read, write and delete of the session file goes through here.
+    private let vault: RecmanSessionVault
     private let defaults: UserDefaults
     private let ownerUserID: @MainActor () -> Int?
     private let isAvailable: @MainActor () -> Bool
@@ -110,8 +132,19 @@ struct RecordingsListing: Equatable {
     /// The WeBeep account the cookies in the browser belong to: read from the saved session, or
     /// the account connected when the user signed in. The session is saved under this id only.
     private var sessionOwner: Int?
-    /// What the session file holds, so an unchanged session isn't written again.
-    private var savedFingerprint: [String]?
+    /// The saved session as read for the current opening cycle, shared by the first visit's check,
+    /// the worker and a sign-in so the file is read once, not once per caller. Forgotten when the
+    /// browser closes (the next opening reads again), when the file is discarded, after a save
+    /// wrote new cookies, and after a read error (kept for the next try).
+    private var sessionLoad: (id: Int, task: Task<[HTTPCookie], Never>)?
+    /// Identifies each read, so a failed one clears the cache only if it is still the cached one.
+    private var sessionLoads = 0
+    /// The first visit's check of the saved session, while it is reading the file. Until it answers
+    /// nothing opens the browser: without a reusable session the page asks for a sign-in instead,
+    /// as when the check was synchronous. Sign-in, turn-off and an account change supersede it.
+    private var initialSessionCheck: Int?
+    /// Identifies each first-visit check, so a superseded one can't apply its answer.
+    private var initialSessionChecks = 0
     /// Webex players already found, so opening a recording again is instant.
     private var playbackURLs: [String: URL] = [:]
 
@@ -136,6 +169,7 @@ struct RecordingsListing: Equatable {
         makeBrowser: @escaping @MainActor () -> RecmanBrowsing = { RecmanWebSession() },
         store: RecordingsSessionStore = .standard,
         defaults: UserDefaults,
+        makeSeenHistory: (@MainActor (UUID?) -> RecordingsSeenHistory)? = nil,
         ownerUserID: @escaping @MainActor () -> Int?,
         isAvailable: @escaping @MainActor () -> Bool,
         openURL: @escaping @MainActor (URL) -> Void = { NSWorkspace.shared.open($0) },
@@ -147,6 +181,21 @@ struct RecordingsListing: Equatable {
     ) {
         self.makeBrowser = makeBrowser
         self.store = store
+        self.vault = RecmanSessionVault(storage: .init(load: { try store.load() }, save: { try store.save($0) }, delete: { try store.delete() }))
+        let historyFactory = makeSeenHistory ?? { namespace in
+            RecordingsSeenHistory(store: RecordingsSeenStore(directory: store.directory, namespace: namespace))
+        }
+        self.makeSeenHistory = historyFactory
+        let savedNamespace = defaults.string(forKey: Self.historyNamespaceKey)
+        let namespace = savedNamespace.flatMap(UUID.init(uuidString:))
+        if savedNamespace != nil && namespace == nil {
+            // An invalid tombstone must not fall back to the pre-reset canonical database.
+            let replacement = UUID()
+            defaults.set(replacement.uuidString, forKey: Self.historyNamespaceKey)
+            self.seenHistory = historyFactory(replacement)
+        } else {
+            self.seenHistory = historyFactory(namespace)
+        }
         self.defaults = defaults
         self.ownerUserID = ownerUserID
         self.isAvailable = isAvailable
@@ -158,9 +207,7 @@ struct RecordingsListing: Equatable {
         let enabled = (defaults.object(forKey: Self.enabledKey) as? Bool ?? true) && isAvailable()
         isEnabled = enabled
         access = enabled ? .ready : .off
-        acknowledgedOrder = enabled ? defaults.stringArray(forKey: Self.acknowledgedKey) ?? [] : []
-        acknowledged = Set(acknowledgedOrder)
-        baselined = enabled ? Set(defaults.stringArray(forKey: Self.baselinedKey) ?? []) : []
+        legacySeen = .init(ids: enabled ? defaults.stringArray(forKey: Self.acknowledgedKey) ?? [] : [], baselines: enabled ? defaults.stringArray(forKey: Self.baselinedKey) ?? [] : [])
     }
 
     // MARK: Personal study state
@@ -242,10 +289,12 @@ struct RecordingsListing: Equatable {
         }
     }
 
-    /// Browser closed and session forgotten; account-scoped study choices survive disabling the feature.
+    /// Browser closed and session/history forgotten; a persisted opaque namespace prevents reuse
+    /// if history cleanup fails. Account-scoped study choices survive disabling the feature.
     /// Also called when the WeBeep account is disconnected or the university changes, whether or
     /// not the feature was on, so no session outlives the account it was made for.
     func turnOff() {
+        supersedeInitialSessionCheck()
         invalidate()
         closeBrowser()
         isEnabled = false
@@ -269,6 +318,7 @@ struct RecordingsListing: Equatable {
     func signIn() {
         guard isEnabled, access != .signingIn else { return }
         hasCheckedInitialSession = true
+        supersedeInitialSessionCheck()
         invalidate()
         access = .signingIn
         let generation = self.generation
@@ -277,7 +327,9 @@ struct RecordingsListing: Equatable {
 
     private func runSignIn(_ generation: Int) async {
         let browser = currentBrowser()
-        await browser.open(cookies: savedCookies())
+        let cookies = await savedCookies()
+        guard generation == self.generation else { return }
+        await browser.open(cookies: cookies)
         guard generation == self.generation else { return }
         do {
             try await browser.signIn()
@@ -312,6 +364,7 @@ struct RecordingsListing: Equatable {
         loadStudy()
         guard let sessionOwner, sessionOwner != userID else { return }
         log.notice("Polimi session belongs to another WeBeep account: dropped")
+        supersedeInitialSessionCheck()
         invalidate()
         closeBrowser()
         listings = [:]
@@ -330,7 +383,27 @@ struct RecordingsListing: Equatable {
         // can open WebKit. Later visits must preserve a session established by explicit sign-in.
         guard isEnabled, access == .ready, !hasCheckedInitialSession else { return }
         hasCheckedInitialSession = true
-        if savedCookies().isEmpty { access = .needsSignIn(nil) }
+        initialSessionChecks += 1
+        let check = initialSessionChecks
+        initialSessionCheck = check
+        // Not tied to `generation`: closing the page while the file is read must not lose the
+        // answer, or the next visit would open the browser without a session to show.
+        Task { [weak self] in
+            guard let self else { return }
+            let cookies = await self.savedCookies()
+            guard self.initialSessionCheck == check else { return }
+            self.initialSessionCheck = nil
+            guard self.isEnabled, self.access == .ready else { return }
+            if cookies.isEmpty {
+                self.clearQueue()
+                self.access = .needsSignIn(nil)
+                return
+            }
+            // What the page asked for while the file was read. No `force` to carry over: this is
+            // the first visit, so nothing has been listed yet and every key loads anyway.
+            if self.visiblePages > 0 { self.enqueue(self.pageKeys, selected: self.selectedKey, force: false) }
+            self.startWorker()
+        }
     }
 
     /// Deferred by one main-actor turn: a language switch rebuilds the page, which disappears and
@@ -366,6 +439,8 @@ struct RecordingsListing: Equatable {
         pageKeys = keys
         selectedKey = selected
         guard access == .ready else { return }
+        // The initial check enqueues these keys itself once it knows a session exists.
+        guard initialSessionCheck == nil else { return }
         enqueue(keys, selected: selected, force: force)
     }
 
@@ -400,7 +475,7 @@ struct RecordingsListing: Equatable {
 
     private func finishOpening(_ recording: RecmanRecording, url: URL, action: OpenAction) {
         if openingRecordingID == recording.id { openingRecordingID = nil }
-        acknowledge([recording.id])
+        if let key = RecmanCourseKey(courseCode: recording.courseCode, academicYear: recording.academicYear) { scheduleAcknowledge([recording.id], for: key, opening: openingRequest) }
         switch action {
         case .play: openURL(url)
         case .copyLink: copy(url)
@@ -409,40 +484,119 @@ struct RecordingsListing: Equatable {
 
     // MARK: New recordings
 
+    /// Pure memory lookup: a list is published only with its matching membership snapshot.
+    /// No disk read, lazy migration or aggregate scan runs from SwiftUI row evaluation.
     func isNew(_ recording: RecmanRecording) -> Bool {
-        baselined.contains(Self.baselineID(courseCode: recording.courseCode, academicYear: recording.academicYear)) && !acknowledged.contains(recording.id)
+        guard let key = RecmanCourseKey(courseCode: recording.courseCode, academicYear: recording.academicYear),
+              let seen = listings[key]?.seenIDs else { return false }
+        return !seen.contains(recording.id)
     }
 
     func newCount(for key: RecmanCourseKey) -> Int {
-        listings[key]?.recordings?.filter(isNew).count ?? 0
+        guard let listing = listings[key], let seen = listing.seenIDs else { return 0 }
+        return listing.recordings?.reduce(0) { $0 + (seen.contains($1.id) ? 0 : 1) } ?? 0
     }
 
-    /// "Segna come viste": the course's dots go away without opening every recording.
+    /// Dots clear after the serialized worker commits their durable acknowledgement.
     func markSeen(_ key: RecmanCourseKey) {
-        acknowledge(listings[key]?.recordings?.map(\.id) ?? [])
+        scheduleAcknowledge(listings[key]?.recordings?.map(\.id) ?? [], for: key)
     }
 
     nonisolated static func baselineID(courseCode: String, academicYear: Int) -> String {
         "\(courseCode)-\(academicYear)"
     }
 
-    private func acknowledge(_ ids: [String]) {
-        let added = ids.filter { !acknowledged.contains($0) }
+    private func scheduleAcknowledge(_ ids: [String], for key: RecmanCourseKey, opening: Int? = nil) {
+        guard let owner = sessionOwner ?? ownerUserID(), !ids.isEmpty else { return }
+        let pending = pendingAcknowledgementIDs[key] ?? []
+        let added = ids.filter { !(listings[key]?.seenIDs?.contains($0) ?? false) && !pending.contains($0) }
         guard !added.isEmpty else { return }
-        acknowledgedOrder.append(contentsOf: added)
-        if acknowledgedOrder.count > Self.acknowledgedLimit {
-            acknowledgedOrder.removeFirst(acknowledgedOrder.count - Self.acknowledgedLimit)
+        let history = seenHistory
+        let generation = self.generation
+        let legacy = legacy(for: owner)
+        let reset = historyResetTask
+        let operation = UUID()
+        pendingAcknowledgements[operation] = key
+        pendingAcknowledgementIDs[key, default: []].formUnion(added)
+        Task { [weak self] in
+            guard let self else { return }
+            defer {
+                // A reset removes the operation token; its old completion must not subtract
+                // IDs belonging to a later account's acknowledgement of the same course.
+                if self.pendingAcknowledgements.removeValue(forKey: operation) != nil {
+                    self.pendingAcknowledgementIDs[key]?.subtract(added)
+                    if self.pendingAcknowledgementIDs[key]?.isEmpty == true { self.pendingAcknowledgementIDs.removeValue(forKey: key) }
+                }
+            }
+            await reset?.value
+            // Explicit user acknowledgements persist when the page closes, but never after
+            // an account/reset boundary. Their fixed scoped IDs remain valid across page generations.
+            guard self.isCurrentIdentity(history, owner: owner) else { return }
+            do {
+                try await history.acknowledge(owner: owner, key: key, ids: added, legacy: legacy)
+                guard self.isCurrentIdentity(history, owner: owner) else { return }
+                self.discardLegacyDefaults()
+                self.historyRevision[key, default: 0] += 1
+                // Explicit acknowledgement IDs belong to this account/course, so they remain
+                // valid across page generations (close/reopen). Never publish old browser/list
+                // results here: only merge the committed IDs into a current matching snapshot.
+                // Opening before the first listing still does not establish a baseline.
+                if self.listings[key]?.seenIDs != nil { self.listings[key]?.seenIDs?.formUnion(added) }
+                if self.listings[key]?.historyReadFailed != true, self.listings[key]?.problem == .historyUnavailable { self.listings[key]?.problem = nil }
+            } catch {
+                guard self.isCurrentHistory(history, owner: owner, generation: generation) else { return }
+                self.listings[key]?.problem = .historyUnavailable
+                if let opening, opening == self.openingRequest { self.openingProblem = .historyUnavailable }
+                self.log.error("Couldn't save recording history")
+            }
         }
-        acknowledged = Set(acknowledgedOrder)
-        defaults.set(acknowledgedOrder, forKey: Self.acknowledgedKey)
+    }
+
+    /// Validate both identity and lifecycle after every await, before publishing or scheduling
+    /// another operation. The old actor is also invalidated at reset, so queued writes reject.
+    private func isCurrentHistory(_ history: RecordingsSeenHistory, owner: Int, generation: Int) -> Bool {
+        self.generation == generation && isCurrentIdentity(history, owner: owner)
+    }
+
+    private func isCurrentIdentity(_ history: RecordingsSeenHistory, owner: Int) -> Bool {
+        isEnabled && seenHistory === history && (sessionOwner ?? ownerUserID()) == owner &&
+            (ownerUserID() == nil || ownerUserID() == owner)
+    }
+
+    /// Import only history whose saved session verified this account. A failed session read
+    /// preserves v1 for retry, but does not authorize attaching it to a later fresh sign-in.
+    private func legacy(for owner: Int) -> RecordingsSeenStore.Legacy {
+        legacyOwner == owner ? legacySeen : .init(ids: [], baselines: [])
+    }
+
+    /// v1 keys are removed only after the SQLite migration committed. Keeping legacySeen in
+    /// memory until reset lets a failed first migration retry without losing surviving IDs.
+    private func discardLegacyDefaults() {
+        for key in [Self.acknowledgedKey, Self.baselinedKey] where defaults.object(forKey: key) != nil { defaults.removeObject(forKey: key) }
     }
 
     private func forgetSeen() {
-        acknowledgedOrder = []
-        acknowledged = []
-        baselined = []
+        for key in listings.keys { listings[key]?.seenIDs = nil }
+        historyRevision = [:]
+        pendingAcknowledgements = [:]
+        pendingAcknowledgementIDs = [:]
+        legacySeen = .init(ids: [], baselines: [])
+        legacyOwner = nil
         defaults.removeObject(forKey: Self.acknowledgedKey)
         defaults.removeObject(forKey: Self.baselinedKey)
+        // Rotate the persisted namespace before asynchronous cleanup. Removal can fail, but
+        // neither re-enable nor restart ever reads that previous namespace again (#106).
+        let namespace = UUID()
+        defaults.set(namespace.uuidString, forKey: Self.historyNamespaceKey)
+        let previous = seenHistory
+        previous.invalidate()
+        let reset = historyResetTask
+        seenHistory = makeSeenHistory(namespace)
+        historyResetTask = Task { [log] in
+            await reset?.value
+            do { try await previous.invalidateAndDelete() }
+            catch { log.error("Couldn't delete obsolete recording history; next use retries cleanup") }
+        }
     }
 
     // MARK: Worker
@@ -450,6 +604,7 @@ struct RecordingsListing: Equatable {
     private func needsLoad(_ key: RecmanCourseKey, force: Bool) -> Bool {
         if key == runningKey { return false }
         if force || queue.contains(.list(key)) { return true }
+        if listings[key]?.problem == .historyUnavailable { return true }
         guard let updatedAt = listings[key]?.updatedAt else { return true }
         return now().timeIntervalSince(updatedAt) > Self.freshness
     }
@@ -477,7 +632,7 @@ struct RecordingsListing: Equatable {
     }
 
     private func startWorker() {
-        guard worker == nil, access == .ready, !queue.isEmpty else { return }
+        guard worker == nil, access == .ready, initialSessionCheck == nil, !queue.isEmpty else { return }
         let generation = self.generation
         worker = Task { [weak self] in await self?.drain(generation) }
     }
@@ -486,7 +641,11 @@ struct RecordingsListing: Equatable {
 
     private func drain(_ generation: Int) async {
         let browser = currentBrowser()
-        if !browser.isOpen { await browser.open(cookies: savedCookies()) }
+        if !browser.isOpen {
+            let cookies = await savedCookies()
+            guard generation == self.generation else { return }
+            await browser.open(cookies: cookies)
+        }
         guard generation == self.generation else { return }
         var succeeded = false
         var saves = true
@@ -498,8 +657,9 @@ struct RecordingsListing: Equatable {
                     runningKey = key
                     let recordings = try await browser.recordings(for: key)
                     guard generation == self.generation else { return }
+                    await record(recordings, for: key, generation: generation)
+                    guard generation == self.generation else { return }
                     runningKey = nil
-                    record(recordings, for: key)
                 case .open(let recording, let action, let request):
                     let url: URL
                     if let cached = playbackURLs[recording.id] {
@@ -530,19 +690,45 @@ struct RecordingsListing: Equatable {
         startWorker()
     }
 
-    private func record(_ recordings: [RecmanRecording], for key: RecmanCourseKey) {
-        var listing = listings[key] ?? RecordingsListing()
-        listing.recordings = recordings
-        listing.isLoading = queue.contains(.list(key))
-        listing.problem = nil
-        listing.updatedAt = now()
-        listings[key] = listing
-        updateStudy { $0.reconcile(recordings, for: key) }
-        let baseline = Self.baselineID(courseCode: key.courseCode, academicYear: key.academicYear)
-        if !baselined.contains(baseline) {
-            baselined.insert(baseline)
-            defaults.set(baselined.sorted(), forKey: Self.baselinedKey)
-            acknowledge(recordings.map(\.id))
+    private func record(_ recordings: [RecmanRecording], for key: RecmanCourseKey, generation: Int) async {
+        guard let owner = sessionOwner ?? ownerUserID() else {
+            listings[key]?.isLoading = false
+            listings[key]?.problem = .historyUnavailable
+            return
+        }
+        let history = seenHistory
+        let legacy = legacy(for: owner)
+        await historyResetTask?.value
+        guard isCurrentHistory(history, owner: owner, generation: generation) else { return }
+        do {
+            let ids = recordings.map(\.id)
+            var seen: Set<String>
+            while true {
+                let revision = historyRevision[key, default: 0]
+                seen = try await history.seen(owner: owner, key: key, ids: ids, legacy: legacy)
+                guard isCurrentHistory(history, owner: owner, generation: generation) else { return }
+                // An acknowledgement can commit/publish while this snapshot returns. Requery
+                // rather than overwrite that newer state with an older membership snapshot.
+                if historyRevision[key, default: 0] == revision { break }
+            }
+            discardLegacyDefaults()
+            var listing = listings[key] ?? RecordingsListing()
+            listing.recordings = recordings
+            listing.seenIDs = seen
+            listing.historyReadFailed = false
+            listing.isLoading = queue.contains(.list(key))
+            listing.problem = nil
+            listing.updatedAt = now()
+            // Publish the list and its history together. A failed refresh retains the previous
+            // pair, so a newly returned list cannot use an incomplete/stale membership cache.
+            listings[key] = listing
+            updateStudy { $0.reconcile(recordings, for: key) }
+        } catch {
+            guard isCurrentHistory(history, owner: owner, generation: generation) else { return }
+            listings[key, default: RecordingsListing()].isLoading = queue.contains(.list(key))
+            listings[key]?.problem = .historyUnavailable
+            listings[key]?.historyReadFailed = true
+            log.error("Couldn't load recording history")
         }
     }
 
@@ -593,8 +779,17 @@ struct RecordingsListing: Equatable {
         }
     }
 
+    /// Sign-in, turn-off and an account change decide access themselves: the first visit's check
+    /// must not overrule them when its read finishes.
+    private func supersedeInitialSessionCheck() {
+        initialSessionCheck = nil
+    }
+
     /// Stops the worker and any sign-in for good: they belong to an older generation from now on.
     private func invalidate() {
+        // A pending explicit acknowledgement may commit after the page closes. Its old
+        // generation cannot publish, so force a history reload when this list returns.
+        for key in pendingAcknowledgements.values { listings[key]?.updatedAt = nil }
         generation += 1
         worker?.cancel()
         worker = nil
@@ -615,27 +810,53 @@ struct RecordingsListing: Equatable {
     private func closeBrowser() {
         browser?.close()
         browser = nil
+        sessionLoad = nil
     }
 
     /// The saved session's cookies, checked against the WeBeep account. A file that can't be
     /// decoded, or that belongs to another known account, is deleted; one that can't be read
-    /// right now (a disk error) is kept for the next try.
-    private func savedCookies() -> [HTTPCookie] {
-        let data: Data?
-        do {
-            data = try store.load()
-        } catch {
-            log.error("Couldn't read the saved Polimi session")
-            return []
+    /// right now (a disk error) is kept for the next try. Read off the main actor, once per
+    /// opening cycle: later callers in the same cycle share the first read.
+    private func savedCookies() async -> [HTTPCookie] {
+        if let sessionLoad { return await sessionLoad.task.value }
+        sessionLoads += 1
+        let id = sessionLoads
+        // Read before the load is enqueued: a discard after this point makes the answer stale.
+        let epoch = vault.epoch
+        let read = vault.load(now: now())
+        let task = Task { [weak self] () -> [HTTPCookie] in
+            let outcome = await read.value
+            guard let self else { return [] }
+            return self.adopt(outcome, epoch: epoch, load: id)
         }
-        guard let data else { return [] }
+        sessionLoad = (id, task)
+        return await task.value
+    }
+
+    /// Applies a finished read on the main actor, unless turn-off, logout or an account change
+    /// discarded the session since it started: what was read is being deleted.
+    private func adopt(_ outcome: RecmanSessionVault.LoadOutcome, epoch: Int, load: Int) -> [HTTPCookie] {
+        guard vault.epoch == epoch else { return [] }
         let snapshot: RecmanSessionCodec.Snapshot
-        do {
-            snapshot = try RecmanSessionCodec.decode(data, now: now())
-        } catch {
+        switch outcome {
+        case .unreadable:
+            log.error("Couldn't read the saved Polimi session")
+            if sessionLoad?.id == load { sessionLoad = nil }
+            return []
+        case .none:
+            // v1 history has no owner. Without a verifiable saved session, attaching it to
+            // the next sign-in could leak another student’s state; v2 is already scoped.
+            legacySeen = .init(ids: [], baselines: [])
+            discardLegacyDefaults()
+            return []
+        case .undecodable:
             log.notice("Saved Polimi session unreadable: dropped")
+            legacySeen = .init(ids: [], baselines: [])
+            discardLegacyDefaults()
             discardSessionFile()
             return []
+        case .session(let saved):
+            snapshot = saved
         }
         if let current = ownerUserID(), current != snapshot.ownerUserID {
             log.notice("Saved Polimi session belongs to another WeBeep account: dropped")
@@ -646,14 +867,20 @@ struct RecordingsListing: Equatable {
             return []
         }
         sessionOwner = snapshot.ownerUserID
-        savedFingerprint = Self.fingerprint(snapshot.cookies)
+        legacyOwner = snapshot.ownerUserID
         return snapshot.cookies
     }
 
     /// Saves the browser's session after a success, under the account it belongs to, unless it
-    /// is what the file already holds.
+    /// is what the file already holds. The vault epoch is read before awaiting WebKit: a turn-off,
+    /// logout or account change from then on makes this save stale, and the vault refuses it at
+    /// commit time even after the guards below have passed. Today those paths also bump
+    /// `generation`, which stops the save first, and `adopt`'s own discards can't land in this
+    /// window (this cycle's read has already finished, after every earlier one). The epoch is the
+    /// guarantee that doesn't depend on either, so no test can fail without it yet.
     private func saveSession(_ generation: Int) async {
         guard let browser else { return }
+        let epoch = vault.epoch
         let cookies = await browser.cookies()
         // The feature may have been turned off, or the page closed, while WebKit answered.
         guard generation == self.generation, isEnabled else { return }
@@ -665,31 +892,35 @@ struct RecordingsListing: Equatable {
             webBeepAccountChanged(to: current)
             return
         }
-        let fingerprint = Self.fingerprint(cookies.filter { RecmanSessionCodec.keeps($0, now: now()) })
-        guard fingerprint != savedFingerprint else { return }
-        do {
-            try store.save(RecmanSessionCodec.encode(cookies, ownerUserID: owner, now: now()))
-            savedFingerprint = fingerprint
-        } catch {
-            log.error("Couldn't save the Polimi session errorType=\(String(reflecting: type(of: error)), privacy: .public)")
+        switch await vault.save(cookies, ownerUserID: owner, epoch: epoch, now: now()).value {
+        case .saved:
+            // The cycle's cached read now describes an older file.
+            sessionLoad = nil
+        case .unchanged:
+            break
+        case .stale:
+            log.notice("Polimi session not saved: discarded while saving")
+        case .failed(let errorType):
+            log.error("Couldn't save the Polimi session errorType=\(errorType, privacy: .public)")
         }
     }
 
+    /// Bumps the vault epoch now, so every save already under way is refused, and deletes the
+    /// file in turn, off the main actor.
     private func discardSessionFile() {
         sessionOwner = nil
-        savedFingerprint = nil
-        do {
-            try store.delete()
-        } catch {
-            log.error("Couldn't delete the saved Polimi session errorType=\(String(reflecting: type(of: error)), privacy: .public)")
+        sessionLoad = nil
+        let delete = vault.discard()
+        Task { [log] in
+            if case .failed(let errorType) = await delete.value {
+                log.error("Couldn't delete the saved Polimi session errorType=\(errorType, privacy: .public)")
+            }
         }
     }
 
-    /// What decides whether the file needs rewriting: every cookie attribute that is saved.
-    nonisolated static func fingerprint(_ cookies: [HTTPCookie]) -> [String] {
-        cookies.map { cookie in
-            let expiry = cookie.expiresDate.map { String($0.timeIntervalSince1970) } ?? "session"
-            return [cookie.name, cookie.domain, cookie.path, cookie.value, expiry, String(cookie.isSecure), String(cookie.isHTTPOnly)].joined(separator: "\u{1F}")
-        }.sorted()
+    /// Waits until the session file reflects every call made so far. For tests, which read the
+    /// file from outside the vault.
+    func settleSessionFile() async {
+        await vault.settle()
     }
 }

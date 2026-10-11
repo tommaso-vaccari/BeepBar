@@ -162,6 +162,29 @@ struct WorkCountersTests {
         #expect(await store.counters() == FileStoreCounters(filesHashed: 0, bytesHashed: 0, pathLookups: 2))
     }
 
+    /// R03 (#111, PR #142): the bulk existence check of a run with nothing new resolves each
+    /// distinct parent folder once per call, not once per file, and a second call resolves them
+    /// again. Six files in two module folders plus one at the root cost three lookups per call.
+    /// Guards against the check going back to one root-to-folder walk per tracked file (the cost
+    /// R03 removed) and, through the second call, against reusing folders across calls.
+    @Test func bulkExistenceCheckResolvesEachParentOncePerCall() async throws {
+        let root = try temporaryRoot()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let names = ["Analisi/Lezioni/1.pdf", "Fisica/Lezioni/1.pdf", "Analisi/Lezioni/2.pdf", "Analisi/Lezioni/3.pdf", "Fisica/Lezioni/2.pdf", "programma.pdf"]
+        for name in names {
+            let url = root.appending(path: name)
+            try FileManager.default.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
+            try Data("x".utf8).write(to: url)
+        }
+        let paths = try names.map { try RelativePath($0) }
+        let store = try FileStore(root: root) { _ in }
+
+        #expect(try await store.existingRegularFiles(paths).count == 6)
+        #expect(await store.counters().pathLookups == 3)
+        #expect(try await store.existingRegularFiles(paths).count == 6)
+        #expect(await store.counters() == FileStoreCounters(filesHashed: 0, bytesHashed: 0, pathLookups: 6))
+    }
+
     /// `since` subtracts field by field, so a measured window excludes everything before it.
     @Test func sinceSubtractsEveryField() {
         #expect(SyncDatabaseWriteCounters(rowChanges: 9, commits: 5, pagesWritten: 7).since(SyncDatabaseWriteCounters(rowChanges: 4, commits: 2, pagesWritten: 3)) == SyncDatabaseWriteCounters(rowChanges: 5, commits: 3, pagesWritten: 4))

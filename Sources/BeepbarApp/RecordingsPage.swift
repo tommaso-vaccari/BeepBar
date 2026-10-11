@@ -499,6 +499,7 @@ private struct CourseRecordings: View {
                             toggleWatchlist: { recordings.toggleWatchlist(recording, courseName: name) },
                             play: { recordings.play(recording) }
                         )
+                        .uiContentReady(.recordings, enabled: recording.id == shown.first?.id)
                         .tag(recording.id)
                     }
                 }

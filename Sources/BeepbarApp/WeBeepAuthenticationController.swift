@@ -489,7 +489,15 @@ struct MenuBarSnapshot: Sendable {
         didSet {
             // Only a controller that already exists can hold another account's session; one
             // created later checks the saved session's owner when it reads it.
-            if let userID = siteInfo?.userID, userID != oldValue?.userID { recordingsStorage?.webBeepAccountChanged(to: userID) }
+            if let userID = siteInfo?.userID, userID != oldValue?.userID {
+                if let recordingsStorage {
+                    recordingsStorage.webBeepAccountChanged(to: userID)
+                } else {
+                    // Nothing created Recordings in this launch, but the previous account's
+                    // places in lectures may still be stored: they go with the account (#148).
+                    RecordingsController.forgetResumePoints(in: operationDefaults, notOwnedBy: userID)
+                }
+            }
         }
     }
     private var database: SyncDatabase?
@@ -551,6 +559,8 @@ struct MenuBarSnapshot: Sendable {
 #if DEBUG
     private var recordingsStoreForTesting: RecordingsSessionStore?
     private var recordingsBrowserForTesting: (@MainActor () -> RecmanBrowsing)?
+    /// Set by a test before the first use of `recordings`; the real player is never built in tests.
+    var recordingsPlayerForTesting: (@MainActor () -> RecordingPlaying)?
     private var beforeReconciliationStateForTesting: (@MainActor () async -> Void)?
     /// Whether the last sync result to be encoded was encoded on the main thread; nil until one
     /// is (R01, #109). Set by the pre-encode in `finishReconciliation` and by the inline
@@ -957,7 +967,9 @@ struct MenuBarSnapshot: Sendable {
     private func makeRecordings() -> RecordingsController {
         var store = RecordingsSessionStore.standard
         var makeBrowser: @MainActor () -> RecmanBrowsing = { RecmanWebSession() }
+        var makePlayer: @MainActor () -> RecordingPlaying = { RecordingPlayerController() }
 #if DEBUG
+        if let recordingsPlayerForTesting { makePlayer = recordingsPlayerForTesting }
         if let recordingsStoreForTesting { store = recordingsStoreForTesting }
         if let recordingsBrowserForTesting { makeBrowser = recordingsBrowserForTesting }
 #endif
@@ -972,7 +984,9 @@ struct MenuBarSnapshot: Sendable {
             store: store,
             defaults: operationDefaults,
             ownerUserID: { [weak self] in self?.recordingsOwnerUserID },
-            isAvailable: { [weak self] in self?.selectedSite.university == .polimi }
+            isAvailable: { [weak self] in self?.selectedSite.university == .polimi },
+            makePlayer: makePlayer,
+            fetchProfileEmail: { [weak self] in await self?.profileEmail() }
         )
 #if DEBUG
         if Self.isUIPreview && ProcessInfo.processInfo.arguments.contains("--watchlist-preview") {
@@ -988,6 +1002,23 @@ struct MenuBarSnapshot: Sendable {
         }
 #endif
         return controller
+    }
+
+    /// The address on the WeBeep profile, to offer in the Recordings settings for confirmation
+    /// (#148). Asked only when the site lists the function for this token. Every failure (no
+    /// function, no token, offline, an odd answer) is nil: the student then types the address, and
+    /// nothing reaches the sync status or the log. The address is personal data and is never
+    /// logged here.
+    private func profileEmail() async -> String? {
+        guard let info = siteInfo, info.availableFunctions.contains(WeBeepAPIClient.ownEmailFunction) else { return nil }
+        do {
+            let token = try await credentialVault.load(.nonInteractive)
+            let address = try await apiClient.fetchOwnEmail(userID: info.userID, token: token)
+            // Another account may have signed in while WeBeep answered: its address is not ours to offer.
+            return siteInfo?.userID == info.userID ? address : nil
+        } catch {
+            return nil
+        }
     }
 
 #if DEBUG
@@ -1283,6 +1314,26 @@ struct MenuBarSnapshot: Sendable {
         return refresh
     }
 
+    /// What `chooseRoot` does with the activation policy once its folder panel is closed.
+    enum PanelPolicyOutcome: Equatable {
+        /// Put `previous` back: the panel raised BeepBar and nothing else has since.
+        case restore
+        /// A lecture window is open: leave BeepBar regular and let the player restore `previous`
+        /// when it closes.
+        case handToPlayer
+        /// Not ours to change: the panel didn't raise BeepBar, or someone else changed the policy
+        /// since.
+        case leave
+    }
+
+    /// Pure, so it is tested without a panel. Restores only if BeepBar is still `.regular` (the
+    /// state `chooseRoot` itself set), never over a policy someone else chose meanwhile, and never
+    /// under an open lecture window (#148).
+    nonisolated static func panelPolicyOutcome(previous: NSApplication.ActivationPolicy, current: NSApplication.ActivationPolicy, playerOpen: Bool) -> PanelPolicyOutcome {
+        guard previous != .regular, current == .regular else { return .leave }
+        return playerOpen ? .handToPlayer : .restore
+    }
+
     func chooseRoot() {
         let panel = NSOpenPanel()
         panel.title = tr("Scegli la cartella dei materiali BeepBar", "Choose the BeepBar materials folder")
@@ -1299,9 +1350,19 @@ struct MenuBarSnapshot: Sendable {
         if previousPolicy != .regular { NSApp.setActivationPolicy(.regular) }
         NSApp.activate(ignoringOtherApps: true)
         let response = panel.runModal()
-        if previousPolicy != .regular {
+        // `runModal` keeps servicing main-actor jobs, so a Lecture Play can open the native
+        // player meanwhile. Putting `.accessory` back unconditionally would then drop the Dock
+        // icon from under the lecture window (#148).
+        let lectureOpen = recordingsIfCreated?.isPlayerOpen ?? false
+        switch Self.panelPolicyOutcome(previous: previousPolicy, current: NSApp.activationPolicy(), playerOpen: lectureOpen) {
+        case .restore:
             NSApp.setActivationPolicy(previousPolicy)
             NSApp.activate(ignoringOtherApps: true)
+        case .handToPlayer:
+            // The player restores it when the lecture closes.
+            recordingsIfCreated?.keepPolicyAfterLecture(previousPolicy)
+        case .leave:
+            break
         }
         guard response == .OK, let url = panel.url else { return }
         // Registered by its resolved path, so the same folder reached through a symlink (the folder

@@ -119,12 +119,12 @@ struct RecmanSessionVaultTests {
             disk.hold(.load)
             _ = vault.load(now: now)
             await disk.waitUntilHeld()
-            save = vault.save(cookies("late"), ownerUserID: 42, epoch: epoch, now: now)
+            save = vault.save(cookies("late"), ownerUserID: 42, email: nil, epoch: epoch, now: now)
             vault.discard()
             disk.release()
         } else {
             vault.discard()
-            save = vault.save(cookies("late"), ownerUserID: 42, epoch: epoch, now: now)
+            save = vault.save(cookies("late"), ownerUserID: 42, email: nil, epoch: epoch, now: now)
         }
         #expect(await save.value == .stale)
         await vault.settle()
@@ -135,7 +135,7 @@ struct RecmanSessionVaultTests {
     /// A save in the epoch that followed the discard is current and is written.
     @Test func aSaveAfterADiscardIsWritten() async throws {
         vault.discard()
-        #expect(await vault.save(cookies("new"), ownerUserID: 42, epoch: vault.epoch, now: now).value == .saved)
+        #expect(await vault.save(cookies("new"), ownerUserID: 42, email: nil, epoch: vault.epoch, now: now).value == .saved)
         #expect(try fileValue() == "new")
     }
 
@@ -144,7 +144,7 @@ struct RecmanSessionVaultTests {
     /// held operation would let a reordered chain run the other one first.
     @Test func operationsRunInTheOrderTheyWereEnqueued() async throws {
         disk.hold(.save)
-        let first = vault.save(cookies("a"), ownerUserID: 42, epoch: vault.epoch, now: now)
+        let first = vault.save(cookies("a"), ownerUserID: 42, email: nil, epoch: vault.epoch, now: now)
         await disk.waitUntilHeld()
         let delete = vault.discard()
         disk.release()
@@ -155,7 +155,7 @@ struct RecmanSessionVaultTests {
         disk.hold(.delete)
         let secondDelete = vault.discard()
         await disk.waitUntilHeld()
-        let second = vault.save(cookies("b"), ownerUserID: 42, epoch: vault.epoch, now: now)
+        let second = vault.save(cookies("b"), ownerUserID: 42, email: nil, epoch: vault.epoch, now: now)
         disk.release()
         #expect(await secondDelete.value == .deleted)
         #expect(await second.value == .saved)
@@ -174,13 +174,13 @@ struct RecmanSessionVaultTests {
             }
             #expect(snapshot.ownerUserID == 42)
         } else {
-            #expect(await vault.save(cookies("same"), ownerUserID: 42, epoch: vault.epoch, now: now).value == .saved)
+            #expect(await vault.save(cookies("same"), ownerUserID: 42, email: nil, epoch: vault.epoch, now: now).value == .saved)
         }
         let writes = disk.writes
-        #expect(await vault.save(cookies("same"), ownerUserID: 42, epoch: vault.epoch, now: now).value == .unchanged)
+        #expect(await vault.save(cookies("same"), ownerUserID: 42, email: nil, epoch: vault.epoch, now: now).value == .unchanged)
         #expect(disk.writes == writes)
-        #expect(await vault.save(cookies("same"), ownerUserID: 7, epoch: vault.epoch, now: now).value == .saved, "another owner is a different session")
-        #expect(await vault.save(cookies("renewed"), ownerUserID: 7, epoch: vault.epoch, now: now).value == .saved)
+        #expect(await vault.save(cookies("same"), ownerUserID: 7, email: nil, epoch: vault.epoch, now: now).value == .saved, "another owner is a different session")
+        #expect(await vault.save(cookies("renewed"), ownerUserID: 7, email: nil, epoch: vault.epoch, now: now).value == .saved)
         #expect(disk.writes == writes + 2)
         #expect(try fileValue() == "renewed")
     }
@@ -198,22 +198,22 @@ struct RecmanSessionVaultTests {
             vault.discard()
         case "save held while discarding":
             disk.hold(.save)
-            _ = vault.save(cookies("same"), ownerUserID: 42, epoch: vault.epoch, now: now)
+            _ = vault.save(cookies("same"), ownerUserID: 42, email: nil, epoch: vault.epoch, now: now)
             await disk.waitUntilHeld()
             vault.discard()
             disk.release()
         case "failed delete":
-            #expect(await vault.save(cookies("same"), ownerUserID: 42, epoch: vault.epoch, now: now).value == .saved)
+            #expect(await vault.save(cookies("same"), ownerUserID: 42, email: nil, epoch: vault.epoch, now: now).value == .saved)
             disk.state.withLock { $0.deleteFails = true }
             #expect(await vault.discard().value != .deleted)
             disk.state.withLock { $0.deleteFails = false; $0.data = nil }
         default:
-            #expect(await vault.save(cookies("same"), ownerUserID: 42, epoch: vault.epoch, now: now).value == .saved)
+            #expect(await vault.save(cookies("same"), ownerUserID: 42, email: nil, epoch: vault.epoch, now: now).value == .saved)
             vault.discard()
         }
         await vault.settle()
         #expect(disk.data == nil)
-        #expect(await vault.save(cookies("same"), ownerUserID: 42, epoch: vault.epoch, now: now).value == .saved)
+        #expect(await vault.save(cookies("same"), ownerUserID: 42, email: nil, epoch: vault.epoch, now: now).value == .saved)
         #expect(try fileValue() == "same")
     }
 
@@ -237,10 +237,114 @@ struct RecmanSessionVaultTests {
         #expect(disk.data != nil, "a file that can't be read right now must be kept")
     }
 
+    // MARK: The confirmed Polimi email (#148)
+
+    private func fileEmail() throws -> String? {
+        guard let data = disk.data else { return nil }
+        return try RecmanSessionCodec.decode(data, now: now).email
+    }
+
+    /// The email is written with the cookies, and a save whose cookies are unchanged but whose
+    /// email changed (or was removed) is still written, while an identical one is not. Guards
+    /// against the email being left out of the saved record: every save would then either drop
+    /// the confirmed address or skip the write that adds it.
+    /// Mutation: remove `email` from the `Saved` candidate in `save` and the second expectation
+    /// fails (`.unchanged`, the file has no email).
+    @Test func theEmailIsPartOfWhatMakesASessionChanged() async throws {
+        #expect(await vault.save(cookies("same"), ownerUserID: 42, email: nil, epoch: vault.epoch, now: now).value == .saved)
+        #expect(try fileEmail() == nil)
+        #expect(await vault.save(cookies("same"), ownerUserID: 42, email: "mario.rossi@mail.polimi.it", epoch: vault.epoch, now: now).value == .saved)
+        #expect(try fileEmail() == "mario.rossi@mail.polimi.it")
+        let writes = disk.writes
+        #expect(await vault.save(cookies("same"), ownerUserID: 42, email: "mario.rossi@mail.polimi.it", epoch: vault.epoch, now: now).value == .unchanged)
+        #expect(disk.writes == writes, "nothing new writes nothing")
+        #expect(await vault.save(cookies("same"), ownerUserID: 42, email: nil, epoch: vault.epoch, now: now).value == .saved)
+        #expect(try fileEmail() == nil, "clearing the email removes it from the file")
+    }
+
+    /// A load seeds the record with the file's email: saving the same cookies and the same email
+    /// afterwards writes nothing, and saving them without it does write (the user removed it).
+    /// Mutation: seed `Saved` in `load` without the email and the first save is written again.
+    @Test func aLoadLearnsTheEmailItFound() async throws {
+        disk.state.withLock { $0.data = try? RecmanSessionCodec.encode(cookies("same"), ownerUserID: 42, email: "a.b@polimi.it", now: now) }
+        guard case .session(let snapshot) = await vault.load(now: now).value else {
+            Issue.record("the saved session did not load")
+            return
+        }
+        #expect(snapshot.email == "a.b@polimi.it")
+        #expect(await vault.save(cookies("same"), ownerUserID: 42, email: "a.b@polimi.it", epoch: vault.epoch, now: now).value == .unchanged)
+        #expect(await vault.save(cookies("same"), ownerUserID: 42, email: nil, epoch: vault.epoch, now: now).value == .saved)
+        #expect(try fileEmail() == nil)
+    }
+
+    /// `updateEmail` rewrites the saved file with the new address and the same cookies and owner,
+    /// without a browser, and records what it wrote so the next full save of those cookies and
+    /// that email is `.unchanged`.
+    /// Mutation: encode `[]` instead of the file's cookies and the cookie check fails.
+    @Test func updatingTheEmailKeepsTheCookies() async throws {
+        #expect(await vault.save(cookies("same"), ownerUserID: 42, email: nil, epoch: vault.epoch, now: now).value == .saved)
+        #expect(await vault.updateEmail("a.b@polimi.it", ownerUserID: 42, epoch: vault.epoch, now: now).value == .saved)
+        #expect(try fileEmail() == "a.b@polimi.it")
+        #expect(try fileValue() == "same")
+        let writes = disk.writes
+        #expect(await vault.updateEmail("a.b@polimi.it", ownerUserID: 42, epoch: vault.epoch, now: now).value == .unchanged)
+        #expect(await vault.save(cookies("same"), ownerUserID: 42, email: "a.b@polimi.it", epoch: vault.epoch, now: now).value == .unchanged)
+        #expect(disk.writes == writes)
+        #expect(await vault.updateEmail(nil, ownerUserID: 42, epoch: vault.epoch, now: now).value == .saved)
+        #expect(try fileEmail() == nil)
+    }
+
+    /// With no saved session, or one that belongs to another account, nothing is written: the
+    /// controller keeps the address in memory and the next full save writes it.
+    /// Mutation: drop the owner comparison in `updateEmail` and the second expectation fails.
+    @Test func updatingTheEmailWritesNothingWithoutThisAccountsSession() async throws {
+        #expect(await vault.updateEmail("a.b@polimi.it", ownerUserID: 42, epoch: vault.epoch, now: now).value == .unchanged)
+        #expect(disk.writes == 0)
+        #expect(await vault.save(cookies("same"), ownerUserID: 7, email: nil, epoch: vault.epoch, now: now).value == .saved)
+        #expect(await vault.updateEmail("a.b@polimi.it", ownerUserID: 42, epoch: vault.epoch, now: now).value == .unchanged)
+        #expect(try fileEmail() == nil)
+        #expect(disk.writes == 1)
+    }
+
+    /// An email edit that began before a discard (logout, turn-off, account change) is refused at
+    /// commit time and the session stays gone, even though the file was still there when the edit
+    /// read it. Mutation: remove the epoch comparison in `updateEmail` and the file reappears.
+    @Test func anEmailUpdateFromBeforeADiscardIsRefused() async throws {
+        #expect(await vault.save(cookies("same"), ownerUserID: 42, email: nil, epoch: vault.epoch, now: now).value == .saved)
+        let epoch = vault.epoch
+        disk.hold(.load)
+        let update = vault.updateEmail("a.b@polimi.it", ownerUserID: 42, epoch: epoch, now: now)
+        await disk.waitUntilHeld()
+        vault.discard()
+        disk.release()
+        #expect(await update.value == .stale)
+        await vault.settle()
+        #expect(disk.data == nil)
+    }
+
+    /// A save by a caller that never managed to read the file keeps the email the file has for
+    /// this owner, and carries none over from another owner; without the flag the given email
+    /// (here none) wins. Guards against a disk error at launch costing the confirmed address.
+    /// Mutation: ignore `keepingFileEmail` and the first expectation fails.
+    @Test func aSaveBlindToTheFileKeepsItsEmail() async throws {
+        let seeded = try RecmanSessionCodec.encode(cookies("old"), ownerUserID: 42, email: "a.b@polimi.it", now: now)
+        disk.state.withLock { $0.data = seeded }
+        #expect(await vault.save(cookies("new"), ownerUserID: 42, email: nil, keepingFileEmail: true, epoch: vault.epoch, now: now).value == .saved)
+        #expect(try fileEmail() == "a.b@polimi.it")
+        #expect(try fileValue() == "new")
+
+        #expect(await vault.save(cookies("other"), ownerUserID: 7, email: "z@polimi.it", keepingFileEmail: true, epoch: vault.epoch, now: now).value == .saved)
+        #expect(try fileEmail() == nil, "another owner's email is never carried over")
+
+        disk.state.withLock { $0.data = seeded }
+        #expect(await vault.save(cookies("new"), ownerUserID: 42, email: nil, epoch: vault.epoch, now: now).value == .saved)
+        #expect(try fileEmail() == nil, "without the flag the caller's answer stands")
+    }
+
     /// Every operation, called from the main actor, does its file work elsewhere.
     @Test func fileWorkNeverRunsOnTheMainThread() async {
         _ = vault.load(now: now)
-        _ = vault.save(cookies("a"), ownerUserID: 42, epoch: vault.epoch, now: now)
+        _ = vault.save(cookies("a"), ownerUserID: 42, email: nil, epoch: vault.epoch, now: now)
         vault.discard()
         await vault.settle()
         #expect(disk.state.withLock { $0.mainThreadCalls } == 0)

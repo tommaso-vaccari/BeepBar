@@ -14,6 +14,9 @@ import OSLog
     /// Where the student stopped in a recording, as (recording id, position, duration) in
     /// seconds; see `RecordingPlayerController.onPositionCheckpoint` for exactly when.
     var onPositionCheckpoint: ((String, TimeInterval, TimeInterval?) -> Void)? { get set }
+    /// Called, with the `recordingID` of the play that failed, when a play fails; see
+    /// `RecordingPlaybackFailure` for what the player has already done in each phase.
+    var onFailure: ((String, RecordingPlaybackFailure) -> Void)? { get set }
     /// Plays `url` in the player window, creating it on first use and reusing it afterwards.
     /// `cookies` go with every request AVFoundation makes for the stream; empty means none.
     /// `startAt` resumes from that position once the stream is ready, unless it is within a few
@@ -24,6 +27,10 @@ import OSLog
     func pause()
     /// Stops playback and releases the player and its window. Safe to call at any time.
     func close()
+    /// Makes the player restore `policy` when it closes, for code that raised BeepBar to a
+    /// regular app and finds a lecture open when it is done; see
+    /// `RecordingPlayerController.adoptPolicyToRestore`.
+    func adoptPolicyToRestore(_ policy: NSApplication.ActivationPolicy)
 }
 
 /// How a play failed, reported once per item through `RecordingPlayerController.onFailure`.
@@ -294,10 +301,12 @@ enum RecordingPlayerError: Error {
         }
         // Which speeds the stream allows can change while it loads (an HLS stream may learn about
         // an I-frame playlist late): follow it, so 2.5x/3x or 0.5x/0.75x open up when allowed.
+        // Nothing is read on AVFoundation's thread: two reports can hop in either order, and a
+        // value carried by an older hop would overwrite a newer one. The hop reads the item's
+        // current values itself (`rateSupportObserved`).
         rateSupportObservations = [\AVPlayerItem.canPlayFastForward, \AVPlayerItem.canPlaySlowForward].map { keyPath in
-            item.observe(keyPath, options: [.new]) { [weak self] item, _ in
-                let support = RateSupport(fastForward: item.canPlayFastForward, slowForward: item.canPlaySlowForward)
-                Task { @MainActor [weak self] in self?.rateSupportChanged(generation: observedGeneration, to: support) }
+            item.observe(keyPath, options: [.new]) { [weak self] _, _ in
+                Task { @MainActor [weak self] in self?.rateSupportObserved(generation: observedGeneration) }
             }
         }
         // `AVPlayerView`'s own speed menu sets `defaultRate`: that is the student choosing a speed.
@@ -323,11 +332,12 @@ enum RecordingPlayerError: Error {
     }
 
     func pause() {
-        // While resuming, the player is already held paused: record the intent instead.
-        if isResuming {
-            playWhenSettled = false
-            return
-        }
+        // While resuming, also record the intent: the landing must not start playback.
+        if isResuming { playWhenSettled = false }
+        // And pause the player itself, always. It is held paused during a resume, but the student
+        // can still start it from the system controls (the view's play button, media keys,
+        // Control Center) before the resume seek lands, and then K or `pause()` has to stop what
+        // is audibly playing, not just change an intention. Pausing a paused player is a no-op.
         // The checkpoint follows through the `timeControlStatus` observation, like any pause.
         player?.pause()
     }
@@ -431,8 +441,16 @@ enum RecordingPlayerError: Error {
         }
     }
 
-    /// Where the item's rate-support KVO lands. Internal so tests can deliver a change the local
-    /// fixture never makes on its own.
+    /// Where the item's rate-support KVO lands: reads the current item's two flags here, on the
+    /// main actor, so the value applied is the latest one whatever order the hops arrive in.
+    /// Internal so tests can deliver the notification after changing what the item reports.
+    func rateSupportObserved(generation observed: Int) {
+        guard observed == generation, let item = player?.currentItem else { return }
+        rateSupportChanged(generation: observed, to: RateSupport(fastForward: item.canPlayFastForward, slowForward: item.canPlaySlowForward))
+    }
+
+    /// Where the item's rate-support change is applied. Internal so tests can deliver a change the
+    /// local fixture never makes on its own.
     func rateSupportChanged(generation observed: Int, to support: RateSupport) {
         guard observed == generation, isCurrentItemReady, support != rateSupport else { return }
         rateSupport = support
@@ -447,7 +465,10 @@ enum RecordingPlayerError: Error {
         switch shortcut {
         case .togglePlayPause:
             if isResuming {
-                playWhenSettled.toggle()
+                // Playing already means the student started it from the system controls during
+                // the resume: Space then pauses it, as everywhere else, instead of "arming" a
+                // play that would double up.
+                if player.rate != 0 { pause() } else { playWhenSettled.toggle() }
             } else if player.rate == 0 {
                 player.play()
             } else {
@@ -701,14 +722,25 @@ enum RecordingPlayerError: Error {
     /// `chooseRoot` is not that careful, and the two can interleave: its `runModal` folder panel
     /// keeps servicing main-actor jobs, so a Play can start while the panel is open. The player
     /// then finds `.regular` (set by `chooseRoot`) and records nothing to restore, and when the
-    /// panel closes `chooseRoot` puts back `.accessory` unconditionally: the lecture keeps
+    /// panel closes `chooseRoot` would put back `.accessory` unconditionally: the lecture keeps
     /// playing but its window loses the Dock icon and the Cmd-Tab entry until the next Play.
-    /// Package F is to make `chooseRoot` leave the policy alone while the player is open.
+    /// `chooseRoot` now leaves the policy alone while the player is open and hands the policy to
+    /// restore over with `adoptPolicyToRestore`, so the Dock icon goes when the lecture closes.
     private func promoteToRegularApp() {
         let current = activationPolicy.current()
         guard current != .regular, policyToRestore == nil else { return }
         policyToRestore = current
         activationPolicy.set(.regular)
+    }
+
+    /// Takes over restoring `policy` when the player closes, for code that raised BeepBar to
+    /// `.regular` itself and finds a lecture open when it is done (`WeBeepAuthenticationController.chooseRoot`
+    /// after its folder panel): putting `.accessory` back then would drop the Dock icon from under
+    /// the lecture window. The player restores it at close instead. Nothing happens if the player
+    /// already holds a policy to restore, or isn't open.
+    func adoptPolicyToRestore(_ policy: NSApplication.ActivationPolicy) {
+        guard isOpen, policyToRestore == nil, policy != .regular else { return }
+        policyToRestore = policy
     }
 
     private func restoreActivationPolicy() {

@@ -40,6 +40,12 @@ final class PlayerTestDefaults: UserDefaults, @unchecked Sendable {
     func discard() { values = [:] }
 }
 
+/// Records the activation policy changes a player makes; starts `.regular`.
+@MainActor final class PolicyLog {
+    var current: NSApplication.ActivationPolicy = .regular
+    var sets: [NSApplication.ActivationPolicy] = []
+}
+
 /// A plain view that takes a player through key-value coding, as `AVPlayerView` does, without
 /// AVKit: whatever is registered on the player then comes from the controller alone.
 final class FakePlayerView: NSView {
@@ -695,6 +701,86 @@ struct RecordingPlayerMVPTests {
         try await Self.waitUntil { second.isStartSettled }
         #expect(secondPlayer.rate != 0)
         second.close()
+    }
+
+    /// A student who starts the held player from the system controls (play button, media key)
+    /// before the resume seek lands is hearing the lecture from 0: K, Space and `pause()` must
+    /// stop that playback, not only change the intention for when the seek lands. Guards against
+    /// a lecture that keeps playing after "pause". Mutation: make `pause()` return right after
+    /// recording the intent (the old code) and the first expectation fails; make `.togglePlayPause`
+    /// always toggle the intention and the Space expectation fails.
+    @Test func pausingDuringTheResumeStopsAPlayerTheStudentStarted() async throws {
+        for stopper in ["pause()", "K", "Space"] {
+            let recorder = Recorder()
+            let (controller, player) = try await makeHeldResume(recorder: recorder)
+            // The system controls drive the AVPlayer directly, past the controller.
+            player.play()
+            #expect(player.rate != 0, "the student started the held player (\(stopper))")
+            switch stopper {
+            case "pause()": controller.pause()
+            case "K": controller.performShortcut(.pause)
+            default: controller.performShortcut(.togglePlayPause)
+            }
+            #expect(player.rate == 0, "\(stopper) must pause what is playing")
+            #expect(controller.playWhenSettled == false, "and the landing must not start it again (\(stopper))")
+            player.releaseSeeks()
+            try await Self.waitUntil { controller.isStartSettled }
+            await Self.settle()
+            #expect(player.rate == 0)
+            #expect(abs(time(controller) - 30) <= 1.01)
+            controller.close()
+        }
+    }
+
+    /// The rate-support notification carries no value: the controller reads the item's flags
+    /// itself when the notification lands, so a notification that arrives late still applies the
+    /// item's current state, and one from a replaced item is dropped. Guards against an older hop
+    /// overwriting a newer value. Mutation: restore the capture of the flags on AVFoundation's
+    /// thread (pass a value into the hop) and the "reads the current item" expectation fails.
+    @Test func theRateSupportNotificationReadsTheItemWhenItLands() async throws {
+        let controller = makeController()
+        try await playReady(controller)
+        let player = try #require(controller.player)
+        let generation = controller.generation
+        // Pretend an older report left the controller believing nothing is supported.
+        controller.rateSupportChanged(generation: generation, to: .unknown)
+        #expect(controller.rateSupport == .unknown)
+        #expect(player.currentItem?.canPlayFastForward == true)
+        controller.rateSupportObserved(generation: generation)
+        #expect(controller.rateSupport == .all, "reads the current item, not a value carried by the hop")
+        controller.rateSupportChanged(generation: generation, to: .unknown)
+        controller.rateSupportObserved(generation: generation - 1)
+        #expect(controller.rateSupport == .unknown, "a notification from a replaced item is dropped")
+        controller.close()
+        controller.rateSupportObserved(generation: controller.generation)
+        #expect(controller.player == nil, "nothing to read after close")
+    }
+
+    /// Handing the activation policy over (`chooseRoot` finding a lecture open after its panel):
+    /// the player restores it at close, and only if BeepBar is still regular; a player that is
+    /// not open adopts nothing. Guards against the Dock icon dropping under an open lecture, or
+    /// staying forever after it. Mutation: empty the body of `adoptPolicyToRestore` and the
+    /// restore expectation fails.
+    @Test func aPolicyHandedOverIsRestoredAtClose() async throws {
+        let log = PolicyLog()
+        let controller = RecordingPlayerController(present: { _ in }, makePlayerView: { FakePlayerView() },
+                                                   activationPolicy: ActivationPolicyControl(current: { log.current }, set: { log.current = $0; log.sets.append($0) }),
+                                                   frameAutosaveName: nil, defaults: PlayerTestDefaults.throwaway())
+        let media = try await TestMedia.shared.url()
+        controller.play(media, title: "Lezione", cookies: [], startAt: nil)
+        // BeepBar was already regular when the lecture opened, so the player holds nothing to restore.
+        controller.adoptPolicyToRestore(.accessory)
+        controller.close()
+        #expect(log.sets == [.accessory], "restored once, at close")
+        #expect(log.current == .accessory)
+
+        let idle = PolicyLog()
+        let idlePlayer = RecordingPlayerController(present: { _ in }, makePlayerView: { FakePlayerView() },
+                                                   activationPolicy: ActivationPolicyControl(current: { idle.current }, set: { idle.current = $0; idle.sets.append($0) }),
+                                                   frameAutosaveName: nil, defaults: PlayerTestDefaults.throwaway())
+        idlePlayer.adoptPolicyToRestore(.accessory)
+        idlePlayer.close()
+        #expect(idle.sets.isEmpty)
     }
 
     /// A Play with a resume position while a lecture is playing pauses at once: the old

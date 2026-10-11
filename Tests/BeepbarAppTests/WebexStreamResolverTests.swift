@@ -273,13 +273,27 @@ struct WebexStreamResolverTests {
 
     // MARK: Transport
 
-    /// The transport stores no cookie Webex sets: the next request carries none.
-    @Test func theTransportKeepsNoCookies() async throws {
-        WebexStubProtocol.reset { _ in .answer(status: 200, headers: ["Set-Cookie": "ticket=leak; Domain=.webex.com; Path=/; Secure"]) }
-        let transport = WebexStubProtocol.makeTransport()
-        _ = try await transport.send(URLRequest(url: URL(string: Self.api)!), limit: 1024)
-        _ = try await transport.send(URLRequest(url: URL(string: Self.api)!), limit: 1024)
-        #expect(WebexStubProtocol.requests.map { $0.headers["Cookie"] } == [nil, nil])
+    /// The real transport's sessions neither add nor keep cookies, cache nothing, and cap each
+    /// request in total, not only between bytes. A stub `URLProtocol` bypasses URLSession's own
+    /// cookie and cache handling, so these settings are checked where they live: on the
+    /// configuration every session is made from (a default ephemeral one would fail each line).
+    @Test func theTransportNeverHandlesCookiesOrCachesAndCapsEachRequest() {
+        let configuration = WebexURLSessionTransport().configuration
+        #expect(configuration.httpShouldSetCookies == false)
+        #expect(configuration.httpCookieAcceptPolicy == .never)
+        #expect(configuration.httpCookieStorage == nil)
+        #expect(configuration.urlCache == nil)
+        #expect(configuration.requestCachePolicy == .reloadIgnoringLocalCacheData)
+        #expect(configuration.timeoutIntervalForRequest == 30)
+        #expect(configuration.timeoutIntervalForResource == 30)
+    }
+
+    /// A body one byte past the limit, with no Content-Length to warn, is cut off while reading.
+    @Test func theTransportCutsOffAnUndeclaredOversizedBody() async throws {
+        WebexStubProtocol.reset { _ in .answer(status: 200, body: Data(repeating: 0x20, count: 1025)) }
+        await #expect(throws: WebexTransportError.tooLarge) {
+            _ = try await WebexStubProtocol.makeTransport().send(URLRequest(url: URL(string: Self.api)!), limit: 1024)
+        }
     }
 
     /// A Content-Length past the limit is refused before reading.

@@ -50,7 +50,8 @@ enum WebexTransportError: Error, Equatable {
 ///   returning, so it holds no task, delegate or socket at rest.
 final class WebexURLSessionTransport: WebexHTTPTransport, @unchecked Sendable {
     /// Only set in `init`; `URLSessionConfiguration` is copied by every session made from it.
-    private let configuration: URLSessionConfiguration
+    /// Readable so tests can check the no-cookie, no-cache and time-cap settings.
+    let configuration: URLSessionConfiguration
 
     init(protocolClasses: [AnyClass]? = nil) {
         let configuration = URLSessionConfiguration.ephemeral
@@ -60,6 +61,9 @@ final class WebexURLSessionTransport: WebexHTTPTransport, @unchecked Sendable {
         configuration.urlCache = nil
         configuration.requestCachePolicy = .reloadIgnoringLocalCacheData
         configuration.timeoutIntervalForRequest = 30
+        // A total cap per request too: the request timeout restarts with every byte, so a server
+        // trickling an answer could otherwise hold a Play (and its spinner) far longer.
+        configuration.timeoutIntervalForResource = 30
         if let protocolClasses { configuration.protocolClasses = protocolClasses }
         self.configuration = configuration
     }

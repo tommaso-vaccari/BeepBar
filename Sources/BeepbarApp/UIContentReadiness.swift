@@ -33,16 +33,16 @@ private struct UIContentReadiness: ViewModifier {
     let enabled: Bool
     @Environment(\.uiContentObserver) private var observer
 
-    @ViewBuilder func body(content: Content) -> some View {
-        if enabled {
-            content.onAppear {
-                kind.trace()
-                observer?(kind)
-            }
-        } else {
-            // Attaching callbacks to all 15k rows would inflate the workload being measured.
-            content
-        }
+    /// One view structure for every row, whatever `enabled` is. An `if enabled` branch would give
+    /// the marked row a different structural identity, so when the first row changes (a refresh
+    /// reorders courses, a filter hides a recording) both rows would be rebuilt and lose their
+    /// `@State`, such as a course rename in progress. A `nil` action keeps unmarked rows free of
+    /// callbacks. `UIContentReadinessTests` fails if the branch comes back (#95, #136).
+    func body(content: Content) -> some View {
+        content.onAppear(perform: enabled ? {
+            kind.trace()
+            observer?(kind)
+        } : nil)
     }
 }
 

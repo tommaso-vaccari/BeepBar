@@ -237,7 +237,10 @@ final class UIFixtureProtocol: URLProtocol, @unchecked Sendable {
 @MainActor enum UIFixtureProgressBurst {
     nonisolated static let events = 10_000
 
-    static func run(_ controller: WeBeepAuthenticationController) async {
+    /// Returns the burst's sink so a test can prove the run is closed: a late event must die in
+    /// the relay, off the main actor.
+    @discardableResult
+    static func run(_ controller: WeBeepAuthenticationController) async -> @Sendable (SyncProgress) async -> Void {
         let operationID = UUID()
         controller.setOperationForTesting(operationID)
         let sink = controller.beginTransferForTesting(operationID, automatic: false)
@@ -258,6 +261,7 @@ final class UIFixtureProtocol: URLProtocol, @unchecked Sendable {
         controller.progressStore.closeCurrentRun()
         controller.setOperationForTesting(nil)
         controller.setSyncStateForTesting(.readyUnchecked)
+        return sink
     }
 }
 #endif

@@ -9,6 +9,7 @@
 
 ### Improved
 
+- Opening BeepBar shows your courses straight away, as they were at the last successful refresh, while the current list loads in the background; offline, the saved list stays visible and says it is not yet confirmed. Every sync still asks your university for the current list first.
 - Cancelling sync stops large local file checks promptly while file changes already underway still finish safely.
 
 - Refreshing unchanged courses avoids unnecessary interface updates while renamed courses and changed selections still appear normally.

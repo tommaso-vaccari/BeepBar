@@ -57,6 +57,9 @@ struct HomePage: View {
             if let error = authentication.courseLoadError {
                 NoticeBanner(text: error.text, systemImage: "wifi.exclamationmark", tint: .red)
             }
+            if case .saved(let savedAt) = authentication.courseListFreshness, !authentication.courses.isEmpty {
+                savedListLabel(savedAt)
+            }
             if authentication.courses.isEmpty {
                 emptyCourses
                     .frame(maxHeight: .infinity)
@@ -113,9 +116,27 @@ struct HomePage: View {
         .clipShape(RoundedRectangle(cornerRadius: BeepbarStyle.cardRadius, style: .continuous))
     }
 
+    /// Says the list on screen is the one saved at an earlier launch, from when, and whether
+    /// Moodle is being asked for the current one (#98). Gone as soon as Moodle confirms the list.
+    private func savedListLabel(_ savedAt: Date) -> some View {
+        let site = authentication.selectedSite.platformName
+        let text = authentication.isLoadingCourses
+            ? tr("Elenco salvato \(savedAt.relativeText) · aggiornamento in corso…", "List saved \(savedAt.relativeText) · refreshing…")
+            : tr("Elenco salvato \(savedAt.relativeText), non ancora confermato da \(site).", "List saved \(savedAt.relativeText), not yet confirmed by \(site).")
+        return Label(text, systemImage: "clock.arrow.circlepath")
+            .font(.caption)
+            .foregroundStyle(.secondary)
+            .help(tr("I corsi mostrati sono quelli dell’ultimo aggiornamento riuscito. Ogni sincronizzazione chiede comunque a \(site) l’elenco attuale.", "These are the courses from the last successful refresh. Every sync still asks \(site) for the current list."))
+    }
+
     private var emptyCourses: some View {
         let site = authentication.selectedSite.platformName
-        let description: String = if authentication.courseLoadError != nil {
+        // While the window is still preparing the list (first opening, launch bootstrap not done
+        // yet) the account state isn't known: no "connect" prompt or sign-in button meanwhile.
+        let loading = authentication.isLoadingCourses || authentication.isPreparingCourseList
+        let description: String? = if loading {
+            nil
+        } else if authentication.courseLoadError != nil {
             tr("Riprova con il pulsante di aggiornamento.", "Try again with the refresh button.")
         } else if authentication.hasStoredCredential {
             tr("Nessun corso disponibile su \(site).", "No courses available on \(site).")
@@ -123,11 +144,11 @@ struct HomePage: View {
             tr("Collega \(site) per caricare l’elenco dei corsi.", "Connect \(site) to load your course list.")
         }
         return ContentUnavailableView {
-            Label(authentication.isLoadingCourses ? tr("Caricamento corsi…", "Loading courses…") : tr("Nessun corso caricato", "No courses loaded"), systemImage: "books.vertical")
+            Label(loading ? tr("Caricamento corsi…", "Loading courses…") : tr("Nessun corso caricato", "No courses loaded"), systemImage: "books.vertical")
         } description: {
-            Text(description)
+            if let description { Text(description) }
         } actions: {
-            if !authentication.hasStoredCredential {
+            if !loading, !authentication.hasStoredCredential {
                 Button(tr("Accedi a \(site)", "Sign in to \(site)")) { open(.settings) }
             }
         }

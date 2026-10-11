@@ -402,6 +402,28 @@ struct MenuBarSnapshot: Sendable {
     @Published private(set) var courses: [RemoteCourseSummary] = [] {
         didSet { defaultCourseFolders = Self.defaultFolders(for: courses, saved: courseFolders) }
     }
+    /// Where `courses` comes from (#98): `.saved` while the window shows the list saved at an
+    /// earlier launch and Moodle has not confirmed it in this one, `.current` once it has. Every
+    /// assignment of `courses` that changes its origin sets this in the same main-actor turn, so
+    /// the label under "Corsi" never describes another list. A sync asks Moodle for the list
+    /// first unless this is `.current`: saved enrollments never decide what is synced.
+    @Published private(set) var courseListFreshness: CourseListFreshness = .unknown
+    /// The course list saved for the next launch (`course-list.json` next to `sync.sqlite`). Tests
+    /// and previews point it at a throwaway folder, never at the installed app's.
+    private let courseListStore: CourseListSnapshotStore
+    /// Bumped whenever the account the course list belongs to may change: sign-out, another
+    /// university, a new sign-in, the stored credential gone. A network refresh, a restore or a
+    /// save that began under an earlier value belongs to someone else and is dropped, and the
+    /// store refuses saves from retired epochs (#98).
+    private var courseListEpoch = 0
+    /// The epoch whose saved list was already read, so reopening the window doesn't read the
+    /// file again when the first read found nothing to show.
+    private var courseListRestoreEpoch: Int?
+    /// True from the moment the window asks for courses until the saved list is on screen or the
+    /// network load has started (`isLoadingCourses` takes over in the same turn), so a first
+    /// opening shows "Caricamento corsi…" at once instead of "no courses" while the launch
+    /// bootstrap finishes (#98).
+    @Published private(set) var isPreparingCourseList = false
     @Published private(set) var hasStoredCredential: Bool {
         didSet {
             if !hasStoredCredential {
@@ -560,6 +582,8 @@ struct MenuBarSnapshot: Sendable {
     private var beforeRestoredSummaryPublicationForTesting: (@MainActor () async -> Void)?
     private var beforePendingChoicesForTesting: (@MainActor () async -> Void)?
     private var courseLoadTaskForTesting: Task<Void, Never>?
+    /// The last save or deletion of the saved course list, so a test can wait for the file.
+    private var courseListWriteTaskForTesting: Task<Void, Never>?
     private var deleteCredentialForTesting: (() throws -> Void)?
     private var testDefaults: UserDefaults?
     /// Off in every test controller, so a test can turn automatic sync on, as users have it,
@@ -614,6 +638,13 @@ struct MenuBarSnapshot: Sendable {
         dataSaverEnabled = Self.storedDataSaverEnabled(in: Self.defaults)
         automaticSyncEnvironment = .system
         rootID = Self.storedRootID()
+        // Resolved once here (a path lookup, no file is touched): the store calls it off the main
+        // actor, where the preview flags can't be read.
+        let courseListFolder = Self.courseListDirectory()
+        courseListStore = CourseListSnapshotStore {
+            guard let courseListFolder else { throw CocoaError(.fileNoSuchFile) }
+            return courseListFolder
+        }
         apiClient = WeBeepAPIClient(policy: selectedSite.serverPolicy)
         downloader = RemoteDownloader(policy: apiClient.policy)
         database = nil
@@ -695,11 +726,15 @@ struct MenuBarSnapshot: Sendable {
     /// defaults to mains power and an ordinary network, so no test depends on the Mac running it.
     ///
     /// The Recordings session goes to `recordingsStore`, or to a throwaway folder: never to the
-    /// real one, which a sign-out in any test would otherwise delete.
-    init(testRootURL: URL, database: SyncDatabase? = nil, rootID: UUID? = nil, notificationCenter: NotificationCenterClient = InertNotificationCenter(), fileOpener: ActivityFileOpening = InertFileOpener(), apiClient: WeBeepAPIClient? = nil, downloader: RemoteDownloader? = nil, credentialVault: CredentialVault? = nil, deleteCredential: (() throws -> Void)? = nil, defaults: UserDefaults? = nil, automaticSyncEnvironment: AutomaticSyncEnvironment = .fixed(), recordingsStore: RecordingsSessionStore? = nil, recordingsBrowser: (@MainActor () -> RecmanBrowsing)? = nil) {
+    /// real one, which a sign-out in any test would otherwise delete. The saved course list
+    /// likewise goes to `courseListStore` or to a throwaway folder; a test that relaunches passes
+    /// the same store to the second controller.
+    init(testRootURL: URL, database: SyncDatabase? = nil, rootID: UUID? = nil, notificationCenter: NotificationCenterClient = InertNotificationCenter(), fileOpener: ActivityFileOpening = InertFileOpener(), apiClient: WeBeepAPIClient? = nil, downloader: RemoteDownloader? = nil, credentialVault: CredentialVault? = nil, deleteCredential: (() throws -> Void)? = nil, defaults: UserDefaults? = nil, automaticSyncEnvironment: AutomaticSyncEnvironment = .fixed(), recordingsStore: RecordingsSessionStore? = nil, recordingsBrowser: (@MainActor () -> RecmanBrowsing)? = nil, courseListStore: CourseListSnapshotStore? = nil) {
         deleteCredentialForTesting = deleteCredential
         let throwawayRecordingsFolder = FileManager.default.temporaryDirectory.appendingPathComponent("beepbar-recordings-test-\(UUID().uuidString)", isDirectory: true)
         recordingsStoreForTesting = recordingsStore ?? RecordingsSessionStore { throwawayRecordingsFolder }
+        let throwawayCourseListFolder = FileManager.default.temporaryDirectory.appendingPathComponent("beepbar-course-list-test-\(UUID().uuidString)", isDirectory: true)
+        self.courseListStore = courseListStore ?? CourseListSnapshotStore { throwawayCourseListFolder }
         recordingsBrowserForTesting = recordingsBrowser
         self.credentialVault = credentialVault ?? CredentialVault(read: FileTokenStore.load, write: FileTokenStore.save)
         self.fileOpener = fileOpener
@@ -763,9 +798,17 @@ struct MenuBarSnapshot: Sendable {
         setSyncState(synced: result)
     }
 
+    /// Stands for a list Moodle confirmed in this session, as every caller assumed before #98.
     func setCoursesForTesting(_ courses: [RemoteCourseSummary]) {
         self.courses = courses
+        courseListFreshness = courses.isEmpty ? .unknown : .current
     }
+
+    /// Waits for the last save or deletion of the saved course list, which runs unawaited.
+    func waitForCourseListWriteForTesting() async { await courseListWriteTaskForTesting?.value }
+
+    /// The restore a window opening does before the network refresh, without that refresh.
+    func restoreSavedCourseListForTesting() async { await restoreSavedCourseList() }
 
     func setBackgroundSchedulerForTesting(_ register: @escaping (TimeInterval, @escaping @Sendable (@escaping NSBackgroundActivityScheduler.CompletionHandler) -> Void) -> BackgroundActivityRegistration) {
         scheduleBackgroundActivity = register
@@ -998,7 +1041,7 @@ struct MenuBarSnapshot: Sendable {
 
     /// Forgets the stored token so another account, or another university, can be connected.
     /// The sync folder, its files and the course selection stay as they are; the Recordings
-    /// feature is turned off and its Polimi session deleted.
+    /// feature is turned off and its Polimi session deleted, and so is the saved course list.
     func signOut(removeFile: (URL) throws -> Void = { try FileManager.default.removeItem(at: $0) }) {
         guard hasStoredCredential, !isSyncActive, !isAuthenticating, !isVerifying, !isLoadingCourses else { return }
         do {
@@ -1019,7 +1062,7 @@ struct MenuBarSnapshot: Sendable {
         Self.defaults.removeObject(forKey: Self.credentialExpiredKey)
         notificationCoordinator.clearFailure()
         siteInfo = nil
-        courses = []
+        forgetCourseList()
         courseLoadError = nil
         hasStoredCredential = false
         accountState = .notConnected
@@ -1269,11 +1312,20 @@ struct MenuBarSnapshot: Sendable {
         }
     }
 
+    /// Fills the Corsi page when the window opens: the course list saved at an earlier launch
+    /// first, read from disk without waiting for the network, then Moodle's list (#98).
     @discardableResult func refreshOnWindowOpen() -> Task<Void, Never> {
+        // Nothing on screen yet: the loading state shows from the first frame, not only once the
+        // launch bootstrap and the saved list are done, which would show "no courses" meanwhile.
+        if courses.isEmpty, !Self.isUIPreview { isPreparingCourseList = true }
         let refresh = Task { [weak self] in
             guard let self else { return }
             await self.bootstrapTask?.value
+            await self.restoreSavedCourseList()
+            // In the same main-actor turn as `loadCourses` setting `isLoadingCourses`, so the
+            // loading state has no gap; when nothing is loaded (signed out) it ends here.
             self.loadCourses()
+            self.isPreparingCourseList = false
 #if DEBUG
             // The isolated UI harness awaits the real refresh completion instead of sleeping.
             await self.courseLoadTaskForTesting?.value
@@ -1329,11 +1381,26 @@ struct MenuBarSnapshot: Sendable {
                 activityItemProblems = [:]
                 dataSaverPause = nil
                 courseFolders = [:]; conflicts = []; remoteChanges = []
-                try await restoreScopes(for: courses)
+                // Only a list Moodle confirmed may create the new folder's records: a saved one is
+                // set aside and Moodle's list loaded instead, as at a window opening (#98).
+                let reloadCourses = courseListFreshness != .current && !courses.isEmpty
+                if reloadCourses {
+                    courses = []
+                    courseListFreshness = .unknown
+                } else {
+                    try await restoreScopes(for: courses)
+                }
                 Self.defaults.set(selectedURL.path, forKey: Self.rootKey)
                 Self.defaults.set(selectedID.uuidString, forKey: Self.rootIDKey)
                 await self.restorePersistedSyncState()
                 self.configureBackgroundScheduler()
+                if reloadCourses {
+                    self.loadCourses()
+                } else if courseListFreshness == .current, !courses.isEmpty, let token = try? await credentialVault.load() {
+                    // The saved list names its folder: saved again for the new one, so the next
+                    // launch can show it.
+                    saveConfirmedCourseList(courses, token: token)
+                }
             } catch {
                 self?.setSyncState(.failed(.local(BilingualText("Non è stato possibile usare questa cartella. Scegline un'altra.", "This folder couldn't be used. Choose another one."))))
             }
@@ -1557,8 +1624,11 @@ struct MenuBarSnapshot: Sendable {
                 try Task.checkCancellation()
                 guard self.activeOperationID == operationID else { return }
                 // The course list is only loaded when the window opens, so a sync started from the
-                // menu right after launch would otherwise find nothing selected and do nothing.
-                if self.courses.isEmpty, self.hasStoredCredential, self.accountState == .connected {
+                // menu right after launch would otherwise find nothing selected and do nothing. A
+                // list restored from disk is not enough either: saved enrollments never decide
+                // what is synced, so until Moodle confirmed the list in this session it is asked
+                // first (#98).
+                if self.courseListFreshness != .current, self.hasStoredCredential, self.accountState == .connected {
                     let token = try await self.credentialVault.load()
                     try await self.refreshCourseList(token: token)
                     try Task.checkCancellation()
@@ -1830,7 +1900,7 @@ struct MenuBarSnapshot: Sendable {
         apiClient = WeBeepAPIClient(policy: site.serverPolicy)
         downloader = RemoteDownloader(policy: site.serverPolicy)
         siteInfo = nil
-        courses = []
+        forgetCourseList()
         // Recordings exist only for Polimi, and a Polimi session must not wait for the next
         // Polimi account.
         recordings.turnOff()
@@ -1875,27 +1945,41 @@ struct MenuBarSnapshot: Sendable {
         guard accountState == .connected, hasStoredCredential, !isLoadingCourses, !isSyncActive else { return }
         courseLoadError = nil
         isLoadingCourses = true
+        let epoch = courseListEpoch
         let task = Task { [weak self] in
-            defer { self?.isLoadingCourses = false }
+            defer {
+                if let self {
+                    self.isLoadingCourses = false
+                    // A new sign-in replaced the account while this load ran: its result was
+                    // dropped, and the sign-in's own `loadCourses` found this one running and did
+                    // nothing, so the new account's list is loaded now (#98).
+                    if self.courseListEpoch != epoch { self.loadCourses() }
+                }
+            }
             do {
                 guard let self else { return }
                 await self.bootstrapTask?.value
                 try Task.checkCancellation()
                 let token = try await self.credentialVault.load()
                 try await self.refreshCourseList(token: token)
-            } catch let error as WeBeepAPIError {
-                guard let self else { return }
-                if error == .invalidToken {
-                    await self.expireCredential()
-                } else if error == .network(.timedOut) {
-                    self.courseLoadError = BilingualText("\(self.selectedSite.platformName) non risponde. Riprova.", "\(self.selectedSite.platformName) isn't responding. Try again.")
-                } else {
-                    self.courseLoadError = BilingualText("Impossibile aggiornare i corsi da \(self.selectedSite.platformName). Riprova.", "Couldn't refresh courses from \(self.selectedSite.platformName). Try again.")
-                }
-            } catch let error as CredentialStorageError {
-                await self?.handleCredentialStorageError(error)
+            } catch is CancellationError {
+                // Superseded (a new sign-in) or cancelled: nothing failed that the user must see.
             } catch {
-                self?.courseLoadError = BilingualText("Impossibile aggiornare i corsi. Riprova.", "Couldn't refresh courses. Try again.")
+                // A failure of the previous account's token says nothing about the account
+                // signed in now: expiring or reporting it would blame the new sign-in (#98).
+                guard let self, self.courseListEpoch == epoch else { return }
+                switch error {
+                case let error as WeBeepAPIError where error == .invalidToken:
+                    await self.expireCredential()
+                case let error as WeBeepAPIError where error == .network(.timedOut):
+                    self.courseLoadError = BilingualText("\(self.selectedSite.platformName) non risponde. Riprova.", "\(self.selectedSite.platformName) isn't responding. Try again.")
+                case is WeBeepAPIError:
+                    self.courseLoadError = BilingualText("Impossibile aggiornare i corsi da \(self.selectedSite.platformName). Riprova.", "Couldn't refresh courses from \(self.selectedSite.platformName). Try again.")
+                case let error as CredentialStorageError:
+                    await self.handleCredentialStorageError(error)
+                default:
+                    self.courseLoadError = BilingualText("Impossibile aggiornare i corsi. Riprova.", "Couldn't refresh courses. Try again.")
+                }
             }
         }
 #if DEBUG
@@ -1906,21 +1990,28 @@ struct MenuBarSnapshot: Sendable {
     }
 
     /// Fetches the enrolled courses and makes them the current list. Shared by the course list
-    /// refresh and by a sync started before the list was ever loaded (from the menu right after
-    /// launch), which cannot go through `loadCourses` because that refuses to run during a sync.
+    /// refresh and by a sync started before the list was confirmed (from the menu right after
+    /// launch, or over a saved list), which cannot go through `loadCourses` because that refuses
+    /// to run during a sync. The confirmed list replaces a saved one and is saved for the next
+    /// launch (#98).
     private func refreshCourseList(token: String) async throws {
+        let epoch = courseListEpoch
         let courses = try await fetchEnrolledCourses(token: token)
-        // The account may have been disconnected while the list was loading.
-        guard hasStoredCredential else { return }
+        // The account may have been disconnected or replaced while the list was loading.
+        guard hasStoredCredential, courseListEpoch == epoch else { return }
         try await restoreScopes(for: courses)
+        guard hasStoredCredential, courseListEpoch == epoch else { return }
         let ordered = Self.orderedForDisplay(courses, enabledCourseIDs: enabledCourseIDs)
         // #94: equal @Published assignments still invalidate every course subscriber.
         if self.courses != ordered { self.courses = ordered }
+        if courseListFreshness != .current { courseListFreshness = .current }
         accountState = .connected
         operationDefaults.removeObject(forKey: Self.credentialExpiredKey)
+        saveConfirmedCourseList(courses, token: token)
     }
 
     private func fetchEnrolledCourses(token: String) async throws -> [RemoteCourseSummary] {
+        let epoch = courseListEpoch
         let siteInfo: WeBeepSiteInfo
         if let existing = self.siteInfo {
             siteInfo = existing
@@ -1928,8 +2019,83 @@ struct MenuBarSnapshot: Sendable {
             siteInfo = try await apiClient.validateToken(token)
         }
         let courses = try await apiClient.fetchCourses(userID: siteInfo.userID, token: token)
+        // A sign-in that replaced this account meanwhile owns `siteInfo` now: writing the old
+        // account's back would hand its id to Recordings (#98).
+        guard courseListEpoch == epoch else { throw CancellationError() }
         self.siteInfo = siteInfo
         return courses
+    }
+
+    /// Shows the course list saved at an earlier launch while nothing is on screen (#98). The
+    /// file is read and decoded off the main actor by `courseListStore`, and only a list saved
+    /// for this site, this sync folder and this very sign-in is accepted. Folders come from the
+    /// sync database, read only: a saved list never renames, enables or records anything; that
+    /// is `restoreScopes`, once Moodle has answered. Whatever changes meanwhile (sign-out, a new
+    /// sign-in, another folder, Moodle's list arriving first) makes the result stale, and it is
+    /// dropped.
+    private func restoreSavedCourseList() async {
+        guard !Self.isUIPreview, courses.isEmpty, courseListFreshness == .unknown, courseListRestoreEpoch != courseListEpoch,
+              hasStoredCredential, let rootID, let database else { return }
+        let epoch = courseListEpoch
+        courseListRestoreEpoch = epoch
+        let site = selectedSite
+        // A token that can't be read shows nothing here; the refresh that follows reports it.
+        guard let token = try? await credentialVault.load() else { return }
+        let outcome = await courseListStore.load(expecting: CourseListSnapshot.Identity(siteID: site.id, rootID: rootID, token: token))
+        guard case .restored(let snapshot) = outcome else {
+            if case .discarded(let reason) = outcome {
+                BeepbarLog.lifecycle.notice("Saved course list discarded reason=\(String(describing: reason), privacy: .public)")
+            }
+            return
+        }
+        let scopes = (try? await database.scopes(rootID: rootID)) ?? []
+        guard courseListEpoch == epoch, courses.isEmpty, courseListFreshness == .unknown, self.rootID == rootID, selectedSite == site, hasStoredCredential else { return }
+        let savedIDs = Set(snapshot.courses.map(\.id))
+        // Before `courses`, whose didSet derives the default folders from these.
+        for scope in scopes where savedIDs.contains(scope.courseID) && !scope.localFolder.isEmpty && courseFolders[scope.courseID] != scope.localFolder {
+            courseFolders[scope.courseID] = scope.localFolder
+        }
+        courses = Self.orderedForDisplay(snapshot.summaries, enabledCourseIDs: enabledCourseIDs)
+        courseListFreshness = .saved(snapshot.savedAt)
+    }
+
+    /// Saves a list Moodle just confirmed for the next launch, without waiting: the store writes
+    /// only when the list changed or a day has passed, and refuses the write if the account was
+    /// forgotten meanwhile (`courseListEpoch`).
+    private func saveConfirmedCourseList(_ courses: [RemoteCourseSummary], token: String) {
+        guard !Self.isUIPreview, let rootID else { return }
+        let identity = CourseListSnapshot.Identity(siteID: selectedSite.id, rootID: rootID, token: token)
+        let epoch = courseListEpoch
+        let store = courseListStore
+        let write = Task.detached(priority: .utility) {
+            do { try await store.save(courses, identity: identity, epoch: epoch) }
+            catch { BeepbarLog.lifecycle.error("Saved course list not written errorType=\(String(reflecting: type(of: error)), privacy: .public)") }
+        }
+#if DEBUG
+        courseListWriteTaskForTesting = write
+#else
+        _ = write
+#endif
+    }
+
+    /// Clears the course list of an account that is going away (sign-out, another university, a
+    /// new sign-in, the stored credential gone) and deletes its saved copy. Bumps the epoch first,
+    /// so a refresh, a restore or a save still running for that account is dropped (#98).
+    private func forgetCourseList() {
+        courseListEpoch += 1
+        courses = []
+        courseListFreshness = .unknown
+        let epoch = courseListEpoch
+        let store = courseListStore
+        let delete = Task.detached(priority: .utility) {
+            do { try await store.delete(retiringEpochsBelow: epoch) }
+            catch { BeepbarLog.lifecycle.error("Saved course list not deleted errorType=\(String(reflecting: type(of: error)), privacy: .public)") }
+        }
+#if DEBUG
+        courseListWriteTaskForTesting = delete
+#else
+        _ = delete
+#endif
     }
 
     private static let onboardingCompletedKey = "io.github.tvaccari.beepbar.onboarding-completed.v1"
@@ -2015,8 +2181,10 @@ struct MenuBarSnapshot: Sendable {
                 guard let self else { return }
                 let siteInfo = try await self.apiClient.validateToken(token)
                 try await self.credentialVault.save(token)
-                // Only a token that was accepted and stored replaces the previous account's state.
-                self.courses = []
+                // Only a token that was accepted and stored replaces the previous account's state,
+                // including the course list saved for the previous sign-in, even if it is the same
+                // account: the new token has its own fingerprint (#98).
+                self.forgetCourseList()
                 self.siteInfo = siteInfo
                 self.hasStoredCredential = true
                 self.accountState = .connected
@@ -2063,6 +2231,17 @@ struct MenuBarSnapshot: Sendable {
             return directory
         }
         return installedDatabaseDirectory(applicationSupport: try FileManager.default.url(for: .applicationSupportDirectory, in: .userDomainMask, appropriateFor: nil, create: false))
+    }
+
+    /// Where the saved course list lives (#98): next to `sync.sqlite` for the installed app, and in
+    /// a throwaway folder for the `--ui-preview` builds, which share the installed app's identity
+    /// and must never read or replace its file. `nil` when Application Support can't be found:
+    /// then nothing is saved or restored and the window simply waits for the network, as before.
+    private static func courseListDirectory() -> URL? {
+        guard !isUIPreview, !isUIPreviewOnboarding else {
+            return FileManager.default.temporaryDirectory.appendingPathComponent("Beepbar-preview-course-list", isDirectory: true)
+        }
+        return try? databaseDirectory()
     }
 
     /// Where an installed BeepBar keeps `sync.sqlite`: the same Application Support folder as the
@@ -2652,6 +2831,8 @@ struct MenuBarSnapshot: Sendable {
         case .absent, .corrupt:
             hasStoredCredential = false
             accountState = .notConnected
+            // Signed out in all but name: the list of an account with no credential goes too (#98).
+            forgetCourseList()
             setSyncState(.loginRequired)
         case .write:
             setSyncState(.failed(.credentialUnavailable))

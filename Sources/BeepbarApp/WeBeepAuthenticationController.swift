@@ -827,8 +827,11 @@ struct MenuBarSnapshot: Sendable {
     /// The restore a window opening does before the network refresh, without that refresh.
     func restoreSavedCourseListForTesting() async { await restoreSavedCourseList() }
 
-    /// What the launch bootstrap does with its result, for a test controller (which has none).
-    func applyBootstrapForTesting(_ result: BootstrapService.Result) async { await applyBootstrap(result) }
+    /// The launch bootstrap finding no stored credential, for a test controller (which has none).
+    func applyBootstrapWithoutCredentialForTesting() async {
+        guard let database else { return }
+        await applyBootstrap(BootstrapService.Result(database: database, recoveryBlocked: false, credential: .absent))
+    }
 
     /// The folder handling after the open panel, with `url` as if picked there.
     func useRootForTesting(_ url: URL) async {

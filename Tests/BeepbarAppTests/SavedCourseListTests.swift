@@ -375,7 +375,7 @@ import BeepbarCore
         #expect(FileManager.default.fileExists(atPath: install.file.path))
 
         let controller = install.launch(token: token)
-        await controller.applyBootstrapForTesting(BootstrapService.Result(database: install.database, recoveryBlocked: false, credential: .absent))
+        await controller.applyBootstrapWithoutCredentialForTesting()
         await controller.waitForCourseListWriteForTesting()
         #expect(!controller.hasStoredCredential)
         #expect(!FileManager.default.fileExists(atPath: install.file.path), "the saved list outlived the credential")

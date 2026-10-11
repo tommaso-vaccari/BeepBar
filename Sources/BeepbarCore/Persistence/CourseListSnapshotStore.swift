@@ -32,8 +32,11 @@ public actor CourseListSnapshotStore {
     /// Resolved on each use, so creating the store costs nothing and a test or a preview run can
     /// point it at a throwaway folder.
     private let directory: @Sendable () throws -> URL
-    /// What this store last wrote or restored, so `save` can skip a rewrite of an unchanged list
-    /// (`CourseListSnapshotCodec.shouldSave`). Reset by `delete`, never trusted across launches.
+    /// What the file holds, as this store last wrote, restored or read it, so `save` can skip a
+    /// rewrite of an unchanged list (`CourseListSnapshotCodec.shouldSave`). Forgotten whenever
+    /// the file goes. Filled from the file by the first `save` of a launch when nothing filled it
+    /// yet: a sync started from the menu before the window ever opened would otherwise rewrite an
+    /// unchanged list on every launch.
     private var lastWritten: CourseListSnapshot?
     /// Saves made for an epoch below this are refused (see the type's comment). Only grows.
     private var firstLiveEpoch = 0
@@ -45,27 +48,26 @@ public actor CourseListSnapshotStore {
     /// The saved list for `identity`, if there is one this launch may show.
     public func load(expecting identity: CourseListSnapshot.Identity, now: Date = Date()) -> LoadOutcome {
         guard let url = try? directory().appendingPathComponent(Self.fileName), FileManager.default.fileExists(atPath: url.path) else { return .missing }
-        // The size is checked before the bytes are read: the limit exists so a damaged file is
-        // never loaded into memory, which reading it first would defeat.
-        if let size = (try? FileManager.default.attributesOfItem(atPath: url.path)[.size] as? NSNumber)?.intValue, size > CourseListSnapshotCodec.maximumBytes {
-            try? FileManager.default.removeItem(at: url)
-            return .discarded(.tooLarge)
-        }
-        guard let data = try? Data(contentsOf: url) else {
-            try? FileManager.default.removeItem(at: url)
-            return .discarded(.unreadable)
-        }
         do {
-            let snapshot = try CourseListSnapshotCodec.decode(data, expecting: identity, now: now)
+            let snapshot = try read(url, expecting: identity, now: now)
             lastWritten = snapshot
             return .restored(snapshot)
-        } catch let error as CourseListSnapshotCodec.DecodeError {
-            try? FileManager.default.removeItem(at: url)
-            return .discarded(error)
         } catch {
             try? FileManager.default.removeItem(at: url)
-            return .discarded(.unreadable)
+            lastWritten = nil
+            return .discarded(error as? CourseListSnapshotCodec.DecodeError ?? .unreadable)
         }
+    }
+
+    /// The file's snapshot for `identity`, or the reason it is refused. The size is checked
+    /// before the bytes are read: the limit exists so a damaged file is never loaded into memory,
+    /// which reading it first would defeat.
+    private func read(_ url: URL, expecting identity: CourseListSnapshot.Identity, now: Date) throws -> CourseListSnapshot {
+        if let size = (try? FileManager.default.attributesOfItem(atPath: url.path)[.size] as? NSNumber)?.intValue, size > CourseListSnapshotCodec.maximumBytes {
+            throw CourseListSnapshotCodec.DecodeError.tooLarge
+        }
+        guard let data = try? Data(contentsOf: url) else { throw CourseListSnapshotCodec.DecodeError.unreadable }
+        return try CourseListSnapshotCodec.decode(data, expecting: identity, now: now)
     }
 
     /// Writes `courses` as the confirmed list for `identity`, unless an equal list was written
@@ -75,6 +77,10 @@ public actor CourseListSnapshotStore {
     @discardableResult
     public func save(_ courses: [RemoteCourseSummary], identity: CourseListSnapshot.Identity, epoch: Int = 0, now: Date = Date()) throws -> Bool {
         guard epoch >= firstLiveEpoch else { return false }
+        if lastWritten == nil, let url = try? directory().appendingPathComponent(Self.fileName), FileManager.default.fileExists(atPath: url.path) {
+            // Only a peek: a file this save is about to replace is not worth deleting first.
+            lastWritten = try? read(url, expecting: identity, now: now)
+        }
         guard CourseListSnapshotCodec.shouldSave(courses, identity: identity, after: lastWritten, now: now) else { return false }
         let snapshot = CourseListSnapshot(identity: identity, savedAt: now, courses: courses)
         let data: Data
@@ -86,6 +92,9 @@ public actor CourseListSnapshotStore {
         }
         let folder = try directory()
         try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true, attributes: [.posixPermissions: 0o700])
+        // A crash between creating and renaming a temporary file leaves it behind; like the token
+        // store, the next write sweeps them up instead of waiting for a sign-out.
+        try? removeTemporaries(in: folder)
         let temporary = folder.appendingPathComponent("\(Self.tempPrefix)\(UUID().uuidString)\(Self.tempSuffix)")
         guard FileManager.default.createFile(atPath: temporary.path, contents: data, attributes: [.posixPermissions: 0o600]) else {
             throw CocoaError(.fileWriteUnknown)
@@ -112,10 +121,14 @@ public actor CourseListSnapshotStore {
         lastWritten = nil
         let folder = try directory()
         guard FileManager.default.fileExists(atPath: folder.path) else { return }
+        try removeTemporaries(in: folder)
+        let url = folder.appendingPathComponent(Self.fileName)
+        if FileManager.default.fileExists(atPath: url.path) { try FileManager.default.removeItem(at: url) }
+    }
+
+    private func removeTemporaries(in folder: URL) throws {
         for name in try FileManager.default.contentsOfDirectory(atPath: folder.path) where name.hasPrefix(Self.tempPrefix) && name.hasSuffix(Self.tempSuffix) {
             try FileManager.default.removeItem(at: folder.appendingPathComponent(name))
         }
-        let url = folder.appendingPathComponent(Self.fileName)
-        if FileManager.default.fileExists(atPath: url.path) { try FileManager.default.removeItem(at: url) }
     }
 }

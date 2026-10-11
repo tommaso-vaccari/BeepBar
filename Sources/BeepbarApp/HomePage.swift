@@ -94,9 +94,10 @@ struct HomePage: View {
                         isEnabled: authentication.isCourseEnabled(course),
                         isRenaming: authentication.renamingCourseID == course.id,
                         renameError: authentication.courseRenameErrors[course.id],
-                        toggleDisabled: authentication.isSyncActive || authentication.isLoadingCourses,
-                        // renameFolder() is a no-op during a sync or a blocked recovery.
-                        renameDisabled: authentication.isSyncActive || authentication.recoveryBlocked,
+                        // A saved list waits for Moodle's before anything is recorded for it (#98).
+                        toggleDisabled: authentication.isSyncActive || authentication.isLoadingCourses || authentication.isShowingSavedCourseList,
+                        // renameFolder() is a no-op during a sync, a blocked recovery or over a saved list.
+                        renameDisabled: authentication.isSyncActive || authentication.recoveryBlocked || authentication.isShowingSavedCourseList,
                         organizeDisabled: organizeDisabled,
                         folderURL: authentication.rootURL?.appending(path: folder, directoryHint: .isDirectory),
                         authentication: authentication,
@@ -120,9 +121,11 @@ struct HomePage: View {
     /// Moodle is being asked for the current one (#98). Gone as soon as Moodle confirms the list.
     private func savedListLabel(_ savedAt: Date) -> some View {
         let site = authentication.selectedSite.platformName
-        let text = authentication.isLoadingCourses
-            ? tr("Elenco salvato \(savedAt.relativeText) · aggiornamento in corso…", "List saved \(savedAt.relativeText) · refreshing…")
-            : tr("Elenco salvato \(savedAt.relativeText), non ancora confermato da \(site).", "List saved \(savedAt.relativeText), not yet confirmed by \(site).")
+        // A clock moved back a little leaves the date ahead of now: "now", not "in 2 hours".
+        let when = min(savedAt, Date()).relativeText
+        let text = authentication.isLoadingCourses || authentication.isPreparingCourseList
+            ? tr("Elenco salvato \(when) · aggiornamento in corso…", "List saved \(when) · refreshing…")
+            : tr("Elenco salvato \(when), non ancora confermato da \(site).", "List saved \(when), not yet confirmed by \(site).")
         return Label(text, systemImage: "clock.arrow.circlepath")
             .font(.caption)
             .foregroundStyle(.secondary)

@@ -26,8 +26,10 @@ public struct CourseListSnapshot: Codable, Equatable, Sendable {
     ///
     /// The account is identified by a fingerprint of the stored credential, not by the Moodle
     /// user id: the id is only known once the network has validated the token, and the whole
-    /// point is to show the list before that. A new sign-in stores a new token, so a list saved
-    /// under any earlier sign-in never matches it.
+    /// point is to show the list before that. Another account always has another token. Moodle
+    /// may hand the same account its old token again on a new sign-in, which would match: the
+    /// controller deletes the file at every sign-in anyway, so the fingerprint is the guard for
+    /// the cases where that deletion never ran (a crash, an older BeepBar).
     public struct Identity: Codable, Equatable, Sendable {
         public let siteID: String
         /// The sync folder's id (`rootID`). The list itself is the account's, but the folders and
@@ -74,8 +76,9 @@ public struct CourseListSnapshot: Codable, Equatable, Sendable {
 
     public let version: Int
     public let identity: Identity
-    /// When the list was confirmed by Moodle. Shown to the user while the list is not yet
-    /// refreshed, and the basis of the age limit.
+    /// When the file was written, so when Moodle confirmed the list to within
+    /// `CourseListSnapshotCodec.saveRefreshInterval` (an unchanged list is rewritten at most once
+    /// a day). Shown while the list is not yet refreshed, and the basis of the age limit.
     public let savedAt: Date
     /// Sorted by course id, whatever order Moodle answered in: a reordered response is the same
     /// list and must not cost a rewrite (`CourseListSnapshotCodec.shouldSave`).
@@ -143,6 +146,9 @@ public enum CourseListSnapshotCodec {
         case unsupportedVersion(Int)
         case wrongIdentity
         case expired
+        /// Dated more than `saveRefreshInterval` ahead of now: written while the clock was wrong,
+        /// so its age, and with it the age limit, means nothing.
+        case savedInTheFuture
         case tooManyCourses
     }
 
@@ -186,11 +192,13 @@ public enum CourseListSnapshotCodec {
         guard snapshot.identity == identity else { throw DecodeError.wrongIdentity }
         guard snapshot.courses.count <= maximumCourses else { throw DecodeError.tooManyCourses }
         guard !isExpired(savedAt: snapshot.savedAt, now: now) else { throw DecodeError.expired }
+        guard snapshot.savedAt.timeIntervalSince(now) <= saveRefreshInterval else { throw DecodeError.savedInTheFuture }
         return snapshot
     }
 
-    /// Older than `maximumAge`. A date in the future (clock moved back) is not expired: the list
-    /// is still the last one Moodle confirmed, and the next refresh rewrites the date.
+    /// Older than `maximumAge`. A date slightly in the future (the clock moved back a little) is
+    /// not expired: the list is still the last one Moodle confirmed, and the next refresh
+    /// rewrites the date (`shouldSave`). Far in the future, `decode` refuses it.
     public static func isExpired(savedAt: Date, now: Date) -> Bool {
         now.timeIntervalSince(savedAt) > maximumAge
     }
@@ -198,10 +206,13 @@ public enum CourseListSnapshotCodec {
     /// Whether a confirmed list is worth a write: always when nothing was written for this
     /// identity yet or the list differs, otherwise only once `saveRefreshInterval` has passed, so
     /// an unchanged list costs no disk write per refresh (cost proportional to what changed).
-    /// Order does not count: Moodle may answer the same enrollments in another order.
+    /// Order does not count: Moodle may answer the same enrollments in another order. A date in
+    /// the future is rewritten at once: left alone, an unchanged list would never age and the
+    /// window would say it was saved "in 3 days".
     public static func shouldSave(_ courses: [RemoteCourseSummary], identity: CourseListSnapshot.Identity, after previous: CourseListSnapshot?, now: Date) -> Bool {
         guard let previous, previous.identity == identity else { return true }
         guard previous.courses == CourseListSnapshot.canonical(courses) else { return true }
+        guard previous.savedAt <= now else { return true }
         return now.timeIntervalSince(previous.savedAt) >= saveRefreshInterval
     }
 }

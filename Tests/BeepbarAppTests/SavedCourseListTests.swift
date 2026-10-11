@@ -5,9 +5,10 @@ import BeepbarCore
 @testable import BeepbarApp
 
 /// The course list saved between launches (#98), through the real controller: a local Moodle
-/// (`MoodleRecordingProtocol`), a real sync database and a real store in a throwaway folder that
-/// every "launch" of one install shares. Each test names the acceptance rule it guards; the codec
-/// and store rules themselves are in `CourseListSnapshotTests`.
+/// (`MoodleRecordingProtocol`), a real sync database and a throwaway folder for the saved list.
+/// Each "launch" of one install gets a store of its own over that folder, as two processes would,
+/// so nothing a store remembers in memory carries over. Each test names the acceptance rule it
+/// guards; the codec and store rules themselves are in `CourseListSnapshotTests`.
 @MainActor struct SavedCourseListTests {
     /// One install: a sync folder with its database (course 1 enabled in "Analisi I", course 2
     /// off), and the folder the saved list lives in.
@@ -16,7 +17,6 @@ import BeepbarCore
         let database: SyncDatabase
         let rootID: UUID
         let storeFolder: URL
-        let store: CourseListSnapshotStore
 
         static func make() async throws -> Install {
             let root = FileManager.default.temporaryDirectory.appending(path: "SavedCourseListTests-\(UUID().uuidString)", directoryHint: .isDirectory)
@@ -27,19 +27,34 @@ import BeepbarCore
             try await database.upsertScope(SyncScope(rootID: rootID, courseID: 1, displayName: "Analisi", localFolder: "Analisi I", enabled: true))
             try await database.upsertScope(SyncScope(rootID: rootID, courseID: 2, displayName: "Fisica", localFolder: "Fisica", enabled: false))
             let storeFolder = root.appending(path: "support", directoryHint: .isDirectory)
-            return Install(root: root, database: database, rootID: rootID, storeFolder: storeFolder, store: CourseListSnapshotStore { storeFolder })
+            return Install(root: root, database: database, rootID: rootID, storeFolder: storeFolder)
         }
 
         var file: URL { storeFolder.appending(path: CourseListSnapshotStore.fileName) }
 
+        /// The saved list's store as a new process opens it.
+        func store() -> CourseListSnapshotStore {
+            let folder = storeFolder
+            return CourseListSnapshotStore { folder }
+        }
+
         /// A controller as one launch of the app makes it, signed in with `token`.
         @MainActor func launch(token: String) -> WeBeepAuthenticationController {
+            launch(vault: CredentialVault(read: { _ in token }, write: { _ in }))
+        }
+
+        @MainActor func launch(vault: CredentialVault) -> WeBeepAuthenticationController {
             WeBeepAuthenticationController(
                 testRootURL: root, database: database, rootID: rootID,
                 apiClient: MoodleRecordingProtocol.makeClient(), downloader: MoodleRecordingProtocol.makeDownloader(),
-                credentialVault: CredentialVault(read: { _ in token }, write: { _ in }), deleteCredential: {},
-                courseListStore: store
+                credentialVault: vault, deleteCredential: {},
+                courseListStore: store()
             )
+        }
+
+        /// Writes a saved list directly, as an earlier launch would have.
+        func save(_ courses: [RemoteCourseSummary], token: String) async throws {
+            try await store().save(courses, identity: identity(token: token))
         }
 
         func identity(token: String) -> CourseListSnapshot.Identity {
@@ -280,5 +295,245 @@ import BeepbarCore
         await controller.waitForCourseLoadForTesting()
         await controller.waitForCourseListWriteForTesting()
         #expect(try install.savedSnapshot(token: token).summaries.map(\.displayName) == ["Analisi matematica", "Fisica"])
+    }
+
+    // MARK: Review round 1
+
+    private func course(_ id: Int64, _ name: String) -> RemoteCourseSummary {
+        RemoteCourseSummary(id: id, shortName: name, displayName: name, isVisible: true, startDate: nil, endDate: nil)
+    }
+
+    /// A window opened while a sync runs, with nothing saved (every user's first opening after
+    /// updating): the page shows the loading state, not "no courses", and the list is loaded as
+    /// soon as the sync ends. Fails if the deferred load is dropped (the page would stay empty
+    /// until the refresh button) or the loading state ends early.
+    @Test func aWindowOpenedDuringASyncLoadsTheListWhenItEnds() async throws {
+        let install = try await Install.make()
+        defer { install.remove() }
+        let token = MoodleRecordingProtocol.register(courses: [(1, "Analisi"), (2, "Fisica")])
+        defer { MoodleRecordingProtocol.revoke(token: token) }
+        let controller = install.launch(token: token)
+        let operation = UUID()
+        controller.setOperationForTesting(operation)
+
+        await controller.refreshOnWindowOpen().value
+        #expect(controller.courses.isEmpty)
+        #expect(controller.isPreparingCourseList, "the page said no courses while the list was only waiting for the sync")
+        #expect(!MoodleRecordingProtocol.requests(token: token).contains { $0.function == "core_enrol_get_users_courses" })
+
+        await controller.failSyncForTesting(operation)
+        // Nil, and so no wait, if ending the sync started no load.
+        await controller.waitForCourseLoadForTesting()
+        #expect(controller.courses.map(\.id) == [1, 2], "the list the window asked for did not load when the sync ended")
+        #expect(controller.courseListFreshness == .current)
+        #expect(!controller.isPreparingCourseList)
+    }
+
+    /// The same with a saved list: it is shown at once, says it is refreshing while the sync holds
+    /// the load back, and is confirmed when the sync ends. Closing the window first cancels the
+    /// deferred load, so a closed window sends nothing.
+    @Test func aSavedListOpenedDuringASyncIsConfirmedWhenItEndsUnlessTheWindowClosed() async throws {
+        let install = try await Install.make()
+        defer { install.remove() }
+        let token = MoodleRecordingProtocol.register(courses: [(1, "Analisi"), (2, "Fisica")])
+        defer { MoodleRecordingProtocol.revoke(token: token) }
+        _ = await launchAndSave(install, token: token)
+
+        let relaunched = install.launch(token: token)
+        let operation = UUID()
+        relaunched.setOperationForTesting(operation)
+        await relaunched.refreshOnWindowOpen().value
+        guard case .saved = relaunched.courseListFreshness else {
+            Issue.record("The saved list was not shown during the sync: \(relaunched.courseListFreshness)")
+            return
+        }
+        #expect(relaunched.isPreparingCourseList)
+        await relaunched.failSyncForTesting(operation)
+        await relaunched.waitForCourseLoadForTesting()
+        #expect(relaunched.courseListFreshness == .current)
+
+        let closing = install.launch(token: token)
+        let second = UUID()
+        closing.setOperationForTesting(second)
+        await closing.refreshOnWindowOpen().value
+        closing.windowClosed()
+        let requests = MoodleRecordingProtocol.requests(token: token).count
+        await closing.failSyncForTesting(second)
+        await closing.waitForCourseLoadForTesting()
+        #expect(MoodleRecordingProtocol.requests(token: token).count == requests, "a closed window still loaded the list when the sync ended")
+    }
+
+    /// No credential at launch, so no account the saved list could belong to (an older BeepBar
+    /// signed out, or a sign-out's deletion never ran): the file is deleted, as the behaviour
+    /// documents, instead of waiting for a sign-in that may never come.
+    @Test func aLaunchWithoutACredentialDeletesTheSavedList() async throws {
+        let install = try await Install.make()
+        defer { install.remove() }
+        let token = MoodleRecordingProtocol.register(courses: [(1, "Analisi")])
+        defer { MoodleRecordingProtocol.revoke(token: token) }
+        try await install.save([course(1, "Analisi")], token: token)
+        #expect(FileManager.default.fileExists(atPath: install.file.path))
+
+        let controller = install.launch(token: token)
+        await controller.applyBootstrapForTesting(BootstrapService.Result(database: install.database, recoveryBlocked: false, credential: .absent))
+        await controller.waitForCourseListWriteForTesting()
+        #expect(!controller.hasStoredCredential)
+        #expect(!FileManager.default.fileExists(atPath: install.file.path), "the saved list outlived the credential")
+    }
+
+    /// The credential found missing or corrupt while loading the list: signed out in all but
+    /// name, so the saved list goes too.
+    @Test func aCredentialFoundMissingDeletesTheSavedList() async throws {
+        let install = try await Install.make()
+        defer { install.remove() }
+        let token = MoodleRecordingProtocol.register(courses: [(1, "Analisi")])
+        defer { MoodleRecordingProtocol.revoke(token: token) }
+        try await install.save([course(1, "Analisi")], token: token)
+
+        let controller = install.launch(vault: CredentialVault(read: { _ in throw CredentialStorageError.absent }, write: { _ in }))
+        await controller.refreshOnWindowOpen().value
+        await controller.waitForCourseListWriteForTesting()
+        #expect(!controller.hasStoredCredential)
+        #expect(controller.courses.isEmpty)
+        #expect(!FileManager.default.fileExists(atPath: install.file.path))
+    }
+
+    /// Choosing another university (only possible signed out) deletes a saved list left behind.
+    @Test func choosingAnotherUniversityDeletesTheSavedList() async throws {
+        let install = try await Install.make()
+        defer { install.remove() }
+        let token = MoodleRecordingProtocol.register(courses: [(1, "Analisi")])
+        defer { MoodleRecordingProtocol.revoke(token: token) }
+        try await install.save([course(1, "Analisi")], token: token)
+
+        let controller = install.launch(token: token)
+        controller.setDisconnectedForTesting()
+        let other = try #require(MoodleSite.unipd.first { $0 != controller.selectedSite })
+        controller.selectSite(other)
+        await controller.waitForCourseListWriteForTesting()
+        #expect(controller.selectedSite == other)
+        #expect(!FileManager.default.fileExists(atPath: install.file.path))
+    }
+
+    /// A failure of the previous account's token, answered after another account signed in, says
+    /// nothing about the new one: it must not mark the new sign-in expired or show an error.
+    @Test func aLateFailureOfThePreviousTokenDoesNotExpireTheNewSignIn() async throws {
+        let install = try await Install.make()
+        defer { install.remove() }
+        let a = MoodleRecordingProtocol.register(courses: [(1, "Analisi")], userID: 11)
+        let b = MoodleRecordingProtocol.register(courses: [(3, "Chimica")], userID: 22)
+        defer { MoodleRecordingProtocol.revoke(token: a); MoodleRecordingProtocol.revoke(token: b) }
+        let controller = install.launch(token: a)
+
+        MoodleRecordingProtocol.holdCourseLists(token: a)
+        controller.loadCourses()
+        try await waitUntil { MoodleRecordingProtocol.heldCourseListCount(token: a) == 1 }
+        let login = Task { await controller.completeLoginForTesting(moodleLoginCallback(token: b)) }
+        try await waitUntil {
+            MoodleRecordingProtocol.requests(token: b).contains { $0.function == "core_webservice_get_site_info" } && !controller.isAuthenticating
+        }
+        MoodleRecordingProtocol.reject(token: a)
+        MoodleRecordingProtocol.releaseCourseLists(token: a)
+        await login.value
+        await controller.waitForCourseLoadForTesting()
+
+        #expect(controller.accountState == .connected, "the previous token's rejection expired the new sign-in")
+        #expect(controller.courseLoadError == nil)
+        #expect(controller.courses.map(\.id) == [3])
+    }
+
+    /// The second check in a refresh: a sign-out while the folders are being read, after Moodle
+    /// answered, still drops the answer instead of publishing it, and saves nothing.
+    @Test func aSignOutDuringTheFolderReadDropsTheRefresh() async throws {
+        let install = try await Install.make()
+        defer { install.remove() }
+        let token = MoodleRecordingProtocol.register(courses: [(1, "Analisi"), (2, "Fisica")])
+        defer { MoodleRecordingProtocol.revoke(token: token) }
+        let controller = install.launch(token: token)
+        var published: [[Int64]] = []
+        let subscription = controller.$courses.dropFirst().sink { published.append($0.map(\.id)) }
+        defer { subscription.cancel() }
+        controller.setBeforeScopeRestoreForTesting {
+            controller.setDisconnectedForTesting()
+            controller.forgetCourseListForTesting()
+        }
+
+        controller.loadCourses()
+        await controller.waitForCourseLoadForTesting()
+        #expect(published.allSatisfy(\.isEmpty), "a refresh that began for the previous account was published: \(published)")
+        #expect(controller.courseListFreshness == .unknown)
+        await controller.waitForCourseListWriteForTesting()
+        #expect(!FileManager.default.fileExists(atPath: install.file.path))
+    }
+
+    /// The restore only reads: a saved name that differs from the database's (renamed on Moodle
+    /// since) is shown, but no record is updated and no folder renamed until Moodle confirms it;
+    /// the folder shown is the database's. Fails if the restore goes through `restoreScopes`.
+    @Test func restoringASavedListRecordsNothing() async throws {
+        let install = try await Install.make()
+        defer { install.remove() }
+        let token = MoodleRecordingProtocol.register(courses: [(1, "Analisi"), (2, "Fisica")])
+        defer { MoodleRecordingProtocol.revoke(token: token) }
+        try await install.save([course(1, "Analisi matematica"), course(2, "Fisica")], token: token)
+        let before = try await install.database.scopes(rootID: install.rootID)
+
+        let controller = install.launch(token: token)
+        await controller.restoreSavedCourseListForTesting()
+        #expect(controller.isShowingSavedCourseList)
+        #expect(controller.courses.map(\.displayName).contains("Analisi matematica"))
+        #expect(controller.folder(for: controller.courses.first { $0.id == 1 }!) == "Analisi I")
+        let after = try await install.database.scopes(rootID: install.rootID)
+        #expect(after.map(\.displayName) == before.map(\.displayName))
+        #expect(after.map(\.localFolder) == before.map(\.localFolder))
+
+        // Nor can the user record anything for it: switches and renames wait for Moodle's list.
+        let enabled = controller.enabledCourseIDs
+        controller.setCourse(controller.courses.first { $0.id == 2 }!, enabled: true)
+        #expect(controller.enabledCourseIDs == enabled)
+        #expect(try await install.database.scopes(rootID: install.rootID).map(\.enabled) == before.map(\.enabled))
+    }
+
+    /// Choosing another folder over a saved list: the saved list is set aside and Moodle's list
+    /// loaded, so the new folder's records come from Moodle only. A course in the saved list that
+    /// Moodle no longer lists (course 9) gets no record there. Fails if the saved list goes
+    /// through `restoreScopes` for the new folder.
+    @Test func choosingAFolderOverASavedListUsesMoodlesList() async throws {
+        let install = try await Install.make()
+        defer { install.remove() }
+        let token = MoodleRecordingProtocol.register(courses: [(1, "Analisi"), (2, "Fisica")])
+        defer { MoodleRecordingProtocol.revoke(token: token) }
+        try await install.save([course(1, "Analisi"), course(2, "Fisica"), course(9, "Corso finito")], token: token)
+        let controller = install.launch(token: token)
+        await controller.restoreSavedCourseListForTesting()
+        #expect(controller.courses.map(\.id).contains(9))
+
+        let newRoot = FileManager.default.temporaryDirectory.appending(path: "SavedCourseListTests-new-\(UUID().uuidString)", directoryHint: .isDirectory)
+        try FileManager.default.createDirectory(at: newRoot, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: newRoot) }
+        await controller.useRootForTesting(newRoot)
+        await controller.waitForCourseLoadForTesting()
+        let newRootID = try #require(try await install.database.rootID(canonicalPath: newRoot.resolvingSymlinksInPath().path))
+        let scopes = try await install.database.scopes(rootID: newRootID)
+        #expect(!scopes.contains { $0.courseID == 9 }, "the saved list created records in the new folder")
+        #expect(controller.courses.map(\.id) == [1, 2])
+        #expect(controller.courseListFreshness == .current)
+    }
+
+    /// A sync from the menu right after a launch, before the window ever opened, confirms an
+    /// unchanged list: nothing is written (no disk write when nothing changed).
+    @Test func aSyncAfterARelaunchDoesNotRewriteAnUnchangedList() async throws {
+        let install = try await Install.make()
+        defer { install.remove() }
+        let token = MoodleRecordingProtocol.register(courses: [(1, "Analisi"), (2, "Fisica")])
+        defer { MoodleRecordingProtocol.revoke(token: token) }
+        _ = await launchAndSave(install, token: token)
+        let written = try Data(contentsOf: install.file)
+
+        let relaunched = install.launch(token: token)
+        relaunched.synchronizeNow()
+        await relaunched.waitForSyncForTesting()
+        await relaunched.waitForCourseListWriteForTesting()
+        #expect(relaunched.courseListFreshness == .current)
+        #expect(try Data(contentsOf: install.file) == written, "an unchanged list was rewritten at the first sync of a launch")
     }
 }

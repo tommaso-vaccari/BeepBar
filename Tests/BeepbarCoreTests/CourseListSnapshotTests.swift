@@ -329,4 +329,58 @@ struct CourseListSnapshotTests {
         #expect(try await store.save(courses(2), identity: identity, epoch: 0, now: now) == false)
         #expect(!FileManager.default.fileExists(atPath: folder.appendingPathComponent(CourseListSnapshotStore.fileName).path))
     }
+
+    /// A file dated well ahead of now was written with a wrong clock: its age says nothing, so it
+    /// is refused rather than shown "saved in 3 days" and never expiring. A day ahead is still
+    /// accepted (a clock moved back a little), and an unchanged list dated ahead is rewritten at
+    /// once instead of waiting for its future date to pass.
+    @Test func futureDatesAreRefusedOrRewritten() throws {
+        let data = try CourseListSnapshotCodec.encode(CourseListSnapshot(identity: identity, savedAt: now, courses: courses(1)))
+        let dayBefore = now.addingTimeInterval(-CourseListSnapshotCodec.saveRefreshInterval)
+        #expect(throws: Never.self) { try CourseListSnapshotCodec.decode(data, expecting: identity, now: dayBefore) }
+        #expect(throws: CourseListSnapshotCodec.DecodeError.savedInTheFuture) {
+            try CourseListSnapshotCodec.decode(data, expecting: identity, now: dayBefore.addingTimeInterval(-1))
+        }
+        let ahead = CourseListSnapshot(identity: identity, savedAt: now.addingTimeInterval(3_600), courses: courses(1))
+        #expect(CourseListSnapshotCodec.shouldSave(courses(1), identity: identity, after: ahead, now: now))
+    }
+
+    /// The first save of a launch reads the file before deciding: a sync from the menu before the
+    /// window ever opened must not rewrite an unchanged list on every launch (no disk write when
+    /// nothing changed). A changed list is still written.
+    @Test func aNewLaunchDoesNotRewriteAnUnchangedList() async throws {
+        let (store, folder, cleanup) = try makeStore()
+        defer { cleanup() }
+        #expect(try await store.save(courses(3), identity: identity, now: now))
+        let file = folder.appendingPathComponent(CourseListSnapshotStore.fileName)
+        let written = try Data(contentsOf: file)
+
+        let relaunched = CourseListSnapshotStore(directory: { folder })
+        #expect(try await relaunched.save(courses(3), identity: identity, now: now.addingTimeInterval(3_600)) == false)
+        #expect(try Data(contentsOf: file) == written)
+        #expect(try await relaunched.save(courses(2), identity: identity, now: now.addingTimeInterval(3_600)))
+    }
+
+    /// A file refused on load is gone, so the store must not keep believing it holds the list: the
+    /// next save of that very list writes it again instead of skipping it as unchanged.
+    @Test func aDiscardedFileIsWrittenAgain() async throws {
+        let (store, folder, cleanup) = try makeStore()
+        defer { cleanup() }
+        let file = folder.appendingPathComponent(CourseListSnapshotStore.fileName)
+        #expect(try await store.save(courses(2), identity: identity, now: now))
+        try Data("{broken".utf8).write(to: file)
+        #expect(await store.load(expecting: identity, now: now) == .discarded(.unreadable))
+        #expect(try await store.save(courses(2), identity: identity, now: now.addingTimeInterval(60)))
+        #expect(FileManager.default.fileExists(atPath: file.path))
+    }
+
+    /// A temporary file a crash left behind is swept by the next write, not only at sign-out.
+    @Test func aSaveRemovesLeftoverTemporaries() async throws {
+        let (store, folder, cleanup) = try makeStore()
+        defer { cleanup() }
+        try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+        try Data("half".utf8).write(to: folder.appendingPathComponent(".course-list-leftover.tmp"))
+        #expect(try await store.save(courses(1), identity: identity, now: now))
+        #expect(try FileManager.default.contentsOfDirectory(atPath: folder.path) == [CourseListSnapshotStore.fileName])
+    }
 }

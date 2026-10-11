@@ -24,6 +24,8 @@ final class MoodleRecordingProtocol: URLProtocol, @unchecked Sendable {
         var requests: [RecordedRequest] = []
         var onHotspot = false
         var offline = false
+        /// Moodle stopped accepting the token but the account's held answers stay deliverable.
+        var rejected = false
         var holdsCourseLists = false
         var heldCourseLists: [@Sendable () -> Void] = []
     }
@@ -61,7 +63,14 @@ final class MoodleRecordingProtocol: URLProtocol, @unchecked Sendable {
         accounts.withLock { $0[token]?.offline = offline }
     }
 
-    /// Holds every enrolled-courses answer for this account, already computed, until
+    /// Moodle stops accepting `token` like `revoke(token:)`, but its held answers stay: once
+    /// released they answer `invalidtoken`, as a request that reached Moodle after the token
+    /// expired would.
+    static func reject(token: String) {
+        accounts.withLock { $0[token]?.rejected = true }
+    }
+
+    /// Holds every enrolled-courses answer for this account until
     /// `releaseCourseLists(token:)`: lets a test change the app's state while a refresh waits for
     /// Moodle and then deliver the answer late.
     static func holdCourseLists(token: String) {
@@ -72,7 +81,7 @@ final class MoodleRecordingProtocol: URLProtocol, @unchecked Sendable {
         accounts.withLock { $0[token]?.heldCourseLists.count ?? 0 }
     }
 
-    /// Delivers every held enrolled-courses answer and stops holding new ones.
+    /// Delivers every held enrolled-courses answer, worked out now, and stops holding new ones.
     static func releaseCourseLists(token: String) {
         let held = accounts.withLock { accounts -> [@Sendable () -> Void] in
             let held = accounts[token]?.heldCourseLists ?? []
@@ -137,21 +146,10 @@ final class MoodleRecordingProtocol: URLProtocol, @unchecked Sendable {
             client?.urlProtocolDidFinishLoading(self)
             return
         }
-        let json: String
-        switch (account, function) {
-        case (nil, _):
-            json = #"{"exception":"invalidtoken","errorcode":"invalidtoken"}"#
-        case (let account?, "core_webservice_get_site_info"):
-            json = #"{"userid":\#(account.userID),"siteurl":"https://webeep.polimi.it","functions":[{"name":"core_enrol_get_users_courses"},{"name":"core_course_get_contents"}]}"#
-        case (let account?, "core_enrol_get_users_courses"):
-            json = "[" + account.courses.map { #"{"id":\#($0.id),"shortname":"\#($0.name)","fullname":"\#($0.name)","visible":1}"# }.joined(separator: ",") + "]"
-        case (let account?, "core_course_get_contents"):
-            json = Self.contents(course: Int64(fields["courseid"] ?? "") ?? 0, files: account.files)
-        default:
-            json = "[]"
-        }
         let this = self
         let deliver: @Sendable () -> Void = {
+            // Worked out when delivered, so a held answer reflects a token rejected meanwhile.
+            let json = MoodleRecordingProtocol.answer(function: function, fields: fields, account: MoodleRecordingProtocol.accounts.withLock { $0[token] })
             let response = HTTPURLResponse(url: url, statusCode: 200, httpVersion: "HTTP/1.1", headerFields: ["Content-Type": "application/json"])!
             this.client?.urlProtocol(this, didReceive: response, cacheStoragePolicy: .notAllowed)
             this.client?.urlProtocol(this, didLoad: Data(json.utf8))
@@ -163,6 +161,23 @@ final class MoodleRecordingProtocol: URLProtocol, @unchecked Sendable {
             return true
         }
         if !held { deliver() }
+    }
+
+    private static func answer(function: String, fields: [String: String], account: Account?) -> String {
+        switch (account, function) {
+        case (nil, _):
+            return #"{"exception":"invalidtoken","errorcode":"invalidtoken"}"#
+        case (let account?, _) where account.rejected:
+            return #"{"exception":"invalidtoken","errorcode":"invalidtoken"}"#
+        case (let account?, "core_webservice_get_site_info"):
+            return #"{"userid":\#(account.userID),"siteurl":"https://webeep.polimi.it","functions":[{"name":"core_enrol_get_users_courses"},{"name":"core_course_get_contents"}]}"#
+        case (let account?, "core_enrol_get_users_courses"):
+            return "[" + account.courses.map { #"{"id":\#($0.id),"shortname":"\#($0.name)","fullname":"\#($0.name)","visible":1}"# }.joined(separator: ",") + "]"
+        case (let account?, "core_course_get_contents"):
+            return contents(course: Int64(fields["courseid"] ?? "") ?? 0, files: account.files)
+        default:
+            return "[]"
+        }
     }
 
     /// One section with one folder module listing the course's registered files; empty without any.

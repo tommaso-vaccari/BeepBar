@@ -40,7 +40,7 @@ All findings below come from `scripts/recman-probe.sh play` / `lab` runs on 2026
 |---|---|---|
 | A | `PolimiEmail` (only `mail.polimi.it` / `polimi.it`, redacted description) and `WeBeepAPIClient.fetchOwnEmail` (`core_user_get_users_by_field`) | integrated |
 | B | `RecmanSessionCodec` v2: email + Webex cookies (`webex.com` on a label boundary), Webex cookies expiring within 12 h not kept; v1 still read | integrated |
-| C | `RecordingPlayerController`: one window, nothing before first Play, full release on close, 30 s forward buffer; AVKit loaded with `dlopen` on first Play (linking it adds ~335 dyld images to every launch); failures reported before/during playback | review fixes in progress |
+| C | `RecordingPlayerController`: one window, nothing before first Play, full release on close, 30 s forward buffer; AVKit loaded with `dlopen` on first Play (linking it adds ~335 dyld images to every launch; images 656 → 920 after dlopen → 1151 with the player); failures reported `.beforeReady` (window closed) / `.duringPlayback(position:)` (paused, window kept); app `.regular` while the player is open | integrated |
 | D | Core parsing of Webex pages and the stream API answer, URL policy | waits for this investigation |
 | E | `RecmanWebSession.stream(for:email:)` per the design above | waits for D |
 | F | Controller/UI integration, settings email confirmation, specs, CHANGELOG, compliance wiki, measurements | last |
@@ -48,6 +48,8 @@ All findings below come from `scripts/recman-probe.sh play` / `lab` runs on 2026
 Decisions by the product owner: native window (not QuickTime Player); email read from the WeBeep profile and confirmed by the user; player MVP = system controls (PiP, AirPlay, Now Playing), speed 0.5–3x, ±10/30 s skips and shortcuts, resume where you left off (saved on pause/close only, tied to the watchlist/seen state), recovery after errors or expired URLs. v2: transcript (VTT) with search, chapters, audio-only (`audioURL`), bookmarks, slide capture, next-lecture queue, floating window. Out: adaptive bitrate (single level), offline download (#87, honour `preventDownload`).
 
 Requirements recorded for F by reviews: carry the email through the controller's save path and its fingerprint; verify a relaunch reaches the stream without a new Webex sign-in (the 12 h floor must not drop the cookie that matters — `ticket` is a session cookie, so it is kept); any `fetchOwnEmail` failure means "ask the user", never a sync error; specs IT/EN and compliance wiki must say the session file also holds Webex cookies and the Polimi email; measure `otool -L` (no AVKit), dyld images and launch, 30-min idle wakeups, memory after 1 and 10 play/close cycles, `scripts/quit-probe.sh` with the player open.
+
+Player ownership and lifecycle for F (from C's review): the long-lived `RecordingsController` owns the player; call `close()` on logout, Recordings disable and account change (the stream belongs to the old identity), but **not** from `windowClosed()` (a lecture keeps playing with the settings window closed). The player has no deinit teardown. While BeepBar is `.regular`, ⌘Q from the main menu and Dock Quit become new quit entry points: rerun `scripts/quit-probe.sh` and try both by hand with the player open during a sync. `WeBeepAuthenticationController.chooseRoot` restores `.accessory` unconditionally after its modal panel and can drop the Dock icon if a Play started meanwhile: make it restore only if still `.regular`.
 
 ## Open items
 

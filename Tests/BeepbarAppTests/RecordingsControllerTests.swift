@@ -2249,7 +2249,7 @@ struct RecordingsControllerTests {
         controller.pageAppeared()
         await controller.prepareEmailField()
         #expect(controller.confirmedEmail?.value == "a.b@polimi.it")
-        #expect(controller.suggestedEmail == nil)
+        #expect(!controller.emailFromProfile)
         #expect(world.profileEmailCalls == 0, "no profile read when an address is already confirmed")
         controller.play(recording("a"))
         await settle("a playing") { world.player.plays.count == 1 }
@@ -2257,40 +2257,132 @@ struct RecordingsControllerTests {
         controller.turnOff()
     }
 
-    /// Without a confirmed address the WeBeep profile's is only offered, never stored: the file
-    /// has no email and Play still asks for none until the student confirms; any profile failure
-    /// or a non-Polimi address means an empty field. Mutation: store the suggestion in
-    /// `prepareEmailField` and the file expectation fails.
+    /// Product decision (2026-10-11): the WeBeep profile's Polimi address is in use without a
+    /// confirmation step, stored in the session file like a typed one, and Play sends it. A
+    /// profile failure, no address or a non-Polimi address leave none, and Play still ends on the
+    /// message. Replaces the earlier "only a suggestion" test. Mutation: drop
+    /// `confirmedEmail = email` in `performEmailLookup` and the Polimi row fails (no address, no
+    /// file email, Play gets nil).
     @Test(arguments: ["polimi address", "personal address", "no address"])
-    func theProfileAddressIsOnlyASuggestion(profile: String) async throws {
+    func theProfileAddressIsUsedWithoutConfirmation(profile: String) async throws {
         defer { cleanUp() }
         world.profileEmail = switch profile {
         case "polimi address": "Mario.Rossi@mail.polimi.it"
         case "personal address": "mario@gmail.com"
         default: nil
         }
-        browser.streamResults["a"] = [.failure(RecmanBrowserError.needsEmail), .success(stream("a"))]
+        let usable = profile == "polimi address"
+        browser.streamResults["a"] = usable ? [.success(stream("a"))] : [.failure(RecmanBrowserError.needsEmail)]
         let controller = await readyController()
         await controller.prepareEmailField()
         #expect(world.profileEmailCalls == 1)
-        #expect(controller.suggestedEmail?.value == (profile == "polimi address" ? "mario.rossi@mail.polimi.it" : nil))
-        #expect(controller.confirmedEmail == nil)
+        #expect(controller.confirmedEmail?.value == (usable ? "mario.rossi@mail.polimi.it" : nil))
+        #expect(controller.emailFromProfile == usable)
         await controller.settleSessionFile()
-        #expect(try savedEmail() == nil, "a suggestion is not stored")
+        #expect(try savedEmail() == (usable ? "mario.rossi@mail.polimi.it" : nil), "stored like a typed address")
 
         controller.play(recording("a"))
-        await settle("needs an email") { controller.openingProblem == .playbackUnavailable }
-        #expect(browser.streamEmails == [nil])
-        #expect(world.player.plays.isEmpty)
-
-        if let suggestion = controller.suggestedEmail {
-            #expect(controller.confirmEmail(suggestion.value) == .saved)
-            #expect(controller.suggestedEmail == nil)
-            controller.play(recording("a"))
+        if usable {
             await settle("a playing") { world.player.plays.count == 1 }
-            #expect(browser.streamEmails == [nil, suggestion.value])
+            #expect(browser.streamEmails == ["mario.rossi@mail.polimi.it"])
+        } else {
+            await settle("needs an email") { controller.openingProblem == .playbackUnavailable }
+            #expect(browser.streamEmails == [nil])
+            #expect(world.player.plays.isEmpty)
         }
+        #expect(world.profileEmailCalls == 1, "the Play doesn't ask WeBeep again in the same epoch")
         controller.turnOff()
+    }
+
+    /// The first Play works without the Settings row ever appearing: Play itself takes the
+    /// profile's address, once, and the save after the Play keeps it in the file. Guards against
+    /// the lookup depending on the Settings view (the user's report: "Couldn't open this
+    /// recording." until the address was confirmed by hand). Mutation: remove the `learnEmail()`
+    /// call in `playNatively` and `streamEmails` is `[nil]`.
+    @Test func theFirstPlayUsesTheProfileAddressWithoutSettings() async throws {
+        defer { cleanUp() }
+        world.profileEmail = "mario.rossi@mail.polimi.it"
+        browser.streamResults["a"] = [.success(stream("a")), .success(stream("a"))]
+        let controller = await readyController()
+        #expect(world.profileEmailCalls == 0, "nothing is asked at rest")
+        controller.play(recording("a"))
+        await settle("a playing") { world.player.plays.count == 1 }
+        #expect(browser.streamEmails == ["mario.rossi@mail.polimi.it"])
+        #expect(controller.emailFromProfile)
+        await settle("stored") { (try? self.savedEmail()) == "mario.rossi@mail.polimi.it" }
+        controller.play(recording("a"))
+        await settle("played again") { world.player.plays.count == 2 }
+        #expect(world.profileEmailCalls == 1)
+        controller.turnOff()
+    }
+
+    /// The student's choice beats the profile: an edited address is the one used, and a removed
+    /// one stays removed, in this launch and after a relaunch (`emailDeclinedKey`), so the
+    /// profile is never asked again for that account; entering an address again lifts it.
+    /// Mutations: drop the `emailDeclined(by:)` guard in `performEmailLookup`, or the
+    /// `defaults.set(owner, forKey: emailDeclinedKey)` in `setConfirmedEmail`, and the relaunch
+    /// expectations fail; drop `forgetEmailOptOut()` for a new address and the last one fails.
+    /// (In the same launch the removal is also covered by the epoch's single lookup.)
+    @Test func theStudentsEditOrRemovalWinsOverTheProfile() async throws {
+        defer { cleanUp() }
+        world.profileEmail = "mario.rossi@mail.polimi.it"
+        let controller = await readyController()
+        await controller.prepareEmailField()
+        #expect(controller.confirmedEmail?.value == "mario.rossi@mail.polimi.it")
+        #expect(controller.confirmEmail("m.rossi@polimi.it") == .saved)
+        #expect(!controller.emailFromProfile)
+        #expect(controller.confirmEmail("") == .cleared)
+        await controller.learnEmail()
+        #expect(controller.confirmedEmail == nil, "no re-prefill after a removal")
+        #expect(world.profileEmailCalls == 1)
+        await controller.settleSessionFile()
+        #expect(try savedEmail() == nil)
+        #expect(defaults.integer(forKey: RecordingsController.emailDeclinedKey) == 42)
+
+        let relaunched = makeController()
+        relaunched.pageAppeared()
+        await relaunched.prepareEmailField()
+        #expect(relaunched.confirmedEmail == nil, "the removal survives a relaunch")
+        #expect(world.profileEmailCalls == 1, "WeBeep is not asked for a removed address")
+        #expect(relaunched.confirmEmail("a.b@polimi.it") == .saved)
+        #expect(defaults.object(forKey: RecordingsController.emailDeclinedKey) == nil, "an address entered again lifts the removal")
+        relaunched.turnOff()
+    }
+
+    /// A Play that starts while the Settings row's lookup is still waiting for WeBeep uses its
+    /// answer instead of going on without an address or asking twice. Mutation: drop the shared
+    /// `emailLookup` (always start a new lookup) and the Play gets nil.
+    @Test func aPlayDuringTheSettingsLookupWaitsForIt() async throws {
+        defer { cleanUp() }
+        world.profileEmail = "mario.rossi@mail.polimi.it"
+        browser.streamResults["a"] = [.success(stream("a"))]
+        let controller = await readyController()
+        let gate = FakeRecmanBrowser.Gate()
+        defer { gate.release() }
+        world.profileGate = gate
+        let settings = Task { await controller.prepareEmailField() }
+        await settle("profile read held") { gate.isWaiting }
+        controller.play(recording("a"))
+        await drainTasks()
+        #expect(browser.streamCalls.isEmpty, "the Play waits for the address")
+        gate.release()
+        await settings.value
+        await settle("a playing") { world.player.plays.count == 1 }
+        #expect(browser.streamEmails == ["mario.rossi@mail.polimi.it"])
+        #expect(world.profileEmailCalls == 1)
+        controller.turnOff()
+    }
+
+    /// The Play log says where the address came from and never contains it.
+    /// Mutation: return "confirmed" for every address in `emailDiagnosis` and the profile row fails.
+    @Test func thePlayLogNamesTheAddressSourceOnly() throws {
+        let email = try #require(PolimiEmail("mario.rossi@mail.polimi.it"))
+        #expect(RecordingsController.emailDiagnosis(email, fromProfile: true) == "profile")
+        #expect(RecordingsController.emailDiagnosis(email, fromProfile: false) == "confirmed")
+        #expect(RecordingsController.emailDiagnosis(nil, fromProfile: true) == "none")
+        for fromProfile in [true, false] {
+            #expect(!RecordingsController.emailDiagnosis(email, fromProfile: fromProfile).contains("mario"))
+        }
     }
 
     /// Typed before any session exists, the address waits in memory and the sign-in writes it.
@@ -2319,29 +2411,41 @@ struct RecordingsControllerTests {
         world.owner = 7
         controller.webBeepAccountChanged(to: 7)
         #expect(controller.confirmedEmail == nil)
-        #expect(controller.suggestedEmail == nil)
+        #expect(!controller.emailFromProfile)
         await controller.settleSessionFile()
         #expect(try store.load() == nil)
         controller.turnOff()
     }
 
-    /// A profile answer that arrives after an account change is dropped instead of being offered
-    /// to the next account. Mutation: remove the `epoch == emailEpoch` check in
-    /// `prepareEmailField` and the suggestion appears.
-    @Test func aLateProfileAnswerAfterAnAccountChangeIsDropped() async {
+    /// A profile answer that arrives after an account change is dropped instead of becoming the
+    /// next account's address, whether the Settings row or a Play asked. Mutation: remove the
+    /// `epoch == emailEpoch` check after `fetchProfileEmail` in `performEmailLookup` and the
+    /// address appears (and reaches the file).
+    @Test(arguments: [false, true])
+    func aLateProfileAnswerAfterAnAccountChangeIsDropped(fromPlay: Bool) async throws {
         defer { cleanUp() }
         let controller = await readyController()
         let gate = FakeRecmanBrowser.Gate()
         defer { gate.release() }
         world.profileGate = gate
         world.profileEmail = "previous.account@mail.polimi.it"
-        let task = Task { await controller.prepareEmailField() }
+        var settings: Task<Void, Never>?
+        if fromPlay {
+            controller.play(recording("a"))
+        } else {
+            settings = Task { await controller.prepareEmailField() }
+        }
         await settle("profile read held") { gate.isWaiting }
         world.owner = 7
         controller.webBeepAccountChanged(to: 7)
         gate.release()
-        await task.value
-        #expect(controller.suggestedEmail == nil)
+        await settings?.value
+        await drainTasks()
+        #expect(controller.confirmedEmail == nil)
+        #expect(!controller.emailFromProfile)
+        #expect(browser.streamEmails.allSatisfy { $0 == nil })
+        await controller.settleSessionFile()
+        #expect(try store.load() == nil, "nothing of the old account's answer is written")
         controller.turnOff()
     }
 

@@ -117,6 +117,12 @@ struct RecordingsListing: Equatable {
     /// Where the student stopped in each lecture (`RecordingResumePoints`), for one account.
     /// Removed with the session: turn-off, disconnect and account change.
     static let resumePointsKey = "io.github.tvaccari.beepbar.recordings-resume.v1"
+    /// The WeBeep account (numeric user id) whose student removed the Polimi email in Settings:
+    /// the profile's address is then never taken again for that account, also after a relaunch
+    /// (an empty session file can't tell "removed" from "never set"). Holds no address. Removed
+    /// with the session's identity (turn-off, disconnect, account change) and when the student
+    /// enters an address again.
+    static let emailDeclinedKey = "io.github.tvaccari.beepbar.recordings-email-declined.v1"
     /// A course shown again within this time isn't asked for again unless the user refreshes.
     static let freshness: TimeInterval = 300
 
@@ -164,20 +170,29 @@ struct RecordingsListing: Equatable {
     /// A recovery job is executing (it has left the queue).
     private var runningRecovery = false
 
-    /// The Polimi address the student confirmed for the Webex sign-in; lives in the session file.
+    /// The Polimi address in use for the Webex sign-in: the one the student typed, the one the
+    /// session file holds, or (product decision 2026-10-11) the WeBeep profile's, taken as
+    /// confirmed without a confirmation step (`learnEmail`). Lives in the session file.
     @Published private(set) var confirmedEmail: PolimiEmail? = nil
-    /// The address the WeBeep profile offers, valid but not confirmed yet.
-    @Published private(set) var suggestedEmail: PolimiEmail? = nil
+    /// Whether `confirmedEmail` was taken from the WeBeep profile in this session (the Settings
+    /// field says so, and the Play diagnostics log `email=profile`). False once the student
+    /// edits it, and for an address read from the session file.
+    @Published private(set) var emailFromProfile = false
     /// Whether the saved session was read, so `confirmedEmail` says what the file holds.
     private var emailLoaded = false
-    /// The student changed the address in this launch: it wins over what a late read finds.
+    /// The student changed or removed the address in this launch: it wins over what a late read
+    /// finds, and the profile is not asked again.
     private var emailEditedByUser = false
     /// Bumped whenever the session (and so the email) is discarded: a late profile answer or
     /// read from before it is dropped.
     private var emailEpoch = 0
-    /// The profile was asked (or is being asked) in this session: a failed or empty answer is
-    /// not asked again at every Settings appearance.
+    /// The profile was asked (or is being asked) in this epoch: a failed or empty answer is not
+    /// asked again at every Settings appearance or Play.
     private var suggestionAttempted = false
+    /// The one profile lookup of the current epoch, shared by the Settings field and Play so a
+    /// Play that starts while the Settings row is already asking waits for the same answer
+    /// instead of going on without an address.
+    private var emailLookup: (epoch: Int, task: Task<Void, Never>)?
 
     private let makeBrowser: @MainActor () -> RecmanBrowsing
     private let store: RecordingsSessionStore
@@ -387,6 +402,7 @@ struct RecordingsListing: Equatable {
         selectedKey = nil
         forgetSeen()
         forgetResumePoints()
+        forgetEmailOptOut()
         studyLoaded = false
         loadStudy()
         defaults.removeObject(forKey: Self.enabledKey)
@@ -454,6 +470,7 @@ struct RecordingsListing: Equatable {
         playbackURLs = [:]
         forgetSeen()
         forgetResumePoints()
+        forgetEmailOptOut()
         discardSessionFile()
         if isEnabled { access = .needsSignIn(nil) }
     }
@@ -943,10 +960,23 @@ struct RecordingsListing: Equatable {
         return "play: player failed phase=\(phase) recovery=\(next) reason=\(PlayFailureReason.playerFailure.rawValue) error=\(PlaybackDiagnostics.errorName(cause))"
     }
 
+    /// `confirmed` (typed, or read from the session file), `profile` (taken from WeBeep in this
+    /// session) or `none`: the Play log's word for the address, which is never logged itself.
+    nonisolated static func emailDiagnosis(_ email: PolimiEmail?, fromProfile: Bool) -> String {
+        guard email != nil else { return "none" }
+        return fromProfile ? "profile" : "confirmed"
+    }
+
     private func playNatively(_ recording: RecmanRecording, request: Int, browser: RecmanBrowsing, generation: Int) async throws {
-        // Whether an address is confirmed, never the address: with none, a Play that needs a
-        // Webex sign-in can only show the message.
-        let emailState = confirmedEmail == nil ? "none" : "confirmed"
+        // No address yet: the WeBeep profile's is taken now (at most once per epoch), so the
+        // very first Play works without the Settings row ever having appeared.
+        if confirmedEmail == nil {
+            await learnEmail()
+            guard generation == self.generation else { return }
+        }
+        // Where the address came from, never the address: with none, a Play that needs a Webex
+        // sign-in can only show the message.
+        let emailState = Self.emailDiagnosis(confirmedEmail, fromProfile: emailFromProfile)
         PlaybackDiagnostics.log.notice("play: start email=\(emailState, privacy: .public)")
         let stream: RecordingStream
         do {
@@ -1072,6 +1102,24 @@ struct RecordingsListing: Equatable {
         defaults.removeObject(forKey: resumePointsKey)
     }
 
+    /// Removes the "email removed" marker (`emailDeclinedKey`) unless it is `owner`'s, without a
+    /// controller: an account change in a launch that never created Recordings.
+    nonisolated static func forgetEmailOptOut(in defaults: UserDefaults, notOwnedBy owner: Int) {
+        guard defaults.object(forKey: emailDeclinedKey) != nil, defaults.integer(forKey: emailDeclinedKey) != owner else { return }
+        defaults.removeObject(forKey: emailDeclinedKey)
+    }
+
+    /// The marker goes with the identity: turn-off, disconnect and account change.
+    private func forgetEmailOptOut() {
+        if defaults.object(forKey: Self.emailDeclinedKey) != nil { defaults.removeObject(forKey: Self.emailDeclinedKey) }
+    }
+
+    /// Whether the student of `owner` removed the address in Settings (in any launch).
+    private func emailDeclined(by owner: Int?) -> Bool {
+        guard let owner, defaults.object(forKey: Self.emailDeclinedKey) != nil else { return false }
+        return defaults.integer(forKey: Self.emailDeclinedKey) == owner
+    }
+
     /// Positions go with the session: turn-off, disconnect and account change.
     private func forgetResumePoints() {
         resumePoints = nil
@@ -1104,6 +1152,10 @@ struct RecordingsListing: Equatable {
         if case .freshStream(let position) = recovery {
             guard stillShowing(recording) else { return }
             recoveredLectures.insert(recording.id)
+            if confirmedEmail == nil {
+                await learnEmail()
+                guard generation == self.generation else { return }
+            }
             do {
                 let stream = try await browser.stream(for: recording, email: confirmedEmail)
                 guard generation == self.generation, stillShowing(recording) else { return }
@@ -1289,28 +1341,63 @@ struct RecordingsListing: Equatable {
         case invalid
     }
 
-    /// Called when the Settings field appears: learns the confirmed address from the saved
-    /// session, and, when there is none, offers the WeBeep profile's. Reads the session file once
-    /// (off the main actor) and asks WeBeep only when it is needed; a profile that can't be read,
-    /// a function the token isn't allowed to call and an address that isn't Polimi's all mean an
-    /// empty field for the student to fill in, never an error. Nothing is stored here: only
-    /// `confirmEmail` saves.
+    /// Called when the Settings field appears: the same lookup as a Play's (`learnEmail`).
     func prepareEmailField() async {
+        await learnEmail()
+    }
+
+    /// Learns the address to sign in to Webex with, when none is known: first the saved
+    /// session's, then (product decision 2026-10-11) the WeBeep profile's, taken as confirmed
+    /// with no confirmation step, so the first Play works without opening Settings.
+    ///
+    /// - Lazy and bounded: called by the Settings field and by Play when no address is known,
+    ///   never at rest; WeBeep is asked at most once per epoch (`suggestionAttempted`), and
+    ///   concurrent callers share one lookup (`emailLookup`).
+    /// - The student wins: nothing is taken after they edited or removed the address in this
+    ///   launch (`emailEditedByUser`), or removed it for this account in any launch
+    ///   (`emailDeclinedKey`).
+    /// - Identity: an answer that arrives after a turn-off, logout or account change (a new
+    ///   `emailEpoch`) is dropped; `fetchProfileEmail` itself checks the account is unchanged.
+    /// - Failure is silent: a profile that can't be read, a function the token isn't allowed to
+    ///   call or an address that isn't Polimi's leave no address (Play then shows its message),
+    ///   never an error. The address is never logged.
+    /// - Stored like a typed one: into the session file now when there is one
+    ///   (`storeEmail`), and by the next save (`saveSession`, fingerprint included) otherwise.
+    func learnEmail() async {
+        // Before the cache: a lookup refused while the feature is off must not stand for the
+        // epoch once it is turned on.
         guard isEnabled else { return }
+        if let emailLookup, emailLookup.epoch == emailEpoch {
+            await emailLookup.task.value
+            return
+        }
         let epoch = emailEpoch
+        let task: Task<Void, Never> = Task { [weak self] in
+            guard let self else { return }
+            await self.performEmailLookup(epoch: epoch)
+        }
+        emailLookup = (epoch, task)
+        await task.value
+    }
+
+    private func performEmailLookup(epoch: Int) async {
+        guard isEnabled, epoch == emailEpoch else { return }
         if !emailLoaded {
             _ = await savedCookies()
             // No browser means no opening cycle to share the read with: don't keep it around.
             if browser == nil { sessionLoad = nil }
             guard epoch == emailEpoch, isEnabled else { return }
         }
-        guard confirmedEmail == nil, suggestedEmail == nil, !emailEditedByUser, !suggestionAttempted else { return }
+        guard confirmedEmail == nil, !emailEditedByUser, !suggestionAttempted,
+              !emailDeclined(by: sessionOwner ?? ownerUserID()) else { return }
         suggestionAttempted = true
         let raw = await fetchProfileEmail()
         // A reset (turn-off, account change) already cleared the flag for its own cycle.
         guard epoch == emailEpoch else { return }
         guard isEnabled, confirmedEmail == nil, !emailEditedByUser, let raw, let email = PolimiEmail(raw) else { return }
-        suggestedEmail = email
+        confirmedEmail = email
+        emailFromProfile = true
+        storeEmail(email)
     }
 
     /// The student confirms, changes or removes the address. Only a Polimi address is accepted
@@ -1334,8 +1421,22 @@ struct RecordingsListing: Equatable {
 
     private func setConfirmedEmail(_ email: PolimiEmail?) {
         confirmedEmail = email
-        suggestedEmail = nil
+        emailFromProfile = false
         emailEditedByUser = true
+        let owner = sessionOwner ?? ownerUserID()
+        // A removal is remembered for the account, so the profile's address doesn't come back
+        // at the next launch (the empty file alone can't say it was removed on purpose).
+        if email == nil, let owner {
+            defaults.set(owner, forKey: Self.emailDeclinedKey)
+        } else if email != nil {
+            forgetEmailOptOut()
+        }
+        storeEmail(email)
+    }
+
+    /// Writes the address into the existing session file at once, keeping its cookies; with no
+    /// file yet the next sign-in's save writes it.
+    private func storeEmail(_ email: PolimiEmail?) {
         guard let owner = sessionOwner ?? ownerUserID() else { return }
         let update = vault.updateEmail(email?.value, ownerUserID: owner, epoch: vault.epoch, now: now())
         Task { [log] in
@@ -1350,10 +1451,11 @@ struct RecordingsListing: Equatable {
     private func resetEmail() {
         emailEpoch += 1
         confirmedEmail = nil
-        suggestedEmail = nil
+        emailFromProfile = false
         emailLoaded = false
         emailEditedByUser = false
         suggestionAttempted = false
+        emailLookup = nil
     }
 
     // MARK: Browser and session file
@@ -1424,6 +1526,7 @@ struct RecordingsListing: Equatable {
             playbackURLs = [:]
             forgetSeen()
             forgetResumePoints()
+            forgetEmailOptOut()
             discardSessionFile()
             return []
         }
@@ -1431,7 +1534,14 @@ struct RecordingsListing: Equatable {
         legacyOwner = snapshot.ownerUserID
         // What the file says, unless the student has already changed it in this launch. An
         // address that isn't a Polimi one (a damaged or foreign file) is simply not an address.
-        if !emailEditedByUser { confirmedEmail = snapshot.email.flatMap(PolimiEmail.init) }
+        // A profile address taken in this launch also stays when a later read finds a file
+        // without one: it is not written yet (no session file then, or a write still queued),
+        // and the next save writes it.
+        let fileEmail = snapshot.email.flatMap(PolimiEmail.init)
+        if !emailEditedByUser, !(emailFromProfile && fileEmail == nil) {
+            if fileEmail != confirmedEmail { emailFromProfile = false }
+            confirmedEmail = fileEmail
+        }
         emailLoaded = true
         return snapshot.cookies
     }

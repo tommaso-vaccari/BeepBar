@@ -343,6 +343,25 @@ struct RecordingsWatchProgressStoreTests {
         #expect(try rawRow(id: "a") == ["0.97", "1", "0"])
     }
 
+    /// Proves: the unlocked first read releases its shared lock as soon as it has read an existing
+    /// row, so another connection can update that row before `BEGIN IMMEDIATE`; the decision is
+    /// then re-made on the updated row (done by playback) and the tick writes nothing.
+    /// Guards against: the read statement holding its lock across the gap, blocking every other
+    /// writer until the next bind (mutation: remove `sqlite3_reset` in `readProgress` → the
+    /// second connection's update fails with SQLITE_BUSY, the tick writes `.manual`, red).
+    @Test func unlockedReadReleasesItsLockOnAnExistingRow() throws {
+        defer { cleanUp() }
+        let path = databaseURL.path
+        let probe = RecordingsSeenStore.Probe(afterUnlockedRead: {
+            _ = try? Self.rawText(path, "UPDATE progress SET furthest=0.95, completed=1 WHERE owner=42 AND id='a'")
+        })
+        let store = store(probe: probe)
+        _ = try self.store().applyProgress(owner: 42, key: key, id: "a", event: .checkpoint(session: session(0, 0.5), closes: false))
+        let result = try store.applyProgress(owner: 42, key: key, id: "a", event: .manual(done: true))
+        #expect(result == RecordingProgressResult(entry: RecordingWatchEntry(furthest: 0.95, completed: .playback), changed: false))
+        #expect(try rawRow(id: "a") == ["0.95", "1", "0"])
+    }
+
     /// Runs one statement on its own connection and returns the first column of the first row as
     /// text ("NULL" for SQL NULL, nil when there is no row). Throws on any SQLite error.
     fileprivate static func rawText(_ path: String, _ sql: String) throws -> String? {

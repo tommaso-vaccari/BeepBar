@@ -972,7 +972,8 @@ struct MenuBarSnapshot: Sendable {
             store: store,
             defaults: operationDefaults,
             ownerUserID: { [weak self] in self?.recordingsOwnerUserID },
-            isAvailable: { [weak self] in self?.selectedSite.university == .polimi }
+            isAvailable: { [weak self] in self?.selectedSite.university == .polimi },
+            fetchProfileEmail: { [weak self] in await self?.profileEmail() }
         )
 #if DEBUG
         if Self.isUIPreview && ProcessInfo.processInfo.arguments.contains("--watchlist-preview") {
@@ -988,6 +989,23 @@ struct MenuBarSnapshot: Sendable {
         }
 #endif
         return controller
+    }
+
+    /// The address on the WeBeep profile, to offer in the Recordings settings for confirmation
+    /// (#148). Asked only when the site lists the function for this token. Every failure (no
+    /// function, no token, offline, an odd answer) is nil: the student then types the address, and
+    /// nothing reaches the sync status or the log. The address is personal data and is never
+    /// logged here.
+    private func profileEmail() async -> String? {
+        guard let info = siteInfo, info.availableFunctions.contains(WeBeepAPIClient.ownEmailFunction) else { return nil }
+        do {
+            let token = try await credentialVault.load(.nonInteractive)
+            let address = try await apiClient.fetchOwnEmail(userID: info.userID, token: token)
+            // Another account may have signed in while WeBeep answered: its address is not ours to offer.
+            return siteInfo?.userID == info.userID ? address : nil
+        } catch {
+            return nil
+        }
     }
 
 #if DEBUG
@@ -1283,6 +1301,26 @@ struct MenuBarSnapshot: Sendable {
         return refresh
     }
 
+    /// What `chooseRoot` does with the activation policy once its folder panel is closed.
+    enum PanelPolicyOutcome: Equatable {
+        /// Put `previous` back: the panel raised BeepBar and nothing else has since.
+        case restore
+        /// A lecture window is open: leave BeepBar regular and let the player restore `previous`
+        /// when it closes.
+        case handToPlayer
+        /// Not ours to change: the panel didn't raise BeepBar, or someone else changed the policy
+        /// since.
+        case leave
+    }
+
+    /// Pure, so it is tested without a panel. Restores only if BeepBar is still `.regular` (the
+    /// state `chooseRoot` itself set), never over a policy someone else chose meanwhile, and never
+    /// under an open lecture window (#148).
+    nonisolated static func panelPolicyOutcome(previous: NSApplication.ActivationPolicy, current: NSApplication.ActivationPolicy, playerOpen: Bool) -> PanelPolicyOutcome {
+        guard previous != .regular, current == .regular else { return .leave }
+        return playerOpen ? .handToPlayer : .restore
+    }
+
     func chooseRoot() {
         let panel = NSOpenPanel()
         panel.title = tr("Scegli la cartella dei materiali BeepBar", "Choose the BeepBar materials folder")
@@ -1299,9 +1337,19 @@ struct MenuBarSnapshot: Sendable {
         if previousPolicy != .regular { NSApp.setActivationPolicy(.regular) }
         NSApp.activate(ignoringOtherApps: true)
         let response = panel.runModal()
-        if previousPolicy != .regular {
+        // `runModal` keeps servicing main-actor jobs, so a Lecture Play can open the native
+        // player meanwhile. Putting `.accessory` back unconditionally would then drop the Dock
+        // icon from under the lecture window (#148).
+        let lectureOpen = recordingsIfCreated?.isPlayerOpen ?? false
+        switch Self.panelPolicyOutcome(previous: previousPolicy, current: NSApp.activationPolicy(), playerOpen: lectureOpen) {
+        case .restore:
             NSApp.setActivationPolicy(previousPolicy)
             NSApp.activate(ignoringOtherApps: true)
+        case .handToPlayer:
+            // The player restores it when the lecture closes.
+            recordingsIfCreated?.keepPolicyAfterLecture(previousPolicy)
+        case .leave:
+            break
         }
         guard response == .OK, let url = panel.url else { return }
         // Registered by its resolved path, so the same folder reached through a symlink (the folder

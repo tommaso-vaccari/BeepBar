@@ -10,7 +10,7 @@
 | C02 | Token/sessioni locali, 0600/0700 | `code-backed` misura positiva; valutare rischi, log, backup, errori |
 | C03 | signOut rimuove token, invoca turnOff, conserva sync.sqlite e materiali | `code-backed`; documentare residui e rimozione preservando lavoro locale |
 | C04 | Aggiornamenti automatici ogni otto ore, README anche “Opt-in” | `code-backed` incoerenza; allineare descrizione, verificare payload e base |
-| C05 | Cookie Polimi senza expiry persistiti | `code-backed`; motivare durata e provare cancellazione/failure path |
+| C05 | Cookie Polimi senza expiry persistiti; con la riproduzione nativa (#148, feature branch, non rilasciata) lo stesso file conserva anche cookie di sessione Webex e l'email Polimi confermata dall'utente (dato personale), tutti cancellati con il file | `code-backed`; motivare durata, minimizzazione (solo domini polimi.it/webex.com, cookie Webex con scadenza entro 12 ore esclusi, email validata e mai nei log, nessun nome) e finalità (accesso automatico a Webex); provare cancellazione/failure path su turn-off, logout, cambio sito e account; verificare ruolo di Webex come destinatario dell'email; test e build non eseguiti nell'ambiente Linux di sviluppo |
 | C06 | Preferiti per account restano dopo logout | `code-backed`; conservazione distinta dalla sessione, documentare e verificare rimozione |
 | C07 | Log con campi pubblici; URL Recman ridotti a host/path | `code-backed` parziale; audit di campi/errori e diagnostica |
 | C08 | TelemetryDeck diretto, default attivo in Release, identità persistente hashata e versione app | `code-backed` su dev d3a42dc; verificare informativa, ruoli/contratti, conservazione, trasferimenti e base GDPR/ePrivacy prima della release; hash non prova anonimato |

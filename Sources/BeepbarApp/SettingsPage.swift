@@ -339,6 +339,9 @@ private struct RecordingsSettingsSection: View {
             case .ready, .off:
                 EmptyView()
             }
+            if recordings.isEnabled {
+                RecordingsEmailField(recordings: recordings)
+            }
         } header: {
             Text(tr("Registrazioni", "Recordings"))
         } footer: {
@@ -352,6 +355,87 @@ private struct RecordingsSettingsSection: View {
         if !recordings.isEnabled && !recordings.canTurnOn {
             return tr("Collega prima il tuo account WeBeep.", "Connect your WeBeep account first.")
         }
-        return tr("L'accesso al Politecnico resta solo su questo Mac, leggibile solo dal tuo utente. Spegnendo l'interruttore o disconnettendo l'account viene cancellato.", "The Polimi sign-in stays on this Mac only, readable only by your user. Turning the switch off or disconnecting the account deletes it.")
+        return tr("L'accesso al Politecnico e a Webex e l'email restano solo su questo Mac, leggibili solo dal tuo utente. Spegnendo l'interruttore o disconnettendo l'account vengono cancellati.", "The Polimi and Webex sign-ins and the email stay on this Mac only, readable only by your user. Turning the switch off or disconnecting the account deletes them.")
+    }
+}
+
+/// The Polimi email Webex asks for when a recording is played inside BeepBar (#148). Prefilled
+/// from the WeBeep profile when the account allows reading it, but only ever a suggestion: it is
+/// stored when the student confirms it (the rules live in `RecordingsController.emailFieldState`
+/// and `confirmEmail`). Nothing is read until this row appears.
+private struct RecordingsEmailField: View {
+    @ObservedObject var recordings: RecordingsController
+    @State private var draft = ""
+    /// What `draft` was last filled with, so a late suggestion never overwrites what the student typed.
+    @State private var source = ""
+
+    private var state: RecordingsController.EmailFieldState {
+        RecordingsController.emailFieldState(draft: draft, confirmed: recordings.confirmedEmail)
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 4) {
+            LabeledContent {
+                HStack(spacing: 8) {
+                    TextField("", text: $draft, prompt: Text("nome.cognome@mail.polimi.it"))
+                        .labelsHidden()
+                        .textFieldStyle(.roundedBorder)
+                        .frame(width: 230)
+                        .accessibilityLabel(tr("Email del Politecnico", "Polimi email"))
+                        .onSubmit(confirm)
+                    Button(state == .removable ? tr("Rimuovi", "Remove") : tr("Conferma", "Confirm"), action: confirm)
+                        .disabled(!canConfirm)
+                }
+            } label: {
+                SettingLabel(tr("Email del Politecnico", "Polimi email"), explanation: tr("BeepBar la usa solo per accedere a Webex in automatico quando guardi una registrazione dentro l'app: la manda a Webex per l'accesso e a nessun altro. Resta su questo Mac, nello stesso file dell'accesso al Politecnico, e viene cancellata con lui.", "BeepBar uses it only to sign in to Webex automatically when you watch a recording inside the app: it sends it to Webex for that sign-in and to no one else. It stays on this Mac, in the same file as your Polimi sign-in, and is deleted with it."))
+            }
+            if let note {
+                Text(note)
+                    .font(.caption)
+                    .foregroundStyle(state == .invalid ? Color.red : Color.secondary)
+            }
+        }
+        .task {
+            await recordings.prepareEmailField()
+            fill()
+        }
+        .onChange(of: recordings.confirmedEmail) { _, _ in fill() }
+        .onChange(of: recordings.suggestedEmail) { _, _ in fill() }
+    }
+
+    private var canConfirm: Bool {
+        switch state {
+        case .ready, .removable: true
+        case .empty, .confirmed, .invalid: false
+        }
+    }
+
+    private var note: String? {
+        switch state {
+        case .invalid:
+            return tr("Serve un indirizzo del Politecnico (…@mail.polimi.it o …@polimi.it).", "A Polimi address is needed (…@mail.polimi.it or …@polimi.it).")
+        case .confirmed:
+            return tr("Indirizzo confermato.", "Address confirmed.")
+        case .ready where recordings.confirmedEmail == nil && recordings.suggestedEmail?.value == draft.trimmingCharacters(in: .whitespacesAndNewlines).lowercased():
+            return tr("Trovato nel tuo profilo WeBeep: controllalo e conferma.", "Found on your WeBeep profile: check it and confirm.")
+        case .empty:
+            return tr("Serve per guardare le registrazioni dentro BeepBar: senza, quelle che richiedono l'accesso a Webex non si aprono.", "Needed to watch recordings inside BeepBar: without it, those that need a Webex sign-in won't open.")
+        case .ready, .removable:
+            return nil
+        }
+    }
+
+    private func confirm() {
+        guard canConfirm else { return }
+        recordings.confirmEmail(draft)
+        draft = ""
+        source = ""
+        fill()
+    }
+
+    private func fill() {
+        let latest = recordings.confirmedEmail?.value ?? recordings.suggestedEmail?.value ?? ""
+        if draft == source { draft = latest }
+        source = latest
     }
 }

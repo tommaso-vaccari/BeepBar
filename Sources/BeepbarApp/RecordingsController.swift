@@ -18,8 +18,10 @@ enum RecordingsProblem: Equatable {
         case .unavailable: self = .unavailable
         case .incomplete: self = .incomplete
         case .yearUnavailable: self = .yearUnavailable
-        // `needsEmail` comes only from `stream(for:email:)`, which nothing calls yet (#148
-        // package F wires it and gives it its own handling).
+        // `needsEmail` comes only from `stream(for:email:)` (native playback, #148): the product
+        // decision is the same sentence as for any recording that can't be opened, with no
+        // Webex email page shown to the user. It reaches the page only when Webex needs a
+        // sign-in and no Polimi email was confirmed in Settings.
         case .playbackUnavailable, .needsEmail: self = .playbackUnavailable
         case .unrecognized, .needsSignIn, nil: self = .unrecognized
         }
@@ -90,12 +92,31 @@ struct RecordingsListing: Equatable {
 ///
 /// "New" recordings: the first listing of a course marks everything in it as seen (its
 /// baseline), so only recordings published afterwards get the dot, until opened or marked seen.
+///
+/// Native playback (#148). Play resolves the recording's stream through the same browser and
+/// plays it in BeepBar's own window; anything it can't do falls back to the default browser, as
+/// Play always did. What this class keeps, each guarded by `RecordingsNativePlaybackTests`:
+/// - **Nothing before the first Play.** The player is created by the first Play that has a
+///   stream; no timer, observer or write runs for it at rest, and it is not part of quitting.
+/// - **The player belongs to the account.** Turning the feature off, disconnecting, switching
+///   university and an account change close it (`closePlayerForIdentityChange`); closing the
+///   Settings window does not: a lecture keeps playing with the window closed.
+/// - **Where you stopped is written only when the player reports it** (pause, close, a newer
+///   Play, a failure), never on a clock; a lecture watched to the end starts from the beginning
+///   again and counts as seen. The positions are stored per account and deleted with the session.
+/// - **The Polimi email stays in the session file** (`RecmanSessionVault`) and nowhere else, is
+///   never logged, and is deleted with the file.
+/// - **A failed lecture is recovered once.** A stream that dies mid-lecture is resolved again and
+///   resumes where it stopped; after that, or if it never started, the browser opens.
 @MainActor final class RecordingsController: ObservableObject {
     static let enabledKey = "io.github.tvaccari.beepbar.recordings-enabled.v1"
     static let acknowledgedKey = "io.github.tvaccari.beepbar.recordings-acknowledged.v1"
     static let baselinedKey = "io.github.tvaccari.beepbar.recordings-baselined.v1"
     /// Durable reset tombstone: a failed file removal can never reuse the old namespace.
     static let historyNamespaceKey = "io.github.tvaccari.beepbar.recordings-history-namespace.v2"
+    /// Where the student stopped in each lecture (`RecordingResumePoints`), for one account.
+    /// Removed with the session: turn-off, disconnect and account change.
+    static let resumePointsKey = "io.github.tvaccari.beepbar.recordings-resume.v1"
     /// A course shown again within this time isn't asked for again unless the user refreshes.
     static let freshness: TimeInterval = 300
 
@@ -117,6 +138,39 @@ struct RecordingsListing: Equatable {
     private var pendingAcknowledgementIDs: [RecmanCourseKey: Set<String>] = [:]
     private var legacyOwner: Int?
     private var legacySeen: RecordingsSeenStore.Legacy
+
+    // MARK: Native playback state (#148)
+
+    private let makePlayer: @MainActor () -> RecordingPlaying
+    /// The WeBeep profile's email address, or nil: any failure is "ask the user", never an error.
+    private let fetchProfileEmail: @MainActor () async -> String?
+    /// Created by the first Play that has a stream, never earlier.
+    private var player: RecordingPlaying?
+    /// The lectures whose reports are still accepted, by recording id. Filled before a `play` (the
+    /// lecture it replaces reports inside that call) and cut down to the new lecture right after;
+    /// emptied before the player is closed for an identity change, so the close's last report is
+    /// refused instead of being written under the next account.
+    private var nowPlaying: [String: RecmanRecording] = [:]
+    /// The lecture last handed to the player, for recoveries that outlive a newer Play.
+    private var currentLectureID: String?
+    /// Lectures already given their one fresh stream since the student pressed Play.
+    private var recoveredLectures: Set<String> = []
+    private var resumePoints: RecordingResumePoints?
+    /// A recovery ran with no Recordings page on screen: the browser it opened closes after it.
+    private var closesBrowserWhenIdle = false
+
+    /// The Polimi address the student confirmed for the Webex sign-in; lives in the session file.
+    @Published private(set) var confirmedEmail: PolimiEmail? = nil
+    /// The address the WeBeep profile offers, valid but not confirmed yet.
+    @Published private(set) var suggestedEmail: PolimiEmail? = nil
+    /// Whether the saved session was read, so `confirmedEmail` says what the file holds.
+    private var emailLoaded = false
+    /// The student changed the address in this launch: it wins over what a late read finds.
+    private var emailEditedByUser = false
+    /// Bumped whenever the session (and so the email) is discarded: a late profile answer or
+    /// read from before it is dropped.
+    private var emailEpoch = 0
+    private var suggestionInFlight = false
 
     private let makeBrowser: @MainActor () -> RecmanBrowsing
     private let store: RecordingsSessionStore
@@ -153,6 +207,17 @@ struct RecordingsListing: Equatable {
     private enum Job: Equatable {
         case list(RecmanCourseKey)
         case open(RecmanRecording, OpenAction, Int)
+        /// A lecture in the player went wrong (#148): not a click, so it changes no spinner.
+        case recover(RecmanRecording, Recovery)
+    }
+
+    /// What to do about a lecture that failed in the player.
+    enum Recovery: Equatable {
+        /// Resolve the stream again and resume at this position: its address expired or the
+        /// connection dropped.
+        case freshStream(at: TimeInterval)
+        /// Open the player link in the browser.
+        case browser
     }
     /// Every click, including a cached player, replaces older Play/Copy effects and errors.
     private var openingRequest = 0
@@ -179,8 +244,12 @@ struct RecordingsListing: Equatable {
             NSPasteboard.general.clearContents()
             NSPasteboard.general.setString(url.absoluteString, forType: .string)
         },
-        now: @escaping () -> Date = Date.init
+        now: @escaping () -> Date = Date.init,
+        makePlayer: @escaping @MainActor () -> RecordingPlaying = { RecordingPlayerController() },
+        fetchProfileEmail: @escaping @MainActor () async -> String? = { nil }
     ) {
+        self.makePlayer = makePlayer
+        self.fetchProfileEmail = fetchProfileEmail
         self.makeBrowser = makeBrowser
         self.store = store
         self.vault = RecmanSessionVault(storage: .init(load: { try store.load() }, save: { try store.save($0) }, delete: { try store.delete() }))
@@ -297,6 +366,9 @@ struct RecordingsListing: Equatable {
     /// not the feature was on, so no session outlives the account it was made for.
     func turnOff() {
         supersedeInitialSessionCheck()
+        // The lecture on screen belongs to the account being forgotten. First, because closing it
+        // reports where the student stopped, and that report must find nothing to write.
+        closePlayerForIdentityChange()
         invalidate()
         closeBrowser()
         isEnabled = false
@@ -307,6 +379,7 @@ struct RecordingsListing: Equatable {
         pageKeys = []
         selectedKey = nil
         forgetSeen()
+        forgetResumePoints()
         studyLoaded = false
         loadStudy()
         defaults.removeObject(forKey: Self.enabledKey)
@@ -367,11 +440,13 @@ struct RecordingsListing: Equatable {
         guard let sessionOwner, sessionOwner != userID else { return }
         log.notice("Polimi session belongs to another WeBeep account: dropped")
         supersedeInitialSessionCheck()
+        closePlayerForIdentityChange()
         invalidate()
         closeBrowser()
         listings = [:]
         playbackURLs = [:]
         forgetSeen()
+        forgetResumePoints()
         discardSessionFile()
         if isEnabled { access = .needsSignIn(nil) }
     }
@@ -419,6 +494,8 @@ struct RecordingsListing: Equatable {
     }
 
     /// The configuration window closed: whatever SwiftUI reports later, no page is visible.
+    /// Deliberately leaves the player alone: a lecture keeps playing with this window closed
+    /// (`suspend` stops only requests and the browser, and the stream needs neither).
     func windowClosed() {
         visiblePages = 0
         suspend()
@@ -452,7 +529,8 @@ struct RecordingsListing: Equatable {
 
     // MARK: Opening
 
-    /// Opens the recording's Webex player in the default browser.
+    /// Plays the recording in BeepBar's own player; when that isn't possible, opens its Webex
+    /// player in the default browser, as Play did before native playback.
     func play(_ recording: RecmanRecording) { open(recording, .play) }
 
     /// Copies the link of the recording's Webex player.
@@ -465,8 +543,10 @@ struct RecordingsListing: Equatable {
         openingRecordingID = recording.id
         // The cached path must replace pending openings too, or a slow lookup can later
         // overwrite the clipboard with the link chosen before the cached one.
-        queue.removeAll { if case .open = $0 { true } else { false } }
-        if let url = playbackURLs[recording.id] {
+        queue.removeAll(where: Self.isOpening)
+        // Only the link can be answered from memory: a native Play always asks for a fresh
+        // stream, since its address is short-lived and tied to a sign-in.
+        if action == .copyLink, let url = playbackURLs[recording.id] {
             finishOpening(recording, url: url, action: action)
             return
         }
@@ -476,11 +556,23 @@ struct RecordingsListing: Equatable {
     }
 
     private func finishOpening(_ recording: RecmanRecording, url: URL, action: OpenAction) {
-        if openingRecordingID == recording.id { openingRecordingID = nil }
-        if let key = RecmanCourseKey(courseCode: recording.courseCode, academicYear: recording.academicYear) { scheduleAcknowledge([recording.id], for: key, opening: openingRequest) }
+        markOpened(recording)
         switch action {
         case .play: openURL(url)
         case .copyLink: copy(url)
+        }
+    }
+
+    /// The row stops spinning and the recording stops being new.
+    private func markOpened(_ recording: RecmanRecording) {
+        if openingRecordingID == recording.id { openingRecordingID = nil }
+        if let key = RecmanCourseKey(courseCode: recording.courseCode, academicYear: recording.academicYear) { scheduleAcknowledge([recording.id], for: key, opening: openingRequest) }
+    }
+
+    private static func isOpening(_ job: Job) -> Bool {
+        switch job {
+        case .open, .recover: true
+        case .list: false
         }
     }
 
@@ -615,7 +707,7 @@ struct RecordingsListing: Equatable {
         var ordered: [RecmanCourseKey] = []
         for key in [selected].compactMap({ $0 }).filter({ keys.contains($0) }) + keys where !ordered.contains(key) { ordered.append(key) }
         let wanted = ordered.filter { needsLoad($0, force: force) }
-        let opens = queue.filter { if case .open = $0 { true } else { false } }
+        let opens = queue.filter(Self.isOpening)
         // The page's current keys replace queued listings. Keep explicit openings and the
         // in-flight listing, but stop showing spinners for work that will no longer run.
         for job in queue {
@@ -662,16 +754,17 @@ struct RecordingsListing: Equatable {
                     await record(recordings, for: key, generation: generation)
                     guard generation == self.generation else { return }
                     runningKey = nil
-                case .open(let recording, let action, let request):
-                    let url: URL
-                    if let cached = playbackURLs[recording.id] {
-                        url = cached
-                    } else {
-                        url = try await browser.playbackURL(for: recording)
-                    }
+                case .open(let recording, .copyLink, let request):
+                    let url = try await playerLink(for: recording, browser: browser)
                     guard generation == self.generation else { return }
                     playbackURLs[recording.id] = url
-                    if request == openingRequest { finishOpening(recording, url: url, action: action) }
+                    if request == openingRequest { finishOpening(recording, url: url, action: .copyLink) }
+                case .open(let recording, .play, let request):
+                    try await playNatively(recording, request: request, browser: browser, generation: generation)
+                    guard generation == self.generation else { return }
+                case .recover(let recording, let recovery):
+                    try await recoverPlayback(recording, recovery, browser: browser, generation: generation)
+                    guard generation == self.generation else { return }
                 }
                 succeeded = true
             } catch {
@@ -688,8 +781,225 @@ struct RecordingsListing: Equatable {
         if succeeded, saves { await saveSession(generation) }
         guard generation == self.generation else { return }
         worker = nil
+        // A recovery ran for a lecture while no Recordings page was on screen: the browser it
+        // needed has no reason to stay open (the stream doesn't use it).
+        if closesBrowserWhenIdle, queue.isEmpty, visiblePages == 0, access != .signingIn {
+            closesBrowserWhenIdle = false
+            closeBrowser()
+        }
         // Courses asked for while the session was being saved.
         startWorker()
+    }
+
+    // MARK: Native playback (#148)
+
+    /// The Webex player link of a recording, from memory when it was found before.
+    private func playerLink(for recording: RecmanRecording, browser: RecmanBrowsing) async throws -> URL {
+        if let cached = playbackURLs[recording.id] { return cached }
+        return try await browser.playbackURL(for: recording)
+    }
+
+    /// What a failed stream lookup means for a Play. Pure, so it is tested without a browser.
+    enum StreamFailureOutcome: Equatable {
+        /// Open the player link in the browser, as Play did before native playback.
+        case browser
+        /// Report it like any other failure of a request: the page says why.
+        case report
+    }
+
+    /// Everything Webex can't give us falls back to the browser: an unrecognized page or answer,
+    /// a stream without HLS, a failed hop. What stays a report is what the browser can't fix and
+    /// the page already knows how to say: the Polimi session lapsing, Polimi being unreachable, a
+    /// missing confirmed email (the product decision: no Webex email page is shown to the
+    /// student), and cancellation.
+    nonisolated static func streamFailureOutcome(_ error: Error) -> StreamFailureOutcome {
+        if error is CancellationError { return .report }
+        switch error as? RecmanBrowserError {
+        case .needsSignIn, .needsEmail, .unavailable: return .report
+        default: return .browser
+        }
+    }
+
+    /// What to do about a failed play. A stream that never started goes to the browser (the
+    /// player already closed its window). One that stopped mid-lecture gets one fresh stream at
+    /// the position it stopped, then the browser: a second failure in the same Play means the
+    /// problem isn't an expired address.
+    nonisolated static func recovery(for failure: RecordingPlaybackFailure, alreadyRecovered: Bool) -> Recovery {
+        switch failure {
+        case .beforeReady: return .browser
+        case .duringPlayback(_, let position): return alreadyRecovered ? .browser : .freshStream(at: position)
+        }
+    }
+
+    private func playNatively(_ recording: RecmanRecording, request: Int, browser: RecmanBrowsing, generation: Int) async throws {
+        let stream: RecordingStream
+        do {
+            stream = try await browser.stream(for: recording, email: confirmedEmail)
+        } catch {
+            guard generation == self.generation else { return }
+            guard Self.streamFailureOutcome(error) == .browser else { throw error }
+            log.notice("Native playback not available: opening the browser")
+            let url = try await playerLink(for: recording, browser: browser)
+            guard generation == self.generation else { return }
+            playbackURLs[recording.id] = url
+            if request == openingRequest { finishOpening(recording, url: url, action: .play) }
+            return
+        }
+        guard generation == self.generation else { return }
+        // A newer click replaced this one while the stream was being found: it wins.
+        guard request == openingRequest else { return }
+        recoveredLectures.remove(recording.id)
+        startPlayer(stream, for: recording, startAt: RecordingPlaybackProgress.startAt(stored: storedPosition(for: recording)))
+        markOpened(recording)
+    }
+
+    /// Hands the stream to the player, creating it on first use. The title is the archive's own
+    /// (already on the page), not Webex's; the stream address is never logged.
+    private func startPlayer(_ stream: RecordingStream, for recording: RecmanRecording, startAt: TimeInterval?) {
+        let player = currentPlayer()
+        // Before the call: the lecture this one replaces reports its position inside `play`.
+        nowPlaying[recording.id] = recording
+        currentLectureID = recording.id
+        player.play(stream.url, title: recording.title.isEmpty ? (stream.title ?? "") : recording.title, cookies: [], startAt: startAt, recordingID: recording.id)
+        nowPlaying = nowPlaying.filter { $0.key == recording.id }
+        recoveredLectures = recoveredLectures.intersection(nowPlaying.keys)
+    }
+
+    private func currentPlayer() -> RecordingPlaying {
+        if let player { return player }
+        let player = makePlayer()
+        player.onPositionCheckpoint = { [weak self] id, position, duration in
+            self?.playerCheckpoint(id: id, position: position, duration: duration)
+        }
+        player.onFailure = { [weak self] id, failure in
+            self?.playerFailed(id: id, failure: failure)
+        }
+        self.player = player
+        return player
+    }
+
+    var isPlayerOpen: Bool { player?.isOpen ?? false }
+
+    /// For code that raised BeepBar to a regular app and finds a lecture open when it is done
+    /// (`WeBeepAuthenticationController.chooseRoot`): the player restores `policy` when it closes.
+    func keepPolicyAfterLecture(_ policy: NSApplication.ActivationPolicy) {
+        player?.adoptPolicyToRestore(policy)
+    }
+
+    /// The identity the lecture belongs to is going away (turn-off, disconnect, university or
+    /// account change): the player closes and its last report is refused. Safe with no player.
+    private func closePlayerForIdentityChange() {
+        nowPlaying = [:]
+        currentLectureID = nil
+        recoveredLectures = []
+        player?.close()
+    }
+
+    // MARK: Where you stopped
+
+    private func resumeOwner() -> Int? {
+        guard isEnabled, let owner = sessionOwner ?? ownerUserID() else { return nil }
+        // The account WeBeep says is connected, when it is known, must be the one the session
+        // was made for: positions are never written under a different one.
+        if let current = ownerUserID(), current != owner { return nil }
+        return owner
+    }
+
+    /// The stored positions of `owner`: another account's are never read, and unreadable ones
+    /// count as empty (a lost position costs a few seconds of scrubbing, not data).
+    private func loadedResumePoints(owner: Int) -> RecordingResumePoints {
+        if let resumePoints, resumePoints.owner == owner { return resumePoints }
+        var loaded = RecordingResumePoints(owner: owner)
+        if let data = defaults.data(forKey: Self.resumePointsKey),
+           let stored = try? PropertyListDecoder().decode(RecordingResumePoints.self, from: data), stored.owner == owner {
+            loaded = stored
+        }
+        resumePoints = loaded
+        return loaded
+    }
+
+    private func storedPosition(for recording: RecmanRecording) -> TimeInterval? {
+        guard let owner = resumeOwner() else { return nil }
+        return loadedResumePoints(owner: owner).position(for: RecordingsStudyState.identity(recording))
+    }
+
+    /// The player's report of where the student stopped. Written only when it changes what is
+    /// stored; a lecture watched to the end is forgotten and counts as seen.
+    private func playerCheckpoint(id: String, position: TimeInterval, duration: TimeInterval?) {
+        guard let recording = nowPlaying[id], let owner = resumeOwner() else { return }
+        let update = RecordingPlaybackProgress.update(position: position, duration: duration)
+        var points = loadedResumePoints(owner: owner)
+        if points.apply(update, for: RecordingsStudyState.identity(recording)) {
+            resumePoints = points
+            if points.entries.isEmpty {
+                if defaults.object(forKey: Self.resumePointsKey) != nil { defaults.removeObject(forKey: Self.resumePointsKey) }
+            } else if let data = try? PropertyListEncoder().encode(points) {
+                defaults.set(data, forKey: Self.resumePointsKey)
+            } else {
+                log.error("Couldn't save the playback position")
+            }
+        }
+        if update == .finished, let key = RecmanCourseKey(courseCode: recording.courseCode, academicYear: recording.academicYear) {
+            scheduleAcknowledge([recording.id], for: key)
+        }
+    }
+
+    /// Positions go with the session: turn-off, disconnect and account change.
+    private func forgetResumePoints() {
+        resumePoints = nil
+        if defaults.object(forKey: Self.resumePointsKey) != nil { defaults.removeObject(forKey: Self.resumePointsKey) }
+    }
+
+    // MARK: Recovery
+
+    private func playerFailed(id: String, failure: RecordingPlaybackFailure) {
+        guard isEnabled, let recording = nowPlaying[id] else { return }
+        let recovery = Self.recovery(for: failure, alreadyRecovered: recoveredLectures.contains(id))
+        if case .freshStream = recovery { recoveredLectures.insert(id) }
+        guard access == .ready else {
+            // No Polimi session to look anything up with: the student has to sign in again.
+            if case .beforeReady = failure { openingProblem = .playbackUnavailable }
+            return
+        }
+        if visiblePages == 0 { closesBrowserWhenIdle = true }
+        queue.insert(.recover(recording, recovery), at: 0)
+        startWorker()
+    }
+
+    private func recoverPlayback(_ recording: RecmanRecording, _ recovery: Recovery, browser: RecmanBrowsing, generation: Int) async throws {
+        if case .freshStream(let position) = recovery {
+            guard stillShowing(recording) else { return }
+            do {
+                let stream = try await browser.stream(for: recording, email: confirmedEmail)
+                guard generation == self.generation, stillShowing(recording) else { return }
+                startPlayer(stream, for: recording, startAt: position)
+                return
+            } catch {
+                guard generation == self.generation else { return }
+                if error is CancellationError || (error as? RecmanBrowserError) == .needsSignIn { throw error }
+                log.notice("Fresh stream not available: opening the browser")
+            }
+        }
+        do {
+            let url = try await playerLink(for: recording, browser: browser)
+            guard generation == self.generation else { return }
+            playbackURLs[recording.id] = url
+            // The window of a lecture that can't continue is no use next to the browser. Closing
+            // it reports the position, so the student's place is kept.
+            if currentLectureID == recording.id { player?.close() }
+            openURL(url)
+        } catch {
+            guard generation == self.generation else { return }
+            if error is CancellationError || (error as? RecmanBrowserError) == .needsSignIn { throw error }
+            openingProblem = RecordingsProblem(error)
+            log.error("Couldn't open a failed lecture in the browser")
+        }
+    }
+
+    /// Whether `recording` is still the lecture in the player's window: the student may have
+    /// closed it or started another while a stream was being found.
+    private func stillShowing(_ recording: RecmanRecording) -> Bool {
+        currentLectureID == recording.id && (player?.isOpen ?? false)
     }
 
     private func record(_ recordings: [RecmanRecording], for key: RecmanCourseKey, generation: Int) async {
@@ -757,6 +1067,9 @@ struct RecordingsListing: Equatable {
         case .open(let recording, _, _):
             if openingRecordingID == recording.id { openingRecordingID = nil }
             openingProblem = problem
+        case .recover:
+            // Not a click: the lecture's window already says what happened to it.
+            break
         }
         // Offline or Polimi down: every other request would wait for the same timeout.
         guard problem == .unavailable else { return .next }
@@ -766,6 +1079,7 @@ struct RecordingsListing: Equatable {
             // A Play or Copy still waiting is dropped with the rest: it says why instead of the
             // click doing nothing.
             case .open: openingProblem = problem
+            case .recover: break
             }
         }
         clearQueue()
@@ -798,6 +1112,105 @@ struct RecordingsListing: Equatable {
         signInTask?.cancel()
         signInTask = nil
         clearQueue()
+    }
+
+    // MARK: Polimi email for the Webex sign-in (#148)
+
+    /// What the Settings field offers for the text in it. Pure, so the rules are tested without a
+    /// view.
+    enum EmailFieldState: Equatable {
+        /// Nothing typed and nothing confirmed.
+        case empty
+        /// The text is the confirmed address.
+        case confirmed
+        /// Nothing typed but an address is confirmed: confirming removes it.
+        case removable
+        /// A valid Polimi address that isn't confirmed yet.
+        case ready(PolimiEmail)
+        /// Not a Polimi address (`PolimiEmail` is the single gate).
+        case invalid
+    }
+
+    nonisolated static func emailFieldState(draft: String, confirmed: PolimiEmail?) -> EmailFieldState {
+        let trimmed = draft.trimmingCharacters(in: .whitespacesAndNewlines)
+        if trimmed.isEmpty { return confirmed == nil ? .empty : .removable }
+        guard let email = PolimiEmail(trimmed) else { return .invalid }
+        return email == confirmed ? .confirmed : .ready(email)
+    }
+
+    enum EmailEntry: Equatable {
+        case saved
+        case cleared
+        case unchanged
+        case invalid
+    }
+
+    /// Called when the Settings field appears: learns the confirmed address from the saved
+    /// session, and, when there is none, offers the WeBeep profile's. Reads the session file once
+    /// (off the main actor) and asks WeBeep only when it is needed; a profile that can't be read,
+    /// a function the token isn't allowed to call and an address that isn't Polimi's all mean an
+    /// empty field for the student to fill in, never an error. Nothing is stored here: only
+    /// `confirmEmail` saves.
+    func prepareEmailField() async {
+        guard isEnabled else { return }
+        let epoch = emailEpoch
+        if !emailLoaded {
+            _ = await savedCookies()
+            // No browser means no opening cycle to share the read with: don't keep it around.
+            if browser == nil { sessionLoad = nil }
+            guard epoch == emailEpoch, isEnabled else { return }
+        }
+        guard confirmedEmail == nil, suggestedEmail == nil, !emailEditedByUser, !suggestionInFlight else { return }
+        suggestionInFlight = true
+        let raw = await fetchProfileEmail()
+        // A reset (turn-off, account change) already cleared the flag for its own cycle.
+        guard epoch == emailEpoch else { return }
+        suggestionInFlight = false
+        guard isEnabled, confirmedEmail == nil, !emailEditedByUser, let raw, let email = PolimiEmail(raw) else { return }
+        suggestedEmail = email
+    }
+
+    /// The student confirms, changes or removes the address. Only a Polimi address is accepted
+    /// (`PolimiEmail`); an empty field removes it. It is written into the saved session at once,
+    /// keeping its cookies; with no saved session yet it stays in memory and the next successful
+    /// sign-in writes it. It is never logged.
+    @discardableResult
+    func confirmEmail(_ text: String) -> EmailEntry {
+        guard isEnabled else { return .unchanged }
+        switch Self.emailFieldState(draft: text, confirmed: confirmedEmail) {
+        case .invalid: return .invalid
+        case .empty, .confirmed: return .unchanged
+        case .removable:
+            setConfirmedEmail(nil)
+            return .cleared
+        case .ready(let email):
+            setConfirmedEmail(email)
+            return .saved
+        }
+    }
+
+    private func setConfirmedEmail(_ email: PolimiEmail?) {
+        confirmedEmail = email
+        suggestedEmail = nil
+        emailEditedByUser = true
+        guard let owner = sessionOwner ?? ownerUserID() else { return }
+        let update = vault.updateEmail(email?.value, ownerUserID: owner, epoch: vault.epoch, now: now())
+        Task { [log] in
+            if case .failed(let errorType) = await update.value {
+                log.error("Couldn't save the Polimi email errorType=\(errorType, privacy: .public)")
+            }
+        }
+    }
+
+    /// The session (and so the email) is gone: nothing of the address stays in memory, and an
+    /// answer still on its way for the old one is dropped.
+    private func resetEmail() {
+        emailEpoch += 1
+        confirmedEmail = nil
+        suggestedEmail = nil
+        emailLoaded = false
+        emailEditedByUser = false
+        suggestionInFlight = false
     }
 
     // MARK: Browser and session file
@@ -850,6 +1263,7 @@ struct RecordingsListing: Equatable {
             // the next sign-in could leak another student’s state; v2 is already scoped.
             legacySeen = .init(ids: [], baselines: [])
             discardLegacyDefaults()
+            emailLoaded = true
             return []
         case .undecodable:
             log.notice("Saved Polimi session unreadable: dropped")
@@ -862,14 +1276,20 @@ struct RecordingsListing: Equatable {
         }
         if let current = ownerUserID(), current != snapshot.ownerUserID {
             log.notice("Saved Polimi session belongs to another WeBeep account: dropped")
+            closePlayerForIdentityChange()
             listings = [:]
             playbackURLs = [:]
             forgetSeen()
+            forgetResumePoints()
             discardSessionFile()
             return []
         }
         sessionOwner = snapshot.ownerUserID
         legacyOwner = snapshot.ownerUserID
+        // What the file says, unless the student has already changed it in this launch. An
+        // address that isn't a Polimi one (a damaged or foreign file) is simply not an address.
+        if !emailEditedByUser { confirmedEmail = snapshot.email.flatMap(PolimiEmail.init) }
+        emailLoaded = true
         return snapshot.cookies
     }
 
@@ -894,7 +1314,9 @@ struct RecordingsListing: Equatable {
             webBeepAccountChanged(to: current)
             return
         }
-        switch await vault.save(cookies, ownerUserID: owner, epoch: epoch, now: now()).value {
+        // Read here, right before the save is enqueued: the email in the file is always the one
+        // the student has confirmed at this moment, never one captured before the WebKit wait.
+        switch await vault.save(cookies, ownerUserID: owner, email: confirmedEmail?.value, epoch: epoch, now: now()).value {
         case .saved:
             // The cycle's cached read now describes an older file.
             sessionLoad = nil
@@ -912,6 +1334,8 @@ struct RecordingsListing: Equatable {
     private func discardSessionFile() {
         sessionOwner = nil
         sessionLoad = nil
+        // The email lives in the file and goes with it, in memory too.
+        resetEmail()
         let delete = vault.discard()
         Task { [log] in
             if case .failed(let errorType) = await delete.value {

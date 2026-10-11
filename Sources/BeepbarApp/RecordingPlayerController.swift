@@ -229,7 +229,14 @@ enum RecordingPlayerError: Error {
     /// AVFoundation requires removing a token from that same player. Non-nil only while the
     /// player is not paused. Invariant: every path that pauses, replaces, fails or closes ends in
     /// `removeProgressObserver()`, so a paused or closed player costs no wakeups at all.
-    private var progressObservation: (player: AVPlayer, token: Any)?
+    /// `serial` identifies this observer: its ticks carry it, and a tick whose observer is no
+    /// longer the current one is dropped (see `settleStart`).
+    private var progressObservation: (player: AVPlayer, token: Any, serial: Int)?
+    /// The serial of the last periodic time observer added; only ever increases.
+    private var lastProgressObserverSerial = 0
+    /// The serial of the current periodic time observer, nil when none exists. Internal so tests
+    /// can deliver a tick as the current observer, or as one that was replaced.
+    var progressObserverSerial: Int? { progressObservation?.serial }
     /// The menu items' targets: an item holds its target weakly.
     private var menuActions: [PlayerMenuAction] = []
     /// The policy BeepBar had before the player promoted it to `.regular`; nil when the player
@@ -540,12 +547,19 @@ enum RecordingPlayerError: Error {
 
     /// Where a periodic time observer tick lands on the main actor, with the time AVFoundation
     /// handed the observer. Forwards it to `onProgress` and does nothing else: never a
-    /// checkpoint, never a write. Dropped when it comes from a replaced or closed item (the
-    /// generation moved on), and until the start is settled (see `onProgress`). Internal so tests
-    /// can deliver a tick from a replaced generation, which AVFoundation never produces on demand.
-    func progressTicked(generation observed: Int, position: TimeInterval) {
-        guard observed == generation, isStartSettled, position.isFinite, position >= 0,
-              let item = player?.currentItem else { return }
+    /// checkpoint, never a write. Dropped when:
+    /// - it comes from a replaced or closed item (the generation moved on);
+    /// - its observer is no longer the current one (`observer` is not `progressObserverSerial`):
+    ///   removed on a pause, or replaced when the start settled. The hop is queued, so the start
+    ///   may settle between AVFoundation reading the time and the tick landing here: checking
+    ///   `isStartSettled` alone would let through a time read before the resume landed;
+    /// - the start is not settled yet (see `onProgress`);
+    /// - the position is not a finite, non-negative number.
+    ///
+    /// Internal so tests can deliver ticks AVFoundation never produces on demand.
+    func progressTicked(generation observed: Int, observer: Int, position: TimeInterval) {
+        guard observed == generation, observer == progressObserverSerial, isStartSettled,
+              position.isFinite, position >= 0, let item = player?.currentItem else { return }
         onProgress?(recordingID, position, Self.seconds(item.duration))
     }
 
@@ -656,14 +670,17 @@ enum RecordingPlayerError: Error {
             return
         }
         guard progressObservation == nil else { return }
+        lastProgressObserverSerial += 1
+        let serial = lastProgressObserverSerial
         // The block runs on `progressQueue`: it reads only the time it is handed, then hops to
-        // the main actor, where the generation check drops a tick from a replaced or closed item.
-        // It must never touch main-actor state from there.
+        // the main actor, where the generation and serial checks drop a tick from a replaced or
+        // closed item, or from an observer that was removed meanwhile. It must never touch
+        // main-actor state from there.
         let token = player.addPeriodicTimeObserver(forInterval: progressInterval, queue: Self.progressQueue) { [weak self] time in
             let seconds = time.seconds
-            Task { @MainActor [weak self] in self?.progressTicked(generation: observed, position: seconds) }
+            Task { @MainActor [weak self] in self?.progressTicked(generation: observed, observer: serial, position: seconds) }
         }
-        progressObservation = (player, token)
+        progressObservation = (player, token, serial)
     }
 
     /// Removes the periodic time observer, from the player it was added to. Safe to call when
@@ -698,6 +715,16 @@ enum RecordingPlayerError: Error {
     /// meanwhile or the stream failed.
     private func settleStart() {
         isStartSettled = true
+        // An observer that already exists was added before the start settled: the student
+        // started the held player from the system controls during the resume, or (without a
+        // resume) playback began while the item loaded. Its ticks still in flight read the time
+        // before the resume landed (~0 for a lecture resumed at 92%), and a stray "below 90%"
+        // would let closing re-complete a lecture the student un-ticked. A fresh observer
+        // gets a new serial, so every tick of the old one is dropped (`progressTicked`).
+        if progressObservation != nil {
+            removeProgressObserver()
+            updateProgressObserver(generation: generation)
+        }
         guard isResuming else { return }
         isResuming = false
         if playWhenSettled { player?.play() }

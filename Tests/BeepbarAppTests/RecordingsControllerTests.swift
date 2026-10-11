@@ -2437,6 +2437,26 @@ struct RecordingsControllerTests {
     /// left alone and its one retry is not spent, so after signing in again it still recovers.
     /// Mutation: insert into `recoveredLectures` in `playerFailed` again (before the access
     /// guard) and the last expectation fails.
+    /// A stream that dies mid-lecture stores where it stopped at once, from the `.failed`
+    /// checkpoint alone, with no pause or close after it: if the student then quits, the place
+    /// survives. Guards against handling only some checkpoint reasons now that reports carry one.
+    /// Mutation: in `currentPlayer` ignore checkpoints whose reason is `.failed` and nothing is
+    /// stored.
+    @Test func aFailureMidLectureStoresThePlaceAtOnce() async throws {
+        defer { cleanUp() }
+        browser.streamResults["a"] = [.success(stream("a")), .success(stream("a"))]
+        let controller = await readyController()
+        controller.play(recording("a"))
+        await settle("a playing") { world.player.plays.count == 1 }
+        #expect(resumeWrites() == 0)
+
+        world.player.failDuringPlayback(at: 1_234)
+        #expect(resumeWrites() == 1, "written by the failure's own report")
+        #expect(try storedResumePoints()?.position(for: RecordingsStudyState.identity(recording("a"))) == 1_234)
+        await settle("resumed") { world.player.plays.count == 2 }
+        controller.turnOff()
+    }
+
     @Test func aFailureWhileSignedOutDoesNotSpendTheRetry() async {
         defer { cleanUp() }
         browser.streamResults["a"] = [.success(stream("a")), .success(stream("a"))]

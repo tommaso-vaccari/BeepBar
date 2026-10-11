@@ -539,10 +539,12 @@ struct RecordingPlayerMVPTests {
     /// Exactly one periodic time observer exists while the lecture plays, at 30 s of media time,
     /// and none once it pauses (the pause removes it; resuming adds it again, once) or closes;
     /// never a boundary observer. Guards the "quiet at rest" budget: a paused or closed lecture
-    /// must cost no wakeups. Mutations: skip the removal on `.paused` in `updateProgressObserver`
-    /// and the wait for 0 after the pause times out; drop the `progressObservation == nil` guard
-    /// and `periodicAdded` exceeds 1 while playing; drop the removal in `removeItemObservers` and
-    /// close leaves 1 behind.
+    /// must cost no wakeups. (The observer added while the item loads is replaced once when the
+    /// start settles, see `settleStart`, so only the live count is exact at that point.)
+    /// Mutations: skip the removal on `.paused` in `updateProgressObserver` and the wait for 0
+    /// after the pause times out; drop the `progressObservation == nil` guard and the status
+    /// reports while playing leave more than one alive; drop the removal in `removeItemObservers`
+    /// and close leaves 1 behind.
     @Test func onePeriodicObserverExistsOnlyWhilePlaying() async throws {
         let recorder = Recorder()
         var created: CountingPlayer?
@@ -551,11 +553,13 @@ struct RecordingPlayerMVPTests {
         let player = try #require(created)
         try await Self.waitUntil { player.timeControlStatus == .playing }
         await Self.settle()
-        #expect(player.active == 1)
-        #expect(player.counts.withLock { $0.periodicAdded } == 1, "several status reports while playing add one observer")
+        #expect(player.active == 1, "several status reports while playing keep one observer")
+        let added = player.counts.withLock { $0.periodicAdded }
         #expect(player.counts.withLock { $0.boundaryAdded } == 0)
-        #expect(player.counts.withLock { $0.intervals } == [RecordingPlayerController.progressInterval])
+        #expect(player.counts.withLock { $0.intervals }.allSatisfy { $0 == RecordingPlayerController.progressInterval })
         #expect(RecordingPlayerController.progressInterval == 30)
+        await Self.settle()
+        #expect(player.counts.withLock { $0.periodicAdded } == added, "playing on adds nothing")
 
         controller.pause()
         try await Self.waitUntil { player.active == 0 }
@@ -567,13 +571,13 @@ struct RecordingPlayerMVPTests {
         try await Self.waitUntil { player.active == 1 }
         await Self.settle()
         #expect(player.active == 1)
-        #expect(player.counts.withLock { $0.periodicAdded } == 2)
+        #expect(player.counts.withLock { $0.periodicAdded } == added + 1, "resuming adds exactly one")
 
         controller.close()
         #expect(player.active == 0, "closed: removed synchronously")
         await Self.settle()
         #expect(player.active == 0)
-        #expect(player.counts.withLock { $0.periodicAdded } == 2)
+        #expect(player.counts.withLock { $0.periodicAdded } == added + 1)
     }
 
     /// A replacement removes the old lecture's observer before anything else (with a resume
@@ -646,38 +650,68 @@ struct RecordingPlayerMVPTests {
         #expect(recorder.ticks.count == ticks, "nothing after close")
     }
 
-    /// A tick from a replaced or closed item is dropped by the generation check, and so is a
-    /// tick before the start is settled (the resume seek in flight, the player showing 0), so a
-    /// lecture resumed near its end never reports 0. Guards against a late tick crediting the
-    /// previous lecture's position to the new one. Mutations: drop `observed == generation` and
-    /// the replaced-generation tick is delivered; drop `isStartSettled` and the tick during the
-    /// resume is delivered.
-    @Test func ticksFromAReplacedItemOrBeforeTheStartAreDropped() async throws {
+    /// A tick from a replaced or closed item is dropped by the generation check, and a tick that
+    /// is not a finite, non-negative position is dropped too. Guards against a late tick
+    /// crediting the previous lecture's position to the new one, and against NaN or a negative
+    /// time reaching watch progress. Mutations: drop `observed == generation` and the
+    /// replaced-generation tick is delivered; drop `position.isFinite, position >= 0` and the
+    /// NaN and -1 ticks are delivered.
+    @Test func ticksFromAReplacedItemOrWithoutAPositionAreDropped() async throws {
         let recorder = Recorder()
         let controller = makeController(recorder: recorder)
         try await playReady(controller)
         let old = controller.generation
         let media = try await TestMedia.shared.url()
         controller.play(media, title: "Altra", cookies: [], startAt: nil, recordingID: "rec-2")
-        try await Self.waitUntil { controller.isStartSettled }
+        try await Self.waitUntil { controller.isStartSettled && controller.progressObserverSerial != nil }
+        let serial = try #require(controller.progressObserverSerial)
         recorder.ticks.removeAll()
-        controller.progressTicked(generation: old, position: 5)
+        controller.progressTicked(generation: old, observer: serial, position: 5)
         #expect(recorder.ticks.isEmpty, "a tick from the replaced lecture is dropped")
-        controller.progressTicked(generation: controller.generation, position: 5)
+        controller.progressTicked(generation: controller.generation, observer: serial, position: .nan)
+        controller.progressTicked(generation: controller.generation, observer: serial, position: -1)
+        #expect(recorder.ticks.isEmpty, "no position, no tick")
+        controller.progressTicked(generation: controller.generation, observer: serial, position: 5)
         #expect(recorder.ticks.count == 1)
         #expect(recorder.ticks.first?.id == "rec-2")
         #expect(recorder.ticks.first?.position == 5)
         #expect(recorder.ticks.first?.duration == TestMedia.duration)
         controller.close()
-        controller.progressTicked(generation: controller.generation, position: 6)
+        controller.progressTicked(generation: controller.generation, observer: serial, position: 6)
         #expect(recorder.ticks.count == 1, "nothing after close")
+    }
 
-        let resuming = Recorder()
-        let (held, _) = try await makeHeldResume(recorder: resuming)
-        held.progressTicked(generation: held.generation, position: 0)
-        #expect(resuming.ticks.isEmpty, "the resume has not landed: 0 is not where the student is")
-        #expect(resuming.checkpoints.isEmpty)
-        held.close()
+    /// The race behind P2-1 of the review: during a resume the student starts the held player
+    /// from the system controls, so the observer exists while the player still shows ~0. A tick
+    /// AVFoundation read then can land after the resume settles; it must be dropped, or a lecture
+    /// resumed at 92% would report "below 90%" and closing could re-complete a lecture the
+    /// student un-ticked. Before the start settles, ticks are dropped outright. Mutations: drop
+    /// the re-arm in `settleStart` and the pre-settle tick delivered after the landing gets
+    /// through; drop `isStartSettled` in `progressTicked` and the tick during the resume gets
+    /// through; drop `observer == progressObserverSerial` and the pre-settle tick gets through.
+    @Test func aTickReadBeforeTheResumeLandedIsDroppedAfterIt() async throws {
+        let recorder = Recorder()
+        let (controller, player) = try await makeHeldResume(recorder: recorder)
+        // The student presses play on the system controls before the resume seek lands.
+        player.play()
+        try await Self.waitUntil { controller.progressObserverSerial != nil }
+        let early = try #require(controller.progressObserverSerial)
+        controller.progressTicked(generation: controller.generation, observer: early, position: 0.5)
+        #expect(recorder.ticks.isEmpty, "the resume has not landed: 0.5 is not where the student is")
+
+        player.releaseSeeks()
+        try await Self.waitUntil { controller.isStartSettled }
+        // A tick the early observer read at 0.5 s, delivered only now. Real ticks may arrive
+        // too (AVFoundation fires on start and after the seek), all at or after the resume
+        // target, so the check is that nothing below it got through.
+        controller.progressTicked(generation: controller.generation, observer: early, position: 0.5)
+        #expect(!recorder.ticks.contains { $0.position < 29 }, "read before the resume landed: dropped")
+        let current = try #require(controller.progressObserverSerial)
+        #expect(current != early, "the start settling replaced the observer")
+        controller.progressTicked(generation: controller.generation, observer: current, position: 31)
+        #expect(recorder.ticks.contains { $0.position == 31 }, "the new observer's ticks go through")
+        #expect(recorder.checkpoints.isEmpty)
+        controller.close()
     }
 
     /// A pause reports once, with the position and duration: `pause()`, a pause from outside

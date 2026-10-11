@@ -504,18 +504,24 @@ actor TestMedia {
     static let directory = FileManager.default.temporaryDirectory.appendingPathComponent("\(prefix)\(getpid())", isDirectory: true)
     private static let prefix = "beepbar-player-"
 
-    private var cached: URL?
+    /// The one write of this process. Shared rather than a cached URL: the actor is reentrant
+    /// across the write's `await`, so two suites asking at once would otherwise both write the
+    /// same file and the second would fail with "file name already in use".
+    private var creation: Task<URL, Error>?
 
     func url() async throws -> URL {
-        if let cached { return cached }
-        Self.sweepLeftovers()
-        try FileManager.default.createDirectory(at: Self.directory, withIntermediateDirectories: true)
-        atexit { try? FileManager.default.removeItem(at: TestMedia.directory) }
-        let url = Self.directory.appendingPathComponent("clip.mp4")
-        try? FileManager.default.removeItem(at: url)
-        try await Self.write(to: url)
-        cached = url
-        return url
+        if let creation { return try await creation.value }
+        let creation = Task {
+            Self.sweepLeftovers()
+            try FileManager.default.createDirectory(at: Self.directory, withIntermediateDirectories: true)
+            atexit { try? FileManager.default.removeItem(at: TestMedia.directory) }
+            let url = Self.directory.appendingPathComponent("clip.mp4")
+            try? FileManager.default.removeItem(at: url)
+            try await Self.write(to: url)
+            return url
+        }
+        self.creation = creation
+        return try await creation.value
     }
 
     /// Removes fixtures of test processes that no longer run, and legacy loose files.

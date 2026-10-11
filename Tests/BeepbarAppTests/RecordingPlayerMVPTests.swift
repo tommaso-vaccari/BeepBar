@@ -64,6 +64,25 @@ final class CountingPlayer: AVPlayer, @unchecked Sendable {
     }
 }
 
+/// Records every seek's tolerances and can hold seeks in flight, to observe the moment between
+/// a resume seek being issued and landing.
+final class SeekRecordingPlayer: AVPlayer, @unchecked Sendable {
+    struct Seek { let target: Double; let before: CMTime; let after: CMTime }
+    private let state = OSAllocatedUnfairLock(initialState: (seeks: [Seek](), hold: false))
+    var seeks: [Seek] { state.withLock { $0.seeks } }
+    func holdSeeks() { state.withLock { $0.hold = true } }
+
+    override func seek(to time: CMTime, toleranceBefore: CMTime, toleranceAfter: CMTime, completionHandler: @escaping @Sendable (Bool) -> Void) {
+        let hold = state.withLock { state -> Bool in
+            state.seeks.append(Seek(target: time.seconds, before: toleranceBefore, after: toleranceAfter))
+            return state.hold
+        }
+        // A held seek never lands: neither the player moves nor the completion runs.
+        guard !hold else { return }
+        super.seek(to: time, toleranceBefore: toleranceBefore, toleranceAfter: toleranceAfter, completionHandler: completionHandler)
+    }
+}
+
 /// Tracks block observers added and removed, so a test sees an observer left behind.
 final class CountingCenter: NotificationCenter, @unchecked Sendable {
     private let tokens = OSAllocatedUnfairLock(initialState: [ObjectIdentifier]())
@@ -320,6 +339,30 @@ struct RecordingPlayerMVPTests {
         controller.close()
     }
 
+    /// Every seek the player makes (skips, jumps, the resume) has a bounded tolerance, well
+    /// below the 10 s skip. An unlimited tolerance could snap to a keyframe behind the student
+    /// in a lecture with long keyframe intervals, so "+10 s" would stay put or go back; the
+    /// local fixture cannot show that, so the request itself is checked.
+    @Test func seeksUseABoundedTolerance() async throws {
+        var created: SeekRecordingPlayer?
+        let controller = makeController(makePlayer: { let player = SeekRecordingPlayer(); created = player; return player })
+        try await playReady(controller, startAt: 20)
+        controller.skip(by: 10)
+        controller.performShortcut(.jump(0.5))
+        let player = try #require(created)
+        // The view is a plain one, so every seek on this player is the controller's.
+        let ours = player.seeks
+        #expect(ours.count == 3)
+        #expect(ours.first?.target == 20)
+        #expect(ours.last?.target == 30)
+        for seek in ours {
+            for tolerance in [seek.before, seek.after] {
+                #expect(tolerance.isNumeric && tolerance.seconds >= 0 && tolerance.seconds < RecordingPlayerPolicy.shortSkip / 2)
+            }
+        }
+        controller.close()
+    }
+
     /// Before the item is ready there is no timeline: skips and jumps do nothing.
     @Test func skipsBeforeReadyAreIgnored() async throws {
         let controller = makeController()
@@ -453,6 +496,29 @@ struct RecordingPlayerMVPTests {
         let media = try await TestMedia.shared.url()
         controller.play(media, title: "Lezione", cookies: [], startAt: 30)
         controller.pause()
+        controller.close()
+        await Self.settle()
+        #expect(recorder.checkpoints.isEmpty)
+    }
+
+    /// Between the item becoming ready and the resume seek landing, the player is still at 0:
+    /// closing or pausing then reports nothing, so the saved position survives.
+    @Test func closingBeforeTheResumeSeekLandsReportsNothing() async throws {
+        let recorder = Recorder()
+        var created: SeekRecordingPlayer?
+        let controller = makeController(makePlayer: {
+            let player = SeekRecordingPlayer()
+            player.holdSeeks()
+            created = player
+            return player
+        }, recorder: recorder)
+        let media = try await TestMedia.shared.url()
+        controller.play(media, title: "Lezione", cookies: [], startAt: 30)
+        try await Self.waitUntil { controller.isCurrentItemReady }
+        #expect(created?.seeks.contains { $0.target == 30 } == true)
+        #expect(controller.isStartSettled == false)
+        controller.pause()
+        await Self.settle()
         controller.close()
         await Self.settle()
         #expect(recorder.checkpoints.isEmpty)

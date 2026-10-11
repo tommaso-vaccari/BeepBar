@@ -110,8 +110,9 @@ import BeepbarCore
 }
 
 /// The native player as the controller sees it, without AVFoundation. Behaves like the real one
-/// where the controller depends on it: a newer `play` first reports the lecture it replaces, and
-/// `close()` reports the lecture on screen before it goes.
+/// where the controller depends on it: a newer `play` first reports the lecture it replaces
+/// (`.replaced`), `close()` reports the lecture on screen before it goes (`.closed`), a pause
+/// reports `.paused`, a mid-lecture failure `.failed`, and `tick(at:)` reaches `onProgress` only.
 @MainActor final class FakeRecordingPlayer: RecordingPlaying {
     struct Play: Equatable {
         let url: URL
@@ -122,7 +123,8 @@ import BeepbarCore
     }
 
     private(set) var isOpen = false
-    var onPositionCheckpoint: ((String, TimeInterval, TimeInterval?) -> Void)?
+    var onPositionCheckpoint: ((RecordingCheckpoint) -> Void)?
+    var onProgress: ((String, TimeInterval, TimeInterval?) -> Void)?
     var onFailure: ((String, RecordingPlaybackFailure) -> Void)?
     private(set) var plays: [Play] = []
     private(set) var closes = 0
@@ -133,7 +135,7 @@ import BeepbarCore
     var duration: TimeInterval? = 6_000
 
     func play(_ url: URL, title: String, cookies: [HTTPCookie], startAt: TimeInterval?, recordingID: String) {
-        if isOpen, let current { onPositionCheckpoint?(current.id, current.position, current.duration) }
+        report(.replaced)
         plays.append(Play(url: url, title: title, startAt: startAt, recordingID: recordingID, cookies: cookies.count))
         isOpen = true
         current = (recordingID, startAt ?? 0, duration)
@@ -143,21 +145,36 @@ import BeepbarCore
 
     func close() {
         closes += 1
-        if isOpen, let current { onPositionCheckpoint?(current.id, current.position, current.duration) }
+        report(.closed)
         isOpen = false
         current = nil
     }
 
     func adoptPolicyToRestore(_ policy: NSApplication.ActivationPolicy) { adoptedPolicies.append(policy) }
 
+    /// Reports the lecture on screen, if any, with `reason`: what the real player's checkpoint
+    /// carries.
+    private func report(_ reason: RecordingCheckpoint.Reason) {
+        guard isOpen, let current else { return }
+        onPositionCheckpoint?(RecordingCheckpoint(id: current.id, position: current.position, duration: current.duration, reason: reason))
+    }
+
     /// The lecture plays on to `position` without any report, as it does between pauses.
     func move(to position: TimeInterval) { current?.position = position }
 
+    /// The lecture plays on to `position` and the periodic observer ticks there: `onProgress`
+    /// only, never a checkpoint, as the real player does while playing.
+    func tick(at position: TimeInterval) {
+        guard let current else { return }
+        self.current?.position = position
+        onProgress?(current.id, position, current.duration)
+    }
+
     /// The student pauses at `position`: the report the real player makes.
     func pause(at position: TimeInterval) {
-        guard let id = current?.id else { return }
+        guard current != nil else { return }
         current?.position = position
-        onPositionCheckpoint?(id, position, duration)
+        report(.paused)
     }
 
     /// The stream dies mid-lecture at `position`, as the real player reports it: the position
@@ -165,7 +182,7 @@ import BeepbarCore
     func failDuringPlayback(at position: TimeInterval) {
         guard let id = current?.id else { return }
         current?.position = position
-        onPositionCheckpoint?(id, position, duration)
+        report(.failed)
         onFailure?(id, .duringPlayback(nil, position: position))
     }
 

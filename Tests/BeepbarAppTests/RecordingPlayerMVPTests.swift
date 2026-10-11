@@ -55,18 +55,35 @@ final class FakePlayerView: NSView {
 /// A view without a `player` key: key-value coding on it would raise an uncatchable exception.
 final class ViewWithoutPlayer: NSView {}
 
-/// Counts periodic and boundary time observers: the player must never register either.
+/// Counts time observers added and removed, and the intervals asked for: the player may hold one
+/// periodic observer only while playing, and never a boundary observer.
 final class CountingPlayer: AVPlayer, @unchecked Sendable {
-    let timeObservers = OSAllocatedUnfairLock(initialState: 0)
+    struct Counts {
+        var periodicAdded = 0
+        var boundaryAdded = 0
+        var removed = 0
+        var intervals: [Double] = []
+    }
+    let counts = OSAllocatedUnfairLock(initialState: Counts())
+    /// Observers registered and not yet removed.
+    var active: Int { counts.withLock { $0.periodicAdded + $0.boundaryAdded - $0.removed } }
 
     override func addPeriodicTimeObserver(forInterval interval: CMTime, queue: DispatchQueue?, using block: @escaping @Sendable (CMTime) -> Void) -> Any {
-        timeObservers.withLock { $0 += 1 }
+        counts.withLock {
+            $0.periodicAdded += 1
+            $0.intervals.append(interval.seconds)
+        }
         return super.addPeriodicTimeObserver(forInterval: interval, queue: queue, using: block)
     }
 
     override func addBoundaryTimeObserver(forTimes times: [NSValue], queue: DispatchQueue?, using block: @escaping @Sendable () -> Void) -> Any {
-        timeObservers.withLock { $0 += 1 }
+        counts.withLock { $0.boundaryAdded += 1 }
         return super.addBoundaryTimeObserver(forTimes: times, queue: queue, using: block)
+    }
+
+    override func removeTimeObserver(_ observer: Any) {
+        counts.withLock { $0.removed += 1 }
+        super.removeTimeObserver(observer)
     }
 }
 
@@ -136,7 +153,8 @@ final class CountingCenter: NotificationCenter, @unchecked Sendable {
 @Suite(.serialized)
 struct RecordingPlayerMVPTests {
     @MainActor final class Recorder {
-        var checkpoints: [(id: String, position: TimeInterval, duration: TimeInterval?)] = []
+        var checkpoints: [RecordingCheckpoint] = []
+        var ticks: [(id: String, position: TimeInterval, duration: TimeInterval?)] = []
         var failures: [RecordingPlaybackFailure] = []
         var failureIDs: [String] = []
         var events: [String] = []
@@ -147,16 +165,22 @@ struct RecordingPlayerMVPTests {
                                 makePlayerView: @escaping @MainActor () -> NSView? = { FakePlayerView() },
                                 makePlayer: @escaping @MainActor () -> AVPlayer = { AVPlayer() },
                                 notificationCenter: NotificationCenter = .default,
+                                progressInterval: TimeInterval = RecordingPlayerController.progressInterval,
                                 recorder: Recorder? = nil) -> RecordingPlayerController {
         let policy = ActivationPolicyControl(current: { .regular }, set: { _ in })
         let controller = RecordingPlayerController(present: { _ in }, makePlayerView: makePlayerView, makePlayer: makePlayer,
                                                    activationPolicy: policy, frameAutosaveName: nil, defaults: defaults,
                                                    notificationCenter: notificationCenter,
-                                                   toggleFullScreen: { _ in recorder?.fullScreenToggles += 1 })
+                                                   toggleFullScreen: { _ in recorder?.fullScreenToggles += 1 },
+                                                   progressInterval: progressInterval)
         if let recorder {
-            controller.onPositionCheckpoint = { id, position, duration in
-                recorder.checkpoints.append((id, position, duration))
+            controller.onPositionCheckpoint = { checkpoint in
+                recorder.checkpoints.append(checkpoint)
                 recorder.events.append("checkpoint")
+            }
+            controller.onProgress = { id, position, duration in
+                // Not in `events`: a tick AVFoundation queued before a pause may land after it.
+                recorder.ticks.append((id, position, duration))
             }
             controller.onFailure = { id, failure in
                 recorder.failureIDs.append(id)
@@ -512,19 +536,148 @@ struct RecordingPlayerMVPTests {
 
     // MARK: Checkpoints
 
-    /// While playing, nothing is reported and no periodic or boundary time observer exists: the
-    /// position is never sampled on a clock. Guards against a "save every N seconds" creeping in.
-    @Test func playbackAloneReportsNothingAndUsesNoTimeObserver() async throws {
+    /// Exactly one periodic time observer exists while the lecture plays, at 30 s of media time,
+    /// and none once it pauses (the pause removes it; resuming adds it again, once) or closes;
+    /// never a boundary observer. Guards the "quiet at rest" budget: a paused or closed lecture
+    /// must cost no wakeups. Mutations: skip the removal on `.paused` in `updateProgressObserver`
+    /// and the wait for 0 after the pause times out; drop the `progressObservation == nil` guard
+    /// and `periodicAdded` exceeds 1 while playing; drop the removal in `removeItemObservers` and
+    /// close leaves 1 behind.
+    @Test func onePeriodicObserverExistsOnlyWhilePlaying() async throws {
         let recorder = Recorder()
         var created: CountingPlayer?
         let controller = makeController(makePlayer: { let player = CountingPlayer(); created = player; return player }, recorder: recorder)
         try await playReady(controller)
-        try await Task.sleep(for: .milliseconds(1500))
-        #expect(recorder.checkpoints.isEmpty)
-        #expect(controller.player?.rate != 0)
         let player = try #require(created)
+        try await Self.waitUntil { player.timeControlStatus == .playing }
+        await Self.settle()
+        #expect(player.active == 1)
+        #expect(player.counts.withLock { $0.periodicAdded } == 1, "several status reports while playing add one observer")
+        #expect(player.counts.withLock { $0.boundaryAdded } == 0)
+        #expect(player.counts.withLock { $0.intervals } == [RecordingPlayerController.progressInterval])
+        #expect(RecordingPlayerController.progressInterval == 30)
+
+        controller.pause()
+        try await Self.waitUntil { player.active == 0 }
+        await Self.settle()
+        #expect(player.active == 0, "paused: no clock")
+        #expect(recorder.checkpoints.map(\.reason) == [.paused])
+
+        player.play()
+        try await Self.waitUntil { player.active == 1 }
+        await Self.settle()
+        #expect(player.active == 1)
+        #expect(player.counts.withLock { $0.periodicAdded } == 2)
+
         controller.close()
-        #expect(player.timeObservers.withLock { $0 } == 0)
+        #expect(player.active == 0, "closed: removed synchronously")
+        await Self.settle()
+        #expect(player.active == 0)
+        #expect(player.counts.withLock { $0.periodicAdded } == 2)
+    }
+
+    /// A replacement removes the old lecture's observer before anything else (with a resume
+    /// position the player is held paused, so none exists until the resume lands), and a failure
+    /// mid-lecture removes it before `onFailure` runs. Guards against an observer left ticking on
+    /// a replaced item or on a failed stream. A replacement while playing adds the new item's
+    /// observer inside `play` itself, since the new `timeControlStatus` observation reports
+    /// changes only. Mutations: drop the removal in `removeItemObservers` and the synchronous
+    /// expectation after the replacement fails; drop the `updateProgressObserver` call at the end
+    /// of `play` and the synchronous count after the second replacement is 0; drop the removal in
+    /// `fail` and the count seen from `onFailure` is 1.
+    @Test func theObserverGoesOnReplacementAndFailure() async throws {
+        let recorder = Recorder()
+        var created: CountingPlayer?
+        let controller = makeController(makePlayer: { let player = CountingPlayer(); created = player; return player }, recorder: recorder)
+        try await playReady(controller)
+        let player = try #require(created)
+        try await Self.waitUntil { player.timeControlStatus == .playing && player.active == 1 }
+        let media = try await TestMedia.shared.url()
+
+        // Replaced by a lecture with a resume position: held paused, so no observer at all.
+        controller.play(media, title: "Altra", cookies: [], startAt: 30, recordingID: "rec-2")
+        #expect(player.active == 0, "the replaced lecture's observer is gone at once")
+        #expect(recorder.checkpoints.last?.reason == .replaced)
+        try await Self.waitUntil { controller.isStartSettled && player.active == 1 }
+
+        // Replaced while playing, without a resume position: the old observer goes, one new one.
+        let removed = player.counts.withLock { $0.removed }
+        controller.play(media, title: "Terza", cookies: [], startAt: nil, recordingID: "rec-3")
+        #expect(player.counts.withLock { $0.removed } == removed + 1)
+        #expect(player.active == 1, "re-added within `play`, not left to a status report that may never come")
+        try await Self.waitUntil { player.timeControlStatus == .playing && player.active == 1 }
+        await Self.settle()
+        #expect(player.active == 1)
+
+        var activeAtFailure: Int?
+        controller.onFailure = { _, _ in activeAtFailure = player.active }
+        let item = try #require(player.currentItem)
+        NotificationCenter.default.post(name: AVPlayerItem.failedToPlayToEndTimeNotification, object: item)
+        try await Self.waitUntil { activeAtFailure != nil }
+        #expect(activeAtFailure == 0, "removed before the caller hears of the failure")
+        #expect(recorder.checkpoints.last?.reason == .failed)
+        await Self.settle()
+        #expect(player.active == 0)
+        controller.close()
+        #expect(player.active == 0)
+    }
+
+    /// While playing, ticks reach `onProgress` with the lecture's id, position and duration, and
+    /// never produce a checkpoint: only pauses, closes, replacements and failures do. Guards
+    /// against a "save every N seconds" creeping in through the ticks. The interval is shortened
+    /// so real AVFoundation ticks arrive within the fixture. Mutations: make `progressTicked`
+    /// call `checkpointIfMeaningful(.paused)` and the checkpoints are no longer empty; forward
+    /// nothing and the wait for ticks times out.
+    @Test func ticksReportProgressAndNeverCheckpoint() async throws {
+        let recorder = Recorder()
+        let controller = makeController(progressInterval: 0.2, recorder: recorder)
+        try await playReady(controller)
+        try await Self.waitUntil { recorder.ticks.count >= 3 }
+        #expect(recorder.checkpoints.isEmpty, "ticks are never checkpoints")
+        #expect(recorder.ticks.allSatisfy { $0.id == "Lezione" && $0.duration == TestMedia.duration })
+        let positions = recorder.ticks.map(\.position)
+        #expect(positions.allSatisfy { $0 >= 0 && $0 <= TestMedia.duration })
+        #expect((positions.last ?? 0) > (positions.first ?? 0), "the position moves on")
+        #expect(controller.player?.rate != 0)
+        controller.close()
+        #expect(recorder.checkpoints.map(\.reason) == [.closed])
+        let ticks = recorder.ticks.count
+        try await Task.sleep(for: .milliseconds(600))
+        #expect(recorder.ticks.count == ticks, "nothing after close")
+    }
+
+    /// A tick from a replaced or closed item is dropped by the generation check, and so is a
+    /// tick before the start is settled (the resume seek in flight, the player showing 0), so a
+    /// lecture resumed near its end never reports 0. Guards against a late tick crediting the
+    /// previous lecture's position to the new one. Mutations: drop `observed == generation` and
+    /// the replaced-generation tick is delivered; drop `isStartSettled` and the tick during the
+    /// resume is delivered.
+    @Test func ticksFromAReplacedItemOrBeforeTheStartAreDropped() async throws {
+        let recorder = Recorder()
+        let controller = makeController(recorder: recorder)
+        try await playReady(controller)
+        let old = controller.generation
+        let media = try await TestMedia.shared.url()
+        controller.play(media, title: "Altra", cookies: [], startAt: nil, recordingID: "rec-2")
+        try await Self.waitUntil { controller.isStartSettled }
+        recorder.ticks.removeAll()
+        controller.progressTicked(generation: old, position: 5)
+        #expect(recorder.ticks.isEmpty, "a tick from the replaced lecture is dropped")
+        controller.progressTicked(generation: controller.generation, position: 5)
+        #expect(recorder.ticks.count == 1)
+        #expect(recorder.ticks.first?.id == "rec-2")
+        #expect(recorder.ticks.first?.position == 5)
+        #expect(recorder.ticks.first?.duration == TestMedia.duration)
+        controller.close()
+        controller.progressTicked(generation: controller.generation, position: 6)
+        #expect(recorder.ticks.count == 1, "nothing after close")
+
+        let resuming = Recorder()
+        let (held, _) = try await makeHeldResume(recorder: resuming)
+        held.progressTicked(generation: held.generation, position: 0)
+        #expect(resuming.ticks.isEmpty, "the resume has not landed: 0 is not where the student is")
+        #expect(resuming.checkpoints.isEmpty)
+        held.close()
     }
 
     /// A pause reports once, with the position and duration: `pause()`, a pause from outside
@@ -557,6 +710,7 @@ struct RecordingPlayerMVPTests {
         try await Self.waitUntil { recorder.checkpoints.count == 3 }
         await Self.settle()
         #expect(recorder.checkpoints.count == 3)
+        #expect(recorder.checkpoints.map(\.reason) == [.paused, .paused, .paused])
         controller.close()
     }
 
@@ -570,14 +724,15 @@ struct RecordingPlayerMVPTests {
         try await playReady(controller)
         try await park(controller, at: 25)
         let before = recorder.checkpoints.count
-        controller.onPositionCheckpoint = { id, position, duration in
+        controller.onPositionCheckpoint = { checkpoint in
             openWhenReported = controller.player != nil
-            recorder.checkpoints.append((id, position, duration))
+            recorder.checkpoints.append(checkpoint)
         }
         if byUser { controller.window?.close() } else { controller.close() }
         #expect(recorder.checkpoints.count == before + 1)
         #expect(openWhenReported == true)
         #expect(abs((recorder.checkpoints.last?.position ?? 0) - 25) < 0.5)
+        #expect(recorder.checkpoints.last?.reason == .closed)
         controller.close()
         await Self.settle()
         #expect(recorder.checkpoints.count == before + 1)
@@ -622,6 +777,7 @@ struct RecordingPlayerMVPTests {
         #expect(abs(time(controller)) < 0.5)
         controller.close()
         #expect(recorder.checkpoints.map(\.position) == [30])
+        #expect(recorder.checkpoints.map(\.reason) == [.closed])
     }
 
     /// A failure while the resume seek is in flight reports the resume position, in the
@@ -812,6 +968,7 @@ struct RecordingPlayerMVPTests {
         #expect(recorder.checkpoints.count == before + 1)
         #expect(abs((recorder.checkpoints.last?.position ?? 0) - 40) < 0.5)
         #expect(recorder.checkpoints.last?.id == "Lezione", "The replaced lecture's id, not the new one")
+        #expect(recorder.checkpoints.last?.reason == .replaced)
         #expect(controller.recordingID == "rec-2")
         controller.close()
     }
@@ -831,6 +988,7 @@ struct RecordingPlayerMVPTests {
         try await Self.waitUntil { !recorder.failures.isEmpty }
         await Self.settle()
         #expect(recorder.events == ["checkpoint", "failure"])
+        #expect(recorder.checkpoints.map(\.reason) == [.failed])
         controller.close()
 
         let early = Recorder()

@@ -2,8 +2,8 @@
 
 Branch: `perf/isolated-ui-harness`, initial base `ac68333`, integrated `origin/dev` `7e16c6c`.
 **Delivered as tooling only**, by the owner's decision of 2026-10-11 (see
-[What was not measured](#what-was-not-measured-and-why)). Sections after the next one are the
-historical record of earlier candidates; their gates do not validate the final code.
+[What was not measured](#what-was-not-measured-and-why)). Sections titled *Historical* record
+earlier candidates; their gates do not validate the final code.
 
 ## Final dev integration (2026-10-11)
 
@@ -17,6 +17,15 @@ the opt-in entry point into `UIFixtureProgressBurst`, compiled by the ordinary t
 removed seam now fails `swift test` rather than only the fixture build. `e75377d` drops two
 stray blank lines from the Activity hooks.
 
+Independent review of the delta found one P1, fixed in `b9fda15`: the readiness modifier, which
+ships in the normal app on the first Course and Recordings row, branched on `enabled`. When the
+first row changed (a refresh reordering courses, a filter), both rows took another structural
+identity and lost their `@State`, such as a course rename being typed. The modifier now always
+attaches `onAppear` with an optional action; `UIContentReadinessTests.movingTheMarkerKeepsTheRowState`
+hosts a real row, moves the marker off and back, and proves its state storage is created once.
+The same review's P2 findings (the burst test did not prove its run closed; documentation wording)
+are fixed in the same round.
+
 `progressBurstTravelsTheThrottledSyncPath` proves the burst reaches the final 10,000 total with
 at least one and at most `2 + elapsed/200 ms` main-actor entries, and leaves no sync active.
 Mutations in a disposable `git worktree add --detach` copy of `6d8e6e3`, each run alone:
@@ -26,12 +35,15 @@ Mutations in a disposable `git worktree add --detach` copy of `6d8e6e3`, each ru
 | Burst sends no events | **RED**: final total and main-actor entry expectations fail |
 | Burst leaves the operation set | **RED**: `!isSyncActive` fails |
 | Controller hops to the main actor before the throttle | **RED**: entry bound fails |
+| Burst does not close its run (`closeCurrentRun` removed) | **RED**: a late final event reaches the main actor |
+| Readiness modifier branches on `enabled` again | **RED**: `movingTheMarkerKeepsTheRowState` sees the row rebuilt |
 | Restored | **GREEN** |
 
 Host: Apple M5 (`Mac17,3`), 32 GB, macOS 27.0.1 (`26A434`), Xcode 27.0 (`27A266a`).
 Focused `UIFixtureTests` 9 PASS and the opt-in fixture Release arm64 build (Mach-O arm64,
 identity `beepbar-isolated-ui-fixture-v1`) succeeded on `6d8e6e3`. Full suite, ordinary Release
-build, Python guards and independent review on the exact pushed SHA are recorded in PR #136.
+build, Python guards and the final independent review are run on the exact pushed SHA, which
+cannot appear in this file; that SHA and its results are posted in PR #136 before merge.
 No measurement series, installed app, real account or production data was used.
 
 ## Historical: dev `713033c` integration gates
@@ -63,7 +75,7 @@ still requires AC. Temporary bundle/data identities were removed after each help
 
 ## Historical: pre-integration code gates
 
-Host: Apple M5, `Mac17,3`, 24 GiB RAM, macOS 27.0.1 (`26A434`), Xcode 27.0 (`27A266a`),
+Host: Apple M5, `Mac17,3`, 32 GB RAM (this line said 24 GiB until 2026-10-11; the host reports 32 GB), macOS 27.0.1 (`26A434`), Xcode 27.0 (`27A266a`),
 Developer directory `/Applications/Xcode.app/Contents/Developer`, xctrace 27.0.
 
 | Gate | Result | Retained local evidence |

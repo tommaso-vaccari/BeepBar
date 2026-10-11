@@ -143,7 +143,9 @@ xcodebuild -project Beepbar.xcodeproj -target Beepbar -configuration Release bui
 ```
 
 The focused suite checks token/defaults/root isolation, malformed workloads, immutable reports,
-offline known-model retention, fail-closed requests, full corpora and a genuine held sync. The
+offline known-model retention, fail-closed requests, full corpora, a genuine held sync, and the
+progress burst through the real throttled sync sink with its run closed afterwards.
+`UIContentReadinessTests` proves moving the readiness marker never rebuilds a row in the normal app. The
 safe regression mutation is removal of the mock offline guard in a disposable copy: the offline
 refresh test must fail while every request still remains intercepted. Never mutate away the
 network protocol injection and then run tests against a real Moodle host.

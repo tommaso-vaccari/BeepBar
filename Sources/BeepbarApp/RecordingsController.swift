@@ -903,8 +903,10 @@ struct RecordingsListing: Equatable {
     private func currentPlayer() -> RecordingPlaying {
         if let player { return player }
         let player = makePlayer()
-        player.onPositionCheckpoint = { [weak self] id, position, duration in
-            self?.playerCheckpoint(id: id, position: position, duration: duration)
+        // Every reason is handled alike for now: the resume point only needs where the student
+        // stopped. The reason (and `onProgress`) are for watch progress.
+        player.onPositionCheckpoint = { [weak self] checkpoint in
+            self?.playerCheckpoint(id: checkpoint.id, position: checkpoint.position, duration: checkpoint.duration)
         }
         player.onFailure = { [weak self] id, failure in
             self?.playerFailed(id: id, failure: failure)

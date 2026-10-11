@@ -11,9 +11,13 @@ import OSLog
 @MainActor protocol RecordingPlaying: AnyObject {
     /// Whether the player is open (between a `play` and the window closing).
     var isOpen: Bool { get }
-    /// Where the student stopped in a recording, as (recording id, position, duration) in
-    /// seconds; see `RecordingPlayerController.onPositionCheckpoint` for exactly when.
-    var onPositionCheckpoint: ((String, TimeInterval, TimeInterval?) -> Void)? { get set }
+    /// Where the student stopped in a recording, and why it was reported; see
+    /// `RecordingPlayerController.onPositionCheckpoint` for exactly when.
+    var onPositionCheckpoint: ((RecordingCheckpoint) -> Void)? { get set }
+    /// Where the student is while a lecture plays, as (recording id, position, duration) in
+    /// seconds, about every 30 s of media time; memory only, never a checkpoint. See
+    /// `RecordingPlayerController.onProgress`.
+    var onProgress: ((String, TimeInterval, TimeInterval?) -> Void)? { get set }
     /// Called, with the `recordingID` of the play that failed, when a play fails; see
     /// `RecordingPlaybackFailure` for what the player has already done in each phase.
     var onFailure: ((String, RecordingPlaybackFailure) -> Void)? { get set }
@@ -31,6 +35,36 @@ import OSLog
     /// regular app and finds a lecture open when it is done; see
     /// `RecordingPlayerController.adoptPolicyToRestore`.
     func adoptPolicyToRestore(_ policy: NSApplication.ActivationPolicy)
+}
+
+/// One report of where the student stopped in a lecture (`RecordingPlaying.onPositionCheckpoint`).
+///
+/// The reason is part of the report because the caller treats the moments differently: a pause
+/// or a failure keeps the lecture open, while a close or a replacement ends it (watch progress
+/// may complete a lecture only when it ends, issue #148 follow-up "recording view tracking").
+/// The player states what happened; whether a replacement by the *same* recording counts as an
+/// end is the caller's decision, since only it knows what comes next.
+struct RecordingCheckpoint: Equatable, Sendable {
+    /// Why the position was reported.
+    enum Reason: Equatable, Sendable {
+        /// Playback paused: the student's pause, `pause()`, or the end of the lecture.
+        case paused
+        /// The player closed, by `close()` or the window's close button.
+        case closed
+        /// A newer `play` replaced this lecture; the report carries the old lecture's id.
+        case replaced
+        /// The stream stopped mid-lecture (`RecordingPlaybackFailure.duringPlayback`); the
+        /// window stays open, paused here.
+        case failed
+    }
+
+    /// The `recordingID` of the `play` that loaded the lecture.
+    let id: String
+    /// Seconds from the start: `RecordingPlayerController.reportedPosition`.
+    let position: TimeInterval
+    /// The lecture's length in seconds, nil when unknown.
+    let duration: TimeInterval?
+    let reason: Reason
 }
 
 /// How a play failed, reported once per item through `RecordingPlayerController.onFailure`.
@@ -75,13 +109,17 @@ enum RecordingPlayerError: Error {
 /// `close()`) pauses, empties the player and drops every reference, so nothing of AVFoundation
 /// stays retained by BeepBar afterwards.
 ///
-/// Event-driven only, even while playing: no timer, no polling, no periodic or boundary time
-/// observer. The only observers are KVO on the current item's status, `canPlayFastForward` and
+/// Event-driven, with one clock only while playing: no timer, no polling, no boundary time
+/// observer. The observers are KVO on the current item's status, `canPlayFastForward` and
 /// `canPlaySlowForward`, KVO on the player's `timeControlStatus` and `defaultRate`, and the item's
 /// failed-to-play-to-end notification, all tied to the current item and removed on every
-/// replacement and on close. Where the student
-/// stopped is therefore reported only at the moments that matter (`onPositionCheckpoint`), never
-/// on a clock.
+/// replacement and on close; plus one periodic time observer only while playing, memory only,
+/// never a disk write (`onProgress`). It exists only while `timeControlStatus` is not `.paused`
+/// and is removed on pause, replacement, failure and close, so a paused or closed player has no
+/// clock at all. Its interval is media time: 30 s of lecture, which is 15 s of wall time at 2x
+/// and 60 s at 0.5x; AVFoundation also fires it when playback starts or stops and when time
+/// jumps (seeks). Where the student stopped is reported only at the moments that matter
+/// (`onPositionCheckpoint`), never on that clock: ticks never produce a checkpoint.
 ///
 /// Not part of the quit path: `prepareForTermination` must never reach this controller, since
 /// AVFoundation teardown is exactly the kind of work the quit rules forbid there. Quitting simply
@@ -96,23 +134,41 @@ enum RecordingPlayerError: Error {
     /// player was closed.
     var onFailure: ((String, RecordingPlaybackFailure) -> Void)?
 
-    /// Where the student stopped, as (recording id, position, duration) in seconds, the duration
-    /// nil when unknown. The id is the `recordingID` of the `play` that loaded the lecture, so a
-    /// report is self-describing even when it is about a lecture being replaced. Called on the
-    /// main actor, and only:
-    /// - when playback pauses: the student's pause (controls, Space, K, media keys, Control
-    ///   Center), `pause()`, or the end of the lecture; once per pause;
-    /// - when the player closes, by `close()` or the window's close button, synchronously before
-    ///   anything is released;
-    /// - when a newer `play` replaces the item (the old lecture is closed), synchronously at the
-    ///   start of that `play`, before anything changes, with the old lecture's id;
-    /// - on a `.duringPlayback` failure, just before `onFailure`, with the same position.
+    /// Where the student stopped (`RecordingCheckpoint`: id, position and duration in seconds,
+    /// the duration nil when unknown, and the reason). The id is the `recordingID` of the `play`
+    /// that loaded the lecture, so a report is self-describing even when it is about a lecture
+    /// being replaced. Called on the main actor, and only:
+    /// - `.paused`: when playback pauses: the student's pause (controls, Space, K, media keys,
+    ///   Control Center), `pause()`, or the end of the lecture; once per pause;
+    /// - `.closed`: when the player closes, by `close()` or the window's close button,
+    ///   synchronously before anything is released;
+    /// - `.replaced`: when a newer `play` replaces the item (the old lecture is closed),
+    ///   synchronously at the start of that `play`, before anything changes, with the old
+    ///   lecture's id (also when the newer `play` is for the same id: the caller decides);
+    /// - `.failed`: on a `.duringPlayback` failure, just before `onFailure`, with the same
+    ///   position. The pause the player makes for it is not reported a second time.
     ///
-    /// Never periodically. Nothing is reported before the item is ready, so a lecture closed
-    /// while loading never overwrites a saved position with 0. The position is
-    /// `reportedPosition()`: where an in-flight seek (a skip, or the resume) is going, else the
-    /// player's time. The callback must not call back into the player synchronously.
-    var onPositionCheckpoint: ((String, TimeInterval, TimeInterval?) -> Void)?
+    /// Never periodically: `onProgress` ticks never lead here. Nothing is reported before the
+    /// item is ready, so a lecture closed while loading never overwrites a saved position with 0.
+    /// The position is `reportedPosition()`: where an in-flight seek (a skip, or the resume) is
+    /// going, else the player's time. The callback must not call back into the player
+    /// synchronously.
+    var onPositionCheckpoint: ((RecordingCheckpoint) -> Void)?
+
+    /// Where the student is while the lecture plays, as (recording id, position, duration) in
+    /// seconds, the duration nil when unknown, so the window can follow progress live. Called on
+    /// the main actor from the one periodic time observer (`progressInterval` of media time, plus
+    /// AVFoundation's own fires when playback starts or stops and after a seek), which exists
+    /// only while the player is not paused.
+    ///
+    /// Memory only: this is not a checkpoint, and a consumer must never write to disk on it (the
+    /// "quiet at rest" and "disk only at pause/close" budgets). Nothing is reported before the
+    /// start is settled (ready, and the resume seek landed), so a lecture resumed near its end
+    /// never reports the 0 the player shows while the resume is under way; a tick from a replaced
+    /// or closed item is dropped by the generation check. The position is the time AVFoundation
+    /// handed the observer, read on its queue. The callback must not call back into the player
+    /// synchronously.
+    var onProgress: ((String, TimeInterval, TimeInterval?) -> Void)?
 
     // Internal rather than private so tests can hold weak references and prove the release.
     private(set) var window: NSWindow?
@@ -169,6 +225,18 @@ enum RecordingPlayerError: Error {
     private var rateSupportObservations: [NSKeyValueObservation] = []
     private var defaultRateObservation: NSKeyValueObservation?
     private var failedToEndObserver: NSObjectProtocol?
+    /// The one periodic time observer (`onProgress`), with the player it was added to:
+    /// AVFoundation requires removing a token from that same player. Non-nil only while the
+    /// player is not paused. Invariant: every path that pauses, replaces, fails or closes ends in
+    /// `removeProgressObserver()`, so a paused or closed player costs no wakeups at all.
+    /// `serial` identifies this observer: its ticks carry it, and a tick whose observer is no
+    /// longer the current one is dropped (see `settleStart`).
+    private var progressObservation: (player: AVPlayer, token: Any, serial: Int)?
+    /// The serial of the last periodic time observer added; only ever increases.
+    private var lastProgressObserverSerial = 0
+    /// The serial of the current periodic time observer, nil when none exists. Internal so tests
+    /// can deliver a tick as the current observer, or as one that was replaced.
+    var progressObserverSerial: Int? { progressObservation?.serial }
     /// The menu items' targets: an item holds its target weakly.
     private var menuActions: [PlayerMenuAction] = []
     /// The policy BeepBar had before the player promoted it to `.regular`; nil when the player
@@ -183,6 +251,16 @@ enum RecordingPlayerError: Error {
     private let defaults: UserDefaults
     private let notificationCenter: NotificationCenter
     private let toggleFullScreen: @MainActor (NSWindow) -> Void
+    private let progressInterval: CMTime
+
+    /// How often, in media time, `onProgress` reports while playing. Thirty seconds of lecture
+    /// keeps the window's progress bar moving visibly (a lecture lasts 1-2 hours, so a step is
+    /// well under 1%) for about two wakeups a minute at 1x; finer would cost wakeups for nothing
+    /// a student can see. Media time, not wall time: 15 s of wall time at 2x, 60 s at 0.5x.
+    static let progressInterval: TimeInterval = 30
+    /// Where the periodic time observer's block runs: off the main thread, so a tick only reads
+    /// the time it is handed and hops; serial, as AVFoundation requires.
+    private static let progressQueue = DispatchQueue(label: "io.github.tvaccari.beepbar.player-progress", qos: .utility)
 
     /// How far ahead AVFoundation may buffer. Lectures last hours: left at its default (0, meaning
     /// "let the system decide"), AVPlayer may buffer minutes of high-bitrate video ahead, which
@@ -211,6 +289,8 @@ enum RecordingPlayerError: Error {
     ///   - defaults: where the chosen speed is remembered.
     ///   - notificationCenter: where AVFoundation's item notifications are observed.
     ///   - toggleFullScreen: what F does; tests record it instead of animating a window.
+    ///   - progressInterval: seconds of media time between `onProgress` ticks; tests shorten it
+    ///     to see real ticks within the 60 s fixture.
     init(present: @escaping @MainActor (NSWindow) -> Void = RecordingPlayerController.bringToFront,
          makePlayerView: @escaping @MainActor () -> NSView? = AVKitLoader.makePlayerView,
          makePlayer: @escaping @MainActor () -> AVPlayer = { AVPlayer() },
@@ -218,7 +298,9 @@ enum RecordingPlayerError: Error {
          frameAutosaveName: String? = RecordingPlayerController.defaultFrameAutosaveName,
          defaults: UserDefaults = .standard,
          notificationCenter: NotificationCenter = .default,
-         toggleFullScreen: @escaping @MainActor (NSWindow) -> Void = { $0.toggleFullScreen(nil) }) {
+         toggleFullScreen: @escaping @MainActor (NSWindow) -> Void = { $0.toggleFullScreen(nil) },
+         progressInterval: TimeInterval = RecordingPlayerController.progressInterval) {
+        self.progressInterval = CMTime(seconds: progressInterval, preferredTimescale: 600)
         self.present = present
         self.makePlayerView = makePlayerView
         self.makePlayer = makePlayer
@@ -239,7 +321,7 @@ enum RecordingPlayerError: Error {
         Self.log.notice("Playing a recording from \(url.host ?? "-", privacy: .public)")
         // A newer lecture closes the one on screen: report where the student left it, with its
         // own id, while the old item is still in place.
-        checkpointIfMeaningful()
+        checkpointIfMeaningful(.replaced)
         removeItemObservers()
         generation += 1
         self.recordingID = recordingID
@@ -328,6 +410,10 @@ enum RecordingPlayerError: Error {
         // (`itemBecameReady`): starting now would play the first seconds of the lecture and then
         // jump. AVFoundation cannot seek an item before it is ready.
         if !isResuming { player.play() }
+        // The new `timeControlStatus` observation reports changes only: if the player was
+        // already moving and stays so across the replacement, no report would come to add the
+        // progress observer for the new item, so it is added here from the current status.
+        updateProgressObserver(generation: observedGeneration)
         if let window { present(window) }
     }
 
@@ -343,7 +429,7 @@ enum RecordingPlayerError: Error {
     }
 
     func close() {
-        checkpointIfMeaningful()
+        checkpointIfMeaningful(.closed)
         let window = self.window
         stopPlayback()
         guard let window else { return }
@@ -359,7 +445,7 @@ enum RecordingPlayerError: Error {
     func windowWillClose(_ notification: Notification) {
         guard let closing = notification.object as? NSWindow, closing === window else { return }
         // The student closed the window: report where they stopped before anything is released.
-        checkpointIfMeaningful()
+        checkpointIfMeaningful(.closed)
         // Playback stops now: no sound may outlive the window.
         stopPlayback()
         // Synchronously, so a Play in the meantime can give the name to its new window: AppKit
@@ -409,8 +495,10 @@ enum RecordingPlayerError: Error {
             // start playback afterwards.
             player.pause()
             playWhenSettled = false
+            // No clock on a failed stream, even before the pause's KVO lands.
+            removeProgressObserver()
             let position = reportedPosition(of: player)
-            checkpointIfMeaningful()
+            checkpointIfMeaningful(.failed)
             Self.log.error("Recording playback stopped while playing")
             onFailure?(id, .duringPlayback(error, position: position))
         } else {
@@ -455,6 +543,24 @@ enum RecordingPlayerError: Error {
         guard observed == generation, isCurrentItemReady, support != rateSupport else { return }
         rateSupport = support
         applySpeed()
+    }
+
+    /// Where a periodic time observer tick lands on the main actor, with the time AVFoundation
+    /// handed the observer. Forwards it to `onProgress` and does nothing else: never a
+    /// checkpoint, never a write. Dropped when:
+    /// - it comes from a replaced or closed item (the generation moved on);
+    /// - its observer is no longer the current one (`observer` is not `progressObserverSerial`):
+    ///   removed on a pause, or replaced when the start settled. The hop is queued, so the start
+    ///   may settle between AVFoundation reading the time and the tick landing here: checking
+    ///   `isStartSettled` alone would let through a time read before the resume landed;
+    /// - the start is not settled yet (see `onProgress`);
+    /// - the position is not a finite, non-negative number.
+    ///
+    /// Internal so tests can deliver ticks AVFoundation never produces on demand.
+    func progressTicked(generation observed: Int, observer: Int, position: TimeInterval) {
+        guard observed == generation, observer == progressObserverSerial, isStartSettled,
+              position.isFinite, position >= 0, let item = player?.currentItem else { return }
+        onProgress?(recordingID, position, Self.seconds(item.duration))
     }
 
     // MARK: Controls
@@ -547,18 +653,51 @@ enum RecordingPlayerError: Error {
         // Read now rather than in the observer: if hops arrive late or out of order, only the
         // current state counts.
         if player.timeControlStatus == .paused {
-            if !checkpointedSincePlaying { checkpointIfMeaningful() }
+            if !checkpointedSincePlaying { checkpointIfMeaningful(.paused) }
         } else {
             checkpointedSincePlaying = false
         }
+        updateProgressObserver(generation: observed)
     }
 
-    /// Reports the position, unless there is nothing meaningful to report yet (see
+    /// Keeps the one periodic time observer in step with the player: present while it is not
+    /// paused (playing, or waiting to play at a rate), absent otherwise. Idempotent, so the
+    /// repeated `timeControlStatus` reports of one playing stretch (waiting, playing, waiting
+    /// after a stall) never add a second observer.
+    private func updateProgressObserver(generation observed: Int) {
+        guard observed == generation, let player, player.timeControlStatus != .paused else {
+            removeProgressObserver()
+            return
+        }
+        guard progressObservation == nil else { return }
+        lastProgressObserverSerial += 1
+        let serial = lastProgressObserverSerial
+        // The block runs on `progressQueue`: it reads only the time it is handed, then hops to
+        // the main actor, where the generation and serial checks drop a tick from a replaced or
+        // closed item, or from an observer that was removed meanwhile. It must never touch
+        // main-actor state from there.
+        let token = player.addPeriodicTimeObserver(forInterval: progressInterval, queue: Self.progressQueue) { [weak self] time in
+            let seconds = time.seconds
+            Task { @MainActor [weak self] in self?.progressTicked(generation: observed, observer: serial, position: seconds) }
+        }
+        progressObservation = (player, token, serial)
+    }
+
+    /// Removes the periodic time observer, from the player it was added to. Safe to call when
+    /// there is none.
+    private func removeProgressObserver() {
+        guard let progressObservation else { return }
+        self.progressObservation = nil
+        progressObservation.player.removeTimeObserver(progressObservation.token)
+    }
+
+    /// Reports the position with `reason`, unless there is nothing meaningful to report yet (see
     /// `onPositionCheckpoint`).
-    private func checkpointIfMeaningful() {
+    private func checkpointIfMeaningful(_ reason: RecordingCheckpoint.Reason) {
         guard isCurrentItemReady, let player, let item = player.currentItem else { return }
         checkpointedSincePlaying = true
-        onPositionCheckpoint?(recordingID, reportedPosition(of: player), Self.seconds(item.duration))
+        onPositionCheckpoint?(RecordingCheckpoint(id: recordingID, position: reportedPosition(of: player),
+                                                  duration: Self.seconds(item.duration), reason: reason))
     }
 
     /// The one definition of "where the student is", shared by checkpoints and
@@ -576,6 +715,16 @@ enum RecordingPlayerError: Error {
     /// meanwhile or the stream failed.
     private func settleStart() {
         isStartSettled = true
+        // An observer that already exists was added before the start settled: the student
+        // started the held player from the system controls during the resume, or (without a
+        // resume) playback began while the item loaded. Its ticks still in flight read the time
+        // before the resume landed (~0 for a lecture resumed at 92%), and a stray "below 90%"
+        // would let closing re-complete a lecture the student un-ticked. A fresh observer
+        // gets a new serial, so every tick of the old one is dropped (`progressTicked`).
+        if progressObservation != nil {
+            removeProgressObserver()
+            updateProgressObserver(generation: generation)
+        }
         guard isResuming else { return }
         isResuming = false
         if playWhenSettled { player?.play() }
@@ -749,7 +898,10 @@ enum RecordingPlayerError: Error {
         if activationPolicy.current() == .regular { activationPolicy.set(previous) }
     }
 
+    /// Removes every observer tied to the current item, the periodic time observer included: on
+    /// every replacement and, through `stopPlayback`, on close.
     private func removeItemObservers() {
+        removeProgressObserver()
         statusObservation?.invalidate()
         statusObservation = nil
         timeControlObservation?.invalidate()
@@ -764,6 +916,8 @@ enum RecordingPlayerError: Error {
 
     /// Stops and releases the player. Idempotent: a second call finds nothing to stop. The window
     /// and view are released by the caller (`close()` now, `windowWillClose` on the next turn).
+    /// The periodic time observer goes with the item observers, before `player` is dropped:
+    /// its token can only be removed from the player that holds it.
     private func stopPlayback() {
         generation += 1
         isCurrentItemReady = false

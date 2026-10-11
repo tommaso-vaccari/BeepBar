@@ -202,8 +202,9 @@ final class SessionFileProbe: @unchecked Sendable {
         // Never park the main thread: that is the failure this probe reports, not one to hang on.
         // Parking blocks the vault's file thread, never a cooperative one (see `RecmanSessionVault`
         // on the CI deadlock); the deadline makes a regression or a missing release fail, not hang.
+        // A hang detector, not a timing bound: CI tests here take up to ~33 s, and 10 s failed there.
         guard parks, !Thread.isMainThread else { return }
-        let deadline = Date().addingTimeInterval(10)
+        let deadline = Date().addingTimeInterval(120)
         while lock.withLock({ held }) {
             guard Date() < deadline else {
                 Issue.record("a held session file access was never released")

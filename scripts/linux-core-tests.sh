@@ -7,12 +7,16 @@
 # - Suites that mock the network with URLProtocol subclasses: swift-corelibs-foundation's
 #   URLSession never calls startLoading on them, so every such test hangs.
 # - Tests that rely on a permission denial, which cannot happen when the container runs as root.
+# - `RecmanSessionVaultTests/anUnchangedSessionIsNotRewritten`: swift-corelibs-foundation's
+#   `HTTPCookie.properties` reports `Secure` as a Bool, while `HTTPCookie(properties:)` only reads
+#   it as a String, so a cookie reloaded from the saved session loses `Secure` there and its
+#   fingerprint changes. Apple's Foundation keeps the string, which is what the product runs on.
 set -euo pipefail
 cd "$(dirname "$0")/.."
 # The Linux manifest resolves swift-crypto instead of Sparkle, which rewrites Package.resolved;
 # the committed file belongs to the macOS build, so it is put back afterwards.
 trap 'git checkout -q -- Package.resolved' EXIT
-skip='MetadataResponseTests|RemoteDownloaderTests|WeBeepAPIClientTests|ManualSyncEngineIntegrationTests|SyncCoordinatorEndToEndTests|FileHashCancellationTests/cancelledRecoveryStillPreservesEditedLocalCopy'
+skip='MetadataResponseTests|RemoteDownloaderTests|WeBeepAPIClientTests|ManualSyncEngineIntegrationTests|SyncCoordinatorEndToEndTests|FileHashCancellationTests/cancelledRecoveryStillPreservesEditedLocalCopy|RecmanSessionVaultTests/anUnchangedSessionIsNotRewritten'
 if [ "$(id -u)" = 0 ]; then
     skip="$skip|rollsBackThePendingMoveWhenTheDirectoryRenameFails|recoveryLeavesReplacementAtOldPathUnresolved|recoveryDoesNotCommitReplacementAtNewPath"
 fi

@@ -274,18 +274,22 @@ private final class MetadataProtocol: URLProtocol, @unchecked Sendable {
     override func startLoading() {
         let fixture = Self.fixture!
         active = fixture
-        DispatchQueue.global().async { [self] in
-            if let failure = fixture.failure { client?.urlProtocol(self, didFailWithError: URLError(failure)); return }
+        // `URLProtocol` is not `Sendable` on Linux's Foundation, so the class's own `@unchecked
+        // Sendable` does not reach the closure there (same as `StreamingProtocol`). The fixture
+        // serializes everything the closure shares with `stopLoading`.
+        nonisolated(unsafe) let this = self
+        DispatchQueue.global().async {
+            if let failure = fixture.failure { this.client?.urlProtocol(this, didFailWithError: URLError(failure)); return }
             var headers = ["Content-Type": fixture.type]
             if let length = fixture.length { headers["Content-Length"] = length }
-            let response = HTTPURLResponse(url: request.url!, statusCode: fixture.status, httpVersion: "HTTP/1.1", headerFields: headers)!
-            client?.urlProtocol(self, didReceive: response, cacheStoragePolicy: .notAllowed)
+            let response = HTTPURLResponse(url: this.request.url!, statusCode: fixture.status, httpVersion: "HTTP/1.1", headerFields: headers)!
+            this.client?.urlProtocol(this, didReceive: response, cacheStoragePolicy: .notAllowed)
             while let chunk = fixture.next() {
-                client?.urlProtocol(self, didLoad: chunk)
+                this.client?.urlProtocol(this, didLoad: chunk)
                 fixture.waitAtCancellationBoundary()
                 Thread.sleep(forTimeInterval: 0.001)
             }
-            if !fixture.stopped { client?.urlProtocolDidFinishLoading(self) }
+            if !fixture.stopped { this.client?.urlProtocolDidFinishLoading(this) }
         }
     }
     override func stopLoading() { active?.stop() }

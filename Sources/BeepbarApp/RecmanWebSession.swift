@@ -403,7 +403,8 @@ enum RecmanBrowserError: Error, Equatable {
 
     /// The hidden sign-in can't go on alone.
     ///
-    /// With `restartWithoutHint` (a stall or the deadline) the window opens on Webex's login again
+    /// With `restartWithoutHint` (a stall or the deadline) on a Webex page, the window opens on
+    /// Webex's login again
     /// without the email hint: the page it stalled on (live, a blank idbroker page after a hint
     /// that didn't match the asserted identity) gives the user nothing to act on, while the
     /// unhinted login starts at Webex's own email page. A page that asks for credentials is
@@ -425,7 +426,9 @@ enum RecmanBrowserError: Error, Equatable {
         login.stall?.cancel()
         login.deadline?.cancel()
         showWindow()
-        if restartWithoutHint, let webView {
+        // Only from a Webex page: a stall on Polimi's side (a 2FA push waiting for approval on
+        // the phone, say) is the user's to finish where it is, and reloading would throw it away.
+        if restartWithoutHint, let webView, WebexSignIn.isWebexLoginPage(webView.url) {
             webView.stopLoading()
             startWebexLogin(webView, WebexSignIn.withoutEmailHint(login.loginURL))
         }
@@ -973,7 +976,7 @@ enum RecmanBrowserError: Error, Equatable {
             // Webex considers the sign-in done. The ticket normally arrives with this hop; if it
             // doesn't within a moment, the operation ends in the browser rather than waiting for
             // a stall or, with the window up, for the user to close a window that can't help.
-            if login.playbackGrace == nil {
+            if login.playbackGrace == nil, !login.isFinished {
                 let grace = webexPlaybackGrace
                 login.playbackGrace = Task { [weak self] in
                     do { try await Task.sleep(for: grace) } catch { return }

@@ -293,6 +293,17 @@ struct WebexStreamTests {
         #expect(WebexSignIn.encoded("a&b=c#d e+f") == "a%26b%3Dc%23d%20e%2Bf")
     }
 
+    /// Only Webex's own login pages may be restarted without the hint.
+    @Test func onlyWebexLoginPagesCountAsWebex() {
+        for url in ["https://politecnicomilano.webex.com/webappng/sites/politecnicomilano/login", "https://idbroker-eu.webex.com/idb/Consumer/metaAlias/x/sp", "https://IDBROKER.webex.com/idb"] {
+            #expect(WebexSignIn.isWebexLoginPage(URL(string: url)), "\(url)")
+        }
+        for url in ["https://aunicalogin.polimi.it/aunicalogin/push.jsp", "https://shibidp.polimi.it/idp", "https://www.webex.com/", "https://evilidbroker.webex.com/", "http://politecnicomilano.webex.com/x", "about:blank"] {
+            #expect(!WebexSignIn.isWebexLoginPage(URL(string: url)), "\(url)")
+        }
+        #expect(!WebexSignIn.isWebexLoginPage(nil))
+    }
+
     /// Without the hint, the same login and return page remain and only `email` goes.
     @Test func theUnhintedLoginDropsOnlyTheEmail() throws {
         let email = try #require(PolimiEmail("mario.rossi@mail.polimi.it"))

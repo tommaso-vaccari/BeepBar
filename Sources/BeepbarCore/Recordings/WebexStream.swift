@@ -321,6 +321,14 @@ public enum WebexSignIn {
         return components.url ?? loginPage
     }
 
+    /// Whether `url` is a page of Webex's own login (Polimi's Webex site or idbroker), over
+    /// https: where a stalled sign-in may be restarted without the hint. Polimi's pages and any
+    /// other host are not.
+    public static func isWebexLoginPage(_ url: URL?) -> Bool {
+        guard let url, let components = WebexSite.safeComponents(url), let host = components.host?.lowercased() else { return false }
+        return host == WebexSite.host || WebexSignInNavigation.isIDBroker(host)
+    }
+
     private static let unreserved = CharacterSet(charactersIn: "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-._~")
 
     static func encoded(_ value: String) -> String {

@@ -36,14 +36,17 @@ struct WebexSignInWebViewTests {
 
         /// `fixtureFor` picks the page by the login address it is served at, so a restart
         /// without the email hint can show a different page.
-        func open(fixtureFor: @escaping (URL) -> String, stall: Duration = .seconds(20), deadline: Duration = .seconds(60), grace: Duration = .milliseconds(300)) async throws {
+        /// `servedAt`, when set, is where the first page appears to be instead of the login
+        /// address (a Polimi page the chain stalled on, say).
+        func open(fixtureFor: @escaping (URL) -> String, servedAt: URL? = nil, stall: Duration = .seconds(20), deadline: Duration = .seconds(60), grace: Duration = .milliseconds(300)) async throws {
             session.webexStallTimeout = stall
             session.webexHiddenDeadline = deadline
             session.webexPlaybackGrace = grace
             session.presentSignInWindow = { [weak self] _ in self?.windowsShown += 1 }
             session.startWebexLogin = { [weak self] webView, url in
+                let first = self?.started.isEmpty ?? true
                 self?.started.append(url)
-                webView.loadHTMLString(fixtureFor(url), baseURL: url)
+                webView.loadHTMLString(fixtureFor(url), baseURL: first ? (servedAt ?? url) : url)
             }
             await session.open(cookies: [])
             let store = try #require(session.webView?.configuration.websiteDataStore)
@@ -225,6 +228,38 @@ struct WebexSignInWebViewTests {
         try await harness.untilBlank()
     }
 
+    /// A stall on Polimi's side (a 2FA push waiting on the phone) hands over to the user on that
+    /// very page: reloading Webex's login there would throw the user's progress away.
+    @Test(.timeLimit(.minutes(1))) func aStallOnAPolimiPageKeepsThatPage() async throws {
+        let harness = Harness()
+        defer { harness.session.close() }
+        let polimi = URL(string: "https://aunicalogin.polimi.it/aunicalogin/push.jsp")!
+        try await harness.open(fixtureFor: { _ in "<p>Approva la notifica</p>" }, servedAt: polimi, stall: .milliseconds(200))
+        let task = harness.start()
+        try await harness.until { harness.windowsShown == 1 }
+        try await Task.sleep(for: .milliseconds(300))
+        #expect(harness.started.count == 1)
+        #expect(harness.session.webView?.url == polimi)
+        await harness.store.setCookie(Self.ticket())
+        #expect(await outcome(task) == "signed in")
+    }
+
+    /// A newer operation started while a sign-in runs keeps its page: the ended sign-in must not
+    /// blank the page under it (its script would come back unrecognized, or its load wait time
+    /// out).
+    @Test(.timeLimit(.minutes(1))) func aNewerOperationKeepsItsPageWhenTheSignInEnds() async throws {
+        let harness = Harness()
+        defer { harness.session.close() }
+        try await harness.open(fixture: "<p>idbroker</p>")
+        let task = harness.start()
+        try await harness.until { harness.started.count == 1 && harness.session.webView?.isLoading == false }
+        try await Task.sleep(for: .milliseconds(100))
+        let href = try await harness.session.runScript("await new Promise(r => setTimeout(r, 300)); return location.href", arguments: [:])
+        #expect(href == Self.loginURL.absoluteString)
+        #expect(await outcome(task) == "cancelled")
+        #expect(harness.session.webView?.url?.absoluteString != "about:blank")
+    }
+
     /// A page that fails to load ends a hidden sign-in as "not responding"; with the window up
     /// it is the user's to retry, and the sign-in goes on.
     @Test(.timeLimit(.minutes(1))) func aFailedLoadEndsAHiddenSignInButNotTheUsers() async throws {
@@ -284,6 +319,13 @@ struct WebexSignInWebViewTests {
             await session.open(cookies: [])
             defer { session.close() }
             let task = Task { try await session.stream(player: URL(string: Self.page)!, email: nil) }
+            // If the wiring broke, the Play would wait out the transport: cancel it after 10 s
+            // so the timing check below fails fast instead of the suite hanging.
+            let watchdog = Task {
+                try await Task.sleep(for: .seconds(10))
+                task.cancel()
+            }
+            defer { watchdog.cancel() }
             try await Task.sleep(for: .milliseconds(200))
             let clock = ContinuousClock()
             let started = clock.now

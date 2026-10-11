@@ -32,6 +32,8 @@
 		A100000000000000000000B8 /* RecordingsPage.swift in Sources */ = {isa = PBXBuildFile; fileRef = A100000000000000000000B9 /* RecordingsPage.swift */; };
 		A100000000000000000000B6 /* RecordingsController.swift in Sources */ = {isa = PBXBuildFile; fileRef = A100000000000000000000B7 /* RecordingsController.swift */; };
 		A100000000000000000000B4 /* RecordingsSessionStore.swift in Sources */ = {isa = PBXBuildFile; fileRef = A100000000000000000000B5 /* RecordingsSessionStore.swift */; };
+		A100000000000000000000C0 /* UIContentReadiness.swift in Sources */ = {isa = PBXBuildFile; fileRef = A100000000000000000000C1 /* UIContentReadiness.swift */; };
+		A100000000000000000000C2 /* UIPerformanceHarness.swift in Sources */ = {isa = PBXBuildFile; fileRef = A100000000000000000000C3 /* UIPerformanceHarness.swift */; };
 		B12300000000000000000001 /* RecordingsStudyState.swift in Sources */ = {isa = PBXBuildFile; fileRef = B12300000000000000000002 /* RecordingsStudyState.swift */; };
 		B14800000000000000000001 /* RecordingPlayerController.swift in Sources */ = {isa = PBXBuildFile; fileRef = B14800000000000000000002 /* RecordingPlayerController.swift */; };
 		B14800000000000000000003 /* RecordingPlayerControls.swift in Sources */ = {isa = PBXBuildFile; fileRef = B14800000000000000000004 /* RecordingPlayerControls.swift */; };
@@ -64,6 +66,8 @@
 		A100000000000000000000B9 /* RecordingsPage.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = RecordingsPage.swift; sourceTree = "<group>"; };
 		A100000000000000000000B7 /* RecordingsController.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = RecordingsController.swift; sourceTree = "<group>"; };
 		A100000000000000000000B5 /* RecordingsSessionStore.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = RecordingsSessionStore.swift; sourceTree = "<group>"; };
+		A100000000000000000000C1 /* UIContentReadiness.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = UIContentReadiness.swift; sourceTree = "<group>"; };
+		A100000000000000000000C3 /* UIPerformanceHarness.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = UIPerformanceHarness.swift; sourceTree = "<group>"; };
 		B12300000000000000000002 /* RecordingsStudyState.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = RecordingsStudyState.swift; sourceTree = "<group>"; };
 		B14800000000000000000002 /* RecordingPlayerController.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = RecordingPlayerController.swift; sourceTree = "<group>"; };
 		B14800000000000000000004 /* RecordingPlayerControls.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = RecordingPlayerControls.swift; sourceTree = "<group>"; };
@@ -108,6 +112,8 @@
 			isa = PBXGroup;
 			children = (
 				A10000000000000000000011 /* BeepbarApp.swift */,
+				A100000000000000000000C3 /* UIPerformanceHarness.swift */,
+				A100000000000000000000C1 /* UIContentReadiness.swift */,
 				A10000000000000000000012 /* WeBeepAuthenticationController.swift */,
 				A10000000000000000000014 /* BeepbarShellView.swift */,
 				A10000000000000000000017 /* UpdaterController.swift */,
@@ -222,6 +228,8 @@
 			buildActionMask = 2147483647;
 			files = (
 				A10000000000000000000001 /* BeepbarApp.swift in Sources */,
+				A100000000000000000000C2 /* UIPerformanceHarness.swift in Sources */,
+				A100000000000000000000C0 /* UIContentReadiness.swift in Sources */,
 				A10000000000000000000002 /* WeBeepAuthenticationController.swift in Sources */,
 				A10000000000000000000006 /* BeepbarShellView.swift in Sources */,
 				A10000000000000000000009 /* UpdaterController.swift in Sources */,

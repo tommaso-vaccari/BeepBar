@@ -66,6 +66,7 @@ struct ActivityPage: View {
             VStack(alignment: .leading, spacing: 16) {
                 if let summary = authentication.lastSyncSummary {
                     SectionHeader(title: tr("Ultima sincronizzazione", "Last sync"), subtitle: summary.completedAt.shortText)
+                        .uiContentReady(.activity)
                     HStack(spacing: 8) {
                         MetricTile(value: summary.added, label: tr("Nuovi", "New"), systemImage: "plus.circle.fill", tint: .green)
                         MetricTile(value: summary.updated, label: tr("Aggiornati", "Updated"), systemImage: "arrow.triangle.2.circlepath.circle.fill", tint: .blue)
@@ -117,6 +118,9 @@ private struct CourseActivityCard: View {
     /// (remote id, name, show in Finder instead of opening).
     let openItem: (String, String, Bool) -> Void
     @State private var isExpanded = false
+#if DEBUG
+    @Environment(\.uiFixtureExpandedActivity) private var fixtureExpanded
+#endif
     /// How many rows of the expanded course exist as views; grows with "Mostra altri", goes back
     /// to one page on collapse and on a new summary (`ActivityRowLayout.visibleCount`), and is
     /// clamped to the course by `ActivityRowLayout.page`.
@@ -152,6 +156,11 @@ private struct CourseActivityCard: View {
             .buttonStyle(.plain)
             .accessibilityHint(isExpanded ? tr("Comprimi", "Collapse") : tr("Espandi", "Expand"))
 
+#if DEBUG
+            Color.clear.frame(height: 0).onAppear {
+                if fixtureExpanded { isExpanded = true }
+            }
+#endif
             if isExpanded {
                 Divider().padding(.leading, 56)
                 // Only the first `visibleRows` rows exist as views (#99): the outer LazyVStack makes
@@ -162,6 +171,7 @@ private struct CourseActivityCard: View {
                 VStack(alignment: .leading, spacing: 7) {
                     ForEach(page.rows) { row in
                         activityRow(row)
+                            .uiContentReady(.expandedActivity, enabled: row.id == page.rows.first?.id)
                     }
                     if let title = ActivityRowLayout.showMoreTitle(for: page) {
                         HStack(spacing: 8) {

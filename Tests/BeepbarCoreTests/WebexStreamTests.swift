@@ -183,12 +183,15 @@ struct WebexStreamTests {
         #expect(answer == .stream(hls: URL(string: "https://nfg1wss.webex.com/nbr/MultiThumbnail/hls.m3u8?trackingID=t-1")!, title: "Lezione sintetica", duration: 8160))
     }
 
-    /// 403 is signed out, 200 without an hlsURL too (a lapsed session).
-    @Test func a403OrA200WithoutTheStreamIsSignedOut() throws {
+    /// Only a 403 is signed out. A 200 without an hlsURL is a recording without HLS: signing in
+    /// can't fix it (live, a `ticket` alone always got the 200), so it goes to the browser
+    /// instead of costing a hidden sign-in on every Play.
+    @Test func onlyA403IsSignedOutAndA200WithoutTheStreamIsUnavailable() throws {
         #expect(WebexStreamAPI.decode(status: 403, data: try json(signedOut)) == .signedOut)
-        #expect(WebexStreamAPI.decode(status: 200, data: try json(signedIn(hls: nil))) == .signedOut)
-        #expect(WebexStreamAPI.decode(status: 200, data: try json(signedIn(hls: ""))) == .signedOut)
-        #expect(WebexStreamAPI.decode(status: 200, data: try json(["something": "else"])) == .signedOut)
+        #expect(WebexStreamAPI.decode(status: 200, data: try json(signedIn(hls: nil))) == .unavailable(.noStream))
+        #expect(WebexStreamAPI.decode(status: 200, data: try json(signedIn(hls: ""))) == .unavailable(.noStream))
+        #expect(WebexStreamAPI.decode(status: 200, data: try json(signedIn(hls: 42))) == .unavailable(.noStream))
+        #expect(WebexStreamAPI.decode(status: 200, data: try json(["something": "else"])) == .unavailable(.noStream))
     }
 
     /// `requireLogin` reads 1 on success and 0 on the 403: whatever it says, the status and the
@@ -230,7 +233,6 @@ struct WebexStreamTests {
     @Test func aStreamOffWebexIsUnavailable() throws {
         #expect(WebexStreamAPI.decode(status: 200, data: try json(signedIn(hls: "https://evil.example/hls.m3u8"))) == .unavailable(.disallowedStream))
         #expect(WebexStreamAPI.decode(status: 200, data: try json(signedIn(hls: "http://nfg1wss.webex.com/hls.m3u8"))) == .unavailable(.disallowedStream))
-        #expect(WebexStreamAPI.decode(status: 200, data: try json(signedIn(hls: 42))) == .signedOut)
     }
 
     /// Title and length are hints: absent, blank, boolean or nonsense values become nil.

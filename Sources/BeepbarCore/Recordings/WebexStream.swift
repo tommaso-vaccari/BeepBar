@@ -9,7 +9,8 @@ import FoundationNetworking
 // 1. `WebexPlayerLink`: the `ldr.php` player link answers a cookie-less, no-follow GET with a
 //    302 whose Location is the playback page; its path carries the recording's 32-hex uuid.
 // 2. `WebexStreamAPI`: the web player's own JSON API, called with the Webex cookies a browser
-//    would send. 200 with `hlsURL` is the stream; 403, or 200 without `hlsURL`, is "signed out".
+//    would send. 200 with `hlsURL` is the stream; 403 is "signed out"; 200 without `hlsURL`
+//    is a recording without HLS, for the browser.
 // 3. `WebexStreamPolicy`: the only stream addresses BeepBar hands to the player.
 // 4. `WebexSignIn` and `WebexSignInNavigation`: the Webex sign-in in the hidden Recman web view,
 //    hinted with the user's Polimi email so idbroker skips its email page.
@@ -174,6 +175,8 @@ public enum WebexStreamUnavailable: Sendable, Equatable {
     case malformed
     /// More than `WebexStreamAPI.responseLimit` bytes.
     case tooLarge
+    /// A 200 without an `hlsURL`: no HLS stream for this recording.
+    case noStream
     /// An `hlsURL` that `WebexStreamPolicy` refuses.
     case disallowedStream
 }
@@ -222,7 +225,9 @@ public enum WebexStreamAPI {
     ///   answer may describe the recording differently; the retry after signing in decides.
     /// - 200 with a JSON object: playback prevented or a password needed → unavailable;
     ///   otherwise an `hlsURL` the policy accepts → stream, one it refuses → unavailable, none →
-    ///   signed out (Webex has been seen to answer 200 without the stream to a lapsed session).
+    ///   unavailable (`noStream`). Live, signed out was only ever a 403 and a `ticket` alone got a
+    ///   200, so a 200 without the stream is this recording having no HLS (or a changed answer):
+    ///   signing in can't fix it, and doing so would cost a hidden sign-in on every Play.
     /// - Anything else, or more than `responseLimit` bytes → unavailable.
     public static func decode(status: Int, data: Data) -> WebexStreamAnswer {
         guard data.count <= responseLimit else { return .unavailable(.tooLarge) }
@@ -232,7 +237,7 @@ public enum WebexStreamAPI {
         if flag(json["preventPlayback"]) == true || flag(json["canPlayback"]) == false { return .unavailable(.playbackPrevented) }
         if flag(json["needPassword"]) == true || flag(json["passwordProtected"]) == true { return .unavailable(.passwordRequired) }
         let info = (json["downloadRecordingInfo"] as? [String: Any])?["downloadInfo"] as? [String: Any]
-        guard let raw = info?["hlsURL"] as? String, !raw.isEmpty else { return .signedOut }
+        guard let raw = info?["hlsURL"] as? String, !raw.isEmpty else { return .unavailable(.noStream) }
         guard let hls = URL(string: raw), WebexStreamPolicy.isAllowedStream(hls) else { return .unavailable(.disallowedStream) }
         let title = (json["recordName"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines)
         return .stream(hls: hls, title: title?.isEmpty == false ? title : nil, duration: duration(json["duration"]))

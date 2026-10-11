@@ -157,13 +157,16 @@ struct WebexStreamResolverTests {
         #expect(requestedURLs == [Self.player.absoluteString, Self.api, Self.api])
     }
 
-    /// A 200 without the stream is a lapsed session too.
-    @Test func a200WithoutTheStreamSignsIn() async throws {
+    /// A 200 without the stream is a recording without HLS, not a lapsed session: the browser
+    /// takes over at once, the ticket stays and no sign-in runs.
+    @Test func a200WithoutTheStreamEndsInTheBrowserWithoutSigningIn() async throws {
         let empty = try JSONSerialization.data(withJSONObject: ["requireLogin": 1, "downloadRecordingInfo": ["downloadInfo": [String: Any]()]])
         liveWebex(api: .answer(status: 200, body: empty))
-        let browser = FakeBrowser(cookies: [])
+        let browser = FakeBrowser(cookies: [Self.cookie("ticket", value: "fresh", domain: ".webex.com")])
         #expect(await outcome { try await resolver().stream(player: Self.player, email: email, driver: browser.driver) } == "playbackUnavailable")
-        #expect(browser.signIns.count == 1)
+        #expect(browser.events.isEmpty)
+        #expect(browser.cookies.contains(where: WebexSignIn.isTicket))
+        #expect(requestedURLs == [Self.player.absoluteString, Self.api])
     }
 
     /// No email to hint: nothing is attempted; the page asks the user for it.

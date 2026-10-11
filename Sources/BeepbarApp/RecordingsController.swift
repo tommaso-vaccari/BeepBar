@@ -116,7 +116,7 @@ struct RecordingsListing: Equatable {
     static let historyNamespaceKey = "io.github.tvaccari.beepbar.recordings-history-namespace.v2"
     /// Where the student stopped in each lecture (`RecordingResumePoints`), for one account.
     /// Removed with the session: turn-off, disconnect and account change.
-    static let resumePointsKey = "io.github.tvaccari.beepbar.recordings-resume.v1"
+    nonisolated static let resumePointsKey = "io.github.tvaccari.beepbar.recordings-resume.v1"
     /// A course shown again within this time isn't asked for again unless the user refreshes.
     static let freshness: TimeInterval = 300
 

@@ -1,12 +1,17 @@
 import Foundation
+#if canImport(os)
+import os
+#endif
 import Testing
 @testable import BeepbarCore
 
 /// The saved course list (#98): what the window may show before the network answers. Each test
 /// guards one acceptance rule of the issue: a foreign, old, oversized or corrupt file is never
-/// shown, the file never carries the token, and an unchanged list costs no write.
+/// shown, the file never carries the token, an unchanged list costs no write, and a save that
+/// arrives after a sign-out never writes the old account's list back.
 struct CourseListSnapshotTests {
-    private let identity = CourseListSnapshot.Identity(siteID: "polimi", userID: 42)
+    private static let rootID = UUID(uuidString: "6F9619FF-8B86-D011-B42D-00C04FC964FF")!
+    private let identity = CourseListSnapshot.Identity(siteID: "polimi", rootID: Self.rootID, token: "token-a")
     private let now = Date(timeIntervalSince1970: 1_800_000_000)
 
     private func courses(_ count: Int) -> [RemoteCourseSummary] {
@@ -24,15 +29,38 @@ struct CourseListSnapshotTests {
         #expect(decoded.version == CourseListSnapshotCodec.currentVersion)
     }
 
-    /// Account A's list must never be shown to account B, nor one site's list on another site.
+    /// Account A's list must never be shown after another sign-in (account B, or A signing in
+    /// again with a new token), on another site, or for another sync folder: each part of the
+    /// identity on its own refuses the file.
     @Test func foreignIdentityIsRejected() throws {
         let data = try CourseListSnapshotCodec.encode(CourseListSnapshot(identity: identity, savedAt: now, courses: courses(1)))
-        #expect(throws: CourseListSnapshotCodec.DecodeError.wrongIdentity) {
-            try CourseListSnapshotCodec.decode(data, expecting: CourseListSnapshot.Identity(siteID: "polimi", userID: 43), now: now)
+        let others = [
+            CourseListSnapshot.Identity(siteID: "polimi", rootID: Self.rootID, token: "token-b"),
+            CourseListSnapshot.Identity(siteID: "unipd-math", rootID: Self.rootID, token: "token-a"),
+            CourseListSnapshot.Identity(siteID: "polimi", rootID: UUID(), token: "token-a"),
+        ]
+        for other in others {
+            #expect(throws: CourseListSnapshotCodec.DecodeError.wrongIdentity) {
+                try CourseListSnapshotCodec.decode(data, expecting: other, now: now)
+            }
         }
-        #expect(throws: CourseListSnapshotCodec.DecodeError.wrongIdentity) {
-            try CourseListSnapshotCodec.decode(data, expecting: CourseListSnapshot.Identity(siteID: "unipd", userID: 42), now: now)
+        #expect(throws: Never.self) {
+            try CourseListSnapshotCodec.decode(data, expecting: CourseListSnapshot.Identity(siteID: "polimi", rootID: Self.rootID, token: "token-a"), now: now)
         }
+    }
+
+    /// The fingerprint names a sign-in without carrying it: stable for one token and site,
+    /// different for another token or another site, and never the token or a prefix of it.
+    @Test func credentialFingerprintIsStableOneWayAndSiteBound() {
+        let token = "0123456789abcdef0123456789abcdef"
+        let fingerprint = CourseListSnapshot.credentialFingerprint(token: token, siteID: "polimi")
+        #expect(fingerprint == CourseListSnapshot.credentialFingerprint(token: token, siteID: "polimi"))
+        #expect(fingerprint != CourseListSnapshot.credentialFingerprint(token: token + "0", siteID: "polimi"))
+        #expect(fingerprint != CourseListSnapshot.credentialFingerprint(token: token, siteID: "unipd-math"))
+        #expect(fingerprint.count == 64)
+        #expect(fingerprint.allSatisfy { $0.isHexDigit && !$0.isUppercase })
+        #expect(!fingerprint.contains(token))
+        #expect(!fingerprint.contains(token.prefix(8)))
     }
 
     /// The age limit is explicit: a list confirmed within the limit is shown, one past it is not,
@@ -87,18 +115,32 @@ struct CourseListSnapshotTests {
         }
     }
 
-    /// The file holds names, ids and dates only: no token, no folder, no selection. Pinned by the
-    /// exact key set so a field added by mistake fails here before it ships.
+    /// The file holds names, ids and dates only: no token, no folder, no selection, no Moodle
+    /// user id. Pinned by the exact key set so a field added by mistake fails here before it ships.
     @Test func fileCarriesOnlyTheCourseListFields() throws {
+        let token = "0123456789abcdef0123456789abcdef"
+        let identity = CourseListSnapshot.Identity(siteID: "polimi", rootID: Self.rootID, token: token)
         let data = try CourseListSnapshotCodec.encode(CourseListSnapshot(identity: identity, savedAt: now, courses: courses(2)))
         let object = try JSONSerialization.jsonObject(with: data) as! [String: Any]
         #expect(Set(object.keys) == ["version", "identity", "savedAt", "courses"])
-        #expect(Set((object["identity"] as! [String: Any]).keys) == ["siteID", "userID"])
+        #expect(Set((object["identity"] as! [String: Any]).keys) == ["siteID", "rootID", "credential"])
         let course = (object["courses"] as! [[String: Any]])[0]
         #expect(Set(course.keys).isSubset(of: ["id", "shortName", "displayName", "isVisible", "startDate", "endDate"]))
         let text = String(decoding: data, as: UTF8.self).lowercased()
+        #expect(!text.contains(token))
         #expect(!text.contains("token"))
         #expect(!text.contains("folder"))
+        #expect(!text.contains("user"))
+    }
+
+    /// Moodle may list the same enrollments in another order: that is the same list, kept in one
+    /// canonical order on disk, and it costs no rewrite.
+    @Test func responseOrderIsNotAChange() {
+        let list = courses(3)
+        let previous = CourseListSnapshot(identity: identity, savedAt: now, courses: list.reversed())
+        #expect(previous.summaries == list)
+        #expect(!CourseListSnapshotCodec.shouldSave(Array(list.reversed()), identity: identity, after: previous, now: now.addingTimeInterval(60)))
+        #expect(!CourseListSnapshotCodec.shouldSave(list, identity: identity, after: previous, now: now.addingTimeInterval(60)))
     }
 
     /// An unchanged list is not rewritten on every refresh, but `savedAt` is refreshed once a day
@@ -113,7 +155,7 @@ struct CourseListSnapshotTests {
         let renamed = [RemoteCourseSummary(id: 1, shortName: "C1", displayName: "Renamed", isVisible: nil, startDate: nil, endDate: nil)] + Array(list.dropFirst())
         #expect(CourseListSnapshotCodec.shouldSave(renamed, identity: identity, after: previous, now: now))
         #expect(CourseListSnapshotCodec.shouldSave(Array(list.dropLast()), identity: identity, after: previous, now: now))
-        #expect(CourseListSnapshotCodec.shouldSave(list, identity: CourseListSnapshot.Identity(siteID: "polimi", userID: 7), after: previous, now: now))
+        #expect(CourseListSnapshotCodec.shouldSave(list, identity: CourseListSnapshot.Identity(siteID: "polimi", rootID: Self.rootID, token: "token-b"), after: previous, now: now))
     }
 
     // MARK: Store
@@ -163,7 +205,7 @@ struct CourseListSnapshotTests {
         let (store, folder, cleanup) = try makeStore()
         defer { cleanup() }
         try await store.save(courses(2), identity: identity, now: now)
-        let other = CourseListSnapshot.Identity(siteID: "polimi", userID: 99)
+        let other = CourseListSnapshot.Identity(siteID: "polimi", rootID: Self.rootID, token: "token-b")
         #expect(await store.load(expecting: other, now: now) == .discarded(.wrongIdentity))
         #expect(!FileManager.default.fileExists(atPath: folder.appendingPathComponent(CourseListSnapshotStore.fileName).path))
         #expect(await store.load(expecting: identity, now: now) == .missing)
@@ -242,5 +284,49 @@ struct CourseListSnapshotTests {
         #expect(await store.load(expecting: identity, now: now) == .missing)
         // After a delete the next save writes again even for the same list: nothing is on disk.
         #expect(try await store.save(courses(2), identity: identity, now: now))
+    }
+
+    /// Sign-out while a save is in flight, whichever reaches the store first: a save made before
+    /// the sign-out is refused once the deletion retired its epoch, so the signed-out account's
+    /// list is not written back. A save made after it (the next account's) still writes.
+    @Test func retiredEpochSavesAreRefused() async throws {
+        let (store, folder, cleanup) = try makeStore()
+        defer { cleanup() }
+        let file = folder.appendingPathComponent(CourseListSnapshotStore.fileName)
+        try await store.delete(retiringEpochsBelow: 1)
+        #expect(try await store.save(courses(2), identity: identity, epoch: 0, now: now) == false)
+        #expect(!FileManager.default.fileExists(atPath: file.path))
+        #expect(try await store.save(courses(2), identity: identity, epoch: 1, now: now))
+        #expect(FileManager.default.fileExists(atPath: file.path))
+        // A later delete with a smaller epoch never revives retired epochs.
+        try await store.delete(retiringEpochsBelow: 0)
+        #expect(try await store.save(courses(2), identity: identity, epoch: 0, now: now) == false)
+    }
+
+    /// The other order: the late save arrived first and wrote; the sign-out's deletion then
+    /// removes it, so nothing of the old account is left on disk either way.
+    @Test func deletionAfterAnEarlierSaveRemovesIt() async throws {
+        let (store, folder, cleanup) = try makeStore()
+        defer { cleanup() }
+        #expect(try await store.save(courses(2), identity: identity, epoch: 0, now: now))
+        try await store.delete(retiringEpochsBelow: 1)
+        #expect(!FileManager.default.fileExists(atPath: folder.appendingPathComponent(CourseListSnapshotStore.fileName).path))
+        #expect(await store.load(expecting: identity, now: now) == .missing)
+    }
+
+    /// A deletion that fails (the folder cannot be read) still retires the epoch: the old
+    /// account's list is not written by a save that arrives afterwards.
+    @Test func failedDeletionStillRetiresTheEpoch() async throws {
+        let folder = FileManager.default.temporaryDirectory.appendingPathComponent("CourseListSnapshotTests-\(UUID().uuidString)", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: folder) }
+        let failing = OSAllocatedUnfairLock(initialState: true)
+        let store = CourseListSnapshotStore(directory: {
+            if failing.withLock({ $0 }) { throw CocoaError(.fileReadNoPermission) }
+            return folder
+        })
+        await #expect(throws: CocoaError.self) { try await store.delete(retiringEpochsBelow: 1) }
+        failing.withLock { $0 = false }
+        #expect(try await store.save(courses(2), identity: identity, epoch: 0, now: now) == false)
+        #expect(!FileManager.default.fileExists(atPath: folder.appendingPathComponent(CourseListSnapshotStore.fileName).path))
     }
 }

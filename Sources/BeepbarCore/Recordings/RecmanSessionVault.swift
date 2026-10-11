@@ -10,7 +10,7 @@ import os
 ///
 /// The file holds sign-on cookies, so two things must hold whatever the UI does:
 /// - **Nothing of it runs on the main actor.** Every operation (read, decode, encode, write,
-///   delete) is handed to a detached task; the controller only awaits the returned `Task`. A slow
+///   delete) runs on a private serial queue; the controller only awaits the returned `Task`. A slow
 ///   disk makes a spinner last longer, never the menu or the window freeze.
 /// - **A late write never brings a deleted session back.** `discard()` bumps an *epoch*
 ///   synchronously and enqueues the delete. A save carries the epoch its cycle started in and the
@@ -89,6 +89,11 @@ public final class RecmanSessionVault: Sendable {
 
     private let storage: Storage
     private let state = OSAllocatedUnfairLock(initialState: State())
+    /// Where the blocking file work runs. Not the cooperative pool: Swift's pool has one thread per
+    /// core and assumes none of them blocks, so a slow disk parked there takes a thread the rest of
+    /// the process (or, in tests, the code that would unblock it) needs. Held test disks once
+    /// deadlocked the 3-core CI runner this way. The chain below still decides the order.
+    private let queue = DispatchQueue(label: "io.github.tvaccari.beepbar.recman-session")
 
     public init(storage: Storage) {
         self.storage = storage
@@ -166,12 +171,15 @@ public final class RecmanSessionVault: Sendable {
     }
 
     /// FIFO by construction: the new task first awaits the previous tail, then runs `operation`
-    /// on a detached task (never the caller's actor), and becomes the tail itself.
+    /// on `queue` (never the caller's actor, never a cooperative thread) while it stays suspended,
+    /// and becomes the tail itself.
     private func enqueue<T: Sendable>(into state: inout State, _ operation: @escaping @Sendable () -> T) -> Task<T, Never> {
         let previous = state.tail
-        let task = Task<T, Never>.detached {
+        let task = Task<T, Never>.detached { [queue] in
             if let previous { await previous.value }
-            return operation()
+            return await withCheckedContinuation { continuation in
+                queue.async { continuation.resume(returning: operation()) }
+            }
         }
         state.tail = Task.detached { _ = await task.value }
         return task

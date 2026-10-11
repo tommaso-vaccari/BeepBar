@@ -45,15 +45,24 @@ private final class MemoryDisk: Sendable {
     }
 
     /// Records the thread, fails when told to, and parks in a held operation until `release()`.
-    /// Parking blocks one pool thread for a few milliseconds: acceptable in a test, and it is what
-    /// a slow disk does to the vault.
+    /// Parking blocks the vault's file thread, as a slow disk does. It must never be a cooperative
+    /// pool thread: the test's own wake-up needs one, and three held tests at once deadlocked the
+    /// 3-core CI runner before the vault moved its file work to a queue. The deadline turns any
+    /// such regression, or a missing `release()`, into a failure instead of a run that never ends.
     private func enter(_ operation: Operation) throws {
         let fails = state.withLock { state -> Bool in
             if Thread.isMainThread { state.mainThreadCalls += 1 }
             if state.hold == operation { state.held = true }
             return (operation == .load && state.loadFails) || (operation == .delete && state.deleteFails)
         }
-        while state.withLock({ $0.held }) { usleep(500) }
+        let deadline = Date().addingTimeInterval(10)
+        while state.withLock({ $0.held }) {
+            guard Date() < deadline else {
+                Issue.record("a held disk operation was never released")
+                break
+            }
+            usleep(500)
+        }
         if fails { throw CocoaError(.fileReadUnknown) }
     }
 

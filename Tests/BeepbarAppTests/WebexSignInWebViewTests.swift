@@ -24,8 +24,20 @@ struct WebexSignInWebViewTests {
     nonisolated static let page = "https://politecnicomilano.webex.com/recordingservice/sites/politecnicomilano/recording/playback/\(uuid)"
     nonisolated static let loginURL = URL(string: "https://politecnicomilano.webex.com/webappng/sites/politecnicomilano/login?siteurl=politecnicomilano&email=x%40mail.polimi.it")!
 
+    /// The session's trace and Play-diagnostics lines, collected from whatever context
+    /// `traceHandler` is called in.
+    final class Lines: @unchecked Sendable {
+        private let lock = NSLock()
+        private var stored: [String] = []
+        func append(_ line: String) { lock.withLock { stored.append(line) } }
+        var all: [String] { lock.withLock { stored } }
+        /// The Play diagnostics only (`RecmanWebSession.diagnose`), not the debug trace.
+        var diagnostics: [String] { all.filter { $0.hasPrefix("stream: ") } }
+    }
+
     @MainActor final class Harness {
         let session = RecmanWebSession()
+        let lines = Lines()
         var windowsShown = 0
         /// Every address the sign-in started (or restarted) its login at.
         var started: [URL] = []
@@ -42,6 +54,8 @@ struct WebexSignInWebViewTests {
             session.webexStallTimeout = stall
             session.webexHiddenDeadline = deadline
             session.webexPlaybackGrace = grace
+            let lines = lines
+            session.traceHandler = { lines.append($0) }
             session.presentSignInWindow = { [weak self] _ in self?.windowsShown += 1 }
             session.startWebexLogin = { [weak self] webView, url in
                 let first = self?.started.isEmpty ?? true
@@ -108,6 +122,10 @@ struct WebexSignInWebViewTests {
         #expect(harness.session.webView?.url?.path.contains("/recording/") != true)
         // No Webex page keeps running once signed in.
         try await harness.untilBlank()
+        // The diagnostics say the ticket came with the hop back to the playback page.
+        let ended = try #require(harness.lines.diagnostics.last)
+        #expect(ended.hasPrefix("stream: step=sign-in ended result=ticket at-playback-page window=hidden"), "\(ended)")
+        #expect(ended.contains("politecnicomilano.webex.com(playback)"), "\(ended)")
     }
 
     /// A ticket set in the middle of the chain is seen through the cookie store's own change
@@ -173,6 +191,14 @@ struct WebexSignInWebViewTests {
         #expect(await outcome(harness.start()) == "playbackUnavailable")
         #expect(harness.windowsShown == 0)
         #expect(harness.session.cancelledPlaybackPages == 1)
+        // Package F diagnostics: this way to the browser is named as such, so a user's log tells
+        // it apart from a refused host or a failed load. Mutation: pass "" as the `reason:` of
+        // both `finish` calls that end at the playback page (the grace timer's and
+        // `webexLoginNeedsUser`'s; either may fire first here) and the first expectation fails.
+        let ended = try #require(harness.lines.diagnostics.last)
+        #expect(ended.contains("result=back-at-playback-without-ticket"), "\(ended)")
+        #expect(ended.contains("error=playbackUnavailable"), "\(ended)")
+        #expect(!ended.contains(Self.uuid) && !ended.contains("recording/"), "no address in the log: \(ended)")
     }
 
     /// Hidden, a host off the measured chain is refused and ends the sign-in (browser fallback).
@@ -184,6 +210,14 @@ struct WebexSignInWebViewTests {
         #expect(harness.windowsShown == 0)
         // A failed sign-in leaves no Webex page running either.
         try await harness.untilBlank()
+        // Package F diagnostics: the refused hop is named by kind of host, never by address,
+        // and nothing of the login URL (which carries the email hint) reaches any line.
+        let ended = try #require(harness.lines.diagnostics.last)
+        #expect(ended.contains("result=refused-host host=other-host"), "\(ended)")
+        #expect(ended.contains("other-host(refused)"), "\(ended)")
+        for line in harness.lines.diagnostics {
+            #expect(!line.contains("evil.example") && !line.contains("collect") && !line.contains("%40") && !line.contains("@"), "\(line)")
+        }
     }
 
     /// `close()` and a cancelled Play both end a sign-in in flight at once.

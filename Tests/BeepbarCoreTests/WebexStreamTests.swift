@@ -205,15 +205,30 @@ struct WebexStreamTests {
         }
     }
 
-    /// Prevented playback or a password: signing in can't fix it, so the browser takes over.
+    /// Prevented playback or a password the viewer still has to type: signing in can't fix it,
+    /// so the browser takes over.
     @Test func preventedOrPasswordProtectedRecordingsAreUnavailable() throws {
         #expect(WebexStreamAPI.decode(status: 200, data: try json(signedIn(extra: ["preventPlayback": true]))) == .unavailable(.playbackPrevented))
         #expect(WebexStreamAPI.decode(status: 200, data: try json(signedIn(extra: ["preventPlayback": 1]))) == .unavailable(.playbackPrevented))
         #expect(WebexStreamAPI.decode(status: 200, data: try json(signedIn(extra: ["canPlayback": false]))) == .unavailable(.playbackPrevented))
         #expect(WebexStreamAPI.decode(status: 200, data: try json(signedIn(extra: ["needPassword": true]))) == .unavailable(.passwordRequired))
-        #expect(WebexStreamAPI.decode(status: 200, data: try json(signedIn(extra: ["passwordProtected": "true"]))) == .unavailable(.passwordRequired))
+        #expect(WebexStreamAPI.decode(status: 200, data: try json(signedIn(extra: ["needPassword": "true", "passwordProtected": 1]))) == .unavailable(.passwordRequired))
+        // A protected recording without a stream says why, for the Play diagnostics.
+        #expect(WebexStreamAPI.decode(status: 200, data: try json(signedIn(hls: nil, extra: ["passwordProtected": 1]))) == .unavailable(.passwordRequired))
         // Unknown flag values decide nothing.
         #expect(WebexStreamAPI.decode(status: 200, data: try json(signedIn(extra: ["preventPlayback": "maybe", "canPlayback": 7]))).isStream)
+    }
+
+    /// The package F fix (#148): a recording that is `passwordProtected` but that this signed-in
+    /// viewer may watch (`needPassword` 0, `hlsURL` handed out) streams natively. Refusing it sent
+    /// such Plays to the browser, where Webex played them without asking for anything; the flag
+    /// describes the recording, like `requireLogin`, not what the viewer still has to do.
+    /// Mutation: put `|| flag(json["passwordProtected"]) == true` back next to `needPassword` in
+    /// `decode` and both expectations fail.
+    @Test func aProtectedRecordingTheViewerMayWatchStreams() throws {
+        let hls = URL(string: "https://nfg1wss.webex.com/nbr/MultiThumbnail/hls.m3u8?trackingID=t-1")!
+        #expect(WebexStreamAPI.decode(status: 200, data: try json(signedIn(extra: ["passwordProtected": true, "needPassword": false]))) == .stream(hls: hls, title: "Lezione sintetica", duration: 8160))
+        #expect(WebexStreamAPI.decode(status: 200, data: try json(signedIn(extra: ["passwordProtected": 1, "needPassword": 0]))).isStream)
     }
 
     /// Any other status, a body that isn't a JSON object, or an oversized body is unavailable.
@@ -380,6 +395,68 @@ struct WebexStreamTests {
         #expect(decide("https://spid.example/", userDriven: true) == .allow)
         #expect(decide("http://spid.example/", userDriven: true) == .refuse)
         #expect(decide("https://u:p@spid.example/", userDriven: true) == .refuse)
+    }
+
+    // MARK: Play diagnostics (package F fix)
+
+    /// The pieces of the Play log say which hop left the chain without writing an id, a ticket
+    /// or the email: Webex and Polimi hosts by name, any other site as "other-host", never a
+    /// path or query. Guards against a diagnostic line leaking the email hint or the uuid, and
+    /// against a refused hop being logged so vaguely that the next run can't tell which it was.
+    /// Mutation: return `components.host` for every https URL and the "other-host" line fails;
+    /// return `url.absoluteString` and the no-leak lines fail.
+    @Test func diagnosticHostsNameWebexAndPolimiHopsOnly() {
+        #expect(WebexSignInNavigation.diagnosticHost(URL(string: "https://signin.webex.com/collabs/auth?email=mario.rossi%40mail.polimi.it")) == "signin.webex.com")
+        #expect(WebexSignInNavigation.diagnosticHost(URL(string: "https://idbroker-eu.webex.com/idb/x")) == "idbroker-eu.webex.com")
+        #expect(WebexSignInNavigation.diagnosticHost(URL(string: "https://aunicalogin.polimi.it/aunicalogin/?ticket=ST-1")) == "aunicalogin.polimi.it")
+        #expect(WebexSignInNavigation.diagnosticHost(URL(string: "https://evilwebex.com/x")) == "other-host")
+        #expect(WebexSignInNavigation.diagnosticHost(URL(string: "https://webex.com.evil.example/x")) == "other-host")
+        #expect(WebexSignInNavigation.diagnosticHost(URL(string: "http://politecnicomilano.webex.com/x")) == "http")
+        #expect(WebexSignInNavigation.diagnosticHost(URL(string: "about:blank")) == "about")
+        #expect(WebexSignInNavigation.diagnosticHost(URL(string: "javascript:alert(1)")) == "other-scheme")
+        #expect(WebexSignInNavigation.diagnosticHost(nil) == "none")
+        for url in ["https://signin.webex.com/collabs/auth?email=mario.rossi%40mail.polimi.it", Self.page] {
+            let line = WebexSignInNavigation.diagnosticHost(URL(string: url))
+            #expect(!line.contains("mario") && !line.contains(Self.uuid) && !line.contains("/"), "\(line)")
+        }
+    }
+
+    /// The path shape keeps Webex's own words and masks everything else, so the two known forms
+    /// of a playback page (and an uppercase id, which `WebexPlayerLink` refuses) can be told
+    /// apart in a log. Guards against an id or a personal room name reaching the log.
+    @Test func diagnosticPathShapesMaskIdsAndNames() throws {
+        let shape = { (url: String) in WebexSignInNavigation.diagnosticPathShape(try #require(URL(string: url))) }
+        #expect(try shape(Self.page) == "/recordingservice/sites/politecnicomilano/recording/playback/<hex32>")
+        #expect(try shape("https://politecnicomilano.webex.com/webappng/sites/politecnicomilano/recording/\(Self.uuid)/playback") == "/webappng/sites/politecnicomilano/recording/<hex32>/playback")
+        #expect(try shape("https://politecnicomilano.webex.com/recording/playback/\(Self.uuid.uppercased())") == "/recording/playback/<HEX32>")
+        #expect(try shape("https://politecnicomilano.webex.com/recording/01234567-89ab-cdef-0123-456789abcdef") == "/recording/<uuid>")
+        #expect(try shape("https://politecnicomilano.webex.com/meet/mario.rossi") == "/<seg>/<seg>")
+    }
+
+    /// ldr.php's Location as one log word: recognized, absent, or where it went instead.
+    @Test func diagnosticLocationsSayWhatTheRedirectWas() {
+        let base = Self.loader
+        #expect(WebexPlayerLink.diagnosticLocation(Self.page, relativeTo: base) == "playback-page")
+        #expect(WebexPlayerLink.diagnosticLocation(nil, relativeTo: base) == "absent")
+        #expect(WebexPlayerLink.diagnosticLocation("  ", relativeTo: base) == "absent")
+        #expect(WebexPlayerLink.diagnosticLocation("/webappng/sites/politecnicomilano/recording/\(Self.uuid)/playback", relativeTo: base)
+            == "unrecognized host=politecnicomilano.webex.com path=/webappng/sites/politecnicomilano/recording/<hex32>/playback")
+        #expect(WebexPlayerLink.diagnosticLocation("https://evil.example/recording/playback/\(Self.uuid)", relativeTo: base) == "unrecognized host=other-host")
+    }
+
+    /// The API's deciding flags as 1/0/-, and whether a stream was handed out: enough to tell
+    /// "prevented", "password" and "no HLS" apart, with no value that could be a title or an
+    /// address. Mutation: print `json[name]` instead of `flag(json[name])` and the title/URL
+    /// check fails on the hls line.
+    @Test func diagnosticFlagsAreBooleansOnly() throws {
+        let line = WebexStreamAPI.diagnosticFlags(try json(signedIn(extra: ["passwordProtected": 1, "needPassword": "false", "canPlayback": "weird"])))
+        #expect(line == "json=object hls=present needPassword=0 passwordProtected=1 preventPlayback=0 canPlayback=- requireLogin=1")
+        #expect(!line.contains("http") && !line.contains("Lezione"))
+        #expect(WebexStreamAPI.diagnosticFlags(try json(signedIn(hls: nil))).contains("hls=absent"))
+        #expect(WebexStreamAPI.diagnosticFlags(try json(signedIn(hls: ""))).contains("hls=empty"))
+        #expect(WebexStreamAPI.diagnosticFlags(Data("<html>".utf8)) == "json=none")
+        #expect(WebexStreamUnavailable.unexpectedStatus(401).diagnosticName == "unexpected-status-401")
+        #expect(WebexStreamUnavailable.passwordRequired.diagnosticName == "password-required")
     }
 }
 

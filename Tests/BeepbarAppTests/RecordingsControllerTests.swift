@@ -1926,6 +1926,57 @@ struct RecordingsControllerTests {
         #expect(Controller.recovery(for: .duringPlayback(nil, position: 321), alreadyRecovered: true) == .browser)
     }
 
+    /// Package F diagnostics: each way a Play can miss the player is logged under its own
+    /// reason, with what happens next, and the line holds only names (no email, address or
+    /// title). Before the fix all of them logged the same "opening the browser" line. Mutation:
+    /// map `.needsEmail` to `.nativeUnavailable` in `playFailureReason` and the no-email row fails.
+    @Test func everyPlayFailureIsLoggedUnderItsOwnReason() {
+        typealias Controller = RecordingsController
+        #expect(Controller.playDiagnosis(RecmanBrowserError.playbackUnavailable) == "play: fallback=browser reason=native-unavailable error=playbackUnavailable")
+        #expect(Controller.playDiagnosis(RecmanBrowserError.needsEmail) == "play: fallback=none reason=no-email error=needsEmail")
+        #expect(Controller.playDiagnosis(RecmanBrowserError.needsSignIn) == "play: fallback=none reason=needs-sign-in error=needsSignIn")
+        #expect(Controller.playDiagnosis(RecmanBrowserError.unavailable) == "play: fallback=none reason=unreachable error=unavailable")
+        #expect(Controller.playDiagnosis(RecmanBrowserError.unrecognized) == "play: fallback=browser reason=stream-error error=unrecognized")
+        #expect(Controller.playDiagnosis(CancellationError()) == "play: fallback=none reason=cancelled error=cancelled")
+        // A URLError's user info carries the failing address: only its code is written.
+        let network = URLError(.timedOut, userInfo: [NSURLErrorFailingURLStringErrorKey: "https://nfg1wss.webex.com/nbr/secret/hls.m3u8"])
+        #expect(Controller.playDiagnosis(network) == "play: fallback=browser reason=stream-error error=URLError(-1001)")
+
+        // A stream that was found but never played: the player's failure, with AVFoundation's
+        // domain and code and the underlying cause, never the address in its user info.
+        let underlying = NSError(domain: "CoreMediaErrorDomain", code: -12660)
+        let avError = NSError(domain: "AVFoundationErrorDomain", code: -11800, userInfo: [
+            NSUnderlyingErrorKey: underlying,
+            NSURLErrorFailingURLErrorKey: URL(string: "https://nfg1wss.webex.com/nbr/secret/hls.m3u8")!,
+        ])
+        let beforeReady = Controller.playerFailureDiagnosis(.beforeReady(avError), recovery: .browser)
+        #expect(beforeReady == "play: player failed phase=before-ready recovery=browser reason=player-failure error=AVFoundationErrorDomain(-11800) underlying=CoreMediaErrorDomain(-12660)")
+        #expect(Controller.playerFailureDiagnosis(.duringPlayback(nil, position: 30), recovery: .freshStream(at: 30))
+            == "play: player failed phase=during-playback recovery=fresh-stream reason=player-failure error=none")
+        #expect(!beforeReady.contains("secret") && !beforeReady.contains("http"))
+    }
+
+    /// "Apri nel browser" in a row's menu opens the Webex player in the browser and never asks
+    /// for a stream; before the fix it called `play` and started BeepBar's player despite its
+    /// name. A second click is answered from the cached link. Mutation: point the case's
+    /// `finishOpening` at `.play`'s path (`playNatively`) and `streamCalls` is no longer empty.
+    @Test func openInBrowserOpensTheBrowserWithoutTheNativePlayer() async throws {
+        defer { cleanUp() }
+        browser.playbackResults["a"] = .success(playerLink("a"))
+        browser.streamResults["a"] = [.success(stream("a"))]
+        let controller = await readyController()
+        controller.openInBrowser(recording("a"))
+        await settle("browser opened") { world.opened == [playerLink("a")] }
+        #expect(browser.streamCalls.isEmpty, "no stream is asked for")
+        #expect(world.player.plays.isEmpty)
+        #expect(world.playersMade == 0)
+        #expect(controller.openingRecordingID == nil)
+        controller.openInBrowser(recording("a"))
+        await settle("opened again") { world.opened.count == 2 }
+        #expect(browser.playCalls.count == 1, "the second click uses the cached link")
+        controller.turnOff()
+    }
+
     /// A click replaced by a newer one while the stream is being found never starts the older
     /// lecture. Mutation: remove `guard request == openingRequest` in `playNatively`.
     @Test func onlyTheLatestPlayStartsTheNativePlayer() async {

@@ -182,8 +182,8 @@ struct RecordingsPage: View {
             SymbolTile(systemImage: "play.rectangle.fill", size: 52)
             Text(tr("Registrazioni delle lezioni", "Lecture recordings"))
                 .font(.title3.weight(.semibold))
-            Text(tr("Trova le registrazioni dei corsi che sincronizzi, cerca una lezione e riproducila nel browser. Accedi con Polimi per iniziare. Se non ti serve questa funzione, disattiva Registrazioni in Impostazioni.",
-                    "Find recordings for the courses you sync, search for a lecture and play it in your browser. Sign in with Polimi to get started. If you don't need this feature, turn off Recordings in Settings."))
+            Text(tr("Trova le registrazioni dei corsi che sincronizzi, cerca una lezione e riproducila in BeepBar. Accedi con Polimi per iniziare. Se non ti serve questa funzione, disattiva Registrazioni in Impostazioni.",
+                    "Find recordings for the courses you sync, search for a lecture and play it in BeepBar. Sign in with Polimi to get started. If you don't need this feature, turn off Recordings in Settings."))
                 .multilineTextAlignment(.center)
                 .foregroundStyle(.secondary)
                 .frame(maxWidth: 420)
@@ -510,7 +510,9 @@ private struct CourseRecordings: View {
         // Double click and Return open the player, the way Finder opens a file.
         .contextMenu(forSelectionType: String.self) { ids in
             if let recording = ids.first.flatMap({ byID[$0] }) {
-                Button(tr("Apri nel browser", "Open in browser")) { recordings.play(recording) }
+                // Really the browser: Play (double click, Return, the row's button) is BeepBar's
+                // own player since #148, and this item is the way around it.
+                Button(tr("Apri nel browser", "Open in browser")) { recordings.openInBrowser(recording) }
                 Button(tr("Copia link", "Copy link")) { recordings.copyLink(recording) }
                 Button(recordings.study.contains(recording) ? tr("Rimuovi dalla watchlist", "Remove from watchlist") : tr("Aggiungi alla watchlist", "Add to watchlist")) { recordings.toggleWatchlist(recording, courseName: name) }
                     .disabled(!recordings.canEditStudy)
@@ -592,7 +594,7 @@ private struct WatchlistRecordings: View {
                     if let bookmark = shown.first(where: { ids.contains($0.id) }) {
                         Button(tr("Rimuovi dalla watchlist", "Remove from watchlist")) { recordings.toggleWatchlist(bookmark.recording, courseName: bookmark.courseName) }
                             .disabled(!recordings.canEditStudy)
-                        Button(tr("Apri nel browser", "Open in browser")) { recordings.play(bookmark.recording) }
+                        Button(tr("Apri nel browser", "Open in browser")) { recordings.openInBrowser(bookmark.recording) }
                             .disabled(recordings.access != .ready || bookmark.unavailable)
                     }
                 } primaryAction: { ids in
@@ -687,7 +689,9 @@ private struct RecordingRow: View {
             }
             .buttonStyle(.plain)
             .disabled(!canPlay)
-            .help(tr("Apri nel browser", "Open in browser"))
+            // Play is BeepBar's own player since #148 (the browser only when that isn't possible);
+            // "Apri nel browser" is the row menu's item.
+            .help(tr("Riproduci", "Play"))
             .accessibilityLabel(tr("Riproduci \(RecordingsPresentation.title(recording))", "Play \(RecordingsPresentation.title(recording))"))
         }
         .padding(.vertical, 9)

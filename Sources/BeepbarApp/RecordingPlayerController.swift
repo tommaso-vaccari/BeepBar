@@ -142,7 +142,7 @@ enum RecordingPlayerError: Error {
     /// Where an in-flight seek is going. `currentTime()` still reports the old position until the
     /// seek lands, so repeated skips (a held L) accumulate from here, and a checkpoint taken
     /// meanwhile reports where the student is going.
-    private var pendingSeekTarget: TimeInterval?
+    private(set) var pendingSeekTarget: TimeInterval?
     /// Whether this pause was already reported: the KVO for a pause the player made itself (a
     /// failure) must not report it a second time.
     private var checkpointedSincePlaying = false

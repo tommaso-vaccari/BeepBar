@@ -197,7 +197,18 @@ let diagnostics = #"""
         say("RESULT player found in \(elapsed(since: start))")
         try await save(session, to: file)
         guard let store = session.webView?.configuration.websiteDataStore else { say("no browser store"); return 1 }
-        await WebexProbe(store: store).run(player: player, limit: .seconds(300))
+        // First the way BeepBar would like to go: no player page at all.
+        let directStart = ContinuousClock.now
+        if let stream = await direct(player: player, store: store) {
+            say("RESULT direct OK stream found in \(elapsed(since: directStart)) without opening Webex's page: \(streamShape(stream))")
+        } else {
+            let probe = WebexProbe(store: store)
+            await probe.run(player: player, limit: .seconds(300))
+            // Right after the sign-in: does the direct way work now?
+            if let stream = await direct(player: player, store: store) {
+                say("RESULT direct-after-login OK: \(streamShape(stream))")
+            }
+        }
         saveWebexCookies(await store.httpCookieStore.allCookies(), to: webexFile)
         return 0
     } catch {

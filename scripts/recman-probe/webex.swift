@@ -48,7 +48,7 @@ let webexObserver = #"""
     if (skip(url)) return;
     const m = { kind: 'request', method: method, url: red(url), status: status, type: type || '' };
     if (body && /json/i.test(type || '')) {
-      try { const j = JSON.parse(body); m.shape = JSON.stringify(shape(j, 0)); candidates(j, red(url), 0); } catch (e) {}
+      try { const j = JSON.parse(body); if (/\/webappng\/api\/v1\/recordings\//.test(url)) m.shape = JSON.stringify(shape(j, 0)); candidates(j, red(url), 0); } catch (e) {}
     }
     if (/m3u8|mpegurl/i.test(url + ' ' + (type || ''))) { try { post({ kind: 'candidate', source: 'request', value: new URL(url, location.href).href }); } catch (e) {} }
     post(m);
@@ -105,6 +105,10 @@ let webexVideoSource = #"""
     private var windowClosed = false
     private var candidates: [(source: String, url: URL)] = []
     private var pages = 0
+    /// Telemetry and Webex-app service calls, counted instead of printed.
+    private var quietRequests = 0
+    /// The playback page's address, whose path carries the recording's uuid.
+    private(set) var playbackPage: URL?
 
     init(store: WKWebsiteDataStore) {
         self.store = store
@@ -145,9 +149,10 @@ let webexVideoSource = #"""
                 found(url, source: "video element")
             }
         }
+        say("(\(quietRequests) telemetry and Webex-app service requests not printed)")
         say(windowClosed ? "window closed after \(elapsed(since: start))" : "time limit reached (\(elapsed(since: start)))")
         if let facts = try? await webView.evaluateJavaScript(webexPageFacts, in: nil, contentWorld: .defaultClient) as? String {
-            say("  [last page] at \(RecmanWebSession.redacted(webView.url)) \(facts)")
+            say("  [last page] at \(webView.url.map(streamShape) ?? "(none)") \(facts)")
         }
         content.removeAllScriptMessageHandlers()
         webView.navigationDelegate = nil
@@ -240,6 +245,10 @@ let webexVideoSource = #"""
         guard let body = message.body as? [String: Any], let kind = body["kind"] as? String else { return }
         switch kind {
         case "request":
+            if let url = body["url"] as? String, ["tsa-f.webex.com", "tsa.webex.com", "amplitude.com", "wbx2.com", "/metric"].contains(where: url.contains) {
+                quietRequests += 1
+                return
+            }
             let shape = (body["shape"] as? String).map { " " + $0 } ?? ""
             say("  · request \(body["method"] ?? "?") \(body["url"] ?? "?") → \(body["status"] ?? "?") \(body["type"] ?? "")\(shape)")
         case "candidate":
@@ -251,6 +260,7 @@ let webexVideoSource = #"""
 
     func webView(_ webView: WKWebView, decidePolicyFor action: WKNavigationAction, decisionHandler: @escaping @MainActor (WKNavigationActionPolicy) -> Void) {
         if action.targetFrame?.isMainFrame ?? true, let url = action.request.url {
+            if webexRecordingUUID(url) != nil, playbackPage == nil { playbackPage = url }
             say("  → \(streamShape(url))")
         }
         decisionHandler(.allow)
@@ -262,7 +272,7 @@ let webexVideoSource = #"""
         let url = webView.url
         Task {
             let facts = (try? await webView.evaluateJavaScript(webexPageFacts, in: nil, contentWorld: .defaultClient) as? String) ?? "(no facts)"
-            say("  [page \(page)] \(RecmanWebSession.redacted(url)) \(facts)")
+            say("  [page \(page)] \(url.map(streamShape) ?? "(none)") \(facts)")
         }
     }
 
@@ -297,4 +307,88 @@ let webexVideoSource = #"""
     FileManager.default.createFile(atPath: file.path, contents: data, attributes: [.posixPermissions: 0o600])
     say("kept \(kept.count) non-Polimi cookies for the next play run:")
     describeCookies(kept)
+}
+
+// MARK: The direct way, without the player page
+
+/// The 32-hex recording uuid of a Webex playback page, from either form of its path.
+func webexRecordingUUID(_ url: URL) -> String? {
+    guard url.host?.lowercased() == "politecnicomilano.webex.com" else { return nil }
+    let parts = url.path.split(separator: "/").map(String.init)
+    guard let index = parts.firstIndex(of: "recording") else { return nil }
+    return parts[(index + 1)...].first { $0.range(of: "^[0-9a-f]{32}$", options: .regularExpression) != nil }
+}
+
+/// Cookies of `cookies` that a browser would send to `url`.
+func cookies(_ cookies: [HTTPCookie], for url: URL) -> [HTTPCookie] {
+    guard let host = url.host?.lowercased() else { return [] }
+    return cookies.filter { cookie in
+        let domain = cookie.domain.lowercased()
+        let matches = domain.hasPrefix(".") ? (host == String(domain.dropFirst()) || host.hasSuffix(domain)) : host == domain
+        return matches && url.path.hasPrefix(cookie.path) && (!cookie.isSecure || url.scheme == "https")
+    }
+}
+
+/// One GET from Swift with exactly `sent` as cookies, no redirects followed unless `follow`.
+final class NoRedirect: NSObject, URLSessionTaskDelegate {
+    let follow: Bool
+    init(follow: Bool) { self.follow = follow }
+    func urlSession(_ session: URLSession, task: URLSessionTask, willPerformHTTPRedirection response: HTTPURLResponse, newRequest request: URLRequest) async -> URLRequest? {
+        follow ? request : nil
+    }
+}
+
+func get(_ url: URL, cookies sent: [HTTPCookie], follow: Bool) async throws -> (Data, HTTPURLResponse) {
+    let configuration = URLSessionConfiguration.ephemeral
+    configuration.httpShouldSetCookies = false
+    configuration.httpCookieAcceptPolicy = .never
+    let session = URLSession(configuration: configuration, delegate: NoRedirect(follow: follow), delegateQueue: nil)
+    defer { session.finishTasksAndInvalidate() }
+    var request = URLRequest(url: url, timeoutInterval: 20)
+    for (name, value) in HTTPCookie.requestHeaderFields(with: sent) { request.setValue(value, forHTTPHeaderField: name) }
+    request.setValue("application/json, text/html", forHTTPHeaderField: "Accept")
+    let (data, response) = try await session.data(for: request)
+    return (data, response as! HTTPURLResponse)
+}
+
+/// Tries to reach the stream without loading Webex's player page: the player link answered
+/// from Swift, then the stream API with the store's cookies. Returns the HLS address when that
+/// works, so the window is only needed when it doesn't.
+@MainActor func direct(player: URL, store: WKWebsiteDataStore) async -> URL? {
+    let all = await store.httpCookieStore.allCookies()
+    say("direct: \(all.filter { $0.domain.lowercased().contains("webex.com") }.count) Webex cookies in the store")
+    var uuid: String?
+    do {
+        let (_, response) = try await get(player, cookies: [], follow: false)
+        let location = response.value(forHTTPHeaderField: "Location").flatMap { URL(string: $0, relativeTo: player)?.absoluteURL }
+        say("direct: player link without cookies → HTTP \(response.statusCode)\(location.map { " Location \(streamShape($0))" } ?? " (no redirect: the hop is done by the page)")")
+        uuid = location.flatMap(webexRecordingUUID)
+        if uuid == nil {
+            let (data, followed) = try await get(player, cookies: [], follow: true)
+            let final = followed.url.flatMap(webexRecordingUUID)
+            let inBody = String(decoding: data.prefix(200_000), as: UTF8.self).range(of: "recording/(?:playback/)?[0-9a-f]{32}", options: .regularExpression) != nil
+            say("direct: followed → HTTP \(followed.statusCode) at \(followed.url.map(streamShape) ?? "?"), uuid in final URL \(final != nil), in body \(inBody)")
+            uuid = final
+        }
+    } catch {
+        say("direct: player link failed \((error as NSError).domain) \((error as NSError).code)")
+    }
+    guard let uuid else { say("RESULT direct NO-UUID: the recording id needs the web view"); return nil }
+    var components = URLComponents(string: "https://politecnicomilano.webex.com/webappng/api/v1/recordings/\(uuid)/stream")!
+    components.queryItems = [URLQueryItem(name: "siteurl", value: "politecnicomilano")]
+    let api = components.url!
+    for (label, sent) in [("without cookies", [HTTPCookie]()), ("with the store's cookies", cookies(all, for: api))] {
+        do {
+            let (data, response) = try await get(api, cookies: sent, follow: false)
+            let json = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any]
+            let flags = ["requireLogin", "canPlayback", "preventPlayback", "passwordProtected", "needPassword", "preventDownload"]
+                .map { "\($0)=\(json?[$0].map { "\($0)" } ?? "-")" }.joined(separator: " ")
+            let hls = ((json?["downloadRecordingInfo"] as? [String: Any])?["downloadInfo"] as? [String: Any])?["hlsURL"] as? String
+            say("RESULT direct API \(label) (\(sent.count) sent) → HTTP \(response.statusCode) \(flags) hlsURL \(hls.flatMap(URL.init(string:)).map(streamShape) ?? "absent")")
+            if response.statusCode == 200, let hls, let url = URL(string: hls) { return url }
+        } catch {
+            say("RESULT direct API \(label) failed \((error as NSError).domain) \((error as NSError).code)")
+        }
+    }
+    return nil
 }

@@ -19,8 +19,12 @@ enum RecmanBrowserError: Error, Equatable {
     case incomplete
     /// The archive doesn't list that academic year (yet).
     case yearUnavailable
-    /// The recording's player couldn't be found.
+    /// The recording's player couldn't be found, or Webex answered in a way native playback
+    /// doesn't recognize: open the player in the browser instead.
     case playbackUnavailable
+    /// Native playback (#148): signed out of Webex, and there is no confirmed Polimi email to
+    /// sign in with. The Recordings page asks the user to confirm it, then tries again.
+    case needsEmail
 }
 
 /// The Recman browser as the Recordings controller sees it. `RecmanWebSession` is the real one;
@@ -40,6 +44,11 @@ enum RecmanBrowserError: Error, Equatable {
     func recordings(for key: RecmanCourseKey) async throws -> [RecmanRecording]
     /// The Webex player of a recording, to open in the default browser.
     func playbackURL(for recording: RecmanRecording) async throws -> URL
+    /// The recording's stream for the native player (#148): the player link as `playbackURL`
+    /// finds it, then Webex's stream API, signing in to Webex once with `email` if needed. Only
+    /// for a Play the user asked for: the sign-in window may appear if Webex or Polimi needs the
+    /// user. Throws `playbackUnavailable` when the browser should open the player instead.
+    func stream(for recording: RecmanRecording, email: PolimiEmail?) async throws -> RecordingStream
     /// Stops whatever is running and discards the browser and its cookies.
     func close()
 }
@@ -65,7 +74,7 @@ enum RecmanBrowserError: Error, Equatable {
 /// `CancellationError`), and every step checks it is still the current operation before touching
 /// the page, so two operations never drive the web view at once. Interrupting reaches scripts
 /// too: a page script still waiting for WebKit's callback ends with the operation (#112).
-@MainActor final class RecmanWebSession: NSObject, RecmanBrowsing, WKNavigationDelegate, WKUIDelegate, NSWindowDelegate {
+@MainActor final class RecmanWebSession: NSObject, RecmanBrowsing, WKNavigationDelegate, WKUIDelegate, NSWindowDelegate, WKHTTPCookieStoreObserver {
     /// How long a script-triggered page load (a search, "prossima", a preview) may take.
     static let loadTimeout: Duration = .seconds(30)
 
@@ -103,6 +112,37 @@ enum RecmanBrowserError: Error, Equatable {
     /// The most recent script call, kept after it ends so `RecmanWebSessionTests` can see what
     /// WebKit delivered late. Holds only that call's outcome, never the page or the web view.
     private(set) var lastScriptCall: BoundedScriptCall<String?>?
+
+    /// Native playback's HTTP side (#148): the player link's hop and the stream API. Replaced by
+    /// tests with a stub `URLProtocol` transport; never the network in a test.
+    var webexTransport: WebexHTTPTransport = WebexURLSessionTransport()
+    /// The Webex sign-in in progress, if any (see `signInToWebex`).
+    private var webexLogin: WebexLogin?
+    /// The stream operation's work, so a newer operation or `close()` stops its HTTP requests
+    /// at once instead of letting them run to their timeout.
+    private var streamWork: Task<RecordingStream, Error>?
+    /// How long the hidden Webex sign-in may sit on one page with nothing happening (no load, no
+    /// redirect) before it counts as needing the user. The live chain moves every few hundred
+    /// milliseconds; a placeholder email stalled forever on a blank idbroker page, which this
+    /// turns into the sign-in window instead of a silent wait. A variable so tests can shorten it.
+    var webexStallTimeout: Duration = RecmanWebSession.loadTimeout
+    /// The most the hidden part of a Webex sign-in may take in total, even while pages keep
+    /// moving (a redirect loop never stalls). A silent sign-in took ~7 s live.
+    var webexHiddenDeadline: Duration = .seconds(60)
+    /// Starts the Webex sign-in's first load. Tests load a local fixture at the login address
+    /// instead, so nothing reaches Webex.
+    var startWebexLogin: @MainActor (WKWebView, URL) -> Void = { webView, url in webView.load(URLRequest(url: url)) }
+    /// Puts the sign-in window on screen. Tests replace it so a run never takes the focus.
+    var presentSignInWindow: @MainActor (NSWindow) -> Void = { window in
+        window.center()
+        // As in `LoginWindowController.showWindow`: a menu-bar app has to activate itself, or
+        // the window shows without keyboard focus and the sign-in fields reject typing.
+        NSApp.activate()
+        window.makeKeyAndOrderFront(nil)
+    }
+    /// Main-frame loads of a Webex playback page cancelled during a sign-in; for tests, which
+    /// prove the player page is never loaded.
+    private(set) var cancelledPlaybackPages = 0
 
     var isOpen: Bool { store != nil }
 
@@ -194,6 +234,197 @@ enum RecmanBrowserError: Error, Equatable {
             throw RecmanBrowserError.needsSignIn
         }
         throw RecmanBrowserError.playbackUnavailable
+    }
+
+    func stream(for recording: RecmanRecording, email: PolimiEmail?) async throws -> RecordingStream {
+        let player = try await playbackURL(for: recording)
+        let operation = beginOperation()
+        let resolver = WebexStreamResolver(transport: webexTransport) { [weak self] in self?.trace($0) }
+        let driver = WebexSignInDriver(
+            cookies: { [weak self] in await self?.cookies() ?? [] },
+            forgetTicket: { [weak self] in await self?.forgetWebexTicket() },
+            // A Play is always the user's own request, so the sign-in may show its window.
+            signIn: { [weak self] url in
+                guard let self else { throw CancellationError() }
+                try await self.signInToWebex(loginURL: url, interactive: true, operation: operation)
+            },
+            ensureCurrent: { [weak self] in
+                guard let self else { throw CancellationError() }
+                try self.ensureCurrent(operation)
+            })
+        let work = Task { try await resolver.stream(player: player, email: email, driver: driver) }
+        streamWork = work
+        defer { if streamWork == work { streamWork = nil } }
+        return try await withTaskCancellationHandler {
+            try await work.value
+        } onCancel: {
+            work.cancel()
+        }
+    }
+
+    // MARK: Signing in to Webex
+
+    /// A Webex sign-in in progress (#148): whether the user has the window, and whoever awaits
+    /// the outcome. It ends exactly once; later events find it finished and do nothing.
+    @MainActor private final class WebexLogin {
+        let loginURL: URL
+        let interactive: Bool
+        /// The sign-in window is up and the user is driving: no more timers, any https page.
+        var windowShown = false
+        /// Webex sent the web view back to the playback page (cancelled): the chain is over.
+        var reachedPlayback = false
+        var stall: Task<Void, Never>?
+        var deadline: Task<Void, Never>?
+        private(set) var result: Result<Void, Error>?
+        private var continuation: CheckedContinuation<Void, Error>?
+
+        init(loginURL: URL, interactive: Bool) {
+            self.loginURL = loginURL
+            self.interactive = interactive
+        }
+
+        var isFinished: Bool { result != nil }
+
+        func finish(_ result: Result<Void, Error>) {
+            guard self.result == nil else { return }
+            self.result = result
+            stall?.cancel()
+            deadline?.cancel()
+            continuation?.resume(with: result)
+            continuation = nil
+        }
+
+        func wait() async throws {
+            if let result { return try result.get() }
+            try await withCheckedThrowingContinuation { continuation = $0 }
+        }
+    }
+
+    /// Deletes the store's Webex `ticket`: the stream API just refused it, and leaving it there
+    /// would make the next sign-in look done before it started.
+    func forgetWebexTicket() async {
+        guard let store else { return }
+        for cookie in await store.httpCookieStore.allCookies() where WebexSignIn.isTicket(cookie) {
+            await store.httpCookieStore.deleteCookie(cookie)
+        }
+    }
+
+    /// Signs in to Webex in the hidden web view through `loginURL` (`WebexSignIn.loginURL`, which
+    /// carries the email hint), and returns once a Webex `ticket` is in the store.
+    ///
+    /// The store already holds the Polimi single sign-on, so the live chain (webappng login →
+    /// idbroker → shibidp/aunicalogin → back) needs nobody. While hidden, only that chain's hosts
+    /// load (`WebexSignInNavigation`), and the final hop to the playback page is cancelled in
+    /// every case: the player page would pull Webex's whole web app and play audio hidden.
+    ///
+    /// Done is decided on the cookie store, checked on every load, redirect and cookie change,
+    /// never on a polling timer. The user is needed when a page asks for credentials, when the
+    /// chain sits still for `webexStallTimeout`, or when it is still hidden after
+    /// `webexHiddenDeadline`: an `interactive` sign-in then shows the window (as `signIn()` does)
+    /// and waits for the user without a deadline; otherwise it throws `needsSignIn`. A host off
+    /// the chain while hidden throws `playbackUnavailable` (browser fallback), a failed load
+    /// `unavailable`, and closing the window, `close()`, a newer operation or cancelling the
+    /// awaiting task `CancellationError`.
+    private func signInToWebex(loginURL: URL, interactive: Bool, operation: Int) async throws {
+        try ensureCurrent(operation)
+        guard let store else { throw CancellationError() }
+        let login = WebexLogin(loginURL: loginURL, interactive: interactive)
+        webexLogin = login
+        store.httpCookieStore.add(self)
+        defer {
+            store.httpCookieStore.remove(self)
+            if webexLogin === login { webexLogin = nil }
+            // Whatever happened, the web view stops where it is: nothing loads after the outcome.
+            webView?.stopLoading()
+            window?.orderOut(nil)
+        }
+        trace("signing in to Webex at \(Self.redacted(loginURL))")
+        let deadline = webexHiddenDeadline
+        login.deadline = Task { [weak self] in
+            do { try await Task.sleep(for: deadline) } catch { return }
+            self?.trace("Webex sign-in still hidden at its deadline")
+            self?.webexLoginNeedsUser(login)
+        }
+        restartStall(login)
+        let webView = browser()
+        webView.stopLoading()
+        startWebexLogin(webView, loginURL)
+        try await withTaskCancellationHandler {
+            try await login.wait()
+        } onCancel: {
+            Task { @MainActor in login.finish(.failure(CancellationError())) }
+        }
+        try ensureCurrent(operation)
+    }
+
+    /// Runs `signInToWebex` as an operation of its own, exactly as `stream(for:email:)` does after
+    /// finding the player link. For `RecmanWebSessionTests`, which drive it against local pages.
+    func runWebexSignIn(loginURL: URL, interactive: Bool) async throws {
+        let operation = beginOperation()
+        try await signInToWebex(loginURL: loginURL, interactive: interactive, operation: operation)
+    }
+
+    /// Restarts the "nothing is happening" timer of a hidden sign-in.
+    private func restartStall(_ login: WebexLogin) {
+        guard !login.windowShown, !login.isFinished else { return }
+        login.stall?.cancel()
+        let timeout = webexStallTimeout
+        login.stall = Task { [weak self] in
+            do { try await Task.sleep(for: timeout) } catch { return }
+            self?.trace("Webex sign-in stalled")
+            self?.webexLoginNeedsUser(login)
+        }
+    }
+
+    /// The hidden sign-in can't go on alone.
+    private func webexLoginNeedsUser(_ login: WebexLogin) {
+        guard webexLogin === login, !login.isFinished, !login.windowShown else { return }
+        if login.reachedPlayback {
+            // Webex considers the sign-in over, yet no ticket arrived: an unknown change, not
+            // something the user could fix in the window.
+            login.finish(.failure(RecmanBrowserError.playbackUnavailable))
+            return
+        }
+        guard login.interactive else {
+            login.finish(.failure(RecmanBrowserError.needsSignIn))
+            return
+        }
+        trace("Webex sign-in needs the user: showing the sign-in window")
+        login.windowShown = true
+        login.stall?.cancel()
+        login.deadline?.cancel()
+        showWindow()
+    }
+
+    /// Ends the sign-in if the store now holds a Webex ticket.
+    private func checkWebexTicket(_ login: WebexLogin) {
+        guard let store, !login.isFinished else { return }
+        Task { [weak self] in
+            let cookies = await store.httpCookieStore.allCookies()
+            guard let self, self.webexLogin === login, WebexSignIn.isSignedIn(cookies: cookies) else { return }
+            self.trace("signed in to Webex")
+            login.finish(.success(()))
+        }
+    }
+
+    /// A page of the sign-in finished loading: maybe the ticket is there, maybe the page needs
+    /// the user (a password or one-time-code field, read by the same probe as Polimi's pages).
+    private func webexPageFinished(_ login: WebexLogin, url: URL?) {
+        checkWebexTicket(login)
+        restartStall(login)
+        guard !login.windowShown else { return }
+        let operation = operationID
+        Task { [weak self] in
+            guard let self else { return }
+            let facts = try? await self.pageFacts(operation: operation)
+            guard self.webexLogin === login, !login.isFinished else { return }
+            self.trace("loaded \(Self.redacted(url)) — asks credentials \(facts?.asksForCredentials ?? false)")
+            if facts?.asksForCredentials == true { self.webexLoginNeedsUser(login) }
+        }
+    }
+
+    func cookiesDidChange(in cookieStore: WKHTTPCookieStore) {
+        if let login = webexLogin { checkWebexTicket(login) }
     }
 
     func close() {
@@ -513,6 +744,8 @@ enum RecmanBrowserError: Error, Equatable {
     /// page alongside the next one.
     private func interruptPending() {
         if let entry { feed(.cancelled, to: entry) }
+        webexLogin?.finish(.failure(CancellationError()))
+        streamWork?.cancel()
         loadWaiter?.resolve(.failure(CancellationError()))
         loadWaiter = nil
         capturingPlayback = false
@@ -557,15 +790,12 @@ enum RecmanBrowserError: Error, Equatable {
 
     private func showWindow() {
         guard let window else { return }
-        window.center()
-        // As in `LoginWindowController.showWindow`: a menu-bar app has to activate itself, or
-        // the window shows without keyboard focus and the sign-in fields reject typing.
-        NSApp.activate()
-        window.makeKeyAndOrderFront(nil)
+        presentSignInWindow(window)
     }
 
     func windowWillClose(_ notification: Notification) {
         if let entry { feed(.windowClosed, to: entry) }
+        webexLogin?.finish(.failure(CancellationError()))
     }
 
     // MARK: WKNavigationDelegate
@@ -575,12 +805,17 @@ enum RecmanBrowserError: Error, Equatable {
         loadID += 1
         currentNavigation = navigation
         if let entry { feed(.loadStarted(id: loadID), to: entry) }
+        if let webexLogin { restartStall(webexLogin) }
     }
 
     func webView(_ webView: WKWebView, didReceiveServerRedirectForProvisionalNavigation navigation: WKNavigation!) {
         guard webView === self.webView, navigation === currentNavigation else { return }
         loadID += 1
         if let entry { feed(.loadStarted(id: loadID), to: entry) }
+        if let webexLogin {
+            restartStall(webexLogin)
+            checkWebexTicket(webexLogin)
+        }
     }
 
     func webView(_ webView: WKWebView, didFinish navigation: WKNavigation!) {
@@ -590,6 +825,10 @@ enum RecmanBrowserError: Error, Equatable {
         if let waiter = loadWaiter, id > waiter.after {
             loadWaiter = nil
             waiter.resolve(.success(()))
+        }
+        if let webexLogin {
+            webexPageFinished(webexLogin, url: url)
+            return
         }
         guard let entry else {
             trace("loaded \(Self.redacted(url))")
@@ -631,6 +870,8 @@ enum RecmanBrowserError: Error, Equatable {
         loadWaiter?.resolve(.failure(RecmanBrowserError.unavailable))
         loadWaiter = nil
         if let entry { feed(.loadFailed(id: loadID), to: entry) }
+        // With the window up a failed load is the user's to retry, as in a browser.
+        if let webexLogin, !webexLogin.windowShown { webexLogin.finish(.failure(RecmanBrowserError.unavailable)) }
     }
 
     func webViewWebContentProcessDidTerminate(_ webView: WKWebView) {
@@ -638,6 +879,14 @@ enum RecmanBrowserError: Error, Equatable {
         trace("web content process ended")
         loadWaiter?.resolve(.failure(RecmanBrowserError.unavailable))
         loadWaiter = nil
+        if let webexLogin {
+            if webexLogin.windowShown {
+                startWebexLogin(webView, webexLogin.loginURL)
+            } else {
+                webexLogin.finish(.failure(RecmanBrowserError.unavailable))
+            }
+            return
+        }
         guard let entry else { return }
         if entry.navigator.isWaitingForUser {
             // The user is looking at a blank window: start the way in again for them.
@@ -650,6 +899,10 @@ enum RecmanBrowserError: Error, Equatable {
     func webView(_ webView: WKWebView, decidePolicyFor action: WKNavigationAction, decisionHandler: @escaping @MainActor (WKNavigationActionPolicy) -> Void) {
         guard webView === self.webView, let url = action.request.url else { decisionHandler(.cancel); return }
         let mainFrame = action.targetFrame?.isMainFrame ?? true
+        if let login = webexLogin {
+            decideDuringWebexLogin(login, url: url, mainFrame: mainFrame, decisionHandler: decisionHandler)
+            return
+        }
         if capturingPlayback, let player = RecmanURLPolicy.playbackURL(url) {
             decisionHandler(.cancel)
             playbackFound(player)
@@ -666,6 +919,28 @@ enum RecmanBrowserError: Error, Equatable {
         guard mainFrame else { return }
         trace("refused \(Self.redacted(url))")
         refused(url)
+    }
+
+    /// The navigation policy while signing in to Webex (`WebexSignInNavigation`). The playback
+    /// page is cancelled whoever is driving: it means the chain is over, so the ticket is
+    /// checked. A refused page while hidden ends the sign-in (an unknown chain, browser fallback).
+    private func decideDuringWebexLogin(_ login: WebexLogin, url: URL, mainFrame: Bool, decisionHandler: @MainActor (WKNavigationActionPolicy) -> Void) {
+        switch WebexSignInNavigation.decide(url, mainFrame: mainFrame, userDriven: login.windowShown) {
+        case .allow:
+            decisionHandler(.allow)
+        case .playbackPage:
+            decisionHandler(.cancel)
+            cancelledPlaybackPages += 1
+            trace("Webex went back to the playback page: not loaded")
+            login.reachedPlayback = true
+            checkWebexTicket(login)
+            restartStall(login)
+        case .refuse:
+            decisionHandler(.cancel)
+            guard mainFrame else { return }
+            trace("refused \(Self.redacted(url))")
+            if !login.windowShown { login.finish(.failure(RecmanBrowserError.playbackUnavailable)) }
+        }
     }
 
     /// A main-frame load the policy refused. Whatever was waiting for the next page won't get
@@ -703,12 +978,14 @@ enum RecmanBrowserError: Error, Equatable {
 
     /// Host and path only: Polimi's query strings carry single sign-on tickets, and Java and
     /// Shibboleth pages can put the session id in the path itself (`;jsessionid=…`), so each
-    /// path segment is cut at its first `;` too.
+    /// path segment is cut at its first `;` too. Webex puts the recording's uuid in the path of
+    /// its playback page (#148): 32-hex runs are masked, so a trace never says what was watched.
     static func redacted(_ url: URL?) -> String {
         guard let url, let components = URLComponents(url: url, resolvingAgainstBaseURL: false) else { return "(none)" }
         let path = components.path.split(separator: "/", omittingEmptySubsequences: false)
             .map { $0.split(separator: ";", maxSplits: 1, omittingEmptySubsequences: false).first.map(String.init) ?? "" }
             .joined(separator: "/")
+            .replacingOccurrences(of: "[0-9A-Fa-f]{32}", with: "<id>", options: .regularExpression)
         return "\(components.scheme ?? "?")://\(components.host ?? "?")\(path)"
     }
 }

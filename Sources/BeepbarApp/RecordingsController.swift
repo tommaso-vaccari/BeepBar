@@ -18,7 +18,9 @@ enum RecordingsProblem: Equatable {
         case .unavailable: self = .unavailable
         case .incomplete: self = .incomplete
         case .yearUnavailable: self = .yearUnavailable
-        case .playbackUnavailable: self = .playbackUnavailable
+        // `needsEmail` comes only from `stream(for:email:)`, which nothing calls yet (#148
+        // package F wires it and gives it its own handling).
+        case .playbackUnavailable, .needsEmail: self = .playbackUnavailable
         case .unrecognized, .needsSignIn, nil: self = .unrecognized
         }
     }

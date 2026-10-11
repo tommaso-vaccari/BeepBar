@@ -28,20 +28,21 @@ are fixed in the same round.
 
 `progressBurstTravelsTheThrottledSyncPath` proves the burst reaches the final 10,000 total with
 at least one and at most `2 + elapsed/200 ms` main-actor entries, and leaves no sync active.
-Mutations in a disposable `git worktree add --detach` copy of `6d8e6e3`, each run alone:
+Mutations in disposable `git worktree add --detach` copies, each run alone:
 
-| Mutation | Result |
-|---|---|
-| Burst sends no events | **RED**: final total and main-actor entry expectations fail |
-| Burst leaves the operation set | **RED**: `!isSyncActive` fails |
-| Controller hops to the main actor before the throttle | **RED**: entry bound fails |
-| Burst does not close its run (`closeCurrentRun` removed) | **RED**: a late final event reaches the main actor |
-| Readiness modifier branches on `enabled` again | **RED**: `movingTheMarkerKeepsTheRowState` sees the row rebuilt |
-| Restored | **GREEN** |
+| Mutation | Copy of | Result |
+|---|---|---|
+| Burst sends no events | `6d8e6e3` | **RED**: final total and main-actor entry expectations fail |
+| Burst leaves the operation set | `6d8e6e3` | **RED**: `!isSyncActive` fails |
+| Controller hops to the main actor before the throttle | `6d8e6e3` | **RED**: entry bound fails |
+| Burst does not close its run (`closeCurrentRun` removed) | `b9fda15` | **RED**: a late final event reaches the main actor |
+| Readiness modifier branches on `enabled` again | `b9fda15` | **RED**: `movingTheMarkerKeepsTheRowState` sees the row rebuilt |
+| Burst does not restore the ready state | `__MUT_SHA__` | **RED**: `syncState == .readyUnchecked` fails |
+| Restored | each copy | **GREEN** |
 
 Host: Apple M5 (`Mac17,3`), 32 GB, macOS 27.0.1 (`26A434`), Xcode 27.0 (`27A266a`).
-Focused `UIFixtureTests` 9 PASS and the opt-in fixture Release arm64 build (Mach-O arm64,
-identity `beepbar-isolated-ui-fixture-v1`) succeeded on `6d8e6e3`. Full suite, ordinary Release
+Focused `UIFixtureTests` and `UIContentReadinessTests` (10 tests) pass, and the opt-in fixture
+Release arm64 build (Mach-O arm64, identity `beepbar-isolated-ui-fixture-v1`) succeeds. Full suite, ordinary Release
 build, Python guards and the final independent review are run on the exact pushed SHA, which
 cannot appear in this file; that SHA and its results are posted in PR #136 before merge.
 No measurement series, installed app, real account or production data was used.

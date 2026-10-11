@@ -136,6 +136,7 @@ import BeepbarCore
         #expect(store.mainActorEntries >= 1)
         #expect(store.mainActorEntries <= allowed, "\(store.mainActorEntries) main-actor entries in \(elapsed); at most \(allowed) allowed")
         #expect(!fixture.controller.isSyncActive)
+        #expect(fixture.controller.syncState == .readyUnchecked, "the burst left the menu showing a running sync")
         let entries = store.mainActorEntries
         await sink(SyncProgress(completed: 20_000, total: 20_000, installed: 20_000, preservedLocal: 0, unchanged: 0, conflicts: 0, failures: 0))
         #expect(store.mainActorEntries == entries, "a late event of the finished burst reached the main actor")

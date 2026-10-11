@@ -1269,13 +1269,18 @@ struct MenuBarSnapshot: Sendable {
         }
     }
 
-    func refreshOnWindowOpen() {
-        Task { [weak self] in
+    @discardableResult func refreshOnWindowOpen() -> Task<Void, Never> {
+        let refresh = Task { [weak self] in
             guard let self else { return }
             await self.bootstrapTask?.value
             self.loadCourses()
+#if DEBUG
+            // The isolated UI harness awaits the real refresh completion instead of sleeping.
+            await self.courseLoadTaskForTesting?.value
+#endif
         }
         refreshConflicts()
+        return refresh
     }
 
     func chooseRoot() {

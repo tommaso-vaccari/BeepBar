@@ -137,11 +137,13 @@ struct RecordingsListing: Equatable {
     /// browser closes (the next opening reads again), when the file is discarded, after a save
     /// wrote new cookies, and after a read error (kept for the next try).
     private var sessionLoad: (id: Int, task: Task<[HTTPCookie], Never>)?
+    /// Identifies each read, so a failed one clears the cache only if it is still the cached one.
     private var sessionLoads = 0
     /// The first visit's check of the saved session, while it is reading the file. Until it answers
     /// nothing opens the browser: without a reusable session the page asks for a sign-in instead,
     /// as when the check was synchronous. Sign-in, turn-off and an account change supersede it.
     private var initialSessionCheck: Int?
+    /// Identifies each first-visit check, so a superseded one can't apply its answer.
     private var initialSessionChecks = 0
     /// Webex players already found, so opening a recording again is instant.
     private var playbackURLs: [String: URL] = [:]

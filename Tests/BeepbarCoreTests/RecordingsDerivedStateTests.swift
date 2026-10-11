@@ -8,6 +8,8 @@ import Testing
 /// cache removed only if it recomputed on equal inputs, which the counters refuse.
 struct RecordingsDerivedStateTests {
     private let rome = TimeZone(identifier: "Europe/Rome")!
+    /// Same offset as Rome all year: only the identifier differs.
+    private let berlin = TimeZone(identifier: "Europe/Berlin")!
     private let tokyo = TimeZone(identifier: "Asia/Tokyo")!
 
     private func recording(_ id: String, _ date: String, title: String = "Lesson", kind: String = "Laboratorio", duration: String = "97 min") -> RecmanRecording {
@@ -59,21 +61,25 @@ struct RecordingsDerivedStateTests {
     }
 
     /// Each presentation input is part of the key: a list change, a search, a language switch, a
-    /// time zone change and a new day each derive again. Missing one would show stale sections.
-    @Test func eachInputChangeRecomputes() {
+    /// time zone change (even to one with the same offset and day) and a new day each derive
+    /// again. Every change is measured against the same base input, so an input left out of the
+    /// key fails here on its own rather than being hidden by another field that also changed.
+    @Test(arguments: ["list", "query", "language", "timeZone", "day"])
+    func eachInputChangeRecomputes(_ input: String) {
         let list = [recording("a", "2026-10-05T10:00:00Z")]
+        let base = inputs(list)
+        let changed: RecmanCourseListDerivation.Inputs = switch input {
+        case "list": inputs(list + [recording("b", "2026-10-06T10:00:00Z")])
+        case "query": inputs(list, query: "les")
+        case "language": inputs(list, language: .english)
+        case "timeZone": inputs(list, timeZone: berlin)
+        default: inputs(list, now: "2026-10-07T10:00:00Z")
+        }
+        if input == "timeZone" { #expect(changed.day == base.day, "the time zone must be keyed on its own, not only through the day") }
         let cache = DerivedValueCache<RecmanCourseListDerivation.Inputs, RecmanCourseListDerivation>()
-        _ = cache.value(for: inputs(list), compute: RecmanCourseListDerivation.init)
-        _ = cache.value(for: inputs(list + [recording("b", "2026-10-06T10:00:00Z")]), compute: RecmanCourseListDerivation.init)
-        #expect(cache.computations == 2)
-        _ = cache.value(for: inputs(list, query: "les"), compute: RecmanCourseListDerivation.init)
-        #expect(cache.computations == 3)
-        _ = cache.value(for: inputs(list, language: .english), compute: RecmanCourseListDerivation.init)
-        #expect(cache.computations == 4)
-        _ = cache.value(for: inputs(list, timeZone: tokyo), compute: RecmanCourseListDerivation.init)
-        #expect(cache.computations == 5)
-        _ = cache.value(for: inputs(list, now: "2026-10-07T10:00:00Z"), compute: RecmanCourseListDerivation.init)
-        #expect(cache.computations == 6)
+        _ = cache.value(for: base, compute: RecmanCourseListDerivation.init)
+        _ = cache.value(for: changed, compute: RecmanCourseListDerivation.init)
+        #expect(cache.computations == 2, "a change of \(input) reused the stale derivation")
     }
 
     /// The day boundary belongs to the list's time zone, not UTC: 23:30 and 00:30 Rome time are
@@ -88,25 +94,60 @@ struct RecordingsDerivedStateTests {
 
     // MARK: Course list derivation
 
-    /// What the pane shows comes from the derivation: search filters the rows but not the lesson
-    /// numbers, sections follow Rome weeks, and the header's minutes add up the whole list.
+    /// What the pane shows comes from the derivation: search filters the rows, sections follow
+    /// Rome weeks; the summary (lesson numbers, the header's minutes) covers the whole list.
     @Test func derivationMatchesThePresentationFunctions() {
         let mon = recording("mon", "2026-10-05T10:00:00Z", title: "Krylov methods")
         let sun = recording("sun", "2026-10-04T10:00:00Z", title: "Sparse matrices", duration: "30 min")
         let old = recording("old", "2026-09-21T10:00:00Z", title: "Intro", duration: "x")
+        let summary = RecmanCourseListSummary([mon, sun, old])
+        #expect(summary.totalMinutes == 127)
+        #expect(summary.numbers == ["old": 1, "sun": 2, "mon": 3])
         let derived = RecmanCourseListDerivation(inputs([mon, sun, old]))
-        #expect(derived.totalMinutes == 127)
-        #expect(derived.numbers == ["old": 1, "sun": 2, "mon": 3])
         #expect(derived.shown.map(\.id) == ["mon", "sun", "old"])
         #expect(derived.sections.map { $0.recordings.map(\.id) } == [["mon"], ["sun"], ["old"]])
         #expect(derived.sections[0].title == RecmanPresentation.weekSections([mon], now: mon.recordedAt, calendar: RecmanPresentation.calendar(timeZone: rome), locale: AppLanguage.italian.locale)[0].title)
         #expect(derived.byID["sun"] == sun)
         let searched = RecmanCourseListDerivation(inputs([mon, sun, old], query: "sparse"))
         #expect(searched.shown.map(\.id) == ["sun"])
-        #expect(searched.numbers["sun"] == 2)
         #expect(searched.sections.count == 1)
         #expect(searched.byID.keys.sorted() == ["sun"])
         #expect(RecmanCourseListDerivation(inputs([])).sections.isEmpty)
+    }
+
+    /// The derivation uses the time zone it is given, not the Mac's: 20:00 UTC on Sunday 4 October
+    /// is still Sunday in Rome (last week) but already Monday in Tokyo (this week). Fails if the
+    /// calendar falls back to `TimeZone.current`, whatever zone the test machine runs in.
+    @Test func weeksFollowTheGivenTimeZone() {
+        let late = recording("late", "2026-10-04T20:00:00Z")
+        let monday = recording("mon", "2026-10-05T10:00:00Z")
+        let inRome = RecmanCourseListDerivation(inputs([late, monday], timeZone: rome))
+        let inTokyo = RecmanCourseListDerivation(inputs([late, monday], timeZone: tokyo))
+        #expect(inRome.sections.map { $0.recordings.map(\.id) } == [["mon"], ["late"]])
+        #expect(inTokyo.sections.map { $0.recordings.map(\.id) } == [["mon", "late"]])
+    }
+
+    /// Older weeks are dated in the language given, not the Mac's: "set" in Italian, "Sep" in
+    /// English. ("Questa settimana" comes from `tr` and the global language, see `Inputs`.)
+    @Test func olderWeeksAreDatedInTheGivenLanguage() {
+        let old = [recording("old", "2026-09-21T10:00:00Z")]
+        let italian = RecmanCourseListDerivation(inputs(old, language: .italian))
+        let english = RecmanCourseListDerivation(inputs(old, language: .english))
+        #expect(italian.sections.first?.title.contains("set") == true)
+        #expect(english.sections.first?.title.contains("Sep") == true)
+    }
+
+    /// The summary depends on the listing only: a search re-derives the rows but not the numbers
+    /// and minutes, which the view keys on the listing alone.
+    @Test func theSummaryIgnoresTheSearch() {
+        let list = [recording("a", "2026-10-05T10:00:00Z"), recording("b", "2026-10-06T10:00:00Z", duration: "30 min")]
+        let cache = DerivedValueCache<[RecmanRecording], RecmanCourseListSummary>()
+        _ = cache.value(for: list, compute: RecmanCourseListSummary.init)
+        _ = cache.value(for: list, compute: RecmanCourseListSummary.init)
+        #expect(cache.computations == 1)
+        #expect(cache.value(for: list, compute: RecmanCourseListSummary.init) == RecmanCourseListSummary(list))
+        _ = cache.value(for: Array(list.prefix(1)), compute: RecmanCourseListSummary.init)
+        #expect(cache.computations == 2)
     }
 
     // MARK: Sidebar

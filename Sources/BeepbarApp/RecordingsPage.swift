@@ -57,8 +57,9 @@ struct RecordingsPage: View {
     /// The sidebar derived from the synced courses (#100). The page observes every publication of
     /// both controllers (a spinner, a row opening, a bookmark), and each archive key costs two
     /// regular expressions per course name and each display name two more: they are worked out
-    /// again only when the course list or the selection changes. A cache, not view state: filling
-    /// it during `body` changes nothing SwiftUI observes.
+    /// again only when the course list or the courses chosen for syncing change. The course shown
+    /// on the right is not part of the key: picking it is a lookup in the result. A cache, not
+    /// view state: filling it during `body` changes nothing SwiftUI observes.
     @State private var sidebarCache = DerivedValueCache<RecmanCourseSidebar.Inputs, RecmanCourseSidebar>()
 
     /// Every use in one `body` after the first is an equality check of the inputs, which for the
@@ -296,17 +297,24 @@ private struct CourseRecordings: View {
     @State private var query = ""
     @State private var selection: String?
     @FocusState private var searchFocused: Bool
-    /// The pane's rows, week sections, lesson numbers and total minutes (#100). The pane observes
-    /// the whole controller, so its `body` runs again when a spinner flips, a row starts opening or
-    /// another course's listing arrives; the sort, the grouping by week (a calendar lookup per
-    /// recording) and the search are redone only when the listing, the search, the language, the
-    /// time zone or the day changes. `RecmanCourseListDerivation.Inputs` says why each is there.
+    /// The pane's rows and week sections (#100). The pane observes the whole controller, so its
+    /// `body` runs again when a spinner flips, a row starts opening or another course's listing
+    /// arrives; the search and the grouping by week (a calendar lookup per recording) are redone
+    /// only when the listing, the search, the language, the time zone or the day changes.
+    /// `RecmanCourseListDerivation.Inputs` says why each is there.
     @State private var derivation = DerivedValueCache<RecmanCourseListDerivation.Inputs, RecmanCourseListDerivation>()
+    /// Lesson numbers and total minutes, which depend on the listing alone: typing in the search
+    /// doesn't sort the whole list again.
+    @State private var summaryCache = DerivedValueCache<[RecmanRecording], RecmanCourseListSummary>()
 
     private var listing: RecordingsListing? { recordings.listing(for: key) }
 
     private func derivedList(_ list: [RecmanRecording]) -> RecmanCourseListDerivation {
         derivation.value(for: .init(recordings: list, query: query, language: AppLanguage.current, timeZone: .current, now: Date()), compute: RecmanCourseListDerivation.init)
+    }
+
+    private func summary(_ list: [RecmanRecording]) -> RecmanCourseListSummary {
+        summaryCache.value(for: list, compute: RecmanCourseListSummary.init)
     }
 
     var body: some View {
@@ -380,7 +388,7 @@ private struct CourseRecordings: View {
         guard let list = listing?.recordings else {
             return listing?.isLoading == true ? "\(year) · \(tr("caricamento…", "loading…"))" : year
         }
-        let minutes = derivedList(list).totalMinutes
+        let minutes = summary(list).totalMinutes
         var parts = [year, tr("\(list.count) registrazioni", englishCount(list.count, "recording", "recordings"))]
         if minutes > 0 { parts.append(RecordingsPresentation.durationText(minutes: minutes)) }
         return parts.joined(separator: " · ")
@@ -422,7 +430,7 @@ private struct CourseRecordings: View {
             } else if model.shown.isEmpty {
                 ContentUnavailableView.search(text: query)
             } else {
-                recordingList(model)
+                recordingList(model, numbers: summary(list).numbers)
             }
         } else if listing?.isLoading == true {
             VStack(spacing: 10) {
@@ -434,7 +442,7 @@ private struct CourseRecordings: View {
         }
     }
 
-    private func recordingList(_ model: RecmanCourseListDerivation) -> some View {
+    private func recordingList(_ model: RecmanCourseListDerivation, numbers: [String: Int]) -> some View {
         let byID = model.byID
         let firstID = model.shown.first?.id
         // One set per `body` instead of a scan of every bookmark for every row.
@@ -445,7 +453,7 @@ private struct CourseRecordings: View {
                     ForEach(section.recordings) { recording in
                         RecordingRow(
                             recording: recording,
-                            number: model.numbers[recording.id],
+                            number: numbers[recording.id],
                             isNew: recordings.isNew(recording),
                             isOpening: recordings.openingRecordingID == recording.id,
                             isWatchlisted: watchlisted.contains(RecordingsStudyState.identity(recording)),
@@ -482,8 +490,19 @@ private struct WatchlistRecordings: View {
     let refresh: () -> Void
     @State private var query = ""
     @State private var selection: String?
+    /// The bookmarks matching the search, newest first (#100): filtered and sorted again only when
+    /// the bookmarks or the search change, not on every publication of the controller.
+    @State private var shownCache = DerivedValueCache<ShownInputs, [RecordingsStudyState.Bookmark]>()
 
-    private var shown: [RecordingsStudyState.Bookmark] { recordings.study.visibleBookmarks(query: query) }
+    private struct ShownInputs: Equatable {
+        let bookmarks: [RecordingsStudyState.Bookmark]
+        let query: String
+    }
+
+    private var shown: [RecordingsStudyState.Bookmark] {
+        let study = recordings.study
+        return shownCache.value(for: ShownInputs(bookmarks: study.bookmarks, query: query)) { study.visibleBookmarks(query: $0.query) }
+    }
 
     private var listings: [RecordingsListing] {
         let keys = Set(recordings.study.bookmarks.compactMap {
@@ -493,8 +512,8 @@ private struct WatchlistRecordings: View {
             .compactMap { recordings.listing(for: $0) }
     }
 
-    // `shown` filters and sorts every bookmark and `listings` looks up every bookmarked course:
-    // each is worked out once per `body` and passed down, not once per use (#100).
+    // `listings` looks up every bookmarked course, and depends on listings the controller updates
+    // all the time: worked out once per `body` and passed down, not once per use (#100).
     var body: some View {
         let shown = self.shown
         let listings = self.listings

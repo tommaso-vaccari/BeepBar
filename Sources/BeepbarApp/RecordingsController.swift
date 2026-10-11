@@ -101,11 +101,12 @@ struct RecordingsListing: Equatable {
 
     @Published private(set) var isEnabled: Bool
     @Published private(set) var access: RecordingsAccess
-    /// How many course listings stay in memory beyond the courses on the page (#100). The page's
-    /// own courses are pinned and never evicted, so reopening one stays immediate; the rest
-    /// (courses deselected since, bookmarked courses of other years) go least recently updated
-    /// first. Well above a semester's courses plus a watchlist's, so in normal use nothing a user
-    /// goes back to is reloaded; the bound is for sessions that stay open for weeks.
+    /// How many course listings stay in memory (#100), the page's own included. The page's courses
+    /// are pinned and never evicted, even past the bound, so reopening one stays immediate; the
+    /// others (courses deselected since, bookmarked courses of other years) fill what is left and
+    /// go least recently updated first. Well above a semester's courses plus a watchlist's, so in
+    /// normal use nothing a user goes back to is reloaded; the bound is for sessions that stay
+    /// open for weeks.
     nonisolated static let listingCapacity = 64
     /// Webex players remembered for an instant second opening; a few hundred bytes each.
     nonisolated static let playbackURLCapacity = 512

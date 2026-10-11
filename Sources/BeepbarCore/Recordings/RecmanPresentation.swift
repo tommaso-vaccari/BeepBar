@@ -1,9 +1,9 @@
 import Foundation
 
 /// How the Recordings page reads a list of recordings: weeks, lesson numbers, durations, search.
-/// Pure functions of their arguments (language included, through `tr`), kept in Core so the
-/// derivation below can be cached by its inputs and tested without SwiftUI (#100). The app's
-/// `RecordingsPresentation` forwards to these.
+/// Kept in Core so the derivations below can be cached by their inputs and tested without SwiftUI
+/// (#100); the app's `RecordingsPresentation` forwards to these. Pure functions of their
+/// arguments, except that the week titles go through `tr`, which reads `AppLanguage.current`.
 public enum RecmanPresentation {
     public struct WeekSection: Equatable, Sendable {
         public let title: String
@@ -90,18 +90,36 @@ public enum RecmanPresentation {
     }
 }
 
-/// Everything the course pane derives from one listing: the search result, the lesson numbers,
-/// the week sections, the total duration and the rows by id. Computed once per change of
-/// `Inputs` and held by a `DerivedValueCache` in the view, instead of once per `body` (#100).
+/// What the course pane shows about a listing whatever the search: the total duration in the
+/// header and each lesson's number. Derived once per listing (#100), so typing in the search,
+/// which only changes `RecmanCourseListDerivation`, never re-sorts the whole list again.
+public struct RecmanCourseListSummary: Equatable, Sendable {
+    /// The sum of every recording's minutes, for the header; zero when no duration parsed.
+    public let totalMinutes: Int
+    /// Lesson numbers over the whole list, so a search doesn't renumber the lessons it shows.
+    public let numbers: [String: Int]
+
+    public init(_ recordings: [RecmanRecording]) {
+        totalMinutes = recordings.compactMap { RecmanPresentation.minutes($0.duration) }.reduce(0, +)
+        numbers = RecmanPresentation.numbers(recordings)
+    }
+}
+
+/// What the course pane shows of a listing for the current search: the matching rows, grouped by
+/// week, and the rows by id. Computed once per change of `Inputs` and held by a
+/// `DerivedValueCache` in the view, instead of once per `body` (#100).
 public struct RecmanCourseListDerivation: Equatable, Sendable {
     /// What the derivation depends on, and so what invalidates it. Leaving one out shows stale
-    /// content: the sections' titles follow the language, the week boundaries the time zone,
+    /// content: the week titles follow the language, the week boundaries the time zone,
     /// "this week" and the year suffix the day.
     public struct Inputs: Equatable, Sendable {
         /// The course's recordings as listed. Comparing two arrays that share storage is O(1),
         /// so an unchanged `@Published` listing costs no element comparison.
         public var recordings: [RecmanRecording]
         public var query: String
+        /// Must be `AppLanguage.current`: the dates of older weeks are written in this language,
+        /// but "Questa settimana" and "Settimana scorsa" come from `tr`, which reads the global.
+        /// Part of the key so that a language switch derives the titles again.
         public var language: AppLanguage
         public var timeZoneIdentifier: String
         /// The start of "today" in that zone: the sections depend on `now` only through the
@@ -117,21 +135,14 @@ public struct RecmanCourseListDerivation: Equatable, Sendable {
         }
     }
 
-    /// The sum of every recording's minutes, for the header; zero when no duration parsed.
-    public let totalMinutes: Int
     /// The recordings matching the query, in listing order.
     public let shown: [RecmanRecording]
-    /// Lesson numbers over the whole list, so a search doesn't renumber the lessons it shows.
-    public let numbers: [String: Int]
     public let sections: [RecmanPresentation.WeekSection]
     /// `shown` by id, for the list's selection-based actions.
     public let byID: [String: RecmanRecording]
 
     public init(_ inputs: Inputs) {
-        let list = inputs.recordings
-        totalMinutes = list.compactMap { RecmanPresentation.minutes($0.duration) }.reduce(0, +)
-        shown = list.filter { RecmanPresentation.matches($0, query: inputs.query) }
-        numbers = RecmanPresentation.numbers(list)
+        shown = inputs.recordings.filter { RecmanPresentation.matches($0, query: inputs.query) }
         let zone = TimeZone(identifier: inputs.timeZoneIdentifier) ?? .current
         sections = RecmanPresentation.weekSections(shown, now: inputs.day, calendar: RecmanPresentation.calendar(timeZone: zone), locale: inputs.language.locale)
         byID = Dictionary(shown.map { ($0.id, $0) }, uniquingKeysWith: { first, _ in first })

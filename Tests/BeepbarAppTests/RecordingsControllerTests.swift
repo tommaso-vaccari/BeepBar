@@ -1,3 +1,4 @@
+import Combine
 import Foundation
 import Testing
 import BeepbarCore
@@ -889,6 +890,24 @@ struct RecordingsControllerTests {
         controller.refresh([course], selected: course)
         await settle("forgotten course listed again") { controller.listing(for: course)?.recordings != nil }
         #expect(browser.listCalls.count == calls + 1)
+    }
+
+    /// Asking again for an unchanged page publishes nothing (#100): `listings` is published and
+    /// the page asks for its courses on every appearance and change, so re-pinning the same keys
+    /// would redraw the whole page for nothing. Fails if the pins are rewritten unconditionally.
+    @Test func refreshingTheSamePageDoesNotRepublish() async throws {
+        defer { cleanUp() }
+        for key in [course, other] { browser.listResults[key.courseCode] = .success([recording("r\(key.courseCode)", key)]) }
+        let controller = await readyController()
+        controller.refresh([course, other], selected: course)
+        await settle("both listed") { [course, other].allSatisfy { controller.listing(for: $0)?.recordings != nil } }
+        await drainTasks()
+        var changes = 0
+        let subscription = controller.objectWillChange.sink { changes += 1 }
+        defer { subscription.cancel() }
+        controller.refresh([course, other], selected: course)
+        #expect(changes == 0, "an unchanged page republished the controller")
+        #expect(controller.listings.pinnedKeys == [course, other])
     }
 
     /// Remembered Webex players are bounded too (#100): within the bound a second opening needs

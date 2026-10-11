@@ -386,6 +386,49 @@ Evidenza: undici test in `Tests/BeepbarCoreTests/ActivityRowLayoutTests.swift` (
 
 **Registrazioni:** ordinamento/raggruppamento, filtri e scansioni `newCount` si ripetono con aggiornamenti del controller osservato. Profilare `RecordingsPresentation` e `RecordingsPage`; solo dopo introdurre cache derivate per revisione effettiva della lista e input di presentazione. Invalidare per lingua/fuso orario, ricerca e stato visto. Confrontare allocazioni, valutazioni dei body e scorrimento. Se visite a molti corsi/anni mostrano crescita, definire retention limitata di liste e URL playback, preservando la riapertura immediata già prevista.
 
+**Implementata tramite D12 ([#100](https://github.com/tommaso-vaccari/BeepBar/issues/100), [PR #141](https://github.com/tommaso-vaccari/BeepBar/pull/141)), non ancora integrata.** Evidenza raccolta leggendo il codice su dev `713033c`, non profilata. `RecordingsPage.body` ricalcolava a ogni pubblicazione dei due controller osservati (spinner, apertura di una riga, segnalibri, elenchi di altri corsi) la barra laterale: per ogni corso la chiave d'archivio, con due regex per nome, e il nome mostrato, con altre due. `CourseRecordings` riordinava, raggruppava per settimana (una ricerca nel calendario per registrazione), filtrava e rinumerava l'elenco a ogni `body`, e `study.contains` scorreva tutti i segnalibri per ogni riga. `WatchlistRecordings` valutava filtro e ordinamento tre volte per `body`. `listings` e `playbackURLs` crescevano con ogni corso e lettore visitato, fino alla disattivazione o al cambio account.
+
+Intervento:
+- **Core:**
+  - `DerivedValueCache`: un valore, chiave `Equatable`, contatore dei ricalcoli.
+  - `BoundedCache`: LRU per scrittura, con chiavi fissate mai rimosse; rimuove fino a tornare sotto la capacità.
+  - `RecmanCourseSidebar`: corsi sincronizzati, ricercabili e non, con nomi e chiavi.
+  - `RecmanCourseListSummary`: numeri delle lezioni e minuti totali, per elenco.
+  - `RecmanCourseListDerivation`: righe, sezioni e righe per id, con chiave elenco, ricerca, lingua, fuso orario e giorno.
+  - Le funzioni di presentazione sono spostate in Core; `RecordingsPresentation` dell'app le inoltra.
+- **App:** la pagina tiene i memo nello stato delle viste. La watchlist è in memo su (segnalibri, ricerca), con un insieme di segnalibri per `body`.
+- **Controller:** `listings` e `playbackURLs` diventano `BoundedCache` con capacità 64 e 512. I corsi della pagina sono fissati: riaprirli resta immediato. Le fissazioni vengono riscritte solo se cambiano, così una pagina invariata non ridisegna.
+
+Restano per `body`, per scelta: `isNew`, `newCount` e `acknowledge` (stato visto, toccato da #106, fuori perimetro), e la ricerca degli elenchi dei corsi in watchlist, che dipende da `listings` aggiornati di continuo. Nessun cambiamento di comportamento visibile: le specifiche restano invariate. Un corso uscito dalla pagina e dimenticato oltre il limite viene richiesto di nuovo quando torna.
+
+Prove: 12 test Core `RecordingsDerivedStateTests` verdi su Linux:
+- nessun ricalcolo con input uguali;
+- ricalcolo per ogni input rispetto a una base comune, compresi una lingua diversa e un fuso con lo stesso offset;
+- settimane nel fuso dato;
+- date nella lingua data;
+- riepilogo indipendente dalla ricerca;
+- LRU, fissazioni e capacità.
+
+Test app (solo CI macOS):
+- `listingsOffThePageAreBoundedWhileThePageKeepsItsOwn`;
+- `rememberedPlayersAreBounded`;
+- `refreshingTheSamePageDoesNotRepublish`;
+- `RecordingsPresentationTests`, invariati, ora esercitano l'inoltro a Core.
+
+Mutazioni Core su una copia usa e getta, tutte rosse dopo la review:
+- lingua tolta dalla chiave;
+- giorno non quantizzato;
+- giorno in UTC;
+- ordine LRU non aggiornato alle scritture;
+- fissazioni ignorate;
+- memo sempre mancato;
+- una sola rimozione per inserimento;
+- ricerca ignorata.
+
+La prima esecuzione ha trovato un test debole (la lingua sopravviveva), corretto. Le mutazioni dei test app sono registrate nella PR.
+
+**Non misurato:** valutazioni dei `body`, allocazioni, scorrimento, memoria dopo molte visite, confronti base dev → HEAD e main → HEAD. Nessun Mac disponibile. Prossimo passo: `scripts/ui-benchmark.py` con gli scenari `recordings-1000` e `recordings-5000` di D07 su entrambe le revisioni, più una traccia Time Profiler della pagina durante gli aggiornamenti del controller. Nessun beneficio temporale rivendicato; la riduzione dimostrata è strutturale (contatori nei test).
+
 ### I11 — Errori nelle opzioni benchmark rifiutati prima del lavoro
 
 **Consegna [#108](https://github.com/tommaso-vaccari/BeepBar/issues/108).** Il parser condiviso col test valida opzioni per comando, duplicati, valori mancanti e domini numerici prima di creare output o avviare scenari. `baseline --output` ora termina con usage/64; il flag resta `--out`. Controllate anche somme dei campioni/arrotondamento del corpus e conversioni MiB: input non rappresentabili non causano trap. Default, warmup zero e opzioni valide conservati; `--json` per scenari/idle, `--out` per baseline.

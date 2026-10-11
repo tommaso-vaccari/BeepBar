@@ -2433,10 +2433,6 @@ struct RecordingsControllerTests {
         #expect(resumeWrites() == 2, "one write, one removal: the close's report wrote nothing")
     }
 
-    /// While the Polimi session is gone nothing can look a stream up: a lecture that stops is
-    /// left alone and its one retry is not spent, so after signing in again it still recovers.
-    /// Mutation: insert into `recoveredLectures` in `playerFailed` again (before the access
-    /// guard) and the last expectation fails.
     /// A stream that dies mid-lecture stores where it stopped at once, from the `.failed`
     /// checkpoint alone, with no pause or close after it: if the student then quits, the place
     /// survives. Guards against handling only some checkpoint reasons now that reports carry one.
@@ -2457,6 +2453,10 @@ struct RecordingsControllerTests {
         controller.turnOff()
     }
 
+    /// While the Polimi session is gone nothing can look a stream up: a lecture that stops is
+    /// left alone and its one retry is not spent, so after signing in again it still recovers.
+    /// Mutation: insert into `recoveredLectures` in `playerFailed` again (before the access
+    /// guard) and the last expectation fails.
     @Test func aFailureWhileSignedOutDoesNotSpendTheRetry() async {
         defer { cleanUp() }
         browser.streamResults["a"] = [.success(stream("a")), .success(stream("a"))]

@@ -57,7 +57,7 @@ final class ViewWithoutPlayer: NSView {}
 
 /// Counts time observers added and removed, and the intervals asked for: the player may hold one
 /// periodic observer only while playing, and never a boundary observer.
-final class CountingPlayer: AVPlayer, @unchecked Sendable {
+class CountingPlayer: AVPlayer, @unchecked Sendable {
     struct Counts {
         var periodicAdded = 0
         var boundaryAdded = 0
@@ -102,8 +102,9 @@ final class CountingPlayer: AVPlayer, @unchecked Sendable {
 }
 
 /// Records every seek's tolerances and can hold seeks in flight, to observe the moment between
-/// a resume seek being issued and landing.
-final class SeekRecordingPlayer: AVPlayer, @unchecked Sendable {
+/// a resume seek being issued and landing. A `CountingPlayer`, so a held resume can also force
+/// its status and count its time observers.
+final class SeekRecordingPlayer: CountingPlayer, @unchecked Sendable {
     struct Seek { let target: Double; let before: CMTime; let after: CMTime }
     private struct Held { let time: CMTime; let before: CMTime; let after: CMTime; let completion: @Sendable (Bool) -> Void }
     private let state = OSAllocatedUnfairLock(initialState: (seeks: [Seek](), hold: false, held: [Held]()))
@@ -592,6 +593,32 @@ struct RecordingPlayerMVPTests {
         await Self.settle()
         #expect(player.active == 0)
         #expect(player.counts.withLock { $0.periodicAdded } == added + 1)
+    }
+
+    /// When the student started the held player during the resume and its status reports are
+    /// all handled before the seek lands, landing brings no further status change: the observer
+    /// replaced in `settleStart` must be added again there, or the lecture plays to its end with
+    /// no progress at all. The status is pinned to `.playing` so no later report can add it
+    /// back by chance. Mutation: drop the `updateProgressObserver` call after
+    /// `removeProgressObserver()` in `settleStart` and the serial is nil after the landing.
+    @Test func settlingReplacesTheEarlyObserverWithALiveOne() async throws {
+        let recorder = Recorder()
+        let (controller, player) = try await makeHeldResume(recorder: recorder)
+        player.play()
+        try await Self.waitUntil { player.timeControlStatus == .playing && controller.progressObserverSerial != nil }
+        await Self.settle()
+        let early = try #require(controller.progressObserverSerial)
+        player.report(.playing)
+        player.releaseSeeks()
+        try await Self.waitUntil { controller.isStartSettled }
+        #expect(controller.progressObserverSerial != nil, "still playing: the observer must exist")
+        #expect(controller.progressObserverSerial != early, "a fresh observer, not the early one")
+        #expect(player.active == 1)
+        await Self.settle()
+        #expect(player.active == 1)
+        player.report(nil)
+        controller.close()
+        #expect(player.active == 0)
     }
 
     /// A lecture that stalls (waiting for data at a rate) is still moving: the observer stays,

@@ -334,10 +334,12 @@ enum RecordingPlayerError: Error {
 /// Linking AVKit makes dyld load it, and everything it depends on, at every launch. Measured in
 /// the review of issue #148 (macOS 27, arm64): BeepBar's Release binary loads 586 images at
 /// launch, AVFoundation already among them (a probe linking the same system frameworks shows it
-/// arrives with them), so using AVFoundation costs nothing at launch; linking AVKit raised it to 921 (CallKit, Contacts, CloudKit, MediaRemote, picture in picture,
-/// Siri…), about +3.5 ms of warm launch and +0.25 MB, for every user, including those who never
-/// press Play. Loaded on demand, the cost moves to the first Play: a probe with the same links
-/// went from 657 images to 920 after `dlopen` and 1151 once an `AVPlayerView` existed.
+/// arrives with them), so using AVFoundation costs nothing at launch; linking AVKit raised it to
+/// 921 (CallKit, Contacts, CloudKit, MediaRemote, picture in picture, Siri…), about +3.5 ms of
+/// warm launch and +0.25 MB, for every user, including those who never press Play. Loaded on
+/// demand, the cost moves to the first Play: a probe with the same system links (and
+/// `NSApplication` up) went from 656 images to 920 after `dlopen` and 1151 once an
+/// `AVPlayerView` with its `AVPlayer` existed.
 /// An Objective-C framework cannot be unloaded, so after the first Play it stays mapped until
 /// quit; the player's own objects are still released on close.
 ///

@@ -187,8 +187,10 @@ struct RecordingPlayerControllerTests {
         #expect(controller.player?.currentItem != nil)
         #expect(Self.player(of: controller.playerView) === controller.player)
         // The previous window's deferred release must not take the new one with it.
+        let second = controller.window
         await Self.settle()
-        #expect(controller.window?.contentView === controller.playerView)
+        #expect(controller.window != nil && controller.window === second)
+        #expect(controller.playerView != nil && controller.window?.contentView === controller.playerView)
         #expect(controller.isOpen)
         controller.close()
     }

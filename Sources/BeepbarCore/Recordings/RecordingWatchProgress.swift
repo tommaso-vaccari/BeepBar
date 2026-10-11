@@ -23,6 +23,11 @@ import Foundation
 public struct RecordingWatchEntry: Codable, Equatable, Sendable {
     /// How a lecture became done. The raw values are persisted (`progress.completed`) and must
     /// never change: an older or newer build reads the same numbers.
+    ///
+    /// A reader that meets a non-null value it doesn't know (written by a newer build that added
+    /// another way of completing) must treat the lecture as done, never as not done, and must not
+    /// rewrite that row: turning it into nil or a known case would silently undo the student's
+    /// completion once they go back to the newer build.
     public enum Completion: Int, Codable, Sendable {
         /// Closed the player at or past `RecordingWatchProgress.completionThreshold`.
         case playback = 1
@@ -207,8 +212,11 @@ public enum RecordingWatchProgress {
 
     /// The summary of one course's archive rows. `entries` are the stored entries by recording id,
     /// `live` the in-memory fractions of lectures playing now (they may be ahead of the stored
-    /// furthest). Every row counts in `total`; a row of unknown length adds no minutes. Rows are
-    /// expected to have distinct ids, as the parser guarantees.
+    /// furthest). Every row counts in `total`; a row of unknown length adds no minutes and, when
+    /// not done, counts in `unknownDurationCount`. A length outside
+    /// `0...RecmanRecording.maxPlausibleMinutes` is treated as unknown, whatever the caller passed,
+    /// so a damaged row can't make the sum overflow (see `maxPlausibleMinutes`). Rows are expected
+    /// to have distinct ids, as the parser guarantees.
     public static func courseSummary(_ rows: [(id: String, minutes: Int?)], entries: [String: RecordingWatchEntry], live: [String: Double]) -> CourseWatchSummary {
         var done = 0
         var unknown = 0
@@ -219,7 +227,7 @@ public enum RecordingWatchProgress {
                 done += 1
                 continue
             }
-            guard let minutes = row.minutes, minutes >= 0 else {
+            guard let minutes = row.minutes, (0...RecmanRecording.maxPlausibleMinutes).contains(minutes) else {
                 unknown += 1
                 continue
             }
@@ -227,14 +235,24 @@ public enum RecordingWatchProgress {
             remaining += Double(minutes) * (1 - watched)
         }
         // Rounded once over the whole course, so many partly watched lectures don't each lose
-        // half a minute.
-        return CourseWatchSummary(done: done, total: rows.count, remainingMinutes: Int(remaining.rounded()), unknownDurationCount: unknown)
+        // half a minute. With every row capped the sum can't reach `Int.max` in practice; the
+        // saturating conversion is a second guard, because `Int(_:)` traps on an out-of-range
+        // Double and this runs on every listing and menu refresh.
+        let rounded = remaining.rounded()
+        let remainingMinutes = rounded < Double(Int.max) ? Int(rounded) : Int.max
+        return CourseWatchSummary(done: done, total: rows.count, remainingMinutes: remainingMinutes, unknownDurationCount: unknown)
     }
 
     /// One menu bar line, e.g. "Analisi 2 — 12/30 · ~14 h", in both languages so the caller can
     /// rebuild the menu after a language switch without recomputing anything. Under an hour the
-    /// time left reads "~45 min"; with nothing left to watch only the count is shown; a course
-    /// with every lecture done says so; a course with no recordings never reads "0/0".
+    /// time left reads "~45 min"; from 60 minutes on it reads whole hours, rounded half away from
+    /// zero (150 min → "~3 h"); with nothing left to watch only the count is shown; a course with
+    /// every lecture done says so; a course with no recordings never reads "0/0".
+    ///
+    /// - Lectures of unknown length (`unknownDurationCount`) add nothing to "~N h", so the
+    ///   estimate can understate the time left; the "~" is the only hint.
+    /// - The empty-course text exists so this function is total, but the menu bar (package F)
+    ///   omits courses with `total == 0` instead of showing it.
     public static func menuLine(courseName: String, _ summary: CourseWatchSummary) -> BilingualText {
         let head = "\(courseName) — "
         if summary.total == 0 {

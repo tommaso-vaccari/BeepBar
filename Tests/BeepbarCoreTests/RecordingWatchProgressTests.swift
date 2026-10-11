@@ -97,6 +97,15 @@ struct RecordingWatchProgressTests {
         #expect(later.completed == .playback)
     }
 
+    /// Completion by playback reads the stored furthest point, not just this session: a lecture
+    /// paused at 95 % earlier, reopened from the start and closed at 10 % is done. Guards against
+    /// a student who watched almost all of it across sessions never seeing it done. Mutation:
+    /// test `(session.maxFraction ?? 0) >= completionThreshold` instead of `furthest` and this fails.
+    @Test func completionUsesTheStoredFurthestPoint() throws {
+        let reopened = try #require(Progress.applyCheckpoint(Entry(furthest: 0.95), session: session(start: 0, 0.1), closes: true))
+        #expect(reopened == Entry(furthest: 0.95, completed: .playback))
+    }
+
     /// Which checkpoints are closes: a close is; a replacement by a different lecture is (or by
     /// an unknown one); a replacement by the same lecture (recovery or Play again) is not; pause
     /// and failure are not. Mutation: return true for `.replaced` unconditionally and the same-id
@@ -127,7 +136,8 @@ struct RecordingWatchProgressTests {
 
     /// Ticking an untouched lecture makes it done at 0 %; ticking keeps furthest; ticking again or
     /// un-ticking something not done changes nothing. Mutation: reset furthest when ticking and
-    /// the 0.4 expectation fails; drop the "already done" guard and the repeat returns non-nil.
+    /// the 0.4 expectation fails; drop the "already done" guard, or narrow it to
+    /// `old.completed != .manual`, and ticking an already done lecture returns non-nil.
     @Test func tickingAndUntickingAreIdempotent() throws {
         let ticked = try #require(Progress.setManual(nil, done: true))
         #expect(ticked == Entry(furthest: 0, completed: .manual, autoCompletionBlocked: false))
@@ -137,6 +147,9 @@ struct RecordingWatchProgressTests {
 
         let partly = try #require(Progress.setManual(Entry(furthest: 0.4), done: true))
         #expect(partly.furthest == 0.4)
+
+        #expect(Progress.setManual(Entry(furthest: 0.95, completed: .playback), done: true) == nil,
+                "already done by playback: ticking writes nothing and keeps .playback")
 
         let unticked = try #require(Progress.setManual(Entry(furthest: 0.95, completed: .playback), done: false))
         #expect(unticked == Entry(furthest: 0.95, completed: nil, autoCompletionBlocked: true), "keeps furthest, blocks auto-completion")
@@ -220,6 +233,22 @@ struct RecordingWatchProgressTests {
         #expect(doneUnknown.unknownDurationCount == 0, "a done lecture's length doesn't matter")
     }
 
+    /// A damaged row with an absurd length ("9223372036854775807 min", which the parser accepts)
+    /// or two huge rows that would overflow together never trap: lengths above 24 h count in
+    /// `total` and `unknownDurationCount` and add no minutes; exactly 24 h is still a length.
+    /// Guards against a crash on every listing and menu refresh. Mutation: drop the
+    /// `maxPlausibleMinutes` bound in `courseSummary` and the run traps (or the counts fail).
+    @Test func implausibleLengthsCountAsUnknownAndNeverTrap() {
+        let huge = Int.max / 2 + 1
+        let rows: [(id: String, minutes: Int?)] = [
+            ("max", Int.max), ("big1", huge), ("big2", huge), ("day", 1_440), ("dayAndAMinute", 1_441), ("negative", -5),
+        ]
+        let summary = Progress.courseSummary(rows, entries: [:], live: [:])
+        #expect(summary == CourseWatchSummary(done: 0, total: 6, remainingMinutes: 1_440, unknownDurationCount: 5))
+        let line = Progress.menuLine(courseName: "C", summary)
+        #expect(line.english == "C — 0/6 · ~24 h")
+    }
+
     /// The summary is stored as numbers and round-trips, so the menu can show the last known one
     /// after a relaunch. Guards against a Codable change breaking the persisted value.
     @Test func summaryAndEntryRoundTrip() throws {
@@ -236,13 +265,17 @@ struct RecordingWatchProgressTests {
 
     /// The menu line in both languages: hours rounded to the nearest, minutes under an hour, "all
     /// done" when every lecture is done, the bare count when nothing measurable is left, and never
-    /// "0/0". Mutation: drop the under-an-hour branch and "~45 min" becomes "~1 h"; drop the
-    /// `total == 0` branch and the empty course reads "0/0 · tutte fatte".
+    /// "0/0". Mutation: drop the under-an-hour branch and "~45 min" becomes "~1 h"; make it
+    /// `<= 60` and exactly 60 min reads "~60 min"; round hours with `.toNearestOrEven` and 150 min
+    /// reads "~2 h"; drop the `total == 0` branch and the empty course reads "0/0 · tutte fatte".
     @Test func menuLineInBothLanguages() {
         func line(_ done: Int, _ total: Int, _ minutes: Int) -> BilingualText {
             Progress.menuLine(courseName: "Analisi 2", CourseWatchSummary(done: done, total: total, remainingMinutes: minutes, unknownDurationCount: 0))
         }
         #expect(line(12, 30, 840) == BilingualText("Analisi 2 — 12/30 · ~14 h", "Analisi 2 — 12/30 · ~14 h"))
+        #expect(line(12, 30, 59) == BilingualText("Analisi 2 — 12/30 · ~59 min", "Analisi 2 — 12/30 · ~59 min"))
+        #expect(line(12, 30, 60) == BilingualText("Analisi 2 — 12/30 · ~1 h", "Analisi 2 — 12/30 · ~1 h"), "exactly an hour reads as hours")
+        #expect(line(12, 30, 150) == BilingualText("Analisi 2 — 12/30 · ~3 h", "Analisi 2 — 12/30 · ~3 h"), "2.5 h rounds up, not to even")
         #expect(line(12, 30, 89) == BilingualText("Analisi 2 — 12/30 · ~1 h", "Analisi 2 — 12/30 · ~1 h"))
         #expect(line(12, 30, 90) == BilingualText("Analisi 2 — 12/30 · ~2 h", "Analisi 2 — 12/30 · ~2 h"))
         #expect(line(29, 30, 45) == BilingualText("Analisi 2 — 29/30 · ~45 min", "Analisi 2 — 29/30 · ~45 min"))
@@ -254,9 +287,14 @@ struct RecordingWatchProgressTests {
     // MARK: Duration
 
     /// The minutes in Recman's duration, shared by the row and the estimate: "0 min" is 0 (not
-    /// unknown), anything without leading digits is nil, and an overflowing number is nil rather
-    /// than a crash. Mutation: make `minutes` return nil for 0 and the "0 min" case fails.
+    /// unknown), anything without leading digits is nil, an overflowing number is nil rather than
+    /// a crash, and a length above 24 h is nil (unknown), so the course header's sum in the window
+    /// can't overflow either. Mutation: make `minutes` return nil for 0 and the "0 min" case fails;
+    /// drop the `maxPlausibleMinutes` bound and the 1441 and `Int.max` cases fail.
     @Test func recordingMinutes() throws {
+        #expect(RecmanRecording.minutes(inDuration: "1440 min") == 1_440)
+        #expect(RecmanRecording.minutes(inDuration: "1441 min") == nil)
+        #expect(RecmanRecording.minutes(inDuration: "9223372036854775807 min") == nil)
         #expect(RecmanRecording.minutes(inDuration: "97 min") == 97)
         #expect(RecmanRecording.minutes(inDuration: "97min") == 97)
         #expect(RecmanRecording.minutes(inDuration: "0 min") == 0)

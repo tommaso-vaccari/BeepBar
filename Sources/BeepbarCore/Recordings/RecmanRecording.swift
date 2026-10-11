@@ -63,10 +63,19 @@ public struct RecmanRecording: Sendable, Equatable, Identifiable, Codable {
     /// (`RecordingWatchProgress.courseSummary`), so both read the same number.
     public var minutes: Int? { Self.minutes(inDuration: duration) }
 
-    /// The leading ASCII digits of a duration text. The parser accepts only `^[0-9]+\s*min$`, so
-    /// for a parsed row this is the whole number; a value too large for `Int` gives nil.
+    /// The longest length taken at face value: 24 hours. The parser accepts any `^[0-9]+\s*min$`,
+    /// so a damaged row could say "9223372036854775807 min"; summing such values (the course
+    /// header, the hours-left estimate) would trap on `Int` overflow. No lecture recording is a day
+    /// long, so anything longer is treated as an unknown length: the row then shows Recman's text
+    /// as is and adds nothing to the totals.
+    public static let maxPlausibleMinutes = 1_440
+
+    /// The leading ASCII digits of a duration text, or nil when there are none or the number is
+    /// above `maxPlausibleMinutes` (including numbers too large for `Int`). The parser accepts only
+    /// `^[0-9]+\s*min$`, so for a parsed row the digits are the whole number.
     public static func minutes(inDuration duration: String) -> Int? {
-        Int(duration.prefix { ("0"..."9").contains($0) })
+        guard let value = Int(duration.prefix { ("0"..."9").contains($0) }), value <= maxPlausibleMinutes else { return nil }
+        return value
     }
 }
 

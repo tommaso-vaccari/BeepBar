@@ -101,7 +101,16 @@ struct RecordingsListing: Equatable {
 
     @Published private(set) var isEnabled: Bool
     @Published private(set) var access: RecordingsAccess
-    @Published private(set) var listings: [RecmanCourseKey: RecordingsListing] = [:]
+    /// How many course listings stay in memory beyond the courses on the page (#100). The page's
+    /// own courses are pinned and never evicted, so reopening one stays immediate; the rest
+    /// (courses deselected since, bookmarked courses of other years) go least recently updated
+    /// first. Well above a semester's courses plus a watchlist's, so in normal use nothing a user
+    /// goes back to is reloaded; the bound is for sessions that stay open for weeks.
+    nonisolated static let listingCapacity = 64
+    /// Webex players remembered for an instant second opening; a few hundred bytes each.
+    nonisolated static let playbackURLCapacity = 512
+
+    @Published private(set) var listings: BoundedCache<RecmanCourseKey, RecordingsListing>
     /// The recording whose player is being looked up, for its row's spinner.
     @Published private(set) var openingRecordingID: String?
     /// Why the last attempt to open a recording failed, until the next one.
@@ -145,8 +154,9 @@ struct RecordingsListing: Equatable {
     private var initialSessionCheck: Int?
     /// Identifies each first-visit check, so a superseded one can't apply its answer.
     private var initialSessionChecks = 0
-    /// Webex players already found, so opening a recording again is instant.
-    private var playbackURLs: [String: URL] = [:]
+    /// Webex players already found, so opening a recording again is instant. Bounded (#100): it
+    /// used to grow with every recording opened until the feature was turned off.
+    private var playbackURLs: BoundedCache<String, URL>
 
     private enum Job: Equatable {
         case list(RecmanCourseKey)
@@ -177,8 +187,12 @@ struct RecordingsListing: Equatable {
             NSPasteboard.general.clearContents()
             NSPasteboard.general.setString(url.absoluteString, forType: .string)
         },
-        now: @escaping () -> Date = Date.init
+        now: @escaping () -> Date = Date.init,
+        listingCapacity: Int = RecordingsController.listingCapacity,
+        playbackURLCapacity: Int = RecordingsController.playbackURLCapacity
     ) {
+        listings = BoundedCache(capacity: listingCapacity)
+        playbackURLs = BoundedCache(capacity: playbackURLCapacity)
         self.makeBrowser = makeBrowser
         self.store = store
         self.vault = RecmanSessionVault(storage: .init(load: { try store.load() }, save: { try store.save($0) }, delete: { try store.delete() }))
@@ -299,9 +313,10 @@ struct RecordingsListing: Equatable {
         closeBrowser()
         isEnabled = false
         access = .off
-        listings = [:]
+        listings.removeAll()
+        listings.pin([])
         openingProblem = nil
-        playbackURLs = [:]
+        playbackURLs.removeAll()
         pageKeys = []
         selectedKey = nil
         forgetSeen()
@@ -367,8 +382,8 @@ struct RecordingsListing: Equatable {
         supersedeInitialSessionCheck()
         invalidate()
         closeBrowser()
-        listings = [:]
-        playbackURLs = [:]
+        listings.removeAll()
+        playbackURLs.removeAll()
         forgetSeen()
         discardSessionFile()
         if isEnabled { access = .needsSignIn(nil) }
@@ -438,6 +453,10 @@ struct RecordingsListing: Equatable {
         guard isEnabled, visiblePages > 0 else { return }
         pageKeys = keys
         selectedKey = selected
+        // What the page shows is never evicted, so going back to one of its courses is immediate.
+        // Compared first: `listings` is published, and an unchanged page must not redraw.
+        let onPage = Set(keys + [selected].compactMap { $0 })
+        if listings.pinnedKeys != onPage { listings.pin(onPage) }
         guard access == .ready else { return }
         // The initial check enqueues these keys itself once it knows a session exists.
         guard initialSessionCheck == nil else { return }
@@ -860,8 +879,8 @@ struct RecordingsListing: Equatable {
         }
         if let current = ownerUserID(), current != snapshot.ownerUserID {
             log.notice("Saved Polimi session belongs to another WeBeep account: dropped")
-            listings = [:]
-            playbackURLs = [:]
+            listings.removeAll()
+            playbackURLs.removeAll()
             forgetSeen()
             discardSessionFile()
             return []

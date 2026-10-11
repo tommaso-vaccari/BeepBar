@@ -64,11 +64,14 @@ public struct BoundedCache<Key: Hashable, Value> {
         order.removeAll()
     }
 
+    /// Oldest unpinned keys go until the cache is back within its capacity: one is not always
+    /// enough, since a `pin` that released several keys leaves the cache over capacity by more
+    /// than one. `order` is short (at most capacity + pinned), so a linear scan is cheaper than a
+    /// linked structure. The newest entry is the last candidate, and goes only when every other
+    /// entry is pinned, which is the "page's own key set" bound described on the type.
     private mutating func evictIfNeeded() {
-        guard storage.count > capacity else { return }
-        // The oldest unpinned key goes; `order` is short (at most capacity + pinned), so a linear
-        // scan is cheaper than a linked structure.
-        guard let index = order.firstIndex(where: { !pinned.contains($0) }) else { return }
-        storage.removeValue(forKey: order.remove(at: index))
+        while storage.count > capacity, let index = order.firstIndex(where: { !pinned.contains($0) }) {
+            storage.removeValue(forKey: order.remove(at: index))
+        }
     }
 }

@@ -172,8 +172,12 @@ struct RecordingsDerivedStateTests {
         #expect(cache.count == 3, "pinned entries exceed the capacity rather than vanish")
         cache.pin(["c"])
         cache["d"] = 4
+        // Releasing two pins left the cache two over: one insertion brings it back within bounds.
         #expect(cache["a"] == nil)
+        #expect(cache["b"] == nil)
         #expect(cache["c"] == 3)
+        #expect(cache["d"] == 4)
+        #expect(cache.count == 2)
         cache.removeAll()
         #expect(cache.isEmpty)
         #expect(cache.pinnedKeys == ["c"])
@@ -182,6 +186,7 @@ struct RecordingsDerivedStateTests {
         cache["y"] = 2
         #expect(cache["x"] == nil)
         #expect(cache["c"] == 3)
+        #expect(cache["y"] == 2)
         // Dictionary-style default subscript writes through, and nil removes.
         cache["c", default: 0] += 1
         #expect(cache["c"] == 4)

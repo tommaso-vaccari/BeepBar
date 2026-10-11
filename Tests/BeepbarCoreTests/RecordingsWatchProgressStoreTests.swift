@@ -275,8 +275,9 @@ struct RecordingsWatchProgressStoreTests {
     /// only the rows of those IDs in this scope: 5,000 rows of another course and 5,000 of
     /// another account are never read, and no lookup walks the table.
     /// Guards against: materializing a course's or the account's progress on every listing
-    /// (mutation: write `+owner=?` in the lookup, which disables the key seek → full-scan steps
-    /// red; or select the whole course and filter in memory → rows-read red).
+    /// (mutation: write `owner+0=CAST(? AS INTEGER)` in the lookup, which keeps results right but
+    /// disables the key seek → full-scan steps red; selecting the whole course and filtering in
+    /// memory → rows-read red).
     @Test func largeListingReadSeeksPerID() throws {
         defer { cleanUp() }
         let probe = RecordingsSeenStore.Probe()

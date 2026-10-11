@@ -74,6 +74,10 @@ struct RecordingsListing: Equatable {
 ///   screen. Nothing here takes part in quitting or in `expireCredential()`.
 /// - **Nothing new writes nothing.** The session file is rewritten only when its cookies changed,
 ///   and the seen-recordings lists only when a recording is first seen or opened.
+/// - **The session file never touches the main actor (#97).** It is read, written and deleted by
+///   `RecmanSessionVault`, off the main actor and in call order; it is read once per opening cycle,
+///   and a save that began before turn-off, logout or an account change is refused at commit
+///   time, so a late save can't bring the deleted session back.
 /// - **One request at a time, and never a stale one.** A single worker drains a queue (opening a
 ///   recording first, then the selected course, then the others for their badges). Turning off,
 ///   signing in and closing the page bump `generation`; a task from an older generation never
@@ -111,6 +115,8 @@ struct RecordingsListing: Equatable {
 
     private let makeBrowser: @MainActor () -> RecmanBrowsing
     private let store: RecordingsSessionStore
+    /// Every run-time read, write and delete of the session file goes through here.
+    private let vault: RecmanSessionVault
     private let defaults: UserDefaults
     private let ownerUserID: @MainActor () -> Int?
     private let isAvailable: @MainActor () -> Bool
@@ -123,8 +129,18 @@ struct RecordingsListing: Equatable {
     /// The WeBeep account the cookies in the browser belong to: read from the saved session, or
     /// the account connected when the user signed in. The session is saved under this id only.
     private var sessionOwner: Int?
-    /// What the session file holds, so an unchanged session isn't written again.
-    private var savedFingerprint: [String]?
+    /// The saved session as read for the current opening cycle, shared by the first visit's check,
+    /// the worker and a sign-in so the file is read once, not once per caller. Forgotten when the
+    /// browser closes (the next opening reads again), when the file is discarded, after a save
+    /// wrote new cookies, and after a read error (kept for the next try).
+    private var sessionLoad: (id: Int, task: Task<[HTTPCookie], Never>)?
+    private var sessionLoads = 0
+    /// The first visit's check of the saved session, while it is reading the file. Until it answers
+    /// nothing opens the browser: without a reusable session the page asks for a sign-in instead,
+    /// as when the check was synchronous. Sign-in, turn-off and an account change supersede it.
+    private var initialSessionCheck: Int?
+    /// A refresh asked for with the refresh button while the initial check was reading.
+    private var deferredForce = false
     /// Webex players already found, so opening a recording again is instant.
     private var playbackURLs: [String: URL] = [:]
 
@@ -161,6 +177,7 @@ struct RecordingsListing: Equatable {
     ) {
         self.makeBrowser = makeBrowser
         self.store = store
+        self.vault = RecmanSessionVault(storage: .init(load: { try store.load() }, save: { try store.save($0) }, delete: { try store.delete() }))
         let historyFactory = makeSeenHistory ?? { namespace in
             RecordingsSeenHistory(store: RecordingsSeenStore(directory: store.directory, namespace: namespace))
         }
@@ -273,6 +290,7 @@ struct RecordingsListing: Equatable {
     /// Also called when the WeBeep account is disconnected or the university changes, whether or
     /// not the feature was on, so no session outlives the account it was made for.
     func turnOff() {
+        supersedeInitialSessionCheck()
         invalidate()
         closeBrowser()
         isEnabled = false
@@ -296,6 +314,7 @@ struct RecordingsListing: Equatable {
     func signIn() {
         guard isEnabled, access != .signingIn else { return }
         hasCheckedInitialSession = true
+        supersedeInitialSessionCheck()
         invalidate()
         access = .signingIn
         let generation = self.generation
@@ -304,7 +323,9 @@ struct RecordingsListing: Equatable {
 
     private func runSignIn(_ generation: Int) async {
         let browser = currentBrowser()
-        await browser.open(cookies: savedCookies())
+        let cookies = await savedCookies()
+        guard generation == self.generation else { return }
+        await browser.open(cookies: cookies)
         guard generation == self.generation else { return }
         do {
             try await browser.signIn()
@@ -339,6 +360,7 @@ struct RecordingsListing: Equatable {
         loadStudy()
         guard let sessionOwner, sessionOwner != userID else { return }
         log.notice("Polimi session belongs to another WeBeep account: dropped")
+        supersedeInitialSessionCheck()
         invalidate()
         closeBrowser()
         listings = [:]
@@ -357,7 +379,28 @@ struct RecordingsListing: Equatable {
         // can open WebKit. Later visits must preserve a session established by explicit sign-in.
         guard isEnabled, access == .ready, !hasCheckedInitialSession else { return }
         hasCheckedInitialSession = true
-        if savedCookies().isEmpty { access = .needsSignIn(nil) }
+        sessionLoads += 1
+        let check = sessionLoads
+        initialSessionCheck = check
+        // Not tied to `generation`: closing the page while the file is read must not lose the
+        // answer, or the next visit would open the browser without a session to show.
+        Task { [weak self] in
+            guard let self else { return }
+            let cookies = await self.savedCookies()
+            guard self.initialSessionCheck == check else { return }
+            self.initialSessionCheck = nil
+            guard self.isEnabled, self.access == .ready else { return }
+            if cookies.isEmpty {
+                self.clearQueue()
+                self.access = .needsSignIn(nil)
+                return
+            }
+            // What the page and the play buttons asked for while the file was read.
+            let force = self.deferredForce
+            self.deferredForce = false
+            if self.visiblePages > 0 { self.enqueue(self.pageKeys, selected: self.selectedKey, force: force) }
+            self.startWorker()
+        }
     }
 
     /// Deferred by one main-actor turn: a language switch rebuilds the page, which disappears and
@@ -393,6 +436,8 @@ struct RecordingsListing: Equatable {
         pageKeys = keys
         selectedKey = selected
         guard access == .ready else { return }
+        // The initial check enqueues these keys itself once it knows a session exists.
+        guard initialSessionCheck == nil else { deferredForce = deferredForce || force; return }
         enqueue(keys, selected: selected, force: force)
     }
 
@@ -584,7 +629,7 @@ struct RecordingsListing: Equatable {
     }
 
     private func startWorker() {
-        guard worker == nil, access == .ready, !queue.isEmpty else { return }
+        guard worker == nil, access == .ready, initialSessionCheck == nil, !queue.isEmpty else { return }
         let generation = self.generation
         worker = Task { [weak self] in await self?.drain(generation) }
     }
@@ -593,7 +638,11 @@ struct RecordingsListing: Equatable {
 
     private func drain(_ generation: Int) async {
         let browser = currentBrowser()
-        if !browser.isOpen { await browser.open(cookies: savedCookies()) }
+        if !browser.isOpen {
+            let cookies = await savedCookies()
+            guard generation == self.generation else { return }
+            await browser.open(cookies: cookies)
+        }
         guard generation == self.generation else { return }
         var succeeded = false
         var saves = true
@@ -727,6 +776,13 @@ struct RecordingsListing: Equatable {
         }
     }
 
+    /// Sign-in, turn-off and an account change decide access themselves: the first visit's check
+    /// must not overrule them when its read finishes.
+    private func supersedeInitialSessionCheck() {
+        initialSessionCheck = nil
+        deferredForce = false
+    }
+
     /// Stops the worker and any sign-in for good: they belong to an older generation from now on.
     private func invalidate() {
         // A pending explicit acknowledgement may commit after the page closes. Its old
@@ -752,35 +808,53 @@ struct RecordingsListing: Equatable {
     private func closeBrowser() {
         browser?.close()
         browser = nil
+        sessionLoad = nil
     }
 
     /// The saved session's cookies, checked against the WeBeep account. A file that can't be
     /// decoded, or that belongs to another known account, is deleted; one that can't be read
-    /// right now (a disk error) is kept for the next try.
-    private func savedCookies() -> [HTTPCookie] {
-        let data: Data?
-        do {
-            data = try store.load()
-        } catch {
-            log.error("Couldn't read the saved Polimi session")
-            return []
+    /// right now (a disk error) is kept for the next try. Read off the main actor, once per
+    /// opening cycle: later callers in the same cycle share the first read.
+    private func savedCookies() async -> [HTTPCookie] {
+        if let sessionLoad { return await sessionLoad.task.value }
+        sessionLoads += 1
+        let id = sessionLoads
+        // Read before the load is enqueued: a discard after this point makes the answer stale.
+        let epoch = vault.epoch
+        let read = vault.load(now: now())
+        let task = Task { [weak self] () -> [HTTPCookie] in
+            let outcome = await read.value
+            guard let self else { return [] }
+            return self.adopt(outcome, epoch: epoch, load: id)
         }
-        guard let data else {
+        sessionLoad = (id, task)
+        return await task.value
+    }
+
+    /// Applies a finished read on the main actor, unless turn-off, logout or an account change
+    /// discarded the session since it started: what was read is being deleted.
+    private func adopt(_ outcome: RecmanSessionVault.LoadOutcome, epoch: Int, load: Int) -> [HTTPCookie] {
+        guard vault.epoch == epoch else { return [] }
+        let snapshot: RecmanSessionCodec.Snapshot
+        switch outcome {
+        case .unreadable:
+            log.error("Couldn't read the saved Polimi session")
+            if sessionLoad?.id == load { sessionLoad = nil }
+            return []
+        case .none:
             // v1 history has no owner. Without a verifiable saved session, attaching it to
             // the next sign-in could leak another student’s state; v2 is already scoped.
             legacySeen = .init(ids: [], baselines: [])
             discardLegacyDefaults()
             return []
-        }
-        let snapshot: RecmanSessionCodec.Snapshot
-        do {
-            snapshot = try RecmanSessionCodec.decode(data, now: now())
-        } catch {
+        case .undecodable:
             log.notice("Saved Polimi session unreadable: dropped")
             legacySeen = .init(ids: [], baselines: [])
             discardLegacyDefaults()
             discardSessionFile()
             return []
+        case .session(let saved):
+            snapshot = saved
         }
         if let current = ownerUserID(), current != snapshot.ownerUserID {
             log.notice("Saved Polimi session belongs to another WeBeep account: dropped")
@@ -792,14 +866,16 @@ struct RecordingsListing: Equatable {
         }
         sessionOwner = snapshot.ownerUserID
         legacyOwner = snapshot.ownerUserID
-        savedFingerprint = Self.fingerprint(snapshot.cookies)
         return snapshot.cookies
     }
 
     /// Saves the browser's session after a success, under the account it belongs to, unless it
-    /// is what the file already holds.
+    /// is what the file already holds. The vault epoch is read before awaiting WebKit: a turn-off,
+    /// logout or account change from then on makes this save stale, and the vault refuses it at
+    /// commit time even after the guards below have passed.
     private func saveSession(_ generation: Int) async {
         guard let browser else { return }
+        let epoch = vault.epoch
         let cookies = await browser.cookies()
         // The feature may have been turned off, or the page closed, while WebKit answered.
         guard generation == self.generation, isEnabled else { return }
@@ -811,31 +887,35 @@ struct RecordingsListing: Equatable {
             webBeepAccountChanged(to: current)
             return
         }
-        let fingerprint = Self.fingerprint(cookies.filter { RecmanSessionCodec.keeps($0, now: now()) })
-        guard fingerprint != savedFingerprint else { return }
-        do {
-            try store.save(RecmanSessionCodec.encode(cookies, ownerUserID: owner, now: now()))
-            savedFingerprint = fingerprint
-        } catch {
-            log.error("Couldn't save the Polimi session errorType=\(String(reflecting: type(of: error)), privacy: .public)")
+        switch await vault.save(cookies, ownerUserID: owner, epoch: epoch, now: now()).value {
+        case .saved:
+            // The cycle's cached read now describes an older file.
+            sessionLoad = nil
+        case .unchanged:
+            break
+        case .stale:
+            log.notice("Polimi session not saved: discarded while saving")
+        case .failed(let errorType):
+            log.error("Couldn't save the Polimi session errorType=\(errorType, privacy: .public)")
         }
     }
 
+    /// Bumps the vault epoch now, so every save already under way is refused, and deletes the
+    /// file in turn, off the main actor.
     private func discardSessionFile() {
         sessionOwner = nil
-        savedFingerprint = nil
-        do {
-            try store.delete()
-        } catch {
-            log.error("Couldn't delete the saved Polimi session errorType=\(String(reflecting: type(of: error)), privacy: .public)")
+        sessionLoad = nil
+        let delete = vault.discard()
+        Task { [log] in
+            if case .failed(let errorType) = await delete.value {
+                log.error("Couldn't delete the saved Polimi session errorType=\(errorType, privacy: .public)")
+            }
         }
     }
 
-    /// What decides whether the file needs rewriting: every cookie attribute that is saved.
-    nonisolated static func fingerprint(_ cookies: [HTTPCookie]) -> [String] {
-        cookies.map { cookie in
-            let expiry = cookie.expiresDate.map { String($0.timeIntervalSince1970) } ?? "session"
-            return [cookie.name, cookie.domain, cookie.path, cookie.value, expiry, String(cookie.isSecure), String(cookie.isHTTPOnly)].joined(separator: "\u{1F}")
-        }.sorted()
+    /// Waits until the session file reflects every call made so far. For tests, which read the
+    /// file from outside the vault.
+    func settleSessionFile() async {
+        await vault.settle()
     }
 }

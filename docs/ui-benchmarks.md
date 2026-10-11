@@ -3,7 +3,7 @@
 `scripts/ui-benchmark.py` builds an opt-in fixture from a **committed source revision** and
 runs the real Courses, Activity and Recordings SwiftUI views in the application's normal
 configuration window. It never launches the normal BeepBar entry point or an installed app.
-Current code gates, functional checks and unmeasured acceptance are in the
+Code gates, functional checks and what was not measured are in the
 [D07 validation report](reports/isolated-ui-harness.md).
 
 ## Single command
@@ -29,7 +29,7 @@ latency uses the second window. `memory-cycles` performs ten actual open/sync/cl
 process and records footprint after each closed-window settling period. UI controls are disabled
 so an accidental click/shortcut cannot enter real login, Settings, updater or external actions.
 
-For a focused tooling check (not the complete D07 acceptance series):
+For a focused tooling check (fewer scenarios):
 
 ```sh
 scripts/ui-benchmark.py --ref HEAD --out PerformanceReports/ui-d07-smoke \
@@ -65,7 +65,7 @@ notifications, Launch at Login and Sparkle are absent. The fixture icon has no i
 | `reopen-sync` | Close and reopen while a genuine sync is held at its mock contents request, then release and drain |
 | `activity-1000`, `activity-15000` | One course expanded with 1,000 / 15,000 real activity items |
 | `recordings-1000`, `recordings-5000` | Synthetic reusable session and full listing through the real recording controller |
-| `progress-burst` | 10,000 events from an off-main producer through the existing sync progress callback/relay |
+| `progress-burst` | 10,000 events from an off-main producer through the sink a real sync hands to `SyncCoordinator` (D08 throttle relay) |
 | `memory-cycles` | Ten actual open/sync/close cycles, one enabled course, no file downloads |
 | `idle` | Closed-window fixture for 1,800 seconds, before/after process counters and fixture request accounting |
 
@@ -100,7 +100,7 @@ first-window / 100ms same-process reopen; report key and content separately, inc
 it does **not** establish the production app's 200ms launch-to-icon budget. Fixture setup is
 reported separately. The cold scenario does not purge OS caches or run the production credential,
 bootstrap/migration path. The offline scenario does not prove persisted cold offline course
-restoration; that remains D10. These gaps keep D07's full launch acceptance open.
+restoration; that remains D10. The fixture does not measure the production launch path.
 
 Inspect each retained `.trace` in Instruments, select the fixture's main thread, and examine
 window construction, content appearance, expanded Activity, recording list and progress bursts.
@@ -121,10 +121,17 @@ samples, expand sampling before claiming a reliable tail, and record negative fi
 reports each scenario's maximum observed key latency against its 250ms/100ms target. A slow
 but otherwise valid sample remains evidence and reports a violated budget; it is not discarded.
 The target check applies to the observed samples and does not establish the population tail.
-These results establish tooling evidence, not performance benefits. Base-dev → HEAD and main → HEAD UI
-comparisons need an equivalent, reviewed fixture on every revision and are explicitly unmeasured
-until that exists. Keep D07 open until the full launch, main-thread/scroll/action, idle and memory
-acceptance evidence has been checked; a partial tooling PR must use `Refs #95`, not `Closes #95`.
+These results establish tooling evidence, not performance benefits.
+
+**Cross-revision comparisons.** A UI comparison is only possible between revisions that both
+contain this harness. `main` and any `dev` before D07 lack the content-readiness markers, which
+are edits to production views (`HomePage`, `ActivityPage`, `RecordingsPage`, `BeepbarApp`).
+Adding them to an older revision would change its application code, which the
+[comparison rules](benchmarks.md#reproducible-ref-comparisons-single-agent-command) forbid, so
+base-dev → HEAD and main → HEAD UI comparisons against those revisions are **not measured** and
+are never produced by patching. By the owner's decision of 2026-10-11, D07 delivers the tooling
+only: the five-run AC series, 30-minute idle and ten-cycle memory observations were not collected
+as part of D07. Later work runs this command on its own revisions when it needs UI evidence.
 
 ## Tooling verification
 

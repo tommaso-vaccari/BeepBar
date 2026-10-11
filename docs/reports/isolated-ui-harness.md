@@ -1,16 +1,40 @@
 # D07 isolated UI tooling — #95
 
-Branch: `perf/isolated-ui-harness`, initial base `ac68333`, current integrated `origin/dev` `713033c`.
-Verified current implementation: `17a9a00234b4e658381e14908f7d88717bb2112c`.
-The earlier candidate `281cb94` failed the opt-in fixture compilation; `0666707` corrected
-its continuation type and passed the initial gates. Independent review of `a1496b2` found
-three P2 issues: repeated key-window events overwrote the first timestamp, power changes
-were not checked after recording, and trace success did not prove usable artifacts.
-`f32a07e` fixed these with regressions and explicit CPU/signpost exports; `fe47bb5` corrected
-the first-key test's Swift Testing expression. The pre-integration gates below refer to `fe47bb5`; the current-dev merge has its own ledger.
-Historical functional batches are explicitly identified.
+Branch: `perf/isolated-ui-harness`, initial base `ac68333`, integrated `origin/dev` `7e16c6c`.
+**Delivered as tooling only**, by the owner's decision of 2026-10-11 (see
+[What was not measured](#what-was-not-measured-and-why)). Sections after the next one are the
+historical record of earlier candidates; their gates do not validate the final code.
 
-## Current-dev integration gates
+## Final dev integration (2026-10-11)
+
+Merge `2b7d340` integrates dev `7e16c6c`. The only textual conflict was additive: dev's R01 seam
+`setSyncStateForTesting(synced:)` and the harness's progress seam sat side by side; both kept.
+The earlier local merge `6be802a` (dev `6e64e4e`) had never been compiled and did not build:
+D08 (#96, #133) had replaced the controller's `publishProgress` with an off-main throttle relay,
+and the harness still called it. `6d8e6e3` removes that dead seam and drives the burst through
+`beginTransferForTesting`, the sink a real sync hands to `SyncCoordinator`. The burst moved out of
+the opt-in entry point into `UIFixtureProgressBurst`, compiled by the ordinary test build, so a
+removed seam now fails `swift test` rather than only the fixture build. `e75377d` drops two
+stray blank lines from the Activity hooks.
+
+`progressBurstTravelsTheThrottledSyncPath` proves the burst reaches the final 10,000 total with
+at least one and at most `2 + elapsed/200 ms` main-actor entries, and leaves no sync active.
+Mutations in a disposable `git worktree add --detach` copy of `6d8e6e3`, each run alone:
+
+| Mutation | Result |
+|---|---|
+| Burst sends no events | **RED**: final total and main-actor entry expectations fail |
+| Burst leaves the operation set | **RED**: `!isSyncActive` fails |
+| Controller hops to the main actor before the throttle | **RED**: entry bound fails |
+| Restored | **GREEN** |
+
+Host: Apple M5 (`Mac17,3`), 32 GB, macOS 27.0.1 (`26A434`), Xcode 27.0 (`27A266a`).
+Focused `UIFixtureTests` 9 PASS and the opt-in fixture Release arm64 build (Mach-O arm64,
+identity `beepbar-isolated-ui-fixture-v1`) succeeded on `6d8e6e3`. Full suite, ordinary Release
+build, Python guards and independent review on the exact pushed SHA are recorded in PR #136.
+No measurement series, installed app, real account or production data was used.
+
+## Historical: dev `713033c` integration gates
 
 Merge `17a9a00` integrates dev `713033c`. The only conflict was additive Xcode source
 registration: both fixture files and RecordingsStudyState were retained. The new recording
@@ -37,7 +61,7 @@ measurement guard; its logs are retained at `/tmp/issue95-functional-merge-17a9a
 The retry corrected only the disposable helper's metadata collection; the benchmark driver
 still requires AC. Temporary bundle/data identities were removed after each helper run.
 
-## Pre-integration code gates
+## Historical: pre-integration code gates
 
 Host: Apple M5, `Mac17,3`, 24 GiB RAM, macOS 27.0.1 (`26A434`), Xcode 27.0 (`27A266a`),
 Developer directory `/Applications/Xcode.app/Contents/Developer`, xctrace 27.0.
@@ -127,31 +151,27 @@ Raw `.trace` files can contain device names/identifiers and stay local. Exported
 is sanitized by the driver before use in the evidence summary. Synthetic workload reports
 contain no real account data. No raw trace is committed or attached to the PR.
 
-## Measurement blocker and remaining acceptance
+## What was not measured, and why
 
-At preflight on 2026-10-10 15:10 UTC, `pmset -g batt` reported **Battery Power**, 97%,
-discharging. The driver requires AC and refuses to start a measurement series in that state.
-The functional checks above do not substitute for the following unmeasured gates:
+By the owner's decision of 2026-10-11, D07 delivers the tooling only. Not collected:
 
-- At least five comparable Release arm64 samples with main-thread traces for every UI scenario.
-- A 30-minute unprofiled idle observation with CPU/writes/wakeups/request accounting.
-- Comparable stabilized memory after ten open/sync/close cycles.
-- Independent trace interpretation, scrolling/actions and the 16ms frame/main-thread budget.
-- Full launch-to-icon/bootstrap evidence. Current icon timing covers construction after synthetic
-  dependency preparation; cold UI timing covers the first fixture window, not the production
-  credential/bootstrap/migration or process-loader path.
-- Persisted cold offline course restoration remains D10; the current offline scenario validates
-  known synthetic model retention during a failed refresh.
+- five comparable AC Release arm64 samples with main-thread traces for every UI scenario;
+- the 30-minute unprofiled idle observation and stabilized memory after ten cycles;
+- independent trace interpretation, scrolling/actions and the 16 ms frame/main-thread budget.
 
-No base-dev → HEAD or main → HEAD UI benefit is claimed. No Time Profiler series, idle result,
-reliable p95 or completed D07 acceptance is claimed. The tooling can be reviewed independently;
-**#95 remains open** and any partial tooling PR uses `Refs #95`, not `Closes #95`.
+The fixture also does not cover the production launch path (credentials, bootstrap, migration,
+process loader): icon timing covers construction after synthetic preparation. Persisted cold
+offline course restoration remains D10.
 
-After AC is connected and other builds/downloads are quiet, run the documented
-[single command](../ui-benchmarks.md#single-command) on the reviewed source, retain raw traces,
-check budgets and record negative findings. Five samples yield an unstable nearest-rank p95;
-expand samples before a reliable tail claim. Main-thread traces and manual interaction are
-required because SwiftUI `onAppear` proves hierarchy readiness, not compositor presentation.
+**Base-dev → HEAD and main → HEAD UI comparisons are not measured, because they cannot be made
+without changing application code.** `main` and the PR's base dev lack the content-readiness
+markers, which are edits to production views (`HomePage`, `ActivityPage`, `RecordingsPage`,
+`BeepbarApp`). The [comparison rules](../benchmarks.md#reproducible-ref-comparisons-single-agent-command)
+allow measurement-only overlays of the harness, never production patches, so no overlay was
+attempted. A UI comparison is possible only between revisions that both contain this harness.
+
+No performance benefit, timing table, idle result, reliable p95 or budget pass is claimed.
+Earlier smoke samples were rejected (battery, thermal state fair) and remain functional evidence only.
 
 CPU resource counters use Mach-time conversion. The Apple kernel assigns rusage CPU fields from
 task power times, whose values are `rm_time_mach`; see

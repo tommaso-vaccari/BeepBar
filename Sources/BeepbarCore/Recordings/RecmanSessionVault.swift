@@ -79,11 +79,11 @@ public final class RecmanSessionVault: Sendable {
     }
 
     private struct State {
-        /// The last operation enqueued; the next one waits for it. Nil once the chain ran dry.
+        /// The last operation enqueued; the next one waits for it. Nil until the first operation.
         var tail: Task<Void, Never>?
         /// Bumped by `discard()`. A save from an older epoch is refused at commit time.
         var epoch = 0
-        /// What the file holds, when this process knows it (after a load or a save).
+        /// What the file holds, when this process knows it (after a load or a save); a delete forgets it.
         var saved: Saved?
     }
 
@@ -113,20 +113,14 @@ public final class RecmanSessionVault: Sendable {
     /// Writes the session unless it is unchanged, or `epoch` is older than the current one.
     ///
     /// `epoch` is `self.epoch` read when the save cycle began, before any `await`; see `discard()`.
-    /// The check against the current epoch happens twice: once before encoding, to spare the work,
-    /// and once right before the write, which is the one that matters. Keep the second one.
+    /// The epoch is checked once, right before the write, under the lock: that is the check that
+    /// matters, and keeping it the only one keeps it covered by tests. A stale save whose cookies
+    /// equal what the file still holds reports `.unchanged`; either way nothing is written.
     public func save(_ cookies: [HTTPCookie], ownerUserID: Int, epoch: Int, now: Date) -> Task<SaveOutcome, Never> {
         enqueue { [storage, state] in
             let kept = cookies.filter { RecmanSessionCodec.keeps($0, now: now) }
             let candidate = Saved(owner: ownerUserID, fingerprint: RecmanSessionCodec.fingerprint(kept))
-            switch state.withLock({ state -> SaveOutcome? in
-                if state.epoch != epoch { return .stale }
-                if state.saved == candidate { return .unchanged }
-                return nil
-            }) {
-            case let outcome?: return outcome
-            case nil: break
-            }
+            if state.withLock({ $0.saved == candidate }) { return .unchanged }
             let data: Data
             do { data = try RecmanSessionCodec.encode(kept, ownerUserID: ownerUserID, now: now) } catch { return .failed(String(reflecting: type(of: error))) }
             // Commit-time check: a discard that ran while this save waited in the chain, or while
@@ -143,11 +137,18 @@ public final class RecmanSessionVault: Sendable {
     /// save that began before it is stale from this moment, whether it is already in the chain or
     /// still waiting for WebKit. The bump and the enqueue happen under one lock so no save can
     /// slip between them.
+    ///
+    /// What the file holds is forgotten by the delete itself, when it runs, not here: a load or a
+    /// save enqueued before this call still runs first and records the file it read or wrote. Were
+    /// that record to survive the delete, an identical save in the new epoch would be skipped as
+    /// unchanged and the session lost. Clearing it in the delete step covers every such case
+    /// (it also runs when the delete fails: the file's state is then unknown, so the next save
+    /// writes); only operations enqueued after this one can describe the file again.
     @discardableResult public func discard() -> Task<DeleteOutcome, Never> {
         state.withLock { state in
             state.epoch += 1
-            state.saved = nil
-            return enqueue(into: &state) { [storage] in
+            return enqueue(into: &state) { [storage, lock = self.state] in
+                defer { lock.withLock { $0.saved = nil } }
                 do { try storage.delete() } catch { return .failed(String(reflecting: type(of: error))) }
                 return .deleted
             }

@@ -23,6 +23,9 @@ import Glibc
 /// - No eviction, ever: a row may be the student's manual "done", which must never be dropped.
 ///   Rows exist only for recordings that reached a player checkpoint that changed something or
 ///   were ticked, so the table is bounded by the account's archive (one row per recording).
+/// - Schema rule for every future build: `progress` may only gain nullable or defaulted columns,
+///   never lose, rename or retype one. Writes name their columns and update only the three they
+///   own, so an older build keeps working on a newer file and leaves a newer column's value alone.
 public struct RecordingsSeenStore: Sendable {
     public static let fileName = "recordings-seen-v2.sqlite"
     private let directory: @Sendable () throws -> URL
@@ -60,7 +63,11 @@ public struct RecordingsSeenStore: Sendable {
         }
         private let lock = NSLock()
         private var counts = Counts()
-        package init() {}
+        /// Runs inside `applyProgress` between the unlocked first read and `BEGIN IMMEDIATE`, so a
+        /// test can change the row through another connection and prove the decision is re-made
+        /// under the write lock.
+        fileprivate let afterUnlockedRead: (@Sendable () -> Void)?
+        package init(afterUnlockedRead: (@Sendable () -> Void)? = nil) { self.afterUnlockedRead = afterUnlockedRead }
         package var current: Counts { lock.withLock { counts } }
         fileprivate func record(_ change: (inout Counts) -> Void) { lock.withLock { change(&counts) } }
     }
@@ -160,6 +167,7 @@ public struct RecordingsSeenStore: Sendable {
             let first = try decide()
             var result = RecordingProgressResult(entry: first.stored?.entry, changed: false)
             guard first.new != nil else { return result }
+            probe?.afterUnlockedRead?()
             try transaction(db) {
                 let (stored, new) = try decide()
                 result = RecordingProgressResult(entry: new ?? stored?.entry, changed: new != nil)
@@ -210,12 +218,21 @@ public struct RecordingsSeenStore: Sendable {
             }
         }
         let blocked = sqlite3_column_int64(statement, 2) != 0
+        // Release the statement's read lock now: an unlocked first read must not keep blocking
+        // other connections until the next bind.
+        sqlite3_reset(statement)
         return StoredProgress(entry: RecordingWatchEntry(furthest: furthest, completed: completed, autoCompletionBlocked: blocked), unknownCompletion: unknown)
     }
 
     /// Typed bindings: `furthest` must be stored as REAL and `completed` as NULL or an integer.
+    /// Named columns and an upsert that sets only this build's three columns, never
+    /// `INSERT OR REPLACE` with positional values: those fail once a newer build adds a column
+    /// ("7 values for 8 columns") and REPLACE would reset that column on an existing row.
     private func write(_ entry: RecordingWatchEntry, owner: Int, key: RecmanCourseKey, id: String, db: OpaquePointer) throws {
-        let upsert = try prepare("INSERT OR REPLACE INTO progress VALUES (?,?,?,?,?,?,?)", db: db)
+        let upsert = try prepare("""
+            INSERT INTO progress(owner, course, year, id, furthest, completed, blocked) VALUES (?,?,?,?,?,?,?)
+            ON CONFLICT(owner, course, year, id) DO UPDATE SET furthest=excluded.furthest, completed=excluded.completed, blocked=excluded.blocked
+            """, db: db)
         defer { sqlite3_finalize(upsert) }
         let transient = unsafeBitCast(-1, to: sqlite3_destructor_type.self)
         var ok = sqlite3_bind_int64(upsert, 1, Int64(owner)) == SQLITE_OK
@@ -411,6 +428,7 @@ public actor RecordingsSeenHistory {
     private let beforeAcknowledge: @Sendable () async -> Void
     private let afterRead: @Sendable () async -> Void
     private let beforeProgress: @Sendable () async -> Void
+    private let afterProgress: @Sendable () async -> Void
 
     public init(store: RecordingsSeenStore) {
         self.store = store
@@ -418,15 +436,18 @@ public actor RecordingsSeenHistory {
         beforeAcknowledge = {}
         afterRead = {}
         beforeProgress = {}
+        afterProgress = {}
     }
 
     /// Gates exercise real actor reentrancy, late results and resets in isolated tests.
-    package init(store: RecordingsSeenStore, beforeRead: @escaping @Sendable () async -> Void = {}, beforeAcknowledge: @escaping @Sendable () async -> Void = {}, afterRead: @escaping @Sendable () async -> Void = {}, beforeProgress: @escaping @Sendable () async -> Void = {}) {
+    /// `afterProgress` runs after a progress commit, before the final validity check.
+    package init(store: RecordingsSeenStore, beforeRead: @escaping @Sendable () async -> Void = {}, beforeAcknowledge: @escaping @Sendable () async -> Void = {}, afterRead: @escaping @Sendable () async -> Void = {}, beforeProgress: @escaping @Sendable () async -> Void = {}, afterProgress: @escaping @Sendable () async -> Void = {}) {
         self.store = store
         self.beforeRead = beforeRead
         self.beforeAcknowledge = beforeAcknowledge
         self.afterRead = afterRead
         self.beforeProgress = beforeProgress
+        self.afterProgress = afterProgress
     }
 
     public func seen(owner: Int, key: RecmanCourseKey, ids: [String], legacy: RecordingsSeenStore.Legacy) async throws -> Set<String> {
@@ -444,12 +465,19 @@ public actor RecordingsSeenHistory {
         await beforeAcknowledge()
         guard validity.isActive, !Task.isCancelled else { throw CancellationError() }
         try? store.removeObsoleteFiles()
-        try store.acknowledge(owner: owner, key: key, ids: ids, legacy: legacy)
+        // A store error caused by a concurrent reset is a cancellation, not a storage failure.
+        do { try store.acknowledge(owner: owner, key: key, ids: ids, legacy: legacy) }
+        catch { throw validity.isActive ? error : CancellationError() }
     }
 
     /// `seen` plus the watch progress of the same IDs (see `RecordingsSeenStore.seenAndProgress`),
     /// with the same baseline rule and the same validity checks before and after the read, so a
     /// result that returns after a reset is never published.
+    ///
+    /// Snapshots are not ordered against `applyProgress` or `acknowledge` commits: one taken
+    /// before a commit can return after it. The caller must keep a per-course revision bumped on
+    /// each commit and requery when it changed during the read, or it would publish older progress
+    /// over a newer committed entry.
     public func seenAndProgress(owner: Int, key: RecmanCourseKey, ids: [String], legacy: RecordingsSeenStore.Legacy) async throws -> RecordingsHistorySnapshot {
         await beforeRead()
         guard validity.isActive, !Task.isCancelled else { throw CancellationError() }
@@ -467,11 +495,27 @@ public actor RecordingsSeenHistory {
     /// commit. A write that committed while a reset was being requested is reported as cancelled
     /// so the caller doesn't publish it; the reset's `invalidateAndDelete`, queued on this actor,
     /// then removes it with the rest of the namespace.
+    ///
+    /// Contract for the caller (the app's recordings controller):
+    /// - `Task.isCancelled` also refuses the event. Final checkpoints and ticks must not run inside
+    ///   a task that closing the page or tearing the player down cancels, or they are lost.
+    /// - `CancellationError` (before or after the commit) means "discard silently": no banner, no
+    ///   revert of what the UI shows, no retry. The identity it belonged to is gone.
+    /// - A store error raised while a reset is in progress (e.g. the file vanishing under the
+    ///   connection) is reported as `CancellationError` too, never as a storage failure.
+    /// - Results of separate calls are not ordered against `seenAndProgress` snapshots: a listing
+    ///   read that started before a commit may return after it. Bump a per-course revision on
+    ///   every commit and requery a snapshot that raced one, as `acknowledge` already requires.
     public func applyProgress(owner: Int, key: RecmanCourseKey, id: String, event: RecordingProgressEvent) async throws -> RecordingProgressResult {
         await beforeProgress()
         guard validity.isActive, !Task.isCancelled else { throw CancellationError() }
         try? store.removeObsoleteFiles()
-        let result = try store.applyProgress(owner: owner, key: key, id: id, event: event)
+        let result: RecordingProgressResult
+        do { result = try store.applyProgress(owner: owner, key: key, id: id, event: event) }
+        catch { throw validity.isActive ? error : CancellationError() }
+        await afterProgress()
+        // Deliberately no `Task.isCancelled` here: a committed write is durable and is reported
+        // as long as its namespace is still the active one.
         guard validity.isActive else { throw CancellationError() }
         return result
     }

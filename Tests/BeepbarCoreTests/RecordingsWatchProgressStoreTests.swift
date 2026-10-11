@@ -258,12 +258,12 @@ struct RecordingsWatchProgressStoreTests {
         _ = try progress(store, ids: [])
         try execute("INSERT INTO progress VALUES (42,'058167',2026,'future',0.4,7,0); INSERT INTO progress VALUES (42,'058167',2026,'damaged',3.5,NULL,0)")
         let read = try progress(store, ids: ["future", "damaged"])
-        #expect(read["future"]?.isCompleted == true)
-        #expect(read["future"]?.furthest == 0.4)
+        // Exactly `.manual`: the kind no checkpoint can undo (mapping it to `.playback` or nil is red).
+        #expect(read["future"] == RecordingWatchEntry(furthest: 0.4, completed: .manual))
         #expect(read["damaged"] == RecordingWatchEntry(furthest: 1))
 
         for event: RecordingProgressEvent in [.checkpoint(session: session(0.2, 0.99), closes: true), .checkpoint(session: session(0.99), closes: false), .manual(done: true)] {
-            #expect(try store.applyProgress(owner: 42, key: key, id: "future", event: event).changed == false)
+            #expect(try store.applyProgress(owner: 42, key: key, id: "future", event: event) == RecordingProgressResult(entry: RecordingWatchEntry(furthest: 0.4, completed: .manual), changed: false))
         }
         #expect(try rawRow(id: "future") == ["0.4", "7", "0"])
 
@@ -300,6 +300,63 @@ struct RecordingsWatchProgressStoreTests {
         #expect(read.progress == ["id7": RecordingWatchEntry(furthest: 0.1), "id9999": RecordingWatchEntry(furthest: 0.2, completed: .manual)])
         #expect(probe.current.progressRowsRead - before.progressRowsRead == 2)
         #expect(probe.current.progressFullScanSteps == 0)
+    }
+
+    /// Proves: a file whose `progress` table already has an extra nullable column (what a newer
+    /// build is allowed to add) still accepts inserts and updates from this build, and an update
+    /// keeps that column's value.
+    /// Guards against: going back to an older build breaking progress saves or wiping a newer
+    /// build's data (mutation: positional `INSERT OR REPLACE … VALUES (7 values)` → red, as
+    /// "table has 8 columns"; plain REPLACE with named columns → the extra value is lost, red).
+    @Test func newerColumnSurvivesUpdates() throws {
+        defer { cleanUp() }
+        try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+        try execute("""
+            CREATE TABLE progress(owner INTEGER, course TEXT, year INTEGER, id TEXT, furthest REAL NOT NULL, completed INTEGER, blocked INTEGER NOT NULL, note TEXT, PRIMARY KEY(owner,course,year,id)) WITHOUT ROWID;
+            INSERT INTO progress VALUES (42,'058167',2026,'a',0.2,NULL,0,'keep');
+            """)
+        let store = store()
+        #expect(try store.applyProgress(owner: 42, key: key, id: "a", event: .checkpoint(session: session(0.2, 0.5), closes: false)).changed)
+        #expect(try store.applyProgress(owner: 42, key: key, id: "b", event: .manual(done: true)).changed)
+        #expect(try rawRow(id: "a") == ["0.5", "NULL", "0"])
+        #expect(try rawRow(id: "b") == ["0.0", "2", "0"])
+        #expect(try Self.rawText(databaseURL.path, "SELECT note FROM progress WHERE id='a'") == "keep")
+        #expect(try Self.rawText(databaseURL.path, "SELECT note FROM progress WHERE id='b'") == "NULL")
+    }
+
+    /// Proves: the decision is made again under the write lock. Another connection completes the
+    /// lecture by playback between the unlocked first read (which saw no row, so a tick would
+    /// write) and `BEGIN IMMEDIATE`; the tick then finds the lecture done and writes nothing,
+    /// leaving the other writer's `.playback` intact.
+    /// Guards against: a write decided on a stale read overwriting a newer row (mutation: reuse
+    /// the first decision inside the transaction instead of calling `decide()` again → red).
+    @Test func decisionIsRemadeUnderTheWriteLock() throws {
+        defer { cleanUp() }
+        let path = databaseURL.path
+        let probe = RecordingsSeenStore.Probe(afterUnlockedRead: {
+            _ = try? Self.rawText(path, "INSERT INTO progress VALUES (42,'058167',2026,'a',0.97,1,0)")
+        })
+        let store = store(probe: probe)
+        _ = try progress(store, ids: [])
+        let result = try store.applyProgress(owner: 42, key: key, id: "a", event: .manual(done: true))
+        #expect(result == RecordingProgressResult(entry: RecordingWatchEntry(furthest: 0.97, completed: .playback), changed: false))
+        #expect(try rawRow(id: "a") == ["0.97", "1", "0"])
+    }
+
+    /// Runs one statement on its own connection and returns the first column of the first row as
+    /// text ("NULL" for SQL NULL, nil when there is no row). Throws on any SQLite error.
+    fileprivate static func rawText(_ path: String, _ sql: String) throws -> String? {
+        var db: OpaquePointer?
+        defer { sqlite3_close(db) }
+        guard sqlite3_open(path, &db) == SQLITE_OK else { throw SyncDatabaseError.open }
+        var statement: OpaquePointer?
+        guard sqlite3_prepare_v2(db, sql, -1, &statement, nil) == SQLITE_OK else { throw SyncDatabaseError.statement }
+        defer { sqlite3_finalize(statement) }
+        switch sqlite3_step(statement) {
+        case SQLITE_ROW: return sqlite3_column_type(statement, 0) == SQLITE_NULL ? "NULL" : String(cString: sqlite3_column_text(statement, 0))
+        case SQLITE_DONE: return nil
+        default: throw SyncDatabaseError.execution
+        }
     }
 }
 
@@ -349,6 +406,82 @@ struct RecordingsWatchProgressHistoryTests {
         await #expect(throws: CancellationError.self) { try await late.value }
         #expect(!FileManager.default.fileExists(atPath: databaseURL.path))
         #expect(try store.seenAndProgress(owner: 42, key: key, ids: ["a"], establishBaseline: false, legacy: empty).progress.isEmpty)
+    }
+
+    /// Proves: a listing read that was already on disk when a reset is requested (held after the
+    /// read) is refused with `CancellationError` instead of returning the old account's state.
+    /// Guards against: publishing seen state and progress of a removed identity (mutation: drop
+    /// the validity check after `afterRead` in `seenAndProgress` → red).
+    @Test func readFinishingAfterResetIsRefused() async throws {
+        defer { cleanUp() }
+        let gate = Gate()
+        let history = RecordingsSeenHistory(store: store, afterRead: { await gate.wait() })
+        let key = key, empty = empty
+        let read = Task { try await history.seenAndProgress(owner: 42, key: key, ids: ["a"], legacy: empty) }
+        await gate.waitUntilEntered()
+        history.invalidate()
+        gate.open()
+        await #expect(throws: CancellationError.self) { try await read.value }
+    }
+
+    /// Proves: a progress write that commits while a reset is requested is reported as
+    /// `CancellationError` (the caller discards it), and the reset's delete then removes it.
+    /// Guards against: publishing, after logout, a commit that belonged to the old account
+    /// (mutation: drop the validity check after `afterProgress` → the result is returned, red).
+    @Test func commitDuringResetIsReportedAsCancelled() async throws {
+        defer { cleanUp() }
+        let gate = Gate()
+        let history = RecordingsSeenHistory(store: store, afterProgress: { await gate.wait() })
+        let key = key
+        let write = Task { try await history.applyProgress(owner: 42, key: key, id: "a", event: .manual(done: true)) }
+        await gate.waitUntilEntered()
+        // The row committed before the reset was requested.
+        #expect(try store.seenAndProgress(owner: 42, key: key, ids: ["a"], establishBaseline: false, legacy: empty).progress["a"]?.isCompleted == true)
+        history.invalidate()
+        gate.open()
+        await #expect(throws: CancellationError.self) { try await write.value }
+        try await history.invalidateAndDelete()
+        #expect(!FileManager.default.fileExists(atPath: databaseURL.path))
+    }
+
+    /// Proves: a store error raised while a reset is in progress (here the folder lookup failing
+    /// right after the history is invalidated) reaches the caller as `CancellationError`, for both
+    /// progress writes and acknowledgements; with a valid history the same error is reported as is.
+    /// Guards against: a storage-failure banner caused by the user's own logout (mutation: rethrow
+    /// the store error unchanged in `applyProgress` or `acknowledge` → red).
+    @Test func storeErrorDuringResetIsCancellation() async throws {
+        defer { cleanUp() }
+        final class Arm: @unchecked Sendable {
+            var history: RecordingsSeenHistory?
+            var invalidating = true
+        }
+        let arm = Arm()
+        let folder = folder
+        let failing = RecordingsSeenStore(directory: {
+            if arm.invalidating { arm.history?.invalidate() }
+            throw POSIXError(.EACCES)
+        })
+        let key = key, empty = empty
+        let history = RecordingsSeenHistory(store: failing)
+        arm.history = history
+        await #expect(throws: CancellationError.self) {
+            try await history.applyProgress(owner: 42, key: key, id: "a", event: .manual(done: true))
+        }
+        let other = RecordingsSeenHistory(store: failing)
+        arm.history = other
+        await #expect(throws: CancellationError.self) {
+            try await other.acknowledge(owner: 42, key: key, ids: ["a"], legacy: empty)
+        }
+        // Not resetting: the real error comes through.
+        arm.invalidating = false
+        let valid = RecordingsSeenHistory(store: failing)
+        await #expect(throws: POSIXError.self) {
+            try await valid.applyProgress(owner: 42, key: key, id: "a", event: .manual(done: true))
+        }
+        await #expect(throws: POSIXError.self) {
+            try await valid.acknowledge(owner: 42, key: key, ids: ["a"], legacy: empty)
+        }
+        #expect(!FileManager.default.fileExists(atPath: folder.path))
     }
 
     /// Proves: on a valid history the actor applies the event and returns the committed entry,

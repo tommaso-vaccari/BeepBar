@@ -57,8 +57,16 @@ struct WebexSignInWebViewTests {
         HTTPCookie(properties: [.name: "ticket", .value: value, .domain: ".webex.com", .path: "/", .secure: "TRUE"])!
     }
 
-    private func outcome(_ task: Task<Void, Error>) async -> String {
-        switch await task.result {
+    /// How `task` ended. A sign-in still running after `bound` is cancelled, so a regression
+    /// that leaves it waiting (for a ticket it never notices, say) fails as "cancelled" instead of
+    /// hanging the suite: the time limit alone can't end an unstructured task.
+    private func outcome(_ task: Task<Void, Error>, within bound: Duration = .seconds(10)) async -> String {
+        let watchdog = Task {
+            try await Task.sleep(for: bound)
+            task.cancel()
+        }
+        defer { watchdog.cancel() }
+        return switch await task.result {
         case .success: "signed in"
         case .failure(is CancellationError): "cancelled"
         case .failure(let error): "\(error)"

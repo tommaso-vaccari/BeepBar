@@ -271,6 +271,83 @@ struct WebexStreamResolverTests {
         #expect(requestedURLs == [Self.player.absoluteString, Self.api])
     }
 
+    // MARK: Play diagnostics (package F fix)
+
+    @MainActor final class Diagnosed {
+        var lines: [String] = []
+    }
+
+    private func diagnosingResolver(_ diagnosed: Diagnosed) -> WebexStreamResolver {
+        WebexStreamResolver(transport: WebexStubProtocol.makeTransport(), diagnose: { diagnosed.lines.append($0) })
+    }
+
+    /// Nothing that identifies the student, the recording or the session reaches a line.
+    private func expectNoLeak(_ lines: [String]) {
+        for line in lines {
+            for secret in ["http", Self.uuid, "abc123", "mario", "polimi.it", "stale", "fresh", "Lezione", "trackingID"] {
+                #expect(!line.contains(secret), "\(secret) in \(line)")
+            }
+        }
+    }
+
+    /// A signed-out Play, step by step, exactly as it reaches the log: the hop, the refused ask
+    /// (with a ticket that Webex no longer takes), the sign-in, and the second ask with what
+    /// decided it. Before the fix every way to the browser logged one identical line, so a
+    /// user's "Play opens the browser" could not be traced to a step. Mutation: drop the
+    /// `diagnose` call in `ask` and the array differs.
+    @Test func everyStepOfASignedOutPlayIsDiagnosedWithoutAddresses() async throws {
+        liveWebex()
+        let browser = FakeBrowser(cookies: [Self.cookie("ticket", value: "stale", domain: ".webex.com"), Self.polimi])
+        browser.cookiesAfterSignIn = [Self.cookie("ticket", value: "fresh", domain: ".webex.com"), Self.polimi]
+        let diagnosed = Diagnosed()
+        _ = try await diagnosingResolver(diagnosed).stream(player: Self.player, email: email, driver: browser.driver)
+        #expect(diagnosed.lines == [
+            "stream: step=player-link form=loader status=302 location=playback-page",
+            "stream: step=api attempt=first ticket=present status=403 result=signed-out json=object hls=absent needPassword=- passwordProtected=- preventPlayback=0 canPlayback=0 requireLogin=0",
+            "stream: step=sign-in start",
+            "stream: step=sign-in done",
+            "stream: step=api attempt=after-sign-in ticket=present status=200 result=stream json=object hls=present needPassword=0 passwordProtected=0 preventPlayback=0 canPlayback=1 requireLogin=1",
+        ])
+        expectNoLeak(diagnosed.lines)
+    }
+
+    /// Each silent way to the browser (or to the "couldn't open" message) leaves a line that
+    /// names it: ldr.php not redirecting, a redirect somewhere unknown, prevented playback, no
+    /// email, a sign-in that throws, a network failure. These are the ranked hypotheses for a
+    /// Play that opened the browser on a real account; one run's log tells them apart.
+    @Test(arguments: ["ldr 200", "ldr elsewhere", "prevented", "no email", "sign-in fails", "offline"])
+    func eachWayOutIsNamed(_ scenario: String) async throws {
+        var email: PolimiEmail? = self.email
+        let browser = FakeBrowser(cookies: [])
+        let expected: String
+        switch scenario {
+        case "ldr 200":
+            liveWebex(ldr: .answer(status: 200, headers: ["Content-Type": "text/html"], body: Data("<html></html>".utf8)))
+            expected = "stream: step=player-link form=loader status=200 location=absent"
+        case "ldr elsewhere":
+            liveWebex(ldr: .redirect(status: 302, location: "/webappng/sites/politecnicomilano/recording/\(Self.uuid)/playback"))
+            expected = "stream: step=player-link form=loader status=302 location=unrecognized host=politecnicomilano.webex.com path=/webappng/sites/politecnicomilano/recording/<hex32>/playback"
+        case "prevented":
+            liveWebex(api: .answer(status: 200, body: signedInBody(extra: ["preventPlayback": true])))
+            expected = "result=unavailable(playback-prevented)"
+        case "no email":
+            liveWebex()
+            email = nil
+            expected = "stream: step=sign-in skipped reason=no-email"
+        case "sign-in fails":
+            liveWebex()
+            browser.signInError = RecmanBrowserError.playbackUnavailable
+            expected = "stream: step=sign-in failed error=playbackUnavailable"
+        default:
+            liveWebex(ldr: .failure(.notConnectedToInternet))
+            expected = "stream: step=player-link transport-error=URLError(\(URLError.Code.notConnectedToInternet.rawValue))"
+        }
+        let diagnosed = Diagnosed()
+        _ = await outcome { try await diagnosingResolver(diagnosed).stream(player: Self.player, email: email, driver: browser.driver) }
+        #expect(diagnosed.lines.contains { $0.contains(expected) }, "\(diagnosed.lines)")
+        expectNoLeak(diagnosed.lines)
+    }
+
     // MARK: Transport
 
     /// The real transport's sessions neither add nor keep cookies, cache nothing, and cap each

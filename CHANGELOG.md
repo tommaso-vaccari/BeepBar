@@ -4,7 +4,7 @@
 
 ### New
 
-- Watch lecture recordings right inside BeepBar instead of in the browser, with the usual video controls, speeds from 0.5x to 3x, 10 and 30 second skips and keyboard shortcuts. A lecture picks up where you stopped, and if the connection drops it resumes on its own. If a recording can't be played inside BeepBar, it still opens in your browser.
+- Watch lecture recordings right inside BeepBar instead of in the browser, with the usual video controls, speeds from 0.5x to 3x, 10 and 30 second skips and keyboard shortcuts. A lecture picks up where you stopped, and if the connection drops it resumes on its own. If a recording can't be played inside BeepBar, it still opens in your browser, and "Open in browser" in a recording's menu always opens it there.
 - In Settings › Recordings, confirm your Polimi email so BeepBar can sign in to Webex for you. It is filled in from your WeBeep profile when available, you can change or remove it, and it stays on your Mac.
 - **After updating:** the first time you press Play, BeepBar may sign in to Webex on its own; without a confirmed email, recordings that need that sign-in don't open. Turning Recordings off or disconnecting also deletes the Webex sign-in, the email and where you stopped.
 - Save lessons from different courses in a single Watchlist inside Recordings. Add or remove bookmarks and find your saved list again after restarting.

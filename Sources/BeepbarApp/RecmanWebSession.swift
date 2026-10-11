@@ -244,7 +244,14 @@ enum RecmanBrowserError: Error, Equatable {
     /// Only for a Play the user asked for (#148 package F must never call it in the background):
     /// a sign-in it starts may put the sign-in window on screen.
     func stream(for recording: RecmanRecording, email: PolimiEmail?) async throws -> RecordingStream {
-        let player = try await playbackURL(for: recording)
+        let player: URL
+        do {
+            player = try await playbackURL(for: recording)
+        } catch {
+            diagnose("stream: step=archive-player-link failed error=\(PlaybackDiagnostics.errorName(error))")
+            throw error
+        }
+        diagnose("stream: step=archive-player-link found form=\(WebexPlayerLink.isLoader(player) ? "loader" : "other")")
         return try await stream(player: player, email: email)
     }
 
@@ -253,7 +260,10 @@ enum RecmanBrowserError: Error, Equatable {
     /// without Polimi's archive.
     func stream(player: URL, email: PolimiEmail?) async throws -> RecordingStream {
         let operation = beginOperation()
-        let resolver = WebexStreamResolver(transport: webexTransport) { [weak self] in self?.trace($0) }
+        let resolver = WebexStreamResolver(
+            transport: webexTransport,
+            trace: { [weak self] in self?.trace($0) },
+            diagnose: { [weak self] in self?.diagnose($0) })
         let driver = WebexSignInDriver(
             cookies: { [weak self] in await self?.cookies() ?? [] },
             forgetTicket: { [weak self] in await self?.forgetWebexTicket() },
@@ -291,7 +301,20 @@ enum RecmanBrowserError: Error, Equatable {
         var deadline: Task<Void, Never>?
         var playbackGrace: Task<Void, Never>?
         private(set) var result: Result<Void, Error>?
+        /// Why it ended, as a stable word for the Play diagnostics (`signInToWebex` logs it):
+        /// which of the many ways out of a sign-in sent a Play to the browser.
+        private(set) var endReason: String?
+        /// The hosts of the main-frame hops so far (`WebexSignInNavigation.diagnosticHost`, never
+        /// an address), consecutive repeats folded and at most `maxTrail`: the diagnostics show
+        /// how far along the measured chain (webappng → idbroker → Polimi → back) the sign-in got.
+        private(set) var trail: [String] = []
+        static let maxTrail = 24
         private var continuation: CheckedContinuation<Void, Error>?
+
+        func noteHop(_ host: String) {
+            guard trail.last != host, trail.count < Self.maxTrail else { return }
+            trail.append(host)
+        }
 
         init(loginURL: URL, interactive: Bool) {
             self.loginURL = loginURL
@@ -300,9 +323,11 @@ enum RecmanBrowserError: Error, Equatable {
 
         var isFinished: Bool { result != nil }
 
-        func finish(_ result: Result<Void, Error>) {
+        /// `reason`: a privacy-safe word or two (never an address), see `endReason`.
+        func finish(_ result: Result<Void, Error>, reason: String) {
             guard self.result == nil else { return }
             self.result = result
+            endReason = reason
             stall?.cancel()
             deadline?.cancel()
             playbackGrace?.cancel()
@@ -368,17 +393,26 @@ enum RecmanBrowserError: Error, Equatable {
         login.deadline = Task { [weak self] in
             do { try await Task.sleep(for: deadline) } catch { return }
             self?.trace("Webex sign-in still hidden at its deadline")
-            self?.webexLoginNeedsUser(login, restartWithoutHint: true)
+            self?.webexLoginNeedsUser(login, cause: "deadline", restartWithoutHint: true)
         }
         restartStall(login)
         let webView = browser()
         webView.stopLoading()
         startWebexLogin(webView, loginURL)
-        try await withTaskCancellationHandler {
-            try await login.wait()
-        } onCancel: {
-            Task { @MainActor in login.finish(.failure(CancellationError())) }
+        do {
+            try await withTaskCancellationHandler {
+                try await login.wait()
+            } onCancel: {
+                Task { @MainActor in login.finish(.failure(CancellationError()), reason: "task-cancelled") }
+            }
+        } catch {
+            // Which way out it was, and whether the user had the window: a Play that ended in the
+            // browser from here says whether Webex never set the ticket, left the measured chain
+            // or stalled (#148, package F diagnostics).
+            diagnose("stream: step=sign-in ended result=\(login.endReason ?? "unknown") window=\(login.windowShown ? "shown" : "hidden") error=\(PlaybackDiagnostics.errorName(error)) trail=\(login.trail.joined(separator: ">"))")
+            throw error
         }
+        diagnose("stream: step=sign-in ended result=\(login.endReason ?? "unknown") window=\(login.windowShown ? "shown" : "hidden") trail=\(login.trail.joined(separator: ">"))")
         try ensureCurrent(operation)
     }
 
@@ -397,7 +431,7 @@ enum RecmanBrowserError: Error, Equatable {
         login.stall = Task { [weak self] in
             do { try await Task.sleep(for: timeout) } catch { return }
             self?.trace("Webex sign-in stalled")
-            self?.webexLoginNeedsUser(login, restartWithoutHint: true)
+            self?.webexLoginNeedsUser(login, cause: "stall", restartWithoutHint: true)
         }
     }
 
@@ -409,18 +443,21 @@ enum RecmanBrowserError: Error, Equatable {
     /// that didn't match the asserted identity) gives the user nothing to act on, while the
     /// unhinted login starts at Webex's own email page. A page that asks for credentials is
     /// already actionable and stays as it is.
-    private func webexLoginNeedsUser(_ login: WebexLogin, restartWithoutHint: Bool = false) {
+    /// `cause` ("stall", "deadline", "credentials") goes to the Play diagnostics, with the host of
+    /// the page the hidden sign-in was on, never its address.
+    private func webexLoginNeedsUser(_ login: WebexLogin, cause: String, restartWithoutHint: Bool = false) {
         guard webexLogin === login, !login.isFinished, !login.windowShown else { return }
         if login.reachedPlayback {
             // Webex considers the sign-in over, yet no ticket arrived: an unknown change, not
             // something the user could fix in the window.
-            login.finish(.failure(RecmanBrowserError.playbackUnavailable))
+            login.finish(.failure(RecmanBrowserError.playbackUnavailable), reason: "back-at-playback-without-ticket after=\(cause)")
             return
         }
         guard login.interactive else {
-            login.finish(.failure(RecmanBrowserError.needsSignIn))
+            login.finish(.failure(RecmanBrowserError.needsSignIn), reason: "needs-user cause=\(cause)")
             return
         }
+        diagnose("stream: step=sign-in needs-user cause=\(cause) page=\(WebexSignInNavigation.diagnosticHost(webView?.url))")
         trace("Webex sign-in needs the user: showing the sign-in window")
         login.windowShown = true
         login.stall?.cancel()
@@ -441,7 +478,9 @@ enum RecmanBrowserError: Error, Equatable {
             let cookies = await store.httpCookieStore.allCookies()
             guard let self, self.webexLogin === login, WebexSignIn.isSignedIn(cookies: cookies) else { return }
             self.trace("signed in to Webex")
-            login.finish(.success(()))
+            // Whether the ticket was already there when Webex sent the web view back to the
+            // playback page (whose load is always cancelled), or arrived before that hop.
+            login.finish(.success(()), reason: login.reachedPlayback ? "ticket at-playback-page" : "ticket")
         }
     }
 
@@ -457,7 +496,7 @@ enum RecmanBrowserError: Error, Equatable {
             let facts = try? await self.pageFacts(operation: operation)
             guard self.webexLogin === login, !login.isFinished else { return }
             self.trace("loaded \(Self.redacted(url)) — asks credentials \(facts?.asksForCredentials ?? false)")
-            if facts?.asksForCredentials == true { self.webexLoginNeedsUser(login) }
+            if facts?.asksForCredentials == true { self.webexLoginNeedsUser(login, cause: "credentials") }
         }
     }
 
@@ -782,7 +821,7 @@ enum RecmanBrowserError: Error, Equatable {
     /// page alongside the next one.
     private func interruptPending() {
         if let entry { feed(.cancelled, to: entry) }
-        webexLogin?.finish(.failure(CancellationError()))
+        webexLogin?.finish(.failure(CancellationError()), reason: "superseded")
         streamWork?.cancel()
         loadWaiter?.resolve(.failure(CancellationError()))
         loadWaiter = nil
@@ -833,7 +872,7 @@ enum RecmanBrowserError: Error, Equatable {
 
     func windowWillClose(_ notification: Notification) {
         if let entry { feed(.windowClosed, to: entry) }
-        webexLogin?.finish(.failure(CancellationError()))
+        webexLogin?.finish(.failure(CancellationError()), reason: "window-closed")
     }
 
     // MARK: WKNavigationDelegate
@@ -909,7 +948,9 @@ enum RecmanBrowserError: Error, Equatable {
         loadWaiter = nil
         if let entry { feed(.loadFailed(id: loadID), to: entry) }
         // With the window up a failed load is the user's to retry, as in a browser.
-        if let webexLogin, !webexLogin.windowShown { webexLogin.finish(.failure(RecmanBrowserError.unavailable)) }
+        if let webexLogin, !webexLogin.windowShown {
+            webexLogin.finish(.failure(RecmanBrowserError.unavailable), reason: "load-failed code=\(error.code)")
+        }
     }
 
     func webViewWebContentProcessDidTerminate(_ webView: WKWebView) {
@@ -922,7 +963,7 @@ enum RecmanBrowserError: Error, Equatable {
                 // The user is looking at a blank window: start the login again for them.
                 startWebexLogin(webView, WebexSignIn.withoutEmailHint(webexLogin.loginURL))
             } else {
-                webexLogin.finish(.failure(RecmanBrowserError.unavailable))
+                webexLogin.finish(.failure(RecmanBrowserError.unavailable), reason: "web-process-ended")
             }
             return
         }
@@ -964,7 +1005,9 @@ enum RecmanBrowserError: Error, Equatable {
     /// page is cancelled whoever is driving: it means the chain is over, so the ticket is
     /// checked. A refused page while hidden ends the sign-in (an unknown chain, browser fallback).
     private func decideDuringWebexLogin(_ login: WebexLogin, url: URL, mainFrame: Bool, decisionHandler: @MainActor (WKNavigationActionPolicy) -> Void) {
-        switch WebexSignInNavigation.decide(url, mainFrame: mainFrame, userDriven: login.windowShown) {
+        let decision = WebexSignInNavigation.decide(url, mainFrame: mainFrame, userDriven: login.windowShown)
+        if mainFrame { login.noteHop(WebexSignInNavigation.diagnosticHost(url) + (decision == .playbackPage ? "(playback)" : decision == .refuse ? "(refused)" : "")) }
+        switch decision {
         case .allow:
             decisionHandler(.allow)
         case .playbackPage:
@@ -982,14 +1025,16 @@ enum RecmanBrowserError: Error, Equatable {
                     do { try await Task.sleep(for: grace) } catch { return }
                     guard let self, self.webexLogin === login, !login.isFinished else { return }
                     self.trace("back at the playback page without a Webex ticket")
-                    login.finish(.failure(RecmanBrowserError.playbackUnavailable))
+                    login.finish(.failure(RecmanBrowserError.playbackUnavailable), reason: "back-at-playback-without-ticket")
                 }
             }
         case .refuse:
             decisionHandler(.cancel)
             guard mainFrame else { return }
             trace("refused \(Self.redacted(url))")
-            if !login.windowShown { login.finish(.failure(RecmanBrowserError.playbackUnavailable)) }
+            if !login.windowShown {
+                login.finish(.failure(RecmanBrowserError.playbackUnavailable), reason: "refused-host host=\(WebexSignInNavigation.diagnosticHost(url))")
+            }
         }
     }
 
@@ -1023,6 +1068,17 @@ enum RecmanBrowserError: Error, Equatable {
 
     private func trace(_ line: String) {
         log.debug("\(line, privacy: .public)")
+        traceHandler?(line)
+    }
+
+    /// One step of a Play (#148, package F diagnostics), at notice level in the `playback`
+    /// category, so it is in the unified log without debug logging turned on and a Play that
+    /// ended in the browser says which step sent it there. Only lines built from step names,
+    /// statuses and the privacy-safe names of `PlaybackDiagnostics` and Core's `diagnostic…`
+    /// helpers reach it: never an address, a uuid, a cookie, a title or the email. Called only
+    /// on a Play's path, so nothing is logged at rest.
+    private func diagnose(_ line: String) {
+        PlaybackDiagnostics.log.notice("\(line, privacy: .public)")
         traceHandler?(line)
     }
 

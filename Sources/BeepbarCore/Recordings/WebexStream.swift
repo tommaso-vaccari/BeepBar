@@ -119,6 +119,20 @@ public enum WebexPlayerLink {
     public static func isRedirect(_ status: Int) -> Bool {
         [301, 302, 303, 307, 308].contains(status)
     }
+
+    /// What `ldr.php`'s `Location` looked like, for the Play diagnostics (#148): "absent",
+    /// "playback-page" when `playbackPage(fromRedirectLocation:)` accepts it, otherwise the host
+    /// (`WebexSignInNavigation.diagnosticHost`) and, on Polimi's Webex site, the path's shape
+    /// with every id masked, so one log line says whether Webex moved its playback page and
+    /// where to. Never the address: its path carries the recording's uuid.
+    public static func diagnosticLocation(_ location: String?, relativeTo base: URL) -> String {
+        guard let location, !location.trimmingCharacters(in: .whitespaces).isEmpty else { return "absent" }
+        if playbackPage(fromRedirectLocation: location, relativeTo: base) != nil { return "playback-page" }
+        guard let url = URL(string: location.trimmingCharacters(in: .whitespaces), relativeTo: base)?.absoluteURL else { return "unparsable" }
+        let host = WebexSignInNavigation.diagnosticHost(url)
+        guard url.host?.lowercased() == WebexSite.host else { return "unrecognized host=\(host)" }
+        return "unrecognized host=\(host) path=\(WebexSignInNavigation.diagnosticPathShape(url))"
+    }
 }
 
 /// The cookies a browser would send with a request, restricted to Webex's own.
@@ -179,6 +193,19 @@ public enum WebexStreamUnavailable: Sendable, Equatable {
     case noStream
     /// An `hlsURL` that `WebexStreamPolicy` refuses.
     case disallowedStream
+
+    /// A stable name for the Play diagnostics (#148): which reason sent a Play to the browser.
+    public var diagnosticName: String {
+        switch self {
+        case .playbackPrevented: "playback-prevented"
+        case .passwordRequired: "password-required"
+        case .unexpectedStatus(let status): "unexpected-status-\(status)"
+        case .malformed: "malformed"
+        case .tooLarge: "too-large"
+        case .noStream: "no-stream"
+        case .disallowedStream: "disallowed-stream"
+        }
+    }
 }
 
 /// The web player's stream API:
@@ -223,24 +250,51 @@ public enum WebexStreamAPI {
     /// it read 1 on the signed-in 200 and 0 on the signed-out 403, the opposite of its name.
     /// - 403 with a JSON object: signed out. Its flags are not trusted, since a signed-out
     ///   answer may describe the recording differently; the retry after signing in decides.
-    /// - 200 with a JSON object: playback prevented or a password needed → unavailable;
-    ///   otherwise an `hlsURL` the policy accepts → stream, one it refuses → unavailable, none →
-    ///   unavailable (`noStream`). Live, signed out was only ever a 403 and a `ticket` alone got a
-    ///   200, so a 200 without the stream is this recording having no HLS (or a changed answer):
-    ///   signing in can't fix it, and doing so would cost a hidden sign-in on every Play.
+    /// - 200 with a JSON object: playback prevented, or a password this viewer still has to type
+    ///   (`needPassword`) → unavailable; otherwise an `hlsURL` the policy accepts → stream, one it
+    ///   refuses → unavailable, none → unavailable (`noStream`, or `passwordRequired` when the
+    ///   recording is `passwordProtected`). Live, signed out was only ever a 403 and a `ticket`
+    ///   alone got a 200, so a 200 without the stream is this recording having no HLS (or a
+    ///   changed answer): signing in can't fix it, and doing so would cost a hidden sign-in on
+    ///   every Play.
     /// - Anything else, or more than `responseLimit` bytes → unavailable.
+    ///
+    /// `passwordProtected` alone no longer refuses a stream (#148, package F fix). It describes
+    /// the recording, as `requireLogin` does (1 on the signed-in 200, where the login has
+    /// happened); `needPassword` is the viewer's own state. Webex lets a signed-in member of the
+    /// site watch a protected recording without typing its password, and then answers with the
+    /// `hlsURL` it already authorized: refusing on `passwordProtected` sent every such Play to
+    /// the browser, where Webex played it without asking anything. Fail-safe either way: a
+    /// stream AVPlayer can't open still ends in the browser (`RecordingPlaybackFailure.beforeReady`).
     public static func decode(status: Int, data: Data) -> WebexStreamAnswer {
         guard data.count <= responseLimit else { return .unavailable(.tooLarge) }
         guard status == 200 || status == 403 else { return .unavailable(.unexpectedStatus(status)) }
         guard let json = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any] else { return .unavailable(.malformed) }
         if status == 403 { return .signedOut }
         if flag(json["preventPlayback"]) == true || flag(json["canPlayback"]) == false { return .unavailable(.playbackPrevented) }
-        if flag(json["needPassword"]) == true || flag(json["passwordProtected"]) == true { return .unavailable(.passwordRequired) }
+        if flag(json["needPassword"]) == true { return .unavailable(.passwordRequired) }
         let info = (json["downloadRecordingInfo"] as? [String: Any])?["downloadInfo"] as? [String: Any]
-        guard let raw = info?["hlsURL"] as? String, !raw.isEmpty else { return .unavailable(.noStream) }
+        guard let raw = info?["hlsURL"] as? String, !raw.isEmpty else {
+            return .unavailable(flag(json["passwordProtected"]) == true ? .passwordRequired : .noStream)
+        }
         guard let hls = URL(string: raw), WebexStreamPolicy.isAllowedStream(hls) else { return .unavailable(.disallowedStream) }
         let title = (json["recordName"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines)
         return .stream(hls: hls, title: title?.isEmpty == false ? title : nil, duration: duration(json["duration"]))
+    }
+
+    /// The flags of an API answer that decide a Play, for the Play diagnostics (#148): each as
+    /// 1, 0 or "-" (absent or not a flag), plus whether an `hlsURL` is present, e.g.
+    /// `json=object hls=present needPassword=0 passwordProtected=1 preventPlayback=0
+    /// canPlayback=1 requireLogin=1`. Only booleans and the word "present": never a value that
+    /// could be a title, an id or an address.
+    public static func diagnosticFlags(_ data: Data) -> String {
+        guard data.count <= responseLimit, let json = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any] else { return "json=none" }
+        let info = (json["downloadRecordingInfo"] as? [String: Any])?["downloadInfo"] as? [String: Any]
+        let hls = (info?["hlsURL"] as? String).map { $0.isEmpty ? "empty" : "present" } ?? "absent"
+        let flags = ["needPassword", "passwordProtected", "preventPlayback", "canPlayback", "requireLogin"].map { name in
+            "\(name)=\(flag(json[name]).map { $0 ? "1" : "0" } ?? "-")"
+        }
+        return (["json=object", "hls=\(hls)"] + flags).joined(separator: " ")
     }
 
     /// A JSON boolean, also when Webex writes it as 0/1 or "true"/"false". Nil when absent or
@@ -396,5 +450,44 @@ public enum WebexSignInNavigation {
     /// `idbroker.webex.com` and its regional forms (`idbroker-eu.webex.com`, `idbroker-b-us…`).
     static func isIDBroker(_ host: String) -> Bool {
         host.range(of: #"^idbroker(-[a-z0-9]+)*\.webex\.com$"#, options: .regularExpression) != nil
+    }
+
+    /// Where a page of the Webex sign-in or a redirect points, for the Play diagnostics (#148):
+    /// the host itself when it is Webex's (`webex.com` on a label boundary) or Polimi's, since
+    /// those names carry no personal data and say exactly which hop left the measured chain;
+    /// "other-host" for any other site, and only the scheme's kind for non-https addresses.
+    /// Never a path or a query: they carry ids, tickets and the email hint.
+    public static func diagnosticHost(_ url: URL?) -> String {
+        guard let url, let components = URLComponents(url: url, resolvingAgainstBaseURL: false),
+              let scheme = components.scheme?.lowercased() else { return "none" }
+        guard scheme == "https" else { return ["about", "http"].contains(scheme) ? scheme : "other-scheme" }
+        guard let host = components.host?.lowercased(), host.range(of: #"^[a-z0-9.-]+$"#, options: .regularExpression) != nil else { return "no-host" }
+        if host == "webex.com" || WebexSite.isWebexSubdomain(host) || PolimiPage.isPolimiHost(host) { return host }
+        return "other-host"
+    }
+
+    /// The path segments Webex's own addresses are made of, kept as they are in
+    /// `diagnosticPathShape`. Anything else could be an id or a name (a personal room is
+    /// `/meet/<name>`), so it is masked.
+    static let knownPathWords: Set<String> = [
+        "recordingservice", "sites", "politecnicomilano", "recording", "recordings", "playback", "play",
+        "webappng", "api", "v1", "stream", "login", "ldr.php", "lsr.php", "nbr", "idb", "oauth2",
+    ]
+
+    /// The shape of `url`'s path with every segment that isn't one of `knownPathWords` masked:
+    /// `<hex32>` for a 32-hex id (`<HEX32>` when it has uppercase letters, which
+    /// `WebexPlayerLink` refuses), `<uuid>` for a dashed uuid, `<seg>` for anything else. So
+    /// `recording/playback/<hex32>` and `recording/<hex32>/playback` can be told apart in a log
+    /// without the id ever being written.
+    public static func diagnosticPathShape(_ url: URL) -> String {
+        let segments = (URLComponents(url: url, resolvingAgainstBaseURL: false)?.percentEncodedPath ?? "")
+            .split(separator: "/", omittingEmptySubsequences: false).map(String.init)
+        return segments.map { segment -> String in
+            if segment.isEmpty || knownPathWords.contains(segment.lowercased()) { return segment.lowercased() }
+            if segment.range(of: "^[0-9a-f]{32}$", options: .regularExpression) != nil { return "<hex32>" }
+            if segment.range(of: "^[0-9A-Fa-f]{32}$", options: .regularExpression) != nil { return "<HEX32>" }
+            if segment.range(of: "^[0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{12}$", options: .regularExpression) != nil { return "<uuid>" }
+            return "<seg>"
+        }.joined(separator: "/")
     }
 }

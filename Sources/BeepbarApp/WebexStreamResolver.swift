@@ -1,4 +1,5 @@
 import Foundation
+import OSLog
 #if canImport(BeepbarCore)
 // `scripts/recman-probe.sh` compiles this file together with Core's Recordings folder into one
 // module, where there is no BeepbarCore to import.
@@ -127,27 +128,43 @@ final class WebexURLSessionTransport: WebexHTTPTransport, @unchecked Sendable {
 ///   (`needsSignIn`, cancellation when the user closes the window).
 ///
 /// The uuid, the stream address, cookies and the email never reach the trace.
+///
+/// Diagnostics (#148, package F fix): every step also reports one line through `diagnose`, which
+/// `RecmanWebSession` writes to the unified log at notice level (category `playback`), so a Play
+/// that ended in the browser says which step sent it there. A line holds only a step name, an
+/// HTTP status, a decision and privacy-safe names (`PlaybackDiagnostics`,
+/// `WebexStreamAPI.diagnosticFlags`, `WebexPlayerLink.diagnosticLocation`): never an address, a
+/// uuid, a cookie, a title or the email. Lines are written only while a Play runs.
 @MainActor struct WebexStreamResolver {
     let transport: WebexHTTPTransport
     var trace: @MainActor (String) -> Void = { _ in }
+    var diagnose: @MainActor (String) -> Void = { _ in }
 
     func stream(player: URL, email: PolimiEmail?, driver: WebexSignInDriver) async throws -> RecordingStream {
         let page = try await playbackPage(for: player, driver: driver)
-        switch try await ask(page, driver: driver) {
+        switch try await ask(page, attempt: "first", driver: driver) {
         case .stream(let stream): return stream
         case .unavailable: throw RecmanBrowserError.playbackUnavailable
         case .signedOut: break
         }
         guard let email else {
             trace("signed out of Webex, and no Polimi email to sign in with")
+            diagnose("stream: step=sign-in skipped reason=no-email")
             throw RecmanBrowserError.needsEmail
         }
         trace("signed out of Webex: signing in")
+        diagnose("stream: step=sign-in start")
         await driver.forgetTicket()
         try driver.ensureCurrent()
-        try await driver.signIn(WebexSignIn.loginURL(playbackPage: page, email: email))
+        do {
+            try await driver.signIn(WebexSignIn.loginURL(playbackPage: page, email: email))
+        } catch {
+            diagnose("stream: step=sign-in failed error=\(PlaybackDiagnostics.errorName(error))")
+            throw error
+        }
         try driver.ensureCurrent()
-        switch try await ask(page, driver: driver) {
+        diagnose("stream: step=sign-in done")
+        switch try await ask(page, attempt: "after-sign-in", driver: driver) {
         case .stream(let stream): return stream
         case .signedOut:
             // Signed in, yet refused again: retrying would loop, and the browser may still work.
@@ -160,9 +177,16 @@ final class WebexURLSessionTransport: WebexHTTPTransport, @unchecked Sendable {
     private enum Answer { case stream(RecordingStream), signedOut, unavailable }
 
     private func playbackPage(for player: URL, driver: WebexSignInDriver) async throws -> WebexPlaybackPage {
-        if let page = WebexPlayerLink.playbackPage(fromPlayerURL: player) { return page }
-        guard WebexPlayerLink.isLoader(player) else { throw RecmanBrowserError.playbackUnavailable }
-        let response = try await send(WebexPlayerLink.loaderRequest(player), driver: driver)
+        if let page = WebexPlayerLink.playbackPage(fromPlayerURL: player) {
+            diagnose("stream: step=player-link form=playback-page")
+            return page
+        }
+        guard WebexPlayerLink.isLoader(player) else {
+            diagnose("stream: step=player-link form=unknown host=\(WebexSignInNavigation.diagnosticHost(player)) path=\(WebexSignInNavigation.diagnosticPathShape(player))")
+            throw RecmanBrowserError.playbackUnavailable
+        }
+        let response = try await send(WebexPlayerLink.loaderRequest(player), step: "player-link", driver: driver)
+        diagnose("stream: step=player-link form=loader status=\(response.status) location=\(WebexPlayerLink.diagnosticLocation(response.location, relativeTo: player))")
         guard WebexPlayerLink.isRedirect(response.status), let location = response.location,
               let page = WebexPlayerLink.playbackPage(fromRedirectLocation: location, relativeTo: player) else {
             // A 200 here is Webex's HTML player page: an unknown layout, not a way to the stream.
@@ -172,11 +196,17 @@ final class WebexURLSessionTransport: WebexHTTPTransport, @unchecked Sendable {
         return page
     }
 
-    private func ask(_ page: WebexPlaybackPage, driver: WebexSignInDriver) async throws -> Answer {
+    /// `attempt` names the ask in the diagnostics: "first", or "after-sign-in".
+    private func ask(_ page: WebexPlaybackPage, attempt: String, driver: WebexSignInDriver) async throws -> Answer {
         let cookies = await driver.cookies()
         try driver.ensureCurrent()
-        let response = try await send(WebexStreamAPI.request(for: page, cookies: cookies), driver: driver)
-        switch WebexStreamAPI.decode(status: response.status, data: response.body) {
+        // Whether a ticket went with the ask, never its value: "signed out" with no ticket is the
+        // expected first Play, with one it means Webex refused the ticket it gave.
+        let ticket = WebexSignIn.isSignedIn(cookies: cookies) ? "present" : "absent"
+        let response = try await send(WebexStreamAPI.request(for: page, cookies: cookies), step: "api", driver: driver)
+        let answer = WebexStreamAPI.decode(status: response.status, data: response.body)
+        diagnose(Self.apiDiagnosis(attempt: attempt, ticket: ticket, status: response.status, answer: answer, body: response.body))
+        switch answer {
         case .stream(let hls, let title, let duration):
             trace("stream API answered \(response.status) with a stream")
             return .stream(RecordingStream(url: hls, title: title, duration: duration))
@@ -189,7 +219,19 @@ final class WebexURLSessionTransport: WebexHTTPTransport, @unchecked Sendable {
         }
     }
 
-    private func send(_ request: URLRequest, driver: WebexSignInDriver) async throws -> WebexHTTPResponse {
+    /// The diagnostics line of one ask of the stream API: status, decision and the deciding
+    /// flags. Pure, so tests check exactly what reaches the log; built only from the status, the
+    /// decision's name and `WebexStreamAPI.diagnosticFlags`, never from the stream itself.
+    nonisolated static func apiDiagnosis(attempt: String, ticket: String, status: Int, answer: WebexStreamAnswer, body: Data) -> String {
+        let result = switch answer {
+        case .stream: "stream"
+        case .signedOut: "signed-out"
+        case .unavailable(let reason): "unavailable(\(reason.diagnosticName))"
+        }
+        return "stream: step=api attempt=\(attempt) ticket=\(ticket) status=\(status) result=\(result) \(WebexStreamAPI.diagnosticFlags(body))"
+    }
+
+    private func send(_ request: URLRequest, step: String, driver: WebexSignInDriver) async throws -> WebexHTTPResponse {
         let response: WebexHTTPResponse
         do {
             response = try await transport.send(request, limit: WebexStreamAPI.responseLimit)
@@ -197,14 +239,45 @@ final class WebexURLSessionTransport: WebexHTTPTransport, @unchecked Sendable {
             throw CancellationError()
         } catch is CancellationError {
             throw CancellationError()
-        } catch is URLError {
+        } catch let error as URLError {
+            diagnose("stream: step=\(step) transport-error=\(PlaybackDiagnostics.errorName(error))")
             try driver.ensureCurrent()
             throw RecmanBrowserError.unavailable
         } catch {
+            diagnose("stream: step=\(step) transport-error=\(PlaybackDiagnostics.errorName(error))")
             try driver.ensureCurrent()
             throw RecmanBrowserError.playbackUnavailable
         }
         try driver.ensureCurrent()
         return response
+    }
+}
+
+/// Privacy-safe names for the Play diagnostics (#148, package F fix), shared by the resolver,
+/// `RecmanWebSession` and `RecordingsController`.
+enum PlaybackDiagnostics {
+    /// Where the Play diagnostics go: notice level, so they are kept without debug logging, in
+    /// their own category. To read them on the Mac:
+    /// `log stream --style compact --predicate 'subsystem == "io.github.tvaccari.beepbar" AND category IN {"playback", "player"}'`
+    /// (or `log show --last 15m` with the same predicate after the fact).
+    static let log = Logger(subsystem: "io.github.tvaccari.beepbar", category: "playback")
+
+    /// A stable name for `error` that can go to the log: the case name of BeepBar's own errors,
+    /// a `URLError`'s code, otherwise the error's domain and code (and those of its underlying
+    /// error, which is where AVFoundation puts the real cause). Never `localizedDescription` or
+    /// any other `userInfo` value: a `URLError`'s or an AVFoundation error's carries the
+    /// failing address, and with it the stream token or the recording's id.
+    nonisolated static func errorName(_ error: Error?) -> String {
+        guard let error else { return "none" }
+        if error is CancellationError { return "cancelled" }
+        if let error = error as? RecmanBrowserError { return "\(error)" }
+        if let error = error as? WebexTransportError { return "\(error)" }
+        if let error = error as? URLError { return "URLError(\(error.code.rawValue))" }
+        let nsError = error as NSError
+        var name = "\(nsError.domain)(\(nsError.code))"
+        if let underlying = nsError.userInfo[NSUnderlyingErrorKey] as? NSError {
+            name += " underlying=\(underlying.domain)(\(underlying.code))"
+        }
+        return name
     }
 }

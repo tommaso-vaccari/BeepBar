@@ -120,7 +120,10 @@ struct RecordingsListing: Equatable {
     /// A course shown again within this time isn't asked for again unless the user refreshes.
     static let freshness: TimeInterval = 300
 
-    enum OpenAction: Equatable { case play, copyLink }
+    /// `play`: BeepBar's player, the browser only as a fallback (#148). `browser`: the Webex
+    /// player in the default browser, on purpose (the rows' "Apri nel browser" menu item, which
+    /// before the package F fix ran a native Play despite its name). `copyLink`: the clipboard.
+    enum OpenAction: Equatable { case play, browser, copyLink }
 
     @Published private(set) var isEnabled: Bool
     @Published private(set) var access: RecordingsAccess
@@ -560,6 +563,11 @@ struct RecordingsListing: Equatable {
     /// player in the default browser, as Play did before native playback.
     func play(_ recording: RecmanRecording) { open(recording, .play) }
 
+    /// Opens the recording's Webex player in the default browser, without trying BeepBar's own
+    /// player: the menu item that says so. Like Copy link, it is answered from the cached link
+    /// when there is one.
+    func openInBrowser(_ recording: RecmanRecording) { open(recording, .browser) }
+
     /// Copies the link of the recording's Webex player.
     func copyLink(_ recording: RecmanRecording) { open(recording, .copyLink) }
 
@@ -577,9 +585,9 @@ struct RecordingsListing: Equatable {
             if case .recover = job { return action == .play }
             return false
         }
-        // Only the link can be answered from memory: a native Play always asks for a fresh
-        // stream, since its address is short-lived and tied to a sign-in.
-        if action == .copyLink, let url = playbackURLs[recording.id] {
+        // Only the link can be answered from memory (Copy link, Open in browser): a native Play
+        // always asks for a fresh stream, since its address is short-lived and tied to a sign-in.
+        if action != .play, let url = playbackURLs[recording.id] {
             finishOpening(recording, url: url, action: action)
             return
         }
@@ -591,7 +599,7 @@ struct RecordingsListing: Equatable {
     private func finishOpening(_ recording: RecmanRecording, url: URL, action: OpenAction) {
         markOpened(recording)
         switch action {
-        case .play: openURL(url)
+        case .play, .browser: openURL(url)
         case .copyLink: copy(url)
         }
     }
@@ -792,6 +800,11 @@ struct RecordingsListing: Equatable {
                     guard generation == self.generation else { return }
                     playbackURLs[recording.id] = url
                     if request == openingRequest { finishOpening(recording, url: url, action: .copyLink) }
+                case .open(let recording, .browser, let request):
+                    let url = try await playerLink(for: recording, browser: browser)
+                    guard generation == self.generation else { return }
+                    playbackURLs[recording.id] = url
+                    if request == openingRequest { finishOpening(recording, url: url, action: .browser) }
                 case .open(let recording, .play, let request):
                     try await playNatively(recording, request: request, browser: browser, generation: generation)
                     guard generation == self.generation else { return }
@@ -866,12 +879,82 @@ struct RecordingsListing: Equatable {
         }
     }
 
+    /// Why a Play didn't reach BeepBar's player, for the Play diagnostics (#148, package F fix).
+    /// Before them every such Play logged the same "opening the browser" line, so a user report
+    /// ("Play opens the browser") couldn't say which step failed.
+    enum PlayFailureReason: String, Equatable {
+        /// Webex answered something native playback doesn't handle (`playbackUnavailable`): the
+        /// resolver's own `stream:` lines say which step and what it saw.
+        case nativeUnavailable = "native-unavailable"
+        /// The Polimi session lapsed: the page asks for a sign-in.
+        case needsSignIn = "needs-sign-in"
+        /// Webex needs a sign-in and no Polimi email was confirmed in Settings.
+        case noEmail = "no-email"
+        /// Polimi or Webex didn't answer (offline, a timeout).
+        case unreachable = "unreachable"
+        /// Interrupted (a newer operation, the user closed the sign-in window).
+        case cancelled = "cancelled"
+        /// Any other error on the way to the stream (the archive looked different, an error
+        /// BeepBar doesn't know).
+        case streamError = "stream-error"
+        /// The stream was found but the player couldn't play it.
+        case playerFailure = "player-failure"
+    }
+
+    nonisolated static func playFailureReason(_ error: Error) -> PlayFailureReason {
+        if error is CancellationError { return .cancelled }
+        switch error as? RecmanBrowserError {
+        case .playbackUnavailable: return .nativeUnavailable
+        case .needsSignIn: return .needsSignIn
+        case .needsEmail: return .noEmail
+        case .unavailable: return .unreachable
+        case .unrecognized, .incomplete, .yearUnavailable, nil: return .streamError
+        }
+    }
+
+    /// The log line of a Play whose stream lookup failed: what happens next (the browser, or
+    /// nothing but the page's message), why, and the error's privacy-safe name. Pure, so tests
+    /// read exactly what is logged; never the email, an address or a title.
+    nonisolated static func playDiagnosis(_ error: Error) -> String {
+        let next = streamFailureOutcome(error) == .browser ? "browser" : "none"
+        return "play: fallback=\(next) reason=\(playFailureReason(error).rawValue) error=\(PlaybackDiagnostics.errorName(error))"
+    }
+
+    /// The log line of a play the player reported as failed, with the phase and the error's
+    /// domain and code (AVFoundation's, and the underlying one that names the real cause).
+    nonisolated static func playerFailureDiagnosis(_ failure: RecordingPlaybackFailure, recovery: Recovery) -> String {
+        let phase: String
+        let cause: Error?
+        switch failure {
+        case .beforeReady(let error):
+            phase = "before-ready"
+            cause = error
+        case .duringPlayback(let error, _):
+            phase = "during-playback"
+            cause = error
+        }
+        let next: String
+        switch recovery {
+        case .browser: next = "browser"
+        case .freshStream: next = "fresh-stream"
+        }
+        // `recovery`: what the controller decides (`recovery(for:alreadyRecovered:)`); with no
+        // Polimi session it shows the page's message instead.
+        return "play: player failed phase=\(phase) recovery=\(next) reason=\(PlayFailureReason.playerFailure.rawValue) error=\(PlaybackDiagnostics.errorName(cause))"
+    }
+
     private func playNatively(_ recording: RecmanRecording, request: Int, browser: RecmanBrowsing, generation: Int) async throws {
+        // Whether an address is confirmed, never the address: with none, a Play that needs a
+        // Webex sign-in can only show the message.
+        let emailState = confirmedEmail == nil ? "none" : "confirmed"
+        PlaybackDiagnostics.log.notice("play: start email=\(emailState, privacy: .public)")
         let stream: RecordingStream
         do {
             stream = try await browser.stream(for: recording, email: confirmedEmail)
         } catch {
             guard generation == self.generation else { return }
+            let diagnosis = Self.playDiagnosis(error)
+            PlaybackDiagnostics.log.notice("\(diagnosis, privacy: .public)")
             guard Self.streamFailureOutcome(error) == .browser else { throw error }
             log.notice("Native playback not available: opening the browser")
             let url = try await playerLink(for: recording, browser: browser)
@@ -884,6 +967,7 @@ struct RecordingsListing: Equatable {
         // A newer click replaced this one while the stream was being found: it wins.
         guard request == openingRequest else { return }
         recoveredLectures.remove(recording.id)
+        PlaybackDiagnostics.log.notice("play: stream found, handing it to the player")
         startPlayer(stream, for: recording, startAt: RecordingPlaybackProgress.startAt(stored: storedPosition(for: recording)))
         markOpened(recording)
     }
@@ -1002,6 +1086,10 @@ struct RecordingsListing: Equatable {
         // that can't be recovered now (no Polimi session) or a recovery that never starts must
         // not use it up.
         let recovery = Self.recovery(for: failure, alreadyRecovered: recoveredLectures.contains(id))
+        // A stream that was found but never played ends in the browser from here: without this
+        // line it looked exactly like a stream that was never found (#148, package F diagnostics).
+        let diagnosis = Self.playerFailureDiagnosis(failure, recovery: recovery)
+        PlaybackDiagnostics.log.notice("\(diagnosis, privacy: .public)")
         guard access == .ready else {
             // No Polimi session to look anything up with: the student has to sign in again.
             if case .beforeReady = failure { openingProblem = .playbackUnavailable }
@@ -1023,6 +1111,8 @@ struct RecordingsListing: Equatable {
                 return
             } catch {
                 guard generation == self.generation else { return }
+                let diagnosis = "play: recovery stream failed reason=\(Self.playFailureReason(error).rawValue) error=\(PlaybackDiagnostics.errorName(error))"
+                PlaybackDiagnostics.log.notice("\(diagnosis, privacy: .public)")
                 if error is CancellationError || (error as? RecmanBrowserError) == .needsSignIn { throw error }
                 if (error as? RecmanBrowserError) == .needsEmail {
                     // Same decision as for Play: no Webex page for the student, only the sentence.

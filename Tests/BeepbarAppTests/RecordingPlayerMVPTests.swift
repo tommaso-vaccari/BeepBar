@@ -85,6 +85,20 @@ final class CountingPlayer: AVPlayer, @unchecked Sendable {
         counts.withLock { $0.removed += 1 }
         super.removeTimeObserver(observer)
     }
+
+    private let forcedStatus = OSAllocatedUnfairLock<AVPlayer.TimeControlStatus?>(initialState: nil)
+
+    override var timeControlStatus: AVPlayer.TimeControlStatus {
+        forcedStatus.withLock { $0 } ?? super.timeControlStatus
+    }
+
+    /// Reports `status` (nil: the real one) through the `timeControlStatus` KVO, as AVFoundation
+    /// does when a stream stalls and waits for data: a state the local fixture never reaches.
+    func report(_ status: AVPlayer.TimeControlStatus?) {
+        willChangeValue(forKey: "timeControlStatus")
+        forcedStatus.withLock { $0 = status }
+        didChangeValue(forKey: "timeControlStatus")
+    }
 }
 
 /// Records every seek's tolerances and can hold seeks in flight, to observe the moment between
@@ -578,6 +592,29 @@ struct RecordingPlayerMVPTests {
         await Self.settle()
         #expect(player.active == 0)
         #expect(player.counts.withLock { $0.periodicAdded } == added + 1)
+    }
+
+    /// A lecture that stalls (waiting for data at a rate) is still moving: the observer stays,
+    /// so progress resumes the moment data arrives, and no checkpoint is made, since the student
+    /// did not pause. Only `.paused` removes it. Guards against a buffering stream being treated
+    /// as a pause. Mutation: add the observer only for `.playing` in `updateProgressObserver` and
+    /// the observer is gone while waiting.
+    @Test func aStalledLectureKeepsItsObserver() async throws {
+        let recorder = Recorder()
+        var created: CountingPlayer?
+        let controller = makeController(makePlayer: { let player = CountingPlayer(); created = player; return player }, recorder: recorder)
+        try await playReady(controller)
+        let player = try #require(created)
+        try await Self.waitUntil { player.timeControlStatus == .playing && player.active == 1 }
+        player.report(.waitingToPlayAtSpecifiedRate)
+        await Self.settle()
+        #expect(player.active == 1, "waiting for data is not a pause")
+        #expect(recorder.checkpoints.isEmpty)
+        player.report(nil)
+        await Self.settle()
+        #expect(player.active == 1)
+        controller.close()
+        #expect(player.active == 0)
     }
 
     /// A replacement removes the old lecture's observer before anything else (with a resume

@@ -257,7 +257,145 @@ import Testing
         #expect(file.size == 42)
     }
 
-    private func testSession(handler: @escaping @Sendable (URLRequest) -> (HTTPURLResponse, Data)) -> URLSession {
+    // MARK: fetchOwnEmail (#148)
+
+    /// Proves the call is `core_user_get_users_by_field` with `field=id` and `values[0]=<id>`,
+    /// sent as a POST body with the token (never in the URL), and that the public constant callers
+    /// check against `availableFunctions` names the same function.
+    @Test func ownEmailRequestUsesUsersByFieldWithTheUserID() async throws {
+        #expect(WeBeepAPIClient.ownEmailFunction == "core_user_get_users_by_field")
+        let built = WeBeepAPIClient.ownEmailRequest(userID: 7, token: "secret+token")
+        #expect(built.url == WeBeepAPIClient.endpoint)
+        #expect(built.httpMethod == "POST")
+        #expect(built.url?.query == nil)
+        let fields = formFields(built.httpBody ?? Data())
+        #expect(fields["wsfunction"] == "core_user_get_users_by_field")
+        #expect(fields["field"] == "id")
+        #expect(fields["values[0]"] == "7")
+        #expect(fields["wstoken"] == "secret+token")
+        #expect(fields["moodlewsrestformat"] == "json")
+
+        // The request actually sent by fetchOwnEmail carries the same fields.
+        let sent = SentBody()
+        let session = testSession { request in
+            sent.value = formFields(bodyData(of: request))
+            #expect(request.url?.query == nil)
+            return response(status: 200, body: #"[{"id":42,"email":"a@mail.polimi.it"}]"#)
+        }
+        _ = try await WeBeepAPIClient(session: session).fetchOwnEmail(userID: 42, token: "tok")
+        #expect(sent.value["wsfunction"] == WeBeepAPIClient.ownEmailFunction)
+        #expect(sent.value["field"] == "id")
+        #expect(sent.value["values[0]"] == "42")
+        #expect(sent.value["wstoken"] == "tok")
+    }
+
+    /// Proves the address of the matching user is returned raw: not trimmed, lowercased or
+    /// validated, since `PolimiEmail` is the caller's job.
+    @Test func ownEmailReturnsTheMatchingUsersRawAddress() async throws {
+        let session = testSession { _ in
+            response(status: 200, body: #"[{"id":7,"username":"10712345","email":" Mario.Rossi@Mail.Polimi.it ","customfields":[]}]"#)
+        }
+        let email = try await WeBeepAPIClient(session: session).fetchOwnEmail(userID: 7, token: "token")
+        #expect(email == " Mario.Rossi@Mail.Polimi.it ")
+    }
+
+    /// Guards against offering another person's address: only the user whose id matches counts,
+    /// even when it is not first, and a response with only other users yields nil.
+    @Test func ownEmailIgnoresOtherUsers() async throws {
+        let both = testSession { _ in
+            response(status: 200, body: #"[{"id":8,"email":"other@mail.polimi.it"},{"id":7,"email":"me@mail.polimi.it"}]"#)
+        }
+        #expect(try await WeBeepAPIClient(session: both).fetchOwnEmail(userID: 7, token: "token") == "me@mail.polimi.it")
+
+        let onlyOther = testSession { _ in response(status: 200, body: #"[{"id":8,"email":"other@mail.polimi.it"}]"#) }
+        #expect(try await WeBeepAPIClient(session: onlyOther).fetchOwnEmail(userID: 7, token: "token") == nil)
+    }
+
+    /// Proves "the account has no address" is nil, not an error: an empty array, a missing,
+    /// null, empty or blank `email` all leave playback to ask the user.
+    @Test(arguments: [
+        "[]",
+        #"[{"id":7}]"#,
+        #"[{"id":7,"email":null}]"#,
+        #"[{"id":7,"email":""}]"#,
+        #"[{"id":7,"email":"  \n"}]"#
+    ])
+    func ownEmailIsNilWhenTheAccountHasNoAddress(_ body: String) async throws {
+        let session = testSession { _ in response(status: 200, body: body) }
+        #expect(try await WeBeepAPIClient(session: session).fetchOwnEmail(userID: 7, token: "token") == nil)
+    }
+
+    /// Proves Moodle exceptions follow the existing mapping: an expired token is `.invalidToken`
+    /// (so the app asks to sign in again), any other exception or a non-array is malformed.
+    @Test func ownEmailMapsMoodleErrors() async {
+        let expired = testSession { _ in response(status: 200, body: #"{"exception":"moodle_exception","errorcode":"invalidtoken"}"#) }
+        await #expect(throws: WeBeepAPIError.invalidToken) {
+            try await WeBeepAPIClient(session: expired).fetchOwnEmail(userID: 7, token: "token")
+        }
+        let denied = testSession { _ in response(status: 200, body: #"{"exception":"webservice_access_exception","errorcode":"accessexception"}"#) }
+        await #expect(throws: WeBeepAPIError.malformedPayload) {
+            try await WeBeepAPIClient(session: denied).fetchOwnEmail(userID: 7, token: "token")
+        }
+        let garbage = testSession { _ in response(status: 200, body: #"{"users":[]}"#) }
+        await #expect(throws: WeBeepAPIError.malformedPayload) {
+            try await WeBeepAPIClient(session: garbage).fetchOwnEmail(userID: 7, token: "token")
+        }
+        let unavailable = testSession { _ in response(status: 503, body: "{}") }
+        await #expect(throws: WeBeepAPIError.transport(503)) {
+            try await WeBeepAPIClient(session: unavailable).fetchOwnEmail(userID: 7, token: "token")
+        }
+    }
+
+    /// Proves a non-positive id is refused before any request, like `fetchCourses`.
+    @Test func ownEmailRejectsInvalidUserIDWithoutARequest() async {
+        let requested = SentBody()
+        let session = testSession { _ in requested.value = ["called": "yes"]; return response(status: 200, body: "[]") }
+        await #expect(throws: WeBeepAPIError.malformedPayload) {
+            try await WeBeepAPIClient(session: session).fetchOwnEmail(userID: 0, token: "token")
+        }
+        #expect(requested.value.isEmpty)
+    }
+
+    /// Guards the reception bound (#102): a body larger than the cap is refused as
+    /// `.responseTooLarge`, while a body half the cap's size is still accepted.
+    @Test func ownEmailResponseIsBounded() async throws {
+        let padding = String(repeating: "x", count: WeBeepAPIClient.ownEmailResponseLimit)
+        let oversized = testSession { _ in response(status: 200, body: #"[{"id":7,"email":"a@polimi.it","description":"\#(padding)"}]"#) }
+        await #expect(throws: WeBeepAPIError.responseTooLarge) {
+            try await WeBeepAPIClient(session: oversized).fetchOwnEmail(userID: 7, token: "token")
+        }
+        let small = String(repeating: "x", count: WeBeepAPIClient.ownEmailResponseLimit / 2)
+        let fits = testSession { _ in response(status: 200, body: #"[{"id":7,"email":"a@polimi.it","description":"\#(small)"}]"#) }
+        #expect(try await WeBeepAPIClient(session: fits).fetchOwnEmail(userID: 7, token: "token") == "a@polimi.it")
+    }
+
+    private func formFields(_ body: Data) -> [String: String] {
+        let text = String(data: body, encoding: .utf8) ?? ""
+        var fields: [String: String] = [:]
+        for pair in text.split(separator: "&") {
+            let parts = pair.split(separator: "=", maxSplits: 1).map { String($0).removingPercentEncoding ?? String($0) }
+            if parts.count == 2 { fields[parts[0]] = parts[1] }
+        }
+        return fields
+    }
+
+    /// URLSession moves a POST body into `httpBodyStream` before a URLProtocol sees it.
+    private func bodyData(of request: URLRequest) -> Data {
+        if let body = request.httpBody { return body }
+        guard let stream = request.httpBodyStream else { return Data() }
+        stream.open()
+        defer { stream.close() }
+        var data = Data()
+        var buffer = [UInt8](repeating: 0, count: 4096)
+        while stream.hasBytesAvailable {
+            let read = stream.read(&buffer, maxLength: buffer.count)
+            guard read > 0 else { break }
+            data.append(buffer, count: read)
+        }
+        return data
+    }
+
+    private func testSession(handler:@escaping @Sendable (URLRequest) -> (HTTPURLResponse, Data)) -> URLSession {
         StubURLProtocol.handler = handler
         let configuration = URLSessionConfiguration.ephemeral
         configuration.protocolClasses = [StubURLProtocol.self]
@@ -275,4 +413,14 @@ private final class StubURLProtocol: URLProtocol, @unchecked Sendable {
     override class func canonicalRequest(for request: URLRequest) -> URLRequest { request }
     override func startLoading() { let (response, data) = Self.handler(request); client?.urlProtocol(self, didReceive: response, cacheStoragePolicy: .notAllowed); client?.urlProtocol(self, didLoad: data); client?.urlProtocolDidFinishLoading(self) }
     override func stopLoading() {}
+}
+
+/// Captures what a stub handler saw, for assertions after the call returns.
+private final class SentBody: @unchecked Sendable {
+    private let lock = NSLock()
+    private var stored: [String: String] = [:]
+    var value: [String: String] {
+        get { lock.withLock { stored } }
+        set { lock.withLock { stored = newValue } }
+    }
 }

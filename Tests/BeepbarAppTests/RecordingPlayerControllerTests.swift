@@ -271,7 +271,7 @@ struct RecordingPlayerControllerTests {
         let controller = makeController(policy: policy)
         var failures: [RecordingPlaybackFailure] = []
         var openWhenReported: Bool?
-        controller.onFailure = { failure in
+        controller.onFailure = { _, failure in
             MainActor.preconditionIsolated()
             openWhenReported = controller.isOpen
             failures.append(failure)
@@ -297,7 +297,7 @@ struct RecordingPlayerControllerTests {
         let policy = FakePolicy(.accessory)
         let controller = makeController(policy: policy, makePlayerView: { nil })
         var failures: [RecordingPlaybackFailure] = []
-        controller.onFailure = { failures.append($0) }
+        controller.onFailure = { failures.append($1) }
         controller.play(URL(fileURLWithPath: "/nonexistent.mp4"), title: "Lezione", cookies: [])
         #expect(failures.isEmpty, "Reported on a later turn, never from inside play")
         try await Self.waitUntil { !failures.isEmpty }
@@ -319,7 +319,7 @@ struct RecordingPlayerControllerTests {
         let media = try await TestMedia.shared.url()
         let controller = makeController()
         var failures = 0
-        controller.onFailure = { _ in failures += 1 }
+        controller.onFailure = { _, _ in failures += 1 }
         controller.play(media, title: "Lezione", cookies: [])
         try await Self.waitUntil { controller.isCurrentItemReady }
         await Self.settle()
@@ -336,7 +336,7 @@ struct RecordingPlayerControllerTests {
         let media = try await TestMedia.shared.url()
         let controller = makeController()
         var failures: [RecordingPlaybackFailure] = []
-        controller.onFailure = { failures.append($0) }
+        controller.onFailure = { failures.append($1) }
         controller.play(media, title: "Lezione", cookies: [])
         try await Self.waitUntil { controller.isCurrentItemReady }
         let item = try #require(controller.player?.currentItem)
@@ -364,7 +364,7 @@ struct RecordingPlayerControllerTests {
         let media = try await TestMedia.shared.url()
         let controller = makeController()
         var failures = 0
-        controller.onFailure = { _ in failures += 1 }
+        controller.onFailure = { _, _ in failures += 1 }
         controller.play(media, title: "Uno", cookies: [])
         let replaced = try #require(controller.player?.currentItem)
         controller.play(media, title: "Due", cookies: [])
@@ -385,7 +385,7 @@ struct RecordingPlayerControllerTests {
     @Test func noFailureIsReportedAfterClose() {
         let controller = makeController()
         var failures = 0
-        controller.onFailure = { _ in failures += 1 }
+        controller.onFailure = { _, _ in failures += 1 }
         controller.play(TestMedia.missing, title: "Mancante", cookies: [])
         let observed = controller.generation
         controller.close()
@@ -399,7 +399,7 @@ struct RecordingPlayerControllerTests {
         let media = try await TestMedia.shared.url()
         let controller = makeController()
         var failures = 0
-        controller.onFailure = { _ in failures += 1 }
+        controller.onFailure = { _, _ in failures += 1 }
         controller.play(TestMedia.missing, title: "Mancante", cookies: [])
         let replaced = controller.generation
         controller.play(media, title: "Lezione", cookies: [])

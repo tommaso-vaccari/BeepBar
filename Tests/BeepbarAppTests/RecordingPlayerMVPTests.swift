@@ -68,18 +68,39 @@ final class CountingPlayer: AVPlayer, @unchecked Sendable {
 /// a resume seek being issued and landing.
 final class SeekRecordingPlayer: AVPlayer, @unchecked Sendable {
     struct Seek { let target: Double; let before: CMTime; let after: CMTime }
-    private let state = OSAllocatedUnfairLock(initialState: (seeks: [Seek](), hold: false))
+    private struct Held { let time: CMTime; let before: CMTime; let after: CMTime; let completion: @Sendable (Bool) -> Void }
+    private let state = OSAllocatedUnfairLock(initialState: (seeks: [Seek](), hold: false, held: [Held]()))
     var seeks: [Seek] { state.withLock { $0.seeks } }
     func holdSeeks() { state.withLock { $0.hold = true } }
+
+    /// Stops holding and lets every held seek run, in order.
+    func releaseSeeks() {
+        let held = state.withLock { state -> [Held] in
+            state.hold = false
+            defer { state.held = [] }
+            return state.held
+        }
+        for seek in held {
+            super.seek(to: seek.time, toleranceBefore: seek.before, toleranceAfter: seek.after, completionHandler: seek.completion)
+        }
+    }
 
     override func seek(to time: CMTime, toleranceBefore: CMTime, toleranceAfter: CMTime, completionHandler: @escaping @Sendable (Bool) -> Void) {
         let hold = state.withLock { state -> Bool in
             state.seeks.append(Seek(target: time.seconds, before: toleranceBefore, after: toleranceAfter))
+            if state.hold { state.held.append(Held(time: time, before: toleranceBefore, after: toleranceAfter, completion: completionHandler)) }
             return state.hold
         }
-        // A held seek never lands: neither the player moves nor the completion runs.
+        // A held seek has not landed: neither the player moves nor the completion runs.
         guard !hold else { return }
         super.seek(to: time, toleranceBefore: toleranceBefore, toleranceAfter: toleranceAfter, completionHandler: completionHandler)
+    }
+}
+
+extension RecordingPlayerController {
+    /// Test shorthand: the title doubles as the recording id.
+    func play(_ url: URL, title: String, cookies: [HTTPCookie], startAt: TimeInterval? = nil) {
+        play(url, title: title, cookies: cookies, startAt: startAt, recordingID: title)
     }
 }
 
@@ -109,8 +130,9 @@ final class CountingCenter: NotificationCenter, @unchecked Sendable {
 @Suite(.serialized)
 struct RecordingPlayerMVPTests {
     @MainActor final class Recorder {
-        var checkpoints: [(position: TimeInterval, duration: TimeInterval?)] = []
+        var checkpoints: [(id: String, position: TimeInterval, duration: TimeInterval?)] = []
         var failures: [RecordingPlaybackFailure] = []
+        var failureIDs: [String] = []
         var events: [String] = []
         var fullScreenToggles = 0
     }
@@ -126,11 +148,12 @@ struct RecordingPlayerMVPTests {
                                                    notificationCenter: notificationCenter,
                                                    toggleFullScreen: { _ in recorder?.fullScreenToggles += 1 })
         if let recorder {
-            controller.onPositionCheckpoint = { position, duration in
-                recorder.checkpoints.append((position, duration))
+            controller.onPositionCheckpoint = { id, position, duration in
+                recorder.checkpoints.append((id, position, duration))
                 recorder.events.append("checkpoint")
             }
-            controller.onFailure = { failure in
+            controller.onFailure = { id, failure in
+                recorder.failureIDs.append(id)
                 recorder.failures.append(failure)
                 recorder.events.append("failure")
             }
@@ -159,6 +182,16 @@ struct RecordingPlayerMVPTests {
 
     private func time(_ controller: RecordingPlayerController) -> TimeInterval {
         controller.player?.currentTime().seconds ?? .nan
+    }
+
+    /// Waits for the hops and the seek they started, then checks the paused player landed within
+    /// the seek tolerance of `seconds`.
+    private func landed(_ controller: RecordingPlayerController, near seconds: TimeInterval,
+                        sourceLocation: SourceLocation = #_sourceLocation) async throws {
+        await Self.drainHops()
+        try await Self.waitUntil { controller.pendingSeekTarget == nil }
+        await Self.settle()
+        #expect(abs(time(controller) - seconds) <= 1.01, "landed at \(time(controller))", sourceLocation: sourceLocation)
     }
 
     // MARK: Speed and pitch
@@ -242,7 +275,7 @@ struct RecordingPlayerMVPTests {
         let media = try await TestMedia.shared.url()
         controller.play(media, title: "Lezione", cookies: [], startAt: nil)
         #expect(controller.player?.defaultRate == 2)
-        #expect(controller.canFastForward == false)
+        #expect(controller.rateSupport == .unknown)
         try await Self.waitUntil { controller.isStartSettled }
         #expect(controller.player?.currentItem?.canPlayFastForward == true)
         #expect(controller.player?.defaultRate == 3)
@@ -301,9 +334,65 @@ struct RecordingPlayerMVPTests {
         controller.play(media, title: "Lezione", cookies: [], startAt: nil)
         let view = try #require(controller.playerView)
         func rates() -> [Float] { ((view.value(forKey: "speeds") as? [NSObject]) ?? []).compactMap { ($0.value(forKey: "rate") as? NSNumber)?.floatValue } }
-        #expect(rates() == RecordingPlayerPolicy.availableSpeeds(canPlayFastForward: false))
+        #expect(rates() == RecordingPlayerPolicy.availableSpeeds(.unknown))
         try await Self.waitUntil { controller.isStartSettled }
         #expect(rates() == RecordingPlayerPolicy.speeds)
+        controller.close()
+    }
+
+    /// Every play gives `AVPlayerView` fresh speed objects, so their labels follow a language
+    /// switch made between plays (tests never switch the language itself: it is process-wide).
+    @Test func theViewSpeedsAreRebuiltAtEveryPlay() async throws {
+        let controller = makeController(makePlayerView: AVKitLoader.makePlayerView)
+        try await playReady(controller)
+        let view = try #require(controller.playerView)
+        let first = try #require(view.value(forKey: "speeds") as? [NSObject])
+        try await playReady(controller)
+        let second = try #require(view.value(forKey: "speeds") as? [NSObject])
+        #expect(first.count == second.count)
+        #expect(zip(first, second).allSatisfy { $0 !== $1 })
+        controller.close()
+    }
+
+    /// Rate support can change after the item is ready: 2.5x/3x and 0.5x/0.75x follow it, both
+    /// ways, and the remembered speed is never rewritten by a cap. A report from a replaced item
+    /// is ignored.
+    @Test func speedsFollowRateSupportChanges() async throws {
+        let defaults = PlayerTestDefaults.throwaway()
+        defaults.set(3.0, forKey: RecordingPlayerPolicy.speedDefaultsKey)
+        let written = defaults.writes.count
+        let controller = makeController(defaults: defaults)
+        try await playReady(controller)
+        let player = try #require(controller.player)
+        #expect(player.defaultRate == 3)
+        let generation = controller.generation
+        controller.rateSupportChanged(generation: generation, to: .unknown)
+        #expect(player.defaultRate == 2)
+        let threeItem = controller.speedPopUp?.menu?.items.first { ($0.representedObject as? NSNumber)?.floatValue == 3 }
+        #expect(threeItem?.isEnabled == false)
+        controller.rateSupportChanged(generation: generation, to: .all)
+        #expect(player.defaultRate == 3)
+        #expect(threeItem?.isEnabled == true)
+        controller.rateSupportChanged(generation: generation - 1, to: .unknown)
+        #expect(player.defaultRate == 3)
+        #expect(defaults.writes.count == written)
+        controller.close()
+    }
+
+    /// 0.5x and 0.75x wait for slow-forward support like the fast speeds wait for fast-forward:
+    /// before the item is ready a remembered 0.5x plays at 1x, then at 0.5x once allowed.
+    @Test func slowSpeedsWaitForSlowForwardSupport() async throws {
+        let defaults = PlayerTestDefaults.throwaway()
+        defaults.set(0.5, forKey: RecordingPlayerPolicy.speedDefaultsKey)
+        let controller = makeController(defaults: defaults)
+        let media = try await TestMedia.shared.url()
+        controller.play(media, title: "Lezione", cookies: [], startAt: nil)
+        #expect(controller.player?.defaultRate == 1)
+        try await Self.waitUntil { controller.isStartSettled }
+        #expect(controller.player?.currentItem?.canPlaySlowForward == true)
+        #expect(controller.player?.defaultRate == 0.5)
+        controller.rateSupportChanged(generation: controller.generation, to: RateSupport(fastForward: true, slowForward: false))
+        #expect(controller.player?.defaultRate == 1)
         controller.close()
     }
 
@@ -475,9 +564,9 @@ struct RecordingPlayerMVPTests {
         try await playReady(controller)
         try await park(controller, at: 25)
         let before = recorder.checkpoints.count
-        controller.onPositionCheckpoint = { position, duration in
+        controller.onPositionCheckpoint = { id, position, duration in
             openWhenReported = controller.player != nil
-            recorder.checkpoints.append((position, duration))
+            recorder.checkpoints.append((id, position, duration))
         }
         if byUser { controller.window?.close() } else { controller.close() }
         #expect(recorder.checkpoints.count == before + 1)
@@ -488,8 +577,8 @@ struct RecordingPlayerMVPTests {
         #expect(recorder.checkpoints.count == before + 1)
     }
 
-    /// Closing before the stream is ready, or before the resume seek has landed, reports
-    /// nothing: a saved position must never be replaced by 0.
+    /// Closing before the stream is ready reports nothing: a saved position must never be
+    /// replaced by 0.
     @Test func closingWhileLoadingReportsNothing() async throws {
         let recorder = Recorder()
         let controller = makeController(recorder: recorder)
@@ -501,10 +590,8 @@ struct RecordingPlayerMVPTests {
         #expect(recorder.checkpoints.isEmpty)
     }
 
-    /// Between the item becoming ready and the resume seek landing, the player is still at 0:
-    /// closing or pausing then reports nothing, so the saved position survives.
-    @Test func closingBeforeTheResumeSeekLandsReportsNothing() async throws {
-        let recorder = Recorder()
+    /// A controller whose resume seeks are held in flight (the player is still at 0).
+    private func makeHeldResume(recorder: Recorder, startAt: TimeInterval = 30) async throws -> (RecordingPlayerController, SeekRecordingPlayer) {
         var created: SeekRecordingPlayer?
         let controller = makeController(makePlayer: {
             let player = SeekRecordingPlayer()
@@ -513,15 +600,116 @@ struct RecordingPlayerMVPTests {
             return player
         }, recorder: recorder)
         let media = try await TestMedia.shared.url()
-        controller.play(media, title: "Lezione", cookies: [], startAt: 30)
+        controller.play(media, title: "Lezione", cookies: [], startAt: startAt)
         try await Self.waitUntil { controller.isCurrentItemReady }
-        #expect(created?.seeks.contains { $0.target == 30 } == true)
-        #expect(controller.isStartSettled == false)
-        controller.pause()
-        await Self.settle()
+        let player = try #require(created)
+        #expect(player.seeks.contains { $0.target == startAt })
+        #expect(controller.isStartSettled == false && controller.isResuming)
+        return (controller, player)
+    }
+
+    /// Closing while the resume seek is still in flight reports the resume position, not the 0
+    /// the player still shows: the saved position survives.
+    @Test func closingDuringTheResumeSeekReportsTheResumePosition() async throws {
+        let recorder = Recorder()
+        let (controller, _) = try await makeHeldResume(recorder: recorder)
+        #expect(abs(time(controller)) < 0.5)
         controller.close()
+        #expect(recorder.checkpoints.map(\.position) == [30])
+    }
+
+    /// A failure while the resume seek is in flight reports the resume position, in the
+    /// checkpoint and in the failure alike, and the resume landing afterwards does not restart
+    /// playback. Guards against telling the caller to resume a failed lecture from 0.
+    @Test func aFailureDuringTheResumeSeekReportsTheResumePosition() async throws {
+        let recorder = Recorder()
+        let (controller, player) = try await makeHeldResume(recorder: recorder)
+        let item = try #require(controller.player?.currentItem)
+        NotificationCenter.default.post(name: AVPlayerItem.failedToPlayToEndTimeNotification, object: item)
+        try await Self.waitUntil { !recorder.failures.isEmpty }
+        guard case .duringPlayback(_, let position)? = recorder.failures.first else {
+            Issue.record("Expected duringPlayback")
+            return
+        }
+        #expect(position == 30)
+        #expect(recorder.checkpoints.map(\.position) == [30])
+        #expect(recorder.failureIDs == ["Lezione"])
+        player.releaseSeeks()
+        try await Self.waitUntil { controller.isStartSettled }
         await Self.settle()
-        #expect(recorder.checkpoints.isEmpty)
+        #expect(player.rate == 0)
+        controller.close()
+    }
+
+    /// A failure while a skip is in flight reports where the skip was going, in the checkpoint
+    /// and in the failure alike.
+    @Test func aFailureDuringASkipReportsTheSkipTarget() async throws {
+        let recorder = Recorder()
+        var created: SeekRecordingPlayer?
+        let controller = makeController(makePlayer: { let player = SeekRecordingPlayer(); created = player; return player }, recorder: recorder)
+        try await playReady(controller)
+        try await park(controller, at: 20)
+        let player = try #require(created)
+        recorder.checkpoints.removeAll()
+        player.holdSeeks()
+        controller.skip(by: 10)
+        let target = try #require(controller.pendingSeekTarget)
+        let item = try #require(player.currentItem)
+        NotificationCenter.default.post(name: AVPlayerItem.failedToPlayToEndTimeNotification, object: item)
+        try await Self.waitUntil { !recorder.failures.isEmpty }
+        guard case .duringPlayback(_, let position)? = recorder.failures.first else {
+            Issue.record("Expected duringPlayback")
+            return
+        }
+        #expect(abs(target - 30) < 0.5)
+        #expect(position == target)
+        #expect(recorder.checkpoints.map(\.position) == [target])
+        controller.close()
+    }
+
+    /// Pausing during the resume (K, Space, `pause()`) does not drive the held player but
+    /// records the intent, which the landing honours: paused stays paused, a second Space plays.
+    @Test func pausingDuringTheResumeIsHonouredWhenItLands() async throws {
+        let recorder = Recorder()
+        let (controller, player) = try await makeHeldResume(recorder: recorder)
+        controller.performShortcut(.pause)
+        #expect(controller.playWhenSettled == false)
+        #expect(player.rate == 0)
+        controller.performShortcut(.togglePlayPause)
+        #expect(controller.playWhenSettled == true)
+        #expect(player.rate == 0, "Still held: the lecture must not start at 0")
+        controller.pause()
+        #expect(controller.playWhenSettled == false)
+        player.releaseSeeks()
+        try await Self.waitUntil { controller.isStartSettled }
+        await Self.settle()
+        #expect(player.rate == 0)
+        #expect(abs(time(controller) - 30) <= 1.01)
+        controller.close()
+
+        let playing = Recorder()
+        let (second, secondPlayer) = try await makeHeldResume(recorder: playing)
+        second.performShortcut(.pause)
+        second.performShortcut(.togglePlayPause)
+        secondPlayer.releaseSeeks()
+        try await Self.waitUntil { second.isStartSettled }
+        #expect(secondPlayer.rate != 0)
+        second.close()
+    }
+
+    /// A Play with a resume position while a lecture is playing pauses at once: the old
+    /// lecture's sound must not run on into the new item before its resume lands.
+    @Test func replacingWhilePlayingWithAResumePositionPausesFirst() async throws {
+        let controller = makeController()
+        try await playReady(controller)
+        let player = try #require(controller.player)
+        try await Self.waitUntil { player.timeControlStatus == .playing }
+        let media = try await TestMedia.shared.url()
+        controller.play(media, title: "Altra", cookies: [], startAt: 30)
+        #expect(player.rate == 0)
+        try await Self.waitUntil { controller.isStartSettled }
+        #expect(player.rate != 0)
+        controller.close()
     }
 
     /// A newer play reports where the previous lecture was left, synchronously, before it is
@@ -534,9 +722,11 @@ struct RecordingPlayerMVPTests {
         try await park(controller, at: 40)
         let before = recorder.checkpoints.count
         let media = try await TestMedia.shared.url()
-        controller.play(media, title: "Altra", cookies: [], startAt: nil)
+        controller.play(media, title: "Altra", cookies: [], startAt: nil, recordingID: "rec-2")
         #expect(recorder.checkpoints.count == before + 1)
         #expect(abs((recorder.checkpoints.last?.position ?? 0) - 40) < 0.5)
+        #expect(recorder.checkpoints.last?.id == "Lezione", "The replaced lecture's id, not the new one")
+        #expect(controller.recordingID == "rec-2")
         controller.close()
     }
 
@@ -616,54 +806,99 @@ struct RecordingPlayerMVPTests {
         let right = String(UnicodeScalar(NSRightArrowFunctionKey)!)
         let left = String(UnicodeScalar(NSLeftArrowFunctionKey)!)
 
-        try await park(controller, at: 20)
-        window.sendEvent(key("l"))
-        #expect(controller.pendingSeekTarget == 30)
-        try await Self.waitUntil { controller.pendingSeekTarget == nil }
-        window.sendEvent(key(left, left, [.function, .numericPad, .shift]))
-        #expect(controller.pendingSeekTarget.map { $0 <= 1.01 } == true)
-        try await Self.waitUntil { controller.pendingSeekTarget == nil }
-        try await park(controller, at: 20)
-        window.sendEvent(key(right, right, [.function, .numericPad]))
-        #expect(controller.pendingSeekTarget == 30)
-        try await Self.waitUntil { controller.pendingSeekTarget == nil }
-        window.sendEvent(key("j"))
-        #expect(controller.pendingSeekTarget.map { abs($0 - 20) <= 1.01 } == true)
-        try await Self.waitUntil { controller.pendingSeekTarget == nil }
+        /// Sends through the window, then lets the main-actor hop run.
+        func send(_ event: NSEvent) async {
+            window.sendEvent(event)
+            await Self.drainHops()
+        }
 
-        window.sendEvent(key(">", ".", [.shift]))
-        #expect(player.defaultRate == 1.25)
-        window.sendEvent(key("<", ",", [.shift]))
-        window.sendEvent(key("<", ",", [.shift]))
-        #expect(player.defaultRate == 0.75)
-
+        // The hard rule: `sendEvent` acts only through a hop, never synchronously.
         window.sendEvent(key("m"))
+        #expect(!player.isMuted, "Acted inside the AppKit callback")
+        await Self.drainHops()
         #expect(player.isMuted)
-        window.sendEvent(key("m", repeated: true))
+        await send(key("m", repeated: true))
         #expect(player.isMuted)
-        window.sendEvent(key("m"))
+        await send(key("m"))
         #expect(!player.isMuted)
 
-        window.sendEvent(key("f"))
+        try await park(controller, at: 20)
+        await send(key("l"))
+        try await landed(controller, near: 30)
+        await send(key(left, left, [.function, .numericPad, .shift]))
+        try await landed(controller, near: 0)
+        try await park(controller, at: 20)
+        await send(key(right, right, [.function, .numericPad]))
+        try await landed(controller, near: 30)
+        await send(key("j"))
+        try await landed(controller, near: 20)
+
+        await send(key(">", ".", [.shift]))
+        #expect(player.defaultRate == 1.25)
+        await send(key("<", ",", [.shift]))
+        await send(key("<", ",", [.shift]))
+        #expect(player.defaultRate == 0.75)
+
+        await send(key("f"))
         #expect(recorder.fullScreenToggles == 1)
 
         player.play()
         #expect(player.rate != 0)
-        window.sendEvent(key(" "))
+        await send(key(" "))
         #expect(player.rate == 0)
-        window.sendEvent(key(" "))
+        await send(key(" "))
         #expect(player.rate != 0)
-        window.sendEvent(key("k"))
+        await send(key("k"))
         #expect(player.rate == 0)
 
-        #expect(controller.handleKeyDown(key("f", "f", [.command])) == false)
-        #expect(controller.handleKeyDown(key("x")) == false)
-        #expect(controller.handleKeyDown(key("m", repeated: true)) == true)
+        // Chords and unmapped keys go through; a held toggle is taken but does nothing.
+        #expect(RecordingPlayerPolicy.keyDecision(for: key("f", "f", [.command])) == nil)
+        #expect(RecordingPlayerPolicy.keyDecision(for: key("x")) == nil)
+        let heldMute = try #require(RecordingPlayerPolicy.keyDecision(for: key("m", repeated: true)))
+        #expect(heldMute.shortcut == .toggleMute && !heldMute.perform)
+        await send(key("f", repeated: true))
         #expect(recorder.fullScreenToggles == 1)
         controller.close()
     }
 
+    /// A held skip key's repeats, each through its own hop, add up: the hops run in order and
+    /// each skip starts from where the previous one is going.
+    @Test func heldSkipRepeatsAccumulate() async throws {
+        let controller = makeController()
+        try await playReady(controller)
+        try await park(controller, at: 10)
+        let window = try #require(controller.window)
+        func key(repeated: Bool) -> NSEvent {
+            NSEvent.keyEvent(with: .keyDown, location: .zero, modifierFlags: [], timestamp: 0, windowNumber: window.windowNumber, context: nil,
+                             characters: "l", charactersIgnoringModifiers: "l", isARepeat: repeated, keyCode: 37)!
+        }
+        window.sendEvent(key(repeated: false))
+        window.sendEvent(key(repeated: true))
+        window.sendEvent(key(repeated: true))
+        try await landed(controller, near: 40)
+        controller.close()
+    }
+
+    /// On a layout that types non-Latin letters, the physical J key still skips back.
+    @Test func aCyrillicLayoutUsesThePhysicalKey() async throws {
+        let controller = makeController()
+        try await playReady(controller)
+        try await park(controller, at: 30)
+        let window = try #require(controller.window)
+        // On the Russian layout the J key types "о" (U+043E).
+        let event = NSEvent.keyEvent(with: .keyDown, location: .zero, modifierFlags: [], timestamp: 0, windowNumber: window.windowNumber, context: nil,
+                                     characters: "\u{043E}", charactersIgnoringModifiers: "\u{043E}", isARepeat: false, keyCode: 38)!
+        window.sendEvent(event)
+        try await landed(controller, near: 20)
+        controller.close()
+    }
+
     // MARK: Helpers
+
+    /// Lets queued main-actor hops (key shortcuts, menu actions) run.
+    private static func drainHops() async {
+        for _ in 0..<10 { await Task.yield() }
+    }
 
     private static func waitUntil(seconds: Double = 20, _ condition: @MainActor () -> Bool) async throws {
         let deadline = Date().addingTimeInterval(seconds)

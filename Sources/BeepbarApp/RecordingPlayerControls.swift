@@ -52,11 +52,13 @@ enum RecordingPlayerPolicy {
     /// foreign language.
     static let speeds: [Float] = [0.5, 0.75, 1, 1.25, 1.5, 1.75, 2, 2.5, 3]
 
-    /// AVFoundation guarantees rates up to 2.0 for every ready item; above that only when
-    /// `AVPlayerItem.canPlayFastForward` is true (AVPlayerItem.h). A single-level HLS stream
-    /// without an I-frame playlist, like Webex's, may not qualify, so faster speeds are offered
-    /// only once the item says it can.
+    /// AVFoundation guarantees rates from 1.0 to 2.0 for every ready item (AVPlayerItem.h);
+    /// above 2.0 only when `canPlayFastForward` is true, below 1.0 only when
+    /// `canPlaySlowForward` is. A single-level HLS stream without an I-frame playlist, like
+    /// Webex's, may not qualify, so those speeds are offered only once the item says it can
+    /// (`RateSupport`).
     static let maximumSpeedWithoutFastForward: Float = 2
+    static let minimumSpeedWithoutSlowForward: Float = 1
 
     /// The UserDefaults key holding the last speed the student chose. Written only when the
     /// student changes speed, never at launch or when a play applies it.
@@ -70,9 +72,9 @@ enum RecordingPlayerPolicy {
     /// nothing worth resuming, near the end the student has finished and should start over.
     static let resumeMargin: TimeInterval = 5
 
-    /// The speeds the current item can play at.
-    nonisolated static func availableSpeeds(canPlayFastForward: Bool) -> [Float] {
-        canPlayFastForward ? speeds : speeds.filter { $0 <= maximumSpeedWithoutFastForward }
+    /// The speeds an item with `support` can play at.
+    nonisolated static func availableSpeeds(_ support: RateSupport) -> [Float] {
+        speeds.filter { $0 == effectiveSpeed(preferred: $0, support: support) }
     }
 
     /// The listed speed equal to `rate` (within float rounding), or nil.
@@ -88,9 +90,12 @@ enum RecordingPlayerPolicy {
         return speed
     }
 
-    /// The rate actually applied: the preference, capped when the item cannot fast-forward.
-    nonisolated static func effectiveSpeed(preferred: Float, canPlayFastForward: Bool) -> Float {
-        canPlayFastForward ? preferred : min(preferred, maximumSpeedWithoutFastForward)
+    /// The rate actually applied: the preference, brought within what the item supports.
+    nonisolated static func effectiveSpeed(preferred: Float, support: RateSupport) -> Float {
+        var speed = preferred
+        if !support.fastForward { speed = min(speed, maximumSpeedWithoutFastForward) }
+        if !support.slowForward { speed = max(speed, minimumSpeedWithoutSlowForward) }
+        return speed
     }
 
     /// The next speed in `available` above (`faster`) or below `current`, or nil at either end:
@@ -140,8 +145,13 @@ enum RecordingPlayerPolicy {
     /// - Letters ignore Shift and Caps Lock. `<`, `>` and digits are read from the produced
     ///   character, so they follow the keyboard layout: on a US layout `<` is Shift + `,`, on an
     ///   Italian one it has its own key, and on AZERTY digits need Shift.
+    /// - Letters follow the layout too (AZERTY's M is where QWERTY has `;`), except when the key
+    ///   types a letter outside ASCII (Cyrillic, Greek, Hebrew…, or an accented letter): then
+    ///   the physical key decides (`letterKeyCodes`), so J / K / L / F / M work on the ANSI J / K /
+    ///   L / F / M keys without switching input source.
     nonisolated static func shortcut(characters: String?, charactersIgnoringModifiers: String?,
-                                     specialKey: NSEvent.SpecialKey?, modifiers: NSEvent.ModifierFlags) -> PlayerShortcut? {
+                                     specialKey: NSEvent.SpecialKey?, modifiers: NSEvent.ModifierFlags,
+                                     keyCode: UInt16? = nil) -> PlayerShortcut? {
         let chords: NSEvent.ModifierFlags = [.command, .control, .option]
         guard modifiers.intersection(chords).isEmpty else { return nil }
         let shift = modifiers.contains(.shift)
@@ -160,7 +170,12 @@ enum RecordingPlayerPolicy {
             return .jump(Double(Int(digit) ?? 0) / 10)
         default: break
         }
-        switch charactersIgnoringModifiers?.lowercased() {
+        var letter = charactersIgnoringModifiers?.lowercased()
+        if let typed = letter, typed.unicodeScalars.count == 1, let scalar = typed.unicodeScalars.first,
+           !scalar.isASCII, CharacterSet.letters.contains(scalar), let keyCode {
+            letter = letterKeyCodes[keyCode]
+        }
+        switch letter {
         case "k": return .pause
         case "j": return .skip(-shortSkip)
         case "l": return .skip(shortSkip)
@@ -168,6 +183,22 @@ enum RecordingPlayerPolicy {
         case "m": return .toggleMute
         default: return nil
         }
+    }
+
+    /// The physical ANSI positions of the letter shortcuts (`kVK_ANSI_*` in Carbon's Events.h),
+    /// for layouts that type no Latin letters.
+    static let letterKeyCodes: [UInt16: String] = [38: "j", 40: "k", 37: "l", 3: "f", 46: "m"]
+
+    /// What the player window does with a key-down, decided from the event alone so the window
+    /// answers AppKit without touching main-actor state: nil lets the event through; otherwise
+    /// the key is taken, and its shortcut runs unless it is the repeat of a key that must not
+    /// repeat (a held toggle is swallowed, so `AVPlayerView` does not run its own binding for it
+    /// either).
+    nonisolated static func keyDecision(for event: NSEvent) -> (shortcut: PlayerShortcut, perform: Bool)? {
+        guard event.type == .keyDown,
+              let shortcut = shortcut(characters: event.characters, charactersIgnoringModifiers: event.charactersIgnoringModifiers,
+                                      specialKey: event.specialKey, modifiers: event.modifierFlags, keyCode: event.keyCode) else { return nil }
+        return (shortcut, !event.isARepeat || shortcut.repeats)
     }
 
     /// How a speed is shown: "1,25×" in Italian, "1.25×" in English, without trailing zeros.
@@ -194,19 +225,37 @@ enum RecordingPlayerPolicy {
     }
 }
 
-/// The player window: hands every key-down to `keyDownHandler` before the normal dispatch, so the
-/// player's shortcuts work whichever view is first responder and take precedence over
-/// `AVPlayerView`'s own bindings (see `PlayerShortcut`). Keys the handler declines go through
-/// unchanged. Scoped to this window: no global or local event monitor, nothing at rest.
+/// Which rates an item supports beyond the 1x–2x every ready item plays (AVPlayerItem.h):
+/// `unknown` (nothing beyond) until the item is ready and says otherwise.
+struct RateSupport: Equatable, Sendable {
+    var fastForward: Bool
+    var slowForward: Bool
+    static let unknown = RateSupport(fastForward: false, slowForward: false)
+    static let all = RateSupport(fastForward: true, slowForward: true)
+}
+
+/// The player window: takes the player's shortcut keys before the normal dispatch, so they work
+/// whichever view is first responder and take precedence over `AVPlayerView`'s own bindings (see
+/// `PlayerShortcut`). Other keys go through unchanged. Scoped to this window: no global or local
+/// event monitor, nothing at rest.
 ///
-/// `sendEvent` is an ordinary main-thread `NSWindow` override, like the player's
-/// `windowWillClose`; the issue #30 rule about hopping concerns the status item's menu callbacks.
+/// AppKit callbacks never touch main-actor state synchronously (AGENTS.md, issue #30):
+/// `sendEvent` decides from the event alone, with the pure `RecordingPlayerPolicy.keyDecision`,
+/// whether to take the key, and the action runs in a `Task { @MainActor in … }` hop. Hops run in
+/// order, so a held key's repeats still add up (`RecordingPlayerController.skip(by:)` starts
+/// from the pending seek target).
 final class RecordingPlayerWindow: NSWindow {
-    /// Returns true when the event was handled and must not reach the views.
-    var keyDownHandler: ((NSEvent) -> Bool)?
+    /// Runs a shortcut; called only from the main-actor hop, never inside `sendEvent`.
+    var shortcutHandler: (@MainActor @Sendable (PlayerShortcut) -> Void)?
 
     override func sendEvent(_ event: NSEvent) {
-        if event.type == .keyDown, let keyDownHandler, keyDownHandler(event) { return }
+        if let handler = shortcutHandler, let decision = RecordingPlayerPolicy.keyDecision(for: event) {
+            if decision.perform {
+                let shortcut = decision.shortcut
+                Task { @MainActor in handler(shortcut) }
+            }
+            return
+        }
         super.sendEvent(event)
     }
 }

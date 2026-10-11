@@ -15,17 +15,24 @@ struct RecordingPlayerPolicyTests {
         #expect(Policy.speeds == Policy.speeds.sorted())
     }
 
-    /// Without fast-forward support only speeds up to 2x are offered (AVFoundation guarantees
-    /// no more); with it, all of them. Guards against offering 2.5x/3x on a stream that cannot
-    /// play them.
-    @Test func fastSpeedsNeedFastForward() {
-        #expect(Policy.availableSpeeds(canPlayFastForward: true) == Policy.speeds)
-        #expect(Policy.availableSpeeds(canPlayFastForward: false) == [0.5, 0.75, 1, 1.25, 1.5, 1.75, 2])
-        #expect(Policy.effectiveSpeed(preferred: 3, canPlayFastForward: false) == 2)
-        #expect(Policy.effectiveSpeed(preferred: 2.5, canPlayFastForward: false) == 2)
-        #expect(Policy.effectiveSpeed(preferred: 3, canPlayFastForward: true) == 3)
-        #expect(Policy.effectiveSpeed(preferred: 2, canPlayFastForward: false) == 2)
-        #expect(Policy.effectiveSpeed(preferred: 0.5, canPlayFastForward: false) == 0.5)
+    /// AVFoundation guarantees only 1x–2x: faster speeds need fast-forward support, slower ones
+    /// slow-forward support, each independently. Guards against offering a speed the stream
+    /// cannot play.
+    @Test func speedsBeyondOneToTwoNeedSupport() {
+        let fastOnly = RateSupport(fastForward: true, slowForward: false)
+        let slowOnly = RateSupport(fastForward: false, slowForward: true)
+        #expect(Policy.availableSpeeds(.all) == Policy.speeds)
+        #expect(Policy.availableSpeeds(.unknown) == [1, 1.25, 1.5, 1.75, 2])
+        #expect(Policy.availableSpeeds(fastOnly) == [1, 1.25, 1.5, 1.75, 2, 2.5, 3])
+        #expect(Policy.availableSpeeds(slowOnly) == [0.5, 0.75, 1, 1.25, 1.5, 1.75, 2])
+        #expect(Policy.effectiveSpeed(preferred: 3, support: slowOnly) == 2)
+        #expect(Policy.effectiveSpeed(preferred: 2.5, support: .unknown) == 2)
+        #expect(Policy.effectiveSpeed(preferred: 3, support: fastOnly) == 3)
+        #expect(Policy.effectiveSpeed(preferred: 2, support: .unknown) == 2)
+        #expect(Policy.effectiveSpeed(preferred: 0.5, support: fastOnly) == 1)
+        #expect(Policy.effectiveSpeed(preferred: 0.75, support: .unknown) == 1)
+        #expect(Policy.effectiveSpeed(preferred: 0.5, support: slowOnly) == 0.5)
+        #expect(Policy.effectiveSpeed(preferred: 1.25, support: .unknown) == 1.25)
     }
 
     /// A rate matches a listed speed only within float rounding.
@@ -54,8 +61,8 @@ struct RecordingPlayerPolicyTests {
     /// `<` / `>` step to the neighbouring speed and stop at the ends, for every speed in both
     /// lists; a rate between two speeds steps to the nearest in that direction.
     @Test func speedStepsWalkTheListAndStopAtTheEnds() {
-        for canFastForward in [false, true] {
-            let available = Policy.availableSpeeds(canPlayFastForward: canFastForward)
+        for support in [RateSupport.unknown, .all, RateSupport(fastForward: true, slowForward: false), RateSupport(fastForward: false, slowForward: true)] {
+            let available = Policy.availableSpeeds(support)
             for (index, speed) in available.enumerated() {
                 let faster = Policy.steppedSpeed(from: speed, faster: true, available: available)
                 let slower = Policy.steppedSpeed(from: speed, faster: false, available: available)
@@ -66,7 +73,7 @@ struct RecordingPlayerPolicyTests {
         let all = Policy.speeds
         #expect(Policy.steppedSpeed(from: 1.1, faster: true, available: all) == 1.25)
         #expect(Policy.steppedSpeed(from: 1.1, faster: false, available: all) == 1)
-        #expect(Policy.steppedSpeed(from: 2, faster: true, available: Policy.availableSpeeds(canPlayFastForward: false)) == nil)
+        #expect(Policy.steppedSpeed(from: 2, faster: true, available: Policy.availableSpeeds(.unknown)) == nil)
     }
 
     /// Skips land inside the lecture: never before 0, never past the duration, unclamped above
@@ -146,6 +153,27 @@ struct RecordingPlayerPolicyTests {
         #expect(map("x") == nil)
         #expect(map("10") == nil)
         #expect(map("") == nil)
+    }
+
+    /// Layouts that type non-Latin letters fall back to the physical key; Latin layouts keep the
+    /// typed letter (AZERTY's M is not on QWERTY's M key), and an unknown physical key maps to
+    /// nothing.
+    @Test func nonLatinLayoutsUseThePhysicalKey() {
+        func map(_ typed: String, keyCode: UInt16) -> PlayerShortcut? {
+            Policy.shortcut(characters: typed, charactersIgnoringModifiers: typed, specialKey: nil, modifiers: [], keyCode: keyCode)
+        }
+        #expect(map("\u{043E}", keyCode: 38) == .skip(-10))   // Russian J key
+        #expect(map("\u{043B}", keyCode: 40) == .pause)       // Russian K key
+        #expect(map("\u{0434}", keyCode: 37) == .skip(10))    // Russian L key
+        #expect(map("\u{0430}", keyCode: 3) == .toggleFullScreen)
+        #expect(map("\u{044C}", keyCode: 46) == .toggleMute)
+        #expect(map("\u{03C8}", keyCode: 38) == .skip(-10))   // Greek
+        #expect(map("\u{043E}", keyCode: 0) == nil)
+        #expect(map("\u{043E}", keyCode: 99) == nil)
+        #expect(map("m", keyCode: 41) == .toggleMute)         // AZERTY M, on QWERTY's ; key
+        #expect(map(";", keyCode: 46) == nil)                 // AZERTY's , on QWERTY's M key
+        #expect(map("é", keyCode: 38) == .skip(-10))
+        #expect(Policy.shortcut(characters: "\u{043E}", charactersIgnoringModifiers: "\u{043E}", specialKey: nil, modifiers: [.command], keyCode: 38) == nil)
     }
 
     /// Only skips and speed steps repeat while a key is held; toggles would flicker.

@@ -15,11 +15,11 @@ import BeepbarCore
 /// Serialized: `WebexStubProtocol` has one handler for the process.
 @MainActor @Suite(.serialized)
 struct WebexStreamResolverTests {
-    static let uuid = "0123456789abcdef0123456789abcdef"
-    static let player = URL(string: "https://politecnicomilano.webex.com/politecnicomilano/ldr.php?RCID=abc123")!
-    static let page = "https://politecnicomilano.webex.com/recordingservice/sites/politecnicomilano/recording/playback/\(uuid)"
-    static let api = "https://politecnicomilano.webex.com/webappng/api/v1/recordings/\(uuid)/stream?siteurl=politecnicomilano"
-    static let hls = "https://nfg1wss.webex.com/nbr/MultiThumbnail/hls.m3u8?trackingID=t-1"
+    nonisolated static let uuid = "0123456789abcdef0123456789abcdef"
+    nonisolated static let player = URL(string: "https://politecnicomilano.webex.com/politecnicomilano/ldr.php?RCID=abc123")!
+    nonisolated static let page = "https://politecnicomilano.webex.com/recordingservice/sites/politecnicomilano/recording/playback/\(uuid)"
+    nonisolated static let api = "https://politecnicomilano.webex.com/webappng/api/v1/recordings/\(uuid)/stream?siteurl=politecnicomilano"
+    nonisolated static let hls = "https://nfg1wss.webex.com/nbr/MultiThumbnail/hls.m3u8?trackingID=t-1"
     let email = PolimiEmail("mario.rossi@mail.polimi.it")!
 
     static func cookie(_ name: String, value: String, domain: String) -> HTTPCookie {
@@ -76,7 +76,7 @@ struct WebexStreamResolverTests {
         return try! JSONSerialization.data(withJSONObject: body)
     }
 
-    private static let signedOutBody = try! JSONSerialization.data(withJSONObject: ["requireLogin": 0, "canPlayback": false, "preventPlayback": false])
+    nonisolated private static let signedOutBody = try! JSONSerialization.data(withJSONObject: ["requireLogin": 0, "canPlayback": false, "preventPlayback": false])
 
     /// Webex as measured: ldr.php redirects to the playback page; the API answers 200 to
     /// `ticket=fresh` and 403 to anything else; the playback page itself answers 200 (so a

@@ -1,19 +1,35 @@
 import AppKit
 @preconcurrency import AVFoundation
+import BeepbarCore
 import OSLog
 // No `import AVKit`, on purpose: see `AVKitLoader`.
 
-/// What Recordings needs from a native player: play a lecture stream in BeepBar, close it, and
-/// know whether it is showing. A protocol so the Recordings flow (issue #148, package F) can be
-/// tested with a fake that never touches AVFoundation.
+/// What Recordings needs from a native player: play a lecture stream in BeepBar, pause it, close
+/// it, learn where the student stopped, and know whether it is showing. A protocol so the
+/// Recordings flow (issue #148, package F) can be tested with a fake that never touches
+/// AVFoundation.
 @MainActor protocol RecordingPlaying: AnyObject {
     /// Whether the player is open (between a `play` and the window closing).
     var isOpen: Bool { get }
+    /// Where the student stopped, as (position, duration) in seconds; see
+    /// `RecordingPlayerController.onPositionCheckpoint` for exactly when it is called.
+    var onPositionCheckpoint: ((TimeInterval, TimeInterval?) -> Void)? { get set }
     /// Plays `url` in the player window, creating it on first use and reusing it afterwards.
     /// `cookies` go with every request AVFoundation makes for the stream; empty means none.
-    func play(_ url: URL, title: String, cookies: [HTTPCookie])
+    /// `startAt` resumes from that position once the stream is ready, unless it is within a few
+    /// seconds of either end (`RecordingPlayerPolicy.resumePosition`).
+    func play(_ url: URL, title: String, cookies: [HTTPCookie], startAt: TimeInterval?)
+    /// Pauses playback, keeping the window and the position.
+    func pause()
     /// Stops playback and releases the player and its window. Safe to call at any time.
     func close()
+}
+
+extension RecordingPlaying {
+    /// Plays from the beginning.
+    func play(_ url: URL, title: String, cookies: [HTTPCookie]) {
+        play(url, title: title, cookies: cookies, startAt: nil)
+    }
 }
 
 /// How a play failed, reported once per item through `RecordingPlayerController.onFailure`.
@@ -48,20 +64,27 @@ enum RecordingPlayerError: Error {
     }
 }
 
-/// The native recordings player (issue #148, package C): one window with an `AVPlayerView`, the
-/// same engine and controls as QuickTime.
+/// The native recordings player (issue #148, packages C and G): one window with an
+/// `AVPlayerView`, the same engine and controls as QuickTime, plus speeds, skips and keyboard
+/// shortcuts (`PlayerShortcut`), and resume hooks for the Recordings flow.
 ///
 /// Quiet at rest: the feature exists in memory only while it is used. `init` creates nothing and
 /// AVKit is not even loaded until the first `play` (`AVKitLoader`). The first `play` builds the
 /// window, the view and the `AVPlayer`; closing the window (from its close button or through
 /// `close()`) pauses, empties the player and drops every reference, so nothing of AVFoundation
-/// stays retained by BeepBar afterwards. There is no timer and no polling: the only observers are
-/// a KVO on the current item's status and its failed-to-play-to-end notification, both removed on
-/// every replacement and on close.
+/// stays retained by BeepBar afterwards.
+///
+/// Event-driven only, even while playing: no timer, no polling, no periodic or boundary time
+/// observer. The only observers are KVO on the current item's status and on the player's
+/// `timeControlStatus` and `defaultRate`, plus the item's failed-to-play-to-end notification, all
+/// tied to the current item and removed on every replacement and on close. Where the student
+/// stopped is therefore reported only at the moments that matter (`onPositionCheckpoint`), never
+/// on a clock.
 ///
 /// Not part of the quit path: `prepareForTermination` must never reach this controller, since
 /// AVFoundation teardown is exactly the kind of work the quit rules forbid there. Quitting simply
-/// lets the process end with the window open.
+/// lets the process end with the window open (so quitting reports no checkpoint: the last pause
+/// is what survives).
 ///
 /// Privacy: the stream URL carries a token, so it is never logged; at most its host.
 @MainActor final class RecordingPlayerController: NSObject, RecordingPlaying, NSWindowDelegate {
@@ -70,31 +93,79 @@ enum RecordingPlayerError: Error {
     /// called for an item that a newer `play` replaced, or after the player was closed.
     var onFailure: ((RecordingPlaybackFailure) -> Void)?
 
+    /// Where the student stopped, as (position, duration) in seconds, the duration nil when
+    /// unknown. Called on the main actor, and only:
+    /// - when playback pauses: the student's pause (controls, Space, K, media keys, Control
+    ///   Center), `pause()`, or the end of the lecture; once per pause;
+    /// - when the player closes, by `close()` or the window's close button, synchronously before
+    ///   anything is released;
+    /// - when a newer `play` replaces the item (the old lecture is closed), synchronously at the
+    ///   start of that `play`, before anything changes;
+    /// - on a `.duringPlayback` failure, just before `onFailure`.
+    ///
+    /// Never periodically. Nothing is reported until the item is ready and the `startAt` seek
+    /// has landed, so a lecture closed while loading never overwrites a saved position with 0.
+    /// The callback must not call back into the player synchronously.
+    var onPositionCheckpoint: ((TimeInterval, TimeInterval?) -> Void)?
+
     // Internal rather than private so tests can hold weak references and prove the release.
     private(set) var window: NSWindow?
     /// The `AVPlayerView`, typed as `NSView` because AVKit is loaded at runtime.
     private(set) var playerView: NSView?
     private(set) var player: AVPlayer?
+    /// The speed menu in the title bar; internal so tests can drive it.
+    private(set) var speedPopUp: NSPopUpButton?
     /// Whether the current item reached `.readyToPlay`: decides which failure phase is reported.
     private(set) var isCurrentItemReady = false
+    /// Whether the start of playback is settled: the item is ready and the `startAt` seek, if
+    /// any, has landed. Checkpoints wait for it (see `onPositionCheckpoint`).
+    private(set) var isStartSettled = false
     /// Bumped by every `play` and by every teardown. Observations hop to the main actor carrying
     /// the generation they were made in, and are dropped if it no longer matches: a report from a
     /// replaced item, or one that lands after close, never reaches `onFailure`.
     private(set) var generation = 0
+    /// The speed the student chose (`RecordingPlayerPolicy.speedDefaultsKey`).
+    private(set) var preferredSpeed: Float = 1
+    /// The rate last given to the player's `defaultRate`: the preference, capped while the item
+    /// cannot fast-forward. A `defaultRate` that differs was set by `AVPlayerView`'s own speed
+    /// menu, i.e. by the student.
+    private(set) var appliedSpeed: Float = 1
+    /// Whether the current item may play above 2x (`AVPlayerItem.canPlayFastForward`); false
+    /// until it is ready.
+    private(set) var canFastForward = false
     /// Whether `onFailure` already fired for the current generation: the status KVO and the
     /// failed-to-play-to-end notification can both report the same failure, and the fallback must
     /// run once.
     private var failureReported = false
+    /// The resume position waiting for the item to become ready.
+    private var pendingStartAt: TimeInterval?
+    /// Where an in-flight seek is going. `currentTime()` still reports the old position until the
+    /// seek lands, so repeated skips (a held L) accumulate from here, and a checkpoint taken
+    /// meanwhile reports where the student is going.
+    private var pendingSeekTarget: TimeInterval?
+    /// Whether this pause was already reported: the KVO for a pause the player made itself (a
+    /// failure) must not report it a second time.
+    private var checkpointedSincePlaying = false
+    /// The speed list last given to the view's `speeds`, so it is replaced only when it changes.
+    private var installedViewSpeeds: [Float]?
     private var statusObservation: NSKeyValueObservation?
+    private var timeControlObservation: NSKeyValueObservation?
+    private var defaultRateObservation: NSKeyValueObservation?
     private var failedToEndObserver: NSObjectProtocol?
+    /// The menu items' targets: an item holds its target weakly.
+    private var menuActions: [PlayerMenuAction] = []
     /// The policy BeepBar had before the player promoted it to `.regular`; nil when the player
     /// did not change it.
     private var policyToRestore: NSApplication.ActivationPolicy?
 
     private let present: @MainActor (NSWindow) -> Void
     private let makePlayerView: @MainActor () -> NSView?
+    private let makePlayer: @MainActor () -> AVPlayer
     private let activationPolicy: ActivationPolicyControl
     private let frameAutosaveName: String?
+    private let defaults: UserDefaults
+    private let notificationCenter: NotificationCenter
+    private let toggleFullScreen: @MainActor (NSWindow) -> Void
 
     /// How far ahead AVFoundation may buffer. Lectures last hours: left at its default (0, meaning
     /// "let the system decide"), AVPlayer may buffer minutes of high-bitrate video ahead, which
@@ -103,34 +174,61 @@ enum RecordingPlayerError: Error {
     /// and download proportional to what is actually watched.
     static let forwardBufferDuration: TimeInterval = 30
     static let defaultFrameAutosaveName = "BeepbarRecordingPlayerWindow"
+    /// How far a seek may land from its target. An exact seek (zero tolerance) decodes from the
+    /// previous keyframe up to the exact frame; an unlimited one may snap to a keyframe far away,
+    /// which in a lecture with long keyframe intervals can make "+10 s" stay put or even go
+    /// back. One second each way is invisible for a lecture, keeps every skip moving in its
+    /// direction (it is well below the 10 s skip) and lets AVFoundation stop decoding early.
+    static let seekTolerance = CMTime(seconds: 1, preferredTimescale: 600)
 
     private static let log = Logger(subsystem: "io.github.tvaccari.beepbar", category: "player")
 
     /// - Parameters:
     ///   - present: brings the window on screen; tests pass a no-op so nothing is shown and the
     ///     test process is never activated.
-    ///   - makePlayerView: builds the `AVPlayerView`; tests can simulate AVKit failing to load.
+    ///   - makePlayerView: builds the `AVPlayerView`; tests can simulate AVKit failing to load,
+    ///     or pass a plain view to observe the player without AVKit in between.
+    ///   - makePlayer: builds the `AVPlayer`; tests pass a subclass that counts time observers.
     ///   - activationPolicy: see `promoteToRegularApp()`.
     ///   - frameAutosaveName: where AppKit keeps the window's size and position; nil disables it.
+    ///   - defaults: where the chosen speed is remembered.
+    ///   - notificationCenter: where AVFoundation's item notifications are observed.
+    ///   - toggleFullScreen: what F does; tests record it instead of animating a window.
     init(present: @escaping @MainActor (NSWindow) -> Void = RecordingPlayerController.bringToFront,
          makePlayerView: @escaping @MainActor () -> NSView? = AVKitLoader.makePlayerView,
+         makePlayer: @escaping @MainActor () -> AVPlayer = { AVPlayer() },
          activationPolicy: ActivationPolicyControl = .application,
-         frameAutosaveName: String? = RecordingPlayerController.defaultFrameAutosaveName) {
+         frameAutosaveName: String? = RecordingPlayerController.defaultFrameAutosaveName,
+         defaults: UserDefaults = .standard,
+         notificationCenter: NotificationCenter = .default,
+         toggleFullScreen: @escaping @MainActor (NSWindow) -> Void = { $0.toggleFullScreen(nil) }) {
         self.present = present
         self.makePlayerView = makePlayerView
+        self.makePlayer = makePlayer
         self.activationPolicy = activationPolicy
         self.frameAutosaveName = frameAutosaveName
+        self.defaults = defaults
+        self.notificationCenter = notificationCenter
+        self.toggleFullScreen = toggleFullScreen
         super.init()
     }
 
     var isOpen: Bool { player != nil }
 
-    func play(_ url: URL, title: String, cookies: [HTTPCookie]) {
+    func play(_ url: URL, title: String, cookies: [HTTPCookie], startAt: TimeInterval?) {
         Self.log.notice("Playing a recording from \(url.host ?? "-", privacy: .public)")
+        // A newer lecture closes the one on screen: report where the student left it, while the
+        // old item is still in place.
+        checkpointIfMeaningful()
         removeItemObservers()
         generation += 1
         failureReported = false
         isCurrentItemReady = false
+        isStartSettled = false
+        canFastForward = false
+        pendingSeekTarget = nil
+        checkpointedSincePlaying = false
+        pendingStartAt = RecordingPlayerPolicy.acceptsStartAt(startAt) ? startAt : nil
         let observedGeneration = generation
 
         guard let player = self.player ?? makePlayerAndWindow() else {
@@ -143,12 +241,20 @@ enum RecordingPlayerError: Error {
             return
         }
         window?.title = title
+        preferredSpeed = RecordingPlayerPolicy.storedSpeed(defaults.object(forKey: RecordingPlayerPolicy.speedDefaultsKey))
 
         let asset = AVURLAsset(url: url, options: Self.assetOptions(cookies: cookies))
         let item = AVPlayerItem(asset: asset)
         item.preferredForwardBufferDuration = Self.forwardBufferDuration
-        // Both observers fire on whatever thread AVFoundation uses: read the values there, then
-        // hop to the main actor, where the generation check rejects stale results.
+        // Pitch-corrected speech at every speed. `timeDomain` is AVFoundation's default for apps
+        // built against macOS 12 or later, but a default can change and the choice matters here:
+        // it is the algorithm meant for voice and the cheapest pitch-preserving one, while
+        // `spectral` (the default before macOS 12, and for offline processing) costs more CPU
+        // for a quality only music needs, and `varispeed` would turn 2x lectures into chipmunks.
+        item.audioTimePitchAlgorithm = .timeDomain
+        // Every observer fires on whatever thread AVFoundation uses: read the values there (or
+        // nothing at all), then hop to the main actor, where the generation check rejects stale
+        // results.
         statusObservation = item.observe(\.status, options: [.new]) { [weak self] item, _ in
             let status = item.status
             let error = item.error
@@ -160,20 +266,41 @@ enum RecordingPlayerError: Error {
                 }
             }
         }
+        // Pauses from anywhere (the controls, Space, media keys, Control Center, the end of the
+        // lecture) show up here: this is how a pause reaches `onPositionCheckpoint` without
+        // watching the clock.
+        timeControlObservation = player.observe(\.timeControlStatus, options: [.new]) { [weak self] _, _ in
+            Task { @MainActor [weak self] in self?.timeControlStatusChanged(generation: observedGeneration) }
+        }
+        // `AVPlayerView`'s own speed menu sets `defaultRate`: that is the student choosing a speed.
+        defaultRateObservation = player.observe(\.defaultRate, options: [.new]) { [weak self] _, _ in
+            Task { @MainActor [weak self] in self?.defaultRateChanged(generation: observedGeneration) }
+        }
         // A stream that dies after it started (network lost, token expired) does not always move
         // the item to `.failed`; AVFoundation reports it with this notification instead.
-        failedToEndObserver = NotificationCenter.default.addObserver(forName: AVPlayerItem.failedToPlayToEndTimeNotification, object: item, queue: nil) { [weak self] notification in
+        failedToEndObserver = notificationCenter.addObserver(forName: AVPlayerItem.failedToPlayToEndTimeNotification, object: item, queue: nil) { [weak self] notification in
             let error = notification.userInfo?[AVPlayerItemFailedToPlayToEndTimeErrorKey] as? Error
             Task { @MainActor [weak self] in
                 self?.fail(generation: observedGeneration, error: error)
             }
         }
         player.replaceCurrentItem(with: item)
-        player.play()
+        rebuildSpeedMenu()
+        applySpeed()
+        // With a resume position, playback starts only once the seek has landed
+        // (`itemBecameReady`): starting now would play the first seconds of the lecture and then
+        // jump. AVFoundation cannot seek an item before it is ready.
+        if pendingStartAt == nil { player.play() }
         if let window { present(window) }
     }
 
+    func pause() {
+        // The checkpoint follows through the `timeControlStatus` observation, like any pause.
+        player?.pause()
+    }
+
     func close() {
+        checkpointIfMeaningful()
         let window = self.window
         stopPlayback()
         guard let window else { return }
@@ -181,13 +308,16 @@ enum RecordingPlayerError: Error {
         if self.window === window {
             self.window = nil
             playerView = nil
+            speedPopUp = nil
         }
         window.close()
     }
 
     func windowWillClose(_ notification: Notification) {
         guard let closing = notification.object as? NSWindow, closing === window else { return }
-        // The user closed the window. Playback stops now: no sound may outlive the window.
+        // The student closed the window: report where they stopped before anything is released.
+        checkpointIfMeaningful()
+        // Playback stops now: no sound may outlive the window.
         stopPlayback()
         // Synchronously, so a Play in the meantime can give the name to its new window: AppKit
         // refuses a name another live window still holds. The frame was saved on the last move
@@ -204,6 +334,7 @@ enum RecordingPlayerError: Error {
             if let self, self.window === closing {
                 self.window = nil
                 self.playerView = nil
+                self.speedPopUp = nil
             }
         }
     }
@@ -233,6 +364,7 @@ enum RecordingPlayerError: Error {
             // decide between a fresh stream URL and the browser.
             player.pause()
             let seconds = player.currentTime().seconds
+            checkpointIfMeaningful()
             Self.log.error("Recording playback stopped while playing")
             onFailure?(.duringPlayback(error, position: seconds.isFinite ? seconds : 0))
         } else {
@@ -244,27 +376,176 @@ enum RecordingPlayerError: Error {
         }
     }
 
+    /// Where the status KVO lands once the item is ready. Internal so tests can deliver a second
+    /// report and prove the resume seek happens once.
+    func itemBecameReady(generation observed: Int) {
+        guard observed == generation, !isCurrentItemReady, let player, let item = player.currentItem else { return }
+        isCurrentItemReady = true
+        canFastForward = item.canPlayFastForward
+        applySpeed()
+        guard let startAt = pendingStartAt else {
+            isStartSettled = true
+            return
+        }
+        pendingStartAt = nil
+        if let target = RecordingPlayerPolicy.resumePosition(startAt: startAt, duration: Self.seconds(item.duration)) {
+            seek(to: target, startPlaybackWhenDone: true)
+        } else {
+            isStartSettled = true
+            player.play()
+        }
+    }
+
+    // MARK: Controls
+
+    /// Performs a player shortcut. Returns whether the key was taken: every mapped key is, even
+    /// when it does nothing right now (a repeat of a toggle, a jump before the duration is
+    /// known), so `AVPlayerView` never runs its own, different binding for it.
+    func handleKeyDown(_ event: NSEvent) -> Bool {
+        guard let shortcut = RecordingPlayerPolicy.shortcut(characters: event.characters, charactersIgnoringModifiers: event.charactersIgnoringModifiers,
+                                                            specialKey: event.specialKey, modifiers: event.modifierFlags) else { return false }
+        if event.isARepeat, !shortcut.repeats { return true }
+        performShortcut(shortcut)
+        return true
+    }
+
+    func performShortcut(_ shortcut: PlayerShortcut) {
+        guard let player else { return }
+        switch shortcut {
+        case .togglePlayPause:
+            if player.rate == 0 { player.play() } else { player.pause() }
+        case .pause:
+            player.pause()
+        case .skip(let delta):
+            skip(by: delta)
+        case .slower, .faster:
+            let available = RecordingPlayerPolicy.availableSpeeds(canPlayFastForward: canFastForward)
+            if let speed = RecordingPlayerPolicy.steppedSpeed(from: appliedSpeed, faster: shortcut == .faster, available: available) {
+                selectSpeed(speed)
+            }
+        case .toggleFullScreen:
+            if let window { toggleFullScreen(window) }
+        case .toggleMute:
+            player.isMuted.toggle()
+        case .jump(let fraction):
+            guard isCurrentItemReady, let item = player.currentItem,
+                  let target = RecordingPlayerPolicy.jumpTarget(fraction: fraction, duration: Self.seconds(item.duration)) else { return }
+            seek(to: target)
+        }
+    }
+
+    /// Moves `delta` seconds from where the student is (or is already going), within the
+    /// lecture. Ignored until the item is ready: there is no timeline to move on yet.
+    func skip(by delta: TimeInterval) {
+        guard isCurrentItemReady, let player, let item = player.currentItem else { return }
+        let current = pendingSeekTarget ?? player.currentTime().seconds
+        seek(to: RecordingPlayerPolicy.skipTarget(from: current, by: delta, duration: Self.seconds(item.duration)))
+    }
+
+    /// The student chose a speed (menu, `<` / `>`, or `AVPlayerView`'s own menu): apply it now,
+    /// for this lecture and the next ones, and remember it. The only place the preference is
+    /// written, and only when it changes, so plays and launches never write.
+    func selectSpeed(_ speed: Float) {
+        guard RecordingPlayerPolicy.speeds.contains(speed) else { return }
+        preferredSpeed = speed
+        let key = RecordingPlayerPolicy.speedDefaultsKey
+        if RecordingPlayerPolicy.storedSpeed(defaults.object(forKey: key)) != speed {
+            defaults.set(Double(speed), forKey: key)
+        }
+        applySpeed()
+    }
+
     // MARK: Private
 
-    private func itemBecameReady(generation observed: Int) {
-        guard observed == generation else { return }
-        isCurrentItemReady = true
+    /// Gives the player the preferred speed, capped to what the item can play. `defaultRate` is
+    /// what `play()` (the controls, Space, media keys) starts at, so resuming keeps the speed; a
+    /// player already moving also changes `rate` at once.
+    private func applySpeed() {
+        guard let player else { return }
+        let speed = RecordingPlayerPolicy.effectiveSpeed(preferred: preferredSpeed, canPlayFastForward: canFastForward)
+        appliedSpeed = speed
+        if player.defaultRate != speed { player.defaultRate = speed }
+        if player.rate != 0, player.rate != speed { player.rate = speed }
+        updateSpeedControls()
+    }
+
+    private func defaultRateChanged(generation observed: Int) {
+        guard observed == generation, let player else { return }
+        let rate = player.defaultRate
+        // Our own `applySpeed` lands here too: only a different rate is the student's choice.
+        guard abs(rate - appliedSpeed) > 0.001 else { return }
+        if let speed = RecordingPlayerPolicy.speed(matching: Double(rate)) {
+            selectSpeed(speed)
+        } else {
+            appliedSpeed = rate
+            updateSpeedControls()
+        }
+    }
+
+    private func timeControlStatusChanged(generation observed: Int) {
+        guard observed == generation, let player else { return }
+        // Read now rather than in the observer: if hops arrive late or out of order, only the
+        // current state counts.
+        if player.timeControlStatus == .paused {
+            if !checkpointedSincePlaying { checkpointIfMeaningful() }
+        } else {
+            checkpointedSincePlaying = false
+        }
+    }
+
+    /// Reports the position, unless there is nothing meaningful to report yet (see
+    /// `onPositionCheckpoint`).
+    private func checkpointIfMeaningful() {
+        guard isCurrentItemReady, isStartSettled, let player, let item = player.currentItem else { return }
+        checkpointedSincePlaying = true
+        let current = player.currentTime().seconds
+        let position = pendingSeekTarget ?? (current.isFinite ? max(0, current) : 0)
+        onPositionCheckpoint?(position, Self.seconds(item.duration))
+    }
+
+    private func seek(to seconds: TimeInterval, startPlaybackWhenDone: Bool = false) {
+        guard let player else { return }
+        let observed = generation
+        pendingSeekTarget = seconds
+        let time = CMTime(seconds: seconds, preferredTimescale: 600)
+        player.seek(to: time, toleranceBefore: Self.seekTolerance, toleranceAfter: Self.seekTolerance) { [weak self] _ in
+            // Also when a newer seek interrupted this one (`finished` false): the resume still
+            // counts as settled, and the newer seek clears its own target when it lands.
+            Task { @MainActor [weak self] in
+                guard let self, observed == self.generation else { return }
+                if self.pendingSeekTarget == seconds { self.pendingSeekTarget = nil }
+                if startPlaybackWhenDone {
+                    self.isStartSettled = true
+                    self.player?.play()
+                }
+            }
+        }
+    }
+
+    /// A finite, positive number of seconds, or nil (indefinite while loading, or a live stream).
+    private static func seconds(_ time: CMTime) -> TimeInterval? {
+        let seconds = time.seconds
+        return seconds.isFinite && seconds > 0 ? seconds : nil
     }
 
     private func makePlayerAndWindow() -> AVPlayer? {
-        guard let view = makePlayerView() else { return nil }
+        // Key-value coding on a key the view lacks raises an Objective-C exception, which Swift
+        // cannot catch: the injected view must prove it takes a player before it is used.
+        guard let view = makePlayerView(), view.responds(to: NSSelectorFromString("setPlayer:")) else { return nil }
         // `automaticallyWaitsToMinimizeStalling` keeps its default (true): AVPlayer waits for
         // enough data before starting or resuming, which suits network streams and works with the
         // bounded forward buffer.
-        let player = AVPlayer()
+        let player = makePlayer()
         view.frame = NSRect(x: 0, y: 0, width: 960, height: 540)
         view.setValue(player, forKey: "player")
-        let window = NSWindow(contentRect: view.frame, styleMask: [.titled, .closable, .miniaturizable, .resizable], backing: .buffered, defer: true)
+        let window = RecordingPlayerWindow(contentRect: view.frame, styleMask: [.titled, .closable, .miniaturizable, .resizable], backing: .buffered, defer: true)
         // We own the window's lifetime: AppKit releasing it on close as well would double-release.
         window.isReleasedWhenClosed = false
         window.collectionBehavior.insert(.fullScreenPrimary)
         window.contentView = view
         window.delegate = self
+        window.keyDownHandler = { [weak self] event in self?.handleKeyDown(event) ?? false }
+        window.addTitlebarAccessoryViewController(makeSpeedAccessory())
         if let frameAutosaveName {
             if !window.setFrameUsingName(frameAutosaveName) { window.center() }
             window.setFrameAutosaveName(frameAutosaveName)
@@ -274,8 +555,83 @@ enum RecordingPlayerError: Error {
         self.player = player
         self.playerView = view
         self.window = window
+        installedViewSpeeds = nil
         promoteToRegularApp()
         return player
+    }
+
+    /// The speed menu at the trailing end of the title bar: always visible, it shows the current
+    /// speed and lists the keyboard shortcuts, whether or not `AVPlayerView`'s own controls offer
+    /// a speed menu in this macOS version.
+    private func makeSpeedAccessory() -> NSTitlebarAccessoryViewController {
+        let popUp = NSPopUpButton(frame: NSRect(x: 0, y: 0, width: 72, height: 22), pullsDown: true)
+        popUp.bezelStyle = .accessoryBarAction
+        popUp.controlSize = .small
+        popUp.font = .systemFont(ofSize: NSFont.smallSystemFontSize)
+        // Clicking it must not steal the keyboard from the player (Space would press it).
+        popUp.refusesFirstResponder = true
+        popUp.autoenablesItems = false
+        speedPopUp = popUp
+        let container = NSView(frame: NSRect(x: 0, y: 0, width: 80, height: 22))
+        popUp.frame.origin = NSPoint(x: 0, y: 0)
+        container.addSubview(popUp)
+        let accessory = NSTitlebarAccessoryViewController()
+        accessory.layoutAttribute = .trailing
+        accessory.view = container
+        return accessory
+    }
+
+    /// Rebuilds the speed menu's items in the current language (so a language switch shows at the
+    /// next play), then `updateSpeedControls` sets their state.
+    private func rebuildSpeedMenu() {
+        guard let popUp = speedPopUp, let menu = popUp.menu else { return }
+        menu.removeAllItems()
+        menuActions = []
+        // A pull-down button shows its first item as its title.
+        menu.addItem(NSMenuItem())
+        let header = NSMenuItem(title: tr("Velocità", "Speed"), action: nil, keyEquivalent: "")
+        header.isEnabled = false
+        menu.addItem(header)
+        for speed in RecordingPlayerPolicy.speeds {
+            let action = PlayerMenuAction { [weak self] in self?.selectSpeed(speed) }
+            menuActions.append(action)
+            let item = NSMenuItem(title: RecordingPlayerPolicy.speedLabel(speed), action: #selector(PlayerMenuAction.invoke(_:)), keyEquivalent: "")
+            item.target = action
+            item.representedObject = NSNumber(value: speed)
+            menu.addItem(item)
+        }
+        menu.addItem(.separator())
+        let shortcutsHeader = NSMenuItem(title: tr("Scorciatoie da tastiera", "Keyboard shortcuts"), action: nil, keyEquivalent: "")
+        shortcutsHeader.isEnabled = false
+        menu.addItem(shortcutsHeader)
+        let help = RecordingPlayerPolicy.shortcutHelp()
+        for entry in help {
+            let item = NSMenuItem(title: "\(entry.keys)\t\(entry.action)", action: nil, keyEquivalent: "")
+            item.isEnabled = false
+            menu.addItem(item)
+        }
+        popUp.toolTip = ([tr("Velocità di riproduzione", "Playback speed")] + help.map { "\($0.keys): \($0.action)" }).joined(separator: "\n")
+        popUp.setAccessibilityLabel(tr("Velocità di riproduzione", "Playback speed"))
+    }
+
+    /// Shows the applied speed in the title-bar menu and gives `AVPlayerView` the speeds the item
+    /// can play, so its own speed menu (where macOS shows one) offers the same list.
+    private func updateSpeedControls() {
+        let available = RecordingPlayerPolicy.availableSpeeds(canPlayFastForward: canFastForward)
+        if let menu = speedPopUp?.menu {
+            menu.item(at: 0)?.title = RecordingPlayerPolicy.speedLabel(appliedSpeed)
+            for item in menu.items {
+                guard let speed = (item.representedObject as? NSNumber)?.floatValue else { continue }
+                item.state = abs(speed - appliedSpeed) < 0.001 ? .on : .off
+                item.isEnabled = available.contains(speed)
+            }
+        }
+        if let playerView, installedViewSpeeds != available,
+           playerView.responds(to: NSSelectorFromString("setSpeeds:")),
+           let speeds = AVKitLoader.makePlaybackSpeeds(available) {
+            installedViewSpeeds = available
+            playerView.setValue(speeds, forKey: "speeds")
+        }
     }
 
     /// BeepBar is a menu-bar app (`LSUIElement`), so its windows have no Dock icon and no entry
@@ -286,8 +642,12 @@ enum RecordingPlayerError: Error {
     /// Interaction with other code switching the policy: the player only remembers a policy it
     /// changed itself (nothing when BeepBar was already regular), and only restores it if BeepBar
     /// is still regular at close, so it never undoes a change someone else made in between.
-    /// `chooseRoot` runs a modal panel that restores its own policy before returning, so the two
-    /// never interleave: if the player is open, `chooseRoot` finds `.regular` and leaves it alone.
+    /// `chooseRoot` is not that careful, and the two can interleave: its `runModal` folder panel
+    /// keeps servicing main-actor jobs, so a Play can start while the panel is open. The player
+    /// then finds `.regular` (set by `chooseRoot`) and records nothing to restore, and when the
+    /// panel closes `chooseRoot` puts back `.accessory` unconditionally: the lecture keeps
+    /// playing but its window loses the Dock icon and the Cmd-Tab entry until the next Play.
+    /// Package F is to make `chooseRoot` leave the policy alone while the player is open.
     private func promoteToRegularApp() {
         let current = activationPolicy.current()
         guard current != .regular, policyToRestore == nil else { return }
@@ -304,7 +664,11 @@ enum RecordingPlayerError: Error {
     private func removeItemObservers() {
         statusObservation?.invalidate()
         statusObservation = nil
-        if let failedToEndObserver { NotificationCenter.default.removeObserver(failedToEndObserver) }
+        timeControlObservation?.invalidate()
+        timeControlObservation = nil
+        defaultRateObservation?.invalidate()
+        defaultRateObservation = nil
+        if let failedToEndObserver { notificationCenter.removeObserver(failedToEndObserver) }
         failedToEndObserver = nil
     }
 
@@ -313,11 +677,15 @@ enum RecordingPlayerError: Error {
     private func stopPlayback() {
         generation += 1
         isCurrentItemReady = false
+        isStartSettled = false
+        pendingStartAt = nil
+        pendingSeekTarget = nil
         removeItemObservers()
         player?.pause()
         player?.replaceCurrentItem(with: nil)
         playerView?.setValue(nil, forKey: "player")
         player = nil
+        menuActions = []
         restoreActivationPolicy()
     }
 
@@ -326,6 +694,8 @@ enum RecordingPlayerError: Error {
         window.setFrameAutosaveName("")
         window.contentView = nil
         window.delegate = nil
+        (window as? RecordingPlayerWindow)?.keyDownHandler = nil
+        while !window.titlebarAccessoryViewControllers.isEmpty { window.removeTitlebarAccessoryViewController(at: 0) }
     }
 }
 
@@ -356,12 +726,7 @@ enum RecordingPlayerError: Error {
     /// A new `AVPlayerView` with floating controls, or nil if AVKit cannot be loaded. The load is
     /// attempted once per process.
     static func makePlayerView() -> NSView? {
-        if !attempted {
-            attempted = true
-            if dlopen(frameworkPath, RTLD_LAZY) != nil {
-                playerViewClass = NSClassFromString("AVPlayerView") as? NSView.Type
-            }
-        }
+        loadIfNeeded()
         guard let playerViewClass else { return nil }
         let view = (playerViewClass as NSObject.Type).init()
         // Key-value coding on a key the object lacks raises an Objective-C exception, which Swift
@@ -371,5 +736,41 @@ enum RecordingPlayerError: Error {
               view.responds(to: NSSelectorFromString("setControlsStyle:")) else { return nil }
         view.setValue(floatingControlsStyle, forKey: "controlsStyle")
         return view
+    }
+
+    /// `AVPlaybackSpeed` objects for `rates` (macOS 13+), for `AVPlayerView.speeds`, or nil when
+    /// the class or its initializer is missing.
+    ///
+    /// `-[AVPlaybackSpeed initWithRate:localizedName:]` takes a `float`, which neither key-value
+    /// coding nor `perform(_:with:)` can pass, so it is called through its implementation
+    /// pointer, with the ownership Objective-C defines for `alloc` and `init`: `alloc` returns a
+    /// +1 object, `init` consumes it and returns a +1 result, taken here exactly once.
+    static func makePlaybackSpeeds(_ rates: [Float]) -> [NSObject]? {
+        loadIfNeeded()
+        let allocSelector = NSSelectorFromString("alloc")
+        let initSelector = NSSelectorFromString("initWithRate:localizedName:")
+        guard let speedClass = NSClassFromString("AVPlaybackSpeed"),
+              speedClass.instancesRespond(to: initSelector),
+              let allocMethod = class_getClassMethod(speedClass, allocSelector),
+              let initMethod = class_getInstanceMethod(speedClass, initSelector) else { return nil }
+        typealias Alloc = @convention(c) (AnyClass, Selector) -> UnsafeMutableRawPointer?
+        typealias Initialize = @convention(c) (UnsafeMutableRawPointer, Selector, Float, NSString) -> UnsafeMutableRawPointer?
+        let alloc = unsafeBitCast(method_getImplementation(allocMethod), to: Alloc.self)
+        let initialize = unsafeBitCast(method_getImplementation(initMethod), to: Initialize.self)
+        var speeds: [NSObject] = []
+        for rate in rates {
+            guard let allocated = alloc(speedClass, allocSelector),
+                  let initialized = initialize(allocated, initSelector, rate, RecordingPlayerPolicy.speedLabel(rate) as NSString) else { return nil }
+            speeds.append(Unmanaged<NSObject>.fromOpaque(initialized).takeRetainedValue())
+        }
+        return speeds
+    }
+
+    private static func loadIfNeeded() {
+        guard !attempted else { return }
+        attempted = true
+        if dlopen(frameworkPath, RTLD_LAZY) != nil {
+            playerViewClass = NSClassFromString("AVPlayerView") as? NSView.Type
+        }
     }
 }

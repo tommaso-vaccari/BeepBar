@@ -243,6 +243,32 @@ import Testing
         #expect(try Data(contentsOf: destination) == Data("changed".utf8))
     }
 
+    /// R03 (#111, PR #142): with nothing new on Moodle, files the user deleted from a module folder
+    /// whose other files are still there are downloaded again, and only those. The run checks the
+    /// existence of every tracked file grouped by folder (`FileStore.existingRegularFiles`); this
+    /// pins the end-to-end result for the shared-folder case. Guards against an existing folder
+    /// being taken as proof that all its files exist, which would leave the deletions unrepaired
+    /// (sync-behavior §2, "You delete a tracked file").
+    @Test func filesDeletedFromASharedFolderAreDownloadedAgainWhenNothingChanged() async throws {
+        let fixture = try await Fixture()
+        defer { fixture.remove() }
+        let target = fixture.targets[0]
+        _ = try await fixture.synchronize(targets: [target], mode: .automatic)
+        try FileManager.default.removeItem(at: fixture.root.appending(path: "Course 1/Lezioni/0.txt"))
+        try FileManager.default.removeItem(at: fixture.root.appending(path: "Course 1/Lezioni/57.txt"))
+        try fixture.write("annotated", to: "Course 1/Lezioni/1.txt")
+        fixture.upstream.resetDownloadCount()
+
+        let restored = try await fixture.synchronize(targets: [target], mode: .automatic)
+
+        #expect(restored.installed == 2)
+        #expect(restored.added == 2)
+        #expect(fixture.upstream.downloadCount == 2)
+        #expect(fixture.contents("Course 1/Lezioni/0.txt") != nil)
+        #expect(fixture.contents("Course 1/Lezioni/57.txt") != nil)
+        #expect(fixture.contents("Course 1/Lezioni/1.txt") == "annotated")
+    }
+
     @Test func oneServerFailureProducesAPartialResultWithTheFileName() async throws {
         let fixture = try await Fixture()
         defer { fixture.remove() }

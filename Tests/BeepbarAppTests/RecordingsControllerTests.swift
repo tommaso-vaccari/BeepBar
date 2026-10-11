@@ -91,7 +91,7 @@ import BeepbarCore
 }
 
 /// Settings that record every write, to prove that a visit with nothing new writes nothing.
-final class CountingDefaults: UserDefaults, @unchecked Sendable {
+class CountingDefaults: UserDefaults, @unchecked Sendable {
     private(set) var writes: [String] = []
 
     static func throwaway() -> CountingDefaults {
@@ -108,7 +108,65 @@ final class CountingDefaults: UserDefaults, @unchecked Sendable {
         super.removeObject(forKey: defaultName)
     }
 
+    func recordWrite(_ key: String) { writes.append(key) }
+
     func resetWrites() { writes = [] }
+}
+
+/// Controller tests share settings across reconstructed controllers without involving cfprefsd.
+/// Disk-backed defaults remain in the persistence tests that open separate suite handles.
+final class MemoryCountingDefaults: CountingDefaults, @unchecked Sendable {
+    private var values: [String: Any] = [:]
+
+    static func isolated() -> MemoryCountingDefaults {
+        MemoryCountingDefaults(suiteName: FileManager.default.temporaryDirectory.appending(path: "BeepbarMemoryDefaults-\(UUID().uuidString)").path)!
+    }
+
+    override func set(_ value: Any?, forKey key: String) {
+        values[key] = value
+        recordWrite(key)
+    }
+    override func removeObject(forKey key: String) {
+        values.removeValue(forKey: key)
+        recordWrite(key)
+    }
+    override func object(forKey key: String) -> Any? { values[key] }
+    override func string(forKey key: String) -> String? { values[key] as? String }
+    override func stringArray(forKey key: String) -> [String]? { values[key] as? [String] }
+    override func data(forKey key: String) -> Data? { values[key] as? Data }
+    override func bool(forKey key: String) -> Bool { (values[key] as? NSNumber)?.boolValue ?? false }
+    override func integer(forKey key: String) -> Int { (values[key] as? NSNumber)?.intValue ?? 0 }
+    override func double(forKey key: String) -> Double { (values[key] as? NSNumber)?.doubleValue ?? 0 }
+}
+
+/// Guards controller fixtures against accidentally going back to asynchronous disk preferences.
+@MainActor struct MemoryCountingDefaultsTests {
+    @Test func valuesStayLocalAndTypedWithoutPersistentWrites() throws {
+        let suite = WeBeepAuthenticationController.throwawayDefaultsSuite()
+        defer { removeTestDefaults(suite) }
+        let defaults = try #require(MemoryCountingDefaults(suiteName: suite))
+        let other = MemoryCountingDefaults.isolated()
+        defaults.set(true, forKey: "enabled")
+        defaults.set([], forKey: "selection")
+        defaults.set("namespace", forKey: "namespace")
+        defaults.set(Data([1, 2]), forKey: "data")
+        defaults.set(42, forKey: "integer")
+        defaults.set(1.5, forKey: "double")
+        #expect(defaults.bool(forKey: "enabled"))
+        #expect(defaults.stringArray(forKey: "selection") == [])
+        #expect(defaults.string(forKey: "namespace") == "namespace")
+        #expect(defaults.data(forKey: "data") == Data([1, 2]))
+        #expect(defaults.integer(forKey: "integer") == 42)
+        #expect(defaults.double(forKey: "double") == 1.5)
+        #expect(other.object(forKey: "enabled") == nil)
+        #expect(defaults.persistentDomain(forName: suite)?.isEmpty != false)
+        #expect(defaults.writes == ["enabled", "selection", "namespace", "data", "integer", "double"])
+        defaults.resetWrites()
+        defaults.removeObject(forKey: "enabled")
+        #expect(defaults.object(forKey: "enabled") == nil)
+        #expect(!defaults.bool(forKey: "enabled"))
+        #expect(defaults.writes == ["enabled"])
+    }
 }
 
 /// Thread-safe fixture faults/probe for the history executor; session counters stay separate.
@@ -150,7 +208,7 @@ final class HistoryFileProbe: @unchecked Sendable {
 @MainActor
 struct RecordingsControllerTests {
     private let folder = FileManager.default.temporaryDirectory.appendingPathComponent("recordings-controller-\(UUID().uuidString)", isDirectory: true)
-    private let defaults = CountingDefaults.throwaway()
+    private let defaults = MemoryCountingDefaults.isolated()
     private let browser = FakeRecmanBrowser()
     private let world = RecordingsWorld()
     private let course = RecmanCourseKey(courseCode: "058167", academicYear: 2026)!
@@ -1162,6 +1220,7 @@ struct RecordingsControllerTests {
         await settle("new namespace baseline") { controller.listing(for: course)?.recordings != nil }
         #expect(controller.newCount(for: course) == 0)
         #expect(controller.listing(for: course)?.seenIDs == ["fresh"])
+        controller.windowClosed()
         let relaunched = makeController()
         relaunched.pageAppeared()
         relaunched.refresh([course], selected: course)

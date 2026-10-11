@@ -398,7 +398,7 @@ struct RecordingsWatchProgressHistoryTests {
         _ = try store.seenAndProgress(owner: 42, key: key, ids: ["a"], establishBaseline: true, legacy: empty)
         #expect(FileManager.default.fileExists(atPath: databaseURL.path))
         let key = key
-        let late = Task { try await history.applyProgress(owner: 42, key: key, id: "a", event: .manual(done: true)) }
+        let late = Task { defer { gate.finished() }; return try await history.applyProgress(owner: 42, key: key, id: "a", event: .manual(done: true)) }
         await gate.waitUntilEntered()
         try await history.invalidateAndDelete()
         #expect(!FileManager.default.fileExists(atPath: databaseURL.path))
@@ -417,7 +417,7 @@ struct RecordingsWatchProgressHistoryTests {
         let gate = Gate()
         let history = RecordingsSeenHistory(store: store, afterRead: { await gate.wait() })
         let key = key, empty = empty
-        let read = Task { try await history.seenAndProgress(owner: 42, key: key, ids: ["a"], legacy: empty) }
+        let read = Task { defer { gate.finished() }; return try await history.seenAndProgress(owner: 42, key: key, ids: ["a"], legacy: empty) }
         await gate.waitUntilEntered()
         history.invalidate()
         gate.open()
@@ -433,7 +433,7 @@ struct RecordingsWatchProgressHistoryTests {
         let gate = Gate()
         let history = RecordingsSeenHistory(store: store, afterProgress: { await gate.wait() })
         let key = key
-        let write = Task { try await history.applyProgress(owner: 42, key: key, id: "a", event: .manual(done: true)) }
+        let write = Task { defer { gate.finished() }; return try await history.applyProgress(owner: 42, key: key, id: "a", event: .manual(done: true)) }
         await gate.waitUntilEntered()
         // The row committed before the reset was requested.
         #expect(try store.seenAndProgress(owner: 42, key: key, ids: ["a"], establishBaseline: false, legacy: empty).progress["a"]?.isCompleted == true)
@@ -510,5 +510,8 @@ private final class Gate: @unchecked Sendable {
     func waitUntilEntered() async {
         for await _ in entered.stream { break }
     }
+    /// Called by the gated task when it ends, so a test whose operation fails before reaching the
+    /// gate goes red on its expectations instead of hanging in `waitUntilEntered`.
+    func finished() { entered.continuation.yield() }
     func open() { release.continuation.yield() }
 }

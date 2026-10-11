@@ -78,5 +78,6 @@ struct RecordingsStudyState: Codable, Equatable {
     }
     func recordings(for key: RecmanCourseKey) async throws -> [RecmanRecording] { Self.lessons(for: key) }
     func playbackURL(for recording: RecmanRecording) async throws -> URL { throw RecmanBrowserError.playbackUnavailable }
+    func stream(for recording: RecmanRecording, email: PolimiEmail?) async throws -> RecordingStream { throw RecmanBrowserError.playbackUnavailable }
 }
 #endif

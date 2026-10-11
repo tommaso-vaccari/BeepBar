@@ -83,6 +83,12 @@ import BeepbarCore
         return try result.get()
     }
 
+    /// Not used by the controller yet (#148 package F wires native playback).
+    func stream(for recording: RecmanRecording, email: PolimiEmail?) async throws -> RecordingStream {
+        calls.append("stream \(recording.id)")
+        throw RecmanBrowserError.playbackUnavailable
+    }
+
     func close() {
         calls.append("close")
         isOpen = false

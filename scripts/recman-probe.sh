@@ -64,6 +64,7 @@ swiftc -swift-version 6 -O \
   "$root/Sources/BeepbarCore/Localization/AppLanguage.swift" \
   "$root/Sources/BeepbarApp/RecmanScripts.swift" \
   "$root/Sources/BeepbarApp/RecmanWebSession.swift" \
+  "$root/Sources/BeepbarApp/WebexStreamResolver.swift" \
   -framework WebKit -framework AVFoundation -o "$app/Contents/MacOS/RecmanProbe"
 codesign --force --sign - "$app" >/dev/null 2>&1
 

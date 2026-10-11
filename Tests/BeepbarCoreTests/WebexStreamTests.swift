@@ -293,6 +293,18 @@ struct WebexStreamTests {
         #expect(WebexSignIn.encoded("a&b=c#d e+f") == "a%26b%3Dc%23d%20e%2Bf")
     }
 
+    /// Without the hint, the same login and return page remain and only `email` goes.
+    @Test func theUnhintedLoginDropsOnlyTheEmail() throws {
+        let email = try #require(PolimiEmail("mario.rossi@mail.polimi.it"))
+        let hinted = WebexSignIn.loginURL(playbackPage: try playbackPage(), email: email)
+        let plain = WebexSignIn.withoutEmailHint(hinted)
+        let items = URLComponents(url: plain, resolvingAgainstBaseURL: false)?.queryItems ?? []
+        #expect(items.map(\.name) == ["siteurl", "login_return_url"])
+        #expect(items.last?.value == Self.page)
+        #expect(plain.path == hinted.path && plain.host == hinted.host)
+        #expect(!plain.absoluteString.contains("mario.rossi"))
+    }
+
     /// Signed in means a live, non-empty `ticket` on the `webex.com` domain, nowhere else.
     @Test func signedInMeansATicketOnWebexDotCom() {
         #expect(WebexSignIn.isSignedIn(cookies: [cookie("ticket", domain: ".webex.com")], now: now))

@@ -27,12 +27,24 @@ struct WebexSignInWebViewTests {
     @MainActor final class Harness {
         let session = RecmanWebSession()
         var windowsShown = 0
+        /// Every address the sign-in started (or restarted) its login at.
+        var started: [URL] = []
 
-        func open(fixture: String, stall: Duration = .seconds(20), deadline: Duration = .seconds(60)) async throws {
+        func open(fixture: String, stall: Duration = .seconds(20), deadline: Duration = .seconds(60), grace: Duration = .milliseconds(300)) async throws {
+            try await open(fixtureFor: { _ in fixture }, stall: stall, deadline: deadline, grace: grace)
+        }
+
+        /// `fixtureFor` picks the page by the login address it is served at, so a restart
+        /// without the email hint can show a different page.
+        func open(fixtureFor: @escaping (URL) -> String, stall: Duration = .seconds(20), deadline: Duration = .seconds(60), grace: Duration = .milliseconds(300)) async throws {
             session.webexStallTimeout = stall
             session.webexHiddenDeadline = deadline
+            session.webexPlaybackGrace = grace
             session.presentSignInWindow = { [weak self] _ in self?.windowsShown += 1 }
-            session.startWebexLogin = { webView, url in webView.loadHTMLString(fixture, baseURL: url) }
+            session.startWebexLogin = { [weak self] webView, url in
+                self?.started.append(url)
+                webView.loadHTMLString(fixtureFor(url), baseURL: url)
+            }
             await session.open(cookies: [])
             let store = try #require(session.webView?.configuration.websiteDataStore)
             store.proxyConfigurations = [ProxyConfiguration(httpCONNECTProxy: .hostPort(host: "127.0.0.1", port: 9))]
@@ -50,6 +62,11 @@ struct WebexSignInWebViewTests {
                 try await Task.sleep(for: .milliseconds(10))
             }
             try #require(condition())
+        }
+
+        /// Waits for the web view to settle on the blank page every sign-in ends on.
+        func untilBlank() async throws {
+            try await until { session.webView?.url?.absoluteString == "about:blank" && session.webView?.isLoading == false }
         }
     }
 
@@ -86,6 +103,8 @@ struct WebexSignInWebViewTests {
         #expect(await outcome(task) == "signed in")
         #expect(harness.windowsShown == 0)
         #expect(harness.session.webView?.url?.path.contains("/recording/") != true)
+        // No Webex page keeps running once signed in.
+        try await harness.untilBlank()
     }
 
     /// A ticket set in the middle of the chain is seen through the cookie store's own change
@@ -160,6 +179,8 @@ struct WebexSignInWebViewTests {
         try await harness.open(fixture: "<script>location.href = 'https://evil.example/collect'</script>")
         #expect(await outcome(harness.start()) == "playbackUnavailable")
         #expect(harness.windowsShown == 0)
+        // A failed sign-in leaves no Webex page running either.
+        try await harness.untilBlank()
     }
 
     /// `close()` and a cancelled Play both end a sign-in in flight at once.
@@ -178,8 +199,104 @@ struct WebexSignInWebViewTests {
         try await Task.sleep(for: .milliseconds(100))
         cancelled.cancel()
         #expect(await outcome(cancelled) == "cancelled")
+        try await second.untilBlank()
         // The session still works for the next operation.
         #expect(try await second.session.runScript("return 'next'", arguments: [:]) == "next")
+    }
+
+    /// A stall hands over to the user on Webex's own login, without the email hint, since the
+    /// page it stalled on gives them nothing to act on; with the window up, getting back to the
+    /// playback page without a ticket ends the Play in the browser instead of waiting for the
+    /// user to close a window that can't help.
+    @Test(.timeLimit(.minutes(1))) func aStallRestartsWithoutTheHintAndThePlaybackPageEndsIt() async throws {
+        let harness = Harness()
+        defer { harness.session.close() }
+        try await harness.open(fixtureFor: { url in
+            url.query?.contains("email=") == true ? "<p></p>" : "<script>setTimeout(() => { location.href = '\(Self.page)' }, 300)</script>"
+        }, stall: .milliseconds(300))
+        let task = harness.start()
+        try await harness.until { harness.windowsShown == 1 }
+        #expect(await outcome(task) == "playbackUnavailable")
+        #expect(harness.started.count == 2)
+        #expect(harness.started.first?.query?.contains("email=") == true)
+        #expect(harness.started.last == WebexSignIn.withoutEmailHint(Self.loginURL))
+        #expect(harness.started.last?.query?.contains("email") == false)
+        #expect(harness.session.cancelledPlaybackPages == 1)
+        try await harness.untilBlank()
+    }
+
+    /// A page that fails to load ends a hidden sign-in as "not responding"; with the window up
+    /// it is the user's to retry, and the sign-in goes on.
+    @Test(.timeLimit(.minutes(1))) func aFailedLoadEndsAHiddenSignInButNotTheUsers() async throws {
+        let unreachable = "<script>setTimeout(() => { location.href = 'https://no-such-host.polimi.it/x' }, 50)</script>"
+        let hidden = Harness()
+        defer { hidden.session.close() }
+        try await hidden.open(fixture: unreachable)
+        #expect(await outcome(hidden.start()) == "unavailable")
+
+        let shown = Harness()
+        defer { shown.session.close() }
+        try await shown.open(fixtureFor: { url in url.query?.contains("email=") == true ? "<p></p>" : unreachable }, stall: .milliseconds(200))
+        let task = shown.start()
+        try await shown.until { shown.windowsShown == 1 }
+        try await Task.sleep(for: .seconds(2))
+        await shown.store.setCookie(Self.ticket())
+        #expect(await outcome(task) == "signed in")
+    }
+
+    /// The web content process ending stops a hidden sign-in; with the window up the login
+    /// starts again for the user (unhinted), as the Recman entry does.
+    @Test(.timeLimit(.minutes(1))) func aCrashedPageStopsAHiddenSignInOrRestartsTheUsers() async throws {
+        let hidden = Harness()
+        defer { hidden.session.close() }
+        try await hidden.open(fixture: "<p></p>")
+        let hiddenTask = hidden.start()
+        try await hidden.until { hidden.started.count == 1 }
+        hidden.session.webViewWebContentProcessDidTerminate(hidden.session.webView!)
+        #expect(await outcome(hiddenTask) == "unavailable")
+
+        let shown = Harness()
+        defer { shown.session.close() }
+        try await shown.open(fixture: "<form><input type='password'></form>")
+        let task = shown.start()
+        try await shown.until { shown.windowsShown == 1 }
+        shown.session.webViewWebContentProcessDidTerminate(shown.session.webView!)
+        #expect(shown.started.count == 2)
+        #expect(shown.started.last == WebexSignIn.withoutEmailHint(Self.loginURL))
+        await shown.store.setCookie(Self.ticket())
+        #expect(await outcome(task) == "signed in")
+    }
+
+    /// A transport that never answers, until cancelled.
+    final class HangingTransport: WebexHTTPTransport {
+        func send(_ request: URLRequest, limit: Int) async throws -> WebexHTTPResponse {
+            try await Task.sleep(for: .seconds(120))
+            throw URLError(.timedOut)
+        }
+    }
+
+    /// `close()` and a newer operation end a Play waiting on Webex at once: the request is
+    /// cancelled, not left to its timeout.
+    @Test(.timeLimit(.minutes(1))) func closingOrANewOperationEndsAStreamWaitingOnWebex() async throws {
+        for interruption in ["close", "newer operation"] {
+            let session = RecmanWebSession()
+            session.webexTransport = HangingTransport()
+            await session.open(cookies: [])
+            defer { session.close() }
+            let task = Task { try await session.stream(player: URL(string: Self.page)!, email: nil) }
+            try await Task.sleep(for: .milliseconds(200))
+            let clock = ContinuousClock()
+            let started = clock.now
+            if interruption == "close" {
+                session.close()
+            } else {
+                _ = try? await session.runScript("'next'")
+            }
+            let result: String
+            do { _ = try await task.value; result = "stream" } catch is CancellationError { result = "cancelled" } catch { result = "\(error)" }
+            #expect(result == "cancelled", "\(interruption)")
+            #expect(clock.now - started < .seconds(5), "\(interruption)")
+        }
     }
 
     /// Forgetting the ticket removes Webex's ticket and nothing else, so a stale ticket can't

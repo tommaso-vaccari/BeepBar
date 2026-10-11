@@ -312,6 +312,15 @@ public enum WebexSignIn {
         return components.url!
     }
 
+    /// `loginURL` without its `email` parameter: Webex's own login, starting at its email page.
+    /// Used when the hinted sign-in stalled and the user takes over in the window.
+    public static func withoutEmailHint(_ loginURL: URL) -> URL {
+        guard var components = URLComponents(url: loginURL, resolvingAgainstBaseURL: false) else { return loginPage }
+        let kept = (components.percentEncodedQuery ?? "").split(separator: "&").filter { !$0.hasPrefix("email=") && $0 != "email" }
+        components.percentEncodedQuery = kept.isEmpty ? nil : kept.joined(separator: "&")
+        return components.url ?? loginPage
+    }
+
     private static let unreserved = CharacterSet(charactersIn: "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-._~")
 
     static func encoded(_ value: String) -> String {
@@ -348,6 +357,12 @@ public enum WebexSignInNavigation {
     ///
     /// Alone, only the hosts of the measured chain load: Polimi's Webex site, idbroker and
     /// Polimi's own login hosts. The playback page is cancelled in every mode.
+    ///
+    /// Embedded frames from any https host are allowed, as `RecmanNavigationPolicy` allows them:
+    /// login pages embed captchas, 2FA widgets and identity-provider helpers from hosts no list
+    /// can anticipate, and refusing one breaks the page around it. A frame can't move the page
+    /// itself off the chain (that is a main-frame load, checked here), and the playback page is
+    /// matched on the main frame because that is the load that would start Webex's player.
     public static func decide(_ url: URL, mainFrame: Bool, userDriven: Bool) -> Decision {
         guard let components = URLComponents(url: url, resolvingAgainstBaseURL: false), let scheme = components.scheme?.lowercased() else { return .refuse }
         if scheme == "about" { return .allow }

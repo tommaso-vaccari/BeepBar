@@ -129,6 +129,11 @@ enum RecmanBrowserError: Error, Equatable {
     /// The most the hidden part of a Webex sign-in may take in total, even while pages keep
     /// moving (a redirect loop never stalls). A silent sign-in took ~7 s live.
     var webexHiddenDeadline: Duration = .seconds(60)
+    /// How long the ticket may take to show up once Webex sends the sign-in back to the playback
+    /// page. A variable so tests can shorten it.
+    var webexPlaybackGrace: Duration = .seconds(5)
+    /// Where the web view goes after a Webex sign-in, so no Webex page keeps running.
+    static let blankPage = URL(string: "about:blank")!
     /// Starts the Webex sign-in's first load. Tests load a local fixture at the login address
     /// instead, so nothing reaches Webex.
     var startWebexLogin: @MainActor (WKWebView, URL) -> Void = { webView, url in webView.load(URLRequest(url: url)) }
@@ -236,8 +241,17 @@ enum RecmanBrowserError: Error, Equatable {
         throw RecmanBrowserError.playbackUnavailable
     }
 
+    /// Only for a Play the user asked for (#148 package F must never call it in the background):
+    /// a sign-in it starts may put the sign-in window on screen.
     func stream(for recording: RecmanRecording, email: PolimiEmail?) async throws -> RecordingStream {
         let player = try await playbackURL(for: recording)
+        return try await stream(player: player, email: email)
+    }
+
+    /// The stream of the player link `player`, as an operation of its own: the second half of
+    /// `stream(for:email:)`, separate so `RecmanWebSessionTests` can start from a player link
+    /// without Polimi's archive.
+    func stream(player: URL, email: PolimiEmail?) async throws -> RecordingStream {
         let operation = beginOperation()
         let resolver = WebexStreamResolver(transport: webexTransport) { [weak self] in self?.trace($0) }
         let driver = WebexSignInDriver(
@@ -275,6 +289,7 @@ enum RecmanBrowserError: Error, Equatable {
         var reachedPlayback = false
         var stall: Task<Void, Never>?
         var deadline: Task<Void, Never>?
+        var playbackGrace: Task<Void, Never>?
         private(set) var result: Result<Void, Error>?
         private var continuation: CheckedContinuation<Void, Error>?
 
@@ -290,6 +305,7 @@ enum RecmanBrowserError: Error, Equatable {
             self.result = result
             stall?.cancel()
             deadline?.cancel()
+            playbackGrace?.cancel()
             continuation?.resume(with: result)
             continuation = nil
         }
@@ -324,7 +340,9 @@ enum RecmanBrowserError: Error, Equatable {
     /// and waits for the user without a deadline; otherwise it throws `needsSignIn`. A host off
     /// the chain while hidden throws `playbackUnavailable` (browser fallback), a failed load
     /// `unavailable`, and closing the window, `close()`, a newer operation or cancelling the
-    /// awaiting task `CancellationError`.
+    /// awaiting task `CancellationError`. Back at the playback page without a ticket after
+    /// `webexPlaybackGrace`, it throws `playbackUnavailable` whoever is driving. Whatever the
+    /// outcome, the web view then goes to `about:blank`.
     private func signInToWebex(loginURL: URL, interactive: Bool, operation: Int) async throws {
         try ensureCurrent(operation)
         guard let store else { throw CancellationError() }
@@ -334,8 +352,15 @@ enum RecmanBrowserError: Error, Equatable {
         defer {
             store.httpCookieStore.remove(self)
             if webexLogin === login { webexLogin = nil }
-            // Whatever happened, the web view stops where it is: nothing loads after the outcome.
-            webView?.stopLoading()
+            // Whatever happened, no Webex page keeps running in the hidden web view: a signed-in
+            // webappng page (or a player reached through in-page routing, which the navigation
+            // policy can't see) would keep its scripts, timers and connections alive until the
+            // next operation (#148 review). Only while this operation is still the current one:
+            // a newer operation already drives the page, and a blank load would cancel its own.
+            if operation == operationID {
+                webView?.stopLoading()
+                webView?.load(URLRequest(url: Self.blankPage))
+            }
             window?.orderOut(nil)
         }
         trace("signing in to Webex at \(Self.redacted(loginURL))")
@@ -343,7 +368,7 @@ enum RecmanBrowserError: Error, Equatable {
         login.deadline = Task { [weak self] in
             do { try await Task.sleep(for: deadline) } catch { return }
             self?.trace("Webex sign-in still hidden at its deadline")
-            self?.webexLoginNeedsUser(login)
+            self?.webexLoginNeedsUser(login, restartWithoutHint: true)
         }
         restartStall(login)
         let webView = browser()
@@ -372,12 +397,18 @@ enum RecmanBrowserError: Error, Equatable {
         login.stall = Task { [weak self] in
             do { try await Task.sleep(for: timeout) } catch { return }
             self?.trace("Webex sign-in stalled")
-            self?.webexLoginNeedsUser(login)
+            self?.webexLoginNeedsUser(login, restartWithoutHint: true)
         }
     }
 
     /// The hidden sign-in can't go on alone.
-    private func webexLoginNeedsUser(_ login: WebexLogin) {
+    ///
+    /// With `restartWithoutHint` (a stall or the deadline) the window opens on Webex's login again
+    /// without the email hint: the page it stalled on (live, a blank idbroker page after a hint
+    /// that didn't match the asserted identity) gives the user nothing to act on, while the
+    /// unhinted login starts at Webex's own email page. A page that asks for credentials is
+    /// already actionable and stays as it is.
+    private func webexLoginNeedsUser(_ login: WebexLogin, restartWithoutHint: Bool = false) {
         guard webexLogin === login, !login.isFinished, !login.windowShown else { return }
         if login.reachedPlayback {
             // Webex considers the sign-in over, yet no ticket arrived: an unknown change, not
@@ -394,6 +425,10 @@ enum RecmanBrowserError: Error, Equatable {
         login.stall?.cancel()
         login.deadline?.cancel()
         showWindow()
+        if restartWithoutHint, let webView {
+            webView.stopLoading()
+            startWebexLogin(webView, WebexSignIn.withoutEmailHint(login.loginURL))
+        }
     }
 
     /// Ends the sign-in if the store now holds a Webex ticket.
@@ -881,7 +916,8 @@ enum RecmanBrowserError: Error, Equatable {
         loadWaiter = nil
         if let webexLogin {
             if webexLogin.windowShown {
-                startWebexLogin(webView, webexLogin.loginURL)
+                // The user is looking at a blank window: start the login again for them.
+                startWebexLogin(webView, WebexSignIn.withoutEmailHint(webexLogin.loginURL))
             } else {
                 webexLogin.finish(.failure(RecmanBrowserError.unavailable))
             }
@@ -934,7 +970,18 @@ enum RecmanBrowserError: Error, Equatable {
             trace("Webex went back to the playback page: not loaded")
             login.reachedPlayback = true
             checkWebexTicket(login)
-            restartStall(login)
+            // Webex considers the sign-in done. The ticket normally arrives with this hop; if it
+            // doesn't within a moment, the operation ends in the browser rather than waiting for
+            // a stall or, with the window up, for the user to close a window that can't help.
+            if login.playbackGrace == nil {
+                let grace = webexPlaybackGrace
+                login.playbackGrace = Task { [weak self] in
+                    do { try await Task.sleep(for: grace) } catch { return }
+                    guard let self, self.webexLogin === login, !login.isFinished else { return }
+                    self.trace("back at the playback page without a Webex ticket")
+                    login.finish(.failure(RecmanBrowserError.playbackUnavailable))
+                }
+            }
         case .refuse:
             decisionHandler(.cancel)
             guard mainFrame else { return }

@@ -496,6 +496,7 @@ struct MenuBarSnapshot: Sendable {
                     // Nothing created Recordings in this launch, but the previous account's
                     // places in lectures may still be stored: they go with the account (#148).
                     RecordingsController.forgetResumePoints(in: operationDefaults, notOwnedBy: userID)
+                    RecordingsController.forgetEmailOptOut(in: operationDefaults, notOwnedBy: userID)
                 }
             }
         }
@@ -1004,9 +1005,10 @@ struct MenuBarSnapshot: Sendable {
         return controller
     }
 
-    /// The address on the WeBeep profile, to offer in the Recordings settings for confirmation
-    /// (#148). Asked only when the site lists the function for this token. Every failure (no
-    /// function, no token, offline, an odd answer) is nil: the student then types the address, and
+    /// The address on the WeBeep profile, used for the Webex sign-in without a confirmation step
+    /// (#148, product decision 2026-10-11; `RecordingsController.learnEmail`, from the Settings
+    /// row or the first Play). Asked only when the site lists the function for this token. Every
+    /// failure (no function, no token, offline, an odd answer) is nil: the student then types the address, and
     /// nothing reaches the sync status or the log. The address is personal data and is never
     /// logged here.
     private func profileEmail() async -> String? {

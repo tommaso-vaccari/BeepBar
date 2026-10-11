@@ -8,6 +8,10 @@ Quattro fonti ufficiali, gist Karpathy originale alla revisione ac46de1 ed estra
 
 Aggiornate mappa dei dati (file di sessione con cookie Webex ed email Polimi, posizione di riproduzione, riproduzione nativa) e valutazione C05 sul branch feature/rnp-app-integration, analisi statica del codice. Nessuna nuova fonte esterna; la passata GDPR sul binario prima della release resta aperta. Test e build non eseguiti nell'ambiente di sviluppo (Linux).
 
+## [2026-10-11] update | Email Polimi dal profilo senza conferma (#148)
+
+Decisione del responsabile: l'email del profilo WeBeep è usata per l'accesso a Webex senza conferma esplicita, letta al primo Play. Aggiornate mappa dei dati (riga sessione Webex/email, marcatore di rimozione per account) e C05 (manca ora un'azione dell'utente prima dell'uso: da valutare informazione e base). Analisi statica sul branch fix/rnp-email-confirmed-by-default; test e build non eseguiti (Linux). Nessuna nuova fonte esterna.
+
 ## [2026-10-10] integrate | Preparazione integrazione in dev
 
 Allineamento a origin/dev d3a42dc: integrazione telemetria sopraggiunta rispetto a c9a04dc. Aggiunta fonte codice S-0007 e aggiornate mappa, valutazione e piano; gli snapshot originari restano immutabili. Integrazione della wiki autorizzata; passata finale GDPR prima della prossima release registrata nel piano e nel protocollo release di AGENTS.md. Nessun comportamento dell’app modificato.

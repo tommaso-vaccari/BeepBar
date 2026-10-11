@@ -359,10 +359,12 @@ private struct RecordingsSettingsSection: View {
     }
 }
 
-/// The Polimi email Webex asks for when a recording is played inside BeepBar (#148). Prefilled
-/// from the WeBeep profile when the account allows reading it, but only ever a suggestion: it is
-/// stored when the student confirms it (the rules live in `RecordingsController.emailFieldState`
-/// and `confirmEmail`). Nothing is read until this row appears.
+/// The Polimi email Webex asks for when a recording is played inside BeepBar (#148). By product
+/// decision (2026-10-11) the WeBeep profile's address, when the account allows reading it, is in
+/// use without a confirmation step (`RecordingsController.learnEmail`, also run by the first
+/// Play); this row shows the address in use, says where it came from, and lets the student change
+/// or remove it, which wins over the profile (rules in `RecordingsController.emailFieldState` and
+/// `confirmEmail`).
 private struct RecordingsEmailField: View {
     @ObservedObject var recordings: RecordingsController
     @State private var draft = ""
@@ -387,7 +389,7 @@ private struct RecordingsEmailField: View {
                         .disabled(!canConfirm)
                 }
             } label: {
-                SettingLabel(tr("Email del Politecnico", "Polimi email"), explanation: tr("BeepBar la usa solo per accedere a Webex in automatico quando guardi una registrazione dentro l'app: la manda a Webex per l'accesso e a nessun altro. Resta su questo Mac, nello stesso file dell'accesso al Politecnico, e viene cancellata con lui.", "BeepBar uses it only to sign in to Webex automatically when you watch a recording inside the app: it sends it to Webex for that sign-in and to no one else. It stays on this Mac, in the same file as your Polimi sign-in, and is deleted with it."))
+                SettingLabel(tr("Email del Politecnico", "Polimi email"), explanation: tr("BeepBar prende l'indirizzo dal tuo profilo WeBeep e lo usa solo per accedere a Webex in automatico quando guardi una registrazione dentro l'app: lo manda a Webex per l'accesso e a nessun altro. Puoi cambiarlo o rimuoverlo qui. Resta su questo Mac, nello stesso file dell'accesso al Politecnico, e viene cancellato con lui.", "BeepBar takes the address from your WeBeep profile and uses it only to sign in to Webex automatically when you watch a recording inside the app: it sends it to Webex for that sign-in and to no one else. You can change or remove it here. It stays on this Mac, in the same file as your Polimi sign-in, and is deleted with it."))
             }
             if let note {
                 Text(note)
@@ -400,7 +402,6 @@ private struct RecordingsEmailField: View {
             fill()
         }
         .onChange(of: recordings.confirmedEmail) { _, _ in fill() }
-        .onChange(of: recordings.suggestedEmail) { _, _ in fill() }
     }
 
     private var canConfirm: Bool {
@@ -414,10 +415,10 @@ private struct RecordingsEmailField: View {
         switch state {
         case .invalid:
             return tr("Serve un indirizzo del Politecnico (…@mail.polimi.it o …@polimi.it).", "A Polimi address is needed (…@mail.polimi.it or …@polimi.it).")
+        case .confirmed where recordings.emailFromProfile:
+            return tr("In uso, preso dal tuo profilo WeBeep. Puoi cambiarlo o rimuoverlo.", "In use, taken from your WeBeep profile. You can change or remove it.")
         case .confirmed:
-            return tr("Indirizzo confermato.", "Address confirmed.")
-        case .ready where recordings.confirmedEmail == nil && recordings.suggestedEmail?.value == draft.trimmingCharacters(in: .whitespacesAndNewlines).lowercased():
-            return tr("Trovato nel tuo profilo WeBeep: controllalo e conferma.", "Found on your WeBeep profile: check it and confirm.")
+            return tr("Indirizzo in uso.", "Address in use.")
         case .empty:
             return tr("Serve per guardare le registrazioni dentro BeepBar: senza, quelle che richiedono l'accesso a Webex non si aprono.", "Needed to watch recordings inside BeepBar: without it, those that need a Webex sign-in won't open.")
         case .ready, .removable:
@@ -434,7 +435,7 @@ private struct RecordingsEmailField: View {
     }
 
     private func fill() {
-        let latest = recordings.confirmedEmail?.value ?? recordings.suggestedEmail?.value ?? ""
+        let latest = recordings.confirmedEmail?.value ?? ""
         if draft == source { draft = latest }
         source = latest
     }

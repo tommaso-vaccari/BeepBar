@@ -77,6 +77,47 @@ struct PolimiEmailTests {
         #expect(PolimiEmail(raw) == nil)
     }
 
+    /// Proves the local part must start and end with a letter or digit, and that `-` or `+`
+    /// may not touch a dot. Guards against sending a corrupted or hostile profile value such as
+    /// `-@polimi.it` to Webex as if it were a mailbox.
+    @Test(arguments: [
+        "-@polimi.it",
+        "+x@polimi.it",
+        "_mario@polimi.it",
+        "x-@mail.polimi.it",
+        "x+@mail.polimi.it",
+        "mario_@polimi.it",
+        "a.-b@mail.polimi.it",
+        "a-.b@mail.polimi.it",
+        "a+.b@mail.polimi.it",
+        "a.+b@mail.polimi.it"
+    ])
+    func rejectsSeparatorsAtEdgesOrNextToDots(_ raw: String) {
+        #expect(PolimiEmail(raw) == nil)
+    }
+
+    /// Proves separators between letters/digits remain valid, so the edge rule above does not
+    /// reject real mailboxes.
+    @Test(arguments: ["a-b@polimi.it", "a+b@polimi.it", "a_b@polimi.it", "a.b-c+d_e.f@mail.polimi.it", "a_.b@polimi.it"])
+    func acceptsSeparatorsBetweenAlphanumerics(_ raw: String) {
+        #expect(PolimiEmail(raw)?.value == raw)
+    }
+
+    /// Guards against leaking the mailbox name: printing, interpolating, `String(reflecting:)`
+    /// and `dump` show only the domain, never the local part.
+    @Test func textualRepresentationsRedactTheLocalPart() throws {
+        let email = try #require(PolimiEmail("mario.rossi@mail.polimi.it"))
+        var dumped = ""
+        dump(email, to: &dumped)
+        let renderings = [email.description, email.debugDescription, "\(email)", String(describing: email), String(reflecting: email), dumped]
+        for rendering in renderings {
+            #expect(!rendering.contains("mario"))
+            #expect(!rendering.contains("rossi"))
+        }
+        #expect(email.description == "PolimiEmail(<redacted>@mail.polimi.it)")
+        #expect(email.value == "mario.rossi@mail.polimi.it")
+    }
+
     /// Proves inner whitespace, control characters, quoting/punctuation and non-ASCII lookalikes
     /// are rejected rather than stripped (trimming applies to the ends only).
     @Test(arguments: [

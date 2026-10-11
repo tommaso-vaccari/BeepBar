@@ -395,7 +395,7 @@ import Testing
         return data
     }
 
-    private func testSession(handler:@escaping @Sendable (URLRequest) -> (HTTPURLResponse, Data)) -> URLSession {
+    private func testSession(handler: @escaping @Sendable (URLRequest) -> (HTTPURLResponse, Data)) -> URLSession {
         StubURLProtocol.handler = handler
         let configuration = URLSessionConfiguration.ephemeral
         configuration.protocolClasses = [StubURLProtocol.self]

@@ -13,6 +13,8 @@ import WebKit
 //   cold <state> [code year]   sign in by hand, save the session in <state>, then list a course
 //   warm <state> [code year]   restore the session from <state> in a new process and get back in
 //                              without the user, as BeepBar does after a relaunch
+//   play <state> code year [n] restore the session, find the n-th newest recording's Webex player
+//                              (default the newest) and investigate it (see webex.swift)
 
 @MainActor func say(_ line: String) {
     print(line)
@@ -116,12 +118,15 @@ let diagnostics = #"""
 
 @MainActor func run() async -> Int32 {
     let arguments = CommandLine.arguments
-    guard arguments.count >= 3, ["cold", "warm"].contains(arguments[1]) else {
-        say("usage: RecmanProbe cold|warm <state folder> [course code] [academic year]")
+    guard arguments.count >= 3, ["cold", "warm", "play"].contains(arguments[1]), arguments[1] != "play" || arguments.count >= 5 else {
+        say("usage: RecmanProbe cold|warm <state folder> [course code] [academic year] | play <state folder> <course code> <academic year> [n]")
         return 2
     }
     let mode = arguments[1]
     let file = URL(fileURLWithPath: arguments[2]).appendingPathComponent("session.plist")
+    if mode == "play" {
+        return await play(state: URL(fileURLWithPath: arguments[2]), code: arguments[3], year: Int(arguments[4]) ?? 0, index: arguments.count >= 6 ? Int(arguments[5]) ?? 1 : 1)
+    }
     let course = arguments.count >= 5 ? (arguments[3], Int(arguments[4]) ?? 0) : nil
     let session = RecmanWebSession()
     session.traceHandler = { say("  · \($0)") }
@@ -164,6 +169,42 @@ let diagnostics = #"""
     }
     if let course { await list(session, code: course.0, year: course.1) }
     return 0
+}
+
+/// Gets back in from the saved session, finds a recording's player as BeepBar does, then hands it
+/// to `WebexProbe` in a window sharing the same cookies.
+@MainActor func play(state: URL, code: String, year: Int, index: Int) async -> Int32 {
+    guard let key = RecmanCourseKey(courseCode: code, academicYear: year) else { say("not a course code and year: \(code) \(year)"); return 2 }
+    let file = state.appendingPathComponent("session.plist")
+    guard let data = FileManager.default.contents(atPath: file.path), let snapshot = try? RecmanSessionCodec.decode(data) else {
+        say("no readable saved session: run cold first")
+        return 1
+    }
+    let webexFile = state.appendingPathComponent("webex-cookies.plist")
+    let webexCookies = loadWebexCookies(from: webexFile)
+    say("restoring \(snapshot.cookies.count) Polimi cookies and \(webexCookies.count) Webex cookies from an earlier play run")
+    let session = RecmanWebSession()
+    session.traceHandler = { say("  · \($0)") }
+    defer { session.close() }
+    await session.open(cookies: snapshot.cookies + webexCookies)
+    let start = ContinuousClock.now
+    do {
+        try await session.reachArchive()
+        say("RESULT warm OK in \(elapsed(since: start))")
+        let recordings = try await session.recordings(for: key)
+        guard recordings.indices.contains(index - 1) else { say("RESULT list has only \(recordings.count) recordings"); return 1 }
+        let player = try await session.playbackURL(for: recordings[index - 1])
+        say("RESULT player found in \(elapsed(since: start))")
+        try await save(session, to: file)
+        guard let store = session.webView?.configuration.websiteDataStore else { say("no browser store"); return 1 }
+        await WebexProbe(store: store).run(player: player, limit: .seconds(300))
+        saveWebexCookies(await store.httpCookieStore.allCookies(), to: webexFile)
+        return 0
+    } catch {
+        say("RESULT play FAILED \(error) after \(elapsed(since: start))")
+        await describePage(session, "where it stopped")
+        return 1
+    }
 }
 
 let application = NSApplication.shared

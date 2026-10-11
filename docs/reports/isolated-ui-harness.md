@@ -37,7 +37,7 @@ Mutations in disposable `git worktree add --detach` copies, each run alone:
 | Controller hops to the main actor before the throttle | `6d8e6e3` | **RED**: entry bound fails |
 | Burst does not close its run (`closeCurrentRun` removed) | `b9fda15` | **RED**: a late final event reaches the main actor |
 | Readiness modifier branches on `enabled` again | `b9fda15` | **RED**: `movingTheMarkerKeepsTheRowState` sees the row rebuilt |
-| Burst does not restore the ready state | `__MUT_SHA__` | **RED**: `syncState == .readyUnchecked` fails |
+| Burst does not restore the ready state | `8916306` | **RED**: `syncState == .readyUnchecked` fails |
 | Restored | each copy | **GREEN** |
 
 Host: Apple M5 (`Mac17,3`), 32 GB, macOS 27.0.1 (`26A434`), Xcode 27.0 (`27A266a`).

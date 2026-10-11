@@ -322,6 +322,25 @@ struct RecmanSessionVaultTests {
         #expect(disk.data == nil)
     }
 
+    /// A save by a caller that never managed to read the file keeps the email the file has for
+    /// this owner, and carries none over from another owner; without the flag the given email
+    /// (here none) wins. Guards against a disk error at launch costing the confirmed address.
+    /// Mutation: ignore `keepingFileEmail` and the first expectation fails.
+    @Test func aSaveBlindToTheFileKeepsItsEmail() async throws {
+        let seeded = try RecmanSessionCodec.encode(cookies("old"), ownerUserID: 42, email: "a.b@polimi.it", now: now)
+        disk.state.withLock { $0.data = seeded }
+        #expect(await vault.save(cookies("new"), ownerUserID: 42, email: nil, keepingFileEmail: true, epoch: vault.epoch, now: now).value == .saved)
+        #expect(try fileEmail() == "a.b@polimi.it")
+        #expect(try fileValue() == "new")
+
+        #expect(await vault.save(cookies("other"), ownerUserID: 7, email: "z@polimi.it", keepingFileEmail: true, epoch: vault.epoch, now: now).value == .saved)
+        #expect(try fileEmail() == nil, "another owner's email is never carried over")
+
+        disk.state.withLock { $0.data = seeded }
+        #expect(await vault.save(cookies("new"), ownerUserID: 42, email: nil, epoch: vault.epoch, now: now).value == .saved)
+        #expect(try fileEmail() == nil, "without the flag the caller's answer stands")
+    }
+
     /// Every operation, called from the main actor, does its file work elsewhere.
     @Test func fileWorkNeverRunsOnTheMainThread() async {
         _ = vault.load(now: now)

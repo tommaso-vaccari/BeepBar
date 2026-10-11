@@ -129,8 +129,20 @@ public final class RecmanSessionVault: Sendable {
     /// `email` is the confirmed Polimi address to keep in the file (nil: none). It has no default
     /// on purpose: every save states what the file should say, so a caller that forgets the email
     /// doesn't silently erase the one the user confirmed.
-    public func save(_ cookies: [HTTPCookie], ownerUserID: Int, email: String?, epoch: Int, now: Date) -> Task<SaveOutcome, Never> {
+    ///
+    /// `keepingFileEmail` is for a caller that never managed to read the file (a disk error at
+    /// load) and so does not know what email it holds: the save then keeps the email the file has
+    /// for this owner, read here, and `email` is ignored. A file that can't be read now, or
+    /// belongs to another owner, counts as having none.
+    public func save(_ cookies: [HTTPCookie], ownerUserID: Int, email: String?, keepingFileEmail: Bool = false, epoch: Int, now: Date) -> Task<SaveOutcome, Never> {
         enqueue { [storage, state] in
+            var email = email
+            if keepingFileEmail {
+                email = nil
+                if let data = try? storage.load(), let snapshot = try? RecmanSessionCodec.decode(data, now: now), snapshot.ownerUserID == ownerUserID {
+                    email = snapshot.email
+                }
+            }
             let kept = cookies.filter { RecmanSessionCodec.keeps($0, now: now) }
             let candidate = Saved(owner: ownerUserID, fingerprint: RecmanSessionCodec.fingerprint(kept), email: email)
             if state.withLock({ $0.saved == candidate }) { return .unchanged }

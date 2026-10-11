@@ -489,7 +489,15 @@ struct MenuBarSnapshot: Sendable {
         didSet {
             // Only a controller that already exists can hold another account's session; one
             // created later checks the saved session's owner when it reads it.
-            if let userID = siteInfo?.userID, userID != oldValue?.userID { recordingsStorage?.webBeepAccountChanged(to: userID) }
+            if let userID = siteInfo?.userID, userID != oldValue?.userID {
+                if let recordingsStorage {
+                    recordingsStorage.webBeepAccountChanged(to: userID)
+                } else {
+                    // Nothing created Recordings in this launch, but the previous account's
+                    // places in lectures may still be stored: they go with the account (#148).
+                    RecordingsController.forgetResumePoints(in: operationDefaults, notOwnedBy: userID)
+                }
+            }
         }
     }
     private var database: SyncDatabase?
@@ -551,6 +559,8 @@ struct MenuBarSnapshot: Sendable {
 #if DEBUG
     private var recordingsStoreForTesting: RecordingsSessionStore?
     private var recordingsBrowserForTesting: (@MainActor () -> RecmanBrowsing)?
+    /// Set by a test before the first use of `recordings`; the real player is never built in tests.
+    var recordingsPlayerForTesting: (@MainActor () -> RecordingPlaying)?
     private var beforeReconciliationStateForTesting: (@MainActor () async -> Void)?
     /// Whether the last sync result to be encoded was encoded on the main thread; nil until one
     /// is (R01, #109). Set by the pre-encode in `finishReconciliation` and by the inline
@@ -957,7 +967,9 @@ struct MenuBarSnapshot: Sendable {
     private func makeRecordings() -> RecordingsController {
         var store = RecordingsSessionStore.standard
         var makeBrowser: @MainActor () -> RecmanBrowsing = { RecmanWebSession() }
+        var makePlayer: @MainActor () -> RecordingPlaying = { RecordingPlayerController() }
 #if DEBUG
+        if let recordingsPlayerForTesting { makePlayer = recordingsPlayerForTesting }
         if let recordingsStoreForTesting { store = recordingsStoreForTesting }
         if let recordingsBrowserForTesting { makeBrowser = recordingsBrowserForTesting }
 #endif
@@ -973,6 +985,7 @@ struct MenuBarSnapshot: Sendable {
             defaults: operationDefaults,
             ownerUserID: { [weak self] in self?.recordingsOwnerUserID },
             isAvailable: { [weak self] in self?.selectedSite.university == .polimi },
+            makePlayer: makePlayer,
             fetchProfileEmail: { [weak self] in await self?.profileEmail() }
         )
 #if DEBUG

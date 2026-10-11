@@ -83,8 +83,9 @@ struct RecordingResumePointsTests {
         #expect(points.position(for: "r6") == nil)
     }
 
-    /// The stored form round-trips, and carries only the owner and the positions: nothing that
-    /// names a lecture, a course or a person.
+    /// The stored form round-trips, and carries only the owner and the (key, seconds) entries: no
+    /// title, date or person. The key itself is the caller's identity (the app's names the course
+    /// code, year and recording id).
     @Test func theStoredFormRoundTrips() throws {
         var points = RecordingResumePoints(owner: 7)
         points.apply(.remember(61), for: "2026:058167:abc")

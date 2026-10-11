@@ -2318,6 +2318,207 @@ struct RecordingsControllerTests {
         #expect(Controller.panelPolicyOutcome(previous: .accessory, current: .accessory, playerOpen: false) == .leave)
         #expect(Controller.panelPolicyOutcome(previous: .accessory, current: .prohibited, playerOpen: false) == .leave)
     }
+
+    // MARK: Review follow-ups (#148)
+
+    /// Closing the Settings window (or leaving the page) while a lecture recovery is running or
+    /// waiting does not cancel it: the lecture resumes at its place and the browser then closes.
+    /// Guards against a lecture left paused and silent with its one retry spent.
+    /// Mutation: make `suspend()` always `invalidate()` and close the browser (drop the
+    /// `hasRecovery` branch) and both variants stay at one play.
+    @Test(arguments: ["running", "queued"])
+    func aRecoveryOutlivesTheWindowClosing(scenario: String) async {
+        defer { cleanUp() }
+        browser.streamResults["a"] = [.success(stream("a")), .success(stream("a"))]
+        let controller = await readyController()
+        controller.play(recording("a"))
+        await settle("a playing") { world.player.plays.count == 1 }
+        let gate = FakeRecmanBrowser.Gate()
+        defer { gate.release() }
+        if scenario == "running" {
+            browser.streamGates["a"] = gate
+            world.player.failDuringPlayback(at: 700)
+            await settle("recovery running") { gate.isWaiting }
+        } else {
+            browser.listResults[course.courseCode] = .success([])
+            browser.listGates[course.courseCode] = gate
+            controller.refresh([course], selected: course)
+            await settle("listing held") { gate.isWaiting }
+            world.player.failDuringPlayback(at: 700)
+        }
+        controller.windowClosed()
+        gate.release()
+        await settle("resumed after the window closed") { world.player.plays.count == 2 }
+        #expect(world.player.plays[1].startAt == 700)
+        await settle("browser closed again") { !browser.isOpen }
+        #expect(world.player.isOpen)
+        controller.turnOff()
+    }
+
+    /// Copy link on another recording leaves a waiting recovery alone; a new Play replaces it.
+    /// Mutation: remove the `.recover` exception for copy in `open` and the lecture never resumes.
+    @Test func copyingALinkDoesNotCancelARecovery() async {
+        defer { cleanUp() }
+        browser.streamResults["a"] = [.success(stream("a")), .success(stream("a"))]
+        browser.playbackResults["c"] = .success(playerLink("c"))
+        let controller = await readyController()
+        controller.play(recording("a"))
+        await settle("a playing") { world.player.plays.count == 1 }
+        let gate = FakeRecmanBrowser.Gate()
+        defer { gate.release() }
+        browser.listResults[course.courseCode] = .success([])
+        browser.listGates[course.courseCode] = gate
+        controller.refresh([course], selected: course)
+        await settle("listing held") { gate.isWaiting }
+        world.player.failDuringPlayback(at: 700)
+        controller.copyLink(recording("c"))
+        gate.release()
+        await settle("link copied") { world.copied == [playerLink("c")] }
+        await settle("recovery still ran") { world.player.plays.count == 2 }
+        controller.turnOff()
+    }
+
+    /// The controller's plumbing to the player: no player until a Play, and a policy handed over
+    /// reaches it. Mutation: make `keepPolicyAfterLecture` do nothing.
+    @Test func thePolicyHandOverReachesTheOpenPlayer() async {
+        defer { cleanUp() }
+        browser.streamResults["a"] = [.success(stream("a"))]
+        let controller = await readyController()
+        #expect(!controller.isPlayerOpen)
+        controller.keepPolicyAfterLecture(.accessory)
+        #expect(world.playersMade == 0, "asking about the player never creates it")
+        controller.play(recording("a"))
+        await settle("a playing") { world.player.plays.count == 1 }
+        #expect(controller.isPlayerOpen)
+        controller.keepPolicyAfterLecture(.accessory)
+        #expect(world.player.adoptedPolicies == [.accessory])
+        controller.turnOff()
+    }
+
+    /// A saved session of another account found when it is read closes the player and forgets
+    /// the places, like any account change. Mutation: remove `closePlayerForIdentityChange()` or
+    /// `forgetResumePoints()` from the owner-mismatch branch of `adopt`.
+    @Test func aSessionOfAnotherAccountFoundOnReadClosesThePlayer() async throws {
+        defer { cleanUp() }
+        browser.streamResults["a"] = [.success(stream("a"))]
+        let controller = await readyController()
+        controller.play(recording("a"))
+        await settle("a playing") { world.player.plays.count == 1 }
+        world.player.pause(at: 1_800)
+        #expect(defaults.data(forKey: resumeKey) != nil)
+        controller.windowClosed()
+        await drainTasks()
+        try store.save(RecmanSessionCodec.encode([FakeRecmanBrowser.cookie("SSO_LOGIN", value: "other")], ownerUserID: 9, now: world.now))
+        controller.signIn()
+        await settle("player closed by the mismatch") { world.player.closes == 1 }
+        await settle("signed in again") { controller.access == .ready && !browser.isOpen }
+        #expect(defaults.object(forKey: resumeKey) == nil)
+        #expect(resumeWrites() == 2, "one write, one removal: the close's report wrote nothing")
+    }
+
+    /// While the Polimi session is gone nothing can look a stream up: a lecture that stops is
+    /// left alone and its one retry is not spent, so after signing in again it still recovers.
+    /// Mutation: insert into `recoveredLectures` in `playerFailed` again (before the access
+    /// guard) and the last expectation fails.
+    @Test func aFailureWhileSignedOutDoesNotSpendTheRetry() async {
+        defer { cleanUp() }
+        browser.streamResults["a"] = [.success(stream("a")), .success(stream("a"))]
+        let controller = await readyController()
+        controller.play(recording("a"))
+        await settle("a playing") { world.player.plays.count == 1 }
+        browser.listResults[course.courseCode] = .failure(RecmanBrowserError.needsSignIn)
+        controller.refresh([course], selected: course)
+        await settle("signed out") { controller.access == .needsSignIn(nil) }
+        // The sign-in below reloads the page's courses: let that succeed.
+        browser.listResults[course.courseCode] = .success([])
+        world.player.failDuringPlayback(at: 300)
+        await drainTasks()
+        #expect(browser.streamCalls == ["stream a"])
+        #expect(world.opened.isEmpty)
+        #expect(world.player.isOpen, "the paused window stays")
+
+        controller.signIn()
+        await settle("signed in") { controller.access == .ready }
+        world.player.failDuringPlayback(at: 99)
+        await settle("recovered after signing in") { world.player.plays.count == 2 }
+        #expect(world.player.plays[1].startAt == 99)
+        controller.turnOff()
+    }
+
+    /// A lecture that never starts while the Polimi session is gone says so instead of doing
+    /// nothing. Mutation: remove the `openingProblem` line in the `access == .ready` guard.
+    @Test func aFailureToStartWhileSignedOutSaysSo() async {
+        defer { cleanUp() }
+        browser.streamResults["a"] = [.success(stream("a"))]
+        browser.playbackResults["a"] = .success(playerLink("a"))
+        let controller = await readyController()
+        controller.play(recording("a"))
+        await settle("a playing") { world.player.plays.count == 1 }
+        browser.listResults[course.courseCode] = .failure(RecmanBrowserError.needsSignIn)
+        controller.refresh([course], selected: course)
+        await settle("signed out") { controller.access == .needsSignIn(nil) }
+        world.player.failBeforeReady()
+        await settle("problem shown") { controller.openingProblem == .playbackUnavailable }
+        #expect(world.opened.isEmpty)
+        controller.turnOff()
+    }
+
+    /// The profile is asked once per session: an empty or failed answer is not asked again at
+    /// every Settings appearance. Mutation: reset `suggestionAttempted` after the answer.
+    @Test func theProfileIsAskedOncePerSession() async {
+        defer { cleanUp() }
+        world.profileEmail = nil
+        let controller = await readyController()
+        await controller.prepareEmailField()
+        await controller.prepareEmailField()
+        await controller.prepareEmailField()
+        #expect(world.profileEmailCalls == 1)
+        controller.turnOff()
+    }
+
+    /// A recovery that needs the email (removed meanwhile) shows the product-decision sentence
+    /// and does not open Webex in the browser; the window stays. Mutation: remove the `needsEmail`
+    /// branch in `recoverPlayback` and the browser opens.
+    @Test func aRecoveryWithoutAnEmailOpensNoWebexPage() async {
+        defer { cleanUp() }
+        browser.streamResults["a"] = [.success(stream("a")), .failure(RecmanBrowserError.needsEmail)]
+        browser.playbackResults["a"] = .success(playerLink("a"))
+        let controller = await readyController()
+        controller.play(recording("a"))
+        await settle("a playing") { world.player.plays.count == 1 }
+        world.player.failDuringPlayback(at: 400)
+        await settle("problem shown") { controller.openingProblem == .playbackUnavailable }
+        #expect(controller.openingProblem?.message == "Non è stato possibile aprire questa registrazione.")
+        #expect(world.opened.isEmpty)
+        #expect(browser.playCalls.isEmpty)
+        #expect(world.player.isOpen)
+        controller.turnOff()
+    }
+
+    /// A session file that could not be read when the app looked (a disk error) still has its
+    /// email afterwards: the next sign-in's save keeps what the file holds instead of writing
+    /// "none" over it. Mutation: pass `keepingFileEmail: false` in `saveSession`.
+    /// (Needs permissions to be enforced, so it does not hold when run as root.)
+    @Test func anUnreadableSessionKeepsItsEmailThroughTheNextSave() async throws {
+        defer { cleanUp() }
+        try store.save(RecmanSessionCodec.encode([FakeRecmanBrowser.cookie("SSO_LOGIN", value: "saved")], ownerUserID: 42, email: "a.b@polimi.it", now: world.now))
+        try FileManager.default.setAttributes([.posixPermissions: 0o000], ofItemAtPath: sessionFile.path)
+        let controller = makeController(useDefault: true)
+        controller.pageAppeared()
+        await settle("unreadable file asks for a sign-in") { controller.access == .needsSignIn(nil) }
+        let gate = FakeRecmanBrowser.Gate()
+        defer { gate.release() }
+        browser.signInGate = gate
+        controller.signIn()
+        await settle("sign-in held") { gate.isWaiting }
+        try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: sessionFile.path)
+        gate.release()
+        await settle("signed in") { controller.access == .ready }
+        await controller.settleSessionFile()
+        #expect(try savedEmail() == "a.b@polimi.it")
+        #expect(try savedSession()?.cookies.map(\.value) == ["fresh"])
+        controller.turnOff()
+    }
 }
 
 /// Recordings through the real account controller: disconnecting, switching university and a
@@ -2405,6 +2606,62 @@ struct RecordingsAccountTests {
         #expect(try store.load() == nil)
         #expect(recordings.access == .needsSignIn(nil))
         #expect(!browser.isOpen)
+    }
+
+    /// Disconnecting through the account controller closes an open lecture and forgets the
+    /// places stored for it. Mutation: remove `closePlayerForIdentityChange()` or
+    /// `forgetResumePoints()` from `turnOff`. (A university change calls the same `turnOff`.)
+    @Test func disconnectingClosesThePlayerAndForgetsPlaces() async throws {
+        defer { try? FileManager.default.removeItem(at: root) }
+        let defaults = WeBeepAuthenticationController.throwawayDefaults()
+        defaults.set(true, forKey: RecordingsController.enabledKey)
+        try store.save(session(owner: 1))
+        let browser = FakeRecmanBrowser()
+        let player = FakeRecordingPlayer()
+        let url = URL(string: "https://nfg1wss.webex.com/nbr/a/hls.m3u8")!
+        browser.streamResults["a"] = [.success(RecordingStream(url: url, title: nil, duration: nil))]
+        let controller = WeBeepAuthenticationController(testRootURL: root.appendingPathComponent("sync"), deleteCredential: {}, defaults: defaults, recordingsStore: store, recordingsBrowser: { browser })
+        controller.recordingsPlayerForTesting = { player }
+        let recordings = controller.recordings
+        recordings.pageAppeared()
+        let recording = RecmanRecording(id: "a", courseCode: "058167", academicYear: 2026, title: "Lezione a", recordedAt: Date(timeIntervalSince1970: 1_790_000_000), kind: "Lezione", duration: "90 min", size: nil, previewURL: URL(string: "https://onlineservices.polimi.it/x?transfer_id=a")!)
+        recordings.play(recording)
+        for _ in 0..<2_000 where player.plays.isEmpty { try await Task.sleep(for: .milliseconds(1)) }
+        #expect(player.plays.count == 1)
+        player.pause(at: 1_800)
+        #expect(defaults.data(forKey: RecordingsController.resumePointsKey) != nil)
+
+        controller.signOut()
+        #expect(player.closes == 1)
+        #expect(!player.isOpen)
+        #expect(defaults.data(forKey: RecordingsController.resumePointsKey) == nil)
+        await recordings.settleSessionFile()
+    }
+
+    /// A different account signing in clears the previous account's stored places even when
+    /// nothing created Recordings in this launch; the same account's are kept.
+    /// Mutation: remove the `else` branch in `siteInfo.didSet`.
+    @Test(arguments: [9, 7])
+    func anAccountChangeForgetsPlacesEvenWithoutRecordings(storedOwner: Int) async throws {
+        defer { try? FileManager.default.removeItem(at: root) }
+        let sync = root.appendingPathComponent("sync", isDirectory: true)
+        try FileManager.default.createDirectory(at: sync, withIntermediateDirectories: true)
+        let database = try SyncDatabase(url: root.appending(path: "state.sqlite"))
+        let rootID = UUID()
+        try await database.registerRoot(id: rootID, canonicalPath: sync.path)
+        let token = MoodleRecordingProtocol.register(courses: [(1, "Course")])
+        let vault = CredentialVault(read: { _ in token }, write: { _ in })
+        let defaults = WeBeepAuthenticationController.throwawayDefaults()
+        var points = RecordingResumePoints(owner: storedOwner)
+        points.apply(.remember(100), for: "2026:058167:a")
+        defaults.set(try PropertyListEncoder().encode(points), forKey: RecordingsController.resumePointsKey)
+        let controller = WeBeepAuthenticationController(testRootURL: sync, database: database, rootID: rootID, apiClient: MoodleRecordingProtocol.makeClient(), credentialVault: vault, defaults: defaults, recordingsStore: store)
+        #expect(controller.recordingsIfCreated == nil)
+
+        // The local Moodle answers user id 7 (`MoodleRecordingProtocol`).
+        await controller.completeLoginForTesting(moodleLoginCallback(token: token))
+        #expect(controller.recordingsIfCreated == nil)
+        #expect((defaults.data(forKey: RecordingsController.resumePointsKey) != nil) == (storedOwner == 7))
     }
 
 }

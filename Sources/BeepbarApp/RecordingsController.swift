@@ -158,6 +158,8 @@ struct RecordingsListing: Equatable {
     private var resumePoints: RecordingResumePoints?
     /// A recovery ran with no Recordings page on screen: the browser it opened closes after it.
     private var closesBrowserWhenIdle = false
+    /// A recovery job is executing (it has left the queue).
+    private var runningRecovery = false
 
     /// The Polimi address the student confirmed for the Webex sign-in; lives in the session file.
     @Published private(set) var confirmedEmail: PolimiEmail? = nil
@@ -170,7 +172,9 @@ struct RecordingsListing: Equatable {
     /// Bumped whenever the session (and so the email) is discarded: a late profile answer or
     /// read from before it is dropped.
     private var emailEpoch = 0
-    private var suggestionInFlight = false
+    /// The profile was asked (or is being asked) in this session: a failed or empty answer is
+    /// not asked again at every Settings appearance.
+    private var suggestionAttempted = false
 
     private let makeBrowser: @MainActor () -> RecmanBrowsing
     private let store: RecordingsSessionStore
@@ -504,10 +508,33 @@ struct RecordingsListing: Equatable {
     /// Back to quiet: requests stop and the browser goes, while the lists stay in memory so the
     /// page shows them at once next time. A sign-in on screen is left alone: the user may be
     /// typing in it with BeepBar's window closed.
+    ///
+    /// A lecture recovery (queued or running) is the exception: the student is watching a lecture
+    /// that stopped, and cancelling its fresh stream because a window closed would leave it
+    /// paused and silent with its one retry spent. Only the course listings are dropped then; the
+    /// browser closes when the recovery has drained (`closesBrowserWhenIdle`).
     private func suspend() {
         guard access != .signingIn else { return }
+        if hasRecovery {
+            dropQueuedListings()
+            closesBrowserWhenIdle = true
+            return
+        }
         invalidate()
         closeBrowser()
+    }
+
+    /// Whether a recovery is queued or running.
+    private var hasRecovery: Bool {
+        runningRecovery || queue.contains { if case .recover = $0 { true } else { false } }
+    }
+
+    /// Removes the listings still waiting (not the one in flight) and their spinners.
+    private func dropQueuedListings() {
+        for job in queue {
+            if case .list(let key) = job, key != runningKey { listings[key]?.isLoading = false }
+        }
+        queue.removeAll { if case .list = $0 { true } else { false } }
     }
 
     /// Brings the page's courses up to date: `selected` first, then the others, which only feed
@@ -543,7 +570,13 @@ struct RecordingsListing: Equatable {
         openingRecordingID = recording.id
         // The cached path must replace pending openings too, or a slow lookup can later
         // overwrite the clipboard with the link chosen before the cached one.
-        queue.removeAll(where: Self.isOpening)
+        // A new Play replaces a waiting recovery (the student moved on); Copy link doesn't: it
+        // has nothing to do with the lecture that stopped.
+        queue.removeAll { job in
+            if case .open = job { return true }
+            if case .recover = job { return action == .play }
+            return false
+        }
         // Only the link can be answered from memory: a native Play always asks for a fresh
         // stream, since its address is short-lived and tied to a sign-in.
         if action == .copyLink, let url = playbackURLs[recording.id] {
@@ -763,6 +796,8 @@ struct RecordingsListing: Equatable {
                     try await playNatively(recording, request: request, browser: browser, generation: generation)
                     guard generation == self.generation else { return }
                 case .recover(let recording, let recovery):
+                    runningRecovery = true
+                    defer { runningRecovery = false }
                     try await recoverPlayback(recording, recovery, browser: browser, generation: generation)
                     guard generation == self.generation else { return }
                 }
@@ -944,6 +979,15 @@ struct RecordingsListing: Equatable {
         }
     }
 
+    /// Removes stored positions that don't belong to `owner`, without a controller: an account
+    /// change in a launch that never created Recordings must not leave the previous account's
+    /// places behind. Unreadable data goes too (it can't be shown to be this account's).
+    nonisolated static func forgetResumePoints(in defaults: UserDefaults, notOwnedBy owner: Int) {
+        guard let data = defaults.data(forKey: resumePointsKey) else { return }
+        if let stored = try? PropertyListDecoder().decode(RecordingResumePoints.self, from: data), stored.owner == owner { return }
+        defaults.removeObject(forKey: resumePointsKey)
+    }
+
     /// Positions go with the session: turn-off, disconnect and account change.
     private func forgetResumePoints() {
         resumePoints = nil
@@ -954,8 +998,10 @@ struct RecordingsListing: Equatable {
 
     private func playerFailed(id: String, failure: RecordingPlaybackFailure) {
         guard isEnabled, let recording = nowPlaying[id] else { return }
+        // The retry is spent when the recovery runs (`recoverPlayback`), not here: a failure
+        // that can't be recovered now (no Polimi session) or a recovery that never starts must
+        // not use it up.
         let recovery = Self.recovery(for: failure, alreadyRecovered: recoveredLectures.contains(id))
-        if case .freshStream = recovery { recoveredLectures.insert(id) }
         guard access == .ready else {
             // No Polimi session to look anything up with: the student has to sign in again.
             if case .beforeReady = failure { openingProblem = .playbackUnavailable }
@@ -969,6 +1015,7 @@ struct RecordingsListing: Equatable {
     private func recoverPlayback(_ recording: RecmanRecording, _ recovery: Recovery, browser: RecmanBrowsing, generation: Int) async throws {
         if case .freshStream(let position) = recovery {
             guard stillShowing(recording) else { return }
+            recoveredLectures.insert(recording.id)
             do {
                 let stream = try await browser.stream(for: recording, email: confirmedEmail)
                 guard generation == self.generation, stillShowing(recording) else { return }
@@ -977,6 +1024,13 @@ struct RecordingsListing: Equatable {
             } catch {
                 guard generation == self.generation else { return }
                 if error is CancellationError || (error as? RecmanBrowserError) == .needsSignIn { throw error }
+                if (error as? RecmanBrowserError) == .needsEmail {
+                    // Same decision as for Play: no Webex page for the student, only the sentence.
+                    // The window stays, paused at the place it stopped.
+                    openingProblem = RecordingsProblem(error)
+                    log.notice("Fresh stream needs a confirmed email")
+                    return
+                }
                 log.notice("Fresh stream not available: opening the browser")
             }
         }
@@ -1160,12 +1214,11 @@ struct RecordingsListing: Equatable {
             if browser == nil { sessionLoad = nil }
             guard epoch == emailEpoch, isEnabled else { return }
         }
-        guard confirmedEmail == nil, suggestedEmail == nil, !emailEditedByUser, !suggestionInFlight else { return }
-        suggestionInFlight = true
+        guard confirmedEmail == nil, suggestedEmail == nil, !emailEditedByUser, !suggestionAttempted else { return }
+        suggestionAttempted = true
         let raw = await fetchProfileEmail()
         // A reset (turn-off, account change) already cleared the flag for its own cycle.
         guard epoch == emailEpoch else { return }
-        suggestionInFlight = false
         guard isEnabled, confirmedEmail == nil, !emailEditedByUser, let raw, let email = PolimiEmail(raw) else { return }
         suggestedEmail = email
     }
@@ -1210,7 +1263,7 @@ struct RecordingsListing: Equatable {
         suggestedEmail = nil
         emailLoaded = false
         emailEditedByUser = false
-        suggestionInFlight = false
+        suggestionAttempted = false
     }
 
     // MARK: Browser and session file
@@ -1316,7 +1369,10 @@ struct RecordingsListing: Equatable {
         }
         // Read here, right before the save is enqueued: the email in the file is always the one
         // the student has confirmed at this moment, never one captured before the WebKit wait.
-        switch await vault.save(cookies, ownerUserID: owner, email: confirmedEmail?.value, epoch: epoch, now: now()).value {
+        // A session file that couldn't be read (a disk error) has an email nobody knows: keep
+        // what the file holds rather than writing "none" over it. A student's own edit wins.
+        let keepFileEmail = !emailLoaded && !emailEditedByUser
+        switch await vault.save(cookies, ownerUserID: owner, email: confirmedEmail?.value, keepingFileEmail: keepFileEmail, epoch: epoch, now: now()).value {
         case .saved:
             // The cycle's cached read now describes an older file.
             sessionLoad = nil

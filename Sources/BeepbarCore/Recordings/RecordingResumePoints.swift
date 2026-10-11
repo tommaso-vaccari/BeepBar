@@ -7,8 +7,9 @@ import Foundation
 /// Linux). The app (`RecordingsController`) owns the storage: one value in the settings, tied to
 /// one WeBeep account and deleted on turn-off, logout and account change.
 ///
-/// What is stored is a number of seconds per recording, nothing else: no title, no date, no
-/// course. The key is the recording's identity chosen by the caller.
+/// What is stored is a number of seconds per key, nothing else: no title and no date. The key is
+/// an opaque identity chosen by the caller; the app uses `year:course code:recording id`, so it
+/// does name a course and a lecture (and is deleted with the session for that reason).
 public struct RecordingResumePoints: Codable, Equatable, Sendable {
     /// The WeBeep account these positions belong to. A value stored for another account is
     /// treated as empty by the caller and replaced at the next write.

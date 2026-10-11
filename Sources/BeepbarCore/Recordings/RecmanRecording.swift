@@ -57,6 +57,17 @@ public struct RecmanRecording: Sendable, Equatable, Identifiable, Codable {
         self.size = size
         self.previewURL = previewURL
     }
+
+    /// The length in minutes from Recman's duration ("97 min" → 97, "0 min" → 0), or nil when it
+    /// can't be read. Used both to show the length and to estimate the hours left in a course
+    /// (`RecordingWatchProgress.courseSummary`), so both read the same number.
+    public var minutes: Int? { Self.minutes(inDuration: duration) }
+
+    /// The leading ASCII digits of a duration text. The parser accepts only `^[0-9]+\s*min$`, so
+    /// for a parsed row this is the whole number; a value too large for `Int` gives nil.
+    public static func minutes(inDuration duration: String) -> Int? {
+        Int(duration.prefix { ("0"..."9").contains($0) })
+    }
 }
 
 /// The only links BeepBar follows from the archive: a row's preview link, and the Webex player it

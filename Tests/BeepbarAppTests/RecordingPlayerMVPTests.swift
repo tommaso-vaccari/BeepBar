@@ -86,6 +86,16 @@ class CountingPlayer: AVPlayer, @unchecked Sendable {
         super.removeTimeObserver(observer)
     }
 
+    /// Runs inside every `play()`, before the player starts: lets a test see the controller's
+    /// state at the exact moment it starts playback, before any status report can change it.
+    /// Tests only call `play()` on the main thread.
+    nonisolated(unsafe) var onPlay: (@MainActor () -> Void)?
+
+    override func play() {
+        if let onPlay { MainActor.assumeIsolated { onPlay() } }
+        super.play()
+    }
+
     private let forcedStatus = OSAllocatedUnfairLock<AVPlayer.TimeControlStatus?>(initialState: nil)
 
     override var timeControlStatus: AVPlayer.TimeControlStatus {
@@ -596,11 +606,14 @@ struct RecordingPlayerMVPTests {
     }
 
     /// When the student started the held player during the resume and its status reports are
-    /// all handled before the seek lands, landing brings no further status change: the observer
-    /// replaced in `settleStart` must be added again there, or the lecture plays to its end with
-    /// no progress at all. The status is pinned to `.playing` so no later report can add it
-    /// back by chance. Mutation: drop the `updateProgressObserver` call after
-    /// `removeProgressObserver()` in `settleStart` and the serial is nil after the landing.
+    /// all handled before the seek lands, landing may bring no further status change: the
+    /// observer replaced in `settleStart` must be added again right there, or the lecture plays
+    /// to its end with no progress at all. The state is read inside the `play()` that
+    /// `settleStart` makes after the replacement, so a later status report cannot hide a missing
+    /// observer by adding one back (it did in the first version of this test). The status is
+    /// also pinned to `.playing`. Mutations: drop the `updateProgressObserver` call after
+    /// `removeProgressObserver()` in `settleStart` and the serial seen at that moment is nil;
+    /// drop the whole replacement and it is the early one.
     @Test func settlingReplacesTheEarlyObserverWithALiveOne() async throws {
         let recorder = Recorder()
         let (controller, player) = try await makeHeldResume(recorder: recorder)
@@ -609,11 +622,14 @@ struct RecordingPlayerMVPTests {
         await Self.settle()
         let early = try #require(controller.progressObserverSerial)
         player.report(.playing)
+        var serialWhenSettled: Int?? = .none
+        player.onPlay = { serialWhenSettled = .some(controller.progressObserverSerial) }
         player.releaseSeeks()
         try await Self.waitUntil { controller.isStartSettled }
-        #expect(controller.progressObserverSerial != nil, "still playing: the observer must exist")
-        #expect(controller.progressObserverSerial != early, "a fresh observer, not the early one")
-        #expect(player.active == 1)
+        player.onPlay = nil
+        let seen = try #require(serialWhenSettled, "settling restarts playback")
+        #expect(seen != nil, "still playing: the observer must exist when the start settles")
+        #expect(seen != early, "a fresh observer, not the early one")
         await Self.settle()
         #expect(player.active == 1)
         player.report(nil)

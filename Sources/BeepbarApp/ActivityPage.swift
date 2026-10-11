@@ -126,7 +126,6 @@ private struct CourseActivityCard: View {
     /// clamped to the course by `ActivityRowLayout.page`.
     @State private var visibleRows = ActivityRowLayout.pageSize
 
-
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
             Button {
@@ -178,7 +177,6 @@ private struct CourseActivityCard: View {
                         HStack(spacing: 8) {
                             Button(title, systemImage: "ellipsis.circle") {
                                 visibleRows = ActivityRowLayout.nextVisibleCount(after: visibleRows, total: ActivityRowLayout.rowCount(for: course))
-
                             }
                             .buttonStyle(.link)
                             .font(.callout)

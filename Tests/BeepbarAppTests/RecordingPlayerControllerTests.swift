@@ -25,10 +25,18 @@ struct RecordingPlayerControllerTests {
         }
     }
 
+    /// Every controller gets throwaway defaults, so no test reads or writes the real speed
+    /// preference.
     private func makeController(policy: FakePolicy = FakePolicy(.accessory),
                                 makePlayerView: @escaping @MainActor () -> NSView? = AVKitLoader.makePlayerView,
-                                frameAutosaveName: String? = nil) -> RecordingPlayerController {
-        RecordingPlayerController(present: { _ in }, makePlayerView: makePlayerView, activationPolicy: policy.control, frameAutosaveName: frameAutosaveName)
+                                makePlayer: @escaping @MainActor () -> AVPlayer = { AVPlayer() },
+                                frameAutosaveName: String? = nil,
+                                defaults: UserDefaults = PlayerTestDefaults.throwaway(),
+                                notificationCenter: NotificationCenter = .default,
+                                toggleFullScreen: @escaping @MainActor (NSWindow) -> Void = { _ in }) -> RecordingPlayerController {
+        RecordingPlayerController(present: { _ in }, makePlayerView: makePlayerView, makePlayer: makePlayer, activationPolicy: policy.control,
+                                  frameAutosaveName: frameAutosaveName, defaults: defaults, notificationCenter: notificationCenter,
+                                  toggleFullScreen: toggleFullScreen)
     }
 
     private static func player(of view: NSView?) -> AVPlayer? {
@@ -263,7 +271,7 @@ struct RecordingPlayerControllerTests {
         let controller = makeController(policy: policy)
         var failures: [RecordingPlaybackFailure] = []
         var openWhenReported: Bool?
-        controller.onFailure = { failure in
+        controller.onFailure = { _, failure in
             MainActor.preconditionIsolated()
             openWhenReported = controller.isOpen
             failures.append(failure)
@@ -289,7 +297,7 @@ struct RecordingPlayerControllerTests {
         let policy = FakePolicy(.accessory)
         let controller = makeController(policy: policy, makePlayerView: { nil })
         var failures: [RecordingPlaybackFailure] = []
-        controller.onFailure = { failures.append($0) }
+        controller.onFailure = { failures.append($1) }
         controller.play(URL(fileURLWithPath: "/nonexistent.mp4"), title: "Lezione", cookies: [])
         #expect(failures.isEmpty, "Reported on a later turn, never from inside play")
         try await Self.waitUntil { !failures.isEmpty }
@@ -311,7 +319,7 @@ struct RecordingPlayerControllerTests {
         let media = try await TestMedia.shared.url()
         let controller = makeController()
         var failures = 0
-        controller.onFailure = { _ in failures += 1 }
+        controller.onFailure = { _, _ in failures += 1 }
         controller.play(media, title: "Lezione", cookies: [])
         try await Self.waitUntil { controller.isCurrentItemReady }
         await Self.settle()
@@ -328,7 +336,7 @@ struct RecordingPlayerControllerTests {
         let media = try await TestMedia.shared.url()
         let controller = makeController()
         var failures: [RecordingPlaybackFailure] = []
-        controller.onFailure = { failures.append($0) }
+        controller.onFailure = { failures.append($1) }
         controller.play(media, title: "Lezione", cookies: [])
         try await Self.waitUntil { controller.isCurrentItemReady }
         let item = try #require(controller.player?.currentItem)
@@ -356,7 +364,7 @@ struct RecordingPlayerControllerTests {
         let media = try await TestMedia.shared.url()
         let controller = makeController()
         var failures = 0
-        controller.onFailure = { _ in failures += 1 }
+        controller.onFailure = { _, _ in failures += 1 }
         controller.play(media, title: "Uno", cookies: [])
         let replaced = try #require(controller.player?.currentItem)
         controller.play(media, title: "Due", cookies: [])
@@ -377,7 +385,7 @@ struct RecordingPlayerControllerTests {
     @Test func noFailureIsReportedAfterClose() {
         let controller = makeController()
         var failures = 0
-        controller.onFailure = { _ in failures += 1 }
+        controller.onFailure = { _, _ in failures += 1 }
         controller.play(TestMedia.missing, title: "Mancante", cookies: [])
         let observed = controller.generation
         controller.close()
@@ -391,7 +399,7 @@ struct RecordingPlayerControllerTests {
         let media = try await TestMedia.shared.url()
         let controller = makeController()
         var failures = 0
-        controller.onFailure = { _ in failures += 1 }
+        controller.onFailure = { _, _ in failures += 1 }
         controller.play(TestMedia.missing, title: "Mancante", cookies: [])
         let replaced = controller.generation
         controller.play(media, title: "Lezione", cookies: [])
@@ -479,25 +487,60 @@ struct RecordingPlayerControllerTests {
     }
 }
 
-/// A tiny playable MP4 written once at test time, so the tests need neither network nor a
+/// A tiny playable MP4 written once per test process, so the tests need neither network nor a
 /// checked-in binary fixture.
+///
+/// The file lives in a directory named after the test process and is deleted when the process
+/// exits (`atexit`). A run that crashes leaves its directory behind, so the next run sweeps every
+/// `beepbar-player-<pid>` directory whose process is gone, plus the loose
+/// `beepbar-player-*.mp4` files earlier versions of this helper left in the temporary folder.
 actor TestMedia {
     static let shared = TestMedia()
+    /// The clip's length: long enough for ±30 s skips and resume positions to land inside it.
+    static let duration: TimeInterval = 60
     /// A file URL that does not exist: AVFoundation fails it quickly and locally.
     static let missing = FileManager.default.temporaryDirectory.appendingPathComponent("beepbar-missing-\(UUID().uuidString).mp4")
+    /// This process's fixture directory.
+    static let directory = FileManager.default.temporaryDirectory.appendingPathComponent("\(prefix)\(getpid())", isDirectory: true)
+    private static let prefix = "beepbar-player-"
 
-    private var cached: URL?
+    /// The one write of this process. Shared rather than a cached URL: the actor is reentrant
+    /// across the write's `await`, so two suites asking at once would otherwise both write the
+    /// same file and the second would fail with "file name already in use".
+    private var creation: Task<URL, Error>?
 
     func url() async throws -> URL {
-        if let cached { return cached }
-        let url = FileManager.default.temporaryDirectory.appendingPathComponent("beepbar-player-\(UUID().uuidString).mp4")
-        try await Self.write(to: url)
-        cached = url
-        return url
+        if let creation { return try await creation.value }
+        let creation = Task {
+            Self.sweepLeftovers()
+            try FileManager.default.createDirectory(at: Self.directory, withIntermediateDirectories: true)
+            atexit { try? FileManager.default.removeItem(at: TestMedia.directory) }
+            let url = Self.directory.appendingPathComponent("clip.mp4")
+            try? FileManager.default.removeItem(at: url)
+            try await Self.write(to: url)
+            return url
+        }
+        self.creation = creation
+        return try await creation.value
     }
 
-    /// Writes thirty 64×64 H.264 frames at 1 fps: thirty seconds, so a test that checks playback
-    /// was paused cannot pass because the clip simply ended.
+    /// Removes fixtures of test processes that no longer run, and legacy loose files.
+    private static func sweepLeftovers() {
+        let fileManager = FileManager.default
+        let temporary = fileManager.temporaryDirectory
+        guard let names = try? fileManager.contentsOfDirectory(atPath: temporary.path) else { return }
+        for name in names where name.hasPrefix(prefix) {
+            let suffix = name.dropFirst(prefix.count)
+            if name.hasSuffix(".mp4") {
+                try? fileManager.removeItem(at: temporary.appendingPathComponent(name))
+            } else if let pid = Int32(suffix), pid != getpid(), kill(pid, 0) != 0, errno == ESRCH {
+                try? fileManager.removeItem(at: temporary.appendingPathComponent(name))
+            }
+        }
+    }
+
+    /// Writes sixty 64×64 H.264 frames at 1 fps: sixty seconds, so a test that checks playback
+    /// was paused cannot pass because the clip simply ended, and seeks have room on both sides.
     private static func write(to url: URL) async throws {
         let writer = try AVAssetWriter(outputURL: url, fileType: .mp4)
         let input = AVAssetWriterInput(mediaType: .video, outputSettings: [
@@ -514,14 +557,14 @@ actor TestMedia {
         writer.add(input)
         guard writer.startWriting() else { throw writer.error ?? CocoaError(.fileWriteUnknown) }
         writer.startSession(atSourceTime: .zero)
-        for frame in 0..<30 {
+        for frame in 0..<Int(duration) {
             while !input.isReadyForMoreMediaData { try await Task.sleep(for: .milliseconds(5)) }
             var buffer: CVPixelBuffer?
             CVPixelBufferCreate(nil, 64, 64, kCVPixelFormatType_32BGRA, nil, &buffer)
             guard let buffer else { throw CocoaError(.fileWriteUnknown) }
             CVPixelBufferLockBaseAddress(buffer, [])
             if let base = CVPixelBufferGetBaseAddress(buffer) {
-                memset(base, Int32(frame * 8), CVPixelBufferGetDataSize(buffer))
+                memset(base, Int32(frame * 4), CVPixelBufferGetDataSize(buffer))
             }
             CVPixelBufferUnlockBaseAddress(buffer, [])
             adaptor.append(buffer, withPresentationTime: CMTime(value: CMTimeValue(frame), timescale: 1))

@@ -18,8 +18,14 @@ import BeepbarCore
 /// Invariants the controller keeps (see its "Watch progress" section):
 /// - `entries` holds what the store committed, never an optimistic value: a tick in progress shows
 ///   the committed state plus `pending`, and a failed save leaves nothing to revert.
-/// - A missing entry means untouched (0 %, not done) only for a recording of a loaded listing:
-///   entries are published in the same main-actor turn as the listing they belong to.
+/// - A missing entry means untouched (0 %, not done) only for a `known` identity: one published
+///   with a listing read (same main-actor turn as the listing) or with a committed write. For an
+///   unknown one (a Watchlist row while offline, signed out or still loading) the store may well
+///   say "done": rows must check `isKnown` and not show 0 % or an empty checkbox for it.
+///
+/// Note for the row UI: a tick changes `live` (and `summaries`) about every 30 s while a lecture
+/// plays, which re-renders every view observing this model. Observe it once in the list and pass
+/// plain values to `Equatable` rows, so only the playing row's body runs again.
 /// - Everything here belongs to one account and is emptied on turn-off, disconnect and account
 ///   change (`reset()`), before the next account's data can arrive.
 @MainActor final class RecordingsWatchProgressModel: ObservableObject {
@@ -33,8 +39,16 @@ import BeepbarCore
     /// Each loaded course's summary including `live`, for the window. The menu bar and the
     /// persisted copy use `RecordingsController.watchSummaries`, which ignores ticks.
     @Published private(set) var summaries: [RecmanCourseKey: CourseWatchSummary] = [:]
+    /// Identities whose stored state this model has read or committed, so a missing entry for
+    /// them really means untouched. Grows with loaded listings; emptied by `reset()`.
+    @Published private(set) var known: Set<String> = []
 
-    /// The stored entry of `recording`, untouched when there is none.
+    /// Whether the stored state of `recording` is known (see `known`). When false, `entry(for:)`
+    /// and `fraction(for:)` say nothing about the store: hide or disable the bar and checkbox.
+    func isKnown(_ recording: RecmanRecording) -> Bool { known.contains(RecordingsStudyState.identity(recording)) }
+
+    /// The stored entry of `recording`, untouched when there is none (meaningful only if
+    /// `isKnown`).
     func entry(for recording: RecmanRecording) -> RecordingWatchEntry {
         entries[RecordingsStudyState.identity(recording)] ?? .untouched
     }
@@ -52,17 +66,23 @@ import BeepbarCore
 
     // MARK: Written by RecordingsController only
 
-    /// Publishes the committed entry (nil: no row) of one identity, if it differs.
-    func setEntry(_ entry: RecordingWatchEntry?, for identity: String) {
-        if entries[identity] != entry { entries[identity] = entry }
+    /// Publishes the committed entry (nil: no row) of one identity and marks it known. Returns
+    /// whether anything visible changed.
+    @discardableResult
+    func setEntry(_ entry: RecordingWatchEntry?, for identity: String) -> Bool {
+        var changed = false
+        if entries[identity] != entry { entries[identity] = entry; changed = true }
+        if !known.contains(identity) { known.insert(identity); changed = true }
+        return changed
     }
 
     /// Publishes a listing's entries at once: every identity in `identities` gets its value from
-    /// `entries`, absent ones become untouched. One `objectWillChange` for the whole listing.
+    /// `entries`, absent ones become untouched, and all become known. Published only if changed.
     func setEntries(_ new: [String: RecordingWatchEntry], for identities: [String]) {
         var updated = entries
         for identity in identities { updated[identity] = new[identity] }
         if updated != entries { entries = updated }
+        if !known.isSuperset(of: identities) { known.formUnion(identities) }
     }
 
     func setLive(_ fraction: Double?, for identity: String) {
@@ -84,5 +104,6 @@ import BeepbarCore
         if !live.isEmpty { live = [:] }
         if !pending.isEmpty { pending = [] }
         if !summaries.isEmpty { summaries = [:] }
+        if !known.isEmpty { known = [] }
     }
 }

@@ -201,20 +201,35 @@ struct RecordingsListing: Equatable {
     /// checkpoint must not be lost. A reset drops it; the invalidated actor refuses what's queued.
     private var progressChain: Task<Void, Never>?
     /// Checkpoints whose save failed (a disk error), by session serial: retried before the next
-    /// checkpoint, never with a timer and never with a banner. Events are idempotent, and a newer
-    /// checkpoint of the same session supersedes the old one (its session includes everything
-    /// the old one saw), so this holds at most one event per session.
+    /// checkpoint, never with a timer and never with a banner, at most `maxUnsavedCheckpoints`.
+    /// A newer checkpoint of the same session supersedes the old one (its session includes
+    /// everything the old one saw), so this holds at most one event per session.
+    ///
+    /// A retry runs *after* writes queued since the failure, so it is out of order by design.
+    /// That is safe for furthest (it never goes down) and for completion of a lecture not
+    /// un-ticked meanwhile; an un-tick in between is handled by `untickCounts`: the retried
+    /// session's crossing is forgotten, so an old close can't undo the student's later choice.
     private var unsavedCheckpoints: [Int: UnsavedCheckpoint] = [:]
+    /// How many un-ticks were queued per identity in this account's lifetime. A checkpoint
+    /// records the count when queued; a retry that finds it changed was overtaken by an un-tick.
+    private var untickCounts: [String: Int] = [:]
     /// The last saved summary of each course, for the menu bar (package F reads it through
     /// `onWatchSummaryChange` and `storedWatchSummaries(in:owner:)`). Changes only when a listing
     /// is published or a progress write commits, never on a tick: the in-memory position moves
     /// only `watchProgress.summaries`. A course absent here is unknown, never "0/0".
+    ///
+    /// `[:]` before the first store in this launch does NOT mean "no summaries": the saved ones
+    /// are read lazily, at the first change (`storeWatchSummary`). The menu must seed itself from
+    /// `storedWatchSummaries(in:owner:)` and take pushes as updates; only the `[:]` pushed by a
+    /// reset (`forgetSeen`) means the account's summaries are gone.
     private(set) var watchSummaries: [RecmanCourseKey: CourseWatchSummary] = [:] {
         didSet { if watchSummaries != oldValue { onWatchSummaryChange?(watchSummaries) } }
     }
     /// Pushed from the main actor whenever `watchSummaries` changes (the pattern of
     /// `WeBeepAuthenticationController.onMenuBarSymbolChange`): the menu never asks this
-    /// controller from an AppKit callback.
+    /// controller from an AppKit callback. Each push is the full dictionary of courses known *in
+    /// this controller*; see `watchSummaries` for why the first one is not the whole picture
+    /// unless it follows a read of the saved summaries.
     var onWatchSummaryChange: (@MainActor ([RecmanCourseKey: CourseWatchSummary]) -> Void)?
     /// The account `watchSummaries` was read for; nil until the first use with a known account.
     private var watchSummaryOwner: Int?
@@ -769,6 +784,7 @@ struct RecordingsListing: Equatable {
         watchProgress.reset()
         sessions = [:]
         unsavedCheckpoints = [:]
+        untickCounts = [:]
         progressChain = nil
         watchSummaryOwner = nil
         watchSummaries = [:]
@@ -1088,11 +1104,22 @@ struct RecordingsListing: Equatable {
     }
 
     /// A checkpoint whose save failed, kept for the next checkpoint (`unsavedCheckpoints`).
+    /// `owner` travels with the event and is checked again at commit (`isCurrentIdentity`), so a
+    /// retry can never be written under another account, even across an account change that
+    /// doesn't go through `forgetSeen` (no saved Polimi session; see `webBeepAccountChanged`).
     private struct UnsavedCheckpoint {
         let recording: RecmanRecording
         let owner: Int
-        let event: RecordingProgressEvent
+        var event: RecordingProgressEvent
+        /// `untickCounts[identity]` when the event was queued: see `retryUnsavedCheckpoints`.
+        var untickEpoch: Int
     }
+
+    /// At most this many failed checkpoints are kept for a retry (the most recent sessions). Under
+    /// a disk that keeps failing each ended lecture would add one and every checkpoint re-queue
+    /// them all (principle 6); a lecture dropped here loses only its unsaved progress, never a
+    /// done mark (those are the student's ticks, which report their failure instead).
+    static let maxUnsavedCheckpoints = 20
 
     /// Whether the student can tick lectures: on, and the account known (rows are keyed by it).
     var canEditProgress: Bool { resumeOwner() != nil }
@@ -1101,9 +1128,15 @@ struct RecordingsListing: Equatable {
     /// where it starts. A recovery or a Play again of the same lecture continues its session:
     /// neither ends the lecture, so a crossing seen before it still counts at the close. Sessions
     /// of lectures no longer in `nowPlaying` go (a stream that never started reports nothing).
-    /// `start` is 0 from the beginning; with no known length the session starts unobserved
-    /// (`RecordingWatchSession(start: nil)`), and ticks then can't be turned into fractions either.
+    /// `start` is 0 from the beginning; with no known length (neither the stream's nor the
+    /// archive's) the session starts unobserved (`RecordingWatchSession(start: nil)`).
+    ///
+    /// The start is not published as a live value: a stream that never becomes ready reports
+    /// nothing (no tick, no checkpoint), and a live value set here would linger on the row and in
+    /// the summary as a percentage nobody saved. The first tick or checkpoint shows it.
     private func startWatchSession(for recording: RecmanRecording, at start: TimeInterval, streamDuration: TimeInterval?) {
+        // A lecture closed before it was ready leaves the player without a report: its session
+        // goes when another lecture takes its place.
         for (id, gone) in sessions where nowPlaying[id] == nil {
             sessions[id] = nil
             watchProgress.setLive(nil, for: gone.identity)
@@ -1116,7 +1149,14 @@ struct RecordingsListing: Equatable {
         } else {
             sessions[recording.id] = newSession(for: recording, start: fraction)
         }
-        publishLive(of: recording)
+    }
+
+    /// The stream of `id` never started (`RecordingPlaybackFailure.beforeReady`): the player
+    /// closed its window without a report, so the session ends here, with nothing to save. Kept
+    /// otherwise, a Play of the same lecture after the browser fallback would continue it.
+    private func endWatchSessionBeforeReady(_ id: String) {
+        guard let gone = sessions.removeValue(forKey: id) else { return }
+        watchProgress.setLive(nil, for: gone.identity)
     }
 
     /// A periodic tick from the playing lecture: memory only. Moves the window's bar and the
@@ -1157,14 +1197,29 @@ struct RecordingsListing: Equatable {
         let closes = RecordingWatchProgress.checkpointCloses(reason: checkpoint.reason, reportedID: checkpoint.id, nextID: pendingPlayID)
         sessions[checkpoint.id] = closes ? nil : session
         if !closes { publishLive(of: recording) }
-        // Retry what failed before, oldest session first; this session's own older checkpoint
-        // is superseded by this one.
+        // This session's own older failed checkpoint is superseded by this one.
         unsavedCheckpoints[session.serial] = nil
+        retryUnsavedCheckpoints()
+        enqueueProgress(.checkpoint(session: session.progress, closes: closes), for: recording, owner: owner, serial: session.serial,
+                        untickEpoch: untickCounts[session.identity, default: 0])
+    }
+
+    /// Re-queues every failed checkpoint, oldest session first. One overtaken by an un-tick of
+    /// its lecture (the count changed since it was queued) loses its crossing first: retried as
+    /// it was, a close seen at 95 % before the un-tick would complete the lecture again, undoing
+    /// the student's choice (`applyCheckpoint` completes a blocked lecture on a crossing).
+    private func retryUnsavedCheckpoints() {
         for serial in unsavedCheckpoints.keys.sorted() {
-            guard let unsaved = unsavedCheckpoints.removeValue(forKey: serial) else { continue }
-            enqueueProgress(unsaved.event, for: unsaved.recording, owner: unsaved.owner, serial: serial)
+            guard var unsaved = unsavedCheckpoints.removeValue(forKey: serial) else { continue }
+            let identity = RecordingsStudyState.identity(unsaved.recording)
+            let current = untickCounts[identity, default: 0]
+            if unsaved.untickEpoch != current, case .checkpoint(var session, let closes) = unsaved.event {
+                session.resetCrossing()
+                unsaved.event = .checkpoint(session: session, closes: closes)
+                unsaved.untickEpoch = current
+            }
+            enqueueProgress(unsaved.event, for: unsaved.recording, owner: unsaved.owner, serial: serial, untickEpoch: unsaved.untickEpoch)
         }
-        enqueueProgress(.checkpoint(session: session.progress, closes: closes), for: recording, owner: owner, serial: session.serial)
     }
 
     /// The student ticks (`done`) or un-ticks a lecture ("done / attended in person"). The row
@@ -1173,17 +1228,25 @@ struct RecordingsListing: Equatable {
     /// forgets the crossing the playing session has seen, at once rather than at commit: a close
     /// queued behind the un-tick must already carry the reset session.
     func setDone(_ recording: RecmanRecording, _ done: Bool) {
-        guard let owner = resumeOwner() else { return }
+        // The key first: a recording without a valid course key can't be written, and must not
+        // leave its checkbox pending forever.
+        guard let owner = resumeOwner(), Self.courseKey(of: recording) != nil else { return }
         let identity = RecordingsStudyState.identity(recording)
         guard !watchProgress.pending.contains(identity) else { return }
-        if !done { sessions[recording.id]?.progress.resetCrossing() }
+        if !done {
+            sessions[recording.id]?.progress.resetCrossing()
+            untickCounts[identity, default: 0] += 1
+        }
         watchProgress.setPending(true, for: identity)
-        enqueueProgress(.manual(done: done), for: recording, owner: owner, serial: nil)
+        enqueueProgress(.manual(done: done), for: recording, owner: owner, serial: nil, untickEpoch: untickCounts[identity, default: 0])
     }
 
     /// Appends one write to the serial chain. The task is unstructured and kept only as the next
     /// write's predecessor: nothing cancels it, so the store's cancellation check can't drop it.
-    private func enqueueProgress(_ event: RecordingProgressEvent, for recording: RecmanRecording, owner: Int, serial: Int?) {
+    /// The history actor is captured now, not when the write runs: a write queued before a reset
+    /// must reach the old (invalidated) actor and be refused, never the next namespace. The
+    /// owner travels with the event too and is checked again at commit (`isCurrentIdentity`).
+    private func enqueueProgress(_ event: RecordingProgressEvent, for recording: RecmanRecording, owner: Int, serial: Int?, untickEpoch: Int) {
         guard let key = Self.courseKey(of: recording) else { return }
         let history = seenHistory
         let reset = historyResetTask
@@ -1191,7 +1254,7 @@ struct RecordingsListing: Equatable {
         progressChain = Task { [weak self] in
             await previous?.value
             await reset?.value
-            await self?.commitProgress(event, for: recording, key: key, owner: owner, history: history, serial: serial)
+            await self?.commitProgress(event, for: recording, key: key, owner: owner, history: history, serial: serial, untickEpoch: untickEpoch)
         }
     }
 
@@ -1199,12 +1262,14 @@ struct RecordingsListing: Equatable {
     /// still current (`isCurrentIdentity`, deliberately not the page `generation`: a pause saved
     /// after the window closed is still this account's progress).
     /// - `CancellationError` (before or after the commit): the identity is gone; discard silently.
-    /// - Unchanged: nothing to publish.
+    /// - Unchanged: the stored entry is still published (it may be the first time the model
+    ///   learns it, e.g. a Watchlist row with no listing loaded, or a tick on a lecture already
+    ///   done in the store), but nothing was written, so no revision bump and no acknowledgement.
     /// - Changed: the entry, a bumped `historyRevision` (an older listing snapshot then requeries
     ///   instead of overwriting it), the course summary, and the "new" dot when it is done.
     /// - Other errors: a checkpoint is kept for the next one, logged, no banner; a tick shows the
     ///   history banner and the row keeps its saved value.
-    private func commitProgress(_ event: RecordingProgressEvent, for recording: RecmanRecording, key: RecmanCourseKey, owner: Int, history: RecordingsSeenHistory, serial: Int?) async {
+    private func commitProgress(_ event: RecordingProgressEvent, for recording: RecmanRecording, key: RecmanCourseKey, owner: Int, history: RecordingsSeenHistory, serial: Int?, untickEpoch: Int) async {
         let identity = RecordingsStudyState.identity(recording)
         let isManual = if case .manual = event { true } else { false }
         guard isCurrentIdentity(history, owner: owner) else { return }
@@ -1221,25 +1286,33 @@ struct RecordingsListing: Equatable {
                 listings[key]?.problem = .historyUnavailable
                 log.error("Couldn't save a lecture's done mark")
             } else if let serial {
-                // Failures arrive in chain order, so this is the session's latest failed event.
-                // Even if a newer checkpoint of the session was queued meanwhile, retrying this
-                // older one is harmless: it can't end the session (a close is always its last
-                // event) and the rules never lower what a newer one saved.
-                unsavedCheckpoints[serial] = UnsavedCheckpoint(recording: recording, owner: owner, event: event)
+                // Failures arrive in chain order, so this replaces an older failure of the same
+                // session. Retrying it later, after writes queued since, can't lower anything
+                // (furthest never decreases) and can't end the session early (a close is always a
+                // session's last event); an un-tick in between is neutralised at retry time
+                // (`retryUnsavedCheckpoints`).
+                unsavedCheckpoints[serial] = UnsavedCheckpoint(recording: recording, owner: owner, event: event, untickEpoch: untickEpoch)
+                // Keep the most recent sessions only (serials grow with time).
+                while unsavedCheckpoints.count > Self.maxUnsavedCheckpoints, let oldest = unsavedCheckpoints.keys.min() {
+                    unsavedCheckpoints[oldest] = nil
+                }
                 log.error("Couldn't save watch progress; retried at the next checkpoint")
             }
             return
         }
+        // Not only a second layer behind the store's own invalidation (which reports a commit
+        // racing a reset as a cancellation): the WeBeep account can change without a reset when
+        // no Polimi session was saved, and then only this check keeps the old account's entry off
+        // the screen.
         guard isCurrentIdentity(history, owner: owner) else { return }
         if isManual { watchProgress.setPending(false, for: identity) }
         // An ended session's position now lives in the entry (or never will, if the save failed
         // and is waiting for a retry): the live value goes unless the lecture is playing again.
         if case .checkpoint(_, true) = event, sessions[recording.id] == nil { watchProgress.setLive(nil, for: identity) }
-        guard result.changed else { return }
-        watchProgress.setEntry(result.entry, for: identity)
-        historyRevision[key, default: 0] += 1
-        refreshWatchSummary(for: key, persist: true)
-        if result.entry?.isCompleted == true { scheduleAcknowledge([recording.id], for: key) }
+        let published = watchProgress.setEntry(result.entry, for: identity)
+        if result.changed { historyRevision[key, default: 0] += 1 }
+        if result.changed || published { refreshWatchSummary(for: key, persist: true) }
+        if result.changed, result.entry?.isCompleted == true { scheduleAcknowledge([recording.id], for: key) }
     }
 
     private static func courseKey(of recording: RecmanRecording) -> RecmanCourseKey? {
@@ -1321,6 +1394,7 @@ struct RecordingsListing: Equatable {
 
     private func playerFailed(id: String, failure: RecordingPlaybackFailure) {
         guard isEnabled, let recording = nowPlaying[id] else { return }
+        if case .beforeReady = failure { endWatchSessionBeforeReady(id) }
         // The retry is spent when the recovery runs (`recoverPlayback`), not here: a failure
         // that can't be recovered now (no Polimi session) or a recovery that never starts must
         // not use it up.

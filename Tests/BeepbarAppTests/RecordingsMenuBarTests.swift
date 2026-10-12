@@ -91,7 +91,7 @@ struct RecordingsMenuBarTests {
         RemoteCourseSummary(id: id, shortName: name, displayName: name, isVisible: true, startDate: nil, endDate: nil)
     }
 
-    private func lines(_ controller: WeBeepAuthenticationController) -> [String] { controller.menuBarSnapshot.recordingLines }
+    private func lines(_ controller: WeBeepAuthenticationController) -> [String] { controller.menuBarSnapshot.recordingLines.map(\.title) }
 
     // MARK: Selection
 
@@ -156,9 +156,9 @@ struct RecordingsMenuBarTests {
             summaries[RecmanCourseKey(courseCode: String(100_000 + index), academicYear: 2026)!] = CourseWatchSummary(done: index, total: 20, remainingMinutes: 0, unknownDurationCount: 0)
         }
         let enabled = Set(courses.map(\.id)).subtracting([101])
-        let lines = WeBeepAuthenticationController.recordingMenuLines(courses: courses, enabledIDs: enabled, summaries: summaries)
+        let lines = WeBeepAuthenticationController.recordingMenuLines(courses: courses, enabledIDs: enabled, summaries: summaries, owner: 7)
         #expect(WeBeepAuthenticationController.maxRecordingMenuLines == 10)
-        #expect(lines.map(\.italian) == [0, 2, 3, 4, 5, 6, 7, 8, 9, 10].map { String(format: "CORSO %02d — %d/20", $0, $0) })
+        #expect(lines.map(\.text.italian) == [0, 2, 3, 4, 5, 6, 7, 8, 9, 10].map { String(format: "CORSO %02d — %d/20", $0, $0) })
     }
 
     /// A course with no known summary, an empty archive (`total == 0`), no archive key, or the
@@ -178,9 +178,9 @@ struct RecordingsMenuBarTests {
             analisi: analisiSummary,
             fisica: CourseWatchSummary(done: 0, total: 0, remainingMinutes: 0, unknownDurationCount: 0),
         ]
-        let lines = WeBeepAuthenticationController.recordingMenuLines(courses: courses, enabledIDs: [1, 2, 3, 4, 5], summaries: summaries)
-        #expect(lines == [BilingualText("ANALISI 2 — 12/30 · ~14 h", "ANALISI 2 — 12/30 · ~14 h")])
-        #expect(WeBeepAuthenticationController.recordingMenuLines(courses: courses, enabledIDs: [1, 2, 3, 4, 5], summaries: [:]).isEmpty)
+        let lines = WeBeepAuthenticationController.recordingMenuLines(courses: courses, enabledIDs: [1, 2, 3, 4, 5], summaries: summaries, owner: 7)
+        #expect(lines.map(\.text) == [BilingualText("ANALISI 2 — 12/30 · ~14 h", "ANALISI 2 — 12/30 · ~14 h")])
+        #expect(WeBeepAuthenticationController.recordingMenuLines(courses: courses, enabledIDs: [1, 2, 3, 4, 5], summaries: [:], owner: 7).isEmpty)
     }
 
     // MARK: Account and launch
@@ -307,22 +307,22 @@ struct RecordingsMenuBarTests {
     /// lines from something other than `recordingMenuLines`.
     @Test func theSectionFollowsTheLanguage() async throws {
         let lines = [
-            RecordingWatchProgress.menuLine(courseName: "Analisi 2", CourseWatchSummary(done: 30, total: 30, remainingMinutes: 0, unknownDurationCount: 0)),
-            RecordingWatchProgress.menuLine(courseName: "Fisica", fisicaSummary),
+            RecordingMenuEntry(text: RecordingWatchProgress.menuLine(courseName: "Analisi 2", CourseWatchSummary(done: 30, total: 30, remainingMinutes: 0, unknownDurationCount: 0)), hint: nil, target: nil),
+            RecordingMenuEntry(text: RecordingWatchProgress.menuLine(courseName: "Fisica", fisicaSummary), hint: nil, target: nil),
         ]
         let italian = WeBeepAuthenticationController.recordingMenuSection(lines, language: .italian)
         let english = WeBeepAuthenticationController.recordingMenuSection(lines, language: .english)
         #expect(italian.title == "Registrazioni")
-        #expect(italian.lines == ["Analisi 2 — 30/30 · tutte fatte", "Fisica — 3/10 · ~45 min"])
+        #expect(italian.lines.map(\.title) == ["Analisi 2 — 30/30 · tutte fatte", "Fisica — 3/10 · ~45 min"])
         #expect(english.title == "Recordings")
-        #expect(english.lines == ["Analisi 2 — 30/30 · all done", "Fisica — 3/10 · ~45 min"])
+        #expect(english.lines.map(\.title) == ["Analisi 2 — 30/30 · all done", "Fisica — 3/10 · ~45 min"])
 
         defer { try? FileManager.default.removeItem(at: root) }
         let defaults = WeBeepAuthenticationController.throwawayDefaults()
         try storeSummaries([analisi: CourseWatchSummary(done: 30, total: 30, remainingMinutes: 0, unknownDurationCount: 0)], owner: 7, in: defaults)
         let controller = try await signedIn(defaults: defaults)
         select([11], on: controller)
-        #expect(controller.recordingMenuLines == [BilingualText("ANALISI 2 — 30/30 · tutte fatte", "ANALISI 2 — 30/30 · all done")], "both languages kept, no resolved string cached")
+        #expect(controller.recordingMenuLines.map(\.text) == [BilingualText("ANALISI 2 — 30/30 · tutte fatte", "ANALISI 2 — 30/30 · all done")], "both languages kept, no resolved string cached")
         #expect(controller.menuBarSnapshot.recordingLines == WeBeepAuthenticationController.recordingMenuSection(controller.recordingMenuLines, language: .italian).lines)
     }
 
@@ -345,21 +345,26 @@ struct RecordingsMenuBarTests {
     // MARK: Menu items
 
     private func snapshot(_ lines: [String]) -> MenuBarSnapshot {
+        snapshot(lines.map { RecordingMenuLine(title: $0, toolTip: nil, target: nil) })
+    }
+
+    private func snapshot(_ lines: [RecordingMenuLine]) -> MenuBarSnapshot {
         MenuBarSnapshot(title: "Sincronizzato", detail: "3 nuovi", actionTitle: "Sincronizza ora", openTitle: "Apri BeepBar…", quitTitle: "Esci da BeepBar", recordingsTitle: "Registrazioni", recordingLines: lines)
     }
 
     /// The recordings section alone: nothing when there are no lines, otherwise a separator, the
-    /// "Registrazioni" section header and one line per course, all with no target or action (no
-    /// new AppKit-to-main-actor path, issue #30), the lines disabled.
+    /// "Registrazioni" section header and one line per course. Lines without a click target
+    /// (nothing to play) have no target or action and are disabled; the clickable kind is
+    /// covered by `aClickableLineIsWiredToThePlayAction`.
     /// Mutations: drop the empty guard (a lone separator and header appear); drop
     /// `isEnabled = false` (the lines look clickable and do nothing); a plain item as header.
     @Test func theMenuSectionIsDisabledTextAfterASeparator() {
         let empty = NSMenu()
-        StatusItemController.addRecordingItems(from: snapshot([]), to: empty)
+        StatusItemController.addRecordingItems(from: snapshot([String]()), to: empty, target: nil)
         #expect(empty.items.isEmpty)
 
         let menu = NSMenu()
-        StatusItemController.addRecordingItems(from: snapshot(["Analisi 2 — 12/30 · ~14 h", "Fisica — 3/10 · ~45 min"]), to: menu)
+        StatusItemController.addRecordingItems(from: snapshot(["Analisi 2 — 12/30 · ~14 h", "Fisica — 3/10 · ~45 min"]), to: menu, target: nil)
         #expect(menu.items.count == 4)
         #expect(menu.items.first?.isSeparatorItem == true)
         #expect(menu.items.dropFirst().map(\.title) == ["Registrazioni", "Analisi 2 — 12/30 · ~14 h", "Fisica — 3/10 · ~45 min"])
@@ -389,7 +394,7 @@ struct RecordingsMenuBarTests {
         #expect(menu.items[8].action == NSSelectorFromString("openConfiguration"))
         #expect(menu.items[9].action == NSSelectorFromString("quit"))
 
-        StatusItemController.build(from: snapshot([]), into: menu, target: nil)
+        StatusItemController.build(from: snapshot([String]()), into: menu, target: nil)
         #expect(menu.items.map { $0.isSeparatorItem ? "—" : $0.title } == ["Sincronizzato", "3 nuovi", "Sincronizza ora", "—", "Apri BeepBar…", "Esci da BeepBar"])
     }
 
@@ -465,5 +470,309 @@ struct RecordingsMenuBarTests {
         #expect(defaults.data(forKey: RecordingsController.watchSummaryKey) == nil)
         #expect(lines(controller).isEmpty)
         await recordings.settleSessionFile()
+    }
+
+    // MARK: Click to play (package P3)
+
+    /// An Analisi lecture with an archive preview link that passes `RecmanURLPolicy` (what the
+    /// parser produces), or one on `host` (a forged stored `next`).
+    private func lecture(_ id: String, host: String = "onlineservices.polimi.it") -> RecmanRecording {
+        RecmanRecording(id: id, courseCode: analisi.courseCode, academicYear: analisi.academicYear, title: "Lezione \(id)",
+                        recordedAt: Date(timeIntervalSince1970: 1_790_000_000), kind: "Lezione", duration: "90 min", size: nil,
+                        previewURL: URL(string: "https://\(host)/recman_frontend/recman_frontend/controller/ArchivioListActivity.do?evn_preview_link=1&transfer_id=\(id)")!)
+    }
+
+    private func summary(next: RecmanRecording?) -> CourseWatchSummary {
+        CourseWatchSummary(done: 12, total: 30, remainingMinutes: 840, unknownDurationCount: 0, next: next)
+    }
+
+    private func stream(_ id: String) -> RecordingStream {
+        RecordingStream(url: URL(string: "https://nfg1wss.webex.com/nbr/\(id)/hls.m3u8")!, title: nil, duration: 6_000)
+    }
+
+    /// What the window-opening seam (`showRecordingsPageForTesting`) was asked for.
+    @MainActor final class PageRequests { var courses: [Int64?] = [] }
+
+    /// A relaunch with Analisi's summary saved for user 7 (next lecture `next`, default "a"),
+    /// Recordings on with a saved Polimi session, a fake browser and player, Analisi synced; no
+    /// Recordings controller.
+    private func clickSetup(next: RecmanRecording? = nil, language: AppLanguage = .italian) async throws
+        -> (WeBeepAuthenticationController, FakeRecmanBrowser, FakeRecordingPlayer, PageRequests, UserDefaults) {
+        let defaults = WeBeepAuthenticationController.throwawayDefaults()
+        defaults.set(true, forKey: RecordingsController.enabledKey)
+        try store.save(RecmanSessionCodec.encode([FakeRecmanBrowser.cookie("SSO_LOGIN")], ownerUserID: 7))
+        try storeSummaries([analisi: summary(next: next ?? lecture("a"))], owner: 7, in: defaults)
+        let browser = FakeRecmanBrowser()
+        let player = FakeRecordingPlayer()
+        let pages = PageRequests()
+        let controller = try await signedIn(defaults: defaults, browser: browser, language: language)
+        controller.recordingsPlayerForTesting = { player }
+        controller.showRecordingsPageForTesting = { pages.courses.append($0) }
+        select([11], on: controller)
+        return (controller, browser, player, pages, defaults)
+    }
+
+    private func settle(_ comment: Comment, sourceLocation: SourceLocation = #_sourceLocation, _ condition: () -> Bool) async {
+        for _ in 0..<2_000 {
+            if condition() { return }
+            await Task.yield()
+            try? await Task.sleep(for: .milliseconds(1))
+        }
+        Issue.record("never happened: \(comment)", sourceLocation: sourceLocation)
+    }
+
+    /// Lets every pending main-actor task run, before checking that something did *not* happen.
+    private func drainTasks() async {
+        for _ in 0..<50 { await Task.yield() }
+        try? await Task.sleep(for: .milliseconds(20))
+        for _ in 0..<50 { await Task.yield() }
+    }
+
+    private func target(_ controller: WeBeepAuthenticationController) -> RecordingMenuTarget? {
+        controller.menuBarSnapshot.recordingLines.first?.target
+    }
+
+    /// A line is clickable (target and "Riproduci" hint, in both languages) only when its summary
+    /// has a valid next lecture and the account is known; an all-done course, one with no known
+    /// next, one whose stored next is forged, or an unknown account give a grey line.
+    /// Guards the owner decision "enabled only with a next" and a click target that plays nothing.
+    /// Mutations: give every line a target (the all-done line gets one); drop `validatedNext` from
+    /// the builder (the forged line gets one); drop the `owner` condition (no account, a target).
+    @Test func aLineIsClickableOnlyWithAPlayableNext() {
+        let courses = [course(1, "058167 - ANALISI 2 [2026-27]"), course(2, "052499 - FISICA [2026-27]")]
+        let forged = RecmanRecording(id: "f", courseCode: fisica.courseCode, academicYear: fisica.academicYear, title: "x", recordedAt: Date(), kind: "Lezione", duration: "90 min", size: nil, previewURL: URL(string: "https://example.com/?transfer_id=f")!)
+        let built = { (summaries: [RecmanCourseKey: CourseWatchSummary], owner: Int?) in
+            WeBeepAuthenticationController.recordingMenuLines(courses: courses, enabledIDs: [1, 2], summaries: summaries, owner: owner)
+        }
+        let lines = built([analisi: summary(next: lecture("a")), fisica: CourseWatchSummary(done: 10, total: 10, remainingMinutes: 0, unknownDurationCount: 0)], 7)
+        #expect(lines.map(\.target) == [RecordingMenuTarget(owner: 7, courseID: 1, key: analisi), nil])
+        #expect(lines.map(\.hint) == [BilingualText("Riproduci: «Lezione a»", "Play: “Lezione a”"), nil])
+
+        #expect(built([analisi: summary(next: nil)], 7).map(\.target) == [nil], "no known next")
+        #expect(built([fisica: CourseWatchSummary(done: 1, total: 10, remainingMinutes: 0, unknownDurationCount: 0, next: forged)], 7).map(\.target) == [nil], "forged next")
+        #expect(built([analisi: summary(next: lecture("a"))], nil).map(\.target) == [nil], "no account")
+        #expect(built([analisi: summary(next: lecture("a"))], nil).map(\.hint) == [nil])
+    }
+
+    /// The section resolves each line's tooltip in the language it is given, next to the title,
+    /// and keeps the target; the controller's snapshot uses its own language. Guards an English
+    /// menu with an Italian tooltip. Mutations: pick the Italian hint always in
+    /// `recordingMenuSection`; drop `target` there.
+    @Test func theTooltipFollowsTheLanguage() async throws {
+        let target = RecordingMenuTarget(owner: 7, courseID: 1, key: analisi)
+        let entries = [RecordingMenuEntry(text: BilingualText("A — 1/2", "A — 1/2"), hint: BilingualText("Riproduci: «L»", "Play: “L”"), target: target)]
+        #expect(WeBeepAuthenticationController.recordingMenuSection(entries, language: .italian).lines == [RecordingMenuLine(title: "A — 1/2", toolTip: "Riproduci: «L»", target: target)])
+        #expect(WeBeepAuthenticationController.recordingMenuSection(entries, language: .english).lines == [RecordingMenuLine(title: "A — 1/2", toolTip: "Play: “L”", target: target)])
+
+        defer { try? FileManager.default.removeItem(at: root) }
+        let (controller, _, _, _, _) = try await clickSetup(language: .english)
+        #expect(controller.menuBarSnapshot.recordingLines.first?.toolTip == "Play: “Lezione a”")
+    }
+
+    /// Item shape: a line with a target points at the `StatusItemController` passed to `build`
+    /// (never NSApp or the account controller), with `playRecording:`, the payload as
+    /// `representedObject` and the tooltip, and NSMenu's autoenabling enables it; a line without
+    /// one has none of these and stays disabled; the header stays a section header.
+    /// Guards a clickable-looking line that does nothing, a grey line that does something, and a
+    /// target that crosses into the main actor. Mutations: `item.target = nil` (target missing,
+    /// the item is not enabled); give every line the action (the grey line is enabled).
+    @Test func aClickableLineIsWiredToThePlayAction() async throws {
+        defer { try? FileManager.default.removeItem(at: root) }
+        let (controller, _, _, _, _) = try await clickSetup()
+        let status = StatusItemController(authentication: controller)
+        let payload = RecordingMenuTarget(owner: 7, courseID: 11, key: analisi)
+        let menu = NSMenu()
+        StatusItemController.build(from: snapshot([
+            RecordingMenuLine(title: "ANALISI 2 — 12/30 · ~14 h", toolTip: "Riproduci: «Lezione a»", target: payload),
+            RecordingMenuLine(title: "FISICA — 10/10 · tutte fatte", toolTip: nil, target: nil),
+        ]), into: menu, target: status)
+        menu.update()
+        #expect(menu.items[4].isSectionHeader)
+        let clickable = menu.items[5]
+        let grey = menu.items[6]
+        #expect(clickable.target === status)
+        #expect(clickable.action == NSSelectorFromString("playRecording:"))
+        #expect(clickable.representedObject as? RecordingMenuTarget == payload)
+        #expect(clickable.toolTip == "Riproduci: «Lezione a»")
+        #expect(clickable.isEnabled)
+        #expect(grey.target == nil)
+        #expect(grey.action == nil)
+        #expect(grey.representedObject == nil)
+        #expect(grey.toolTip == nil)
+        #expect(!grey.isEnabled)
+        #expect(controller.recordingsIfCreated == nil, "drawing the menu creates nothing")
+    }
+
+    /// The whole click path, from AppKit's own dispatch of the item's action: nothing happens
+    /// synchronously (no Recordings controller, nothing played, right after the call), and after
+    /// the main actor runs its queued work the course's next lecture plays in the player, without
+    /// opening the window. The line was enabled from the saved summary after a relaunch without a
+    /// controller. Guards the issue #30 hop being replaced by a synchronous call, and the click
+    /// doing nothing. Mutations: call `authentication.playNextRecording` synchronously in
+    /// `dispatchRecordingClick` (with `MainActor.assumeIsolated`: a controller exists at once);
+    /// drop the `Task` body (nothing plays).
+    @Test func aClickHopsToTheMainActorAndPlaysTheNextLecture() async throws {
+        defer { try? FileManager.default.removeItem(at: root) }
+        let (controller, browser, player, pages, _) = try await clickSetup()
+        browser.streamResults["a"] = [.success(stream("a"))]
+        let line = try #require(controller.menuBarSnapshot.recordingLines.first)
+        #expect(line.target == RecordingMenuTarget(owner: 7, courseID: 11, key: analisi), "enabled from the saved summary")
+        #expect(controller.recordingsIfCreated == nil, "seeding created no controller")
+
+        let status = StatusItemController(authentication: controller)
+        let menu = NSMenu()
+        StatusItemController.build(from: controller.menuBarSnapshot, into: menu, target: status)
+        let index = try #require(menu.items.firstIndex { $0.representedObject is RecordingMenuTarget })
+        menu.performActionForItem(at: index)
+        #expect(controller.recordingsIfCreated == nil, "nothing ran before the hop")
+        #expect(player.plays.isEmpty)
+
+        await settle("a playing") { player.plays.count == 1 }
+        #expect(player.plays.first?.recordingID == "a")
+        #expect(pages.courses.isEmpty, "no window for a Play that works")
+        controller.recordings.turnOff()
+    }
+
+    /// `dispatchRecordingClick` ignores anything that isn't a `RecordingMenuTarget`: another
+    /// type, a line value, nil. Guards a play from a foreign `representedObject`.
+    @Test func aForeignPayloadIsIgnored() async throws {
+        defer { try? FileManager.default.removeItem(at: root) }
+        let (controller, browser, player, pages, _) = try await clickSetup()
+        browser.streamResults["a"] = [.success(stream("a"))]
+        let payloads: [Any?] = ["a", 11, controller.menuBarSnapshot.recordingLines.first, nil]
+        for payload in payloads {
+            StatusItemController.dispatchRecordingClick(payload, to: controller)
+        }
+        await drainTasks()
+        #expect(controller.recordingsIfCreated == nil)
+        #expect(player.plays.isEmpty)
+        #expect(pages.courses.isEmpty)
+    }
+
+    /// `menuPlayRecording` accepts only a click that still applies: same account, Polimi,
+    /// Recordings on, course still synced, a known next lecture that `validatedNext` accepts.
+    /// Mutations: drop any one clause (its case returns a lecture).
+    @Test func menuPlayRecordingRejectsEveryStaleClick() {
+        let target = RecordingMenuTarget(owner: 7, courseID: 11, key: analisi)
+        let good = [analisi: summary(next: lecture("a"))]
+        func play(owner: Int? = 7, polimi: Bool = true, on: Bool = true, enabled: Set<Int64> = [11], summaries: [RecmanCourseKey: CourseWatchSummary]? = nil) -> RecmanRecording? {
+            WeBeepAuthenticationController.menuPlayRecording(target: target, owner: owner, isPolimi: polimi, switchOn: on, enabledIDs: enabled, summaries: summaries ?? good)
+        }
+        #expect(play() == lecture("a"))
+        #expect(play(owner: 9) == nil, "another account")
+        #expect(play(owner: nil) == nil, "no account")
+        #expect(play(polimi: false) == nil, "another university")
+        #expect(play(on: false) == nil, "Recordings off")
+        #expect(play(enabled: [12]) == nil, "course deselected")
+        #expect(play(summaries: [analisi: summary(next: nil)]) == nil, "no next")
+        #expect(play(summaries: [:]) == nil, "no summary")
+        #expect(play(summaries: [analisi: summary(next: lecture("a", host: "example.com"))]) == nil, "forged next")
+    }
+
+    enum Staleness: CaseIterable { case owner, off, deselected, noNext, invalidNext }
+
+    /// A click that no longer applies, through the real controller: nothing plays, the window
+    /// doesn't open, and no Recordings controller is created (no WebKit for a click that does
+    /// nothing). The target is the one a line would have carried; `noNext` and `invalidNext`
+    /// also check that such a line is drawn grey. Guards a stale menu acting for another
+    /// account, a turned-off feature, a removed course or a forged lecture.
+    /// Mutations: drop the owner guard; drop `switchOn`; drop the `enabledIDs` check; drop the
+    /// `next` / `validatedNext` checks from `menuPlayRecording`; create `recordings` before the
+    /// checks (every case).
+    @Test(arguments: Staleness.allCases)
+    func aStaleClickDoesNothing(_ staleness: Staleness) async throws {
+        defer { try? FileManager.default.removeItem(at: root) }
+        let next: RecmanRecording? = switch staleness {
+        case .invalidNext: lecture("a", host: "example.com")
+        default: nil
+        }
+        let (controller, browser, player, pages, defaults) = try await clickSetup(next: next)
+        browser.streamResults["a"] = [.success(stream("a"))]
+        var target = RecordingMenuTarget(owner: 7, courseID: 11, key: analisi)
+        switch staleness {
+        case .owner: target = RecordingMenuTarget(owner: 9, courseID: 11, key: analisi)
+        case .off: defaults.set(false, forKey: RecordingsController.enabledKey)
+        case .deselected: select([], on: controller)
+        case .noNext:
+            // A relaunch whose saved summary has no next lecture (every lecture done since).
+            try storeSummaries([analisi: summary(next: nil)], owner: 7, in: defaults)
+            await signIn(controller, as: 8)
+            try storeSummaries([analisi: summary(next: nil)], owner: 7, in: defaults)
+            await signIn(controller, as: 7)
+            select([11], on: controller)
+            #expect(controller.watchSummaries[analisi] == summary(next: nil))
+            #expect(self.target(controller) == nil, "no next: a grey line")
+        case .invalidNext:
+            #expect(self.target(controller) == nil, "a forged next: a grey line")
+        }
+        StatusItemController.dispatchRecordingClick(target, to: controller)
+        await drainTasks()
+        #expect(controller.recordingsIfCreated == nil)
+        #expect(player.plays.isEmpty)
+        #expect(browser.calls.isEmpty)
+        #expect(pages.courses.isEmpty)
+    }
+
+    /// The account changes between drawing the menu and the click (7 → 9), here through a
+    /// connection check (`validateConnection`) that finds the stored token now belongs to 9:
+    /// the course list isn't reassigned and 9 has equal saved numbers, so neither `courses` nor
+    /// `watchSummaries` changes and only `siteInfo` can rebuild the lines. The old line's click
+    /// is ignored, and the lines carry the new account. Guards a menu drawn for one account
+    /// playing for another. Mutations: drop the `recordingMenuInputsChanged()` defer in
+    /// `siteInfo.didSet` (the line keeps owner 7); drop the owner guard (the old click creates a
+    /// controller).
+    @Test func anAccountChangeBetweenDrawingAndClickingIsIgnored() async throws {
+        defer { try? FileManager.default.removeItem(at: root) }
+        let (controller, _, player, pages, defaults) = try await clickSetup()
+        let old = try #require(target(controller))
+        #expect(old.owner == 7)
+        try storeSummaries([analisi: summary(next: lecture("a"))], owner: 9, in: defaults)
+        MoodleRecordingProtocol.setUserID(token: tokens.value, 9)
+        await controller.validateConnection()?.value
+        #expect(controller.recordingsOwnerUserID == 9)
+        #expect(controller.courses.count == accountCourses.count, "the course list wasn't touched")
+        #expect(controller.watchSummaries[analisi] == summary(next: lecture("a")))
+        #expect(target(controller)?.owner == 9, "lines rebuilt for the new account")
+
+        StatusItemController.dispatchRecordingClick(old, to: controller)
+        await drainTasks()
+        #expect(controller.recordingsIfCreated == nil)
+        #expect(player.plays.isEmpty)
+        #expect(pages.courses.isEmpty)
+    }
+
+    /// When the Play can't go on without the window, the course's Recordings page opens: first
+    /// the Polimi session lapses during a menu Play (the controller asks, `onMenuPlayNeedsPage`),
+    /// then a second click finds the session needing a sign-in (`playFromMenu` answers false).
+    /// Both select the course's page. Guards a click that silently does nothing.
+    /// Mutations: don't wire `onMenuPlayNeedsPage` in `makeRecordings` (first request missing);
+    /// ignore `startMenuPlay`'s false (second missing); drop `selectDestination` (another page).
+    @Test func aPlayThatNeedsTheWindowOpensTheCoursePage() async throws {
+        defer { try? FileManager.default.removeItem(at: root) }
+        let (controller, browser, player, pages, _) = try await clickSetup()
+        browser.streamResults["a"] = [.failure(RecmanBrowserError.needsSignIn)]
+        let target = try #require(target(controller))
+
+        StatusItemController.dispatchRecordingClick(target, to: controller)
+        await settle("asked for the page") { pages.courses.count == 1 }
+        #expect(pages.courses == [11])
+        #expect(controller.recordings.study.destination == .course(11))
+        #expect(player.plays.isEmpty)
+
+        controller.recordings.selectDestination(.watchlist)
+        StatusItemController.dispatchRecordingClick(target, to: controller)
+        await settle("asked again") { pages.courses.count == 2 }
+        #expect(pages.courses == [11, 11])
+        #expect(controller.recordings.study.destination == .course(11))
+        controller.recordings.turnOff()
+    }
+
+    /// Compile-time guard, never run: the menu action and the dispatcher are callable from a
+    /// nonisolated synchronous context, as AppKit calls them. Marking `playRecording(_:)` or
+    /// `dispatchRecordingClick` `@MainActor` (the issue #30 crash: AppKit's Objective-C call
+    /// would make the runtime verify the executor) makes this fail to compile.
+    nonisolated private static func menuActionsAreNonisolated(_ status: StatusItemController, _ item: NSMenuItem, _ auth: WeBeepAuthenticationController) {
+        status.playRecording(item)
+        StatusItemController.dispatchRecordingClick(item.representedObject, to: auth)
     }
 }

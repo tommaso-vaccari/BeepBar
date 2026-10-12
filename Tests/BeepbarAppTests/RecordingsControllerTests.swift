@@ -127,6 +127,11 @@ import BeepbarCore
     var onPositionCheckpoint: ((String, TimeInterval, TimeInterval?) -> Void)?
     var onFailure: ((String, RecordingPlaybackFailure) -> Void)?
     private(set) var plays: [Play] = []
+    /// The `index`th play, or a recorded failure instead of a crash when the controller started
+    /// fewer: an out-of-range index would end the whole test process and hide every other result.
+    func play(_ index: Int, sourceLocation: SourceLocation = #_sourceLocation) throws -> Play {
+        try #require(plays.indices.contains(index) ? plays[index] : nil, sourceLocation: sourceLocation)
+    }
     private(set) var closes = 0
     private(set) var adoptedPolicies: [NSApplication.ActivationPolicy] = []
     /// The lecture on screen and where it is: what the real player would report.
@@ -2118,7 +2123,7 @@ struct RecordingsControllerTests {
         let controller = await readyController()
         controller.play(recording("a"))
         await settle("a playing") { world.player.plays.count == 1 }
-        #expect(world.player.plays[0].startAt == nil)
+        #expect(try world.player.play(0).startAt == nil)
         #expect(resumeWrites() == 0, "nothing is written until the player reports")
 
         world.player.pause(at: 1_800)
@@ -2129,10 +2134,10 @@ struct RecordingsControllerTests {
 
         controller.play(recording("b"))
         await settle("b playing") { world.player.plays.count == 2 }
-        #expect(world.player.plays[1].startAt == nil, "another lecture starts from the beginning")
+        #expect(try world.player.play(1).startAt == nil, "another lecture starts from the beginning")
         controller.play(recording("a"))
         await settle("a again") { world.player.plays.count == 3 }
-        #expect(world.player.plays[2].startAt == 1_800)
+        #expect(try world.player.play(2).startAt == 1_800)
         controller.turnOff()
     }
 
@@ -2151,7 +2156,7 @@ struct RecordingsControllerTests {
         #expect(defaults.object(forKey: resumeKey) == nil, "the last place is forgotten, and so is an empty memory")
         controller.play(recording("a"))
         await settle("a again") { world.player.plays.count == 2 }
-        #expect(world.player.plays[1].startAt == nil)
+        #expect(try world.player.play(1).startAt == nil)
         world.player.pause(at: 2)
         #expect(defaults.object(forKey: resumeKey) == nil)
         controller.turnOff()
@@ -2169,7 +2174,7 @@ struct RecordingsControllerTests {
         let controller = await readyController()
         controller.play(recording("a"))
         await settle("a playing") { world.player.plays.count == 1 }
-        #expect(world.player.plays[0].startAt == (owner == 42 ? 999 : nil))
+        #expect(try world.player.play(0).startAt == (owner == 42 ? 999 : nil))
         controller.turnOff()
     }
 
@@ -2229,7 +2234,7 @@ struct RecordingsControllerTests {
     /// second failure in the same Play opens the browser and closes the dead window. Guards
     /// against a lecture left frozen, and against retrying forever.
     /// Mutation: never insert into `recoveredLectures` and the third stream request happens.
-    @Test func aStreamThatDiesIsResolvedOnceMoreThenTheBrowserOpens() async {
+    @Test func aStreamThatDiesIsResolvedOnceMoreThenTheBrowserOpens() async throws {
         defer { cleanUp() }
         browser.streamResults["a"] = [.success(stream("a")), .success(stream("a")), .success(stream("a"))]
         browser.playbackResults["a"] = .success(playerLink("a"))
@@ -2239,8 +2244,8 @@ struct RecordingsControllerTests {
 
         world.player.failDuringPlayback(at: 1_234)
         await settle("resumed") { world.player.plays.count == 2 }
-        #expect(world.player.plays[1].startAt == 1_234)
-        #expect(world.player.plays[1].recordingID == "a")
+        #expect(try world.player.play(1).startAt == 1_234)
+        #expect(try world.player.play(1).recordingID == "a")
         #expect(world.opened.isEmpty)
 
         world.player.failDuringPlayback(at: 2_000)
@@ -2575,7 +2580,7 @@ struct RecordingsControllerTests {
     /// Mutation: make `suspend()` always `invalidate()` and close the browser (drop the
     /// `hasRecovery` branch) and both variants stay at one play.
     @Test(arguments: ["running", "queued"])
-    func aRecoveryOutlivesTheWindowClosing(scenario: String) async {
+    func aRecoveryOutlivesTheWindowClosing(scenario: String) async throws {
         defer { cleanUp() }
         browser.streamResults["a"] = [.success(stream("a")), .success(stream("a"))]
         let controller = await readyController()
@@ -2597,7 +2602,7 @@ struct RecordingsControllerTests {
         controller.windowClosed()
         gate.release()
         await settle("resumed after the window closed") { world.player.plays.count == 2 }
-        #expect(world.player.plays[1].startAt == 700)
+        #expect(try world.player.play(1).startAt == 700)
         await settle("browser closed again") { !browser.isOpen }
         #expect(world.player.isOpen)
         controller.turnOff()
@@ -2669,7 +2674,7 @@ struct RecordingsControllerTests {
     /// drops a Play clicked meanwhile: nobody is looking, and it would otherwise replace the
     /// recovered lecture, open a browser or show a sign-in window afterwards. Mutation: remove
     /// `dropQueuedOpenings()` from `suspend` and "b" is streamed and played.
-    @Test func closingTheWindowDropsAPlayQueuedBehindARecovery() async {
+    @Test func closingTheWindowDropsAPlayQueuedBehindARecovery() async throws {
         defer { cleanUp() }
         browser.streamResults["a"] = [.success(stream("a")), .success(stream("a"))]
         browser.streamResults["b"] = [.success(stream("b"))]
@@ -2689,7 +2694,7 @@ struct RecordingsControllerTests {
         await settle("a resumed") { world.player.plays.count == 2 }
         await settle("browser closed") { !browser.isOpen }
         #expect(world.player.plays.map(\.recordingID) == ["a", "a"])
-        #expect(world.player.plays[1].startAt == 700)
+        #expect(try world.player.play(1).startAt == 700)
         #expect(!browser.streamCalls.contains("stream b"))
         #expect(world.opened.isEmpty)
         controller.turnOff()
@@ -2825,7 +2830,7 @@ struct RecordingsControllerTests {
     /// left alone and its one retry is not spent, so after signing in again it still recovers.
     /// Mutation: insert into `recoveredLectures` in `playerFailed` again (before the access
     /// guard) and the last expectation fails.
-    @Test func aFailureWhileSignedOutDoesNotSpendTheRetry() async {
+    @Test func aFailureWhileSignedOutDoesNotSpendTheRetry() async throws {
         defer { cleanUp() }
         browser.streamResults["a"] = [.success(stream("a")), .success(stream("a"))]
         let controller = await readyController()
@@ -2846,7 +2851,7 @@ struct RecordingsControllerTests {
         await settle("signed in") { controller.access == .ready }
         world.player.failDuringPlayback(at: 99)
         await settle("recovered after signing in") { world.player.plays.count == 2 }
-        #expect(world.player.plays[1].startAt == 99)
+        #expect(try world.player.play(1).startAt == 99)
         controller.turnOff()
     }
 

@@ -442,7 +442,7 @@ La prima esecuzione ha trovato un test debole (la lingua sopravviveva), corretto
 
 Mutazioni app, su una copia usa e getta:
 - rosse: elenchi illimitati; `refresh` che non fissa; `refresh` che rifissa sempre; lettori illimitati; corso selezionato non fissato (aggiunto un test dopo la review); corsi sincronizzati che ignorano gli id attivi.
-- sopravvissute, per motivo: `turnOff` che lascia le fissazioni non è osservabile, perché svuota i dati e il `refresh` successivo riscrive le fissazioni. Gli inoltri `calendar`, `weekSections` e `weekRange` di `RecordingsPresentation` non sono usati dal codice dell'app, solo dai test, che girano nel fuso e nella lingua del Mac; il comportamento reale è in Core ed è coperto dalle mutazioni sul fuso e sulla lingua qui sopra.
+- sopravvissute, per motivo: `turnOff` che lascia le fissazioni non è osservabile, perché svuota i dati e il `refresh` successivo riscrive le fissazioni. Gli inoltri `calendar`, `weekSections` e `weekRange` di `RecordingsPresentation` non sono usati dal codice dell'app, solo dai test, il cui fuso (Europe/Rome) coincide con quello del Mac; il comportamento reale è in Core ed è coperto dalle mutazioni sul fuso e sulla lingua qui sopra.
 
 **Non misurato:** valutazioni dei `body`, allocazioni, scorrimento, memoria dopo molte visite, confronti base dev → HEAD e main → HEAD. Prossimo passo: `scripts/ui-benchmark.py` con gli scenari `recordings-1000` e `recordings-5000` di D07 su entrambe le revisioni, più una traccia Time Profiler della pagina durante gli aggiornamenti del controller. Nessun beneficio temporale rivendicato; la riduzione dimostrata è strutturale (contatori nei test).
 

@@ -15,8 +15,32 @@ import Foundation
 // university, sync failures) and `scripts/recman-probe.sh` compiles the Recordings folder alone.
 
 /// How the materials run that precedes the recordings follow-up ended, as far as the follow-up
-/// cares. The app maps its own result (`completeSync` / `failedSync`, the automatic decision, a
-/// cancellation) onto it.
+/// cares. The app maps its own result onto it.
+///
+/// Mapping table: every way a run ends in `WeBeepAuthenticationController.swift` and the case it
+/// must map to. A path not listed here must be added to this table, never defaulted to `.synced`:
+/// only a run that reached WeBeep and finished (or failed on WeBeep's side) may lead to Recman.
+///
+/// | Code path | Case |
+/// |---|---|
+/// | `completeSync`, finished, `summary.conflicts > 0` | `.conflicts` |
+/// | `completeSync`, finished, `summary.failures > 0` (no conflicts) | `.partial` |
+/// | `completeSync`, finished, otherwise | `.synced` |
+/// | `completeSync`, `finishReconciliation` threw (pending choices unreadable) | `.localFailure` |
+/// | `completeSync` / any path ending in `cancelledSync`, `CancellationError`, `runAutomaticSync` returning `.cancelled` | `.cancelled` |
+/// | `failedSync(error: someWeBeepError)` | `.failed(SyncServiceFailure(error))` |
+/// | `failedSync(error: nil)` (a non-WeBeep error, e.g. `SyncDatabaseError.open`) | `.localFailure` |
+/// | `runAutomaticSync`, `pausedMidRun` returned true | `.pausedByDataSaver(pause)` |
+/// | `runAutomaticSync`, `AutomaticSyncPolicy.decision` not `.run` | `.notRun(thatDecision)` |
+/// | `runAutomaticSync`, schedule changed while reading the network (`schedulerGeneration` moved, returns `.finished` without running) | `.cancelled` (the run belongs to a schedule that no longer exists) |
+/// | `runAutomaticSync`, no root/database (`guard let rootURL…` returns `.finished`) | `.notRun(.skipUnconfigured)` |
+/// | `runAutomaticSync`, reading the enabled scopes failed (`.failed(.local)`) | `.localFailure` |
+/// | `runAutomaticSync`, no enabled course (`no-enabled-courses`) | `.notRun(.skipUnconfigured)` |
+/// | `runAutomaticSync`, `RootOperationGateError` → `deferredAutomaticSync` | `.notRun(.deferWhileBusy)` |
+/// | `synchronizeNow`, `RootOperationGateError` → `busySync` (`.failed(.local)`) | `.localFailure` |
+/// | `synchronizeNow`, recovery blocked, nothing selected (`.readyUnchecked`) or no folder (`.needsFolder`) | `.notRun(.skipUnconfigured)` |
+/// | `synchronizeNow` returning early because another operation is active | no follow-up at all (nothing ended) |
+/// | `handleCredentialStorageError` (`.absent`/`.corrupt`: effectively signed out, list forgotten; `.write`: `credentialUnavailable`), from `synchronizeNow` or `runAutomaticSync` | `.accountUnavailable` |
 public enum RecordingsMaterialsOutcome: Sendable, Equatable {
     /// Completed, with or without new files.
     case synced
@@ -33,6 +57,12 @@ public enum RecordingsMaterialsOutcome: Sendable, Equatable {
     case notRun(AutomaticSyncDecision)
     /// An automatic run Data Saver stopped midway because the Mac moved to such a network.
     case pausedByDataSaver(DataSaverPause)
+    /// The stored WeBeep credential is missing, unreadable or couldn't be written
+    /// (`handleCredentialStorageError`): the account is gone or in doubt.
+    case accountUnavailable
+    /// A local failure unrelated to WeBeep (database, folder busy, pending choices unreadable):
+    /// nothing about it is fixed by contacting Polimi.
+    case localFailure
 }
 
 /// What started the sync. A manual "Sincronizza ora" re-lists every course ignoring the freshness
@@ -78,6 +108,10 @@ public enum RecordingsSyncSkipReason: Sendable, Equatable {
     case connectivity
     /// WeBeep's sign-in expired: the account is in doubt until the student signs in again.
     case authenticationExpired
+    /// The stored WeBeep credential is missing, unreadable or unwritable.
+    case accountUnavailable
+    /// The materials run failed locally (database, busy folder, unreadable pending choices).
+    case localFailure
     /// Data Saver is on and the Mac is now on a hotspot or a Low Data Mode network (re-read when
     /// the follow-up is about to start, since the network may have changed during the run).
     case dataSaver(DataSaverPause)
@@ -104,7 +138,8 @@ public enum RecordingsSyncPolicy {
     /// materials run says, then the courses, then the network. Rules, as approved:
     /// - A materials result about WeBeep's own service (synced, conflicts, partial, service
     ///   unavailable, incompatible response) does not block it: Recman is a different service.
-    /// - No network, a cancellation, a deferred, paused or unconfigured run skip it.
+    /// - No network, a cancellation, a deferred, paused or unconfigured run skip it, and so do an
+    ///   unavailable WeBeep credential and a local failure (see `RecordingsMaterialsOutcome`'s table).
     /// - An expired WeBeep sign-in skips it too (not in the approved list; chosen because the
     ///   account is in doubt and the app is about to ask the student to sign in again).
     /// - `.signingIn` and `.needsSignIn` skip it at zero cost: the follow-up never asks the student.
@@ -176,6 +211,10 @@ public enum RecordingsSyncPolicy {
             }
         case .pausedByDataSaver(let pause):
             return .materialsPaused(pause)
+        case .accountUnavailable:
+            return .accountUnavailable
+        case .localFailure:
+            return .localFailure
         }
     }
 

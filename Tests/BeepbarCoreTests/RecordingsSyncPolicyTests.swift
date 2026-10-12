@@ -67,7 +67,8 @@ struct RecordingsSyncPolicyTests {
     /// Saver (at the start or midway), had nothing configured, or lost WeBeep's sign-in skips the
     /// follow-up, for both triggers. Guards against listing Recman after the student pressed
     /// "Annulla", on a network Data Saver protects, or with no connection (a pointless timeout per
-    /// course). Mutation: make `.connectivity` return nil in `skipReason` and the "connectivity"
+    /// course), and against contacting Polimi after the WeBeep credential vanished (an effective
+    /// sign-out) or after a local database/folder failure that Polimi can't fix (review P2-1). Mutation: make `.connectivity` return nil in `skipReason` and the "connectivity"
     /// rows refresh; same for any other case.
     @Test(arguments: [
         ("connectivity", RecordingsMaterialsOutcome.failed(.connectivity), RecordingsSyncSkipReason.connectivity),
@@ -79,6 +80,8 @@ struct RecordingsSyncPolicyTests {
         ("paused at start", .notRun(.pause(.hotspot)), .materialsPaused(.hotspot)),
         ("paused midway", .pausedByDataSaver(.lowDataMode), .materialsPaused(.lowDataMode)),
         ("auth expired", .failed(.authenticationExpired), .authenticationExpired),
+        ("credential unavailable", .accountUnavailable, .accountUnavailable),
+        ("local failure", .localFailure, .localFailure),
     ])
     func materialsOutcomesThatSkip(_ name: String, _ outcome: RecordingsMaterialsOutcome, _ reason: RecordingsSyncSkipReason) {
         for trigger in [RecordingsSyncTrigger.automatic, .manual] {
@@ -254,7 +257,33 @@ struct RecordingsSyncPolicyTests {
         #expect(line(12, 30, 840, new: 2) == BilingualText("Analisi 2 — 12/30 · ~14 h · 2 nuove", "Analisi 2 — 12/30 · ~14 h · 2 new"))
         #expect(line(12, 30, 840, new: 1) == BilingualText("Analisi 2 — 12/30 · ~14 h · 1 nuova", "Analisi 2 — 12/30 · ~14 h · 1 new"))
         #expect(line(29, 30, 0, new: 1) == BilingualText("Analisi 2 — 29/30 · 1 nuova", "Analisi 2 — 29/30 · 1 new"))
-        #expect(line(30, 30, 0, new: 3) == BilingualText("Analisi 2 — 30/30 · tutte fatte · 3 nuove", "Analisi 2 — 30/30 · all done · 3 new"))
+    }
+
+    /// A course with every lecture done never shows " · N nuove", even if the summary carries a
+    /// count: "30/30 · tutte fatte · 3 nuove" contradicts itself (review P2-2). Guards against the
+    /// suffix being appended after "tutte fatte". Mutation: append the suffix to the all-done line
+    /// too and both rows gain " · 3 nuove" / " · 3 new".
+    @Test func allDoneLineHasNoNewSuffix() {
+        let done = CourseWatchSummary(done: 30, total: 30, remainingMinutes: 0, unknownDurationCount: 0, newCount: 3)
+        #expect(RecordingWatchProgress.menuLine(courseName: "Analisi 2", done) == BilingualText("Analisi 2 — 30/30 · tutte fatte", "Analisi 2 — 30/30 · all done"))
+        let overDone = CourseWatchSummary(done: 31, total: 30, remainingMinutes: 0, unknownDurationCount: 0, newCount: 1)
+        #expect(RecordingWatchProgress.menuLine(courseName: "C", overDone) == BilingualText("C — 31/30 · tutte fatte", "C — 31/30 · all done"))
+    }
+
+    /// The recordings-based summary carries the `newCount` it is given, so a recompute (progress
+    /// checkpoint, tick) keeps the menu's " · N nuove"; without it the field is nil, as before, and
+    /// the counts and `next` are unaffected (review P2-3). Guards against a recompute silently
+    /// dropping the suffix. Mutation: ignore the `newCount` parameter in `courseSummary` and the
+    /// first expectation reads nil.
+    @Test func courseSummaryCarriesNewCount() {
+        let rows = [Self.lecture]
+        let with = RecordingWatchProgress.courseSummary(recordings: rows, entries: [:], live: [:], newCount: 1)
+        let without = RecordingWatchProgress.courseSummary(recordings: rows, entries: [:], live: [:])
+        #expect(with.newCount == 1)
+        #expect(without.newCount == nil)
+        #expect(with == without.withNewCount(1), "only newCount differs: counts and next are the same")
+        #expect(with.next?.id == "t1")
+        #expect(RecordingWatchProgress.courseSummary(recordings: rows, entries: [:], live: [:], newCount: 0) == without)
     }
 
     /// With nothing new (nil, zero, negative) the line is exactly the line before `newCount`

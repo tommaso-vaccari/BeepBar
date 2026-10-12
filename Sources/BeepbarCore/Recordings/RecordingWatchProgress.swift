@@ -323,10 +323,15 @@ public enum RecordingWatchProgress {
     /// (the app's `RecordingsStudyState.identity`, "year:course:id") before calling, once for both.
     /// `live` affects only `remainingMinutes`, never `next` (see `nextToWatch`). Labelled, unlike
     /// the rows overload, so a call can't silently resolve to the rows version and lose `next`.
-    public static func courseSummary(recordings: [RecmanRecording], entries: [String: RecordingWatchEntry], live: [String: Double]) -> CourseWatchSummary {
+    ///
+    /// `newCount` is passed through as is (normalised by `CourseWatchSummary.init`): this function
+    /// can't know which lectures are unseen, so every recompute (a progress checkpoint, a tick) must
+    /// hand over the current count, or the " · N nuove" suffix silently disappears from the menu.
+    public static func courseSummary(recordings: [RecmanRecording], entries: [String: RecordingWatchEntry], live: [String: Double], newCount: Int? = nil) -> CourseWatchSummary {
         let counts = courseSummary(recordings.map { (id: $0.id, minutes: $0.minutes) }, entries: entries, live: live)
         return CourseWatchSummary(done: counts.done, total: counts.total, remainingMinutes: counts.remainingMinutes,
-                                  unknownDurationCount: counts.unknownDurationCount, next: nextToWatch(recordings, entries: entries))
+                                  unknownDurationCount: counts.unknownDurationCount, next: nextToWatch(recordings, entries: entries),
+                                  newCount: newCount)
     }
 
     /// The lecture a click on a course's menu line plays: "the first recording I'm missing".
@@ -379,19 +384,24 @@ public enum RecordingWatchProgress {
     ///   estimate can understate the time left; the "~" is the only hint.
     /// - The empty-course text exists so this function is total, but the menu bar (package F)
     ///   omits courses with `total == 0` instead of showing it.
-    /// - With unseen recordings (`newCount` above zero) the line ends with " · 2 nuove" /
+    /// - With new recordings (`newCount` above zero) the line ends with " · 2 nuove" /
     ///   " · 2 new" (" · 1 nuova" in the singular). Without them the line is exactly what it was
-    ///   before `newCount` existed. An empty course never gets the suffix.
+    ///   before `newCount` existed. An empty course never gets the suffix, and neither does a
+    ///   course with every lecture done: "30/30 · tutte fatte · 3 nuove" would contradict itself.
+    ///   The caller (package D) counts `newCount` as lectures unseen AND not completed, so a lecture
+    ///   ticked as attended in person without being opened isn't "new"; the done guard here is the
+    ///   backstop for a summary where the two disagree.
     public static func menuLine(courseName: String, _ summary: CourseWatchSummary) -> BilingualText {
         let head = "\(courseName) — "
         if summary.total == 0 {
             return BilingualText(head + "nessuna registrazione", head + "no recordings")
         }
         let count = "\(summary.done)/\(summary.total)"
-        let base: BilingualText
         if summary.done >= summary.total {
-            base = BilingualText(head + count + " · tutte fatte", head + count + " · all done")
-        } else if let left = remainingTimeText(minutes: summary.remainingMinutes) {
+            return BilingualText(head + count + " · tutte fatte", head + count + " · all done")
+        }
+        let base: BilingualText
+        if let left = remainingTimeText(minutes: summary.remainingMinutes) {
             base = BilingualText(head + count + " · " + left, head + count + " · " + left)
         } else {
             base = BilingualText(head + count, head + count)

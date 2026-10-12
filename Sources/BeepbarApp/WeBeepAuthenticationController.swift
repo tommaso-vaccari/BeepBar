@@ -1400,10 +1400,9 @@ struct RecordingMenuEntry: Equatable {
                   shown.insert(key).inserted else { continue }
             let text = RecordingWatchProgress.menuLine(courseName: RecordingsPresentation.courseName(course), summary)
             if let owner, let next = summary.next, RecordingsController.validatedNext(next, for: key) {
-                let title = RecordingsPresentation.title(next)
                 lines.append(RecordingMenuEntry(
                     text: text,
-                    hint: BilingualText("Riproduci: «\(title)»", "Play: “\(title)”"),
+                    hint: recordingMenuHint(title: RecordingsPresentation.title(next)),
                     target: RecordingMenuTarget(owner: owner, courseID: course.id, key: key)
                 ))
             } else {
@@ -1412,6 +1411,16 @@ struct RecordingMenuEntry: Equatable {
             if lines.count == maxRecordingMenuLines { break }
         }
         return lines
+    }
+
+    /// The tooltip of a clickable recordings line: "Riproduci: «title»" / "Play: “title”". The
+    /// archive's title can carry line breaks and runs of spaces, which a one-line tooltip would
+    /// show as gaps or extra lines, so every run of whitespace becomes one space; an empty title
+    /// (nothing left after that) gives just "Riproduci" / "Play" rather than empty quotes.
+    nonisolated static func recordingMenuHint(title: String) -> BilingualText {
+        let clean = title.split(whereSeparator: { $0.isWhitespace || $0.isNewline }).joined(separator: " ")
+        guard !clean.isEmpty else { return BilingualText("Riproduci", "Play") }
+        return BilingualText("Riproduci: «\(clean)»", "Play: “\(clean)”")
     }
 
     /// The recordings section's header and lines in `language`. Takes the language explicitly

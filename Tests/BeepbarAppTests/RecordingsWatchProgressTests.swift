@@ -578,6 +578,7 @@ struct RecordingsWatchProgressTests {
         #expect(controller.watchProgress.entries.isEmpty)
         #expect(controller.watchProgress.live.isEmpty)
         #expect(controller.watchProgress.summaries.isEmpty)
+        #expect(controller.watchProgress.known.isEmpty, "nothing of the old account counts as known")
         #expect(controller.watchSummaries.isEmpty)
         #expect(defaults.object(forKey: RecordingsController.watchSummaryKey) == nil)
         world.player.tick(at: 4_000)
@@ -645,6 +646,35 @@ struct RecordingsWatchProgressTests {
         #expect(entry.autoCompletionBlocked)
         #expect(entry.furthest == 0.95, "its furthest point is still saved")
         #expect(!controller.watchProgress.isCompleted(recording("a")))
+    }
+
+    /// The other side of P1-a: an un-tick that came *before* the session's crossing must not
+    /// neutralise it. Un-ticked earlier, played below then past 90 %, closed: the close fails and
+    /// its retry still completes the lecture, since the crossing is fresh. Mutation: queue fresh
+    /// checkpoints with `untickEpoch: 0` in `recordWatchCheckpoint` (the retry looks overtaken
+    /// by the old un-tick, loses its crossing and the lecture stays not done).
+    @Test func aRetriedFreshCrossingAfterAnEarlierUnTickStillCompletes() async throws {
+        defer { cleanUp() }
+        let controller = await listedController()
+        controller.setDone(recording("a"), true)
+        await controller.settleWatchProgress()
+        controller.setDone(recording("a"), false)
+        await controller.settleWatchProgress()
+        await play("a", on: controller)
+        world.player.tick(at: 3_000)
+        world.player.tick(at: 5_700)
+        fault.isFailing = true
+        world.player.close()
+        await controller.settleWatchProgress()
+        fault.isFailing = false
+        #expect(try storedEntry("a")?.completed == nil, "the close wasn't saved yet")
+
+        await play("b", on: controller)
+        world.player.pause(at: 600)
+        await controller.settleWatchProgress()
+        #expect(try storedEntry("a")?.completed == .playback, "the retried fresh crossing completes it")
+        #expect(controller.watchProgress.isCompleted(recording("a")))
+        controller.turnOff()
     }
 
     /// P1-b: with no listing loaded (a Watchlist row after a relaunch, offline), a tick on a

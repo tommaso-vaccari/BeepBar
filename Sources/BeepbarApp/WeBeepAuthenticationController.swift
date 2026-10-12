@@ -358,6 +358,12 @@ struct MenuBarSnapshot: Sendable {
     let actionTitle: String
     let openTitle: String
     let quitTitle: String
+    /// Header of the recordings section ("Registrazioni"); unused while `recordingLines` is empty.
+    let recordingsTitle: String
+    /// One line per synced course with a known watch summary ("Analisi 2 — 12/30 · ~14 h"), at
+    /// most `WeBeepAuthenticationController.maxRecordingMenuLines`, already in the current
+    /// language. Empty means the menu has no recordings section at all.
+    let recordingLines: [String]
 }
 
 @MainActor final class WeBeepAuthenticationController: NSObject, ObservableObject {
@@ -377,11 +383,14 @@ struct MenuBarSnapshot: Sendable {
     // `menuBarAction`/`menuBarTitle`/`menuBarActionTitle`/`menuBarDetail`/`menuBarSymbol` (currently: syncState,
     // accountState, hasStoredCredential, recoveryBlocked, conflicts, rootURL, activeOperationID,
     // dataSaverPause), and
-    // `setLanguage(_:)` calls it since every label depends on `AppLanguage.current`. If you make
+    // `setLanguage(_:)` calls it since every label depends on `AppLanguage.current`. The
+    // recordings lines (`recordingMenuLines`) are fed by courses, enabledCourseIDs and
+    // watchSummaries, whose `didSet` calls `recordingMenuInputsChanged()`, which rebuilds the
+    // lines and then calls `refreshMenuBarSnapshot()`. If you make
     // those computed properties depend on anything else, add a matching
     // `didSet { refreshMenuBarSnapshot() }` to that property too, or the menu bar will silently
     // go stale instead of crashing loudly.
-    private(set) nonisolated(unsafe) var menuBarSnapshot = MenuBarSnapshot(title: "", detail: "", actionTitle: "", openTitle: "", quitTitle: "")
+    private(set) nonisolated(unsafe) var menuBarSnapshot = MenuBarSnapshot(title: "", detail: "", actionTitle: "", openTitle: "", quitTitle: "", recordingsTitle: "", recordingLines: [])
     /// Pushes the status item's icon from the main actor whenever `menuBarSymbol` changes, so
     /// StatusItemController never has to read it from an AppKit callback (same reason as
     /// `menuBarSnapshot`). Set once by StatusItemController's `@MainActor` init.
@@ -400,7 +409,10 @@ struct MenuBarSnapshot: Sendable {
     @Published private(set) var isLoadingCourses = false
     @Published private(set) var courseLoadError: BilingualText?
     @Published private(set) var courses: [RemoteCourseSummary] = [] {
-        didSet { defaultCourseFolders = Self.defaultFolders(for: courses, saved: courseFolders) }
+        didSet {
+            defaultCourseFolders = Self.defaultFolders(for: courses, saved: courseFolders)
+            recordingMenuInputsChanged()
+        }
     }
     @Published private(set) var hasStoredCredential: Bool {
         didSet {
@@ -435,6 +447,9 @@ struct MenuBarSnapshot: Sendable {
             schedulerGeneration += 1
             dataSaverPause = nil
             configureBackgroundScheduler()
+            // A deselected course leaves the menu; its summary stays in `watchSummaries`, so
+            // selecting it again brings the line back without a request.
+            recordingMenuInputsChanged()
         }
     }
     @Published private(set) var automaticSyncEnabled: Bool
@@ -489,17 +504,44 @@ struct MenuBarSnapshot: Sendable {
         didSet {
             // Only a controller that already exists can hold another account's session; one
             // created later checks the saved session's owner when it reads it.
-            if let userID = siteInfo?.userID, userID != oldValue?.userID {
-                if let recordingsStorage {
-                    recordingsStorage.webBeepAccountChanged(to: userID)
-                } else {
-                    // Nothing created Recordings in this launch, but the previous account's
-                    // places in lectures may still be stored: they go with the account (#148).
-                    RecordingsController.forgetResumePoints(in: operationDefaults, notOwnedBy: userID)
-                }
+            guard siteInfo?.userID != oldValue?.userID else { return }
+            guard let userID = siteInfo?.userID else {
+                // Signed out or another university: no account, so no account's numbers.
+                watchSummaries = [:]
+                return
             }
+            if let recordingsStorage {
+                recordingsStorage.webBeepAccountChanged(to: userID)
+            } else {
+                // Nothing created Recordings in this launch, but the previous account's
+                // places in lectures and watch summaries may still be stored: they go with the
+                // account (#148).
+                RecordingsController.forgetResumePoints(in: operationDefaults, notOwnedBy: userID)
+                RecordingsController.forgetWatchSummary(in: operationDefaults, notOwnedBy: userID)
+            }
+            // After the forgets above, so a previous account's numbers can't be read back. Read
+            // here, once per account, and never by creating the controller: the menu shows the
+            // last known numbers without a request (lazy guarantee of `recordingsStorage`).
+            let recordingsOn = (recordingsStorage?.isEnabled ?? RecordingsController.isSwitchedOn(in: operationDefaults))
+                && selectedSite.university == .polimi
+            watchSummaries = recordingsOn ? RecordingsController.storedWatchSummaries(in: operationDefaults, owner: userID) ?? [:] : [:]
         }
     }
+    /// The last known watch summary of each Recordings course, for the menu bar. Seeded from the
+    /// saved copy when the account becomes known (`siteInfo`), then replaced by each push of the
+    /// controller (`onWatchSummaryChange`, wired in `makeRecordings`), whose pushes are always the
+    /// whole picture: before its first push the controller holds `[:]` without that meaning
+    /// "none", so this is never overwritten from the controller's state, only from its pushes.
+    /// Cleared when the account goes; a push of `[:]` is a reset (turn-off, account change).
+    /// A deselected course keeps its entry here and is only hidden by `recordingMenuLines`.
+    private(set) var watchSummaries: [RecmanCourseKey: CourseWatchSummary] = [:] {
+        didSet { if watchSummaries != oldValue { recordingMenuInputsChanged() } }
+    }
+    /// The menu's recordings lines in both languages, rebuilt only when `courses`,
+    /// `enabledCourseIDs` or `watchSummaries` change, so the frequent snapshot refreshes during a
+    /// sync don't rerun the course-name regexes. Resolved to one language in
+    /// `refreshMenuBarSnapshot()`, which is why a language switch needs no rebuild here.
+    private(set) var recordingMenuLines: [BilingualText] = []
     private var database: SyncDatabase?
     /// Created on first use (the window, a sign-out), so a launch with the window closed doesn't
     /// read anything for a feature that may be off.
@@ -705,15 +747,15 @@ struct MenuBarSnapshot: Sendable {
     /// defaults to mains power and an ordinary network, so no test depends on the Mac running it.
     ///
     /// The Recordings session goes to `recordingsStore`, or to a throwaway folder: never to the
-    /// real one, which a sign-out in any test would otherwise delete.
-    init(testRootURL: URL, database: SyncDatabase? = nil, rootID: UUID? = nil, notificationCenter: NotificationCenterClient = InertNotificationCenter(), fileOpener: ActivityFileOpening = InertFileOpener(), apiClient: WeBeepAPIClient? = nil, downloader: RemoteDownloader? = nil, credentialVault: CredentialVault? = nil, deleteCredential: (() throws -> Void)? = nil, defaults: UserDefaults? = nil, automaticSyncEnvironment: AutomaticSyncEnvironment = .fixed(), recordingsStore: RecordingsSessionStore? = nil, recordingsBrowser: (@MainActor () -> RecmanBrowsing)? = nil) {
+    /// real one, which a sign-out in any test would otherwise delete. `site` is Polimi unless a
+    /// test needs another university from the first moment (Recordings exist only for Polimi).
+    init(testRootURL: URL, database: SyncDatabase? = nil, rootID: UUID? = nil, notificationCenter: NotificationCenterClient = InertNotificationCenter(), fileOpener: ActivityFileOpening = InertFileOpener(), apiClient: WeBeepAPIClient? = nil, downloader: RemoteDownloader? = nil, credentialVault: CredentialVault? = nil, deleteCredential: (() throws -> Void)? = nil, defaults: UserDefaults? = nil, automaticSyncEnvironment: AutomaticSyncEnvironment = .fixed(), recordingsStore: RecordingsSessionStore? = nil, recordingsBrowser: (@MainActor () -> RecmanBrowsing)? = nil, site: MoodleSite = .site(id: nil)) {
         deleteCredentialForTesting = deleteCredential
         let throwawayRecordingsFolder = FileManager.default.temporaryDirectory.appendingPathComponent("beepbar-recordings-test-\(UUID().uuidString)", isDirectory: true)
         recordingsStoreForTesting = recordingsStore ?? RecordingsSessionStore { throwawayRecordingsFolder }
         recordingsBrowserForTesting = recordingsBrowser
         self.credentialVault = credentialVault ?? CredentialVault(read: FileTokenStore.load, write: FileTokenStore.save)
         self.fileOpener = fileOpener
-        let site = MoodleSite.site(id: nil)
         selectedSite = site
         hasStoredCredential = true
         let isolatedDefaults = defaults ?? Self.throwawayDefaults()
@@ -988,6 +1030,9 @@ struct MenuBarSnapshot: Sendable {
             makePlayer: makePlayer,
             fetchProfileEmail: { [weak self] in await self?.profileEmail() }
         )
+        // Pushed from the main actor (never read from the menu's AppKit callback). Each push is
+        // the controller's whole picture, `[:]` included: that one is a reset.
+        controller.onWatchSummaryChange = { [weak self] summaries in self?.watchSummaries = summaries }
 #if DEBUG
         if Self.isUIPreview && ProcessInfo.processInfo.arguments.contains("--watchlist-preview") {
             if controllerDefaultsHaveNoWatchlist {
@@ -1131,18 +1176,65 @@ struct MenuBarSnapshot: Sendable {
     }
 
     private func refreshMenuBarSnapshot() {
+        let recordings = Self.recordingMenuSection(recordingMenuLines, language: AppLanguage.current)
         menuBarSnapshot = MenuBarSnapshot(
             title: menuBarTitle,
             detail: menuBarDetail,
             actionTitle: menuBarActionTitle,
             openTitle: tr("Apri BeepBar…", "Open BeepBar…"),
-            quitTitle: tr("Esci da BeepBar", "Quit BeepBar")
+            quitTitle: tr("Esci da BeepBar", "Quit BeepBar"),
+            recordingsTitle: recordings.title,
+            recordingLines: recordings.lines
         )
         let symbol = menuBarSymbol
         if symbol != lastMenuBarSymbol {
             lastMenuBarSymbol = symbol
             onMenuBarSymbolChange?(symbol)
         }
+    }
+
+    /// The most recordings lines the menu shows: past ten courses the menu would outgrow its
+    /// purpose (a glance), and the window has them all.
+    nonisolated static let maxRecordingMenuLines = 10
+
+    /// Rebuilds `recordingMenuLines` from its three inputs and refreshes the snapshot when they
+    /// changed. Called from the `didSet` of `courses`, `enabledCourseIDs` and `watchSummaries`
+    /// (see the invariant comment on `menuBarSnapshot`). Costs nothing when no summary is known
+    /// (every launch without Recordings), since the pure builder returns before any course.
+    private func recordingMenuInputsChanged() {
+        let lines = Self.recordingMenuLines(courses: courses, enabledIDs: enabledCourseIDs, summaries: watchSummaries)
+        guard lines != recordingMenuLines else { return }
+        recordingMenuLines = lines
+        refreshMenuBarSnapshot()
+    }
+
+    /// The menu's recordings lines: the synced courses (`enabledIDs`) in sidebar order (`courses`,
+    /// as the Recordings page lists them) that have an archive key and a known summary, named as
+    /// the Recordings page names them, at most `maxRecordingMenuLines`.
+    /// - A course with no known summary is left out, never shown as "0/0" (nothing before a page
+    ///   has loaded it once); so is one with `total == 0` (see `RecordingWatchProgress.menuLine`).
+    /// - Two WeBeep courses with the same archive key show the same recordings: one line, the
+    ///   first course's.
+    nonisolated static func recordingMenuLines(courses: [RemoteCourseSummary], enabledIDs: Set<Int64>, summaries: [RecmanCourseKey: CourseWatchSummary]) -> [BilingualText] {
+        guard !summaries.isEmpty, !enabledIDs.isEmpty else { return [] }
+        var lines: [BilingualText] = []
+        var shown: Set<RecmanCourseKey> = []
+        for course in courses where enabledIDs.contains(course.id) {
+            guard let key = RecmanCourseKey(course: course), let summary = summaries[key], summary.total > 0,
+                  shown.insert(key).inserted else { continue }
+            lines.append(RecordingWatchProgress.menuLine(courseName: RecordingsPresentation.courseName(course), summary))
+            if lines.count == maxRecordingMenuLines { break }
+        }
+        return lines
+    }
+
+    /// The recordings section's header and lines in `language`. Takes the language explicitly
+    /// (the app passes `AppLanguage.current`) so tests can check both without switching the
+    /// process-global language; resolved at every snapshot refresh, never cached, so
+    /// `setLanguage(_:)` rebuilds it.
+    nonisolated static func recordingMenuSection(_ lines: [BilingualText], language: AppLanguage) -> (title: String, lines: [String]) {
+        let pick = { (text: BilingualText) in language == .italian ? text.italian : text.english }
+        return (pick(BilingualText("Registrazioni", "Recordings")), lines.map(pick))
     }
 
     /// One short line for the status menu; the full sentences live in the window.

@@ -151,6 +151,9 @@ final class StatusItemController: NSObject, NSMenuDelegate {
     }
 
     nonisolated func menuNeedsUpdate(_ menu: NSMenu) {
+        // Budget: 1 ms (AGENTS.md, Performance). The interval shows the build in Instruments.
+        let trace = PerformanceTrace.shared.begin("ui.menuNeedsUpdate", category: .ui)
+        defer { PerformanceTrace.shared.end("ui.menuNeedsUpdate", category: .ui, state: trace) }
         menu.removeAllItems()
         let snapshot = authentication.menuBarSnapshot
 
@@ -171,6 +174,8 @@ final class StatusItemController: NSObject, NSMenuDelegate {
         actionItem.target = self
         menu.addItem(actionItem)
 
+        Self.addRecordingItems(from: snapshot, to: menu)
+
         menu.addItem(.separator())
 
         let openItem = NSMenuItem(title: snapshot.openTitle, action: #selector(openConfiguration), keyEquivalent: "")
@@ -180,6 +185,22 @@ final class StatusItemController: NSObject, NSMenuDelegate {
         let quitItem = NSMenuItem(title: snapshot.quitTitle, action: #selector(quit), keyEquivalent: "")
         quitItem.target = self
         menu.addItem(quitItem)
+    }
+
+    /// The recordings section: nothing when `snapshot.recordingLines` is empty, otherwise a
+    /// separator, the header and one line per course. Every item is disabled text with no target
+    /// or action, so this section adds no AppKit-to-main-actor path (issue #30): it reads the
+    /// snapshot it is given and nothing else. Static so tests can check the items without a
+    /// status item.
+    nonisolated static func addRecordingItems(from snapshot: MenuBarSnapshot, to menu: NSMenu) {
+        guard !snapshot.recordingLines.isEmpty else { return }
+        menu.addItem(.separator())
+        for title in [snapshot.recordingsTitle] + snapshot.recordingLines {
+            let item = NSMenuItem()
+            item.title = title
+            item.isEnabled = false
+            menu.addItem(item)
+        }
     }
 
     @objc private func performAction() {

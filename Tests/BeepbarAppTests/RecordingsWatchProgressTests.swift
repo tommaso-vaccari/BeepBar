@@ -185,7 +185,7 @@ struct RecordingsWatchProgressTests {
 
         #expect(controller.watchProgress.live[identity("a")] == 0.4)
         #expect(controller.watchProgress.fraction(for: recording("a")) == 0.4)
-        #expect(controller.watchProgress.summaries[course] == CourseWatchSummary(done: 0, total: 2, remainingMinutes: 144, unknownDurationCount: 0), "the window's summary follows the live position")
+        #expect(controller.watchProgress.summaries[course] == CourseWatchSummary(done: 0, total: 2, remainingMinutes: 144, unknownDurationCount: 0, next: recording("a")), "the window's summary follows the live position")
         #expect(probe.current.writeTransactions == transactions, "a tick opens no write transaction")
         #expect(defaults.writes.isEmpty, "a tick writes no setting")
         #expect(controller.watchSummaries[course] == savedSummary)
@@ -506,7 +506,7 @@ struct RecordingsWatchProgressTests {
         controller.refresh([course], selected: course)
         await settle("listed") { controller.listing(for: course)?.recordings != nil }
         #expect(summaryWrites == 1)
-        #expect(pushed == [[course: CourseWatchSummary(done: 0, total: 2, remainingMinutes: 180, unknownDurationCount: 0)]])
+        #expect(pushed == [[course: CourseWatchSummary(done: 0, total: 2, remainingMinutes: 180, unknownDurationCount: 0, next: recording("a"))]])
 
         controller.refresh([course], selected: course, force: true)
         await settle("refreshed") { controller.listing(for: course)?.isLoading == false }
@@ -519,7 +519,7 @@ struct RecordingsWatchProgressTests {
         world.player.pause(at: 3_000)
         await controller.settleWatchProgress()
         #expect(summaryWrites == 2)
-        #expect(pushed.last == [course: CourseWatchSummary(done: 0, total: 2, remainingMinutes: 135, unknownDurationCount: 0)])
+        #expect(pushed.last == [course: CourseWatchSummary(done: 0, total: 2, remainingMinutes: 135, unknownDurationCount: 0, next: recording("a"))])
         #expect(pushed.count == 2)
 
         controller.turnOff()
@@ -794,7 +794,7 @@ struct RecordingsWatchProgressTests {
         await settle("listed after relaunch") { relaunched.listing(for: course)?.recordings?.count == 2 }
         let stored = try #require(RecordingsController.storedWatchSummaries(in: defaults, owner: 42))
         #expect(stored[course]?.total == 2, "the changed course is saved")
-        #expect(stored[other] == CourseWatchSummary(done: 0, total: 1, remainingMinutes: 90, unknownDurationCount: 0), "the other course is kept")
+        #expect(stored[other] == CourseWatchSummary(done: 0, total: 1, remainingMinutes: 90, unknownDurationCount: 0, next: recording("x", in: other)), "the other course is kept")
         controller.turnOff()
     }
 
@@ -809,8 +809,8 @@ struct RecordingsWatchProgressTests {
         world.player.tick(at: 3_000)
         controller.setDone(recording("b"), true)
         await controller.settleWatchProgress()
-        #expect(controller.watchSummaries[course] == CourseWatchSummary(done: 1, total: 2, remainingMinutes: 90, unknownDurationCount: 0))
-        #expect(controller.watchProgress.summaries[course] == CourseWatchSummary(done: 1, total: 2, remainingMinutes: 45, unknownDurationCount: 0))
+        #expect(controller.watchSummaries[course] == CourseWatchSummary(done: 1, total: 2, remainingMinutes: 90, unknownDurationCount: 0, next: recording("a")))
+        #expect(controller.watchProgress.summaries[course] == CourseWatchSummary(done: 1, total: 2, remainingMinutes: 45, unknownDurationCount: 0, next: recording("a")))
         controller.turnOff()
     }
 

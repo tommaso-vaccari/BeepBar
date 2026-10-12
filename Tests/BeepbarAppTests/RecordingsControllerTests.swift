@@ -2694,11 +2694,13 @@ struct RecordingsControllerTests {
         controller.turnOff()
     }
 
-    /// PR #152 review P1: closing the window while a lecture recovery runs keeps the recovery but
-    /// drops a Play clicked meanwhile: nobody is looking, and it would otherwise replace the
-    /// recovered lecture, open a browser or show a sign-in window afterwards. Mutation: remove
-    /// `dropQueuedOpenings()` from `suspend` and "b" is streamed and played.
-    @Test func closingTheWindowDropsAPlayQueuedBehindARecovery() async throws {
+    /// Closing the window while a lecture recovery runs keeps both the recovery and a Play
+    /// clicked meanwhile: the student asked for "b", and closing Settings doesn't cancel a Play
+    /// (menu bar Play decision, 2026-10-12, which replaced the PR #152 review's "drop it"). The
+    /// browser still closes once both have run. Guards a Play pressed just before closing the
+    /// window being silently lost. Mutations: drop the queued-Play case from `hasPlayOrRecovery`
+    /// or let `dropQueuedOpenings` drop Plays ("b" is never streamed).
+    @Test func closingTheWindowKeepsAPlayQueuedBehindARecovery() async throws {
         defer { cleanUp() }
         browser.streamResults["a"] = [.success(stream("a")), .success(stream("a"))]
         browser.streamResults["b"] = [.success(stream("b"))]
@@ -2711,16 +2713,42 @@ struct RecordingsControllerTests {
         world.player.failDuringPlayback(at: 700)
         await settle("recovery running") { gate.isWaiting }
         controller.play(recording("b"))
+        controller.windowClosed()
+        #expect(controller.openingRecordingID == "b", "the kept Play keeps spinning")
+        gate.release()
+        await settle("b played after the recovery") { world.player.plays.count == 3 }
+        await settle("browser closed") { !browser.isOpen }
+        #expect(world.player.plays.map(\.recordingID) == ["a", "a", "b"])
+        #expect(try world.player.play(1).startAt == 700)
+        #expect(world.opened.isEmpty)
+        controller.turnOff()
+    }
+
+    /// PR #152 review P1, still true for the clicks that aren't a Play: closing the window while
+    /// a recovery runs drops a Copy link (or Open in browser) clicked meanwhile and its spinner;
+    /// nobody is looking, and it would otherwise open a browser or sign-in window afterwards.
+    /// Mutation: remove `dropQueuedOpenings()` from `suspend` and "b"'s link is looked up.
+    @Test func closingTheWindowDropsACopyQueuedBehindARecovery() async throws {
+        defer { cleanUp() }
+        browser.streamResults["a"] = [.success(stream("a")), .success(stream("a"))]
+        browser.playbackResults["b"] = .success(URL(string: "https://politecnicomilano.webex.com/recordingservice/sites/politecnicomilano/recording/playback/b")!)
+        let controller = await readyController()
+        controller.play(recording("a"))
+        await settle("a playing") { world.player.plays.count == 1 }
+        let gate = FakeRecmanBrowser.Gate()
+        defer { gate.release() }
+        browser.streamGates["a"] = gate
+        world.player.failDuringPlayback(at: 700)
+        await settle("recovery running") { gate.isWaiting }
+        controller.copyLink(recording("b"))
         #expect(controller.openingRecordingID == "b")
         controller.windowClosed()
         #expect(controller.openingRecordingID == nil, "the dropped click stops spinning")
         gate.release()
         await settle("a resumed") { world.player.plays.count == 2 }
         await settle("browser closed") { !browser.isOpen }
-        #expect(world.player.plays.map(\.recordingID) == ["a", "a"])
-        #expect(try world.player.play(1).startAt == 700)
-        #expect(!browser.streamCalls.contains("stream b"))
-        #expect(world.opened.isEmpty)
+        #expect(!browser.playCalls.contains("play b"))
+        #expect(world.copied.isEmpty)
         controller.turnOff()
     }
 

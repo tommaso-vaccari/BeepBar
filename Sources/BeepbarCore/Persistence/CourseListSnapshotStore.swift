@@ -38,6 +38,10 @@ public actor CourseListSnapshotStore {
     /// yet: a sync started from the menu before the window ever opened would otherwise rewrite an
     /// unchanged list on every launch.
     private var lastWritten: CourseListSnapshot?
+    /// The age `removeIfExpired` gives a file it could not decode (another version, damaged): its
+    /// modification date, since the file is only ever replaced whole. Remembered, so such a file
+    /// is read once per launch, not at every sync. Forgotten with `lastWritten`.
+    private var undecodedFileDate: Date?
     /// Saves made for an epoch below this are refused (see the type's comment). Only grows.
     private var firstLiveEpoch = 0
 
@@ -51,10 +55,12 @@ public actor CourseListSnapshotStore {
         do {
             let snapshot = try read(url, expecting: identity, now: now)
             lastWritten = snapshot
+            undecodedFileDate = nil
             return .restored(snapshot)
         } catch {
             try? FileManager.default.removeItem(at: url)
             lastWritten = nil
+            undecodedFileDate = nil
             return .discarded(error as? CourseListSnapshotCodec.DecodeError ?? .unreadable)
         }
     }
@@ -105,6 +111,7 @@ public actor CourseListSnapshotStore {
             throw error
         }
         lastWritten = snapshot
+        undecodedFileDate = nil
         return true
     }
 
@@ -114,20 +121,27 @@ public actor CourseListSnapshotStore {
     /// an expired list on disk for as long as the account stays signed in.
     ///
     /// Nearly free when nothing is due: no file is one `stat`, and once the file's date is known
-    /// (`lastWritten`) no further read happens. A file that can't be decoded is left for `load`,
-    /// which knows the identity and reports why it discards it. Retires no epoch: the account is
-    /// still the same, and its next confirmed list may be saved again.
+    /// no further read happens. A file that can't be decoded (a newer format after a downgrade,
+    /// damage) is aged by its modification date instead, so it can't outlive the limit either.
+    /// Retires no epoch: the account is still the same, and its next confirmed list may be saved.
     @discardableResult
     public func removeIfExpired(now: Date = Date()) -> Bool {
         guard let url = try? directory().appendingPathComponent(Self.fileName), FileManager.default.fileExists(atPath: url.path) else {
             lastWritten = nil
+            undecodedFileDate = nil
             return false
         }
-        if lastWritten == nil {
-            lastWritten = try? readAnyIdentity(url)
+        if lastWritten == nil, undecodedFileDate == nil {
+            if let snapshot = try? readAnyIdentity(url) {
+                lastWritten = snapshot
+            } else {
+                // No date at all: never expires here, and `load` still refuses the file.
+                undecodedFileDate = (try? FileManager.default.attributesOfItem(atPath: url.path)[.modificationDate] as? Date) ?? .distantFuture
+            }
         }
-        guard let savedAt = lastWritten?.savedAt, CourseListSnapshotCodec.isExpired(savedAt: savedAt, now: now) else { return false }
+        guard let date = lastWritten?.savedAt ?? undecodedFileDate, CourseListSnapshotCodec.isExpired(savedAt: date, now: now) else { return false }
         lastWritten = nil
+        undecodedFileDate = nil
         do {
             try FileManager.default.removeItem(at: url)
             return true
@@ -157,6 +171,7 @@ public actor CourseListSnapshotStore {
 
     private func removeFiles() throws {
         lastWritten = nil
+        undecodedFileDate = nil
         let folder = try directory()
         guard FileManager.default.fileExists(atPath: folder.path) else { return }
         try removeTemporaries(in: folder)

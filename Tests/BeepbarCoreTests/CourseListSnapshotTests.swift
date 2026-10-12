@@ -403,21 +403,34 @@ struct CourseListSnapshotTests {
         #expect(!FileManager.default.fileExists(atPath: file.path), "an expired list outlived the age limit")
     }
 
-    /// Pruning is not a sign-out: the same account's next confirmed list is saved again, and a
-    /// file the pruning can't read is left for `load`, which knows why it refuses it.
-    @Test func removeIfExpiredRetiresNothingAndLeavesUnreadableFiles() async throws {
-        let (store, folder, cleanup) = try makeStore()
+    /// Pruning is not a sign-out: the same account's next confirmed list is saved again.
+    @Test func removeIfExpiredRetiresNothing() async throws {
+        let (store, _, cleanup) = try makeStore()
         defer { cleanup() }
-        let file = folder.appendingPathComponent(CourseListSnapshotStore.fileName)
         #expect(try await store.save(courses(1), identity: identity, epoch: 3, now: now))
         let later = now.addingTimeInterval(CourseListSnapshotCodec.maximumAge + 60)
         #expect(await store.removeIfExpired(now: later))
         #expect(try await store.save(courses(1), identity: identity, epoch: 3, now: later), "pruning retired the account's epoch")
+    }
 
-        try Data("{broken".utf8).write(to: file)
-        let relaunched = CourseListSnapshotStore(directory: { folder })
-        #expect(await relaunched.removeIfExpired(now: later.addingTimeInterval(CourseListSnapshotCodec.maximumAge * 2)) == false)
-        #expect(FileManager.default.fileExists(atPath: file.path))
+    /// A file the pruning can't decode (a newer format after a downgrade, damage) is aged by its
+    /// modification date: kept while young, deleted once past the limit, and read only once in
+    /// between. Fails if such a file is never pruned or is re-read at every check.
+    @Test func removeIfExpiredAgesAnUndecodableFileByItsModificationDate() async throws {
+        let (store, folder, cleanup) = try makeStore()
+        defer { cleanup() }
+        let file = folder.appendingPathComponent(CourseListSnapshotStore.fileName)
+        try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+        try Data(#"{"version":2}"#.utf8).write(to: file)
+        try FileManager.default.setAttributes([.modificationDate: now], ofItemAtPath: file.path)
+
+        #expect(await store.removeIfExpired(now: now.addingTimeInterval(60)) == false)
+        #expect(FileManager.default.fileExists(atPath: file.path), "a young undecodable file was deleted")
+        // Made readable and fresh behind the store's back: a store that read again would now keep it.
+        #expect(try await CourseListSnapshotStore(directory: { folder }).save(courses(1), identity: identity, now: now.addingTimeInterval(CourseListSnapshotCodec.maximumAge)))
+        try FileManager.default.setAttributes([.modificationDate: now], ofItemAtPath: file.path)
+        #expect(await store.removeIfExpired(now: now.addingTimeInterval(CourseListSnapshotCodec.maximumAge + 60)))
+        #expect(!FileManager.default.fileExists(atPath: file.path), "an undecodable file outlived the age limit")
     }
 
     /// Cost proportional to what changed: once the store knows the file's date, later checks

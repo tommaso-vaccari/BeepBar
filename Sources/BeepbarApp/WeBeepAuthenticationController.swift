@@ -426,6 +426,9 @@ struct MenuBarSnapshot: Sendable {
     /// Cleared when nothing will be loaded (signed out), when the list arrives, and when the
     /// window closes, so a closed window never causes a request (`windowClosed()`).
     @Published private(set) var isPreparingCourseList = false
+    /// Bumped when the configuration window closes, so a window-open refresh still waiting for
+    /// the bootstrap or the saved list knows its window is gone and loads nothing (#98).
+    private var windowGeneration = 0
     /// True once the launch bootstrap has finished (always, in a test controller): until then the
     /// account isn't known, so an opening window shows the loading state, not a sign-in prompt.
     private var hasBootstrapped = false
@@ -834,10 +837,13 @@ struct MenuBarSnapshot: Sendable {
     }
 
     /// The launch bootstrap finding the stored credential, for a test controller.
-    func applyBootstrapWithCredentialForTesting() async {
+    func applyBootstrapWithCredentialForTesting(recoveryBlocked: Bool = false) async {
         guard let database else { return }
-        await applyBootstrap(BootstrapService.Result(database: database, recoveryBlocked: false, credential: .present))
+        await applyBootstrap(BootstrapService.Result(database: database, recoveryBlocked: recoveryBlocked, credential: .present))
     }
+
+    /// Makes everything that waits for the launch bootstrap wait for `task` instead.
+    func holdBootstrapForTesting(_ task: Task<Void, Never>) { bootstrapTask = task }
 
     /// The folder handling after the open panel, with `url` as if picked there.
     func useRootForTesting(_ url: URL) async {
@@ -940,7 +946,9 @@ struct MenuBarSnapshot: Sendable {
         // Before the blocked-recovery return: a launch without a credential deletes the saved
         // course list whether or not a pending operation blocks recovery, as documented (#98).
         // The rest of the credential handling waits for recovery, as before.
-        if Self.credentialIsGone(result.credential) { forgetCourseList() }
+        // An expired list is pruned at every launch with a credential, blocked recovery included:
+        // no sync runs then, so nothing else would enforce the age limit.
+        if Self.credentialIsGone(result.credential) { forgetCourseList() } else { pruneExpiredCourseList() }
         if result.recoveryBlocked {
             recoveryBlocked = true
             setSyncState(.recoveryBlocked)
@@ -950,7 +958,6 @@ struct MenuBarSnapshot: Sendable {
         switch result.credential {
         case .present:
             hasStoredCredential = true
-            pruneExpiredCourseList()
             if Self.defaults.bool(forKey: Self.credentialExpiredKey) {
                 accountState = .expired
                 setSyncState(.failed(.authenticationExpired))
@@ -1376,10 +1383,15 @@ struct MenuBarSnapshot: Sendable {
         if !Self.isUIPreview, courseListFreshness != .current, hasBootstrapped ? (hasStoredCredential && accountState == .connected) : true {
             isPreparingCourseList = true
         }
+        let generation = windowGeneration
         let refresh = Task { [weak self] in
             guard let self else { return }
             await self.bootstrapTask?.value
             await self.restoreSavedCourseList()
+            // Closed while the bootstrap or the restore ran: no request for a window nobody sees
+            // (quiet at rest). The loading state was cleared by `windowClosed()`, and a reopened
+            // window's own refresh owns it now, so it is left alone.
+            guard self.windowGeneration == generation else { return }
             // Starts the load in this turn (`isLoadingCourses` takes over), holds it until a
             // running sync ends, or ends the loading state when nothing will be loaded.
             self.loadCourses()
@@ -1477,6 +1489,7 @@ struct MenuBarSnapshot: Sendable {
     /// The configuration window closed: a course list load still waiting for a sync to end is no
     /// longer wanted, so the end of that sync sends no request (quiet at rest, #98).
     func windowClosed() {
+        windowGeneration += 1
         isPreparingCourseList = false
     }
 
@@ -1709,7 +1722,9 @@ struct MenuBarSnapshot: Sendable {
                     try Task.checkCancellation()
                     guard self.activeOperationID == operationID else { return }
                 }
-                let selected = self.courses.filter { self.enabledCourseIDs.contains($0.id) }
+                // Only a list Moodle confirmed selects anything: if the refresh above could not run
+                // (not connected), a saved list on screen still selects nothing (#98).
+                let selected = self.courseListFreshness == .current ? self.courses.filter { self.enabledCourseIDs.contains($0.id) } : []
                 guard !selected.isEmpty else {
                     self.setSyncState(.readyUnchecked)
                     self.endOperation(operationID)

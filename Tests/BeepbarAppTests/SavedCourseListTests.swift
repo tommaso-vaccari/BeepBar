@@ -363,6 +363,49 @@ import BeepbarCore
         #expect(MoodleRecordingProtocol.requests(token: token).count == requests, "a closed window still loaded the list when the sync ended")
     }
 
+    /// The window closed while its refresh still waited for the launch bootstrap: nothing is
+    /// asked of Moodle for a window nobody sees, and no loading state is left behind. Fails if
+    /// the refresh loads the list regardless (or defers it to the end of a sync).
+    @Test func aWindowClosedBeforeItsRefreshStartsAsksNothing() async throws {
+        let install = try await Install.make()
+        defer { install.remove() }
+        let token = MoodleRecordingProtocol.register(courses: [(1, "Analisi")])
+        defer { MoodleRecordingProtocol.revoke(token: token) }
+        let controller = install.launch(token: token)
+        let (released, release) = AsyncStream<Void>.makeStream()
+        controller.holdBootstrapForTesting(Task { for await _ in released {} })
+
+        let refresh = controller.refreshOnWindowOpen()
+        #expect(controller.isPreparingCourseList)
+        controller.windowClosed()
+        release.finish()
+        await refresh.value
+        await controller.waitForCourseLoadForTesting()
+        #expect(!controller.isPreparingCourseList)
+        #expect(!controller.isLoadingCourses)
+        #expect(MoodleRecordingProtocol.requests(token: token).isEmpty, "a closed window asked Moodle for the list")
+    }
+
+    /// Defence in depth: a sync that cannot ask Moodle for the list (not connected) never takes
+    /// its selection from a saved list on screen. Fails if the saved list's enabled course is
+    /// synced.
+    @Test func aSyncThatCannotRefreshNeverSyncsTheSavedList() async throws {
+        let install = try await Install.make()
+        defer { install.remove() }
+        let token = MoodleRecordingProtocol.register(courses: [(1, "Analisi")])
+        defer { MoodleRecordingProtocol.revoke(token: token) }
+        try await install.save([course(1, "Analisi")], token: token)
+        let controller = install.launch(token: token)
+        await controller.restoreSavedCourseListForTesting()
+        try #require(controller.isShowingSavedCourseList)
+        try #require(controller.enabledCourseIDs.contains(1))
+
+        controller.setDisconnectedForTesting()
+        controller.synchronizeNow()
+        await controller.waitForSyncForTesting()
+        #expect(MoodleRecordingProtocol.requests(token: token).isEmpty, "the saved list decided what was synced")
+    }
+
     /// No credential at launch, so no account the saved list could belong to (an older BeepBar
     /// signed out, or a sign-out's deletion never ran): the file is deleted, as the behaviour
     /// documents, instead of waiting for a sign-in that may never come.
@@ -419,6 +462,22 @@ import BeepbarCore
         await second.waitForCourseListWriteForTesting()
         #expect(second.hasStoredCredential)
         #expect(!FileManager.default.fileExists(atPath: install.file.path), "an expired list outlived the launch")
+    }
+
+    /// A launch with a credential but a blocked recovery runs no sync, so the launch is the only
+    /// moment the age limit can be enforced: an expired list goes all the same.
+    @Test func aBlockedLaunchStillDeletesAnExpiredList() async throws {
+        let install = try await Install.make()
+        defer { install.remove() }
+        let token = MoodleRecordingProtocol.register(courses: [(1, "Analisi")])
+        defer { MoodleRecordingProtocol.revoke(token: token) }
+        try await install.store().save([course(1, "Analisi")], identity: install.identity(token: token), now: Date().addingTimeInterval(-CourseListSnapshotCodec.maximumAge - 3_600))
+
+        let controller = install.launch(token: token)
+        await controller.applyBootstrapWithCredentialForTesting(recoveryBlocked: true)
+        await controller.waitForCourseListWriteForTesting()
+        #expect(controller.recoveryBlocked)
+        #expect(!FileManager.default.fileExists(atPath: install.file.path), "an expired list outlived a blocked launch")
     }
 
     /// A menu-bar-only user, app running for weeks: the automatic sync, which never reads or

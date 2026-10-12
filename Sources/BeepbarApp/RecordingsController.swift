@@ -1736,6 +1736,12 @@ struct RecordingsListing: Equatable {
         }
     }
 
+    /// Waits until every progress write queued so far has finished and published. For tests,
+    /// which must prove that a write did *not* happen without guessing how long one takes.
+    func settleWatchProgress() async {
+        await progressChain?.value
+    }
+
     /// Waits until the session file reflects every call made so far. For tests, which read the
     /// file from outside the vault.
     func settleSessionFile() async {

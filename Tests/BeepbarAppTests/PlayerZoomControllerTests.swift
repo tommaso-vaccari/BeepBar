@@ -89,8 +89,9 @@ struct PlayerZoomControllerTests {
         (try #require(controller.window as? RecordingPlayerWindow), try #require(controller.playerView as? FakeZoomingPlayerView))
     }
 
-    private func key(_ characters: String, _ modifiers: NSEvent.ModifierFlags, keyCode: UInt16, window: NSWindow, repeated: Bool = false) -> NSEvent {
-        NSEvent.keyEvent(with: .keyDown, location: .zero, modifierFlags: modifiers, timestamp: 0, windowNumber: window.windowNumber, context: nil,
+    private func key(_ characters: String, _ modifiers: NSEvent.ModifierFlags, keyCode: UInt16, window: NSWindow, repeated: Bool = false,
+                     windowNumber: Int? = nil) -> NSEvent {
+        NSEvent.keyEvent(with: .keyDown, location: .zero, modifierFlags: modifiers, timestamp: 0, windowNumber: windowNumber ?? window.windowNumber, context: nil,
                          characters: characters, charactersIgnoringModifiers: characters, isARepeat: repeated, keyCode: keyCode)!
     }
 
@@ -114,8 +115,9 @@ struct PlayerZoomControllerTests {
     /// ⌘= / ⌘- / ⌘0 reach the zoom through the window's key-equivalent path (where AppKit sends
     /// ⌘ chords first) and through `sendEvent`, only inside the main-actor hop (never in the
     /// AppKit callback), stepping by 0.5, repeating while held, and fitting again; each change
-    /// reaches AVKit's magnification and the clip origin. Guards the shortcut wiring, the hop
-    /// rule, and that ⌘W stays untaken.
+    /// reaches AVKit's magnification and the clip origin. A chord typed in another window (the
+    /// Settings window, say) is not taken. Guards the shortcut wiring, the hop rule, and that
+    /// ⌘W and other windows' chords stay untaken.
     @Test func zoomKeysStepThroughTheWindow() async throws {
         let controller = makeController()
         try await playReady(controller)
@@ -147,6 +149,9 @@ struct PlayerZoomControllerTests {
         #expect(!window.isVideoZoomed)
         expectShown(controller, in: view)
         #expect(RecordingPlayerPolicy.keyDecision(for: key("w", [.command], keyCode: 13, window: window)) == nil)
+        #expect(!window.performKeyEquivalent(with: key("=", [.command], keyCode: 24, window: window, windowNumber: window.windowNumber + 4242)))
+        await Self.drainHops()
+        #expect(controller.zoom.scale == 1, "another window's ⌘= does not zoom the lecture")
         controller.close()
     }
 
@@ -374,14 +379,16 @@ struct PlayerZoomControllerTests {
     /// The real `AVPlayerView` (loaded at runtime): its own pinch stays off, the zoom drives its
     /// public magnification, the video is found by its player layer inside the scroll view AVKit
     /// magnifies in, the clip origin follows the model (pan included), a point in the picture is
-    /// over the video, and fitting again restores 1x. Guards every assumption made about AVKit
-    /// (verified on macOS 27) against a change in a future macOS.
+    /// over the video at fit and zoomed, the magnification survives the item being replaced for
+    /// the same lecture (a recovery), and fitting again restores 1x. Guards every assumption
+    /// made about AVKit (verified on macOS 27) against a change in a future macOS.
     @Test func theRealPlayerViewZooms() async throws {
         let controller = makeController(makePlayerView: AVKitLoader.makePlayerView)
         try await playReady(controller)
         let view = try #require(controller.playerView)
         let window = try #require(controller.window as? RecordingPlayerWindow)
         #expect((view.value(forKey: "allowsMagnification") as? Bool) == false)
+        #expect(window.isOverVideo(CGPoint(x: 480, y: 500)), "at fit, before AVKit built its scroll view")
         controller.performShortcut(.zoomIn)
         controller.performShortcut(.zoomIn)
         #expect((view.value(forKey: "magnification") as? CGFloat) == 2)
@@ -397,6 +404,11 @@ struct PlayerZoomControllerTests {
         #expect(abs(controller.zoom.origin.x - 210) < 1e-9)
         expectClip()
         #expect(window.isOverVideo(CGPoint(x: 480, y: 500)))
+        let kept = controller.zoom
+        try await playReady(controller, id: "Lezione", startAt: 20)
+        #expect(controller.zoom == kept)
+        #expect((view.value(forKey: "magnification") as? CGFloat) == 2, "AVKit keeps it across the new item")
+        expectClip()
         controller.performShortcut(.zoomReset)
         #expect((view.value(forKey: "magnification") as? CGFloat) == 1)
         controller.close()

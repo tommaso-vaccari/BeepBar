@@ -313,8 +313,10 @@ final class RecordingPlayerWindow: NSWindow {
     /// ⌘ chords reach the key window here before the main menu, and reach `sendEvent` as a
     /// key-down only if nobody takes them: the zoom chords are taken here, before
     /// `AVPlayerView`'s own key equivalents can see them. Same decision and hop as `sendEvent`.
+    /// Only for this window's own events: AppKit may offer a key equivalent to windows other
+    /// than the key one, and ⌘- typed in Settings must not zoom a lecture behind it.
     override func performKeyEquivalent(with event: NSEvent) -> Bool {
-        takeShortcut(event) || super.performKeyEquivalent(with: event)
+        (event.windowNumber == windowNumber && takeShortcut(event)) || super.performKeyEquivalent(with: event)
     }
 
     /// Takes the event if it is one of the player's keys, running its shortcut through a hop.

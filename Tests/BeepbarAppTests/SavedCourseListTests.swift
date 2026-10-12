@@ -460,7 +460,8 @@ import BeepbarCore
 
         controller.loadCourses()
         await controller.waitForCourseLoadForTesting()
-        #expect(published.allSatisfy(\.isEmpty), "a refresh that began for the previous account was published: \(published)")
+        let nothingPublished = published.allSatisfy { $0.isEmpty }
+        #expect(nothingPublished, "a refresh that began for the previous account was published: \(published)")
         #expect(controller.courseListFreshness == .unknown)
         await controller.waitForCourseListWriteForTesting()
         #expect(!FileManager.default.fileExists(atPath: install.file.path))

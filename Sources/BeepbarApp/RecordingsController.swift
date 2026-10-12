@@ -352,10 +352,16 @@ struct RecordingsListing: Equatable {
         self.now = now
         // A switch left on for another university (only reachable through an old settings file)
         // counts as off: the feature exists only for Polimi.
-        let enabled = (defaults.object(forKey: Self.enabledKey) as? Bool ?? true) && isAvailable()
+        let enabled = Self.isSwitchedOn(in: defaults) && isAvailable()
         isEnabled = enabled
         access = enabled ? .ready : .off
         legacySeen = .init(ids: enabled ? defaults.stringArray(forKey: Self.acknowledgedKey) ?? [] : [], baselines: enabled ? defaults.stringArray(forKey: Self.baselinedKey) ?? [] : [])
+    }
+
+    /// The saved switch, on unless turned off; Polimi still decides (`isAvailable`). Shared with
+    /// the menu bar, which reads it at launch without creating this controller.
+    static func isSwitchedOn(in defaults: UserDefaults) -> Bool {
+        defaults.object(forKey: enabledKey) as? Bool ?? true
     }
 
     // MARK: Personal study state
@@ -787,7 +793,10 @@ struct RecordingsListing: Equatable {
         untickCounts = [:]
         progressChain = nil
         watchSummaryOwner = nil
-        watchSummaries = [:]
+        // The menu may hold summaries this controller never loaded (seeded from the saved copy
+        // at launch), so the reset is announced even when there is nothing here to clear:
+        // `watchSummaries`' own `didSet` stays silent for `[:]` → `[:]`.
+        if watchSummaries.isEmpty { onWatchSummaryChange?([:]) } else { watchSummaries = [:] }
         if defaults.object(forKey: Self.watchSummaryKey) != nil { defaults.removeObject(forKey: Self.watchSummaryKey) }
         historyRevision = [:]
         pendingAcknowledgements = [:]

@@ -59,6 +59,55 @@ struct DailyTelemetryTests {
         #expect(payload.count == 9)
     }
 
+    /// Without the app's settings reader only system values are sent: unknown settings are left
+    /// out, never reported as "false" (telemetry switched on in Settings during launch).
+    @Test func fallbackContextOmitsSettings() {
+        #expect(Set(configuration.payload(.system(language: .italian)).keys) == [
+            "TelemetryDeck.AppInfo.version", "TelemetryDeck.Device.platform", "TelemetryDeck.Device.operatingSystem",
+            "TelemetryDeck.Device.systemMajorVersion", "TelemetryDeck.RunContext.language",
+        ])
+    }
+
+    /// Telemetry off at launch, then switched on in Settings: the signal still reads the settings
+    /// through the provider the launch installed, not the fallback.
+    @Test func launchProviderSurvivesEnablingLater() async throws {
+        let harness = Harness()
+        defer { harness.remove() }
+        harness.defaults.set(false, forKey: DailyTelemetryController.enabledKey)
+        let recorder = Recorder()
+        let controller = harness.controller(configuration, recorder: recorder)
+        let provided = context
+        await controller.start(context: { provided })
+        #expect(await recorder.count == 0)
+        controller.setEnabled(true)
+        for _ in 0..<1_000 {
+            if await recorder.count == 1 { break }
+            await Task.yield()
+        }
+        let payloads = try await recorder.requests.map(payload)
+        #expect(payloads.first?["BeepBar.automaticSyncInterval"] == "28800")
+        controller.stop()
+    }
+
+    /// Recordings is reported from its saved switch without building the controller, on by
+    /// default for Polimi; once the controller exists, its live state wins.
+    @Test func recordingsAreReadWithoutCreatingTheController() throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent("beepbar-telemetry-\(UUID().uuidString)")
+        defer { try? FileManager.default.removeItem(at: root) }
+        let defaults = WeBeepAuthenticationController.throwawayDefaults()
+        let authentication = WeBeepAuthenticationController(testRootURL: root, deleteCredential: {}, defaults: defaults)
+        #expect(authentication.selectedSite.university == .polimi)
+        #expect(authentication.recordingsEnabledWithoutCreating)
+        defaults.set(false, forKey: RecordingsController.enabledKey)
+        #expect(!authentication.recordingsEnabledWithoutCreating)
+        #expect(authentication.recordingsIfCreated == nil)
+        defaults.set(true, forKey: RecordingsController.enabledKey)
+        #expect(authentication.recordings.isEnabled)
+        // The saved value changing behind the controller doesn't matter once it exists.
+        defaults.set(false, forKey: RecordingsController.enabledKey)
+        #expect(authentication.recordingsEnabledWithoutCreating)
+    }
+
     /// Invalid configuration cannot create an endpoint; debug builds cannot emit production signals.
     @Test func configurationRejectsInvalidIdentifiers() {
         #expect(DailyTelemetryConfiguration(appID: "not-a-uuid", namespace: "com.beepbar", version: "1") == nil)
@@ -251,8 +300,11 @@ struct DailyTelemetryTests {
         await controller.checkIn()
         clock.date += 86_400
         await controller.checkIn()
-        // Back to January.
+        // Back to January: nothing is sent while the clock is before the last attempt...
         clock.date = Date(timeIntervalSince1970: 1_801_310_400)
+        await controller.checkIn()
+        #expect(await recorder.count == 4)
+        // ...and once a signal goes out again (simulated by clearing the attempt), it uses a new identifier.
         harness.defaults.removeObject(forKey: DailyTelemetryController.attemptKey)
         await controller.checkIn()
         let ids = try await recorder.requests.map(identity)

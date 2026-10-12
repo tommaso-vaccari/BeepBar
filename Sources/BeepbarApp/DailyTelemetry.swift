@@ -5,26 +5,28 @@ import CryptoKit
 import Foundation
 import os
 
-/// The settings a daily signal reports. Every field has few possible values, so together with an
-/// identifier that rotates monthly they say how BeepBar is used without singling out a Mac (#128).
+/// The settings a daily signal reports (#128). Each field has few possible values, but with a
+/// small user base their combination, plus the source IP, can still be distinctive: the monthly
+/// identifier limits linking on the client, it does not make the data anonymous.
 /// Built on the main actor at send time, so a change made during the day shows up the next day.
+/// A `nil` setting is unknown and left out of the payload rather than reported wrong.
 struct DailyTelemetryContext: Equatable, Sendable {
     var language: AppLanguage
     /// Major macOS version only (e.g. 15): the full build would narrow installations down.
     var systemMajorVersion: Int
-    var automaticSyncEnabled: Bool
+    var automaticSyncEnabled: Bool?
     /// One of the intervals offered in Settings, already validated by the sync controller.
-    var automaticSyncInterval: Int
-    var dataSaverEnabled: Bool
-    var recordingsEnabled: Bool
-    /// `nil` while macOS hasn't answered yet: the key is then left out rather than reported wrong.
+    var automaticSyncInterval: Int?
+    var dataSaverEnabled: Bool?
+    /// Only ever true for Polimi, the one university with Recordings.
+    var recordingsEnabled: Bool?
+    /// `nil` while macOS hasn't answered yet.
     var launchAtLogin: Bool?
 
-    /// Values that need no app state; used when no provider has been installed.
+    /// Values that need no app state, for a signal sent before the app installed its provider
+    /// (telemetry switched on in Settings during launch): the settings are then omitted.
     static func system(language: AppLanguage = .current) -> Self {
-        Self(language: language, systemMajorVersion: ProcessInfo.processInfo.operatingSystemVersion.majorVersion,
-             automaticSyncEnabled: false, automaticSyncInterval: 0, dataSaverEnabled: false,
-             recordingsEnabled: false, launchAtLogin: nil)
+        Self(language: language, systemMajorVersion: ProcessInfo.processInfo.operatingSystemVersion.majorVersion)
     }
 }
 
@@ -66,14 +68,15 @@ struct DailyTelemetryConfiguration: Sendable {
             "TelemetryDeck.Device.operatingSystem": "macOS",
             "TelemetryDeck.Device.systemMajorVersion": "macOS \(context.systemMajorVersion)",
             "TelemetryDeck.RunContext.language": context.language.rawValue,
-            "BeepBar.automaticSync": context.automaticSyncEnabled ? "true" : "false",
-            "BeepBar.automaticSyncInterval": String(context.automaticSyncInterval),
-            "BeepBar.dataSaver": context.dataSaverEnabled ? "true" : "false",
-            "BeepBar.recordings": context.recordingsEnabled ? "true" : "false",
         ]
-        if let launchAtLogin = context.launchAtLogin {
-            payload["BeepBar.launchAtLogin"] = launchAtLogin ? "true" : "false"
-        }
+        let flags: [(String, Bool?)] = [
+            ("BeepBar.automaticSync", context.automaticSyncEnabled),
+            ("BeepBar.dataSaver", context.dataSaverEnabled),
+            ("BeepBar.recordings", context.recordingsEnabled),
+            ("BeepBar.launchAtLogin", context.launchAtLogin),
+        ]
+        for case let (key, value?) in flags { payload[key] = value ? "true" : "false" }
+        if let interval = context.automaticSyncInterval { payload["BeepBar.automaticSyncInterval"] = String(interval) }
         return payload
     }
 
@@ -180,9 +183,11 @@ enum DailyTelemetryTransport {
 
 /// One best-effort attempt per UTC day, persisted across launches; disabling cancels without waiting.
 ///
-/// Identity: a random UUID that lives for one UTC calendar month (`monthKey` records which). A new
-/// month, in either direction (a clock moved back included), replaces it with a fresh random one,
-/// never derived from the previous one, so nothing on the Mac or the server links two months.
+/// Identity: a random UUID that lives for one UTC calendar month (`monthKey` records which). A
+/// different month replaces it with a fresh random one, never derived from the previous one, so the
+/// client keeps no link between months. The payload and source IP may still let the receiver
+/// re-link them; that is a limit of the data, not something the identifier can fix. A clock moved
+/// back sends nothing until it passes the last attempt, then starts a new identifier.
 /// Daily actives are the signals of a day (one per installation); monthly actives are distinct
 /// identifiers within a calendar month.
 @MainActor
@@ -212,7 +217,8 @@ final class DailyTelemetryController: ObservableObject {
     private var running = false
     private var generation = 0
     private var observers: [(NotificationCenter, NSObjectProtocol)] = []
-    /// Reads the settings at send time; installed by `start`.
+    /// Reads the settings at send time. Installed by `start` before its guards and never reset, so
+    /// the launch provider still applies after Settings turns telemetry off and on again.
     private var context: () -> DailyTelemetryContext = { .system() }
 
     init(defaults: UserDefaults, configuration: DailyTelemetryConfiguration?, defaultEnabled: Bool,

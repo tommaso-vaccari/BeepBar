@@ -13,7 +13,7 @@ Debug builds, tests and UI previews do not use production configuration. Release
 One JSON array containing one signal is POSTed to `https://nom.telemetrydeck.com/v2/namespace/com.beepbar/`:
 
 - `appID`: the public app identifier.
-- `clientUser`: SHA-256 of the App ID and a random UUID that lives for one UTC calendar month. The UUID is never transmitted. When the UTC month changes, in either direction (a clock moved back included), it is replaced by a fresh random UUID, not derived from the previous one, so neither the Mac nor the server can link two months. Turning telemetry off deletes it; turning it on again starts a new one. The permanent installation UUID of the first `dev` build (`dailyTelemetryInstallationID`, never released) is deleted on launch. TelemetryDeck's Swift SDK states in a code comment that the server hashes and salts `clientUser` again; its public ingest documentation does not say so, so this document does not rely on it.
+- `clientUser`: SHA-256 of the App ID and a random UUID that lives for one UTC calendar month. The UUID is never transmitted. When the UTC month changes it is replaced by a fresh random UUID, not derived from the previous one, so the client keeps no link between months (a clock moved back sends nothing until it passes the last attempt, then starts a new UUID). The receiver may still re-link months from the payload and the source IP, see below. Turning telemetry off deletes it; turning it on again starts a new one. The permanent installation UUID of the first `dev` build (`dailyTelemetryInstallationID`, never released) is deleted on launch. TelemetryDeck's Swift SDK states in a code comment that the server hashes and salts `clientUser` again; its public ingest documentation does not say so, so this document does not rely on it.
 - `type`: `BeepBar.dailyActive`.
 - `payload`, all values as strings:
 
@@ -26,12 +26,14 @@ One JSON array containing one signal is POSTed to `https://nom.telemetrydeck.com
 | `BeepBar.automaticSync` | `true` / `false` | custom |
 | `BeepBar.automaticSyncInterval` | seconds, one of the Settings options | custom |
 | `BeepBar.dataSaver` | `true` / `false` | custom |
-| `BeepBar.recordings` | `true` / `false` (read without creating the Recordings controller) | custom |
+| `BeepBar.recordings` | `true` / `false` (read without creating the Recordings controller); `true` implies a Polimi account, the only university with Recordings | custom |
 | `BeepBar.launchAtLogin` | `true` / `false`; omitted while macOS has not reported the login item | custom |
+
+`BeepBar.*` settings that are unknown when a signal is sent (the login item before macOS answers, or every setting when telemetry is switched on during launch, before the app installed its settings reader) are omitted, never reported as `false`.
 
 The SDK keys reuse TelemetryDeck's standard names and formats so the built-in insights work; TelemetryDeck's advice to avoid the `TelemetryDeck.` scope concerns inventing new keys there. No other SDK default is sent: no device model, screen, architecture, time zone, region, locale, full OS build or retention counters. Settings are read when the signal is sent, so a change made during a day appears in the next day's signal.
 
-There is no account, university, course, file, device model, location or session metadata in the payload. Every field has few possible values, which keeps the combination with a month-long identifier low-information. Like any HTTPS receiver, the service necessarily receives network connection information, including the source IP. Use TelemetryDeck's [privacy information](https://telemetrydeck.com/privacy/) for its handling; hashing is not a guarantee that network traffic contains no identifying information.
+There is no account, course, file, device model, location or session metadata in the payload, and no university field (but see `BeepBar.recordings`). Each field has few possible values; with a small user base their combination can still be distinctive and stable across months, so together with the source IP the receiver could re-link an installation's months. The monthly identifier limits linking on the client; it does not make the data anonymous. Like any HTTPS receiver, the service necessarily receives network connection information, including the source IP. Use TelemetryDeck's [privacy information](https://telemetrydeck.com/privacy/) for its handling; hashing is not a guarantee that network traffic contains no identifying information.
 
 ## Scheduling and limits
 
@@ -48,7 +50,7 @@ Filter all production queries to `type = BeepBar.dailyActive` and exclude Test M
 | Question | Measurement |
 | --- | --- |
 | Daily active installations | Number of signals per UTC day: each installation sends at most one. |
-| Monthly active installations | Distinct users per **calendar month**. Never count distinct users across a month boundary: the identifier changes there, so a rolling 7 / 30 day window that spans two months counts each installation twice. |
+| Monthly active installations | Distinct users per **calendar month**. Never count distinct users across a month boundary: the identifier changes there, so a rolling 7 / 30 day window that spans two months counts each installation twice. Turning telemetry off and on within a month also starts a new identifier, so that installation counts twice that month. |
 | Weekly activity | Average daily signals over the week, not distinct users. |
 | App version / macOS / language adoption | Built-in insights, or signals grouped by `TelemetryDeck.AppInfo.version`, `TelemetryDeck.Device.systemMajorVersion`, `TelemetryDeck.RunContext.language`, per day. |
 | Settings in use | Signals per day grouped by a `BeepBar.*` key; divide by that day's signals for a share. |

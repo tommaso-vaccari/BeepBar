@@ -103,6 +103,25 @@ struct RecordingsMenuBarTests {
         #expect(controller.recordingsIfCreated == nil, "nothing here needs the Recordings controller")
     }
 
+    /// A new course list from WeBeep (a reload, a renamed or removed course) redraws the lines
+    /// with the selection unchanged. Guards against a menu naming a course that is no longer in
+    /// the list, or keeping its old name.
+    /// Mutation: drop `recordingMenuInputsChanged()` from `courses.didSet`.
+    @Test func aNewCourseListRedrawsTheLines() async throws {
+        defer { try? FileManager.default.removeItem(at: root) }
+        let defaults = WeBeepAuthenticationController.throwawayDefaults()
+        try storeSummaries([analisi: analisiSummary], owner: 7, in: defaults)
+        let controller = try await signedIn(defaults: defaults)
+        select([11], on: controller)
+        #expect(lines(controller) == ["ANALISI 2 — 12/30 · ~14 h"])
+
+        controller.setCoursesForTesting([course(11, "058167 - ANALISI MATEMATICA 2 [2026-27]")])
+        #expect(lines(controller) == ["ANALISI MATEMATICA 2 — 12/30 · ~14 h"], "renamed on WeBeep")
+        controller.setCoursesForTesting([])
+        #expect(lines(controller).isEmpty, "no longer in the list")
+        #expect(controller.enabledCourseIDs == [11])
+    }
+
     /// At most ten lines, taken in the given (sidebar) order, skipping courses that aren't synced.
     /// Guards against a menu that grows with every course or reorders them.
     /// Mutations: drop the `maxRecordingMenuLines` break (12 lines); drop the `enabledIDs`

@@ -130,6 +130,10 @@ public enum RecordingCheckpointReason: String, Sendable, CaseIterable {
 ///   never to lost summaries.
 /// That is also why `next` is decoded leniently: a damaged or future-shaped `next` must cost only
 /// the shortcut, never the whole summary (and with it every course's saved line).
+///
+/// `newCount` was added the same way, later still (refreshing listings at every sync): optional,
+/// written only when there is something new, decoded leniently. Old data reads as "nothing new",
+/// and an old build reading new data ignores the key, exactly as for `next`.
 public struct CourseWatchSummary: Codable, Equatable, Sendable {
     /// Recordings that are done (by playback or ticked).
     public let done: Int
@@ -149,17 +153,32 @@ public struct CourseWatchSummary: Codable, Equatable, Sendable {
     /// by another build): a caller must re-validate it before use, e.g. check it belongs to the
     /// course and that `previewURL` passes `RecmanURLPolicy`, never open it as is.
     public let next: RecmanRecording?
+    /// Recordings of the course the student hasn't seen yet (the "new" dot), shown in the menu bar
+    /// as " · N nuove". Nil means none, or not known (old data, a summary built from rows only).
+    ///
+    /// Normalised in `init`: zero or a negative value is stored as nil. So "nothing new" has one
+    /// representation, which keeps equality honest (a 0 and a nil summary don't trigger a rewrite
+    /// of the saved value) and keeps such a summary byte-for-byte what the older versions wrote.
+    public let newCount: Int?
 
-    public init(done: Int, total: Int, remainingMinutes: Int, unknownDurationCount: Int, next: RecmanRecording? = nil) {
+    public init(done: Int, total: Int, remainingMinutes: Int, unknownDurationCount: Int, next: RecmanRecording? = nil, newCount: Int? = nil) {
         self.done = done
         self.total = total
         self.remainingMinutes = remainingMinutes
         self.unknownDurationCount = unknownDurationCount
         self.next = next
+        self.newCount = newCount.flatMap { $0 > 0 ? $0 : nil }
+    }
+
+    /// The same summary with `newCount` replaced (normalised as in `init`): the app knows the
+    /// unseen count from the seen store, separately from the counts `courseSummary` computes.
+    public func withNewCount(_ newCount: Int?) -> CourseWatchSummary {
+        CourseWatchSummary(done: done, total: total, remainingMinutes: remainingMinutes,
+                           unknownDurationCount: unknownDurationCount, next: next, newCount: newCount)
     }
 
     private enum CodingKeys: String, CodingKey {
-        case done, total, remainingMinutes, unknownDurationCount, next
+        case done, total, remainingMinutes, unknownDurationCount, next, newCount
     }
 
     /// The four counts are required as before; `next` is optional and lenient (see the type's
@@ -171,11 +190,12 @@ public struct CourseWatchSummary: Codable, Equatable, Sendable {
                   total: try container.decode(Int.self, forKey: .total),
                   remainingMinutes: try container.decode(Int.self, forKey: .remainingMinutes),
                   unknownDurationCount: try container.decode(Int.self, forKey: .unknownDurationCount),
-                  next: try? container.decodeIfPresent(RecmanRecording.self, forKey: .next))
+                  next: try? container.decodeIfPresent(RecmanRecording.self, forKey: .next),
+                  newCount: try? container.decodeIfPresent(Int.self, forKey: .newCount))
     }
 
-    /// Writes `next` only when there is one, so a summary without it is byte-for-byte what the
-    /// four-field version wrote.
+    /// Writes `next` and `newCount` only when there is one, so a summary without them is
+    /// byte-for-byte what the four-field version wrote.
     public func encode(to encoder: Encoder) throws {
         var container = encoder.container(keyedBy: CodingKeys.self)
         try container.encode(done, forKey: .done)
@@ -183,6 +203,7 @@ public struct CourseWatchSummary: Codable, Equatable, Sendable {
         try container.encode(remainingMinutes, forKey: .remainingMinutes)
         try container.encode(unknownDurationCount, forKey: .unknownDurationCount)
         try container.encodeIfPresent(next, forKey: .next)
+        try container.encodeIfPresent(newCount, forKey: .newCount)
     }
 }
 
@@ -358,19 +379,33 @@ public enum RecordingWatchProgress {
     ///   estimate can understate the time left; the "~" is the only hint.
     /// - The empty-course text exists so this function is total, but the menu bar (package F)
     ///   omits courses with `total == 0` instead of showing it.
+    /// - With unseen recordings (`newCount` above zero) the line ends with " · 2 nuove" /
+    ///   " · 2 new" (" · 1 nuova" in the singular). Without them the line is exactly what it was
+    ///   before `newCount` existed. An empty course never gets the suffix.
     public static func menuLine(courseName: String, _ summary: CourseWatchSummary) -> BilingualText {
         let head = "\(courseName) — "
         if summary.total == 0 {
             return BilingualText(head + "nessuna registrazione", head + "no recordings")
         }
         let count = "\(summary.done)/\(summary.total)"
+        let base: BilingualText
         if summary.done >= summary.total {
-            return BilingualText(head + count + " · tutte fatte", head + count + " · all done")
+            base = BilingualText(head + count + " · tutte fatte", head + count + " · all done")
+        } else if let left = remainingTimeText(minutes: summary.remainingMinutes) {
+            base = BilingualText(head + count + " · " + left, head + count + " · " + left)
+        } else {
+            base = BilingualText(head + count, head + count)
         }
-        guard let left = remainingTimeText(minutes: summary.remainingMinutes) else {
-            return BilingualText(head + count, head + count)
-        }
-        return BilingualText(head + count + " · " + left, head + count + " · " + left)
+        guard let suffix = newSuffix(summary.newCount) else { return base }
+        return BilingualText(base.italian + suffix.italian, base.english + suffix.english)
+    }
+
+    /// " · 2 nuove" / " · 2 new" for the menu line, nil when there is nothing new. Italian agrees
+    /// in number ("1 nuova"); English "new" is invariable but still goes through `englishCount`
+    /// like every English count, so a later wording change can't forget the singular.
+    static func newSuffix(_ newCount: Int?) -> BilingualText? {
+        guard let newCount, newCount > 0 else { return nil }
+        return BilingualText(" · \(newCount) \(newCount == 1 ? "nuova" : "nuove")", " · " + englishCount(newCount, "new", "new"))
     }
 
     /// The time left as the menu bar and the Recordings window both show it: "~45 min" under an

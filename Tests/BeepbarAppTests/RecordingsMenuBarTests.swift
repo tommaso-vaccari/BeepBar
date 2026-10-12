@@ -713,19 +713,24 @@ struct RecordingsMenuBarTests {
         #expect(pages.courses.isEmpty)
     }
 
-    /// The account changes between drawing the menu and the click (7 → 9, and 9 has equal saved
-    /// numbers so `watchSummaries` doesn't change): the old line's click is ignored, and the
-    /// lines are rebuilt for the new account. Guards a menu drawn for one account playing for
-    /// another. Mutations: drop the `recordingMenuInputsChanged()` defer in `siteInfo.didSet`
-    /// (the line keeps owner 7); drop the owner guard (the old click creates a controller).
+    /// The account changes between drawing the menu and the click (7 → 9), here through a
+    /// connection check (`validateConnection`) that finds the stored token now belongs to 9:
+    /// the course list isn't reassigned and 9 has equal saved numbers, so neither `courses` nor
+    /// `watchSummaries` changes and only `siteInfo` can rebuild the lines. The old line's click
+    /// is ignored, and the lines carry the new account. Guards a menu drawn for one account
+    /// playing for another. Mutations: drop the `recordingMenuInputsChanged()` defer in
+    /// `siteInfo.didSet` (the line keeps owner 7); drop the owner guard (the old click creates a
+    /// controller).
     @Test func anAccountChangeBetweenDrawingAndClickingIsIgnored() async throws {
         defer { try? FileManager.default.removeItem(at: root) }
         let (controller, _, player, pages, defaults) = try await clickSetup()
         let old = try #require(target(controller))
         #expect(old.owner == 7)
         try storeSummaries([analisi: summary(next: lecture("a"))], owner: 9, in: defaults)
-        await signIn(controller, as: 9)
-        select([11], on: controller)
+        MoodleRecordingProtocol.setUserID(token: tokens.value, 9)
+        await controller.validateConnection()?.value
+        #expect(controller.recordingsOwnerUserID == 9)
+        #expect(controller.courses.count == accountCourses.count, "the course list wasn't touched")
         #expect(controller.watchSummaries[analisi] == summary(next: lecture("a")))
         #expect(target(controller)?.owner == 9, "lines rebuilt for the new account")
 

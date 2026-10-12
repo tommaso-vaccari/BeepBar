@@ -265,6 +265,9 @@ struct RecmanStreamFailure: Error {
         diagnose("stream: step=archive-player-link found form=\(WebexPlayerLink.isLoader(player) ? "loader" : "other")")
         do {
             return try await stream(player: player, email: email)
+        } catch is CancellationError {
+            // Never wrapped: cancellation stays recognizable to every `is CancellationError`.
+            throw CancellationError()
         } catch {
             throw RecmanStreamFailure(player: player, underlying: error)
         }

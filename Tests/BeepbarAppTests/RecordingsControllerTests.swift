@@ -2711,17 +2711,64 @@ struct RecordingsControllerTests {
         controller.turnOff()
     }
 
-    /// The wrapper never changes the decision: a lapsed Polimi session or a missing email found
-    /// after the link is still reported, not sent to the browser. Mutation: decide on the
-    /// wrapper instead of `streamFailureCause(error).cause` and the browser opens.
-    @Test func aWrappedReportedFailureIsStillReported() async {
+    /// The wrapper never changes the decision, on a Play or a recovery: a missing email found
+    /// after the link shows its sentence, a lapsed Polimi session asks for a sign-in, and a
+    /// cancellation stays silent — none opens the browser or walks the archive. Mutation: throw
+    /// or decide on the wrapper instead of `streamFailureCause(error).cause` (either path) and
+    /// the problem becomes `unrecognized`, the sign-in isn't asked or cancellation shows an error.
+    @Test(arguments: ["play", "recovery"], ["needsEmail", "needsSignIn", "cancelled"])
+    func aWrappedReportedFailureIsStillReported(path: String, cause: String) async {
         defer { cleanUp() }
-        browser.streamResults["a"] = [.failure(RecmanStreamFailure(player: playerLink("a"), underlying: RecmanBrowserError.needsEmail))]
+        let underlying: Error = switch cause {
+        case "needsEmail": RecmanBrowserError.needsEmail
+        case "needsSignIn": RecmanBrowserError.needsSignIn
+        default: CancellationError()
+        }
+        let failure = Result<RecordingStream, Error>.failure(RecmanStreamFailure(player: playerLink("a"), underlying: underlying))
+        browser.streamResults["a"] = path == "play" ? [failure] : [.success(stream("a")), failure]
         let controller = await readyController()
         controller.play(recording("a"))
-        await settle("problem shown") { controller.openingProblem != nil }
+        if path == "recovery" {
+            await settle("a playing") { world.player.plays.count == 1 }
+            world.player.failDuringPlayback(at: 700)
+        }
+        await settle("stream answered") { browser.streamCalls.count == (path == "play" ? 1 : 2) }
+        switch cause {
+        case "needsEmail":
+            await settle("sentence shown") { controller.openingProblem == .playbackUnavailable }
+        case "needsSignIn":
+            await settle("sign-in asked") { controller.access == .needsSignIn(nil) }
+        default:
+            await drainTasks()
+            #expect(controller.openingProblem == nil)
+            #expect(controller.access == .ready)
+        }
         #expect(world.opened.isEmpty)
         #expect(browser.playCalls.isEmpty)
+        controller.turnOff()
+    }
+
+    /// PR #152 review: with no WeBeep account known (expired token at launch) a typed address is
+    /// refused, since it could only end up with whichever account signs in next. Mutation: drop
+    /// the owner check in `confirmEmail` and the address is kept and later sent for account 7.
+    @Test func anAddressIsRefusedWhileNoAccountIsKnown() async throws {
+        defer { cleanUp() }
+        browser.signInError = CancellationError()
+        let controller = makeController()
+        controller.setEnabled(true)
+        await settle("sign-in cancelled") { controller.access == .needsSignIn(nil) }
+        world.owner = nil
+        #expect(controller.confirmEmail("someone.else@mail.polimi.it") == .unchanged)
+        #expect(controller.confirmedEmail == nil)
+        world.owner = 7
+        controller.webBeepAccountChanged(to: 7)
+        browser.signInError = nil
+        controller.signIn()
+        await settle("signed in and closed") { controller.access == .ready && !browser.isOpen }
+        controller.pageAppeared()
+        controller.play(recording("a"))
+        await settle("stream asked") { browser.streamCalls.count == 1 }
+        #expect(browser.streamEmails == [nil])
         controller.turnOff()
     }
 

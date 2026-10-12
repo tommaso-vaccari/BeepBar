@@ -1462,9 +1462,13 @@ struct RecordingsListing: Equatable {
     /// (`PolimiEmail`); an empty field removes it. It is written into the saved session at once,
     /// keeping its cookies; with no saved session yet it stays in memory and the next successful
     /// sign-in writes it. It is never logged.
+    ///
+    /// Refused while no WeBeep account is known (an expired token at launch, before a new
+    /// sign-in): an address must belong to an account (`emailAccount`), and one typed then could
+    /// only be handed to whichever account signs in next (PR #152 review).
     @discardableResult
     func confirmEmail(_ text: String) -> EmailEntry {
-        guard isEnabled else { return .unchanged }
+        guard isEnabled, (sessionOwner ?? ownerUserID()) != nil else { return .unchanged }
         switch Self.emailFieldState(draft: text, confirmed: confirmedEmail) {
         case .invalid: return .invalid
         case .empty, .confirmed: return .unchanged

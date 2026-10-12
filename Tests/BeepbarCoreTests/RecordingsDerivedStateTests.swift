@@ -142,6 +142,20 @@ struct RecordingsDerivedStateTests {
         #expect(RecmanCourseListDerivation(inputs([])).sections.isEmpty)
     }
 
+    /// The header's total reads lengths through the bounded Core parser
+    /// (`RecmanRecording.minutes(inDuration:)`), like the rows and the hours-left estimate: a
+    /// damaged length longer than a day counts as unknown. Guards against summing the raw digits,
+    /// which reported a nonsense total and trapped on `Int` overflow with two huge lengths.
+    @Test func theHeaderTotalIgnoresImplausibleLengths() {
+        let real = recording("real", "2026-10-05T10:00:00Z", duration: "90 min")
+        let huge = recording("huge", "2026-10-04T10:00:00Z", duration: "\(Int.max / 2 + 1) min")
+        let alsoHuge = recording("alsoHuge", "2026-10-03T10:00:00Z", duration: "\(Int.max / 2 + 1) min")
+        let dayPlusOne = recording("day", "2026-10-02T10:00:00Z", duration: "1441 min")
+        #expect(RecmanCourseListSummary([real, huge, alsoHuge, dayPlusOne]).totalMinutes == 90)
+        #expect(RecmanPresentation.minutes("1440 min") == 1_440)
+        #expect(RecmanPresentation.minutes("1441 min") == nil)
+    }
+
     /// The derivation uses the time zone it is given, not the Mac's: 20:00 UTC on Sunday 4 October
     /// is still Sunday in Rome (last week) but already Monday in Tokyo (this week). Fails if the
     /// calendar falls back to `TimeZone.current`, whatever zone the test machine runs in.

@@ -22,7 +22,14 @@ public final class DerivedValueCache<Input: Equatable, Output> {
 
     /// The output for `input`: the stored one when the inputs are equal, otherwise `compute`'s.
     public func value(for input: Input, compute: (Input) -> Output) -> Output {
-        if let stored, stored.input == input { return stored.output }
+        if let stored, stored.input == input {
+            // The new input replaces the equal stored one, so the next comparison is with what
+            // the caller holds now: a listing refetched with the same content is a new array, and
+            // keeping the old one would compare element by element on every later `body` instead
+            // of hitting the shared-storage fast path.
+            self.stored = (input, stored.output)
+            return stored.output
+        }
         computations += 1
         let output = compute(input)
         stored = (input, output)

@@ -46,6 +46,33 @@ struct RecordingsDerivedStateTests {
         #expect(cache.computations == 4)
     }
 
+    /// A hit adopts the caller's input (#100): a listing refetched with the same content is a new
+    /// array, and the page compares against what it stored on every later `body`. Keeping the
+    /// first input would compare element by element each time; adopting the new one lets the
+    /// next comparison take the shared-storage fast path. `Shared` models that: equal storage is
+    /// free, anything else is a counted deep comparison. Fails if a hit keeps the old input.
+    @Test func aHitAdoptsTheNewInputSoLaterComparisonsAreCheap() {
+        final class Storage {}
+        struct Shared: Equatable {
+            let storage: Storage
+            let value: Int
+            nonisolated(unsafe) static var deepComparisons = 0
+            static func == (a: Shared, b: Shared) -> Bool {
+                if a.storage === b.storage { return true }
+                deepComparisons += 1
+                return a.value == b.value
+            }
+        }
+        let cache = DerivedValueCache<Shared, Int>()
+        _ = cache.value(for: Shared(storage: Storage(), value: 1), compute: { $0.value })
+        let refetched = Shared(storage: Storage(), value: 1)
+        _ = cache.value(for: refetched, compute: { $0.value })
+        #expect(Shared.deepComparisons == 1, "equal content in new storage is compared once")
+        for _ in 0..<3 { _ = cache.value(for: refetched, compute: { $0.value }) }
+        #expect(Shared.deepComparisons == 1, "later bodies compared against the stale input")
+        #expect(cache.computations == 1)
+    }
+
     // MARK: Course list inputs
 
     /// A controller publication for an unrelated reason republishes the same listing: the inputs

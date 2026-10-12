@@ -113,8 +113,9 @@ public struct RecmanCourseListDerivation: Equatable, Sendable {
     /// content: the week titles follow the language, the week boundaries the time zone,
     /// "this week" and the year suffix the day.
     public struct Inputs: Equatable, Sendable {
-        /// The course's recordings as listed. Comparing two arrays that share storage is O(1),
-        /// so an unchanged `@Published` listing costs no element comparison.
+        /// The course's recordings as listed. Comparing two arrays that share storage is O(1), and
+        /// `DerivedValueCache` keeps the latest equal input, so a refetch with the same content
+        /// costs one element comparison and later evaluations none.
         public var recordings: [RecmanRecording]
         public var query: String
         /// Must be `AppLanguage.current`: the dates of older weeks are written in this language,

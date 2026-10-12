@@ -62,8 +62,9 @@ struct RecordingsPage: View {
     /// view state: filling it during `body` changes nothing SwiftUI observes.
     @State private var sidebarCache = DerivedValueCache<RecmanCourseSidebar.Inputs, RecmanCourseSidebar>()
 
-    /// Every use in one `body` after the first is an equality check of the inputs, which for the
-    /// unchanged arrays the controllers republish is a storage comparison.
+    /// Every use in one `body` after the first is an equality check of the inputs. For arrays the
+    /// controllers republish unchanged it is a storage comparison; equal content in new storage
+    /// is compared once, after which the cache holds the new array.
     private var model: RecmanCourseSidebar {
         sidebarCache.value(for: .init(courses: authentication.courses, enabledIDs: authentication.enabledCourseIDs), compute: RecmanCourseSidebar.init)
     }

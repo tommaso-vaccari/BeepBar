@@ -25,7 +25,10 @@ import BeepbarCore
 ///
 /// Note for the row UI: a tick changes `live` (and `summaries`) about every 30 s while a lecture
 /// plays, which re-renders every view observing this model. Observe it once in the list and pass
-/// plain values to `Equatable` rows, so only the playing row's body runs again.
+/// plain values to `Equatable` rows, so only the playing row's body runs again. The list must
+/// capture a copy of the values (`WatchProgressReader`, `RecordingsPresentation.WatchValues`), not
+/// this object: `List` rebuilds its lazily built rows only when what their closure captured
+/// changes, and a captured reference never does.
 /// - Everything here belongs to one account and is emptied on turn-off, disconnect and account
 ///   change (`reset()`), before the next account's data can arrive.
 @MainActor final class RecordingsWatchProgressModel: ObservableObject {

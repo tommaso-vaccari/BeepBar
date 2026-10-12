@@ -1398,6 +1398,10 @@ struct RecordingsListing: Equatable {
         case invalid
     }
 
+    /// Whether the Settings field can take an address now: the feature is on and a WeBeep account
+    /// is known to own it (see `confirmEmail`). The field is disabled and says why otherwise.
+    var canConfirmEmail: Bool { isEnabled && (sessionOwner ?? ownerUserID()) != nil }
+
     /// Called when the Settings field appears: the same lookup as a Play's (`learnEmail`).
     func prepareEmailField() async {
         await learnEmail()
@@ -1468,7 +1472,7 @@ struct RecordingsListing: Equatable {
     /// only be handed to whichever account signs in next (PR #152 review).
     @discardableResult
     func confirmEmail(_ text: String) -> EmailEntry {
-        guard isEnabled, (sessionOwner ?? ownerUserID()) != nil else { return .unchanged }
+        guard canConfirmEmail else { return .unchanged }
         switch Self.emailFieldState(draft: text, confirmed: confirmedEmail) {
         case .invalid: return .invalid
         case .empty, .confirmed: return .unchanged

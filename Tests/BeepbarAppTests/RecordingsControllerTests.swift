@@ -2749,15 +2749,18 @@ struct RecordingsControllerTests {
     }
 
     /// PR #152 review: with no WeBeep account known (expired token at launch) a typed address is
-    /// refused, since it could only end up with whichever account signs in next. Mutation: drop
-    /// the owner check in `confirmEmail` and the address is kept and later sent for account 7.
+    /// refused, since it could only end up with whichever account signs in next, and the Settings
+    /// field is disabled (`canConfirmEmail`). Mutation: drop the owner check in `canConfirmEmail`
+    /// and the address is kept and later sent for account 7.
     @Test func anAddressIsRefusedWhileNoAccountIsKnown() async throws {
         defer { cleanUp() }
         browser.signInError = CancellationError()
         let controller = makeController()
         controller.setEnabled(true)
         await settle("sign-in cancelled") { controller.access == .needsSignIn(nil) }
+        #expect(controller.canConfirmEmail)
         world.owner = nil
+        #expect(!controller.canConfirmEmail, "the Settings field is disabled and says why")
         #expect(controller.confirmEmail("someone.else@mail.polimi.it") == .unchanged)
         #expect(controller.confirmedEmail == nil)
         world.owner = 7

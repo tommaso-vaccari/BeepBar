@@ -384,6 +384,7 @@ private struct RecordingsEmailField: View {
                         .textFieldStyle(.roundedBorder)
                         .frame(width: 230)
                         .accessibilityLabel(tr("Email del Politecnico", "Polimi email"))
+                        .disabled(!recordings.canConfirmEmail)
                         .onSubmit(confirm)
                     Button(state == .removable ? tr("Rimuovi", "Remove") : tr("Conferma", "Confirm"), action: confirm)
                         .disabled(!canConfirm)
@@ -405,13 +406,19 @@ private struct RecordingsEmailField: View {
     }
 
     private var canConfirm: Bool {
+        guard recordings.canConfirmEmail else { return false }
         switch state {
-        case .ready, .removable: true
-        case .empty, .confirmed, .invalid: false
+        case .ready, .removable: return true
+        case .empty, .confirmed, .invalid: return false
         }
     }
 
     private var note: String? {
+        // No WeBeep account known (expired sign-in at launch): an address typed now would belong
+        // to no account, so the field takes none until the student signs in again.
+        if !recordings.canConfirmEmail {
+            return tr("Accedi di nuovo a WeBeep per inserire l'indirizzo.", "Sign in to WeBeep again to enter the address.")
+        }
         switch state {
         case .invalid:
             return tr("Serve un indirizzo del Politecnico (…@mail.polimi.it o …@polimi.it).", "A Polimi address is needed (…@mail.polimi.it or …@polimi.it).")

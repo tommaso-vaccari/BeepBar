@@ -100,7 +100,8 @@ struct RecordingsListing: Equatable {
 ///   stream; no timer, observer or write runs for it at rest, and it is not part of quitting.
 /// - **The player belongs to the account.** Turning the feature off, disconnecting, switching
 ///   university and an account change close it (`closePlayerForIdentityChange`); closing the
-///   Settings window does not: a lecture keeps playing with the window closed.
+///   Settings window does not: a lecture keeps playing with the window closed, and a Play still
+///   finding its stream goes on (`suspend`).
 /// - **Where you stopped is written only when the player reports it** (pause, close, a newer
 ///   Play, a failure), never on a clock; a lecture watched to the end starts from the beginning
 ///   again and counts as seen. The positions are stored per account and deleted with the session.
@@ -120,7 +121,21 @@ struct RecordingsListing: Equatable {
 /// - **Belongs to the account**, like seen state: turn-off, disconnect and account change forget
 ///   it, and a write that finishes afterwards is never shown.
 /// - **The menu's summary changes only when the saved state does** (`watchSummaries`), never on a
-///   tick, and is stored as numbers so a language switch needs nothing.
+///   tick, and is stored as numbers (plus the next lecture's archive row) so a language switch
+///   needs nothing.
+///
+/// Menu bar Play (a click on a course's line plays its next lecture). What this class keeps, each
+/// guarded by `RecordingsMenuPlayTests`:
+/// - **The saved summary carries the next lecture** (`CourseWatchSummary.next`), recomputed from
+///   committed entries only: it moves at a checkpoint or when a lecture is marked done, never on a
+///   periodic tick, and a lecture finished with no listing loaded stops being offered.
+/// - **Same Play as the window's, without the window** (`playFromMenu`): the window opens only
+///   when it is needed, i.e. the Polimi session needs a sign-in or the lecture can't be opened
+///   (`onMenuPlayNeedsPage`); a window Play's failure never opens anything.
+/// - **Closing the window doesn't cancel a Play** (window or menu) that is queued or running,
+///   as it never cancelled a recovery (`suspend`). Accepted consequence (owner, 2026-10-12): a
+///   Webex sign-in window or the browser fallback of that Play may appear seconds after
+///   Settings was closed.
 @MainActor final class RecordingsController: ObservableObject {
     static let enabledKey = "io.github.tvaccari.beepbar.recordings-enabled.v1"
     static let acknowledgedKey = "io.github.tvaccari.beepbar.recordings-acknowledged.v1"
@@ -180,6 +195,10 @@ struct RecordingsListing: Equatable {
     private let makePlayer: @MainActor () -> RecordingPlaying
     /// The WeBeep profile's email address, or nil: any failure is "ask the user", never an error.
     private let fetchProfileEmail: @MainActor () async -> String?
+    /// Brings the lecture already playing forward for a menu Play of that same lecture
+    /// (`playFromMenu`). Activates the whole app until the player has its own front API
+    /// (package P4, `RecordingPlaying.bringToFront()`); injected so tests don't touch `NSApp`.
+    private let bringPlayerForward: @MainActor () -> Void
     /// Created by the first Play that has a stream, never earlier.
     private var player: RecordingPlaying?
     /// The lectures whose reports are still accepted, by recording id. Filled before a `play` (the
@@ -196,6 +215,29 @@ struct RecordingsListing: Equatable {
     private var closesBrowserWhenIdle = false
     /// A recovery job is executing (it has left the queue).
     private var runningRecovery = false
+    /// A Play job is executing (it has left the queue): with `runningRecovery`, what `suspend`
+    /// must not cancel (`hasPlayOrRecovery`).
+    ///
+    /// Known limitation: neither flag is scoped to `generation`. Both are reset by their
+    /// `defer` when the job's `await` returns, so after an `invalidate` (turn-off, sign-in) an
+    /// old worker still parked in that job can keep a flag set until its answer arrives; a
+    /// `suspend` meanwhile then takes the exemption branch (drops queued listings, keeps the
+    /// browser until the next drain) instead of closing the browser at once. Harmless to data,
+    /// and short-lived; scoping them would need the worker's generation here.
+    private var runningPlay = false
+
+    // MARK: Menu bar Play state
+
+    /// The Play a click on a course's menu line started (`playFromMenu`), until it reaches the
+    /// player or the browser fallback, fails, or a newer click replaces it. Only this Play's
+    /// failure may call `onMenuPlayNeedsPage`: a window Play's failure is shown on the page the
+    /// student is looking at. Cleared by any newer `open` and by `invalidate` (its job is gone).
+    private var menuPlay: (request: Int, key: RecmanCourseKey)?
+    /// A menu Play failed with no Recordings page on screen (the Polimi session lapsed, or the
+    /// lecture can't be opened): the owner shows that course's page, where the usual message or
+    /// "Accedi con Polimi" explains it. Set by `WeBeepAuthenticationController` (package P3);
+    /// called on the main actor, never for a window Play.
+    var onMenuPlayNeedsPage: (@MainActor (RecmanCourseKey) -> Void)?
 
     // MARK: Watch progress state
 
@@ -359,11 +401,13 @@ struct RecordingsListing: Equatable {
         now: @escaping () -> Date = Date.init,
         makePlayer: @escaping @MainActor () -> RecordingPlaying = { RecordingPlayerController() },
         fetchProfileEmail: @escaping @MainActor () async -> String? = { nil },
+        bringPlayerForward: @escaping @MainActor () -> Void = { NSApplication.shared.activate() },
         listingCapacity: Int = RecordingsController.listingCapacity,
         playbackURLCapacity: Int = RecordingsController.playbackURLCapacity
     ) {
         self.makePlayer = makePlayer
         self.fetchProfileEmail = fetchProfileEmail
+        self.bringPlayerForward = bringPlayerForward
         listings = BoundedCache(capacity: listingCapacity)
         playbackURLs = BoundedCache(capacity: playbackURLCapacity)
         self.makeBrowser = makeBrowser
@@ -603,8 +647,11 @@ struct RecordingsListing: Equatable {
             self.initialSessionCheck = nil
             guard self.isEnabled, self.access == .ready else { return }
             if cookies.isEmpty {
+                // A menu Play queued while the file was read can't run without a session.
+                let needsPage = self.takeMenuPlayNeedingPage(failing: nil, queued: true)
                 self.clearQueue()
                 self.access = .needsSignIn(nil)
+                if let needsPage { self.onMenuPlayNeedsPage?(needsPage) }
                 return
             }
             // What the page asked for while the file was read. No `force` to carry over: this is
@@ -626,7 +673,8 @@ struct RecordingsListing: Equatable {
 
     /// The configuration window closed: whatever SwiftUI reports later, no page is visible.
     /// Deliberately leaves the player alone: a lecture keeps playing with this window closed
-    /// (`suspend` stops only requests and the browser, and the stream needs neither).
+    /// (`suspend` stops only requests and the browser, and the stream needs neither; a Play or a
+    /// recovery still finding its stream finishes first).
     func windowClosed() {
         visiblePages = 0
         suspend()
@@ -636,13 +684,20 @@ struct RecordingsListing: Equatable {
     /// page shows them at once next time. A sign-in on screen is left alone: the user may be
     /// typing in it with BeepBar's window closed.
     ///
-    /// A lecture recovery (queued or running) is the exception: the student is watching a lecture
-    /// that stopped, and cancelling its fresh stream because a window closed would leave it
-    /// paused and silent with its one retry spent. Only the course listings are dropped then; the
-    /// browser closes when the recovery has drained (`closesBrowserWhenIdle`).
+    /// A lecture the student asked to watch is the exception (`hasPlayOrRecovery`):
+    /// - a recovery (queued or running): the student is watching a lecture that stopped, and
+    ///   cancelling its fresh stream because a window closed would leave it paused and silent
+    ///   with its one retry spent;
+    /// - a Play (queued or running), from the window or from the menu bar line: the student
+    ///   asked for that lecture, and closing Settings does not stop a lecture (the player
+    ///   already outlives the window), so it doesn't stop one that is about to start either.
+    ///   Before the menu bar Play this closed-window case cancelled a window Play in flight;
+    ///   now a window Play pressed just before closing the window still starts.
+    /// Only the course listings and the other clicks (Open in browser, Copy link) are dropped
+    /// then; the browser closes when the queue has drained (`closesBrowserWhenIdle`).
     private func suspend() {
         guard access != .signingIn else { return }
-        if hasRecovery {
+        if hasPlayOrRecovery {
             dropQueuedListings()
             dropQueuedOpenings()
             closesBrowserWhenIdle = true
@@ -652,9 +707,15 @@ struct RecordingsListing: Equatable {
         closeBrowser()
     }
 
-    /// Whether a recovery is queued or running.
-    private var hasRecovery: Bool {
-        runningRecovery || queue.contains { if case .recover = $0 { true } else { false } }
+    /// Whether a recovery or a Play is queued or running: work for a lecture the student asked
+    /// to watch, which closing the window must not cancel (`suspend`).
+    private var hasPlayOrRecovery: Bool {
+        runningRecovery || runningPlay || queue.contains { job in
+            switch job {
+            case .recover, .open(_, .play, _): true
+            case .list, .open: false
+            }
+        }
     }
 
     /// Removes the listings still waiting (not the one in flight) and their spinners.
@@ -665,15 +726,19 @@ struct RecordingsListing: Equatable {
         queue.removeAll { if case .list = $0 { true } else { false } }
     }
 
-    /// Removes the clicks still waiting (Play, Open in browser, Copy link) and their spinner: with
-    /// the window closed nobody is waiting for them, and a Play would otherwise start a lecture,
-    /// a browser or a sign-in window after the recovery ahead of it (PR #152 review). The one in
-    /// flight, if any, finishes, as it did before the recovery exception.
+    /// Removes the clicks still waiting other than a Play (Open in browser, Copy link) and their
+    /// spinner: with the window closed nobody is waiting for them, and they would otherwise open a
+    /// browser or a sign-in window after the work ahead of them (PR #152 review). A queued Play is
+    /// kept: closing the window doesn't cancel a lecture the student asked for (see `suspend`).
+    /// The one in flight, if any, finishes, as it did before the recovery exception.
     private func dropQueuedOpenings() {
-        for job in queue {
+        let dropped: (Job) -> Bool = { job in
+            if case .open(_, let action, _) = job { action != .play } else { false }
+        }
+        for job in queue where dropped(job) {
             if case .open(let recording, _, _) = job, openingRecordingID == recording.id { openingRecordingID = nil }
         }
-        queue.removeAll { if case .open = $0 { true } else { false } }
+        queue.removeAll(where: dropped)
     }
 
     /// Brings the page's courses up to date: `selected` first, then the others, which only feed
@@ -711,8 +776,88 @@ struct RecordingsListing: Equatable {
     /// Copies the link of the recording's Webex player.
     func copyLink(_ recording: RecmanRecording) { open(recording, .copyLink) }
 
+    /// Plays `recording` for a click on its course's menu bar line, without opening the
+    /// Recordings window. Returns false when only the window can help: the feature is off, the
+    /// Polimi session needs a sign-in (or one is running), or the stored lecture fails
+    /// `validatedNext`; the caller then shows the course's page, with its message, "Accedi con
+    /// Polimi" or the course's real list. True means handled here, including a stale click
+    /// that is ignored.
+    ///
+    /// `owner` is the WeBeep account the menu line was built for (P3's `RecordingMenuTarget`
+    /// payload, passed through unchanged). A click on a line built for another account (the
+    /// account changed while the menu was open) is ignored: nothing plays, nothing opens, true.
+    /// The caller checks the owner too; this is defence in depth, at the point of action.
+    ///
+    /// Same path as the Play button (`open(_, .play)`): the stored resume position, the
+    /// acknowledgement as seen, the watch session and its checkpoints, the regular activation
+    /// policy while the player is open, replacing whatever was playing, and the browser fallback.
+    /// On top of it:
+    /// - the lecture already in the player is brought forward, not played again (a re-Play would
+    ///   restart it from its stored point);
+    /// - the course's listing is queued after the Play when it isn't fresh in memory, so a
+    ///   completion while the lecture plays updates the course's count and next lecture
+    ///   (`refreshWatchSummary` needs it). Appended, never through `enqueue`, which replaces the
+    ///   page's queued listings with its own keys;
+    /// - with no page on screen, the browser closes once the queue has drained;
+    /// - a failure with no page on screen calls `onMenuPlayNeedsPage` (`takeMenuPlayNeedingPage`).
+    ///
+    /// `recording` comes from the saved summary (UserDefaults), so it is untrusted: the caller
+    /// checks it with `validatedNext` first, and it is checked again here; an invalid one is
+    /// never opened, and the course page is asked for instead (false) so the click isn't silent.
+    func playFromMenu(_ recording: RecmanRecording, owner: Int) -> Bool {
+        guard isEnabled else { return false }
+        switch access {
+        case .off, .needsSignIn, .signingIn: return false
+        case .ready: break
+        }
+        guard resumeOwner() == owner else { return true }
+        guard let key = Self.courseKey(of: recording), Self.validatedNext(recording, for: key) else { return false }
+        if stillShowing(recording) {
+            bringPlayerForward()
+            return true
+        }
+        open(recording, .play)
+        menuPlay = (openingRequest, key)
+        if needsLoad(key, force: false), !queue.contains(.list(key)) {
+            listings[key, default: RecordingsListing()].isLoading = true
+            listings[key]?.problem = nil
+            queue.append(.list(key))
+        }
+        if visiblePages == 0 { closesBrowserWhenIdle = true }
+        startWorker()
+        return true
+    }
+
+    /// Whether a stored next lecture (`CourseWatchSummary.next`, read back from UserDefaults and
+    /// so untrusted) may be played for `key`: it belongs to that course and academic year, and
+    /// its preview link is an archive preview link for its own id (`RecmanURLPolicy`, the check
+    /// `RecmanWebSession.playbackURL(for:)` makes before following it). Anything else, e.g. an
+    /// edited settings file pointing at another host, is never opened.
+    nonisolated static func validatedNext(_ recording: RecmanRecording, for key: RecmanCourseKey) -> Bool {
+        recording.courseCode == key.courseCode && recording.academicYear == key.academicYear
+            && RecmanURLPolicy.previewTransferID(recording.previewURL) == recording.id
+    }
+
+    /// The menu Play failed (`failing` is its job) or is being dropped with the queue (`queued`,
+    /// when the whole queue is about to be cleared): forgets it, and returns its course when no
+    /// page is on screen, for `onMenuPlayNeedsPage`. The caller calls that only after updating
+    /// its own state (`access`, the queue), so the page it opens reads the final state. A window
+    /// Play never matches: any newer `open` clears `menuPlay`, and only a job carrying the menu
+    /// Play's request does.
+    private func takeMenuPlayNeedingPage(failing job: Job?, queued: Bool) -> RecmanCourseKey? {
+        guard let menuPlay else { return nil }
+        let isMenuPlay: (Job) -> Bool = { job in
+            if case .open(_, .play, let request) = job { request == menuPlay.request } else { false }
+        }
+        guard job.map(isMenuPlay) == true || (queued && queue.contains(where: isMenuPlay)) else { return nil }
+        self.menuPlay = nil
+        return visiblePages == 0 ? menuPlay.key : nil
+    }
+
     private func open(_ recording: RecmanRecording, _ action: OpenAction) {
         guard isEnabled, access == .ready else { return }
+        // A newer click replaces a menu Play: its failure is no longer the menu's.
+        menuPlay = nil
         openingRequest += 1
         openingProblem = nil
         openingRecordingID = recording.id
@@ -961,8 +1106,12 @@ struct RecordingsListing: Equatable {
                     playbackURLs[recording.id] = url
                     if request == openingRequest { finishOpening(recording, url: url, action: .browser) }
                 case .open(let recording, .play, let request):
+                    runningPlay = true
+                    defer { runningPlay = false }
                     try await playNatively(recording, request: request, browser: browser, generation: generation)
                     guard generation == self.generation else { return }
+                    // Reached the player or the browser fallback: no longer the menu's to report.
+                    if menuPlay?.request == request { menuPlay = nil }
                 case .recover(let recording, let recovery):
                     runningRecovery = true
                     defer { runningRecovery = false }
@@ -984,8 +1133,9 @@ struct RecordingsListing: Equatable {
         if succeeded, saves { await saveSession(generation) }
         guard generation == self.generation else { return }
         worker = nil
-        // A recovery ran for a lecture while no Recordings page was on screen: the browser it
-        // needed has no reason to stay open (the stream doesn't use it).
+        // A recovery or a Play (from the menu bar, or from a window closed meanwhile) ran while
+        // no Recordings page was on screen: the browser it needed has no reason to stay open
+        // (the stream doesn't use it).
         if closesBrowserWhenIdle, queue.isEmpty, visiblePages == 0, access != .signingIn {
             closesBrowserWhenIdle = false
             closeBrowser()
@@ -1506,20 +1656,33 @@ struct RecordingsListing: Equatable {
         let published = watchProgress.setEntry(result.entry, for: identity)
         if result.changed { historyRevision[key, default: 0] += 1 }
         if result.changed || published { refreshWatchSummary(for: key, persist: true) }
-        if result.changed, result.entry?.isCompleted == true { scheduleAcknowledge([recording.id], for: key) }
+        if result.changed, result.entry?.isCompleted == true {
+            clearSavedNextIfCompleted(recording, in: key)
+            scheduleAcknowledge([recording.id], for: key)
+        }
     }
 
     private static func courseKey(of recording: RecmanRecording) -> RecmanCourseKey? {
         RecmanCourseKey(courseCode: recording.courseCode, academicYear: recording.academicYear)
     }
 
-    /// Recomputes a loaded course's summary. The window's (`watchProgress.summaries`) includes
-    /// the playing lecture's live position; the saved one (`watchSummaries`, `persist`) uses saved
-    /// entries only, so a tick never changes the menu or writes the settings. A course whose
-    /// listing isn't loaded keeps its last saved summary.
+    /// Recomputes a loaded course's summary, with its next lecture (`CourseWatchSummary.next`,
+    /// what a click on the course's menu line plays). The window's (`watchProgress.summaries`)
+    /// includes the playing lecture's live position; the saved one (`watchSummaries`, `persist`)
+    /// uses saved entries only, so a tick never changes the menu or writes the settings. `next`
+    /// is the same in both: `nextToWatch` reads committed entries only, never `live`, so it moves
+    /// at a checkpoint (an untouched lecture first saved past 0 %, a completion), never on a tick.
+    /// A course whose listing isn't loaded keeps its last saved summary (but see
+    /// `clearSavedNextIfCompleted`).
+    ///
+    /// `newCount` (new recordings, shown on the menu line) is not computed here yet: the sync
+    /// controller package will. Until then the saved one of the course, if any, is carried over
+    /// unchanged into both summaries, so recomputing the counts never drops it.
     private func refreshWatchSummary(for key: RecmanCourseKey, persist: Bool) {
         guard let recordings = listings[key]?.recordings else { return }
-        let rows = recordings.map { (id: $0.id, minutes: $0.minutes) }
+        let owner = resumeOwner()
+        if let owner { loadWatchSummaries(owner: owner) }
+        let newCount = owner == nil ? nil : watchSummaries[key]?.newCount
         var entries: [String: RecordingWatchEntry] = [:]
         var live: [String: Double] = [:]
         for recording in recordings {
@@ -1527,18 +1690,38 @@ struct RecordingsListing: Equatable {
             entries[recording.id] = watchProgress.entries[identity]
             live[recording.id] = watchProgress.live[identity]
         }
-        watchProgress.setSummary(RecordingWatchProgress.courseSummary(rows, entries: entries, live: live), for: key)
-        guard persist, let owner = resumeOwner() else { return }
-        storeWatchSummary(RecordingWatchProgress.courseSummary(rows, entries: entries, live: [:]), for: key, owner: owner)
+        watchProgress.setSummary(RecordingWatchProgress.courseSummary(recordings: recordings, entries: entries, live: live, newCount: newCount), for: key)
+        guard persist, let owner else { return }
+        storeWatchSummary(RecordingWatchProgress.courseSummary(recordings: recordings, entries: entries, live: [:], newCount: newCount), for: key, owner: owner)
+    }
+
+    /// A lecture just completed in a course whose listing isn't in memory (a menu Play whose
+    /// listing failed, a Watchlist row's tick): `refreshWatchSummary` can't recompute the
+    /// course, so the saved summary would keep offering, on the menu line, the lecture that was
+    /// just finished. When that lecture is the saved `next`, it is dropped (the line goes grey
+    /// until the next listing works out the new one); the counts stay as they were, since they
+    /// can't be recomputed without the listing either.
+    private func clearSavedNextIfCompleted(_ recording: RecmanRecording, in key: RecmanCourseKey) {
+        guard listings[key]?.recordings == nil, let owner = resumeOwner() else { return }
+        loadWatchSummaries(owner: owner)
+        guard let saved = watchSummaries[key], saved.next?.id == recording.id else { return }
+        storeWatchSummary(CourseWatchSummary(done: saved.done, total: saved.total, remainingMinutes: saved.remainingMinutes,
+                                             unknownDurationCount: saved.unknownDurationCount, next: nil, newCount: saved.newCount), for: key, owner: owner)
+    }
+
+    /// Reads the saved summaries of `owner` once per account, before the first change of a
+    /// launch, so a change to one course keeps the others.
+    private func loadWatchSummaries(owner: Int) {
+        guard watchSummaryOwner != owner else { return }
+        watchSummaryOwner = owner
+        watchSummaries = Self.storedWatchSummaries(in: defaults, owner: owner) ?? [:]
     }
 
     /// Saves a course's summary under `owner`, only when it differs from the saved one: a listing
-    /// or a write that changes nothing in it writes nothing.
+    /// or a write that changes nothing in it writes nothing. The comparison is of the whole value,
+    /// `next` included, so only a change of the counts or of the next lecture writes.
     private func storeWatchSummary(_ summary: CourseWatchSummary, for key: RecmanCourseKey, owner: Int) {
-        if watchSummaryOwner != owner {
-            watchSummaryOwner = owner
-            watchSummaries = Self.storedWatchSummaries(in: defaults, owner: owner) ?? [:]
-        }
+        loadWatchSummaries(owner: owner)
         guard watchSummaries[key] != summary else { return }
         var updated = watchSummaries
         updated[key] = summary
@@ -1717,8 +1900,14 @@ struct RecordingsListing: Equatable {
     }
 
     private func handle(_ error: Error, of job: Job) -> Outcome {
+        // A menu Play this failure ends, told last, once access and the queue say what happened.
+        var needsPage: RecmanCourseKey?
+        defer { if let needsPage { onMenuPlayNeedsPage?(needsPage) } }
         if case RecmanBrowserError.needsSignIn = error {
             log.notice("Polimi session lapsed")
+            // Before the queue is cleared: a menu Play failing, or waiting behind a listing that
+            // found the session gone, needs the page's "Accedi con Polimi".
+            needsPage = takeMenuPlayNeedingPage(failing: job, queued: true)
             access = .needsSignIn(nil)
             clearQueue()
             closeBrowser()
@@ -1727,6 +1916,9 @@ struct RecordingsListing: Equatable {
         // Only another operation on the browser interrupts one, and only a sign-in starts one
         // while the worker runs, after bumping the generation. Nothing to tell the user.
         if error is CancellationError {
+            // The menu Play's job goes with the queue and nobody is told (a cancellation is
+            // never the student's problem): forgotten, so `menuPlay` names only a live job.
+            menuPlay = nil
             clearQueue()
             return .stopWithoutSaving
         }
@@ -1739,12 +1931,16 @@ struct RecordingsListing: Equatable {
         case .open(let recording, _, _):
             if openingRecordingID == recording.id { openingRecordingID = nil }
             openingProblem = problem
+            // `openingProblem` is shown by the page; with none on screen a menu Play asks for it.
+            needsPage = takeMenuPlayNeedingPage(failing: job, queued: false)
         case .recover:
             // Not a click: the lecture's window already says what happened to it.
             break
         }
         // Offline or Polimi down: every other request would wait for the same timeout.
         guard problem == .unavailable else { return .next }
+        // A menu Play dropped with the rest says why on its course's page.
+        needsPage = needsPage ?? takeMenuPlayNeedingPage(failing: nil, queued: true)
         for job in queue {
             switch job {
             case .list(let key): listings[key]?.problem = problem
@@ -1779,6 +1975,8 @@ struct RecordingsListing: Equatable {
         // generation cannot publish, so force a history reload when this list returns.
         for key in pendingAcknowledgements.values { listings[key]?.updatedAt = nil }
         generation += 1
+        // Its job goes with the queue below; nothing of it is left to report.
+        menuPlay = nil
         worker?.cancel()
         worker = nil
         signInTask?.cancel()

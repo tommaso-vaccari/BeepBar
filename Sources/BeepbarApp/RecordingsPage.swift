@@ -131,9 +131,23 @@ enum RecordingsPresentation {
 
         static let unknown = WatchRow(known: false, fraction: 0, completed: false, pending: false, canEdit: false)
 
-        /// The checkbox accepts a click: known, editable, and no save of it in flight. It always
-        /// shows the committed value (`completed`), never the value being saved.
-        var acceptsToggle: Bool { known && canEdit && !pending }
+        // The row's view reads only the fields below (never `known`, `completed` or `pending`
+        // directly), so every visible decision is pinned by `RecordingRowProgressTests`.
+
+        /// The checkbox is ticked: the committed state only, never the value being saved, so a
+        /// failed save can't leave a box that lies (no optimistic flip while `pending`).
+        var isOn: Bool { completed }
+
+        /// The checkbox is drawn: only when the stored state is known. An empty box for an
+        /// unknown row would say "not done" for a lecture the store may say is done. Hidden rows
+        /// keep their slot (opacity), so the layout doesn't jump when the listing loads.
+        var checkboxVisible: Bool { known }
+
+        /// The checkbox is hidden from VoiceOver, for the same reason it is hidden on screen.
+        var checkboxAccessibilityHidden: Bool { !known }
+
+        /// The checkbox accepts a click: known, editable, and no save of it in flight.
+        var checkboxEnabled: Bool { known && canEdit && !pending }
 
         /// The bar's value, nil when there is no bar (unknown state). Full once done, whatever the
         /// furthest point: ticking a lecture attended in person completes it at 0 %.
@@ -142,11 +156,18 @@ enum RecordingsPresentation {
             return completed ? 1 : Self.clamped(fraction)
         }
 
+        /// The "done" styling: green bar and a check mark after it.
+        var showsDoneStyle: Bool { known && completed }
+
+        /// The bar's colour: green once done, the accent colour otherwise.
+        var barTint: Color { showsDoneStyle ? .green : .accentColor }
+
         /// The whole percent shown for a lecture that is not done: rounded down and never above
         /// 99, so the row never claims 100 % before the lecture is done (a lecture played to the
         /// very end but still open, or un-ticked after being watched, reads 99 %). Rounding down
-        /// also keeps 0.4 % from reading as 1 %.
-        var percent: Int { min(99, Int((Self.clamped(fraction) * 100).rounded(.down))) }
+        /// also keeps 0.4 % from reading as 1 %. The tiny epsilon absorbs binary representation
+        /// error before flooring: 0.29 × 100 is 28.999999999999996 in `Double` and must read 29.
+        var percent: Int { min(99, Int((Self.clamped(fraction) * 100 + 1e-9).rounded(.down))) }
 
         /// VoiceOver's value for the bar: "Fatta"/"Done" once done, otherwise "N% visto"/"N%
         /// watched". Both languages, so tests can check each without switching the app language.
@@ -173,24 +194,35 @@ enum RecordingsPresentation {
         let known: Set<String>
         /// Each loaded course's summary, live position included: the course header's line.
         let summaries: [RecmanCourseKey: CourseWatchSummary]
+        /// `RecordingsController.canEditProgress` when the reader was built (see
+        /// `WatchProgressReader.init` on why a stale value is harmless).
+        let canEdit: Bool
 
-        @MainActor init(_ model: RecordingsWatchProgressModel) {
+        @MainActor init(_ model: RecordingsWatchProgressModel, canEdit: Bool) {
             entries = model.entries
             live = model.live
             pending = model.pending
             known = model.known
             summaries = model.summaries
+            self.canEdit = canEdit
         }
 
         /// The row values of `recording`: `.unknown` when its stored state isn't known, whatever
         /// is in memory for it; otherwise the rules of `RecordingsWatchProgressModel`'s accessors
         /// (`fraction(for:)`: the further of stored and live).
-        func row(for recording: RecmanRecording, canEdit: Bool) -> WatchRow {
+        func row(for recording: RecmanRecording) -> WatchRow {
             let identity = RecordingsStudyState.identity(recording)
             guard known.contains(identity) else { return .unknown }
             let entry = entries[identity] ?? .untouched
             return WatchRow(known: true, fraction: max(entry.furthest, live[identity] ?? 0), completed: entry.isCompleted,
                             pending: pending.contains(identity), canEdit: canEdit)
+        }
+
+        /// The course header's summary line: `base` ("2026/27 · 30 registrazioni · 36 h"), then
+        /// the progress line of `key` when there is one (`watchSummaryText`).
+        func headerLine(_ base: String, for key: RecmanCourseKey) -> String {
+            guard let watched = RecordingsPresentation.watchSummaryText(summaries[key]) else { return base }
+            return "\(base) · \(watched.text)"
         }
     }
 
@@ -484,9 +516,12 @@ private struct CourseRecordings: View {
                 .font(.title3.weight(.semibold))
                 .lineLimit(3)
                 .fixedSize(horizontal: false, vertical: true)
-            WatchProgressReader(progress: recordings.watchProgress) { progress in
-                let watched = RecordingsPresentation.watchSummaryText(progress.summaries[key])
-                Text(watched.map { "\(summary) · \($0.text)" } ?? summary)
+            WatchProgressReader(recordings: recordings) { progress in
+                let line = progress.headerLine(summary, for: key)
+                #if DEBUG
+                let _ = RecordingsPageProbes.header?(line)
+                #endif
+                Text(line)
                     .font(.callout)
                     .foregroundStyle(.secondary)
                     .fixedSize(horizontal: false, vertical: true)
@@ -591,10 +626,9 @@ private struct CourseRecordings: View {
     private func recordingList(_ shown: [RecmanRecording], numbers: [String: Int]) -> some View {
         let sections = RecordingsPresentation.weekSections(shown, now: Date(), calendar: RecordingsPresentation.calendar(), locale: BeepbarStyle.locale)
         let byID = Dictionary(shown.map { ($0.id, $0) }, uniquingKeysWith: { first, _ in first })
-        let canEditProgress = recordings.canEditProgress
         // Sections, filtering and numbering stay here (this view doesn't observe the progress
         // model); a tick re-runs only the reader's closure below, see `WatchProgressReader`.
-        return WatchProgressReader(progress: recordings.watchProgress) { progress in
+        return WatchProgressReader(recordings: recordings) { progress in
             List(selection: $selection) {
                 ForEach(sections, id: \.title) { section in
                     Section(section.title) {
@@ -608,7 +642,7 @@ private struct CourseRecordings: View {
                                 canEdit: recordings.canEditStudy,
                                 canPlay: recordings.access == .ready,
                                 watchlistCourseName: name,
-                                watch: progress.row(for: recording, canEdit: canEditProgress),
+                                watch: progress.row(for: recording),
                                 actions: RecordingRow.Actions(
                                     toggleWatchlist: { recordings.toggleWatchlist(recording, courseName: name) },
                                     play: { recordings.play(recording) },
@@ -692,11 +726,10 @@ private struct WatchlistRecordings: View {
             }
             if shown.isEmpty { empty.frame(maxWidth: .infinity, maxHeight: .infinity) }
             else {
-                let canEditProgress = recordings.canEditProgress
                 // Same split as the course list: only the reader observes the progress model.
                 // A bookmark whose course listing isn't loaded is unknown to the model and shows
                 // neither bar nor checkbox (`RecordingsPresentation.WatchRow.unknown`).
-                WatchProgressReader(progress: recordings.watchProgress) { progress in
+                WatchProgressReader(recordings: recordings) { progress in
                     List(selection: $selection) {
                         ForEach(shown) { bookmark in
                             let item = bookmark.recording
@@ -706,7 +739,7 @@ private struct WatchlistRecordings: View {
                                 canEdit: recordings.canEditStudy, canPlay: recordings.access == .ready && !bookmark.unavailable,
                                 courseName: bookmark.courseName, unavailable: bookmark.unavailable,
                                 watchlistCourseName: bookmark.courseName,
-                                watch: progress.row(for: item, canEdit: canEditProgress),
+                                watch: progress.row(for: item),
                                 actions: RecordingRow.Actions(
                                     toggleWatchlist: { recordings.toggleWatchlist(item, courseName: bookmark.courseName) },
                                     play: { recordings.play(item) },
@@ -759,12 +792,41 @@ private struct WatchlistRecordings: View {
 /// any row whose values didn't change: in practice the playing lecture's row. Never observe the
 /// model in a row (one subscription per row, every row's body on each tick) or in the pages
 /// themselves (sections recomputed on each tick).
+///
+/// Cost per tick, measured on the isolated fixture at 3cfe069 (package E review): about 300
+/// `WatchValues.row` calls, the rows `List` keeps built around the visible ones, whatever the
+/// listing's size (1,000 or 5,000 recordings), and one row body. Package G records the number
+/// with the rest of the delivery evidence.
 struct WatchProgressReader<Content: View>: View {
     @ObservedObject var progress: RecordingsWatchProgressModel
+    /// `RecordingsController.canEditProgress` when the page built this reader. It can go stale
+    /// until the page's next update (it isn't published), and that is harmless: `setDone`
+    /// checks the account again and does nothing without one, and the checkbox draws only the
+    /// committed value, so a click that was refused leaves the box as it was.
+    let canEdit: Bool
     @ViewBuilder let content: (RecordingsPresentation.WatchValues) -> Content
 
-    var body: some View { content(RecordingsPresentation.WatchValues(progress)) }
+    init(recordings: RecordingsController, @ViewBuilder content: @escaping (RecordingsPresentation.WatchValues) -> Content) {
+        progress = recordings.watchProgress
+        canEdit = recordings.canEditProgress
+        self.content = content
+    }
+
+    /// What the content receives; a property so tests can read it without rendering.
+    var values: RecordingsPresentation.WatchValues { RecordingsPresentation.WatchValues(progress, canEdit: canEdit) }
+
+    var body: some View { content(values) }
 }
+
+#if DEBUG
+/// Test seams of the Recordings page, nil (no cost beyond the check) outside tests: each row
+/// body hands over the row it draws, and the course header the line it shows, so a hosting test
+/// can prove what reached the screen and how often.
+@MainActor enum RecordingsPageProbes {
+    static var row: ((RecordingRow) -> Void)?
+    static var header: ((String) -> Void)?
+}
+#endif
 
 /// A recording keeps its title above its metadata and its play action visible without hover.
 ///
@@ -805,15 +867,15 @@ struct RecordingRow: View, Equatable {
             && lhs.watch == rhs.watch
     }
 
-    #if DEBUG
-    /// Test seam: called with the recording's id each time a row's body runs, so a test can
-    /// prove a tick re-renders only the changed row. Nil (no cost beyond the check) otherwise.
-    @MainActor static var bodyProbe: ((String) -> Void)?
-    #endif
+    /// The checkbox's binding: reads the committed value only (`WatchRow.isOn`, no optimistic
+    /// flip) and forwards exactly the value the student asked for.
+    static func doneBinding(watch: RecordingsPresentation.WatchRow, setDone: @escaping (Bool) -> Void) -> Binding<Bool> {
+        Binding(get: { watch.isOn }, set: { setDone($0) })
+    }
 
     var body: some View {
         #if DEBUG
-        let _ = Self.bodyProbe?(recording.id)
+        let _ = RecordingsPageProbes.row?(self)
         #endif
         HStack(spacing: 10) {
             Circle()
@@ -888,9 +950,9 @@ struct RecordingRow: View, Equatable {
                 ProgressView(value: value)
                     .progressViewStyle(.linear)
                     .controlSize(.mini)
-                    .tint(watch.completed ? .green : .accentColor)
+                    .tint(watch.barTint)
                     .frame(maxWidth: 220)
-                if watch.completed {
+                if watch.showsDoneStyle {
                     Image(systemName: "checkmark.circle.fill")
                         .font(.caption)
                         .foregroundStyle(.green)
@@ -908,12 +970,12 @@ struct RecordingRow: View, Equatable {
     /// place but is hidden: an empty box would say "not done" for a lecture that may be done.
     private var doneCheckbox: some View {
         let label = tr("Fatta (vista o seguita in presenza)", "Done (watched or attended in person)")
-        return Toggle(label, isOn: Binding(get: { watch.completed }, set: { actions.setDone($0) }))
+        return Toggle(label, isOn: Self.doneBinding(watch: watch, setDone: actions.setDone))
             .toggleStyle(.checkbox)
             .labelsHidden()
-            .disabled(!watch.acceptsToggle)
-            .opacity(watch.known ? 1 : 0)
-            .accessibilityHidden(!watch.known)
+            .disabled(!watch.checkboxEnabled)
+            .opacity(watch.checkboxVisible ? 1 : 0)
+            .accessibilityHidden(watch.checkboxAccessibilityHidden)
             .help(label)
     }
 

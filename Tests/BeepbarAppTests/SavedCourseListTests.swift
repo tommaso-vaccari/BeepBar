@@ -436,6 +436,24 @@ import BeepbarCore
         #expect(!FileManager.default.fileExists(atPath: install.file.path), "an expired list outlived the automatic sync")
     }
 
+    /// The same from the menu: a long-running session whose list Moodle confirmed weeks ago, a
+    /// «Sincronizza ora» over that current list (which asks Moodle nothing and saves nothing)
+    /// still deletes the expired file.
+    @Test func aSyncOverACurrentListDeletesAnExpiredList() async throws {
+        let install = try await Install.make()
+        defer { install.remove() }
+        let token = MoodleRecordingProtocol.register(courses: [(1, "Analisi")])
+        defer { MoodleRecordingProtocol.revoke(token: token) }
+        try await install.store().save([course(1, "Analisi")], identity: install.identity(token: token), now: Date().addingTimeInterval(-CourseListSnapshotCodec.maximumAge - 3_600))
+
+        let controller = install.launch(token: token)
+        controller.setCoursesForTesting([course(1, "Analisi")])
+        controller.synchronizeNow()
+        await controller.waitForSyncForTesting()
+        await controller.waitForCourseListWriteForTesting()
+        #expect(!FileManager.default.fileExists(atPath: install.file.path), "an expired list outlived «Sincronizza ora»")
+    }
+
     /// The credential found missing or corrupt while loading the list: signed out in all but
     /// name, so the saved list goes too.
     @Test func aCredentialFoundMissingDeletesTheSavedList() async throws {

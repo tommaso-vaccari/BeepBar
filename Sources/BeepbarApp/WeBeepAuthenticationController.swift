@@ -828,9 +828,15 @@ struct MenuBarSnapshot: Sendable {
     func restoreSavedCourseListForTesting() async { await restoreSavedCourseList() }
 
     /// The launch bootstrap finding no stored credential, for a test controller (which has none).
-    func applyBootstrapWithoutCredentialForTesting() async {
+    func applyBootstrapWithoutCredentialForTesting(recoveryBlocked: Bool = false, corrupt: Bool = false) async {
         guard let database else { return }
-        await applyBootstrap(BootstrapService.Result(database: database, recoveryBlocked: false, credential: .absent))
+        await applyBootstrap(BootstrapService.Result(database: database, recoveryBlocked: recoveryBlocked, credential: corrupt ? .unavailable(.corrupt) : .absent))
+    }
+
+    /// The launch bootstrap finding the stored credential, for a test controller.
+    func applyBootstrapWithCredentialForTesting() async {
+        guard let database else { return }
+        await applyBootstrap(BootstrapService.Result(database: database, recoveryBlocked: false, credential: .present))
     }
 
     /// The folder handling after the open panel, with `url` as if picked there.
@@ -931,6 +937,10 @@ struct MenuBarSnapshot: Sendable {
     /// every root operation gated; otherwise the account and the persisted sync state are restored.
     private func applyBootstrap(_ result: BootstrapService.Result) async {
         await refreshPendingModuleMoves()
+        // Before the blocked-recovery return: a launch without a credential deletes the saved
+        // course list whether or not a pending operation blocks recovery, as documented (#98).
+        // The rest of the credential handling waits for recovery, as before.
+        if Self.credentialIsGone(result.credential) { forgetCourseList() }
         if result.recoveryBlocked {
             recoveryBlocked = true
             setSyncState(.recoveryBlocked)
@@ -940,6 +950,7 @@ struct MenuBarSnapshot: Sendable {
         switch result.credential {
         case .present:
             hasStoredCredential = true
+            pruneExpiredCourseList()
             if Self.defaults.bool(forKey: Self.credentialExpiredKey) {
                 accountState = .expired
                 setSyncState(.failed(.authenticationExpired))
@@ -953,11 +964,20 @@ struct MenuBarSnapshot: Sendable {
             accountState = .notConnected
             // No credential, so no account the saved list could belong to: an older BeepBar that
             // signed out, or a sign-out whose deletion never ran, must not leave it on disk (#98).
-            forgetCourseList()
+            // Deleted above, before the blocked-recovery return.
             await restorePersistedSyncState()
             configureBackgroundScheduler()
         case .unavailable(let error):
             await handleCredentialStorageError(error)
+        }
+    }
+
+    /// Whether the launch found no usable credential: absent, or unreadable as absent or corrupt
+    /// (what `handleCredentialStorageError` treats as signed out). A write error is not one.
+    private nonisolated static func credentialIsGone(_ status: BootstrapService.CredentialStatus) -> Bool {
+        switch status {
+        case .present, .unavailable(.write): false
+        case .absent, .unavailable(.absent), .unavailable(.corrupt): true
         }
     }
 
@@ -1666,6 +1686,7 @@ struct MenuBarSnapshot: Sendable {
         guard activeOperationID == nil, !isLoadingCourses else { return }
         let operationID = UUID()
         activeOperationID = operationID
+        pruneExpiredCourseList()
         // «Sincronizza ora» always downloads, on any network: nothing is paused any more.
         dataSaverPause = nil
         setSyncState(.checking)
@@ -2155,6 +2176,19 @@ struct MenuBarSnapshot: Sendable {
         _ = enqueueCourseListIO(priority: .utility) { (store: CourseListSnapshotStore) async -> Void in
             do { try await store.save(courses, identity: identity, epoch: epoch) }
             catch { BeepbarLog.lifecycle.error("Saved course list not written errorType=\(String(reflecting: type(of: error)), privacy: .public)") }
+        }
+    }
+
+    /// Deletes the saved course list once it is older than 30 days, without retiring the account
+    /// (#98, PR #138). Called at launch and when a sync runs, so the age limit holds for a user who
+    /// never opens the window, where `restoreSavedCourseList` would otherwise be the only check.
+    /// Costs a `stat` when there is no file and nothing once the store knows the file's date.
+    private func pruneExpiredCourseList() {
+        guard !Self.isUIPreview else { return }
+        _ = enqueueCourseListIO(priority: .utility) { (store: CourseListSnapshotStore) async -> Void in
+            if await store.removeIfExpired() {
+                BeepbarLog.lifecycle.notice("Saved course list removed reason=expired")
+            }
         }
     }
 
@@ -2653,6 +2687,7 @@ struct MenuBarSnapshot: Sendable {
         }
         guard let rootURL, let rootID, let database else { return .finished }
         dataSaverPause = nil
+        pruneExpiredCourseList()
         // Captured once: switching "Risparmio dati" during the run changes the next run, not this one.
         let networkAccess: NetworkAccess = dataSaverEnabled ? .dataSaver : .unrestricted
         let operationID = UUID()

@@ -381,6 +381,61 @@ import BeepbarCore
         #expect(!FileManager.default.fileExists(atPath: install.file.path), "the saved list outlived the credential")
     }
 
+    /// No credential at launch while a pending operation blocks recovery: the saved list is
+    /// deleted all the same (the blocked-recovery return used to skip it), whether the credential
+    /// is absent or unreadable as corrupt. Fails if the deletion waits for recovery.
+    @Test(arguments: [false, true]) func aBlockedLaunchWithoutACredentialStillDeletesTheSavedList(corrupt: Bool) async throws {
+        let install = try await Install.make()
+        defer { install.remove() }
+        let token = MoodleRecordingProtocol.register(courses: [(1, "Analisi")])
+        defer { MoodleRecordingProtocol.revoke(token: token) }
+        try await install.save([course(1, "Analisi")], token: token)
+        #expect(FileManager.default.fileExists(atPath: install.file.path))
+
+        let controller = install.launch(token: token)
+        await controller.applyBootstrapWithoutCredentialForTesting(recoveryBlocked: true, corrupt: corrupt)
+        await controller.waitForCourseListWriteForTesting()
+        #expect(controller.recoveryBlocked)
+        #expect(!FileManager.default.fileExists(atPath: install.file.path), "the saved list outlived the credential behind a blocked recovery")
+    }
+
+    /// A list older than 30 days goes at launch even if the window never opens, the only moment
+    /// the file is otherwise read; a younger one stays for the next opening.
+    @Test func aLaunchDeletesAnExpiredListWithoutTheWindow() async throws {
+        let install = try await Install.make()
+        defer { install.remove() }
+        let token = MoodleRecordingProtocol.register(courses: [(1, "Analisi")])
+        defer { MoodleRecordingProtocol.revoke(token: token) }
+        try await install.store().save([course(1, "Analisi")], identity: install.identity(token: token), now: Date().addingTimeInterval(-CourseListSnapshotCodec.maximumAge + 3_600))
+
+        let first = install.launch(token: token)
+        await first.applyBootstrapWithCredentialForTesting()
+        await first.waitForCourseListWriteForTesting()
+        #expect(FileManager.default.fileExists(atPath: install.file.path), "a list within 30 days was deleted at launch")
+
+        try await install.store().save([course(1, "Analisi"), course(2, "Fisica")], identity: install.identity(token: token), now: Date().addingTimeInterval(-CourseListSnapshotCodec.maximumAge - 3_600))
+        let second = install.launch(token: token)
+        await second.applyBootstrapWithCredentialForTesting()
+        await second.waitForCourseListWriteForTesting()
+        #expect(second.hasStoredCredential)
+        #expect(!FileManager.default.fileExists(atPath: install.file.path), "an expired list outlived the launch")
+    }
+
+    /// A menu-bar-only user, app running for weeks: the automatic sync, which never reads or
+    /// writes the saved list, still deletes it once it is older than 30 days.
+    @Test func anAutomaticSyncDeletesAnExpiredList() async throws {
+        let install = try await Install.make()
+        defer { install.remove() }
+        let token = MoodleRecordingProtocol.register(courses: [(1, "Analisi")])
+        defer { MoodleRecordingProtocol.revoke(token: token) }
+        try await install.store().save([course(1, "Analisi")], identity: install.identity(token: token), now: Date().addingTimeInterval(-CourseListSnapshotCodec.maximumAge - 3_600))
+
+        let controller = install.launch(token: token)
+        await controller.runAutomaticSyncForTesting()
+        await controller.waitForCourseListWriteForTesting()
+        #expect(!FileManager.default.fileExists(atPath: install.file.path), "an expired list outlived the automatic sync")
+    }
+
     /// The credential found missing or corrupt while loading the list: signed out in all but
     /// name, so the saved list goes too.
     @Test func aCredentialFoundMissingDeletesTheSavedList() async throws {

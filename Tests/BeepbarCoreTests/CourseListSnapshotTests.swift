@@ -383,4 +383,54 @@ struct CourseListSnapshotTests {
         #expect(try await store.save(courses(1), identity: identity, now: now))
         #expect(try FileManager.default.contentsOfDirectory(atPath: folder.path) == [CourseListSnapshotStore.fileName])
     }
+
+    /// Storage limitation (PR #138): the age limit is enforced without the window, whoever the
+    /// file belongs to. A file within 30 days stays (the account's list, still useful); past
+    /// them it is deleted. Fails if the pruning deletes a valid list, keeps an expired one, or
+    /// only handles the identity it was saved for.
+    @Test func removeIfExpiredDeletesOnlyAnExpiredFile() async throws {
+        let (store, folder, cleanup) = try makeStore()
+        defer { cleanup() }
+        let file = folder.appendingPathComponent(CourseListSnapshotStore.fileName)
+        #expect(await store.removeIfExpired(now: now) == false, "no file is not a deletion")
+        let foreign = CourseListSnapshot.Identity(siteID: "unipd-math", rootID: UUID(), token: "token-z")
+        #expect(try await CourseListSnapshotStore(directory: { folder }).save(courses(2), identity: foreign, now: now))
+
+        let relaunched = CourseListSnapshotStore(directory: { folder })
+        #expect(await relaunched.removeIfExpired(now: now.addingTimeInterval(CourseListSnapshotCodec.maximumAge - 60)) == false)
+        #expect(FileManager.default.fileExists(atPath: file.path), "a list within the age limit was deleted")
+        #expect(await relaunched.removeIfExpired(now: now.addingTimeInterval(CourseListSnapshotCodec.maximumAge + 60)))
+        #expect(!FileManager.default.fileExists(atPath: file.path), "an expired list outlived the age limit")
+    }
+
+    /// Pruning is not a sign-out: the same account's next confirmed list is saved again, and a
+    /// file the pruning can't read is left for `load`, which knows why it refuses it.
+    @Test func removeIfExpiredRetiresNothingAndLeavesUnreadableFiles() async throws {
+        let (store, folder, cleanup) = try makeStore()
+        defer { cleanup() }
+        let file = folder.appendingPathComponent(CourseListSnapshotStore.fileName)
+        #expect(try await store.save(courses(1), identity: identity, epoch: 3, now: now))
+        let later = now.addingTimeInterval(CourseListSnapshotCodec.maximumAge + 60)
+        #expect(await store.removeIfExpired(now: later))
+        #expect(try await store.save(courses(1), identity: identity, epoch: 3, now: later), "pruning retired the account's epoch")
+
+        try Data("{broken".utf8).write(to: file)
+        let relaunched = CourseListSnapshotStore(directory: { folder })
+        #expect(await relaunched.removeIfExpired(now: later.addingTimeInterval(CourseListSnapshotCodec.maximumAge * 2)) == false)
+        #expect(FileManager.default.fileExists(atPath: file.path))
+    }
+
+    /// Cost proportional to what changed: once the store knows the file's date, later checks
+    /// don't read it again. Swapping the file for unreadable bytes after the first check shows
+    /// it: the known date still decides. Fails if every check re-reads the file.
+    @Test func removeIfExpiredReadsTheFileOnlyOnce() async throws {
+        let (store, folder, cleanup) = try makeStore()
+        defer { cleanup() }
+        let file = folder.appendingPathComponent(CourseListSnapshotStore.fileName)
+        #expect(try await CourseListSnapshotStore(directory: { folder }).save(courses(1), identity: identity, now: now))
+        #expect(await store.removeIfExpired(now: now) == false)
+        try Data("{broken".utf8).write(to: file)
+        #expect(await store.removeIfExpired(now: now.addingTimeInterval(CourseListSnapshotCodec.maximumAge + 60)))
+        #expect(!FileManager.default.fileExists(atPath: file.path))
+    }
 }

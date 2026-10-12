@@ -184,15 +184,23 @@ public enum CourseListSnapshotCodec {
     /// Accepts only a readable, current-version snapshot of exactly `identity`, within the size,
     /// count and age limits. Everything else is an error the caller turns into "no snapshot".
     public static func decode(_ data: Data, expecting identity: CourseListSnapshot.Identity, now: Date) throws -> CourseListSnapshot {
+        let snapshot = try decodeAnyIdentity(data)
+        guard snapshot.identity == identity else { throw DecodeError.wrongIdentity }
+        guard snapshot.courses.count <= maximumCourses else { throw DecodeError.tooManyCourses }
+        guard !isExpired(savedAt: snapshot.savedAt, now: now) else { throw DecodeError.expired }
+        guard snapshot.savedAt.timeIntervalSince(now) <= saveRefreshInterval else { throw DecodeError.savedInTheFuture }
+        return snapshot
+    }
+
+    /// A readable, current-version snapshot within the size limit, whoever it belongs to. Only
+    /// for deciding whether a file is too old to keep (`CourseListSnapshotStore.removeIfExpired`):
+    /// what may be shown goes through `decode`.
+    public static func decodeAnyIdentity(_ data: Data) throws -> CourseListSnapshot {
         guard data.count <= maximumBytes else { throw DecodeError.tooLarge }
         let decoder = makeDecoder()
         guard let probe = try? decoder.decode(VersionProbe.self, from: data) else { throw DecodeError.unreadable }
         guard probe.version == currentVersion else { throw DecodeError.unsupportedVersion(probe.version) }
         guard let snapshot = try? decoder.decode(CourseListSnapshot.self, from: data) else { throw DecodeError.unreadable }
-        guard snapshot.identity == identity else { throw DecodeError.wrongIdentity }
-        guard snapshot.courses.count <= maximumCourses else { throw DecodeError.tooManyCourses }
-        guard !isExpired(savedAt: snapshot.savedAt, now: now) else { throw DecodeError.expired }
-        guard snapshot.savedAt.timeIntervalSince(now) <= saveRefreshInterval else { throw DecodeError.savedInTheFuture }
         return snapshot
     }
 

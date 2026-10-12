@@ -108,6 +108,44 @@ public actor CourseListSnapshotStore {
         return true
     }
 
+    /// Deletes the file once it is older than `CourseListSnapshotCodec.maximumAge`, whoever it
+    /// belongs to, and returns whether it did. Storage limitation (#98, PR #138): `load` only runs
+    /// when the window opens, so without this a user who only syncs from the menu bar would keep
+    /// an expired list on disk for as long as the account stays signed in.
+    ///
+    /// Nearly free when nothing is due: no file is one `stat`, and once the file's date is known
+    /// (`lastWritten`) no further read happens. A file that can't be decoded is left for `load`,
+    /// which knows the identity and reports why it discards it. Retires no epoch: the account is
+    /// still the same, and its next confirmed list may be saved again.
+    @discardableResult
+    public func removeIfExpired(now: Date = Date()) -> Bool {
+        guard let url = try? directory().appendingPathComponent(Self.fileName), FileManager.default.fileExists(atPath: url.path) else {
+            lastWritten = nil
+            return false
+        }
+        if lastWritten == nil {
+            lastWritten = try? readAnyIdentity(url)
+        }
+        guard let savedAt = lastWritten?.savedAt, CourseListSnapshotCodec.isExpired(savedAt: savedAt, now: now) else { return false }
+        lastWritten = nil
+        do {
+            try FileManager.default.removeItem(at: url)
+            return true
+        } catch {
+            return false
+        }
+    }
+
+    /// The file's snapshot whatever its identity, within the size and version limits: only its
+    /// date is used, to decide whether it is too old to keep.
+    private func readAnyIdentity(_ url: URL) throws -> CourseListSnapshot {
+        if let size = (try? FileManager.default.attributesOfItem(atPath: url.path)[.size] as? NSNumber)?.intValue, size > CourseListSnapshotCodec.maximumBytes {
+            throw CourseListSnapshotCodec.DecodeError.tooLarge
+        }
+        guard let data = try? Data(contentsOf: url) else { throw CourseListSnapshotCodec.DecodeError.unreadable }
+        return try CourseListSnapshotCodec.decodeAnyIdentity(data)
+    }
+
     /// Removes the list and any temporary file a crash left behind, and refuses from now on
     /// every save made for an epoch below `epoch` (sign-out, another university, a new sign-in).
     /// No file is not an error. The retirement holds even when the removal throws, so a failed

@@ -45,18 +45,14 @@ import OSLog
 /// The player states what happened; whether a replacement by the *same* recording counts as an
 /// end is the caller's decision, since only it knows what comes next.
 struct RecordingCheckpoint: Equatable, Sendable {
-    /// Why the position was reported.
-    enum Reason: Equatable, Sendable {
-        /// Playback paused: the student's pause, `pause()`, or the end of the lecture.
-        case paused
-        /// The player closed, by `close()` or the window's close button.
-        case closed
-        /// A newer `play` replaced this lecture; the report carries the old lecture's id.
-        case replaced
-        /// The stream stopped mid-lecture (`RecordingPlaybackFailure.duringPlayback`); the
-        /// window stays open, paused here.
-        case failed
-    }
+    /// Why the position was reported: Core's `RecordingCheckpointReason`, so the controller hands
+    /// it straight to `RecordingWatchProgress.checkpointCloses` with no app-side mapping to drift.
+    /// - `paused`: the student's pause, `pause()`, or the end of the lecture.
+    /// - `closed`: the player closed, by `close()` or the window's close button.
+    /// - `replaced`: a newer `play` replaced this lecture; the report carries the old lecture's id.
+    /// - `failed`: the stream stopped mid-lecture (`RecordingPlaybackFailure.duringPlayback`); the
+    ///   window stays open, paused here.
+    typealias Reason = RecordingCheckpointReason
 
     /// The `recordingID` of the `play` that loaded the lecture.
     let id: String

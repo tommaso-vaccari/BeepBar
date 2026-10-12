@@ -208,6 +208,7 @@ extension ShellPage {
         case .conflicts: self = .conflicts
         case .activity: self = .activity
         case .home: self = .home
+        case .recordings: self = .recordings
         }
     }
 }

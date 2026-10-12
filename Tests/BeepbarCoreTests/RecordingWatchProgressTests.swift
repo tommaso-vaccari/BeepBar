@@ -224,7 +224,9 @@ struct RecordingWatchProgressTests {
         let halves = Progress.courseSummary(thirds, entries: [:], live: ["a": 0.5, "b": 0.5, "c": 0.5])
         #expect(halves.remainingMinutes == 2, "1.5 rounded once, not 0.5 rounded three times")
 
-        #expect(Progress.courseSummary([], entries: [:], live: [:]) == CourseWatchSummary(done: 0, total: 0, remainingMinutes: 0, unknownDurationCount: 0))
+        // Typed: a bare `[]` is ambiguous between the rows and the recordings overloads.
+        let noRows: [(id: String, minutes: Int?)] = []
+        #expect(Progress.courseSummary(noRows, entries: [:], live: [:]) == CourseWatchSummary(done: 0, total: 0, remainingMinutes: 0, unknownDurationCount: 0))
         let bad = Progress.courseSummary([("a", 60)], entries: [:], live: ["a": .nan])
         #expect(bad.remainingMinutes == 60, "a non-finite live value counts as nothing watched")
         let overshoot = Progress.courseSummary([("a", 60), ("b", 60)], entries: [:], live: ["a": 1.7])

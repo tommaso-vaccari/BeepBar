@@ -114,8 +114,22 @@ public enum RecordingCheckpointReason: String, Sendable, CaseIterable {
     case failed
 }
 
-/// What a course's recordings add up to: shown as "12/30 · ~14 h" in the window and the menu bar.
-/// Stored as numbers (never as text), so it follows a language switch.
+/// What a course's recordings add up to: shown as "12/30 · ~14 h" in the window and the menu bar,
+/// plus the lecture a click on the course's menu line plays (`next`). Stored as numbers and one
+/// archive row (never as text), so it follows a language switch.
+///
+/// Persistence: the app saves `[course: CourseWatchSummary]` under the UserDefaults key
+/// `io.github.tvaccari.beepbar.recordings-watch-summary.v1` (`RecordingsController.StoredWatchSummaries`)
+/// and deletes the whole value at launch when it can't be decoded. `next` was added after that key
+/// shipped, without bumping it, so every combination of builds keeps working:
+/// - a new build reading data written by an old one finds no `next` and decodes it as nil (the
+///   menu line has nothing to play until the course's listing is loaded again);
+/// - an old build reading data written by a new one ignores the extra key, as synthesized
+///   `Decodable` does;
+/// - rolling back and forth therefore only degrades the menu to lines without a lecture to play,
+///   never to lost summaries.
+/// That is also why `next` is decoded leniently: a damaged or future-shaped `next` must cost only
+/// the shortcut, never the whole summary (and with it every course's saved line).
 public struct CourseWatchSummary: Codable, Equatable, Sendable {
     /// Recordings that are done (by playback or ticked).
     public let done: Int
@@ -126,12 +140,44 @@ public struct CourseWatchSummary: Codable, Equatable, Sendable {
     /// Recordings not done whose length is unknown: they add nothing to `remainingMinutes`, so it
     /// is an underestimate when this is above zero.
     public let unknownDurationCount: Int
+    /// The lecture to play next (`RecordingWatchProgress.nextToWatch`), nil when every lecture is
+    /// done, the course has none, or it wasn't known when the summary was made (old data, or a
+    /// summary built from rows only). Part of equality, so a saved summary is rewritten when only
+    /// the next lecture changes.
+    public let next: RecmanRecording?
 
-    public init(done: Int, total: Int, remainingMinutes: Int, unknownDurationCount: Int) {
+    public init(done: Int, total: Int, remainingMinutes: Int, unknownDurationCount: Int, next: RecmanRecording? = nil) {
         self.done = done
         self.total = total
         self.remainingMinutes = remainingMinutes
         self.unknownDurationCount = unknownDurationCount
+        self.next = next
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case done, total, remainingMinutes, unknownDurationCount, next
+    }
+
+    /// The four counts are required as before; `next` is optional and lenient (see the type's
+    /// comment): missing, null or malformed all decode as nil instead of failing the summary.
+    public init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        self.init(done: try container.decode(Int.self, forKey: .done),
+                  total: try container.decode(Int.self, forKey: .total),
+                  remainingMinutes: try container.decode(Int.self, forKey: .remainingMinutes),
+                  unknownDurationCount: try container.decode(Int.self, forKey: .unknownDurationCount),
+                  next: (try? container.decodeIfPresent(RecmanRecording.self, forKey: .next)) ?? nil)
+    }
+
+    /// Writes `next` only when there is one, so a summary without it is byte-for-byte what the
+    /// four-field version wrote.
+    public func encode(to encoder: Encoder) throws {
+        var container = encoder.container(keyedBy: CodingKeys.self)
+        try container.encode(done, forKey: .done)
+        try container.encode(total, forKey: .total)
+        try container.encode(remainingMinutes, forKey: .remainingMinutes)
+        try container.encode(unknownDurationCount, forKey: .unknownDurationCount)
+        try container.encodeIfPresent(next, forKey: .next)
     }
 }
 
@@ -216,7 +262,8 @@ public enum RecordingWatchProgress {
     /// not done, counts in `unknownDurationCount`. A length outside
     /// `0...RecmanRecording.maxPlausibleMinutes` is treated as unknown, whatever the caller passed,
     /// so a damaged row can't make the sum overflow (see `maxPlausibleMinutes`). Rows are expected
-    /// to have distinct ids, as the parser guarantees.
+    /// to have distinct ids, as the parser guarantees. Rows carry no date, so `next` is nil here:
+    /// callers that have the recordings use the `[RecmanRecording]` overload.
     public static func courseSummary(_ rows: [(id: String, minutes: Int?)], entries: [String: RecordingWatchEntry], live: [String: Double]) -> CourseWatchSummary {
         var done = 0
         var unknown = 0
@@ -241,6 +288,56 @@ public enum RecordingWatchProgress {
         let rounded = remaining.rounded()
         let remainingMinutes = rounded < Double(Int.max) ? Int(rounded) : Int.max
         return CourseWatchSummary(done: done, total: rows.count, remainingMinutes: remainingMinutes, unknownDurationCount: unknown)
+    }
+
+    /// The rows-based `courseSummary` over full archive rows, with `next` filled in by
+    /// `nextToWatch`. The window and the saved summary both go through here, so their counts and
+    /// their next lecture can never disagree. `entries` are keyed by recording id (`RecmanRecording.id`),
+    /// exactly like the rows-based overload: the caller translates its own storage identity
+    /// (the app's `RecordingsStudyState.identity`, "year:course:id") before calling, once for both.
+    /// `live` affects only `remainingMinutes`, never `next` (see `nextToWatch`).
+    public static func courseSummary(_ recordings: [RecmanRecording], entries: [String: RecordingWatchEntry], live: [String: Double]) -> CourseWatchSummary {
+        let counts = courseSummary(recordings.map { (id: $0.id, minutes: $0.minutes) }, entries: entries, live: live)
+        return CourseWatchSummary(done: counts.done, total: counts.total, remainingMinutes: counts.remainingMinutes,
+                                  unknownDurationCount: counts.unknownDurationCount, next: nextToWatch(recordings, entries: entries))
+    }
+
+    /// The lecture a click on a course's menu line plays: "the first recording I'm missing".
+    /// Product rules (approved 2026-10-12):
+    /// 1. A partially watched lecture (not done, `furthest > 0`) wins over untouched ones; among
+    ///    several, the oldest by (`recordedAt`, `id`) ascending.
+    /// 2. Otherwise the oldest lecture that is not done, by the same order.
+    /// 3. Done lectures (by playback or ticked) are never picked; a missing entry means untouched.
+    ///    Lectures of unknown or zero length are kept: they are playable.
+    /// 4. Nil when every lecture is done or there are none.
+    ///
+    /// Only stored entries count, never the player's in-memory fractions, and only whether a
+    /// lecture is done, partial or untouched, never how far into it the student is. So the choice
+    /// doesn't move on a periodic progress tick, and the saved summary isn't rewritten every ~30 s.
+    /// It does change at a checkpoint (pause, close, replacement) when an untouched lecture is first
+    /// stored with `furthest > 0` and becomes partial: that is a real change in what is missing.
+    ///
+    /// The order is total (the id breaks equal dates), so the result doesn't depend on the order of
+    /// `recordings`. `entries` are keyed by recording id, as in `courseSummary`.
+    public static func nextToWatch(_ recordings: [RecmanRecording], entries: [String: RecordingWatchEntry]) -> RecmanRecording? {
+        var partial: RecmanRecording?
+        var untouched: RecmanRecording?
+        for recording in recordings {
+            let entry = entries[recording.id] ?? .untouched
+            if entry.isCompleted { continue }
+            if entry.furthest > 0 {
+                if partial.map({ precedes(recording, $0) }) ?? true { partial = recording }
+            } else if untouched.map({ precedes(recording, $0) }) ?? true {
+                untouched = recording
+            }
+        }
+        return partial ?? untouched
+    }
+
+    /// Whether `a` comes before `b` in the archive: older first, then by id, so equal dates
+    /// still give one answer whatever the input order.
+    static func precedes(_ a: RecmanRecording, _ b: RecmanRecording) -> Bool {
+        (a.recordedAt, a.id) < (b.recordedAt, b.id)
     }
 
     /// One menu bar line, e.g. "Analisi 2 — 12/30 · ~14 h", in both languages so the caller can

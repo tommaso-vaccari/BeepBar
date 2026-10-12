@@ -203,6 +203,12 @@ struct RecordingsListing: Equatable {
     /// Play that starts while the Settings row is already asking waits for the same answer
     /// instead of going on without an address.
     private var emailLookup: (epoch: Int, task: Task<Void, Never>)?
+    /// The WeBeep account the in-memory address (or the profile lookup) belongs to. Needed because
+    /// an address can exist before any Polimi session does (the Settings field or a Play read the
+    /// profile, or the student typed one, while the Polimi sign-in never completed): then
+    /// `sessionOwner` is nil, and without this an account change would keep the previous
+    /// account's address and send it to Webex for the new one (PR #152 review, P0).
+    private var emailAccount: Int?
 
     private let makeBrowser: @MainActor () -> RecmanBrowsing
     private let store: RecordingsSessionStore
@@ -476,6 +482,12 @@ struct RecordingsListing: Equatable {
     /// account is dropped together with what that account had seen.
     func webBeepAccountChanged(to userID: Int) {
         loadStudy()
+        // Before the session check: an address learned with no Polimi session yet belongs to the
+        // account that was signed in then, not to this one.
+        if let emailAccount, emailAccount != userID {
+            log.notice("Polimi email belongs to another WeBeep account: dropped")
+            resetEmail()
+        }
         guard let sessionOwner, sessionOwner != userID else { return }
         log.notice("Polimi session belongs to another WeBeep account: dropped")
         supersedeInitialSessionCheck()
@@ -553,6 +565,7 @@ struct RecordingsListing: Equatable {
         guard access != .signingIn else { return }
         if hasRecovery {
             dropQueuedListings()
+            dropQueuedOpenings()
             closesBrowserWhenIdle = true
             return
         }
@@ -571,6 +584,17 @@ struct RecordingsListing: Equatable {
             if case .list(let key) = job, key != runningKey { listings[key]?.isLoading = false }
         }
         queue.removeAll { if case .list = $0 { true } else { false } }
+    }
+
+    /// Removes the clicks still waiting (Play, Open in browser, Copy link) and their spinner: with
+    /// the window closed nobody is waiting for them, and a Play would otherwise start a lecture,
+    /// a browser or a sign-in window after the recovery ahead of it (PR #152 review). The one in
+    /// flight, if any, finishes, as it did before the recovery exception.
+    private func dropQueuedOpenings() {
+        for job in queue {
+            if case .open(let recording, _, _) = job, openingRecordingID == recording.id { openingRecordingID = nil }
+        }
+        queue.removeAll { if case .open = $0 { true } else { false } }
     }
 
     /// Brings the page's courses up to date: `selected` first, then the others, which only feed
@@ -879,9 +903,17 @@ struct RecordingsListing: Equatable {
     // MARK: Native playback (#148)
 
     /// The Webex player link of a recording, from memory when it was found before.
-    private func playerLink(for recording: RecmanRecording, browser: RecmanBrowsing) async throws -> URL {
+    private func playerLink(for recording: RecmanRecording, browser: RecmanBrowsing, found: URL? = nil) async throws -> URL {
+        if let found { return found }
         if let cached = playbackURLs[recording.id] { return cached }
         return try await browser.playbackURL(for: recording)
+    }
+
+    /// What actually failed in a stream lookup, and the player link it had found by then, if any
+    /// (`RecmanStreamFailure`). Every decision and log line reads the cause, never the wrapper.
+    nonisolated static func streamFailureCause(_ error: Error) -> (cause: Error, player: URL?) {
+        if let failure = error as? RecmanStreamFailure { return (failure.underlying, failure.player) }
+        return (error, nil)
     }
 
     /// What a failed stream lookup means for a Play. Pure, so it is tested without a browser.
@@ -1003,11 +1035,12 @@ struct RecordingsListing: Equatable {
             stream = try await browser.stream(for: recording, email: confirmedEmail)
         } catch {
             guard generation == self.generation else { return }
-            let diagnosis = Self.playDiagnosis(error)
+            let (cause, found) = Self.streamFailureCause(error)
+            let diagnosis = Self.playDiagnosis(cause)
             PlaybackDiagnostics.log.notice("\(diagnosis, privacy: .public)")
-            guard Self.streamFailureOutcome(error) == .browser else { throw error }
+            guard Self.streamFailureOutcome(cause) == .browser else { throw cause }
             log.notice("Native playback not available: opening the browser")
-            let url = try await playerLink(for: recording, browser: browser)
+            let url = try await playerLink(for: recording, browser: browser, found: found)
             guard generation == self.generation else { return }
             playbackURLs[recording.id] = url
             if request == openingRequest { finishOpening(recording, url: url, action: .play) }
@@ -1169,6 +1202,8 @@ struct RecordingsListing: Equatable {
     }
 
     private func recoverPlayback(_ recording: RecmanRecording, _ recovery: Recovery, browser: RecmanBrowsing, generation: Int) async throws {
+        // The player link a failed fresh-stream lookup already found, for the browser below.
+        var found: URL?
         if case .freshStream(let position) = recovery {
             guard stillShowing(recording) else { return }
             recoveredLectures.insert(recording.id)
@@ -1183,13 +1218,15 @@ struct RecordingsListing: Equatable {
                 return
             } catch {
                 guard generation == self.generation else { return }
-                let diagnosis = "play: recovery stream failed reason=\(Self.playFailureReason(error).rawValue) error=\(PlaybackDiagnostics.errorName(error))"
+                let (cause, player) = Self.streamFailureCause(error)
+                found = player
+                let diagnosis = "play: recovery stream failed reason=\(Self.playFailureReason(cause).rawValue) error=\(PlaybackDiagnostics.errorName(cause))"
                 PlaybackDiagnostics.log.notice("\(diagnosis, privacy: .public)")
-                if error is CancellationError || (error as? RecmanBrowserError) == .needsSignIn { throw error }
-                if (error as? RecmanBrowserError) == .needsEmail {
+                if cause is CancellationError || (cause as? RecmanBrowserError) == .needsSignIn { throw cause }
+                if (cause as? RecmanBrowserError) == .needsEmail {
                     // Same decision as for Play: no Webex page for the student, only the sentence.
                     // The window stays, paused at the place it stopped.
-                    openingProblem = RecordingsProblem(error)
+                    openingProblem = RecordingsProblem(cause)
                     log.notice("Fresh stream needs a confirmed email")
                     return
                 }
@@ -1197,7 +1234,7 @@ struct RecordingsListing: Equatable {
             }
         }
         do {
-            let url = try await playerLink(for: recording, browser: browser)
+            let url = try await playerLink(for: recording, browser: browser, found: found)
             guard generation == self.generation else { return }
             playbackURLs[recording.id] = url
             // The window of a lecture that can't continue is no use next to the browser. Closing
@@ -1411,6 +1448,7 @@ struct RecordingsListing: Equatable {
         guard confirmedEmail == nil, !emailEditedByUser, !suggestionAttempted,
               !emailDeclined(by: sessionOwner ?? ownerUserID()) else { return }
         suggestionAttempted = true
+        emailAccount = sessionOwner ?? ownerUserID()
         let raw = await fetchProfileEmail()
         // A reset (turn-off, account change) already cleared the flag for its own cycle.
         guard epoch == emailEpoch else { return }
@@ -1444,6 +1482,7 @@ struct RecordingsListing: Equatable {
         emailFromProfile = false
         emailEditedByUser = true
         let owner = sessionOwner ?? ownerUserID()
+        emailAccount = owner
         // A removal is remembered for the account, so the profile's address doesn't come back
         // at the next launch (the empty file alone can't say it was removed on purpose).
         if email == nil, let owner {
@@ -1476,6 +1515,7 @@ struct RecordingsListing: Equatable {
         emailEditedByUser = false
         suggestionAttempted = false
         emailLookup = nil
+        emailAccount = nil
     }
 
     // MARK: Browser and session file
@@ -1562,6 +1602,7 @@ struct RecordingsListing: Equatable {
             if fileEmail != confirmedEmail { emailFromProfile = false }
             confirmedEmail = fileEmail
         }
+        emailAccount = snapshot.ownerUserID
         emailLoaded = true
         return snapshot.cookies
     }

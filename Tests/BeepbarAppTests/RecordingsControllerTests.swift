@@ -2621,6 +2621,110 @@ struct RecordingsControllerTests {
         controller.turnOff()
     }
 
+    /// PR #152 review P0: an address learned while no Polimi session exists yet (sign-in never
+    /// finished) belongs to the WeBeep account signed in then. After an account change it must
+    /// not be shown, written into the next account's session file or sent to Webex as its
+    /// sign-in hint. Mutation: remove the `emailAccount` check in `webBeepAccountChanged` and the
+    /// old address stays, is saved with the new session and reaches `stream`.
+    @Test(arguments: ["profile", "typed"])
+    func anAddressLearnedBeforeAnyPolimiSessionStaysWithItsAccount(source: String) async throws {
+        defer { cleanUp() }
+        browser.signInError = CancellationError()
+        world.profileEmail = "previous.account@mail.polimi.it"
+        let controller = makeController()
+        controller.setEnabled(true)
+        await settle("sign-in cancelled") { controller.access == .needsSignIn(nil) }
+        if source == "profile" {
+            await controller.prepareEmailField()
+        } else {
+            #expect(controller.confirmEmail("previous.account@mail.polimi.it") == .saved)
+        }
+        #expect(controller.confirmedEmail == PolimiEmail("previous.account@mail.polimi.it"))
+        #expect(try store.load() == nil, "no session file yet: the address lives in memory only")
+
+        world.owner = 7
+        world.profileEmail = nil
+        controller.webBeepAccountChanged(to: 7)
+        #expect(controller.confirmedEmail == nil)
+        #expect(!controller.emailFromProfile)
+
+        browser.signInError = nil
+        controller.signIn()
+        await settle("signed in and closed") { controller.access == .ready && !browser.isOpen }
+        await controller.settleSessionFile()
+        #expect(try savedEmail() == nil, "the new account's session holds no address of the old one")
+        controller.pageAppeared()
+        controller.play(recording("a"))
+        await settle("stream asked") { browser.streamCalls.count == 1 }
+        #expect(browser.streamEmails == [nil])
+        controller.turnOff()
+    }
+
+    /// PR #152 review P1: closing the window while a lecture recovery runs keeps the recovery but
+    /// drops a Play clicked meanwhile: nobody is looking, and it would otherwise replace the
+    /// recovered lecture, open a browser or show a sign-in window afterwards. Mutation: remove
+    /// `dropQueuedOpenings()` from `suspend` and "b" is streamed and played.
+    @Test func closingTheWindowDropsAPlayQueuedBehindARecovery() async {
+        defer { cleanUp() }
+        browser.streamResults["a"] = [.success(stream("a")), .success(stream("a"))]
+        browser.streamResults["b"] = [.success(stream("b"))]
+        let controller = await readyController()
+        controller.play(recording("a"))
+        await settle("a playing") { world.player.plays.count == 1 }
+        let gate = FakeRecmanBrowser.Gate()
+        defer { gate.release() }
+        browser.streamGates["a"] = gate
+        world.player.failDuringPlayback(at: 700)
+        await settle("recovery running") { gate.isWaiting }
+        controller.play(recording("b"))
+        #expect(controller.openingRecordingID == "b")
+        controller.windowClosed()
+        #expect(controller.openingRecordingID == nil, "the dropped click stops spinning")
+        gate.release()
+        await settle("a resumed") { world.player.plays.count == 2 }
+        await settle("browser closed") { !browser.isOpen }
+        #expect(world.player.plays.map(\.recordingID) == ["a", "a"])
+        #expect(world.player.plays[1].startAt == 700)
+        #expect(!browser.streamCalls.contains("stream b"))
+        #expect(world.opened.isEmpty)
+        controller.turnOff()
+    }
+
+    /// PR #152 review P1: when the stream lookup fails after the archive gave the player link,
+    /// the browser fallback opens that link instead of walking the archive again, on a Play and
+    /// on a failed recovery. Mutation: drop `found:` from either `playerLink` call and the
+    /// archive is asked (`play a` appears) — and fails here, since it has no link to give.
+    @Test(arguments: ["play", "recovery"])
+    func aStreamFailureAfterTheLinkOpensThatLink(path: String) async {
+        defer { cleanUp() }
+        let failure = RecmanStreamFailure(player: playerLink("a"), underlying: RecmanBrowserError.playbackUnavailable)
+        browser.streamResults["a"] = path == "play" ? [.failure(failure)] : [.success(stream("a")), .failure(failure)]
+        let controller = await readyController()
+        controller.play(recording("a"))
+        if path == "recovery" {
+            await settle("a playing") { world.player.plays.count == 1 }
+            world.player.failDuringPlayback(at: 700)
+        }
+        await settle("browser opened") { world.opened == [playerLink("a")] }
+        #expect(browser.playCalls.isEmpty, "the archive is not walked a second time")
+        #expect(controller.openingProblem == nil)
+        controller.turnOff()
+    }
+
+    /// The wrapper never changes the decision: a lapsed Polimi session or a missing email found
+    /// after the link is still reported, not sent to the browser. Mutation: decide on the
+    /// wrapper instead of `streamFailureCause(error).cause` and the browser opens.
+    @Test func aWrappedReportedFailureIsStillReported() async {
+        defer { cleanUp() }
+        browser.streamResults["a"] = [.failure(RecmanStreamFailure(player: playerLink("a"), underlying: RecmanBrowserError.needsEmail))]
+        let controller = await readyController()
+        controller.play(recording("a"))
+        await settle("problem shown") { controller.openingProblem != nil }
+        #expect(world.opened.isEmpty)
+        #expect(browser.playCalls.isEmpty)
+        controller.turnOff()
+    }
+
     /// The controller's plumbing to the player: no player until a Play, and a policy handed over
     /// reaches it. Mutation: make `keepPolicyAfterLecture` do nothing.
     @Test func thePolicyHandOverReachesTheOpenPlayer() async {

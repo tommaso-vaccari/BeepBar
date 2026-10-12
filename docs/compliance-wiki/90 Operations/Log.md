@@ -12,6 +12,10 @@ Aggiornate mappa dei dati (file di sessione con cookie Webex ed email Polimi, po
 
 Decisione del responsabile: l'email del profilo WeBeep è usata per l'accesso a Webex senza conferma esplicita, letta al primo Play. Aggiornate mappa dei dati (riga sessione Webex/email, marcatore di rimozione per account) e C05 (manca ora un'azione dell'utente prima dell'uso: da valutare informazione e base). Analisi statica sul branch fix/rnp-email-confirmed-by-default; test e build non eseguiti (Linux). Nessuna nuova fonte esterna.
 
+## [2026-10-12] update | Riproduzione nativa verificata su macOS (PR #152)
+
+Test completi e build Release eseguiti su macOS sul branch della PR #152, dopo il merge di dev. La review indipendente ha trovato un caso in cui l'email di un account restava in memoria dopo un cambio account senza sessione Polimi: corretto, con test di regressione. Mappa e C05 aggiornate: riferimento alla PR, minimizzazione della lettura del profilo, inoltro dell'email lungo la catena idbroker → IdP Polimi da verificare. Nessuna nuova fonte esterna; la passata GDPR sul binario prima della release resta aperta.
+
 ## [2026-10-10] integrate | Preparazione integrazione in dev
 
 Allineamento a origin/dev d3a42dc: integrazione telemetria sopraggiunta rispetto a c9a04dc. Aggiunta fonte codice S-0007 e aggiornate mappa, valutazione e piano; gli snapshot originari restano immutabili. Integrazione della wiki autorizzata; passata finale GDPR prima della prossima release registrata nel piano e nel protocollo release di AGENTS.md. Nessun comportamento dell’app modificato.

@@ -27,6 +27,15 @@ enum RecmanBrowserError: Error, Equatable {
     case needsEmail
 }
 
+/// A stream lookup that failed after the archive had already given the recording's player link
+/// (PR #152 review). It carries the link, so the browser fallback opens it directly instead of
+/// walking the archive a second time (up to another page-load timeout). `underlying` is what
+/// actually failed; the controller decides on it as if it had been thrown alone.
+struct RecmanStreamFailure: Error {
+    let player: URL
+    let underlying: Error
+}
+
 /// The Recman browser as the Recordings controller sees it. `RecmanWebSession` is the real one;
 /// controller tests use a fake.
 @MainActor protocol RecmanBrowsing: AnyObject {
@@ -47,7 +56,9 @@ enum RecmanBrowserError: Error, Equatable {
     /// The recording's stream for the native player (#148): the player link as `playbackURL`
     /// finds it, then Webex's stream API, signing in to Webex once with `email` if needed. Only
     /// for a Play the user asked for: the sign-in window may appear if Webex or Polimi needs the
-    /// user. Throws `playbackUnavailable` when the browser should open the player instead.
+    /// user. Throws `playbackUnavailable` when the browser should open the player instead. A
+    /// failure after the player link was found may come wrapped in `RecmanStreamFailure`, which
+    /// hands the link back for that fallback.
     func stream(for recording: RecmanRecording, email: PolimiEmail?) async throws -> RecordingStream
     /// Stops whatever is running and discards the browser and its cookies.
     func close()
@@ -252,7 +263,11 @@ enum RecmanBrowserError: Error, Equatable {
             throw error
         }
         diagnose("stream: step=archive-player-link found form=\(WebexPlayerLink.isLoader(player) ? "loader" : "other")")
-        return try await stream(player: player, email: email)
+        do {
+            return try await stream(player: player, email: email)
+        } catch {
+            throw RecmanStreamFailure(player: player, underlying: error)
+        }
     }
 
     /// The stream of the player link `player`, as an operation of its own: the second half of

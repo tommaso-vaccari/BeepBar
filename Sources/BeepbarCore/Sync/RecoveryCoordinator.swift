@@ -91,7 +91,7 @@ public actor RecoveryCoordinator {
         switch (old, new) {
         case (.directory, .missing):
             guard try await fileStore.topLevelDirectoryIdentity(move.oldFolder) == managedDirectory else { return .unresolved }
-            try await fileStore.renameTopLevelDirectory(from: move.oldFolder, to: move.newFolder)
+            try await fileStore.renameTopLevelDirectory(from: move.oldFolder, to: move.newFolder, expectedIdentity: managedDirectory)
             guard try await fileStore.topLevelDirectoryIdentity(move.newFolder) == managedDirectory else { return .unresolved }
             try await database.commitScopeMove(move)
             return .recovered

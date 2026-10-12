@@ -483,11 +483,19 @@ public actor FileStore {
         return existing
     }
 
-    public func renameTopLevelDirectory(from old: String, to new: String) throws {
+    public func renameTopLevelDirectory(from old: String, to new: String, expectedIdentity: DirectoryIdentity? = nil) throws {
         guard isSafeTopLevelName(old), isSafeTopLevelName(new) else { throw FileStoreError.invalidStage }
         let oldFD = openat(rootFD, old, O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW)
         guard oldFD >= 0 else { throw fileStoreError() }
         defer { close(oldFD) }
+        if let expectedIdentity {
+            let identity = try Self.identity(of: oldFD)
+            guard DirectoryIdentity(device: identity.device, inode: identity.inode) == expectedIdentity else { throw FileStoreError.invalidStage }
+            var current = stat()
+            guard fstatat(rootFD, old, &current, AT_SYMLINK_NOFOLLOW) == 0 else { throw fileStoreError() }
+            guard (current.st_mode & S_IFMT) == S_IFDIR,
+                  Int64(current.st_dev) == expectedIdentity.device, UInt64(current.st_ino) == expectedIdentity.inode else { throw FileStoreError.invalidStage }
+        }
         guard renameatx_np(rootFD, old, rootFD, new, UInt32(RENAME_EXCL)) == 0 else { throw fileStoreError() }
         guard fsync(rootFD) == 0 else { throw fileStoreError() }
     }

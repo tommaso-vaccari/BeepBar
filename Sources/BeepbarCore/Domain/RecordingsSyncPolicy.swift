@@ -40,7 +40,14 @@ import Foundation
 /// | `synchronizeNow`, `RootOperationGateError` → `busySync` (`.failed(.local)`) | `.localFailure` |
 /// | `synchronizeNow`, recovery blocked, nothing selected (`.readyUnchecked`) or no folder (`.needsFolder`) | `.notRun(.skipUnconfigured)` |
 /// | `synchronizeNow` returning early because another operation is active | no follow-up at all (nothing ended) |
+/// | Superseded run: the `activeOperationID == operationID else { return }` guards in `synchronizeNow` (after `bootstrapTask` and after the course-list refresh) and at the top of `completeSync` / `failedSync` (a sign-out, site change or folder change happened mid-run) | no follow-up at all (nothing ended for this operation; whatever replaced it decides for itself) |
 /// | `handleCredentialStorageError` (`.absent`/`.corrupt`: effectively signed out, list forgotten; `.write`: `credentialUnavailable`), from `synchronizeNow` or `runAutomaticSync` | `.accountUnavailable` |
+///
+/// "No follow-up at all" deliberately has no case here, not even a skipping one: a superseded or
+/// never-started operation has no outcome, so the app must not call `RecordingsSyncPolicy.decision`
+/// for it. The app's mapping should therefore return `RecordingsMaterialsOutcome?`, with nil for
+/// those rows and the follow-up started only for a non-nil value; that way the "nothing ended"
+/// rows can't fall into a default of their own.
 public enum RecordingsMaterialsOutcome: Sendable, Equatable {
     /// Completed, with or without new files.
     case synced

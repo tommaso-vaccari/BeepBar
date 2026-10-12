@@ -278,7 +278,7 @@ struct RecordingsSyncPolicyTests {
     @Test func courseSummaryCarriesNewCount() {
         let rows = [Self.lecture]
         let with = RecordingWatchProgress.courseSummary(recordings: rows, entries: [:], live: [:], newCount: 1)
-        let without = RecordingWatchProgress.courseSummary(recordings: rows, entries: [:], live: [:])
+        let without = RecordingWatchProgress.courseSummary(recordings: rows, entries: [:], live: [:], newCount: nil)
         #expect(with.newCount == 1)
         #expect(without.newCount == nil)
         #expect(with == without.withNewCount(1), "only newCount differs: counts and next are the same")

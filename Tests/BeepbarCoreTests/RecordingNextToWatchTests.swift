@@ -125,7 +125,7 @@ struct RecordingNextToWatchTests {
         let rows = [recording("a", day: 1), recording("b", day: 2, duration: "60 min"), recording("c", day: 3, duration: "n/d"), recording("d", day: 4)]
         let entries: [String: Entry] = ["a": Entry(furthest: 0.2, completed: .manual), "b": Entry(furthest: 0.5)]
         let live = ["b": 0.75, "d": 0.5]
-        let summary = Progress.courseSummary(recordings: rows, entries: entries, live: live)
+        let summary = Progress.courseSummary(recordings: rows, entries: entries, live: live, newCount: nil)
         let counts = Progress.courseSummary(rows.map { (id: $0.id, minutes: $0.minutes) }, entries: entries, live: live)
         #expect(summary.done == counts.done && summary.total == counts.total)
         #expect(summary.remainingMinutes == counts.remainingMinutes && summary.unknownDurationCount == counts.unknownDurationCount)
@@ -138,12 +138,12 @@ struct RecordingNextToWatchTests {
     /// Mutation: let `live` count as progress when choosing and "d" is returned instead of "a".
     @Test func liveFractionsDoNotChangeNext() {
         let rows = [recording("a", day: 1), recording("d", day: 4)]
-        let withLive = Progress.courseSummary(recordings: rows, entries: [:], live: ["d": 0.5])
-        let withoutLive = Progress.courseSummary(recordings: rows, entries: [:], live: [:])
+        let withLive = Progress.courseSummary(recordings: rows, entries: [:], live: ["d": 0.5], newCount: nil)
+        let withoutLive = Progress.courseSummary(recordings: rows, entries: [:], live: [:], newCount: nil)
         #expect(withLive.next?.id == "a")
         #expect(withLive.next == withoutLive.next)
         #expect(withLive.remainingMinutes != withoutLive.remainingMinutes, "live still counts in the time left")
-        #expect(Progress.courseSummary(recordings: rows, entries: ["d": Entry(furthest: 0.5)], live: [:]).next?.id == "d",
+        #expect(Progress.courseSummary(recordings: rows, entries: ["d": Entry(furthest: 0.5)], live: [:], newCount: nil).next?.id == "d",
                 "once the checkpoint stores it, it is partial and wins")
     }
 

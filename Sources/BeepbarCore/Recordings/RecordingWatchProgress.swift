@@ -289,7 +289,7 @@ public enum RecordingWatchProgress {
     /// `0...RecmanRecording.maxPlausibleMinutes` is treated as unknown, whatever the caller passed,
     /// so a damaged row can't make the sum overflow (see `maxPlausibleMinutes`). Rows are expected
     /// to have distinct ids, as the parser guarantees. Rows carry no date, so `next` is nil here:
-    /// callers that have the recordings use `courseSummary(recordings:entries:live:)`.
+    /// callers that have the recordings use `courseSummary(recordings:entries:live:newCount:)`.
     public static func courseSummary(_ rows: [(id: String, minutes: Int?)], entries: [String: RecordingWatchEntry], live: [String: Double]) -> CourseWatchSummary {
         var done = 0
         var unknown = 0
@@ -327,7 +327,9 @@ public enum RecordingWatchProgress {
     /// `newCount` is passed through as is (normalised by `CourseWatchSummary.init`): this function
     /// can't know which lectures are unseen, so every recompute (a progress checkpoint, a tick) must
     /// hand over the current count, or the " · N nuove" suffix silently disappears from the menu.
-    public static func courseSummary(recordings: [RecmanRecording], entries: [String: RecordingWatchEntry], live: [String: Double], newCount: Int? = nil) -> CourseWatchSummary {
+    /// Required, with no default, for that reason: a caller has to decide, and pass nil only when
+    /// it really has no count.
+    public static func courseSummary(recordings: [RecmanRecording], entries: [String: RecordingWatchEntry], live: [String: Double], newCount: Int?) -> CourseWatchSummary {
         let counts = courseSummary(recordings.map { (id: $0.id, minutes: $0.minutes) }, entries: entries, live: live)
         return CourseWatchSummary(done: counts.done, total: counts.total, remainingMinutes: counts.remainingMinutes,
                                   unknownDurationCount: counts.unknownDurationCount, next: nextToWatch(recordings, entries: entries),

@@ -113,7 +113,7 @@ Al primo sync dopo l'aggiornamento, i file che il professore aveva rimosso da Mo
 
 | Azione | Cosa succede |
 |---|---|
-| Rinomini la cartella di un corso | Viene rinominata sul disco; BeepBar continua a seguire tutti i file. Se il nome è già occupato, lo dice e non cambia nulla |
+| Rinomini la cartella di un corso | Viene rinominata sul disco; BeepBar continua a seguire tutti i file anche dopo un ripristino o una copia che ha cambiato l’identità della cartella. La cartella viene ricontrollata prima di spostarla. Se il nome è già occupato, lo dice e non cambia nulla |
 | "Organizza cartelle": dai una cartella a un modulo | Anteprima, poi sposta i file del modulo; quelli modificati vengono spostati senza essere sovrascritti; una destinazione occupata blocca l'operazione |
 | "Ripristina layout Moodle" | Riporta i file del modulo nella struttura di Moodle, con la stessa anteprima |
 

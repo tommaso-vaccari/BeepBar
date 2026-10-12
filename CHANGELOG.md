@@ -24,6 +24,8 @@
 
 ### Fixed
 
+- Renaming a course folder works after restoring or copying your files to another Mac, without extra prompts and while keeping your files tracked.
+
 - Old lecture recordings stay marked as seen even after browsing more than 5,000 recordings across courses. After updating, recordings forgotten by earlier versions may still need “Mark as seen”.
 
 - Unexpectedly large course responses stop downloading promptly, keeping memory use bounded while your saved materials remain protected.

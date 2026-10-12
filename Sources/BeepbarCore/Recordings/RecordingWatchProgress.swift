@@ -144,6 +144,10 @@ public struct CourseWatchSummary: Codable, Equatable, Sendable {
     /// done, the course has none, or it wasn't known when the summary was made (old data, or a
     /// summary built from rows only). Part of equality, so a saved summary is rewritten when only
     /// the next lecture changes.
+    ///
+    /// When decoded from storage this is untrusted input (UserDefaults can be edited, or written
+    /// by another build): a caller must re-validate it before use, e.g. check it belongs to the
+    /// course and that `previewURL` passes `RecmanURLPolicy`, never open it as is.
     public let next: RecmanRecording?
 
     public init(done: Int, total: Int, remainingMinutes: Int, unknownDurationCount: Int, next: RecmanRecording? = nil) {
@@ -160,13 +164,14 @@ public struct CourseWatchSummary: Codable, Equatable, Sendable {
 
     /// The four counts are required as before; `next` is optional and lenient (see the type's
     /// comment): missing, null or malformed all decode as nil instead of failing the summary.
+    /// `try?` flattens the optional (SE-0230), so no `?? nil` is needed.
     public init(from decoder: Decoder) throws {
         let container = try decoder.container(keyedBy: CodingKeys.self)
         self.init(done: try container.decode(Int.self, forKey: .done),
                   total: try container.decode(Int.self, forKey: .total),
                   remainingMinutes: try container.decode(Int.self, forKey: .remainingMinutes),
                   unknownDurationCount: try container.decode(Int.self, forKey: .unknownDurationCount),
-                  next: (try? container.decodeIfPresent(RecmanRecording.self, forKey: .next)) ?? nil)
+                  next: try? container.decodeIfPresent(RecmanRecording.self, forKey: .next))
     }
 
     /// Writes `next` only when there is one, so a summary without it is byte-for-byte what the
@@ -263,7 +268,7 @@ public enum RecordingWatchProgress {
     /// `0...RecmanRecording.maxPlausibleMinutes` is treated as unknown, whatever the caller passed,
     /// so a damaged row can't make the sum overflow (see `maxPlausibleMinutes`). Rows are expected
     /// to have distinct ids, as the parser guarantees. Rows carry no date, so `next` is nil here:
-    /// callers that have the recordings use the `[RecmanRecording]` overload.
+    /// callers that have the recordings use `courseSummary(recordings:entries:live:)`.
     public static func courseSummary(_ rows: [(id: String, minutes: Int?)], entries: [String: RecordingWatchEntry], live: [String: Double]) -> CourseWatchSummary {
         var done = 0
         var unknown = 0
@@ -295,8 +300,9 @@ public enum RecordingWatchProgress {
     /// their next lecture can never disagree. `entries` are keyed by recording id (`RecmanRecording.id`),
     /// exactly like the rows-based overload: the caller translates its own storage identity
     /// (the app's `RecordingsStudyState.identity`, "year:course:id") before calling, once for both.
-    /// `live` affects only `remainingMinutes`, never `next` (see `nextToWatch`).
-    public static func courseSummary(_ recordings: [RecmanRecording], entries: [String: RecordingWatchEntry], live: [String: Double]) -> CourseWatchSummary {
+    /// `live` affects only `remainingMinutes`, never `next` (see `nextToWatch`). Labelled, unlike
+    /// the rows overload, so a call can't silently resolve to the rows version and lose `next`.
+    public static func courseSummary(recordings: [RecmanRecording], entries: [String: RecordingWatchEntry], live: [String: Double]) -> CourseWatchSummary {
         let counts = courseSummary(recordings.map { (id: $0.id, minutes: $0.minutes) }, entries: entries, live: live)
         return CourseWatchSummary(done: counts.done, total: counts.total, remainingMinutes: counts.remainingMinutes,
                                   unknownDurationCount: counts.unknownDurationCount, next: nextToWatch(recordings, entries: entries))
@@ -308,6 +314,8 @@ public enum RecordingWatchProgress {
     ///    several, the oldest by (`recordedAt`, `id`) ascending.
     /// 2. Otherwise the oldest lecture that is not done, by the same order.
     /// 3. Done lectures (by playback or ticked) are never picked; a missing entry means untouched.
+    ///    An un-ticked lecture is not done and keeps its furthest point, so with `furthest > 0` it
+    ///    is partial (whatever `autoCompletionBlocked` says) and wins like any other partial one.
     ///    Lectures of unknown or zero length are kept: they are playable.
     /// 4. Nil when every lecture is done or there are none.
     ///

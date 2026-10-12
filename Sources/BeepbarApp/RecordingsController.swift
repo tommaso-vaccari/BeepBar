@@ -108,6 +108,19 @@ struct RecordingsListing: Equatable {
 ///   never logged, and is deleted with the file.
 /// - **A failed lecture is recovered once.** A stream that dies mid-lecture is resolved again and
 ///   resumes where it stopped; after that, or if it never started, the browser opens.
+///
+/// Watch progress (how much of each lecture was watched, and whether it is done; rules in Core's
+/// `RecordingWatchProgress`). What this class keeps, each guarded by `RecordingsWatchProgressTests`:
+/// - **Ticks stay in memory.** While a lecture plays, the player's ~30 s ticks move the window's
+///   bar (`watchProgress.live`) and write nothing, neither the database nor the settings.
+/// - **Saved at checkpoints only, and only when something changed**: pause, close, replacement,
+///   failure, and the student's tick. One serial write chain keeps them in order.
+/// - **Done only when the lecture ends** (closed, or replaced by another lecture) at 90 % or
+///   more, or ticked. Recovery and Play again on the same lecture are not an end.
+/// - **Belongs to the account**, like seen state: turn-off, disconnect and account change forget
+///   it, and a write that finishes afterwards is never shown.
+/// - **The menu's summary changes only when the saved state does** (`watchSummaries`), never on a
+///   tick, and is stored as numbers so a language switch needs nothing.
 @MainActor final class RecordingsController: ObservableObject {
     static let enabledKey = "io.github.tvaccari.beepbar.recordings-enabled.v1"
     static let acknowledgedKey = "io.github.tvaccari.beepbar.recordings-acknowledged.v1"
@@ -117,6 +130,10 @@ struct RecordingsListing: Equatable {
     /// Where the student stopped in each lecture (`RecordingResumePoints`), for one account.
     /// Removed with the session: turn-off, disconnect and account change.
     nonisolated static let resumePointsKey = "io.github.tvaccari.beepbar.recordings-resume.v1"
+    /// The last known `CourseWatchSummary` of each course, for one account
+    /// (`StoredWatchSummaries`), so the menu bar can show it without a network request or a
+    /// controller. Written only when a value changes; removed with the session.
+    nonisolated static let watchSummaryKey = "io.github.tvaccari.beepbar.recordings-watch-summary.v1"
     /// A course shown again within this time isn't asked for again unless the user refreshes.
     static let freshness: TimeInterval = 300
 
@@ -160,6 +177,62 @@ struct RecordingsListing: Equatable {
     private var closesBrowserWhenIdle = false
     /// A recovery job is executing (it has left the queue).
     private var runningRecovery = false
+
+    // MARK: Watch progress state
+
+    /// What the window draws of watch progress. Separate from this controller so a tick doesn't
+    /// re-evaluate every view observing the controller (see the model's comment).
+    let watchProgress = RecordingsWatchProgressModel()
+    /// The playing session of each lecture in `nowPlaying`, by recording id. Memory only. A
+    /// session is the unit of the un-tick crossing rule, so it survives a recovery and a Play
+    /// again of the same lecture (neither is an end) and goes when the lecture ends.
+    private var sessions: [String: LiveWatchSession] = [:]
+    /// Numbers sessions, so a failed checkpoint is superseded only by a later one of its session.
+    private var sessionSerial = 0
+    /// The recording id handed to `player.play` while that call runs, nil otherwise. The player
+    /// reports the lecture it replaces synchronously inside `play`, before anything else changes:
+    /// this is the only way that report can tell a different lecture (an end) from the same one
+    /// re-played (recovery, Play again), which is not an end. Main actor only.
+    private var pendingPlayID: String?
+    /// The tail of the serial chain of progress writes. Separate tasks calling an actor are not
+    /// ordered, so each write awaits the previous one: a tick, an un-tick and a close must commit
+    /// in the order they happened. Never cancelled by closing the page or the player: the store
+    /// refuses an event from a cancelled task (`RecordingsSeenHistory.applyProgress`), and a final
+    /// checkpoint must not be lost. A reset drops it; the invalidated actor refuses what's queued.
+    private var progressChain: Task<Void, Never>?
+    /// Checkpoints whose save failed (a disk error), by session serial: retried before the next
+    /// checkpoint, never with a timer and never with a banner, at most `maxUnsavedCheckpoints`.
+    /// A newer checkpoint of the same session supersedes the old one (its session includes
+    /// everything the old one saw), so this holds at most one event per session.
+    ///
+    /// A retry runs *after* writes queued since the failure, so it is out of order by design.
+    /// That is safe for furthest (it never goes down) and for completion of a lecture not
+    /// un-ticked meanwhile; an un-tick in between is handled by `untickCounts`: the retried
+    /// session's crossing is forgotten, so an old close can't undo the student's later choice.
+    private var unsavedCheckpoints: [Int: UnsavedCheckpoint] = [:]
+    /// How many un-ticks were queued per identity in this account's lifetime. A checkpoint
+    /// records the count when queued; a retry that finds it changed was overtaken by an un-tick.
+    private var untickCounts: [String: Int] = [:]
+    /// The last saved summary of each course, for the menu bar (package F reads it through
+    /// `onWatchSummaryChange` and `storedWatchSummaries(in:owner:)`). Changes only when a listing
+    /// is published or a progress write commits, never on a tick: the in-memory position moves
+    /// only `watchProgress.summaries`. A course absent here is unknown, never "0/0".
+    ///
+    /// `[:]` before the first store in this launch does NOT mean "no summaries": the saved ones
+    /// are read lazily, at the first change (`storeWatchSummary`). The menu must seed itself from
+    /// `storedWatchSummaries(in:owner:)` and take pushes as updates; only the `[:]` pushed by a
+    /// reset (`forgetSeen`) means the account's summaries are gone.
+    private(set) var watchSummaries: [RecmanCourseKey: CourseWatchSummary] = [:] {
+        didSet { if watchSummaries != oldValue { onWatchSummaryChange?(watchSummaries) } }
+    }
+    /// Pushed from the main actor whenever `watchSummaries` changes (the pattern of
+    /// `WeBeepAuthenticationController.onMenuBarSymbolChange`): the menu never asks this
+    /// controller from an AppKit callback. Each push is the full dictionary of courses known *in
+    /// this controller*; see `watchSummaries` for why the first one is not the whole picture
+    /// unless it follows a read of the saved summaries.
+    var onWatchSummaryChange: (@MainActor ([RecmanCourseKey: CourseWatchSummary]) -> Void)?
+    /// The account `watchSummaries` was read for; nil until the first use with a known account.
+    private var watchSummaryOwner: Int?
 
     /// The Polimi address the student confirmed for the Webex sign-in; lives in the session file.
     @Published private(set) var confirmedEmail: PolimiEmail? = nil
@@ -702,8 +775,20 @@ struct RecordingsListing: Equatable {
         for key in [Self.acknowledgedKey, Self.baselinedKey] where defaults.object(forKey: key) != nil { defaults.removeObject(forKey: key) }
     }
 
+    /// Forgets the account's history: seen state and watch progress (which share the namespace),
+    /// the window's progress model, the playing sessions, the progress writes still queued (their
+    /// actor is invalidated below, so they are refused, and a late commit fails the identity check
+    /// in `commitProgress`), and the persisted menu summary.
     private func forgetSeen() {
         for key in listings.keys { listings[key]?.seenIDs = nil }
+        watchProgress.reset()
+        sessions = [:]
+        unsavedCheckpoints = [:]
+        untickCounts = [:]
+        progressChain = nil
+        watchSummaryOwner = nil
+        watchSummaries = [:]
+        if defaults.object(forKey: Self.watchSummaryKey) != nil { defaults.removeObject(forKey: Self.watchSummaryKey) }
         historyRevision = [:]
         pendingAcknowledgements = [:]
         pendingAcknowledgementIDs = [:]
@@ -895,18 +980,24 @@ struct RecordingsListing: Equatable {
         // Before the call: the lecture this one replaces reports its position inside `play`.
         nowPlaying[recording.id] = recording
         currentLectureID = recording.id
+        // The replaced lecture's report inside `play` reads this to tell an end from a re-play.
+        pendingPlayID = recording.id
         player.play(stream.url, title: recording.title.isEmpty ? (stream.title ?? "") : recording.title, cookies: [], startAt: startAt, recordingID: recording.id)
+        pendingPlayID = nil
         nowPlaying = nowPlaying.filter { $0.key == recording.id }
         recoveredLectures = recoveredLectures.intersection(nowPlaying.keys)
+        startWatchSession(for: recording, at: startAt ?? 0, streamDuration: stream.duration)
     }
 
     private func currentPlayer() -> RecordingPlaying {
         if let player { return player }
         let player = makePlayer()
-        // Every reason is handled alike for now: the resume point only needs where the student
-        // stopped. The reason (and `onProgress`) are for watch progress.
+        // Both arrive on the main actor (the player hops before calling them).
         player.onPositionCheckpoint = { [weak self] checkpoint in
-            self?.playerCheckpoint(id: checkpoint.id, position: checkpoint.position, duration: checkpoint.duration)
+            self?.playerCheckpoint(checkpoint)
+        }
+        player.onProgress = { [weak self] id, position, duration in
+            self?.playerProgress(id: id, position: position, duration: duration)
         }
         player.onFailure = { [weak self] id, failure in
             self?.playerFailed(id: id, failure: failure)
@@ -929,6 +1020,8 @@ struct RecordingsListing: Equatable {
         nowPlaying = [:]
         currentLectureID = nil
         recoveredLectures = []
+        // The sessions belong to the account going away; `forgetSeen` clears the rest.
+        sessions = [:]
         player?.close()
     }
 
@@ -960,11 +1053,14 @@ struct RecordingsListing: Equatable {
         return loadedResumePoints(owner: owner).position(for: RecordingsStudyState.identity(recording))
     }
 
-    /// The player's report of where the student stopped. Written only when it changes what is
-    /// stored; a lecture watched to the end is forgotten and counts as seen.
-    private func playerCheckpoint(id: String, position: TimeInterval, duration: TimeInterval?) {
+    /// The player's report of where the student stopped. The resume point is written only when it
+    /// changes what is stored; a lecture watched to the end is forgotten and counts as seen. The
+    /// same report is a watch-progress checkpoint (`recordWatchCheckpoint`).
+    private func playerCheckpoint(_ checkpoint: RecordingCheckpoint) {
+        let id = checkpoint.id
         guard let recording = nowPlaying[id], let owner = resumeOwner() else { return }
-        let update = RecordingPlaybackProgress.update(position: position, duration: duration)
+        recordWatchCheckpoint(checkpoint, of: recording, owner: owner)
+        let update = RecordingPlaybackProgress.update(position: checkpoint.position, duration: checkpoint.duration)
         var points = loadedResumePoints(owner: owner)
         if points.apply(update, for: RecordingsStudyState.identity(recording)) {
             resumePoints = points
@@ -996,10 +1092,309 @@ struct RecordingsListing: Equatable {
         if defaults.object(forKey: Self.resumePointsKey) != nil { defaults.removeObject(forKey: Self.resumePointsKey) }
     }
 
+    // MARK: Watch progress
+
+    /// One lecture's playing session, numbered so a failed save can be superseded by a later
+    /// checkpoint of the same session only.
+    private struct LiveWatchSession {
+        let serial: Int
+        /// `RecordingsStudyState.identity` of the lecture, for its live value in the model.
+        let identity: String
+        var progress: RecordingWatchSession
+    }
+
+    /// A checkpoint whose save failed, kept for the next checkpoint (`unsavedCheckpoints`).
+    /// `owner` travels with the event and is checked again at commit (`isCurrentIdentity`), so a
+    /// retry can never be written under another account, even across an account change that
+    /// doesn't go through `forgetSeen` (no saved Polimi session; see `webBeepAccountChanged`).
+    private struct UnsavedCheckpoint {
+        let recording: RecmanRecording
+        let owner: Int
+        var event: RecordingProgressEvent
+        /// `untickCounts[identity]` when the event was queued: see `retryUnsavedCheckpoints`.
+        var untickEpoch: Int
+    }
+
+    /// At most this many failed checkpoints are kept for a retry (the most recent sessions). Under
+    /// a disk that keeps failing each ended lecture would add one and every checkpoint re-queue
+    /// them all (principle 6); a lecture dropped here loses only its unsaved progress, never a
+    /// done mark (those are the student's ticks, which report their failure instead).
+    static let maxUnsavedCheckpoints = 20
+
+    /// Whether the student can tick lectures: on, and the account known (rows are keyed by it).
+    var canEditProgress: Bool { resumeOwner() != nil }
+
+    /// Starts (or continues) the session of the lecture just handed to the player, observing
+    /// where it starts. A recovery or a Play again of the same lecture continues its session:
+    /// neither ends the lecture, so a crossing seen before it still counts at the close. Sessions
+    /// of lectures no longer in `nowPlaying` go (a stream that never started reports nothing).
+    /// `start` is 0 from the beginning; with no known length (neither the stream's nor the
+    /// archive's) the session starts unobserved (`RecordingWatchSession(start: nil)`).
+    ///
+    /// The start is not published as a live value: a stream that never becomes ready reports
+    /// nothing (no tick, no checkpoint), and a live value set here would linger on the row and in
+    /// the summary as a percentage nobody saved. The first tick or checkpoint shows it.
+    private func startWatchSession(for recording: RecmanRecording, at start: TimeInterval, streamDuration: TimeInterval?) {
+        // A lecture closed before it was ready leaves the player without a report: its session
+        // goes when another lecture takes its place.
+        for (id, gone) in sessions where nowPlaying[id] == nil {
+            sessions[id] = nil
+            watchProgress.setLive(nil, for: gone.identity)
+        }
+        guard resumeOwner() != nil else { return }
+        let fraction = RecordingWatchProgress.fraction(position: start, playerDuration: streamDuration, archiveMinutes: recording.minutes)
+        if var session = sessions[recording.id] {
+            if let fraction { session.progress.observe(fraction) }
+            sessions[recording.id] = session
+        } else {
+            sessions[recording.id] = newSession(for: recording, start: fraction)
+        }
+    }
+
+    /// The stream of `id` never started (`RecordingPlaybackFailure.beforeReady`): the player
+    /// closed its window without a report, so the session ends here, with nothing to save. Kept
+    /// otherwise, a Play of the same lecture after the browser fallback would continue it.
+    private func endWatchSessionBeforeReady(_ id: String) {
+        guard let gone = sessions.removeValue(forKey: id) else { return }
+        watchProgress.setLive(nil, for: gone.identity)
+    }
+
+    /// A periodic tick from the playing lecture: memory only. Moves the window's bar and the
+    /// course's live summary; never a write, never `watchSummaries` (the menu changes at
+    /// checkpoints only). Refused for a lecture no longer playing or an unknown account.
+    private func playerProgress(id: String, position: TimeInterval, duration: TimeInterval?) {
+        guard let recording = nowPlaying[id], resumeOwner() != nil,
+              let fraction = RecordingWatchProgress.fraction(position: position, playerDuration: duration, archiveMinutes: recording.minutes) else { return }
+        var session = sessions[id] ?? newSession(for: recording, start: nil)
+        session.progress.observe(fraction)
+        sessions[id] = session
+        publishLive(of: recording)
+    }
+
+    private func newSession(for recording: RecmanRecording, start: Double?) -> LiveWatchSession {
+        sessionSerial += 1
+        return LiveWatchSession(serial: sessionSerial, identity: RecordingsStudyState.identity(recording), progress: RecordingWatchSession(start: start))
+    }
+
+    /// The session's furthest point into the model and the course's live summary, if it moved.
+    private func publishLive(of recording: RecmanRecording) {
+        let identity = RecordingsStudyState.identity(recording)
+        let fraction = sessions[recording.id]?.progress.maxFraction
+        guard watchProgress.live[identity] != fraction else { return }
+        watchProgress.setLive(fraction, for: identity)
+        if let key = Self.courseKey(of: recording) { refreshWatchSummary(for: key, persist: false) }
+    }
+
+    /// A player checkpoint as watch progress. The checkpoint's own position is observed first:
+    /// ticks stop at a pause, so it is the only report of where the lecture really stopped. A
+    /// close, or a replacement by another lecture (`pendingPlayID`), ends the session. Then the
+    /// event goes on the write chain, after any checkpoint whose save failed earlier.
+    private func recordWatchCheckpoint(_ checkpoint: RecordingCheckpoint, of recording: RecmanRecording, owner: Int) {
+        var session = sessions[checkpoint.id] ?? newSession(for: recording, start: nil)
+        if let fraction = RecordingWatchProgress.fraction(position: checkpoint.position, playerDuration: checkpoint.duration, archiveMinutes: recording.minutes) {
+            session.progress.observe(fraction)
+        }
+        let closes = RecordingWatchProgress.checkpointCloses(reason: checkpoint.reason, reportedID: checkpoint.id, nextID: pendingPlayID)
+        sessions[checkpoint.id] = closes ? nil : session
+        if !closes { publishLive(of: recording) }
+        // This session's own older failed checkpoint is superseded by this one.
+        unsavedCheckpoints[session.serial] = nil
+        retryUnsavedCheckpoints()
+        enqueueProgress(.checkpoint(session: session.progress, closes: closes), for: recording, owner: owner, serial: session.serial,
+                        untickEpoch: untickCounts[session.identity, default: 0])
+    }
+
+    /// Re-queues every failed checkpoint, oldest session first. One overtaken by an un-tick of
+    /// its lecture (the count changed since it was queued) loses its crossing first: retried as
+    /// it was, a close seen at 95 % before the un-tick would complete the lecture again, undoing
+    /// the student's choice (`applyCheckpoint` completes a blocked lecture on a crossing).
+    private func retryUnsavedCheckpoints() {
+        for serial in unsavedCheckpoints.keys.sorted() {
+            guard var unsaved = unsavedCheckpoints.removeValue(forKey: serial) else { continue }
+            let identity = RecordingsStudyState.identity(unsaved.recording)
+            let current = untickCounts[identity, default: 0]
+            if unsaved.untickEpoch != current, case .checkpoint(var session, let closes) = unsaved.event {
+                session.resetCrossing()
+                unsaved.event = .checkpoint(session: session, closes: closes)
+                unsaved.untickEpoch = current
+            }
+            enqueueProgress(unsaved.event, for: unsaved.recording, owner: unsaved.owner, serial: serial, untickEpoch: unsaved.untickEpoch)
+        }
+    }
+
+    /// The student ticks (`done`) or un-ticks a lecture ("done / attended in person"). The row
+    /// keeps showing the saved value, disabled, until the write commits, like the "new" dots;
+    /// a failed save says so with the history banner and leaves the saved value. Un-ticking also
+    /// forgets the crossing the playing session has seen, at once rather than at commit: a close
+    /// queued behind the un-tick must already carry the reset session.
+    func setDone(_ recording: RecmanRecording, _ done: Bool) {
+        // The key first: a recording without a valid course key can't be written, and must not
+        // leave its checkbox pending forever.
+        guard let owner = resumeOwner(), Self.courseKey(of: recording) != nil else { return }
+        let identity = RecordingsStudyState.identity(recording)
+        guard !watchProgress.pending.contains(identity) else { return }
+        if !done {
+            sessions[recording.id]?.progress.resetCrossing()
+            untickCounts[identity, default: 0] += 1
+        }
+        watchProgress.setPending(true, for: identity)
+        enqueueProgress(.manual(done: done), for: recording, owner: owner, serial: nil, untickEpoch: untickCounts[identity, default: 0])
+    }
+
+    /// Appends one write to the serial chain. The task is unstructured and kept only as the next
+    /// write's predecessor: nothing cancels it, so the store's cancellation check can't drop it.
+    /// The history actor is captured now, not when the write runs: a write queued before a reset
+    /// must reach the old (invalidated) actor and be refused, never the next namespace. The
+    /// owner travels with the event too and is checked again at commit (`isCurrentIdentity`).
+    private func enqueueProgress(_ event: RecordingProgressEvent, for recording: RecmanRecording, owner: Int, serial: Int?, untickEpoch: Int) {
+        guard let key = Self.courseKey(of: recording) else { return }
+        let history = seenHistory
+        let reset = historyResetTask
+        let previous = progressChain
+        progressChain = Task { [weak self] in
+            await previous?.value
+            await reset?.value
+            await self?.commitProgress(event, for: recording, key: key, owner: owner, history: history, serial: serial, untickEpoch: untickEpoch)
+        }
+    }
+
+    /// Runs one write and publishes what it committed, only while the identity it belongs to is
+    /// still current (`isCurrentIdentity`, deliberately not the page `generation`: a pause saved
+    /// after the window closed is still this account's progress).
+    /// - `CancellationError` (before or after the commit): the identity is gone; discard silently.
+    /// - Unchanged: the stored entry is still published (it may be the first time the model
+    ///   learns it, e.g. a Watchlist row with no listing loaded, or a tick on a lecture already
+    ///   done in the store), but nothing was written, so no revision bump and no acknowledgement.
+    /// - Changed: the entry, a bumped `historyRevision` (an older listing snapshot then requeries
+    ///   instead of overwriting it), the course summary, and the "new" dot when it is done.
+    /// - Other errors: a checkpoint is kept for the next one, logged, no banner; a tick shows the
+    ///   history banner and the row keeps its saved value.
+    private func commitProgress(_ event: RecordingProgressEvent, for recording: RecmanRecording, key: RecmanCourseKey, owner: Int, history: RecordingsSeenHistory, serial: Int?, untickEpoch: Int) async {
+        let identity = RecordingsStudyState.identity(recording)
+        let isManual = if case .manual = event { true } else { false }
+        guard isCurrentIdentity(history, owner: owner) else { return }
+        let result: RecordingProgressResult
+        do {
+            result = try await history.applyProgress(owner: owner, key: key, id: recording.id, event: event)
+        } catch is CancellationError {
+            if isManual, isCurrentIdentity(history, owner: owner) { watchProgress.setPending(false, for: identity) }
+            return
+        } catch {
+            guard isCurrentIdentity(history, owner: owner) else { return }
+            if isManual {
+                watchProgress.setPending(false, for: identity)
+                listings[key]?.problem = .historyUnavailable
+                log.error("Couldn't save a lecture's done mark")
+            } else if let serial {
+                // Failures arrive in chain order, so this replaces an older failure of the same
+                // session. Retrying it later, after writes queued since, can't lower anything
+                // (furthest never decreases) and can't end the session early (a close is always a
+                // session's last event); an un-tick in between is neutralised at retry time
+                // (`retryUnsavedCheckpoints`).
+                unsavedCheckpoints[serial] = UnsavedCheckpoint(recording: recording, owner: owner, event: event, untickEpoch: untickEpoch)
+                // Keep the most recent sessions only (serials grow with time).
+                while unsavedCheckpoints.count > Self.maxUnsavedCheckpoints, let oldest = unsavedCheckpoints.keys.min() {
+                    unsavedCheckpoints[oldest] = nil
+                }
+                log.error("Couldn't save watch progress; retried at the next checkpoint")
+            }
+            return
+        }
+        // Not only a second layer behind the store's own invalidation (which reports a commit
+        // racing a reset as a cancellation): the WeBeep account can change without a reset when
+        // no Polimi session was saved, and then only this check keeps the old account's entry off
+        // the screen.
+        guard isCurrentIdentity(history, owner: owner) else { return }
+        if isManual { watchProgress.setPending(false, for: identity) }
+        // An ended session's position now lives in the entry (or never will, if the save failed
+        // and is waiting for a retry): the live value goes unless the lecture is playing again.
+        if case .checkpoint(_, true) = event, sessions[recording.id] == nil { watchProgress.setLive(nil, for: identity) }
+        let published = watchProgress.setEntry(result.entry, for: identity)
+        if result.changed { historyRevision[key, default: 0] += 1 }
+        if result.changed || published { refreshWatchSummary(for: key, persist: true) }
+        if result.changed, result.entry?.isCompleted == true { scheduleAcknowledge([recording.id], for: key) }
+    }
+
+    private static func courseKey(of recording: RecmanRecording) -> RecmanCourseKey? {
+        RecmanCourseKey(courseCode: recording.courseCode, academicYear: recording.academicYear)
+    }
+
+    /// Recomputes a loaded course's summary. The window's (`watchProgress.summaries`) includes
+    /// the playing lecture's live position; the saved one (`watchSummaries`, `persist`) uses saved
+    /// entries only, so a tick never changes the menu or writes the settings. A course whose
+    /// listing isn't loaded keeps its last saved summary.
+    private func refreshWatchSummary(for key: RecmanCourseKey, persist: Bool) {
+        guard let recordings = listings[key]?.recordings else { return }
+        let rows = recordings.map { (id: $0.id, minutes: $0.minutes) }
+        var entries: [String: RecordingWatchEntry] = [:]
+        var live: [String: Double] = [:]
+        for recording in recordings {
+            let identity = RecordingsStudyState.identity(recording)
+            entries[recording.id] = watchProgress.entries[identity]
+            live[recording.id] = watchProgress.live[identity]
+        }
+        watchProgress.setSummary(RecordingWatchProgress.courseSummary(rows, entries: entries, live: live), for: key)
+        guard persist, let owner = resumeOwner() else { return }
+        storeWatchSummary(RecordingWatchProgress.courseSummary(rows, entries: entries, live: [:]), for: key, owner: owner)
+    }
+
+    /// Saves a course's summary under `owner`, only when it differs from the saved one: a listing
+    /// or a write that changes nothing in it writes nothing.
+    private func storeWatchSummary(_ summary: CourseWatchSummary, for key: RecmanCourseKey, owner: Int) {
+        if watchSummaryOwner != owner {
+            watchSummaryOwner = owner
+            watchSummaries = Self.storedWatchSummaries(in: defaults, owner: owner) ?? [:]
+        }
+        guard watchSummaries[key] != summary else { return }
+        var updated = watchSummaries
+        updated[key] = summary
+        let stored = StoredWatchSummaries(owner: owner, courses: Dictionary(uniqueKeysWithValues: updated.map { (Self.baselineID(courseCode: $0.key.courseCode, academicYear: $0.key.academicYear), $0.value) }))
+        guard let data = try? PropertyListEncoder().encode(stored) else {
+            // Only the menu's copy is lost; the progress itself is in the database.
+            log.error("Couldn't save the recordings summary")
+            return
+        }
+        defaults.set(data, forKey: Self.watchSummaryKey)
+        watchSummaries = updated
+    }
+
+    /// What `watchSummaryKey` holds: one account's summaries, by "code-year". Numbers only, so the
+    /// menu rebuilds its text in the current language.
+    struct StoredWatchSummaries: Codable, Equatable {
+        let owner: Int
+        let courses: [String: CourseWatchSummary]
+    }
+
+    /// The saved summaries of `owner`, or nil when there are none, they are unreadable, or they
+    /// belong to another account. For the menu bar at launch, without a controller.
+    nonisolated static func storedWatchSummaries(in defaults: UserDefaults, owner: Int) -> [RecmanCourseKey: CourseWatchSummary]? {
+        guard let data = defaults.data(forKey: watchSummaryKey),
+              let stored = try? PropertyListDecoder().decode(StoredWatchSummaries.self, from: data),
+              stored.owner == owner else { return nil }
+        var result: [RecmanCourseKey: CourseWatchSummary] = [:]
+        for (id, summary) in stored.courses {
+            // "code-year": the year is after the last dash, whatever the code contains.
+            guard let dash = id.lastIndex(of: "-"), let year = Int(id[id.index(after: dash)...]),
+                  let key = RecmanCourseKey(courseCode: String(id[..<dash]), academicYear: year) else { continue }
+            result[key] = summary
+        }
+        return result
+    }
+
+    /// Removes saved summaries that don't belong to `owner`, without a controller (the pattern of
+    /// `forgetResumePoints(in:notOwnedBy:)`): an account change in a launch that never created
+    /// Recordings must not show the previous account's numbers. Unreadable data goes too.
+    nonisolated static func forgetWatchSummary(in defaults: UserDefaults, notOwnedBy owner: Int) {
+        guard let data = defaults.data(forKey: watchSummaryKey) else { return }
+        if let stored = try? PropertyListDecoder().decode(StoredWatchSummaries.self, from: data), stored.owner == owner { return }
+        defaults.removeObject(forKey: watchSummaryKey)
+    }
+
     // MARK: Recovery
 
     private func playerFailed(id: String, failure: RecordingPlaybackFailure) {
         guard isEnabled, let recording = nowPlaying[id] else { return }
+        if case .beforeReady = failure { endWatchSessionBeforeReady(id) }
         // The retry is spent when the recovery runs (`recoverPlayback`), not here: a failure
         // that can't be recovered now (no Polimi session) or a recovery that never starts must
         // not use it up.
@@ -1070,15 +1465,16 @@ struct RecordingsListing: Equatable {
         guard isCurrentHistory(history, owner: owner, generation: generation) else { return }
         do {
             let ids = recordings.map(\.id)
-            var seen: Set<String>
+            var snapshot: RecordingsHistorySnapshot
             while true {
                 let revision = historyRevision[key, default: 0]
-                seen = try await history.seen(owner: owner, key: key, ids: ids, legacy: legacy)
+                snapshot = try await history.seenAndProgress(owner: owner, key: key, ids: ids, legacy: legacy)
                 guard isCurrentHistory(history, owner: owner, generation: generation) else { return }
-                // An acknowledgement can commit/publish while this snapshot returns. Requery
-                // rather than overwrite that newer state with an older membership snapshot.
+                // An acknowledgement or a progress write can commit/publish while this snapshot
+                // returns. Requery rather than overwrite that newer state with an older snapshot.
                 if historyRevision[key, default: 0] == revision { break }
             }
+            let seen = snapshot.seen
             discardLegacyDefaults()
             var listing = listings[key] ?? RecordingsListing()
             listing.recordings = recordings
@@ -1087,9 +1483,21 @@ struct RecordingsListing: Equatable {
             listing.isLoading = queue.contains(.list(key))
             listing.problem = nil
             listing.updatedAt = now()
-            // Publish the list and its history together. A failed refresh retains the previous
-            // pair, so a newly returned list cannot use an incomplete/stale membership cache.
+            // Publish the list and its history (seen IDs and watch progress) together, in one
+            // main-actor turn. A failed refresh retains the previous triple, so a newly returned
+            // list cannot use an incomplete/stale membership cache or show 0 % for a lecture
+            // whose progress wasn't read.
             listings[key] = listing
+            var identities: [String] = []
+            var entries: [String: RecordingWatchEntry] = [:]
+            identities.reserveCapacity(recordings.count)
+            for recording in recordings {
+                let identity = RecordingsStudyState.identity(recording)
+                identities.append(identity)
+                entries[identity] = snapshot.progress[recording.id]
+            }
+            watchProgress.setEntries(entries, for: identities)
+            refreshWatchSummary(for: key, persist: true)
             updateStudy { $0.reconcile(recordings, for: key) }
         } catch {
             guard isCurrentHistory(history, owner: owner, generation: generation) else { return }
@@ -1400,6 +1808,12 @@ struct RecordingsListing: Equatable {
                 log.error("Couldn't delete the saved Polimi session errorType=\(errorType, privacy: .public)")
             }
         }
+    }
+
+    /// Waits until every progress write queued so far has finished and published. For tests,
+    /// which must prove that a write did *not* happen without guessing how long one takes.
+    func settleWatchProgress() async {
+        await progressChain?.value
     }
 
     /// Waits until the session file reflects every call made so far. For tests, which read the

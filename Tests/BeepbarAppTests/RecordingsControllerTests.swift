@@ -186,6 +186,13 @@ import BeepbarCore
         onFailure?(id, .duringPlayback(nil, position: position))
     }
 
+    /// The student closes the window before the stream is ready: the real player reports nothing
+    /// then (no settled position), and no failure either.
+    func closeBeforeReady() {
+        isOpen = false
+        current = nil
+    }
+
     /// The stream never starts: the window closes itself and the failure is reported.
     func failBeforeReady() {
         guard let id = current?.id else { return }

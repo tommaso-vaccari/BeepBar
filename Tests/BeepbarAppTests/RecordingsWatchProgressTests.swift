@@ -80,12 +80,17 @@ struct RecordingsWatchProgressTests {
         )
     }
 
-    private func recording(_ id: String, daysAgo: Double = 1) -> RecmanRecording {
-        RecmanRecording(id: id, courseCode: course.courseCode, academicYear: course.academicYear, title: "Lezione \(id)", recordedAt: world.now.addingTimeInterval(-daysAgo * 86_400), kind: "Lezione", duration: "90 min", size: nil, previewURL: URL(string: "https://onlineservices.polimi.it/x?transfer_id=\(id)")!)
+    private let other = RecmanCourseKey(courseCode: "052499", academicYear: 2026)!
+
+    /// A 90-minute lecture of `course` unless told otherwise; `duration: ""` is a row whose length
+    /// the archive doesn't give.
+    private func recording(_ id: String, daysAgo: Double = 1, in key: RecmanCourseKey? = nil, duration: String = "90 min") -> RecmanRecording {
+        let key = key ?? course
+        return RecmanRecording(id: id, courseCode: key.courseCode, academicYear: key.academicYear, title: "Lezione \(id)", recordedAt: world.now.addingTimeInterval(-daysAgo * 86_400), kind: "Lezione", duration: duration, size: nil, previewURL: URL(string: "https://onlineservices.polimi.it/x?transfer_id=\(id)")!)
     }
 
-    private func stream(_ id: String) -> RecordingStream {
-        RecordingStream(url: URL(string: "https://nfg1wss.webex.com/nbr/\(id)/hls.m3u8")!, title: nil, duration: 6_000)
+    private func stream(_ id: String, duration: TimeInterval? = 6_000) -> RecordingStream {
+        RecordingStream(url: URL(string: "https://nfg1wss.webex.com/nbr/\(id)/hls.m3u8")!, title: nil, duration: duration)
     }
 
     private func identity(_ id: String) -> String { RecordingsStudyState.identity(recording(id)) }
@@ -117,11 +122,18 @@ struct RecordingsWatchProgressTests {
         return controller
     }
 
-    private func play(_ id: String, on controller: RecordingsController) async {
+    private func play(_ id: String, on controller: RecordingsController, _ played: RecmanRecording? = nil, streamDuration: TimeInterval? = 6_000) async {
         let before = world.player.plays.count
-        browser.streamResults[id, default: []].append(.success(stream(id)))
-        controller.play(recording(id))
+        browser.streamResults[id, default: []].append(.success(stream(id, duration: streamDuration)))
+        controller.play(played ?? recording(id))
         await settle("\(id) playing") { world.player.plays.count == before + 1 }
+    }
+
+    /// Stores a resume position for `id` as an earlier launch would have.
+    private func storeResumePoint(_ id: String, at position: TimeInterval) throws {
+        var points = RecordingResumePoints(owner: 42)
+        points.apply(.remember(position), for: identity(id))
+        defaults.set(try PropertyListEncoder().encode(points), forKey: RecordingsController.resumePointsKey)
     }
 
     /// What the history file holds for `id` under `owner`, read through a separate connection to
@@ -602,6 +614,291 @@ struct RecordingsWatchProgressTests {
         #expect(!controller.watchProgress.isPending(recording("a")))
         #expect(controller.listing(for: course)?.problem == nil)
         #expect(try storedEntry("a") == nil, "the new namespace has no row")
+        controller.turnOff()
+    }
+
+    // MARK: Review fixes
+
+    /// P1-a: a close at 95 % whose save failed, retried after the student ticked and then
+    /// un-ticked the lecture, must not complete it again: the un-tick came later and wins.
+    /// Mutation: skip the crossing reset in `retryUnsavedCheckpoints` (the retry completes it).
+    @Test func aRetriedCloseCannotUndoALaterUnTick() async throws {
+        defer { cleanUp() }
+        let controller = await listedController()
+        await play("a", on: controller)
+        world.player.tick(at: 5_700)
+        fault.isFailing = true
+        world.player.close()
+        await controller.settleWatchProgress()
+        fault.isFailing = false
+        controller.setDone(recording("a"), true)
+        await controller.settleWatchProgress()
+        controller.setDone(recording("a"), false)
+        await controller.settleWatchProgress()
+        #expect(try storedEntry("a")?.completed == nil)
+
+        await play("b", on: controller)
+        world.player.pause(at: 600)
+        await controller.settleWatchProgress()
+        let entry = try #require(try storedEntry("a"))
+        #expect(entry.completed == nil, "the old close was retried without its crossing")
+        #expect(entry.autoCompletionBlocked)
+        #expect(entry.furthest == 0.95, "its furthest point is still saved")
+        #expect(!controller.watchProgress.isCompleted(recording("a")))
+    }
+
+    /// P1-b: with no listing loaded (a Watchlist row after a relaunch, offline), a tick on a
+    /// lecture already done in the store changes nothing there, yet the row must learn it is done
+    /// and become un-tickable; before any read the row is unknown, not "0 %, not done".
+    /// Mutations: publish only when `result.changed` in `commitProgress` (the row stays not
+    /// done); don't mark the identity known in `setEntry` or `setEntries`.
+    @Test func anUnchangedCommitStillTeachesTheModel() async throws {
+        defer { cleanUp() }
+        let controller = await listedController()
+        #expect(controller.watchProgress.isKnown(recording("b")), "a listed, untouched lecture is known")
+        controller.setDone(recording("a"), true)
+        await controller.settleWatchProgress()
+
+        let relaunched = makeController()
+        #expect(!relaunched.watchProgress.isKnown(recording("a")), "nothing read yet: unknown")
+        relaunched.setDone(recording("a"), true)
+        await relaunched.settleWatchProgress()
+        #expect(relaunched.watchProgress.isKnown(recording("a")))
+        #expect(relaunched.watchProgress.isCompleted(recording("a")), "the stored done mark is shown")
+        relaunched.setDone(recording("a"), false)
+        await relaunched.settleWatchProgress()
+        #expect(!relaunched.watchProgress.isCompleted(recording("a")), "and can be un-ticked")
+        #expect(try storedEntry("a")?.completed == nil)
+    }
+
+    /// Completing by playback (not only by a tick) clears the "new" dot, even when the dot
+    /// survived the Play because that acknowledgement failed. Mutation: drop the
+    /// `scheduleAcknowledge` in `commitProgress` (the dot stays).
+    @Test func completingByPlaybackClearsTheNewDot() async throws {
+        defer { cleanUp() }
+        let controller = await listedController(["a"])
+        browser.listResults[course.courseCode] = .success([recording("b", daysAgo: 0), recording("a")])
+        controller.refresh([course], selected: course, force: true)
+        await settle("b is new") { controller.newCount(for: course) == 1 }
+        fault.isFailing = true
+        await play("b", on: controller)
+        await settle("the Play's acknowledgement failed") { controller.listing(for: course)?.problem == .historyUnavailable }
+        fault.isFailing = false
+        #expect(controller.newCount(for: course) == 1)
+        world.player.tick(at: 5_700)
+        world.player.close()
+        await controller.settleWatchProgress()
+        #expect(try storedEntry("b")?.completed == .playback)
+        await settle("new dot cleared by the completion") { controller.newCount(for: course) == 0 }
+        controller.turnOff()
+    }
+
+    /// A failed checkpoint from before a turn-off is not retried after turning on again for the
+    /// same account: it belonged to the forgotten history. Mutation: don't empty
+    /// `unsavedCheckpoints` in `forgetSeen` (the old close lands in the new namespace).
+    @Test func failedCheckpointsAreForgottenWithTheHistory() async throws {
+        defer { cleanUp() }
+        let controller = await listedController()
+        await play("a", on: controller)
+        world.player.tick(at: 5_700)
+        fault.isFailing = true
+        world.player.close()
+        await controller.settleWatchProgress()
+        fault.isFailing = false
+        controller.setEnabled(false)
+        controller.setEnabled(true)
+        await settle("signed in again") { controller.access == .ready }
+        await play("b", on: controller)
+        world.player.pause(at: 600)
+        await controller.settleWatchProgress()
+        #expect(try storedEntry("b") == RecordingWatchEntry(furthest: 0.1))
+        #expect(try storedEntry("a") == nil, "nothing of the old history in the new namespace")
+        controller.turnOff()
+    }
+
+    /// A write queued before a reset goes to the history it was queued for, which refuses it,
+    /// never to the history of the reset that came in between. Mutation: read `seenHistory` when
+    /// the write runs instead of when it is queued (the second pause lands in the new namespace).
+    @Test func aQueuedWriteNeverReachesTheNextHistory() async throws {
+        defer { cleanUp() }
+        let controller = await listedController()
+        await play("a", on: controller)
+        await controller.settleWatchProgress()
+        let gate = FakeRecmanBrowser.Gate()
+        gates.before = gate
+        gates.holdCall = gates.calls + 1
+        world.player.pause(at: 3_000)
+        await settle("first pause held") { gate.isWaiting }
+        world.player.tick(at: 4_000)
+        world.player.pause(at: 4_000)
+        controller.setEnabled(false)
+        controller.setEnabled(true)
+        await settle("signed in again") { controller.access == .ready }
+        gate.release()
+        await drainTasks()
+        await drainTasks()
+        #expect(try storedEntry("a") == nil)
+        #expect(controller.watchProgress.entries.isEmpty)
+        controller.turnOff()
+    }
+
+    /// The saved summaries are read before the first change of a launch, so updating one course
+    /// keeps the others. Mutation: skip loading `storedWatchSummaries` in `storeWatchSummary`
+    /// (the relaunch's first listing drops the other course).
+    @Test func theFirstChangeAfterARelaunchKeepsOtherCourses() async throws {
+        defer { cleanUp() }
+        let controller = makeController()
+        controller.setEnabled(true)
+        await settle("sign-in finished") { controller.access == .ready && !browser.isOpen }
+        controller.pageAppeared()
+        browser.listResults[course.courseCode] = .success([recording("a")])
+        browser.listResults[other.courseCode] = .success([recording("x", in: other)])
+        controller.refresh([course, other], selected: course)
+        await settle("both listed") { controller.listing(for: course)?.recordings != nil && controller.listing(for: other)?.recordings != nil }
+        #expect(controller.watchSummaries.count == 2)
+
+        let relaunched = makeController()
+        relaunched.pageAppeared()
+        browser.listResults[course.courseCode] = .success([recording("a"), recording("b", daysAgo: 0)])
+        relaunched.refresh([course], selected: course)
+        await settle("listed after relaunch") { relaunched.listing(for: course)?.recordings?.count == 2 }
+        let stored = try #require(RecordingsController.storedWatchSummaries(in: defaults, owner: 42))
+        #expect(stored[course]?.total == 2, "the changed course is saved")
+        #expect(stored[other] == CourseWatchSummary(done: 0, total: 1, remainingMinutes: 90, unknownDurationCount: 0), "the other course is kept")
+        controller.turnOff()
+    }
+
+    /// The saved summary is computed from saved entries only: a commit while a lecture is
+    /// playing ahead of its saved point saves the summary without that live position, which only
+    /// the window shows. Mutation: pass `live` to the persisted `courseSummary` in
+    /// `refreshWatchSummary` (the saved remaining time is 45 instead of 90).
+    @Test func theSavedSummaryIgnoresTheLivePosition() async throws {
+        defer { cleanUp() }
+        let controller = await listedController()
+        await play("a", on: controller)
+        world.player.tick(at: 3_000)
+        controller.setDone(recording("b"), true)
+        await controller.settleWatchProgress()
+        #expect(controller.watchSummaries[course] == CourseWatchSummary(done: 1, total: 2, remainingMinutes: 90, unknownDurationCount: 0))
+        #expect(controller.watchProgress.summaries[course] == CourseWatchSummary(done: 1, total: 2, remainingMinutes: 45, unknownDurationCount: 0))
+        controller.turnOff()
+    }
+
+    /// A lecture closed before it was ready reports nothing; its session ends when another
+    /// lecture plays, so a later Play of it starts a fresh session. Here the first session saw
+    /// 0 % and the second, of unknown start, only 95 %: continued, they'd be a crossing that
+    /// completes the un-ticked lecture. Mutation: drop the pruning loop in `startWatchSession`.
+    @Test func aLectureClosedBeforeReadyLeavesNoSessionBehind() async throws {
+        defer { cleanUp() }
+        let unknown = recording("u", duration: "")
+        let controller = await listedController(["u", "b"])
+        controller.setDone(unknown, true)
+        await controller.settleWatchProgress()
+        controller.setDone(unknown, false)
+        await controller.settleWatchProgress()
+        await play("u", on: controller, unknown)
+        world.player.closeBeforeReady()
+        await play("b", on: controller)
+        world.player.closeBeforeReady()
+        await play("u", on: controller, unknown, streamDuration: nil)
+        world.player.tick(at: 5_700)
+        world.player.close()
+        await controller.settleWatchProgress()
+        #expect(try storedEntry("u")?.completed == nil)
+        #expect(try storedEntry("u")?.furthest == 0.95)
+        controller.turnOff()
+    }
+
+    /// A stream that never starts ends its session at once (the player closed without a report),
+    /// so a later Play of the same lecture doesn't continue it. Same crossing setup as above.
+    /// Mutation: drop `endWatchSessionBeforeReady` in `playerFailed`.
+    @Test func aStreamThatNeverStartsEndsItsSession() async throws {
+        defer { cleanUp() }
+        let unknown = recording("u", duration: "")
+        let controller = await listedController(["u", "b"])
+        controller.setDone(unknown, true)
+        await controller.settleWatchProgress()
+        controller.setDone(unknown, false)
+        await controller.settleWatchProgress()
+        await play("u", on: controller, unknown)
+        world.player.failBeforeReady()
+        await play("u", on: controller, unknown, streamDuration: nil)
+        world.player.tick(at: 5_700)
+        world.player.close()
+        await controller.settleWatchProgress()
+        #expect(try storedEntry("u")?.completed == nil)
+        controller.turnOff()
+    }
+
+    /// Where a lecture starts is not shown as progress until the player reports it: a stream that
+    /// never becomes ready would otherwise leave a percentage nobody saved on the row. Mutation:
+    /// call `publishLive` at the end of `startWatchSession` (the row shows 50 %).
+    @Test func theStartAloneShowsNothing() async throws {
+        defer { cleanUp() }
+        try storeResumePoint("a", at: 3_000)
+        let controller = await listedController()
+        await play("a", on: controller)
+        #expect(world.player.plays.last?.startAt == 3_000)
+        #expect(controller.watchProgress.live.isEmpty)
+        #expect(controller.watchProgress.fraction(for: recording("a")) == 0)
+        controller.turnOff()
+    }
+
+    /// The stream's own length is preferred over the archive's minutes for where a session
+    /// starts (the archive rounds; here 90 min against a 100-minute stream). Mutation: pass nil
+    /// as `streamDuration` to `startWatchSession` (the start reads as 100 %).
+    @Test func theStreamLengthIsUsedForTheStart() async throws {
+        defer { cleanUp() }
+        try storeResumePoint("a", at: 5_700)
+        let controller = await listedController()
+        await play("a", on: controller)
+        world.player.close()
+        await controller.settleWatchProgress()
+        #expect(try storedEntry("a")?.furthest == 0.95)
+        controller.turnOff()
+    }
+
+    /// The WeBeep account can change without a reset (no saved Polimi session to drop): a write
+    /// that commits afterwards is not shown, which only the controller's post-commit identity
+    /// check guarantees (the store's namespace is still valid). Mutation: drop the
+    /// `guard isCurrentIdentity` after `applyProgress` in `commitProgress`.
+    @Test func aCommitForAnAccountNoLongerConnectedIsNotShown() async throws {
+        defer { cleanUp() }
+        let controller = await listedController()
+        let gate = FakeRecmanBrowser.Gate()
+        gates.after = gate
+        controller.setDone(recording("a"), true)
+        await settle("committed and held") { gate.isWaiting }
+        world.owner = 7
+        gates.after = nil
+        gate.release()
+        await controller.settleWatchProgress()
+        #expect(!controller.watchProgress.isCompleted(recording("a")))
+        world.owner = 42
+        controller.turnOff()
+    }
+
+    /// Under a disk that keeps failing, only the most recent `maxUnsavedCheckpoints` sessions are
+    /// kept for a retry. Mutation: drop the trimming loop in `commitProgress` (the oldest
+    /// lecture is saved too).
+    @Test func failedCheckpointsAreCapped() async throws {
+        defer { cleanUp() }
+        let controller = await listedController()
+        let count = RecordingsController.maxUnsavedCheckpoints + 1
+        fault.isFailing = true
+        for index in 1...count {
+            await play("r\(index)", on: controller)
+            world.player.tick(at: 600)
+            world.player.close()
+            await controller.settleWatchProgress()
+        }
+        fault.isFailing = false
+        await play("b", on: controller)
+        world.player.pause(at: 600)
+        await controller.settleWatchProgress()
+        #expect(try storedEntry("r1") == nil, "the oldest one was dropped")
+        #expect(try storedEntry("r2") != nil)
+        #expect(try storedEntry("r\(count)") != nil)
         controller.turnOff()
     }
 }

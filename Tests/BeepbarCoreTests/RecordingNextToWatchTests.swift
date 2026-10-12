@@ -96,6 +96,25 @@ struct RecordingNextToWatchTests {
         #expect(Progress.nextToWatch([], entries: [:]) == nil)
     }
 
+    /// Age decides, not the id: with ids that sort against the dates ("z" is the oldest), the
+    /// oldest is still picked, untouched and partial alike. Guards against ordering by Recman's
+    /// `transfer_id` alone, which every other fixture can't tell apart from ordering by date.
+    /// Mutation: make `precedes` compare ids only (`a.id < b.id`) and "a" is returned.
+    @Test func dateWinsOverIdOrder() {
+        let rows = [recording("a", day: 2), recording("z", day: 1), recording("m", day: 3)]
+        #expect(Progress.nextToWatch(rows, entries: [:])?.id == "z")
+        #expect(Progress.nextToWatch(rows, entries: ["a": Entry(furthest: 0.4), "z": Entry(furthest: 0.1)])?.id == "z")
+    }
+
+    /// An un-ticked lecture keeps its furthest point and is not done, so it counts as partial and
+    /// wins over an older untouched one even though automatic completion is blocked. Pins the
+    /// owner's rule that only "done" and "partial" matter. Mutation: require
+    /// `!autoCompletionBlocked` for partial and "a" is returned.
+    @Test func untickedLectureWithProgressIsPartial() {
+        let rows = [recording("a", day: 1), recording("b", day: 2)]
+        #expect(Progress.nextToWatch(rows, entries: ["b": Entry(furthest: 0.9, autoCompletionBlocked: true)])?.id == "b")
+    }
+
     // MARK: Course summary overload
 
     /// The recordings overload gives the same counts as the rows one, plus `next`. Guards against
@@ -106,7 +125,7 @@ struct RecordingNextToWatchTests {
         let rows = [recording("a", day: 1), recording("b", day: 2, duration: "60 min"), recording("c", day: 3, duration: "n/d"), recording("d", day: 4)]
         let entries: [String: Entry] = ["a": Entry(furthest: 0.2, completed: .manual), "b": Entry(furthest: 0.5)]
         let live = ["b": 0.75, "d": 0.5]
-        let summary = Progress.courseSummary(rows, entries: entries, live: live)
+        let summary = Progress.courseSummary(recordings: rows, entries: entries, live: live)
         let counts = Progress.courseSummary(rows.map { (id: $0.id, minutes: $0.minutes) }, entries: entries, live: live)
         #expect(summary.done == counts.done && summary.total == counts.total)
         #expect(summary.remainingMinutes == counts.remainingMinutes && summary.unknownDurationCount == counts.unknownDurationCount)
@@ -119,12 +138,12 @@ struct RecordingNextToWatchTests {
     /// Mutation: let `live` count as progress when choosing and "d" is returned instead of "a".
     @Test func liveFractionsDoNotChangeNext() {
         let rows = [recording("a", day: 1), recording("d", day: 4)]
-        let withLive = Progress.courseSummary(rows, entries: [:], live: ["d": 0.5])
-        let withoutLive = Progress.courseSummary(rows, entries: [:], live: [:])
+        let withLive = Progress.courseSummary(recordings: rows, entries: [:], live: ["d": 0.5])
+        let withoutLive = Progress.courseSummary(recordings: rows, entries: [:], live: [:])
         #expect(withLive.next?.id == "a")
         #expect(withLive.next == withoutLive.next)
         #expect(withLive.remainingMinutes != withoutLive.remainingMinutes, "live still counts in the time left")
-        #expect(Progress.courseSummary(rows, entries: ["d": Entry(furthest: 0.5)], live: [:]).next?.id == "d",
+        #expect(Progress.courseSummary(recordings: rows, entries: ["d": Entry(furthest: 0.5)], live: [:]).next?.id == "d",
                 "once the checkpoint stores it, it is partial and wins")
     }
 
@@ -164,17 +183,24 @@ struct RecordingNextToWatchTests {
     }
 
     /// A damaged or differently shaped `next` costs only the shortcut: the summary still decodes,
-    /// with `next` nil, while a damaged count still fails. Guards against one bad row deleting
+    /// with `next` nil, while any damaged or missing count still fails. Guards against one bad row deleting
     /// every saved course line at launch. Mutation: remove the `try?` around decoding `next` and
-    /// these throw.
+    /// these throw; make any count lenient (e.g. `(try? decode) ?? 0`) and its loop case fails.
     @Test func malformedNextYieldsSummaryWithoutNext() throws {
         let expected = CourseWatchSummary(done: 3, total: 10, remainingMinutes: 120, unknownDurationCount: 1)
         for next in [#""garbage""#, #"{"id": 5}"#, #"{"id":"a","title":"x"}"#, "[1, 2]", "42"] {
             let data = Data(#"{"done":3,"total":10,"remainingMinutes":120,"unknownDurationCount":1,"next":\#(next)}"#.utf8)
             #expect(try JSONDecoder().decode(CourseWatchSummary.self, from: data) == expected, "next = \(next)")
         }
-        let badCount = Data(#"{"done":"three","total":10,"remainingMinutes":120,"unknownDurationCount":1}"#.utf8)
-        #expect(throws: (any Error).self) { try JSONDecoder().decode(CourseWatchSummary.self, from: badCount) }
+        for key in ["done", "total", "remainingMinutes", "unknownDurationCount"] {
+            var fields: [String: Any] = ["done": 3, "total": 10, "remainingMinutes": 120, "unknownDurationCount": 1]
+            fields[key] = "three"
+            let bad = try JSONSerialization.data(withJSONObject: fields)
+            #expect(throws: (any Error).self, "a malformed \(key) must fail") { try JSONDecoder().decode(CourseWatchSummary.self, from: bad) }
+            fields[key] = nil
+            let missing = try JSONSerialization.data(withJSONObject: fields)
+            #expect(throws: (any Error).self, "a missing \(key) must fail") { try JSONDecoder().decode(CourseWatchSummary.self, from: missing) }
+        }
     }
 
     /// An older build (the four-field struct) reads data written with `next`, ignoring the extra

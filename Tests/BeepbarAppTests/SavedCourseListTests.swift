@@ -542,7 +542,8 @@ import BeepbarCore
 
     /// The restore only reads: a saved name that differs from the database's (renamed on Moodle
     /// since) is shown, but no record is updated and no folder renamed until Moodle confirms it;
-    /// the folder shown is the database's. Fails if the restore goes through `restoreScopes`.
+    /// the folder shown is the database's. Fails if the restore goes through `restoreScopes`, or
+    /// if a switch or a folder rename is accepted over the saved list.
     @Test func restoringASavedListRecordsNothing() async throws {
         let install = try await Install.make()
         defer { install.remove() }
@@ -565,6 +566,16 @@ import BeepbarCore
         controller.setCourse(controller.courses.first { $0.id == 2 }!, enabled: true)
         #expect(controller.enabledCourseIDs == enabled)
         #expect(try await install.database.scopes(rootID: install.rootID).map(\.enabled) == before.map(\.enabled))
+
+        // A rename is refused before it starts: no rename in progress, no error, the folder on
+        // disk and in the database untouched. Fails if `renameFolder` accepts a saved list.
+        try FileManager.default.createDirectory(at: install.root.appending(path: "Analisi I", directoryHint: .isDirectory), withIntermediateDirectories: true)
+        controller.renameFolder(for: controller.courses.first { $0.id == 1 }!, to: "Analisi rinominata")
+        #expect(controller.renamingCourseID == nil, "a rename started over a saved list")
+        #expect(controller.courseRenameErrors.isEmpty)
+        try await Task.sleep(for: .milliseconds(100))
+        #expect(try await install.database.scopes(rootID: install.rootID).map(\.localFolder) == before.map(\.localFolder))
+        #expect(!FileManager.default.fileExists(atPath: install.root.appending(path: "Analisi rinominata").path))
     }
 
     /// Choosing another folder over a saved list: the saved list is set aside and Moodle's list

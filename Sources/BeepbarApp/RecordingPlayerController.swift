@@ -97,7 +97,8 @@ enum RecordingPlayerError: Error {
 
 /// The native recordings player (issue #148, packages C and G): one window with an
 /// `AVPlayerView`, the same engine and controls as QuickTime, plus speeds, skips and keyboard
-/// shortcuts (`PlayerShortcut`), and resume hooks for the Recordings flow.
+/// shortcuts (`PlayerShortcut`), a zoom on the video (pinch, ⌘+ / ⌘− / ⌘0, see `zoom`), and
+/// resume hooks for the Recordings flow.
 ///
 /// Quiet at rest: the feature exists in memory only while it is used. `init` creates nothing and
 /// AVKit is not even loaded until the first `play` (`AVKitLoader`). The first `play` builds the
@@ -233,6 +234,27 @@ enum RecordingPlayerError: Error {
     /// The serial of the current periodic time observer, nil when none exists. Internal so tests
     /// can deliver a tick as the current observer, or as one that was replaced.
     var progressObserverSerial: Int? { progressObservation?.serial }
+    /// How far the video is zoomed and which part is on screen (`PlayerZoomModel` decides,
+    /// `applyZoom` shows it).
+    ///
+    /// How it is shown: through `AVPlayerView`'s own magnification (macOS 13+, public API, called
+    /// at runtime like the rest of AVKit), not by scaling a view or layer of ours. The floating
+    /// controls are subviews of `AVPlayerView`, so scaling the view would scale and push them off
+    /// screen, and a second `AVPlayerLayer` of our own would hide Live Text and the picture in
+    /// picture placeholder and flash black while it loads. AVKit's magnification scales only the
+    /// video, in a scroll view of its own, under the controls. AVKit has no public pan API, so the
+    /// pan places that scroll view's clip origin (`PlayerVideoViews.videoClipView`).
+    /// `AVPlayerView`'s own pinch handling stays off (`allowsMagnification`, its default): the
+    /// window decides every pinch (`PlayerGestureTracker`), so exactly one handler acts on each and
+    /// the 4x limit, the pan limits and "a pinch begun over the controls does nothing" hold.
+    ///
+    /// Lifetime: kept across pauses, failures and recoveries of the same lecture (a `play` with the
+    /// same `recordingID`), back to fit when a different lecture plays or the player closes.
+    /// Memory only, never written to defaults. Costs nothing unused: no observer, no timer; a
+    /// resize at fit is a no-op.
+    private(set) var zoom = PlayerZoomState.fit
+    /// The view showing the video, cached for the pan (`PlayerVideoViews.videoHost`).
+    private weak var videoHost: NSView?
     /// The menu items' targets: an item holds its target weakly.
     private var menuActions: [PlayerMenuAction] = []
     /// The policy BeepBar had before the player promoted it to `.regular`; nil when the player
@@ -320,6 +342,9 @@ enum RecordingPlayerError: Error {
         checkpointIfMeaningful(.replaced)
         removeItemObservers()
         generation += 1
+        // A different lecture starts at fit; the same one (a recovery, Play again) keeps the
+        // student's zoom, like its position.
+        if recordingID != self.recordingID { applyZoom(.fit) }
         self.recordingID = recordingID
         failureReported = false
         isCurrentItemReady = false
@@ -517,6 +542,9 @@ enum RecordingPlayerError: Error {
         isCurrentItemReady = true
         rateSupport = RateSupport(fastForward: item.canPlayFastForward, slowForward: item.canPlaySlowForward)
         applySpeed()
+        // A zoom kept across a recovery was limited by the whole view while the new item had no
+        // size yet: now the video's real frame is known.
+        zoomGeometryChanged()
         guard let startAt = pendingStartAt else {
             settleStart()
             return
@@ -597,6 +625,79 @@ enum RecordingPlayerError: Error {
             guard isCurrentItemReady, let item = player.currentItem,
                   let target = RecordingPlayerPolicy.jumpTarget(fraction: fraction, duration: Self.seconds(item.duration)) else { return }
             seek(to: target)
+        case .zoomIn, .zoomOut:
+            guard let geometry = zoomGeometry() else { return }
+            applyZoom(PlayerZoomModel.stepped(zoom, zoomIn: shortcut == .zoomIn, viewport: geometry.viewport, video: geometry.video))
+        case .zoomReset:
+            applyZoom(.fit)
+        }
+    }
+
+    // MARK: Zoom
+
+    /// Applies a pinch step or a pan from the window (`RecordingPlayerWindow.zoomHandler`), on the
+    /// main actor. Internal so tests can deliver inputs directly.
+    func handleZoomInput(_ input: PlayerZoomInput) {
+        guard player != nil, let playerView, let geometry = zoomGeometry() else { return }
+        switch input {
+        case .magnify(let magnification, let location):
+            let anchor = playerView.convert(location, from: nil)
+            applyZoom(PlayerZoomModel.magnified(zoom, by: magnification, at: anchor, viewport: geometry.viewport, video: geometry.video))
+        case .pan(let movement):
+            applyZoom(PlayerZoomModel.panned(zoom, by: movement, viewport: geometry.viewport, video: geometry.video))
+        }
+    }
+
+    /// The window was resized (also into or out of full screen). Through a hop, like every other
+    /// AppKit callback here: nothing is read from the notification. At fit there is nothing to
+    /// redo, so a resize costs nothing unless the video is zoomed.
+    func windowDidResize(_ notification: Notification) {
+        Task { @MainActor [weak self] in self?.zoomGeometryChanged() }
+    }
+
+    /// Re-clamps a zoom to the current view and video size (a resize, or a new item's frame).
+    /// Internal so tests can run it without animating a real window.
+    func zoomGeometryChanged() {
+        guard zoom.isZoomed, let geometry = zoomGeometry() else { return }
+        applyZoom(PlayerZoomModel.adapted(zoom, to: geometry.viewport, video: geometry.video))
+    }
+
+    /// The player view's size and where the video sits in it (`PlayerZoomModel.videoRect`), or
+    /// nil without a view.
+    private func zoomGeometry() -> (viewport: CGSize, video: CGRect)? {
+        guard let playerView else { return nil }
+        let viewport = playerView.bounds.size
+        let presentation = player?.currentItem?.presentationSize ?? .zero
+        return (viewport, PlayerZoomModel.videoRect(presentationSize: presentation, in: viewport))
+    }
+
+    /// Makes `state` the zoom and shows it: the magnification through AVKit's public
+    /// `setMagnification:centeredAtPoint:`, then the visible part by placing the clip origin of
+    /// AVKit's video scroll view, both within this main-actor turn so no frame shows the halfway
+    /// state. Nothing touches the view when what is shown does not change, so a play at fit
+    /// costs nothing. Also pushes `isVideoZoomed` to the window.
+    ///
+    /// The fixed point handed to AVKit (`PlayerZoomModel.fixedPoint`) already makes its result
+    /// match the model; the clip origin is set as well, because a pan has no scale change to
+    /// carry it, and a resize moves the video under a clip origin AVKit leaves where it was.
+    private func applyZoom(_ state: PlayerZoomState) {
+        let previous = zoom
+        zoom = state
+        (window as? RecordingPlayerWindow)?.isVideoZoomed = state.isZoomed
+        guard let playerView, !state.showsSameView(as: previous) else { return }
+        if state.scale != previous.scale {
+            let viewport = playerView.bounds.size
+            let from = PlayerZoomModel.adapted(previous, to: viewport, video: CGRect(origin: .zero, size: viewport))
+            let fixed = PlayerZoomModel.fixedPoint(from: from, to: state) ?? CGPoint(x: viewport.width / 2, y: viewport.height / 2)
+            AVKitLoader.setMagnification(state.scale, centeredAt: fixed, of: playerView)
+        }
+        guard state.isZoomed else { return }
+        if videoHost.map({ !$0.isDescendant(of: playerView) }) ?? true {
+            videoHost = PlayerVideoViews.videoHost(in: playerView)
+        }
+        if let clipView = PlayerVideoViews.videoClipView(in: playerView, videoHost: videoHost) {
+            clipView.scroll(to: state.origin)
+            (clipView.superview as? NSScrollView)?.reflectScrolledClipView(clipView)
         }
     }
 
@@ -769,6 +870,7 @@ enum RecordingPlayerError: Error {
         window.contentView = view
         window.delegate = self
         window.shortcutHandler = { [weak self] shortcut in self?.performShortcut(shortcut) }
+        window.zoomHandler = { [weak self] input in self?.handleZoomInput(input) }
         window.addTitlebarAccessoryViewController(makeSpeedAccessory())
         if let frameAutosaveName {
             if !window.setFrameUsingName(frameAutosaveName) { window.center() }
@@ -931,6 +1033,10 @@ enum RecordingPlayerError: Error {
         playerView?.setValue(nil, forKey: "player")
         player = nil
         menuActions = []
+        // The window goes with the lecture: the next one opens at fit. The view is not touched,
+        // it is being released.
+        zoom = .fit
+        (window as? RecordingPlayerWindow)?.isVideoZoomed = false
         restoreActivationPolicy()
     }
 
@@ -940,6 +1046,7 @@ enum RecordingPlayerError: Error {
         window.contentView = nil
         window.delegate = nil
         (window as? RecordingPlayerWindow)?.shortcutHandler = nil
+        (window as? RecordingPlayerWindow)?.zoomHandler = nil
         while !window.titlebarAccessoryViewControllers.isEmpty { window.removeTitlebarAccessoryViewController(at: 0) }
     }
 }
@@ -980,7 +1087,29 @@ enum RecordingPlayerError: Error {
               view.responds(to: NSSelectorFromString("setPlayer:")),
               view.responds(to: NSSelectorFromString("setControlsStyle:")) else { return nil }
         view.setValue(floatingControlsStyle, forKey: "controlsStyle")
+        // AVKit's own pinch stays off (its default, set explicitly so a changed default cannot
+        // put two handlers on one pinch): the player window handles every pinch itself, see
+        // `RecordingPlayerController.zoom`.
+        if view.responds(to: NSSelectorFromString("setAllowsMagnification:")) {
+            view.setValue(false, forKey: "allowsMagnification")
+        }
         return view
+    }
+
+    /// Calls `-[AVPlayerView setMagnification:centeredAtPoint:]` (macOS 13+): scales the video
+    /// only, under the controls, keeping `point` (unzoomed view coordinates) where it is on
+    /// screen. Returns false, doing nothing, on a view without it (a test view, or a future AVKit
+    /// without the method). Called through its implementation pointer because it takes a
+    /// `CGFloat` and a `CGPoint`, which key-value coding and `perform(_:with:)` cannot pass; AVKit
+    /// clamps the factor to 1…64 itself, the player to 1…4 before (`PlayerZoomModel`).
+    @discardableResult
+    static func setMagnification(_ magnification: CGFloat, centeredAt point: CGPoint, of view: NSView) -> Bool {
+        let selector = NSSelectorFromString("setMagnification:centeredAtPoint:")
+        guard view.responds(to: selector), let method = class_getInstanceMethod(type(of: view), selector) else { return false }
+        typealias SetMagnification = @convention(c) (NSView, Selector, CGFloat, CGPoint) -> Void
+        let setMagnification = unsafeBitCast(method_getImplementation(method), to: SetMagnification.self)
+        setMagnification(view, selector, magnification, point)
+        return true
     }
 
     /// `AVPlaybackSpeed` objects for `rates` (macOS 13+), for `AVPlayerView.speeds`, or nil when

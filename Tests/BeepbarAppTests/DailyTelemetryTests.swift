@@ -2,17 +2,24 @@ import AppKit
 import Foundation
 import Testing
 import os
+import BeepbarCore
 @testable import BeepbarApp
 
 @MainActor
 struct DailyTelemetryTests {
     private let configuration = DailyTelemetryConfiguration(appID: "AD3B2F70-8FAE-47B1-A58B-4870921E2398", namespace: "com.beepbar", version: "1.2.3")!
 
-    /// The wire contract contains a stable pseudonym and only the selected app version metadata.
+    private let context = DailyTelemetryContext(language: .english, systemMajorVersion: 15, automaticSyncEnabled: true,
+                                                automaticSyncInterval: 28_800, dataSaverEnabled: false,
+                                                recordingsEnabled: true, launchAtLogin: true)
+
+    /// The wire contract: a hashed identifier and exactly the allowed fields, under the SDK's key
+    /// names and value formats where TelemetryDeck's built-in insights read them. Fails if a field
+    /// is added, renamed, or reformatted (e.g. a full macOS build instead of the major version).
     @Test func payloadIsMinimalAndStable() throws {
-        let first = try configuration.request(installationID: "installation-a")
-        let second = try configuration.request(installationID: "installation-a")
-        let other = try configuration.request(installationID: "installation-b")
+        let first = try configuration.request(clientID: "installation-a", context: context)
+        let second = try configuration.request(clientID: "installation-a", context: context)
+        let other = try configuration.request(clientID: "installation-b", context: context)
         let body = try #require(first.httpBody)
         let signals = try #require(JSONSerialization.jsonObject(with: body) as? [[String: Any]])
         let signal = try #require(signals.first)
@@ -20,13 +27,36 @@ struct DailyTelemetryTests {
         #expect(Set(signal.keys) == ["appID", "clientUser", "type", "payload"])
         #expect(signal["appID"] as? String == "AD3B2F70-8FAE-47B1-A58B-4870921E2398")
         #expect(signal["type"] as? String == "BeepBar.dailyActive")
-        #expect(signal["payload"] as? [String: String] == ["BeepBar.appVersion": "1.2.3"])
+        #expect(signal["payload"] as? [String: String] == [
+            "TelemetryDeck.AppInfo.version": "1.2.3",
+            "TelemetryDeck.Device.platform": "macOS",
+            "TelemetryDeck.Device.operatingSystem": "macOS",
+            "TelemetryDeck.Device.systemMajorVersion": "macOS 15",
+            "TelemetryDeck.RunContext.language": "en",
+            "BeepBar.automaticSync": "true",
+            "BeepBar.automaticSyncInterval": "28800",
+            "BeepBar.dataSaver": "false",
+            "BeepBar.recordings": "true",
+            "BeepBar.launchAtLogin": "true",
+        ])
+        #expect(!String(decoding: body, as: UTF8.self).contains("installation-a"))
         #expect((signal["clientUser"] as? String)?.count == 64)
         #expect(try identity(first) == identity(second))
         #expect(try identity(first) != identity(other))
         #expect(first.url?.absoluteString == "https://nom.telemetrydeck.com/v2/namespace/com.beepbar/")
         #expect(first.httpMethod == "POST")
         #expect(first.timeoutInterval == 10)
+    }
+
+    /// A login-item state macOS hasn't reported yet is left out instead of being reported as off.
+    @Test func unknownLoginItemIsOmitted() {
+        var unknown = context
+        unknown.launchAtLogin = nil
+        unknown.language = .italian
+        let payload = configuration.payload(unknown)
+        #expect(payload["BeepBar.launchAtLogin"] == nil)
+        #expect(payload["TelemetryDeck.RunContext.language"] == "it")
+        #expect(payload.count == 9)
     }
 
     /// Invalid configuration cannot create an endpoint; debug builds cannot emit production signals.
@@ -73,7 +103,7 @@ struct DailyTelemetryTests {
             await controller.checkIn()
             #expect(!controller.isEnabled)
             #expect(harness.callbacks.isEmpty)
-            #expect(harness.defaults.object(forKey: DailyTelemetryController.installationKey) == nil)
+            #expect(harness.defaults.object(forKey: DailyTelemetryController.monthlyIDKey) == nil)
             #expect(await recorder.count == 0)
         }
         let harness = Harness()
@@ -82,7 +112,7 @@ struct DailyTelemetryTests {
         let controller = harness.controller(nil, recorder: recorder)
         await controller.start()
         #expect(harness.callbacks.isEmpty)
-        #expect(harness.defaults.object(forKey: DailyTelemetryController.installationKey) == nil)
+        #expect(harness.defaults.object(forKey: DailyTelemetryController.monthlyIDKey) == nil)
         #expect(await recorder.count == 0)
     }
 
@@ -110,7 +140,8 @@ struct DailyTelemetryTests {
         #expect(await recorder.count == 2)
         let requests = await recorder.requests
         try #require(requests.count == 2)
-        #expect(try identity(requests[0]) == identity(requests[1]))
+        // Opting out deleted the identifier, so opting back in starts an unrelated one.
+        #expect(try identity(requests[0]) != identity(requests[1]))
         #expect(harness.defaults.bool(forKey: DailyTelemetryController.enabledKey))
         relaunched.stop()
         let enabledAgain = harness.controller(configuration, clock: clock, recorder: recorder)
@@ -197,8 +228,102 @@ struct DailyTelemetryTests {
         #expect(try identity(requests[0]) == identity(requests[1]))
         let data = try #require(requests[1].httpBody)
         let signals = try #require(JSONSerialization.jsonObject(with: data) as? [[String: Any]])
-        #expect(signals.first?["payload"] as? [String: String] == ["BeepBar.appVersion": "1.2.4"])
+        #expect((signals.first?["payload"] as? [String: String])?["TelemetryDeck.AppInfo.version"] == "1.2.4")
         second.stop()
+    }
+
+    /// The identifier lives one UTC month: kept across days, replaced at the UTC month boundary,
+    /// and replaced again (not restored) when the clock goes back to an earlier month. Guards
+    /// against a permanent identifier coming back, or the rotation following local time.
+    @Test func identifierRotatesWithTheUTCMonth() async throws {
+        let harness = Harness()
+        defer { harness.remove() }
+        let recorder = Recorder()
+        // 2027-01-30 12:00 UTC.
+        let clock = Clock(Date(timeIntervalSince1970: 1_801_310_400))
+        let controller = harness.controller(configuration, clock: clock, recorder: recorder)
+        await controller.start()
+        // 2027-01-31 23:59:59 UTC: already February 1 in Italy, still January in UTC.
+        clock.date = Date(timeIntervalSince1970: 1_801_439_999)
+        await controller.checkIn()
+        // 2027-02-01 00:00 UTC.
+        clock.date += 1
+        await controller.checkIn()
+        clock.date += 86_400
+        await controller.checkIn()
+        // Back to January.
+        clock.date = Date(timeIntervalSince1970: 1_801_310_400)
+        harness.defaults.removeObject(forKey: DailyTelemetryController.attemptKey)
+        await controller.checkIn()
+        let ids = try await recorder.requests.map(identity)
+        try #require(ids.count == 5)
+        #expect(ids[0] == ids[1])
+        #expect(ids[1] != ids[2])
+        #expect(ids[2] == ids[3])
+        #expect(Set(ids).count == 3)
+        #expect(harness.defaults.string(forKey: DailyTelemetryController.monthKey) == "2027-01")
+        controller.stop()
+    }
+
+    /// The first build's permanent installation UUID is deleted on construction, enabled or not,
+    /// and never used as the identifier.
+    @Test func legacyInstallationIDIsDeleted() async throws {
+        for enabled in [true, false] {
+            let harness = Harness()
+            defer { harness.remove() }
+            harness.defaults.set("A3237D19-A407-407A-A07F-57DEB6688981", forKey: DailyTelemetryController.legacyInstallationKey)
+            harness.defaults.set(enabled, forKey: DailyTelemetryController.enabledKey)
+            let recorder = Recorder()
+            let controller = harness.controller(configuration, recorder: recorder)
+            #expect(harness.defaults.object(forKey: DailyTelemetryController.legacyInstallationKey) == nil)
+            await controller.start()
+            let legacy = try configuration.request(clientID: "A3237D19-A407-407A-A07F-57DEB6688981", context: context)
+            for request in await recorder.requests { #expect(try identity(request) != identity(legacy)) }
+            #expect(await recorder.count == (enabled ? 1 : 0))
+            controller.stop()
+        }
+    }
+
+    /// Turning telemetry off deletes the identifier, also when the opt-out was saved by an older
+    /// build that kept it.
+    @Test func optOutDeletesTheIdentifier() async {
+        let harness = Harness()
+        defer { harness.remove() }
+        let recorder = Recorder()
+        let controller = harness.controller(configuration, recorder: recorder)
+        await controller.start()
+        #expect(harness.defaults.string(forKey: DailyTelemetryController.monthlyIDKey) != nil)
+        controller.setEnabled(false)
+        #expect(harness.defaults.object(forKey: DailyTelemetryController.monthlyIDKey) == nil)
+        #expect(harness.defaults.object(forKey: DailyTelemetryController.monthKey) == nil)
+        harness.defaults.set(UUID().uuidString, forKey: DailyTelemetryController.monthlyIDKey)
+        harness.defaults.set("2027-01", forKey: DailyTelemetryController.monthKey)
+        _ = harness.controller(configuration, recorder: recorder)
+        #expect(harness.defaults.object(forKey: DailyTelemetryController.monthlyIDKey) == nil)
+        #expect(harness.defaults.object(forKey: DailyTelemetryController.monthKey) == nil)
+    }
+
+    /// Settings are read when the signal is sent, not when telemetry starts: a change made today
+    /// shows up in tomorrow's signal.
+    @Test func contextIsReadAtSendTime() async throws {
+        let harness = Harness()
+        defer { harness.remove() }
+        let recorder = Recorder()
+        let clock = Clock(Date(timeIntervalSince1970: 1_800_000_000))
+        let state = Clock(Date(timeIntervalSince1970: 0))
+        let controller = harness.controller(configuration, clock: clock, recorder: recorder)
+        let base = context
+        await controller.start(context: {
+            var current = base
+            current.dataSaverEnabled = state.date.timeIntervalSince1970 > 0
+            return current
+        })
+        state.date = Date(timeIntervalSince1970: 1)
+        clock.date += 86_400
+        await controller.checkIn()
+        let payloads = try await recorder.requests.map(payload)
+        #expect(payloads.map { $0["BeepBar.dataSaver"] } == ["false", "true"])
+        controller.stop()
     }
 
     /// A wake retries the day check; disabling removes observers and prevents future wake signals.
@@ -362,6 +487,12 @@ struct DailyTelemetryTests {
         override func stopLoading() {
             if let id = request.url?.lastPathComponent { Self.stopped.withLock { _ = $0.insert(id) } }
         }
+    }
+
+    private func payload(_ request: URLRequest) throws -> [String: String] {
+        let data = try #require(request.httpBody)
+        let signals = try #require(JSONSerialization.jsonObject(with: data) as? [[String: Any]])
+        return try #require(signals.first?["payload"] as? [String: String])
     }
 
     private func identity(_ request: URLRequest) throws -> String {

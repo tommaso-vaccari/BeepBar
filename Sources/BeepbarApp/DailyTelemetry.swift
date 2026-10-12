@@ -1,8 +1,32 @@
 import AppKit
+import BeepbarCore
 import Combine
 import CryptoKit
 import Foundation
 import os
+
+/// The settings a daily signal reports. Every field has few possible values, so together with an
+/// identifier that rotates monthly they say how BeepBar is used without singling out a Mac (#128).
+/// Built on the main actor at send time, so a change made during the day shows up the next day.
+struct DailyTelemetryContext: Equatable, Sendable {
+    var language: AppLanguage
+    /// Major macOS version only (e.g. 15): the full build would narrow installations down.
+    var systemMajorVersion: Int
+    var automaticSyncEnabled: Bool
+    /// One of the intervals offered in Settings, already validated by the sync controller.
+    var automaticSyncInterval: Int
+    var dataSaverEnabled: Bool
+    var recordingsEnabled: Bool
+    /// `nil` while macOS hasn't answered yet: the key is then left out rather than reported wrong.
+    var launchAtLogin: Bool?
+
+    /// Values that need no app state; used when no provider has been installed.
+    static func system(language: AppLanguage = .current) -> Self {
+        Self(language: language, systemMajorVersion: ProcessInfo.processInfo.operatingSystemVersion.majorVersion,
+             automaticSyncEnabled: false, automaticSyncInterval: 0, dataSaverEnabled: false,
+             recordingsEnabled: false, launchAtLogin: nil)
+    }
+}
 
 /// Public ingest identifiers and the only application metadata sent in a daily signal.
 struct DailyTelemetryConfiguration: Sendable {
@@ -30,8 +54,32 @@ struct DailyTelemetryConfiguration: Sendable {
 #endif
     }
 
-    func request(installationID: String) throws -> URLRequest {
-        let user = SHA256.hash(data: Data((appID + ":" + installationID).utf8))
+    /// The whole payload. App version, platform, macOS major version and language use the keys and
+    /// value formats of TelemetryDeck's Swift SDK, so the dashboard's built-in version, OS and
+    /// language insights read them without custom queries; nothing else from the SDK's default set
+    /// (device model, screen, time zone, region, locale) is sent. BeepBar's own settings stay in the
+    /// `BeepBar.` scope, as TelemetryDeck asks for custom keys. Values are strings, as the SDK sends.
+    func payload(_ context: DailyTelemetryContext) -> [String: String] {
+        var payload = [
+            "TelemetryDeck.AppInfo.version": version,
+            "TelemetryDeck.Device.platform": "macOS",
+            "TelemetryDeck.Device.operatingSystem": "macOS",
+            "TelemetryDeck.Device.systemMajorVersion": "macOS \(context.systemMajorVersion)",
+            "TelemetryDeck.RunContext.language": context.language.rawValue,
+            "BeepBar.automaticSync": context.automaticSyncEnabled ? "true" : "false",
+            "BeepBar.automaticSyncInterval": String(context.automaticSyncInterval),
+            "BeepBar.dataSaver": context.dataSaverEnabled ? "true" : "false",
+            "BeepBar.recordings": context.recordingsEnabled ? "true" : "false",
+        ]
+        if let launchAtLogin = context.launchAtLogin {
+            payload["BeepBar.launchAtLogin"] = launchAtLogin ? "true" : "false"
+        }
+        return payload
+    }
+
+    /// `clientID` is this month's random identifier; only its hash with the App ID leaves the Mac.
+    func request(clientID: String, context: DailyTelemetryContext) throws -> URLRequest {
+        let user = SHA256.hash(data: Data((appID + ":" + clientID).utf8))
             .map { String(format: "%02x", $0) }.joined()
         var request = URLRequest(url: URL(string: "https://nom.telemetrydeck.com/v2/namespace/\(namespace)/")!)
         request.httpMethod = "POST"
@@ -42,7 +90,7 @@ struct DailyTelemetryConfiguration: Sendable {
             "appID": appID,
             "clientUser": user,
             "type": "BeepBar.dailyActive",
-            "payload": ["BeepBar.appVersion": version]
+            "payload": payload(context)
         ]])
         return request
     }
@@ -131,10 +179,20 @@ enum DailyTelemetryTransport {
 }
 
 /// One best-effort attempt per UTC day, persisted across launches; disabling cancels without waiting.
+///
+/// Identity: a random UUID that lives for one UTC calendar month (`monthKey` records which). A new
+/// month, in either direction (a clock moved back included), replaces it with a fresh random one,
+/// never derived from the previous one, so nothing on the Mac or the server links two months.
+/// Daily actives are the signals of a day (one per installation); monthly actives are distinct
+/// identifiers within a calendar month.
 @MainActor
 final class DailyTelemetryController: ObservableObject {
     static let enabledKey = "dailyTelemetryEnabled"
-    static let installationKey = "dailyTelemetryInstallationID"
+    /// The permanent installation UUID of the first telemetry build (on `dev` only, never released).
+    /// Deleted at construction so the monthly identifier is the only one left on the Mac.
+    static let legacyInstallationKey = "dailyTelemetryInstallationID"
+    static let monthlyIDKey = "dailyTelemetryMonthlyID"
+    static let monthKey = "dailyTelemetryMonth"
     static let attemptKey = "dailyTelemetryLastAttempt"
     static let shared = DailyTelemetryController(
         defaults: PreviewMode.isActive ? UserDefaults(suiteName: "io.github.tvaccari.beepbar.preview.telemetry")! : .standard,
@@ -154,6 +212,8 @@ final class DailyTelemetryController: ObservableObject {
     private var running = false
     private var generation = 0
     private var observers: [(NotificationCenter, NSObjectProtocol)] = []
+    /// Reads the settings at send time; installed by `start`.
+    private var context: () -> DailyTelemetryContext = { .system() }
 
     init(defaults: UserDefaults, configuration: DailyTelemetryConfiguration?, defaultEnabled: Bool,
          now: @escaping () -> Date = Date.init,
@@ -173,9 +233,13 @@ final class DailyTelemetryController: ObservableObject {
         self.send = send
         self.schedule = schedule
         self.isEnabled = defaults.object(forKey: Self.enabledKey) as? Bool ?? defaultEnabled
+        defaults.removeObject(forKey: Self.legacyInstallationKey)
+        if !isEnabled { Self.forgetIdentity(in: defaults) }
     }
 
-    func start(observing notifications: [(NotificationCenter, Notification.Name)] = []) async {
+    func start(observing notifications: [(NotificationCenter, Notification.Name)] = [],
+               context: (() -> DailyTelemetryContext)? = nil) async {
+        if let context { self.context = context }
         guard !running, isEnabled, isConfigured else { return }
         running = true
         for (center, name) in notifications {
@@ -188,11 +252,11 @@ final class DailyTelemetryController: ObservableObject {
         await checkIn()
     }
 
-    func startForApplication() async {
+    func startForApplication(context: (() -> DailyTelemetryContext)? = nil) async {
         await start(observing: [
             (.default, NSApplication.didBecomeActiveNotification),
             (NSWorkspace.shared.notificationCenter, NSWorkspace.didWakeNotification)
-        ])
+        ], context: context)
     }
 
     func setEnabled(_ enabled: Bool) {
@@ -202,7 +266,28 @@ final class DailyTelemetryController: ObservableObject {
             Task { await startForApplication() }
         } else {
             stop()
+            // Turning telemetry off leaves no identifier behind; turning it on again starts a new one.
+            Self.forgetIdentity(in: defaults)
         }
+    }
+
+    private static func forgetIdentity(in defaults: UserDefaults) {
+        defaults.removeObject(forKey: monthlyIDKey)
+        defaults.removeObject(forKey: monthKey)
+    }
+
+    /// This month's identifier, created (and the previous one replaced) when the UTC month changed.
+    private func clientID(at timestamp: Date) -> String {
+        let components = Self.utcCalendar.dateComponents([.year, .month], from: timestamp)
+        let month = String(format: "%04d-%02d", components.year ?? 0, components.month ?? 0)
+        if defaults.string(forKey: Self.monthKey) == month,
+           let stored = defaults.string(forKey: Self.monthlyIDKey), UUID(uuidString: stored) != nil {
+            return stored
+        }
+        let fresh = UUID().uuidString
+        defaults.set(fresh, forKey: Self.monthlyIDKey)
+        defaults.set(month, forKey: Self.monthKey)
+        return fresh
     }
 
     func stop() {
@@ -221,14 +306,7 @@ final class DailyTelemetryController: ObservableObject {
         let timestamp = now()
         if let attempted = defaults.object(forKey: Self.attemptKey) as? Date,
            attempted >= Self.utcCalendar.startOfDay(for: timestamp) { return }
-        let installationID: String
-        if let stored = defaults.string(forKey: Self.installationKey), UUID(uuidString: stored) != nil {
-            installationID = stored
-        } else {
-            installationID = UUID().uuidString
-            defaults.set(installationID, forKey: Self.installationKey)
-        }
-        guard let request = try? configuration.request(installationID: installationID) else { return }
+        guard let request = try? configuration.request(clientID: clientID(at: timestamp), context: context()) else { return }
         // Persist before sending: failures and relaunches must not create retry storms.
         defaults.set(timestamp, forKey: Self.attemptKey)
         let currentGeneration = generation

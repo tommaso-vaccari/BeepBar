@@ -188,6 +188,107 @@ struct CourseFolderRenamerTests {
         #expect(try await database.pendingScopeMoves().isEmpty)
     }
 
+    @Test(arguments: ["device", "inode", "both"])
+    func renamesRestoredDirectoryWithAStaleIdentity(_ changed: String) async throws {
+        let root = try temporaryRoot()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let rootID = UUID()
+        let database = try SyncDatabase(url: root.appending(path: "state.sqlite"))
+        try await database.registerRoot(id: rootID, canonicalPath: root.path)
+        let store = try FileStore(root: root)
+        let identity = try await store.ensureTopLevelDirectory("Old").identity
+        let stale = DirectoryIdentity(device: identity.device + (changed == "inode" ? 0 : 1), inode: identity.inode + (changed == "device" ? 0 : 1))
+        try await database.upsertScope(SyncScope(rootID: rootID, courseID: 1, displayName: "Course", localFolder: "Old", enabled: true, managedDirectory: stale))
+        try Data("edited notes".utf8).write(to: root.appending(path: "Old/notes.txt"))
+        try Data("personal".utf8).write(to: root.appending(path: "Old/personal.txt"))
+        try await database.upsertBaseline(rootID: rootID, baseline: Baseline(remoteID: "file", relativePath: try RelativePath("Old/notes.txt"), sha256: "original", remoteRevision: "1"))
+        let renamer = CourseFolderRenamer(database: database, fileStore: store, gate: RootOperationGate())
+        try await renamer.rename(rootID: rootID, courseID: 1, from: "Old", to: "New")
+        #expect(try String(contentsOf: root.appending(path: "New/notes.txt"), encoding: .utf8) == "edited notes")
+        #expect(try String(contentsOf: root.appending(path: "New/personal.txt"), encoding: .utf8) == "personal")
+        #expect(try await database.scope(rootID: rootID, courseID: 1)?.managedDirectory == identity)
+        #expect(try await database.baseline(rootID: rootID, remoteID: "file")?.relativePath.value == "New/notes.txt")
+        try await renamer.rename(rootID: rootID, courseID: 1, from: "New", to: "Again")
+        #expect(try await database.scope(rootID: rootID, courseID: 1)?.localFolder == "Again")
+        #expect(try await database.pendingScopeMoves().isEmpty)
+    }
+
+    @Test(arguments: [JournalStep.journaled, .filesystemChanged])
+    func recoversARestoredDirectoryRename(_ stoppedAt: JournalStep) async throws {
+        struct Interrupted: Error {}
+        let root = try temporaryRoot()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let rootID = UUID()
+        let database = try SyncDatabase(url: root.appending(path: "state.sqlite"))
+        try await database.registerRoot(id: rootID, canonicalPath: root.path)
+        let store = try FileStore(root: root)
+        let identity = try await store.ensureTopLevelDirectory("Old").identity
+        try await database.upsertScope(SyncScope(rootID: rootID, courseID: 1, displayName: "Course", localFolder: "Old", enabled: true, managedDirectory: DirectoryIdentity(device: identity.device + 1, inode: identity.inode + 1)))
+        try Data("notes".utf8).write(to: root.appending(path: "Old/notes.txt"))
+        let renamer = CourseFolderRenamer(database: database, fileStore: store, gate: RootOperationGate(), interruption: { step in
+            if step == stoppedAt { throw Interrupted() }
+        })
+        await #expect(throws: Interrupted.self) {
+            try await renamer.rename(rootID: rootID, courseID: 1, from: "Old", to: "New")
+        }
+        let report = try await RecoveryCoordinator(rootID: rootID, database: database, fileStore: store).recover()
+        #expect(report.unresolved.isEmpty)
+        #expect(try String(contentsOf: root.appending(path: "New/notes.txt"), encoding: .utf8) == "notes")
+        #expect(try await database.scope(rootID: rootID, courseID: 1)?.managedDirectory == identity)
+        #expect(try await database.scope(rootID: rootID, courseID: 1)?.localFolder == "New")
+        #expect(try await database.pendingScopeMoves().isEmpty)
+    }
+
+    @Test func aRetryDoesNotChangeTheIdentityOfAnUnfinishedRename() async throws {
+        let root = try temporaryRoot()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let rootID = UUID()
+        let database = try SyncDatabase(url: root.appending(path: "state.sqlite"))
+        try await database.registerRoot(id: rootID, canonicalPath: root.path)
+        let store = try FileStore(root: root)
+        let identity = try await store.ensureTopLevelDirectory("Old").identity
+        try await database.upsertScope(SyncScope(rootID: rootID, courseID: 1, displayName: "Course", localFolder: "Old", enabled: true, managedDirectory: identity))
+        let pending = PendingScopeMove(id: UUID(), rootID: rootID, courseID: 1, oldFolder: "Old", newFolder: "New")
+        try await database.beginScopeMove(pending)
+        try FileManager.default.moveItem(at: root.appending(path: "Old"), to: root.appending(path: "Saved"))
+        _ = try await store.ensureTopLevelDirectory("Old")
+        let renamer = CourseFolderRenamer(database: database, fileStore: store, gate: RootOperationGate())
+        await #expect(throws: SyncDatabaseError.execution) {
+            try await renamer.rename(rootID: rootID, courseID: 1, from: "Old", to: "Again")
+        }
+        #expect(try await database.scope(rootID: rootID, courseID: 1)?.managedDirectory == identity)
+        let report = try await RecoveryCoordinator(rootID: rootID, database: database, fileStore: store).recover()
+        #expect(report.unresolved.contains(pending.id))
+        #expect(FileManager.default.fileExists(atPath: root.appending(path: "Old").path))
+        #expect(!FileManager.default.fileExists(atPath: root.appending(path: "New").path))
+    }
+
+    @Test func refusesAReplacementAfterTheRenameWasPrepared() async throws {
+        let root = try temporaryRoot()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let rootID = UUID()
+        let database = try SyncDatabase(url: root.appending(path: "state.sqlite"))
+        try await database.registerRoot(id: rootID, canonicalPath: root.path)
+        let store = try FileStore(root: root)
+        let identity = try await store.ensureTopLevelDirectory("Old").identity
+        try await database.upsertScope(SyncScope(rootID: rootID, courseID: 1, displayName: "Course", localFolder: "Old", enabled: true, managedDirectory: identity))
+        let renamer = CourseFolderRenamer(database: database, fileStore: store, gate: RootOperationGate(), interruption: { step in
+            if step == .journaled {
+                try FileManager.default.moveItem(at: root.appending(path: "Old"), to: root.appending(path: "Saved"))
+                try FileManager.default.createDirectory(at: root.appending(path: "Old"), withIntermediateDirectories: false)
+                try Data("replacement".utf8).write(to: root.appending(path: "Old/personal.txt"))
+            }
+        })
+        await #expect(throws: FileStoreError.invalidStage) {
+            try await renamer.rename(rootID: rootID, courseID: 1, from: "Old", to: "New")
+        }
+        #expect(try String(contentsOf: root.appending(path: "Old/personal.txt"), encoding: .utf8) == "replacement")
+        #expect(FileManager.default.fileExists(atPath: root.appending(path: "Saved").path))
+        #expect(!FileManager.default.fileExists(atPath: root.appending(path: "New").path))
+        #expect(try await database.pendingScopeMoves().isEmpty)
+        #expect(try await database.scope(rootID: rootID, courseID: 1)?.localFolder == "Old")
+    }
+
     private func temporaryRoot() throws -> URL {
         let root = FileManager.default.temporaryDirectory.appending(path: UUID().uuidString, directoryHint: .isDirectory)
         try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)

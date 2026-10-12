@@ -2474,8 +2474,7 @@ struct MenuBarSnapshot: Sendable {
                             courseID: course.id,
                             displayName: course.displayName,
                             localFolder: replacement,
-                            enabled: scope.enabled,
-                            managedDirectory: scope.managedDirectory
+                            enabled: scope.enabled
                         ))
                     } catch {
                         if courseFolders[course.id] != scope.localFolder { courseFolders[course.id] = scope.localFolder }

@@ -113,7 +113,7 @@ On the first sync after updating, the files the teacher removed from Moodle befo
 
 | Action | What happens |
 |---|---|
-| You rename a course folder | It is renamed on disk; BeepBar keeps tracking every file. If the name is taken, it says so and changes nothing |
+| You rename a course folder | It is renamed on disk; BeepBar keeps tracking every file, including after a restore or copy changed the folder’s identity. The folder is checked again before moving it. If the name is taken, it says so and changes nothing |
 | "Organizza cartelle": you give a module its own folder | Preview, then the module's files are moved; edited files are moved without being overwritten; a taken destination blocks the operation |
 | "Ripristina layout Moodle" | Brings the module's files back to Moodle's structure, with the same preview |
 

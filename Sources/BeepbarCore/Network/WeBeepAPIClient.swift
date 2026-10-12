@@ -329,6 +329,46 @@ public final class WeBeepAPIClient: @unchecked Sendable {
         return RemoteCourseContents(sections: resolved, issueCount: issueCount, modulesWithDroppedEntries: modulesWithDroppedEntries, isComplete: isComplete)
     }
 
+    /// Moodle web service that `fetchOwnEmail` calls. Callers check
+    /// `WeBeepSiteInfo.availableFunctions.contains(ownEmailFunction)` first: a WeBeep token may not
+    /// be allowed to call it, and its absence must not be treated as a failed sign-in.
+    public static let ownEmailFunction = AllowedFunction.userByField.rawValue
+
+    /// Response cap for `fetchOwnEmail`: one user record (profile fields and preferences) is a few
+    /// kilobytes, so 1 MiB, as for site info, leaves headroom without unbounded reception (#102).
+    static let ownEmailResponseLimit = 1_048_576
+
+    /// The e-mail address on the signed-in user's WeBeep profile, used to pre-fill the Polimi
+    /// address Webex asks for in native recordings playback (#148).
+    ///
+    /// Returns the raw string, untouched, for the user whose `id` equals `userID`; nil when Moodle
+    /// returns no user, only other users, or a user without a non-blank `email`. It does not
+    /// validate the address: `PolimiEmail` does that at the caller, so the network client stays
+    /// independent of the playback policy. Moodle errors map as for `fetchCourses`
+    /// (`invalidtoken` → `.invalidToken`, any other exception → `.malformedPayload`).
+    /// The address is personal data and the token a credential: neither is ever logged.
+    public func fetchOwnEmail(userID: Int, token: String) async throws -> String? {
+        guard userID > 0 else { throw WeBeepAPIError.malformedPayload }
+        let data = try await request(.userByField, token: token, fields: Self.ownEmailFields(userID: userID), limit: Self.ownEmailResponseLimit)
+        if let error = try? JSONDecoder().decode(MoodleErrorResponse.self, from: data), error.exception != nil || error.errorcode != nil {
+            throw error.errorcode == "invalidtoken" ? WeBeepAPIError.invalidToken : WeBeepAPIError.malformedPayload
+        }
+        let users: [UserResponse]
+        do { users = try JSONDecoder().decode([UserResponse].self, from: data) }
+        catch { throw WeBeepAPIError.malformedPayload }
+        // Match the id rather than taking the first element: an address that belongs to someone
+        // else must never be offered as the user's own, whatever order Moodle returns.
+        guard let email = users.first(where: { $0.id == Int64(userID) })?.email,
+              !email.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return nil }
+        return email
+    }
+
+    /// `core_user_get_users_by_field` takes a field name and an array of values; PHP reads the
+    /// form key `values[0]` as the array's first element.
+    private static func ownEmailFields(userID: Int) -> [String: String] {
+        ["field": "id", "values[0]": String(userID)]
+    }
+
     private func request(_ function: AllowedFunction, token: String, fields: [String: String], limit: Int) async throws -> Data {
         let request = Self.request(function: function, token: token, fields: fields, endpoint: policy.endpoint)
         do { return try await BoundedMetadataResponse(limit: limit).run(request, in: session) }
@@ -349,6 +389,10 @@ public final class WeBeepAPIClient: @unchecked Sendable {
 
     static func contentsRequest(courseID: Int64, token: String) -> URLRequest {
         request(function: .contents, token: token, fields: ["courseid": String(courseID)], endpoint: endpoint)
+    }
+
+    static func ownEmailRequest(userID: Int, token: String) -> URLRequest {
+        request(function: .userByField, token: token, fields: ownEmailFields(userID: userID), endpoint: endpoint)
     }
 
     private static func request(function: AllowedFunction, token: String, fields: [String: String], endpoint: URL) -> URLRequest {
@@ -585,7 +629,14 @@ private func validContentHash(_ value: String?) -> String? {
     return value.lowercased()
 }
 
-private enum AllowedFunction: String { case siteInfo = "core_webservice_get_site_info", courses = "core_enrol_get_users_courses", contents = "core_course_get_contents" }
+/// The only Moodle web services BeepBar calls. A new call is added here deliberately, never built
+/// from a free-form string.
+private enum AllowedFunction: String {
+    case siteInfo = "core_webservice_get_site_info"
+    case courses = "core_enrol_get_users_courses"
+    case contents = "core_course_get_contents"
+    case userByField = "core_user_get_users_by_field"
+}
 
 private final class RejectRedirects: NSObject, URLSessionTaskDelegate {
     func urlSession(_ session: URLSession, task: URLSessionTask, willPerformHTTPRedirection response: HTTPURLResponse, newRequest request: URLRequest, completionHandler: @escaping (URLRequest?) -> Void) {
@@ -603,6 +654,10 @@ private struct SiteInfoResponse: Decodable {
     let errorcode: String?
     struct Function: Decodable { let name: String }
 }
+
+/// One element of `core_user_get_users_by_field`. Only what `fetchOwnEmail` needs is decoded;
+/// `email` is optional because Moodle omits it when the field is hidden or unset.
+private struct UserResponse: Decodable { let id: Int64; let email: String? }
 
 private struct CourseResponse: Decodable {
     let id: Int64

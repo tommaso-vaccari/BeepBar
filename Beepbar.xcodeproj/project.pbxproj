@@ -28,12 +28,15 @@
 		A10000000000000000000008 /* Sparkle in Frameworks */ = {isa = PBXBuildFile; productRef = A10000000000000000000041 /* Sparkle */; };
 		A100000000000000000000B0 /* RecmanScripts.swift in Sources */ = {isa = PBXBuildFile; fileRef = A100000000000000000000B1 /* RecmanScripts.swift */; };
 		A100000000000000000000B2 /* RecmanWebSession.swift in Sources */ = {isa = PBXBuildFile; fileRef = A100000000000000000000B3 /* RecmanWebSession.swift */; };
+		B148000000000000000E0001 /* WebexStreamResolver.swift in Sources */ = {isa = PBXBuildFile; fileRef = B148000000000000000E0002 /* WebexStreamResolver.swift */; };
 		A100000000000000000000B8 /* RecordingsPage.swift in Sources */ = {isa = PBXBuildFile; fileRef = A100000000000000000000B9 /* RecordingsPage.swift */; };
 		A100000000000000000000B6 /* RecordingsController.swift in Sources */ = {isa = PBXBuildFile; fileRef = A100000000000000000000B7 /* RecordingsController.swift */; };
 		A100000000000000000000B4 /* RecordingsSessionStore.swift in Sources */ = {isa = PBXBuildFile; fileRef = A100000000000000000000B5 /* RecordingsSessionStore.swift */; };
 		A100000000000000000000C0 /* UIContentReadiness.swift in Sources */ = {isa = PBXBuildFile; fileRef = A100000000000000000000C1 /* UIContentReadiness.swift */; };
 		A100000000000000000000C2 /* UIPerformanceHarness.swift in Sources */ = {isa = PBXBuildFile; fileRef = A100000000000000000000C3 /* UIPerformanceHarness.swift */; };
 		B12300000000000000000001 /* RecordingsStudyState.swift in Sources */ = {isa = PBXBuildFile; fileRef = B12300000000000000000002 /* RecordingsStudyState.swift */; };
+		B14800000000000000000001 /* RecordingPlayerController.swift in Sources */ = {isa = PBXBuildFile; fileRef = B14800000000000000000002 /* RecordingPlayerController.swift */; };
+		B14800000000000000000003 /* RecordingPlayerControls.swift in Sources */ = {isa = PBXBuildFile; fileRef = B14800000000000000000004 /* RecordingPlayerControls.swift */; };
 /* End PBXBuildFile section */
 
 /* Begin PBXFileReference section */
@@ -59,12 +62,15 @@
 		A10000000000000000000021 /* WebKit.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = WebKit.framework; path = System/Library/Frameworks/WebKit.framework; sourceTree = SDKROOT; };
 		A100000000000000000000B1 /* RecmanScripts.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = RecmanScripts.swift; sourceTree = "<group>"; };
 		A100000000000000000000B3 /* RecmanWebSession.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = RecmanWebSession.swift; sourceTree = "<group>"; };
+		B148000000000000000E0002 /* WebexStreamResolver.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = WebexStreamResolver.swift; sourceTree = "<group>"; };
 		A100000000000000000000B9 /* RecordingsPage.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = RecordingsPage.swift; sourceTree = "<group>"; };
 		A100000000000000000000B7 /* RecordingsController.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = RecordingsController.swift; sourceTree = "<group>"; };
 		A100000000000000000000B5 /* RecordingsSessionStore.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = RecordingsSessionStore.swift; sourceTree = "<group>"; };
 		A100000000000000000000C1 /* UIContentReadiness.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = UIContentReadiness.swift; sourceTree = "<group>"; };
 		A100000000000000000000C3 /* UIPerformanceHarness.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = UIPerformanceHarness.swift; sourceTree = "<group>"; };
 		B12300000000000000000002 /* RecordingsStudyState.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = RecordingsStudyState.swift; sourceTree = "<group>"; };
+		B14800000000000000000002 /* RecordingPlayerController.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = RecordingPlayerController.swift; sourceTree = "<group>"; };
+		B14800000000000000000004 /* RecordingPlayerControls.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = RecordingPlayerControls.swift; sourceTree = "<group>"; };
 /* End PBXFileReference section */
 
 /* Begin PBXFrameworksBuildPhase section */
@@ -124,10 +130,13 @@
 				A100000000000000000000AB /* ModuleDestinationsSheet.swift */,
 				A100000000000000000000B1 /* RecmanScripts.swift */,
 				A100000000000000000000B3 /* RecmanWebSession.swift */,
+				B148000000000000000E0002 /* WebexStreamResolver.swift */,
 				A100000000000000000000B9 /* RecordingsPage.swift */,
 				A100000000000000000000B7 /* RecordingsController.swift */,
 				A100000000000000000000B5 /* RecordingsSessionStore.swift */,
 				B12300000000000000000002 /* RecordingsStudyState.swift */,
+				B14800000000000000000002 /* RecordingPlayerController.swift */,
+				B14800000000000000000004 /* RecordingPlayerControls.swift */,
 			);
 			name = Sources;
 			path = Sources/BeepbarApp;
@@ -237,10 +246,13 @@
 				A100000000000000000000AA /* ModuleDestinationsSheet.swift in Sources */,
 				A100000000000000000000B0 /* RecmanScripts.swift in Sources */,
 				A100000000000000000000B2 /* RecmanWebSession.swift in Sources */,
+				B148000000000000000E0001 /* WebexStreamResolver.swift in Sources */,
 				A100000000000000000000B8 /* RecordingsPage.swift in Sources */,
 				A100000000000000000000B6 /* RecordingsController.swift in Sources */,
 				A100000000000000000000B4 /* RecordingsSessionStore.swift in Sources */,
 				B12300000000000000000001 /* RecordingsStudyState.swift in Sources */,
+				B14800000000000000000001 /* RecordingPlayerController.swift in Sources */,
+				B14800000000000000000003 /* RecordingPlayerControls.swift in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};

@@ -26,9 +26,12 @@ import os
 /// replace the chain with an actor: actors do not promise FIFO, and the delete running before an
 /// older save is exactly the ordering the epoch check exists to survive, not to rely on.
 ///
-/// The vault remembers what the file holds (owner and a fingerprint of the cookies) so that a
-/// session identical to the saved one is not written again: a visit with nothing new writes
-/// nothing. The fingerprint is seeded by a load and refreshed by a save; a delete forgets it.
+/// The vault remembers what the file holds (owner, a fingerprint of the cookies and the confirmed
+/// Polimi email) so that a session identical to the saved one is not written again: a visit with
+/// nothing new writes nothing. The record is seeded by a load and refreshed by a save; a delete
+/// forgets it. The email is part of it (#148): a save that left it out would write a file without
+/// the email the user confirmed, and a save that only changed the email must not be skipped as
+/// "same cookies".
 ///
 /// Storage is three closures so the app passes its 0700/0600 atomic-rename primitives and the
 /// Core tests an in-memory box; the vault never decides *how* bytes reach the disk, only *when*.
@@ -76,6 +79,7 @@ public final class RecmanSessionVault: Sendable {
     private struct Saved: Equatable {
         var owner: Int
         var fingerprint: [String]
+        var email: String?
     }
 
     private struct State {
@@ -110,7 +114,7 @@ public final class RecmanSessionVault: Sendable {
             do { data = try storage.load() } catch { return .unreadable }
             guard let data else { return .none }
             guard let snapshot = try? RecmanSessionCodec.decode(data, now: now) else { return .undecodable }
-            state.withLock { $0.saved = Saved(owner: snapshot.ownerUserID, fingerprint: RecmanSessionCodec.fingerprint(snapshot.cookies)) }
+            state.withLock { $0.saved = Saved(owner: snapshot.ownerUserID, fingerprint: RecmanSessionCodec.fingerprint(snapshot.cookies), email: snapshot.email) }
             return .session(snapshot)
         }
     }
@@ -121,18 +125,58 @@ public final class RecmanSessionVault: Sendable {
     /// The epoch is checked once, right before the write, under the lock: that is the check that
     /// matters, and keeping it the only one keeps it covered by tests. A stale save whose cookies
     /// equal what the file still holds reports `.unchanged`; either way nothing is written.
-    public func save(_ cookies: [HTTPCookie], ownerUserID: Int, epoch: Int, now: Date) -> Task<SaveOutcome, Never> {
+    ///
+    /// `email` is the confirmed Polimi address to keep in the file (nil: none). It has no default
+    /// on purpose: every save states what the file should say, so a caller that forgets the email
+    /// doesn't silently erase the one the user confirmed.
+    ///
+    /// `keepingFileEmail` is for a caller that never managed to read the file (a disk error at
+    /// load) and so does not know what email it holds: the save then keeps the email the file has
+    /// for this owner, read here, and `email` is ignored. A file that can't be read now, or
+    /// belongs to another owner, counts as having none.
+    public func save(_ cookies: [HTTPCookie], ownerUserID: Int, email: String?, keepingFileEmail: Bool = false, epoch: Int, now: Date) -> Task<SaveOutcome, Never> {
         enqueue { [storage, state] in
+            var email = email
+            if keepingFileEmail {
+                email = nil
+                if let data = try? storage.load(), let snapshot = try? RecmanSessionCodec.decode(data, now: now), snapshot.ownerUserID == ownerUserID {
+                    email = snapshot.email
+                }
+            }
             let kept = cookies.filter { RecmanSessionCodec.keeps($0, now: now) }
-            let candidate = Saved(owner: ownerUserID, fingerprint: RecmanSessionCodec.fingerprint(kept))
+            let candidate = Saved(owner: ownerUserID, fingerprint: RecmanSessionCodec.fingerprint(kept), email: email)
             if state.withLock({ $0.saved == candidate }) { return .unchanged }
             let data: Data
-            do { data = try RecmanSessionCodec.encode(kept, ownerUserID: ownerUserID, now: now) } catch { return .failed(String(reflecting: type(of: error))) }
+            do { data = try RecmanSessionCodec.encode(kept, ownerUserID: ownerUserID, email: email, now: now) } catch { return .failed(String(reflecting: type(of: error))) }
             // Commit-time check: a discard that ran while this save waited in the chain, or while
             // the controller awaited the browser, must win. Nothing is written for a stale epoch.
             guard state.withLock({ $0.epoch == epoch }) else { return .stale }
             do { try storage.save(data) } catch { return .failed(String(reflecting: type(of: error))) }
             state.withLock { $0.saved = candidate }
+            return .saved
+        }
+    }
+
+    /// Changes only the confirmed email of the saved session, keeping its cookies, for an edit
+    /// made while no browser is open (the Settings field). Reads the file in turn, so it sees
+    /// whatever was enqueued before it.
+    ///
+    /// Nothing is written, and the outcome is `.unchanged`, when there is no readable session
+    /// (the caller keeps the email in memory and the next full `save` writes it), when the file
+    /// belongs to another owner than `ownerUserID`, or when it already holds `email`. A discard
+    /// since `epoch` makes it `.stale`, like `save`: the commit-time check is the same one.
+    public func updateEmail(_ email: String?, ownerUserID: Int, epoch: Int, now: Date) -> Task<SaveOutcome, Never> {
+        enqueue { [storage, state] in
+            let data: Data?
+            do { data = try storage.load() } catch { return .failed(String(reflecting: type(of: error))) }
+            guard let data, let snapshot = try? RecmanSessionCodec.decode(data, now: now),
+                  snapshot.ownerUserID == ownerUserID, snapshot.email != email else { return .unchanged }
+            let kept = snapshot.cookies.filter { RecmanSessionCodec.keeps($0, now: now) }
+            let rewritten: Data
+            do { rewritten = try RecmanSessionCodec.encode(kept, ownerUserID: ownerUserID, email: email, now: now) } catch { return .failed(String(reflecting: type(of: error))) }
+            guard state.withLock({ $0.epoch == epoch }) else { return .stale }
+            do { try storage.save(rewritten) } catch { return .failed(String(reflecting: type(of: error))) }
+            state.withLock { $0.saved = Saved(owner: ownerUserID, fingerprint: RecmanSessionCodec.fingerprint(kept), email: email) }
             return .saved
         }
     }

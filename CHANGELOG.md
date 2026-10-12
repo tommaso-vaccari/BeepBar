@@ -13,6 +13,7 @@
 
 ### Improved
 
+- In Recordings, a course whose folder you renamed shows the folder name followed by the teacher (for example “GAL (Claude Sonnet)”), and an orange dot marks the courses that still have lectures to watch.
 - Opening BeepBar shows your courses straight away, as they were at the last successful refresh, while the current list loads in the background; offline, the saved list stays visible and says it is not yet confirmed. Every sync still asks your university for the current list first. The very first opening after updating still waits for the list once.
 - Cancelling sync stops large local file checks promptly while file changes already underway still finish safely.
 

@@ -150,6 +150,22 @@ struct RecordingsMenuPlayTests {
         controller.turnOff()
     }
 
+    /// Until the sync controller computes it, a stored `newCount` survives the recomputation of
+    /// its course's summary (a listing, a checkpoint): recomputing counts and `next` must not
+    /// erase the menu's "· 3 nuove". Mutation: pass `newCount: nil` in `refreshWatchSummary`
+    /// (the saved count is dropped).
+    @Test func aStoredNewCountIsCarriedOver() async throws {
+        defer { cleanUp() }
+        let stored = RecordingsController.StoredWatchSummaries(owner: 42, courses: ["058167-2026": CourseWatchSummary(done: 0, total: 1, remainingMinutes: 90, unknownDurationCount: 0, newCount: 3)])
+        defaults.set(try PropertyListEncoder().encode(stored), forKey: RecordingsController.watchSummaryKey)
+        let controller = await listedController([recording("a", daysAgo: 2), recording("b", daysAgo: 1)])
+        let saved = try #require(RecordingsController.storedWatchSummaries(in: defaults, owner: 42)?[course])
+        #expect(saved.total == 2 && saved.next == recording("a", daysAgo: 2), "recomputed")
+        #expect(saved.newCount == 3, "but the new-recordings count is kept")
+        #expect(controller.watchProgress.summaries[course]?.newCount == 3, "the window agrees")
+        controller.turnOff()
+    }
+
     /// A periodic tick of the playing lecture writes nothing and doesn't move `next`, even when
     /// it takes an untouched lecture past 0 %: only committed entries choose it.
     /// Guards the saved summary being rewritten every ~30 s (principle 3) or the menu line
@@ -222,7 +238,7 @@ struct RecordingsMenuPlayTests {
         let controller = makeController()
         browser.listResults[course.courseCode] = .failure(RecmanBrowserError.unrecognized)
         browser.streamResults["a"] = [.success(stream("a"))]
-        #expect(controller.playFromMenu(recording("a", daysAgo: 2)))
+        #expect(controller.playFromMenu(recording("a", daysAgo: 2), owner: 42))
         await settle("a playing") { world.player.plays.count == 1 }
         await settle("listing tried") { browser.listCalls.contains(course.courseCode) && controller.listing(for: course)?.isLoading == false }
         #expect(controller.listing(for: course)?.recordings == nil)
@@ -256,7 +272,7 @@ struct RecordingsMenuPlayTests {
         browser.listResults[course.courseCode] = .success([recording("a", daysAgo: 2), recording("b")])
         browser.streamResults["a"] = [.success(stream("a"))]
 
-        #expect(controller.playFromMenu(recording("a")))
+        #expect(controller.playFromMenu(recording("a"), owner: 42))
         await settle("a playing") { world.player.plays.count == 1 }
         #expect(try world.player.play(0).startAt == 1_200, "where the student stopped")
         await settle("listed") { controller.listing(for: course)?.recordings != nil }
@@ -283,7 +299,7 @@ struct RecordingsMenuPlayTests {
         await settle("first listing running") { gate.isWaiting }
         browser.streamResults["o"] = [.success(stream("o"))]
 
-        #expect(controller.playFromMenu(recording("o", in: other)))
+        #expect(controller.playFromMenu(recording("o", in: other), owner: 42))
         gate.release()
         await settle("all listed") { [course, other, third].allSatisfy { controller.listing(for: $0)?.recordings != nil } }
         #expect(world.player.plays.map(\.recordingID) == ["o"])
@@ -299,9 +315,9 @@ struct RecordingsMenuPlayTests {
         let controller = await signedInController()
         browser.listResults[course.courseCode] = .success([recording("a")])
         browser.streamResults["a"] = [.success(stream("a")), .success(stream("a"))]
-        #expect(controller.playFromMenu(recording("a")))
+        #expect(controller.playFromMenu(recording("a"), owner: 42))
         await settle("a playing") { world.player.plays.count == 1 }
-        #expect(controller.playFromMenu(recording("a")))
+        #expect(controller.playFromMenu(recording("a"), owner: 42))
         await drainTasks()
         #expect(world.player.plays.count == 1)
         #expect(browser.streamCalls == ["stream a"])
@@ -317,7 +333,7 @@ struct RecordingsMenuPlayTests {
     @Test func aMenuPlayNeedsTheWindowWhenOffOrSignedOut() async throws {
         defer { cleanUp() }
         let off = makeController()
-        #expect(off.playFromMenu(recording("a")) == false, "off")
+        #expect(off.playFromMenu(recording("a"), owner: 42) == false, "off")
 
         let gate = FakeRecmanBrowser.Gate()
         browser.signInGate = gate
@@ -325,30 +341,49 @@ struct RecordingsMenuPlayTests {
         controller.setEnabled(true)
         await settle("signing in") { gate.isWaiting }
         #expect(controller.access == .signingIn)
-        #expect(controller.playFromMenu(recording("a")) == false, "signing in")
+        #expect(controller.playFromMenu(recording("a"), owner: 42) == false, "signing in")
 
         browser.signInError = RecmanBrowserError.unrecognized
         gate.release()
         await settle("sign-in failed") { controller.access == .needsSignIn(.unrecognized) }
-        #expect(controller.playFromMenu(recording("a")) == false, "needs a sign-in")
+        #expect(controller.playFromMenu(recording("a"), owner: 42) == false, "needs a sign-in")
         await drainTasks()
         #expect(browser.streamCalls.isEmpty)
         #expect(world.player.plays.isEmpty)
         controller.turnOff()
     }
 
-    /// A stored next lecture that fails validation is never opened, even by a direct call.
-    /// Guards an edited settings file making the hidden browser follow a foreign link.
-    /// Mutation: drop the `validatedNext` guard in `playFromMenu` (the stream is asked for).
-    @Test func anInvalidNextIsIgnored() async throws {
+    /// A stored next lecture that fails validation is never opened, even by a direct call, and
+    /// the click isn't silent: false, so the caller shows the course's page with its real list.
+    /// Guards an edited settings file making the hidden browser follow a foreign link, and a
+    /// click that does nothing at all. Mutations: drop the `validatedNext` guard in
+    /// `playFromMenu` (the stream is asked for); return true from it (no page).
+    @Test func anInvalidNextIsNeverOpenedAndAsksForThePage() async throws {
         defer { cleanUp() }
         let controller = await signedInController()
         let forged = RecmanRecording(id: "a", courseCode: course.courseCode, academicYear: course.academicYear, title: "x", recordedAt: world.now, kind: "Lezione", duration: "90 min", size: nil, previewURL: Self.previewURL("a", host: "example.com"))
         browser.streamResults["a"] = [.success(stream("a"))]
-        #expect(controller.playFromMenu(forged))
+        #expect(controller.playFromMenu(forged, owner: 42) == false)
         await drainTasks()
         #expect(browser.streamCalls.isEmpty)
         #expect(world.player.plays.isEmpty)
+        #expect(!browser.isOpen, "not even the hidden browser")
+        controller.turnOff()
+    }
+
+    /// A click on a line built for another WeBeep account (the account changed while the menu
+    /// was open) is ignored at the point of action: true, nothing played, no browser, no page.
+    /// Guards a stale menu playing the previous student's lecture under the new account.
+    /// Mutation: drop the `resumeOwner() == owner` guard in `playFromMenu` (the stream is asked).
+    @Test func aClickForAnotherAccountIsIgnored() async throws {
+        defer { cleanUp() }
+        let controller = await signedInController()
+        browser.streamResults["a"] = [.success(stream("a"))]
+        #expect(controller.playFromMenu(recording("a"), owner: 7))
+        await drainTasks()
+        #expect(browser.streamCalls.isEmpty)
+        #expect(world.player.plays.isEmpty)
+        #expect(!browser.isOpen)
         #expect(calls.needsPage.isEmpty)
         controller.turnOff()
     }
@@ -364,7 +399,7 @@ struct RecordingsMenuPlayTests {
         defer { cleanUp() }
         let controller = await signedInController()
         browser.streamResults["a"] = [.failure(RecmanBrowserError.needsSignIn)]
-        #expect(controller.playFromMenu(recording("a")))
+        #expect(controller.playFromMenu(recording("a"), owner: 42))
         await settle("asked for the page") { !calls.needsPage.isEmpty }
         #expect(calls.needsPage == [course])
         #expect(calls.accessWhenAsked == [.needsSignIn(nil)])
@@ -378,10 +413,51 @@ struct RecordingsMenuPlayTests {
     @Test func aLectureThatCantBeOpenedAsksForTheCoursePage() async throws {
         defer { cleanUp() }
         let controller = await signedInController()
-        #expect(controller.playFromMenu(recording("a")))
+        #expect(controller.playFromMenu(recording("a"), owner: 42))
         await settle("asked for the page") { !calls.needsPage.isEmpty }
         #expect(calls.needsPage == [course])
         #expect(controller.openingProblem == .playbackUnavailable, "the message the page will show")
+        controller.turnOff()
+    }
+
+    /// With a Recordings page on screen, a failed menu Play is not reported through the
+    /// callback: the page already shows the message, and opening it again would steal focus.
+    /// Mutation: make `takeMenuPlayNeedingPage` return `menuPlay.key` whatever `visiblePages`
+    /// is (asked).
+    @Test func aFailedMenuPlayWithAPageOnScreenDoesNotAskAgain() async throws {
+        defer { cleanUp() }
+        let controller = await signedInController()
+        controller.pageAppeared()
+        #expect(controller.playFromMenu(recording("a"), owner: 42))
+        await settle("a failed") { controller.openingProblem == .playbackUnavailable }
+        await drainTasks()
+        #expect(calls.needsPage.isEmpty)
+        controller.turnOff()
+    }
+
+    /// Polimi unreachable: a listing ahead of a menu Play fails with `.unavailable`, which drops
+    /// the whole queue (every request would wait for the same timeout). The dropped menu Play
+    /// asks for its course's page, where "Polimi isn't responding" is shown, instead of
+    /// vanishing. The listing ahead is the one an earlier menu Play queued, so no page is open.
+    /// Mutation: drop the `takeMenuPlayNeedingPage(failing: nil, queued: true)` call after the
+    /// `.unavailable` guard in `handle` (never asked).
+    @Test func aMenuPlayDroppedBecausePolimiIsUnreachableAsksForThePage() async throws {
+        defer { cleanUp() }
+        let controller = await signedInController()
+        let gate = FakeRecmanBrowser.Gate()
+        defer { gate.release() }
+        browser.listGates[other.courseCode] = gate
+        browser.listResults[other.courseCode] = .failure(RecmanBrowserError.unavailable)
+        browser.streamResults["o"] = [.success(stream("o"))]
+        #expect(controller.playFromMenu(recording("o", in: other), owner: 42))
+        await settle("o playing, its listing running") { world.player.plays.count == 1 && gate.isWaiting }
+        browser.streamResults["a"] = [.success(stream("a"))]
+        #expect(controller.playFromMenu(recording("a"), owner: 42))
+        gate.release()
+        await settle("asked for the page") { !calls.needsPage.isEmpty }
+        #expect(calls.needsPage == [course])
+        #expect(controller.openingProblem == .unavailable)
+        #expect(!browser.streamCalls.contains("stream a"))
         controller.turnOff()
     }
 
@@ -401,7 +477,7 @@ struct RecordingsMenuPlayTests {
         browser.listResults[course.courseCode] = .failure(RecmanBrowserError.needsSignIn)
         controller.refresh([course], selected: course)
         await settle("listing running") { gate.isWaiting }
-        #expect(controller.playFromMenu(recording("o", in: other)))
+        #expect(controller.playFromMenu(recording("o", in: other), owner: 42))
         controller.windowClosed()
         gate.release()
         await settle("asked for the page") { !calls.needsPage.isEmpty }
@@ -430,7 +506,7 @@ struct RecordingsMenuPlayTests {
         let gate = FakeRecmanBrowser.Gate()
         defer { gate.release() }
         browser.streamGates["m"] = gate
-        #expect(controller.playFromMenu(recording("m")))
+        #expect(controller.playFromMenu(recording("m"), owner: 42))
         await settle("menu Play running") { gate.isWaiting }
         controller.pageAppeared()
         controller.play(recording("b"))
@@ -459,7 +535,7 @@ struct RecordingsMenuPlayTests {
             browser.streamGates[id] = gate
             browser.streamResults[id] = [.success(stream(id))]
             let plays = world.player.plays.count
-            if fromMenu { #expect(controller.playFromMenu(recording(id))) } else { controller.play(recording(id)) }
+            if fromMenu { #expect(controller.playFromMenu(recording(id), owner: 42)) } else { controller.play(recording(id)) }
             await settle("\(id) finding its stream") { gate.isWaiting }
             controller.windowClosed()
             gate.release()

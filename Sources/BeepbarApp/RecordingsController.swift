@@ -133,7 +133,9 @@ struct RecordingsListing: Equatable {
 ///   when it is needed, i.e. the Polimi session needs a sign-in or the lecture can't be opened
 ///   (`onMenuPlayNeedsPage`); a window Play's failure never opens anything.
 /// - **Closing the window doesn't cancel a Play** (window or menu) that is queued or running,
-///   as it never cancelled a recovery (`suspend`).
+///   as it never cancelled a recovery (`suspend`). Accepted consequence (owner, 2026-10-12): a
+///   Webex sign-in window or the browser fallback of that Play may appear seconds after
+///   Settings was closed.
 @MainActor final class RecordingsController: ObservableObject {
     static let enabledKey = "io.github.tvaccari.beepbar.recordings-enabled.v1"
     static let acknowledgedKey = "io.github.tvaccari.beepbar.recordings-acknowledged.v1"
@@ -215,6 +217,13 @@ struct RecordingsListing: Equatable {
     private var runningRecovery = false
     /// A Play job is executing (it has left the queue): with `runningRecovery`, what `suspend`
     /// must not cancel (`hasPlayOrRecovery`).
+    ///
+    /// Known limitation: neither flag is scoped to `generation`. Both are reset by their
+    /// `defer` when the job's `await` returns, so after an `invalidate` (turn-off, sign-in) an
+    /// old worker still parked in that job can keep a flag set until its answer arrives; a
+    /// `suspend` meanwhile then takes the exemption branch (drops queued listings, keeps the
+    /// browser until the next drain) instead of closing the browser at once. Harmless to data,
+    /// and short-lived; scoping them would need the worker's generation here.
     private var runningPlay = false
 
     // MARK: Menu bar Play state
@@ -768,10 +777,16 @@ struct RecordingsListing: Equatable {
     func copyLink(_ recording: RecmanRecording) { open(recording, .copyLink) }
 
     /// Plays `recording` for a click on its course's menu bar line, without opening the
-    /// Recordings window. Returns false when only the window can help: the feature is off, or the
-    /// Polimi session needs a sign-in (or one is running), so the caller shows the course's page
-    /// with its message or "Accedi con Polimi". True means handled here, including the cases
-    /// where nothing needs doing.
+    /// Recordings window. Returns false when only the window can help: the feature is off, the
+    /// Polimi session needs a sign-in (or one is running), or the stored lecture fails
+    /// `validatedNext`; the caller then shows the course's page, with its message, "Accedi con
+    /// Polimi" or the course's real list. True means handled here, including a stale click
+    /// that is ignored.
+    ///
+    /// `owner` is the WeBeep account the menu line was built for (P3's `RecordingMenuTarget`
+    /// payload, passed through unchanged). A click on a line built for another account (the
+    /// account changed while the menu was open) is ignored: nothing plays, nothing opens, true.
+    /// The caller checks the owner too; this is defence in depth, at the point of action.
     ///
     /// Same path as the Play button (`open(_, .play)`): the stored resume position, the
     /// acknowledgement as seen, the watch session and its checkpoints, the regular activation
@@ -787,15 +802,16 @@ struct RecordingsListing: Equatable {
     /// - a failure with no page on screen calls `onMenuPlayNeedsPage` (`takeMenuPlayNeedingPage`).
     ///
     /// `recording` comes from the saved summary (UserDefaults), so it is untrusted: the caller
-    /// checks it with `validatedNext` first, and it is checked again here (an invalid one is
-    /// ignored: the page couldn't play it either).
-    func playFromMenu(_ recording: RecmanRecording) -> Bool {
+    /// checks it with `validatedNext` first, and it is checked again here; an invalid one is
+    /// never opened, and the course page is asked for instead (false) so the click isn't silent.
+    func playFromMenu(_ recording: RecmanRecording, owner: Int) -> Bool {
         guard isEnabled else { return false }
         switch access {
         case .off, .needsSignIn, .signingIn: return false
         case .ready: break
         }
-        guard let key = Self.courseKey(of: recording), Self.validatedNext(recording, for: key) else { return true }
+        guard resumeOwner() == owner else { return true }
+        guard let key = Self.courseKey(of: recording), Self.validatedNext(recording, for: key) else { return false }
         if stillShowing(recording) {
             bringPlayerForward()
             return true
@@ -1117,8 +1133,9 @@ struct RecordingsListing: Equatable {
         if succeeded, saves { await saveSession(generation) }
         guard generation == self.generation else { return }
         worker = nil
-        // A recovery ran for a lecture while no Recordings page was on screen: the browser it
-        // needed has no reason to stay open (the stream doesn't use it).
+        // A recovery or a Play (from the menu bar, or from a window closed meanwhile) ran while
+        // no Recordings page was on screen: the browser it needed has no reason to stay open
+        // (the stream doesn't use it).
         if closesBrowserWhenIdle, queue.isEmpty, visiblePages == 0, access != .signingIn {
             closesBrowserWhenIdle = false
             closeBrowser()
@@ -1657,8 +1674,15 @@ struct RecordingsListing: Equatable {
     /// at a checkpoint (an untouched lecture first saved past 0 %, a completion), never on a tick.
     /// A course whose listing isn't loaded keeps its last saved summary (but see
     /// `clearSavedNextIfCompleted`).
+    ///
+    /// `newCount` (new recordings, shown on the menu line) is not computed here yet: the sync
+    /// controller package will. Until then the saved one of the course, if any, is carried over
+    /// unchanged into both summaries, so recomputing the counts never drops it.
     private func refreshWatchSummary(for key: RecmanCourseKey, persist: Bool) {
         guard let recordings = listings[key]?.recordings else { return }
+        let owner = resumeOwner()
+        if let owner { loadWatchSummaries(owner: owner) }
+        let newCount = owner == nil ? nil : watchSummaries[key]?.newCount
         var entries: [String: RecordingWatchEntry] = [:]
         var live: [String: Double] = [:]
         for recording in recordings {
@@ -1666,9 +1690,9 @@ struct RecordingsListing: Equatable {
             entries[recording.id] = watchProgress.entries[identity]
             live[recording.id] = watchProgress.live[identity]
         }
-        watchProgress.setSummary(RecordingWatchProgress.courseSummary(recordings: recordings, entries: entries, live: live), for: key)
-        guard persist, let owner = resumeOwner() else { return }
-        storeWatchSummary(RecordingWatchProgress.courseSummary(recordings: recordings, entries: entries, live: [:]), for: key, owner: owner)
+        watchProgress.setSummary(RecordingWatchProgress.courseSummary(recordings: recordings, entries: entries, live: live, newCount: newCount), for: key)
+        guard persist, let owner else { return }
+        storeWatchSummary(RecordingWatchProgress.courseSummary(recordings: recordings, entries: entries, live: [:], newCount: newCount), for: key, owner: owner)
     }
 
     /// A lecture just completed in a course whose listing isn't in memory (a menu Play whose
@@ -1682,7 +1706,7 @@ struct RecordingsListing: Equatable {
         loadWatchSummaries(owner: owner)
         guard let saved = watchSummaries[key], saved.next?.id == recording.id else { return }
         storeWatchSummary(CourseWatchSummary(done: saved.done, total: saved.total, remainingMinutes: saved.remainingMinutes,
-                                             unknownDurationCount: saved.unknownDurationCount, next: nil), for: key, owner: owner)
+                                             unknownDurationCount: saved.unknownDurationCount, next: nil, newCount: saved.newCount), for: key, owner: owner)
     }
 
     /// Reads the saved summaries of `owner` once per account, before the first change of a
@@ -1892,6 +1916,9 @@ struct RecordingsListing: Equatable {
         // Only another operation on the browser interrupts one, and only a sign-in starts one
         // while the worker runs, after bumping the generation. Nothing to tell the user.
         if error is CancellationError {
+            // The menu Play's job goes with the queue and nobody is told (a cancellation is
+            // never the student's problem): forgotten, so `menuPlay` names only a live job.
+            menuPlay = nil
             clearQueue()
             return .stopWithoutSaving
         }

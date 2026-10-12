@@ -153,8 +153,10 @@ struct RecordingsMenuPlayTests {
     /// A periodic tick of the playing lecture writes nothing and doesn't move `next`, even when
     /// it takes an untouched lecture past 0 %: only committed entries choose it.
     /// Guards the saved summary being rewritten every ~30 s (principle 3) or the menu line
-    /// changing on a tick. Mutation: `refreshWatchSummary(for:persist: true)` in `publishLive`
-    /// (the tick writes the summary).
+    /// changing on a tick. Mutation: pass `live` into the saved summary in
+    /// `refreshWatchSummary` and persist it from `publishLive` (the tick writes the summary).
+    /// Persisting from `publishLive` alone writes nothing, because the saved summary ignores
+    /// live positions: that is the property under test.
     @Test func aTickWritesNothingAndKeepsTheNextLecture() async throws {
         defer { cleanUp() }
         let controller = await listedController([recording("a", daysAgo: 2), recording("b", daysAgo: 1)])
@@ -310,7 +312,8 @@ struct RecordingsMenuPlayTests {
     /// Only the window can help when the feature is off, a sign-in is running or the Polimi
     /// session needs one: the menu Play says so (false) and does nothing.
     /// Guards the menu click silently doing nothing instead of showing "Accedi con Polimi".
-    /// Mutation: drop the `isEnabled` guard or the `access` switch in `playFromMenu` (true).
+    /// Mutation: drop the `isEnabled` guard and the `access` switch in `playFromMenu` (true;
+    /// either alone is enough, since `access` is `.off` whenever the feature is off).
     @Test func aMenuPlayNeedsTheWindowWhenOffOrSignedOut() async throws {
         defer { cleanUp() }
         let off = makeController()
@@ -385,7 +388,9 @@ struct RecordingsMenuPlayTests {
     /// A menu Play waiting behind a listing that finds the session gone is dropped with the
     /// queue: it asks for the page too, instead of vanishing. Here the window was closed while
     /// the listing ran, which keeps the listing in flight because a Play is queued.
-    /// Mutation: `queued: false` in `handle`'s needsSignIn branch (never asked).
+    /// Mutations: `queued: false` in `handle`'s needsSignIn branch (never asked); drop the
+    /// queued Play from `hasPlayOrRecovery`, or let `dropQueuedOpenings` drop Plays (the Play
+    /// is dropped when the window closes, before the listing fails).
     @Test func aMenuPlayDroppedBehindALapsedListingAsksForThePage() async throws {
         defer { cleanUp() }
         let controller = await signedInController()
@@ -408,8 +413,10 @@ struct RecordingsMenuPlayTests {
     /// A window Play's failure never opens anything, even with the window closed meanwhile, and
     /// neither does a window Play that replaced a pending menu Play: only the menu's own request
     /// counts. Guards the window popping up on its own for a click made in it.
-    /// Mutations: ignore the request in `takeMenuPlayNeedingPage` (match any Play: the second
-    /// case asks); set `menuPlay` in `open` for every Play (the first case asks).
+    /// Mutations: report every failed Play with no page on screen in `handle`'s `.open` case
+    /// (the first case asks); keep `menuPlay` across a newer `open` and match any Play in
+    /// `takeMenuPlayNeedingPage` (the second case asks; the two layers are redundant on
+    /// purpose, so only both together break it).
     @Test func aWindowPlaysFailureNeverAsksForThePage() async throws {
         defer { cleanUp() }
         let controller = await signedInController()

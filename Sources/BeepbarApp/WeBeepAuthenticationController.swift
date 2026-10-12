@@ -1129,6 +1129,10 @@ struct MenuBarSnapshot: Sendable {
     }
 
 #if DEBUG
+    /// The profile lookup Recordings uses, called directly so tests can check its own guards
+    /// (the listed function, the account after the answer) apart from Recordings' epochs.
+    func profileEmailForTesting() async -> String? { await profileEmail() }
+
     private var controllerDefaultsHaveNoWatchlist: Bool {
         operationDefaults.data(forKey: RecordingsController.studyKey(owner: 1)) == nil
     }

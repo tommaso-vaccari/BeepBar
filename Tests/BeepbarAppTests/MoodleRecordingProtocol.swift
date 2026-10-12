@@ -28,6 +28,12 @@ final class MoodleRecordingProtocol: URLProtocol, @unchecked Sendable {
         var rejected = false
         var holdsCourseLists = false
         var heldCourseLists: [@Sendable () -> Void] = []
+        /// The profile address `core_user_get_users_by_field` answers; site info lists that
+        /// function only when `listsEmailFunction` is set.
+        var email: String?
+        var listsEmailFunction = false
+        var holdsEmails = false
+        var heldEmails: [@Sendable () -> Void] = []
     }
 
     /// What a download records as its `function`.
@@ -42,6 +48,35 @@ final class MoodleRecordingProtocol: URLProtocol, @unchecked Sendable {
         let token = UUID().uuidString
         accounts.withLock { $0[token] = Account(courses: courses, files: files, userID: userID) }
         return token
+    }
+
+    /// Gives this account a profile `email`; `listed` says whether site info lists the function
+    /// that reads it (a WeBeep token may not be allowed to call it).
+    static func setProfileEmail(token: String, _ email: String?, listed: Bool) {
+        accounts.withLock {
+            $0[token]?.email = email
+            $0[token]?.listsEmailFunction = listed
+        }
+    }
+
+    /// Holds every profile-address answer for this account until `releaseEmails(token:)`, like
+    /// `holdCourseLists(token:)`: lets a test switch accounts while the address is on its way.
+    static func holdEmails(token: String) {
+        accounts.withLock { $0[token]?.holdsEmails = true }
+    }
+
+    static func heldEmailCount(token: String) -> Int {
+        accounts.withLock { $0[token]?.heldEmails.count ?? 0 }
+    }
+
+    static func releaseEmails(token: String) {
+        let held = accounts.withLock { accounts -> [@Sendable () -> Void] in
+            let held = accounts[token]?.heldEmails ?? []
+            accounts[token]?.holdsEmails = false
+            accounts[token]?.heldEmails = []
+            return held
+        }
+        held.forEach { $0() }
     }
 
     /// Puts this account's Mac on a phone hotspot: a request that may not use an expensive network
@@ -155,10 +190,16 @@ final class MoodleRecordingProtocol: URLProtocol, @unchecked Sendable {
             this.client?.urlProtocol(this, didLoad: Data(json.utf8))
             this.client?.urlProtocolDidFinishLoading(this)
         }
-        let held = function == "core_enrol_get_users_courses" && Self.accounts.withLock { accounts in
-            guard accounts[token]?.holdsCourseLists == true else { return false }
-            accounts[token]?.heldCourseLists.append(deliver)
-            return true
+        let held = Self.accounts.withLock { accounts in
+            if function == "core_enrol_get_users_courses", accounts[token]?.holdsCourseLists == true {
+                accounts[token]?.heldCourseLists.append(deliver)
+                return true
+            }
+            if function == WeBeepAPIClient.ownEmailFunction, accounts[token]?.holdsEmails == true {
+                accounts[token]?.heldEmails.append(deliver)
+                return true
+            }
+            return false
         }
         if !held { deliver() }
     }
@@ -170,7 +211,11 @@ final class MoodleRecordingProtocol: URLProtocol, @unchecked Sendable {
         case (let account?, _) where account.rejected:
             return #"{"exception":"invalidtoken","errorcode":"invalidtoken"}"#
         case (let account?, "core_webservice_get_site_info"):
-            return #"{"userid":\#(account.userID),"siteurl":"https://webeep.polimi.it","functions":[{"name":"core_enrol_get_users_courses"},{"name":"core_course_get_contents"}]}"#
+            let email = account.listsEmailFunction ? #",{"name":"\#(WeBeepAPIClient.ownEmailFunction)"}"# : ""
+            return #"{"userid":\#(account.userID),"siteurl":"https://webeep.polimi.it","functions":[{"name":"core_enrol_get_users_courses"},{"name":"core_course_get_contents"}\#(email)]}"#
+        case (let account?, WeBeepAPIClient.ownEmailFunction):
+            guard let email = account.email else { return "[]" }
+            return #"[{"id":\#(account.userID),"email":"\#(email)"}]"#
         case (let account?, "core_enrol_get_users_courses"):
             return "[" + account.courses.map { #"{"id":\#($0.id),"shortname":"\#($0.name)","fullname":"\#($0.name)","visible":1}"# }.joined(separator: ",") + "]"
         case (let account?, "core_course_get_contents"):

@@ -1,6 +1,7 @@
 import AppKit
 import Combine
 import Foundation
+import os
 import Testing
 import BeepbarCore
 @testable import BeepbarApp
@@ -2176,7 +2177,9 @@ struct RecordingsControllerTests {
     /// own last report is refused instead of being written and then erased: the stored place
     /// is written once and removed once, nothing in between.
     /// Mutation: call `player?.close()` before clearing `nowPlaying` in
-    /// `closePlayerForIdentityChange` and the write count is 3.
+    /// `closePlayerForIdentityChange` and the write count is 3. The address removal
+    /// (`emailDeclinedKey`) goes too: drop `forgetEmailOptOut()` from `turnOff` or
+    /// `webBeepAccountChanged` and the next account would never get its address pre-filled.
     @Test(arguments: ["turn off", "account change"])
     func identityChangesCloseThePlayerAndForgetPlaces(change: String) async throws {
         defer { cleanUp() }
@@ -2187,6 +2190,7 @@ struct RecordingsControllerTests {
         world.player.pause(at: 1_800)
         #expect(defaults.data(forKey: resumeKey) != nil)
         world.player.move(to: 2_500)
+        defaults.set(42, forKey: RecordingsController.emailDeclinedKey)
 
         if change == "turn off" {
             controller.setEnabled(false)
@@ -2198,6 +2202,7 @@ struct RecordingsControllerTests {
         #expect(!world.player.isOpen)
         #expect(defaults.object(forKey: resumeKey) == nil)
         #expect(resumeWrites() == 2, "one write, one removal: the close's report at 2 500 s wrote nothing")
+        #expect(defaults.object(forKey: RecordingsController.emailDeclinedKey) == nil, "a removed address belongs to the account that removed it")
         await controller.settleSessionFile()
         #expect(try store.load() == nil)
         controller.turnOff()
@@ -2793,8 +2798,9 @@ struct RecordingsControllerTests {
     }
 
     /// A saved session of another account found when it is read closes the player and forgets
-    /// the places, like any account change. Mutation: remove `closePlayerForIdentityChange()` or
-    /// `forgetResumePoints()` from the owner-mismatch branch of `adopt`.
+    /// the places and the address removal, like any account change. Mutation: remove
+    /// `closePlayerForIdentityChange()`, `forgetResumePoints()` or `forgetEmailOptOut()` from the
+    /// owner-mismatch branch of `adopt`.
     @Test func aSessionOfAnotherAccountFoundOnReadClosesThePlayer() async throws {
         defer { cleanUp() }
         browser.streamResults["a"] = [.success(stream("a"))]
@@ -2803,6 +2809,7 @@ struct RecordingsControllerTests {
         await settle("a playing") { world.player.plays.count == 1 }
         world.player.pause(at: 1_800)
         #expect(defaults.data(forKey: resumeKey) != nil)
+        defaults.set(42, forKey: RecordingsController.emailDeclinedKey)
         controller.windowClosed()
         await drainTasks()
         try store.save(RecmanSessionCodec.encode([FakeRecmanBrowser.cookie("SSO_LOGIN", value: "other")], ownerUserID: 9, now: world.now))
@@ -2811,6 +2818,7 @@ struct RecordingsControllerTests {
         await settle("signed in again") { controller.access == .ready && !browser.isOpen }
         #expect(defaults.object(forKey: resumeKey) == nil)
         #expect(resumeWrites() == 2, "one write, one removal: the close's report wrote nothing")
+        #expect(defaults.object(forKey: RecordingsController.emailDeclinedKey) == nil)
     }
 
     /// While the Polimi session is gone nothing can look a stream up: a lecture that stops is
@@ -3052,6 +3060,7 @@ struct RecordingsAccountTests {
         var points = RecordingResumePoints(owner: storedOwner)
         points.apply(.remember(100), for: "2026:058167:a")
         defaults.set(try PropertyListEncoder().encode(points), forKey: RecordingsController.resumePointsKey)
+        defaults.set(storedOwner, forKey: RecordingsController.emailDeclinedKey)
         let controller = WeBeepAuthenticationController(testRootURL: sync, database: database, rootID: rootID, apiClient: MoodleRecordingProtocol.makeClient(), credentialVault: vault, defaults: defaults, recordingsStore: store)
         #expect(controller.recordingsIfCreated == nil)
 
@@ -3059,6 +3068,55 @@ struct RecordingsAccountTests {
         await controller.completeLoginForTesting(moodleLoginCallback(token: token))
         #expect(controller.recordingsIfCreated == nil)
         #expect((defaults.data(forKey: RecordingsController.resumePointsKey) != nil) == (storedOwner == 7))
+        #expect((defaults.object(forKey: RecordingsController.emailDeclinedKey) != nil) == (storedOwner == 7))
+    }
+
+    /// The profile address is asked only when WeBeep lists the function for this token, and the
+    /// listed case returns the address (so the unlisted nil is not a broken fixture).
+    /// Mutation: drop the `availableFunctions` check in `profileEmail` and the unlisted case
+    /// sends the request.
+    @Test(arguments: [true, false])
+    func theProfileAddressIsAskedOnlyWhenWeBeepListsIt(listed: Bool) async throws {
+        defer { try? FileManager.default.removeItem(at: root) }
+        let (controller, token) = try await signedInAccount(userID: 7, email: "mario.rossi@mail.polimi.it", listed: listed)
+        let address = await controller.profileEmailForTesting()
+        #expect(address == (listed ? "mario.rossi@mail.polimi.it" : nil))
+        let asked = MoodleRecordingProtocol.requests(token: token).contains { $0.function == WeBeepAPIClient.ownEmailFunction }
+        #expect(asked == listed)
+    }
+
+    /// An address that arrives after another WeBeep account signed in is not offered: it is the
+    /// previous account's. Mutation: return `address` without comparing `siteInfo?.userID` in
+    /// `profileEmail` and the late answer is returned.
+    @Test func aProfileAddressArrivingAfterAnAccountChangeIsDropped() async throws {
+        defer { try? FileManager.default.removeItem(at: root) }
+        let (controller, token) = try await signedInAccount(userID: 7, email: "mario.rossi@mail.polimi.it", listed: true)
+        MoodleRecordingProtocol.holdEmails(token: token)
+        let lookup = Task { await controller.profileEmailForTesting() }
+        for _ in 0..<2_000 where MoodleRecordingProtocol.heldEmailCount(token: token) == 0 { try await Task.sleep(for: .milliseconds(1)) }
+        #expect(MoodleRecordingProtocol.heldEmailCount(token: token) == 1)
+
+        let other = MoodleRecordingProtocol.register(courses: [(1, "Course")], userID: 8)
+        await controller.completeLoginForTesting(moodleLoginCallback(token: other))
+        MoodleRecordingProtocol.releaseEmails(token: token)
+        #expect(await lookup.value == nil)
+    }
+
+    /// A controller signed in to the local Moodle as `userID`, whose profile holds `email`.
+    private func signedInAccount(userID: Int, email: String, listed: Bool) async throws -> (WeBeepAuthenticationController, String) {
+        let sync = root.appendingPathComponent("sync", isDirectory: true)
+        try FileManager.default.createDirectory(at: sync, withIntermediateDirectories: true)
+        let database = try SyncDatabase(url: root.appending(path: "state.sqlite"))
+        let rootID = UUID()
+        try await database.registerRoot(id: rootID, canonicalPath: sync.path)
+        let token = MoodleRecordingProtocol.register(courses: [(1, "Course")], userID: userID)
+        MoodleRecordingProtocol.setProfileEmail(token: token, email, listed: listed)
+        let current = OSAllocatedUnfairLock(initialState: token)
+        let vault = CredentialVault(read: { _ in current.withLock { $0 } }, write: { new in current.withLock { $0 = new } })
+        let controller = WeBeepAuthenticationController(testRootURL: sync, database: database, rootID: rootID, apiClient: MoodleRecordingProtocol.makeClient(), credentialVault: vault, defaults: WeBeepAuthenticationController.throwawayDefaults(), recordingsStore: store)
+        await controller.completeLoginForTesting(moodleLoginCallback(token: token))
+        #expect(controller.courseLoadError == nil)
+        return (controller, token)
     }
 
 }

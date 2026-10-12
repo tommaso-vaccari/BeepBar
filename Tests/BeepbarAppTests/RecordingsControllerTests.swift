@@ -1,4 +1,5 @@
 import AppKit
+import Combine
 import Foundation
 import Testing
 import BeepbarCore
@@ -375,7 +376,7 @@ struct RecordingsControllerTests {
     }
     private var sessionFile: URL { folder.appendingPathComponent(RecordingsSessionStore.fileName) }
 
-    private func makeController(useDefault: Bool = false) -> RecordingsController {
+    private func makeController(useDefault: Bool = false, listingCapacity: Int = RecordingsController.listingCapacity, playbackURLCapacity: Int = RecordingsController.playbackURLCapacity) -> RecordingsController {
         if !useDefault && defaults.object(forKey: RecordingsController.enabledKey) == nil {
             defaults.set(false, forKey: RecordingsController.enabledKey)
             defaults.resetWrites()
@@ -404,7 +405,9 @@ struct RecordingsControllerTests {
                 world.profileEmailCalls += 1
                 await world.profileGate?.wait()
                 return world.profileEmail
-            }
+            },
+            listingCapacity: listingCapacity,
+            playbackURLCapacity: playbackURLCapacity
         )
     }
 
@@ -446,8 +449,8 @@ struct RecordingsControllerTests {
 
     /// Turned on, signed in, session saved, browser closed again, then the page shown: the state
     /// after enabling the switch and opening Registrazioni.
-    private func readyController() async -> RecordingsController {
-        let controller = makeController()
+    private func readyController(listingCapacity: Int = RecordingsController.listingCapacity, playbackURLCapacity: Int = RecordingsController.playbackURLCapacity) async -> RecordingsController {
+        let controller = makeController(listingCapacity: listingCapacity, playbackURLCapacity: playbackURLCapacity)
         controller.setEnabled(true)
         await settle("sign-in finished and browser closed") { controller.access == .ready && !browser.isOpen }
         controller.pageAppeared()
@@ -967,6 +970,91 @@ struct RecordingsControllerTests {
         world.now.addTimeInterval(RecordingsController.freshness + 1)
         controller.refresh([course], selected: course)
         await settle("stale course asked again") { browser.listCalls.count == 7 }
+    }
+
+    /// Bounded retention (#100): listings of courses that left the page are forgotten past the
+    /// bound, oldest first, while the page's own courses are pinned and kept even beyond it, so
+    /// going back to one of them is immediate. A forgotten course is simply asked for again.
+    /// Fails with the old unbounded dictionary (the first courses stay) and if pins are ignored
+    /// (the page's second course evicts its first before both are listed).
+    @Test func listingsOffThePageAreBoundedWhileThePageKeepsItsOwn() async throws {
+        defer { cleanUp() }
+        for key in [course, other, third] { browser.listResults[key.courseCode] = .success([recording("r\(key.courseCode)", key)]) }
+        let controller = await readyController(listingCapacity: 1)
+        controller.refresh([course, other], selected: course)
+        await settle("both listed") { [course, other].allSatisfy { controller.listing(for: $0)?.recordings != nil } }
+        #expect(controller.listings.count == 2, "the page's own courses exceed the bound rather than vanish")
+
+        controller.refresh([third], selected: third)
+        await settle("third listed") { controller.listing(for: third)?.recordings != nil }
+        #expect(controller.listing(for: course) == nil)
+        #expect(controller.listing(for: other) == nil)
+        #expect(controller.listings.count == 1)
+
+        let calls = browser.listCalls.count
+        controller.refresh([course], selected: course)
+        await settle("forgotten course listed again") { controller.listing(for: course)?.recordings != nil }
+        #expect(browser.listCalls.count == calls + 1)
+    }
+
+    /// The selected course is pinned with the page's keys even when it is not among them (#100):
+    /// its listing, loaded earlier, stays while the page lists other courses past the bound.
+    /// Fails if `refresh` pins only `keys`: listing `other` would then evict the selected course.
+    @Test func theSelectedCourseIsKeptEvenWhenNotAmongThePageKeys() async throws {
+        defer { cleanUp() }
+        for key in [course, other] { browser.listResults[key.courseCode] = .success([recording("r\(key.courseCode)", key)]) }
+        let controller = await readyController(listingCapacity: 1)
+        controller.refresh([course], selected: course)
+        await settle("selected listed") { controller.listing(for: course)?.recordings != nil }
+
+        controller.refresh([other], selected: course)
+        await settle("other listed") { controller.listing(for: other)?.recordings != nil }
+        #expect(controller.listing(for: course)?.recordings != nil, "the selected course was evicted")
+        #expect(controller.listings.pinnedKeys == [course, other])
+    }
+
+    /// Asking again for an unchanged page publishes nothing (#100): `listings` is published and
+    /// the page asks for its courses on every appearance and change, so re-pinning the same keys
+    /// would redraw the whole page for nothing. Fails if the pins are rewritten unconditionally.
+    @Test func refreshingTheSamePageDoesNotRepublish() async throws {
+        defer { cleanUp() }
+        for key in [course, other] { browser.listResults[key.courseCode] = .success([recording("r\(key.courseCode)", key)]) }
+        let controller = await readyController()
+        controller.refresh([course, other], selected: course)
+        await settle("both listed") { [course, other].allSatisfy { controller.listing(for: $0)?.recordings != nil } }
+        await drainTasks()
+        var changes = 0
+        let subscription = controller.objectWillChange.sink { changes += 1 }
+        defer { subscription.cancel() }
+        controller.refresh([course, other], selected: course)
+        #expect(changes == 0, "an unchanged page republished the controller")
+        #expect(controller.listings.pinnedKeys == [course, other])
+    }
+
+    /// Remembered Webex players are bounded too (#100): within the bound a second opening needs
+    /// no lookup, past it the least recently found player is looked up again. Fails with the old
+    /// unbounded dictionary, which never looks a player up twice.
+    @Test func rememberedPlayersAreBounded() async throws {
+        defer { cleanUp() }
+        let a = recording("a")
+        let b = recording("b")
+        browser.listResults[course.courseCode] = .success([a, b])
+        browser.playbackResults["a"] = .success(URL(string: "https://politecnicomilano.webex.com/a")!)
+        browser.playbackResults["b"] = .success(URL(string: "https://politecnicomilano.webex.com/b")!)
+        let controller = await readyController(playbackURLCapacity: 1)
+        controller.refresh([course], selected: course)
+        await settle("listed") { controller.listing(for: course)?.recordings != nil }
+
+        controller.play(a)
+        await settle("a opened") { world.opened.count == 1 }
+        controller.play(a)
+        await settle("a opened again") { world.opened.count == 2 }
+        #expect(browser.playCalls == ["play a"], "a remembered player was looked up again")
+        controller.play(b)
+        await settle("b opened") { world.opened.count == 3 }
+        controller.play(a)
+        await settle("a opened once more") { world.opened.count == 4 }
+        #expect(browser.playCalls == ["play a", "play b", "play a"], "past the bound the oldest player is forgotten")
     }
 
     /// A lapsed Polimi session stops the batch and asks for the sign-in, without saving; signing

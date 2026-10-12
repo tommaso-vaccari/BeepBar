@@ -793,9 +793,10 @@ private struct WatchlistRecordings: View {
 /// model in a row (one subscription per row, every row's body on each tick) or in the pages
 /// themselves (sections recomputed on each tick).
 ///
-/// Cost per tick, measured on the isolated fixture at 3cfe069 (package E review): about 300
-/// `WatchValues.row` calls, the rows `List` keeps built around the visible ones, whatever the
-/// listing's size (1,000 or 5,000 recordings), and one row body. Package G records the number
+/// Cost per tick, measured on the isolated fixture at 5eb7199 (a temporary counter in
+/// `WatchValues.row`, `aTickReRendersOnlyThePlayingRow`, 1000×700 window): 302 `row` calls with
+/// 1,000 recordings and 326 with 5,000 (the rows `List` keeps built around the visible ones,
+/// nearly flat in the listing's size), and one row body in both. Package G records these numbers
 /// with the rest of the delivery evidence.
 struct WatchProgressReader<Content: View>: View {
     @ObservedObject var progress: RecordingsWatchProgressModel

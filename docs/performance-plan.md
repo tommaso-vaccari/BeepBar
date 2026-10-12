@@ -358,7 +358,7 @@ Integrazione con dev `7e16c6c`: il merge locale precedente non compilava, perch�
 
 **Accettazione:** I7 dimostra primo contenuto noto senza attesa della rete, offline e durante sync. Test account A→B, cambio sito/root, cache corrotta/vecchia, corsi rimossi/rinominati e refresh tardivo. Limiti di dimensione/età espliciti e verificati; nessun token nello snapshot. Confrontare latenza e byte persistiti. È una feature con design e review, non una semplice memoizzazione.
 
-**Implementata tramite D10 ([#98](https://github.com/tommaso-vaccari/BeepBar/issues/98), [PR #138](https://github.com/tommaso-vaccari/BeepBar/pull/138)), non ancora integrata.** Snapshot `course-list.json` accanto a `sync.sqlite` (Core `CourseListSnapshot`, `CourseListSnapshotStore`): versione 1; al massimo 500 corsi e 1 MiB, con la dimensione controllata prima di leggere il file; età massima 30 giorni; data oltre un giorno nel futuro rifiutata; identità = sito + ID della cartella di sync + impronta SHA-256 del token con separazione di dominio. Nessun token né ID utente Moodle nel file. File 0600 con rename atomico; corsi in ordine canonico per id; un elenco invariato si riscrive al massimo una volta al giorno, anche al primo sync di un avvio (il file esistente viene letto prima di decidere). Ogni file rifiutato viene eliminato. Un file oltre i 30 giorni viene eliminato anche all'avvio e a ogni sync (`removeIfExpired`: uno `stat` se il file non c'è, nessuna lettura una volta nota la data), così il limite d'età vale anche senza aprire la finestra.
+**Implementata tramite D10 ([#98](https://github.com/tommaso-vaccari/BeepBar/issues/98), [PR #138](https://github.com/tommaso-vaccari/BeepBar/pull/138)), integrata in dev con #138 (`19718e9`).** Snapshot `course-list.json` accanto a `sync.sqlite` (Core `CourseListSnapshot`, `CourseListSnapshotStore`): versione 1; al massimo 500 corsi e 1 MiB, con la dimensione controllata prima di leggere il file; età massima 30 giorni; data oltre un giorno nel futuro rifiutata; identità = sito + ID della cartella di sync + impronta SHA-256 del token con separazione di dominio. Nessun token né ID utente Moodle nel file. File 0600 con rename atomico; corsi in ordine canonico per id; un elenco invariato si riscrive al massimo una volta al giorno, anche al primo sync di un avvio (il file esistente viene letto prima di decidere). Ogni file rifiutato viene eliminato. Un file oltre i 30 giorni viene eliminato anche all'avvio e a ogni sync (`removeIfExpired`: uno `stat` se il file non c'è, nessuna lettura una volta nota la data), così il limite d'età vale anche senza aprire la finestra.
 
 Controller: all'apertura della finestra, dopo il bootstrap e prima della rete, il ripristino legge il file fuori dal main actor; letture, scritture e cancellazioni sono in una catena seriale. Le cartelle vengono dal DB in sola lettura, senza rinomine né record. Lo stato `saved`/`current` è esplicito, con la nota sotto «Corsi». «Sincronizza ora» chiede l'elenco a Moodle finché non è `current`; il sync automatico usa sempre quello di Moodle. Interruttori e rinomina sono disattivati sull'elenco salvato; scegliere un'altra cartella sopra un elenco salvato lo ricarica da Moodle. Un'epoca, incrementata a logout, cambio università, nuovo accesso o credenziale assente (anche all'avvio, che elimina il file anche con il recupero bloccato), scarta refresh, ripristini, salvataggi e `siteInfo` tardivi. Un refresh scartato viene rifatto per il nuovo account, e un errore del token precedente non fa scadere il nuovo. Con la finestra aperta durante un sync compare lo stato di caricamento e la lista si carica alla fine del sync; chiudendo la finestra prima, non parte. Comportamento visibile nelle specifiche IT/EN **[PR #138]** e nel CHANGELOG.
 
@@ -393,6 +393,58 @@ Misure: `scripts/ui-benchmark.py`, scenari `recordings-1000` e `recordings-5000`
 Evidenza: undici test in `Tests/BeepbarCoreTests/ActivityRowLayoutTests.swift` (ordine e contenuto, taglio pagine tra gruppi senza salti/ripetizioni, univocità tra tipi e corsi, id ripetuto stabile tra pagine, stabilità tra refresh, limiti e clamp, multiplo esatto senza pagina vuota, passi fino a 15000, corso vuoto/una riga, testi, ritorno a una pagina). Mutazioni controllate su copia usa e getta (prefisso tipo rimosso dagli id, ordine spostati/falliti invertito, clamp rimosso, passo costante, suffisso duplicati rimosso, reset rimosso) fanno fallire le asserzioni attese: dettagli nella PR. `swift test` completo (678 test) e build Release CI verdi in locale (Apple M2, macOS) su `9543abe`; CI macOS verde sullo stesso SHA. **Non misurato:** budget di espansione/scorrimento (I7 1k/15k), occupazione main, allocazioni e confronti base dev → HEAD / main → HEAD, perché l’harness UI di D07 non è integrato; la riduzione dimostrata è strutturale (righe costruite ≤ mostrate), non una misura. Prossimo passo dopo D07: misurare espansione e «Mostra altri» con 1k/15k elementi e valutare un `LazyVStack` interno per rendere lazy anche le pagine già rivelate.
 
 **Registrazioni:** ordinamento/raggruppamento, filtri e scansioni `newCount` si ripetono con aggiornamenti del controller osservato. Profilare `RecordingsPresentation` e `RecordingsPage`; solo dopo introdurre cache derivate per revisione effettiva della lista e input di presentazione. Invalidare per lingua/fuso orario, ricerca e stato visto. Confrontare allocazioni, valutazioni dei body e scorrimento. Se visite a molti corsi/anni mostrano crescita, definire retention limitata di liste e URL playback, preservando la riapertura immediata già prevista.
+
+**Implementata tramite D12 ([#100](https://github.com/tommaso-vaccari/BeepBar/issues/100), [PR #141](https://github.com/tommaso-vaccari/BeepBar/pull/141)), non ancora integrata.** Evidenza raccolta leggendo il codice su dev `713033c`, non profilata. `RecordingsPage.body` ricalcolava a ogni pubblicazione dei due controller osservati (spinner, apertura di una riga, segnalibri, elenchi di altri corsi) la barra laterale: per ogni corso la chiave d'archivio, con due regex per nome, e il nome mostrato, con altre due. `CourseRecordings` riordinava, raggruppava per settimana (una ricerca nel calendario per registrazione), filtrava e rinumerava l'elenco a ogni `body`, e `study.contains` scorreva tutti i segnalibri per ogni riga. `WatchlistRecordings` valutava filtro e ordinamento tre volte per `body`. `listings` e `playbackURLs` crescevano con ogni corso e lettore visitato, fino alla disattivazione o al cambio account.
+
+Intervento:
+- **Core:**
+  - `DerivedValueCache`: un valore, chiave `Equatable`, contatore dei ricalcoli. Su un risultato già valido adotta l'input nuovo, così un elenco riscaricato con lo stesso contenuto si confronta elemento per elemento una volta sola.
+  - `BoundedCache`: LRU per scrittura, con chiavi fissate mai rimosse; rimuove fino a tornare sotto la capacità.
+  - `RecmanCourseSidebar`: corsi sincronizzati, ricercabili e non, con nomi e chiavi.
+  - `RecmanCourseListSummary`: numeri delle lezioni e minuti totali, per elenco.
+  - `RecmanCourseListDerivation`: righe, sezioni e righe per id, con chiave elenco, ricerca, lingua, fuso orario e giorno.
+  - Le funzioni di presentazione sono spostate in Core; `RecordingsPresentation` dell'app le inoltra.
+- **App:** la pagina tiene i memo nello stato delle viste. La watchlist è in memo su (segnalibri, ricerca); `CourseRecordings` costruisce un insieme di segnalibri per `body`, così ogni riga lo consulta in tempo costante.
+- **Controller:** `listings` e `playbackURLs` diventano `BoundedCache` con capacità 64 e 512. I corsi della pagina sono fissati: riaprirli resta immediato. Le fissazioni vengono riscritte solo se cambiano, così una pagina invariata non ridisegna.
+
+Restano per `body`, per scelta: `isNew`, `newCount` e `acknowledge` (stato visto, toccato da #106, fuori perimetro), e la ricerca degli elenchi dei corsi in watchlist, che dipende da `listings` aggiornati di continuo. Nessun cambiamento di comportamento visibile: le specifiche restano invariate. Un corso uscito dalla pagina e dimenticato oltre il limite viene richiesto di nuovo quando torna.
+
+Prove: 13 test Core `RecordingsDerivedStateTests`, verdi sul Mac (M2):
+- nessun ricalcolo con input uguali;
+- ricalcolo per ogni input rispetto a una base comune, compresi una lingua diversa e un fuso con lo stesso offset;
+- settimane nel fuso dato;
+- date nella lingua data;
+- riepilogo indipendente dalla ricerca;
+- LRU, fissazioni e capacità;
+- un risultato valido adotta l'input nuovo (confronti successivi a costo costante).
+
+Test app:
+- `listingsOffThePageAreBoundedWhileThePageKeepsItsOwn`;
+- `theSelectedCourseIsKeptEvenWhenNotAmongThePageKeys`;
+- `rememberedPlayersAreBounded`;
+- `refreshingTheSamePageDoesNotRepublish`;
+- `RecordingsPresentationTests`, invariati, ora esercitano l'inoltro a Core.
+
+Mutazioni Core su una copia usa e getta, tutte rosse dopo la review:
+- lingua tolta dalla chiave;
+- giorno non quantizzato;
+- giorno in UTC;
+- ordine LRU non aggiornato alle scritture;
+- fissazioni ignorate;
+- memo sempre mancato;
+- una sola rimozione per inserimento;
+- ricerca ignorata;
+- calendario nel fuso del Mac;
+- date nella lingua del Mac;
+- fuso orario tolto dalla chiave.
+
+La prima esecuzione ha trovato un test debole (la lingua sopravviveva), corretto.
+
+Mutazioni app, su una copia usa e getta:
+- rosse: elenchi illimitati; `refresh` che non fissa; `refresh` che rifissa sempre; lettori illimitati; corso selezionato non fissato (aggiunto un test dopo la review); corsi sincronizzati che ignorano gli id attivi.
+- sopravvissute, per motivo: `turnOff` che lascia le fissazioni non è osservabile, perché svuota i dati e il `refresh` successivo riscrive le fissazioni. Gli inoltri `calendar`, `weekSections` e `weekRange` di `RecordingsPresentation` non sono usati dal codice dell'app, solo dai test, il cui fuso (Europe/Rome) coincide con quello del Mac; il comportamento reale è in Core ed è coperto dalle mutazioni sul fuso e sulla lingua qui sopra.
+
+**Non misurato:** valutazioni dei `body`, allocazioni, scorrimento, memoria dopo molte visite, confronti base dev → HEAD e main → HEAD. Una serie `recordings-1000`/`recordings-5000` avviata il 2026-10-12 è stata interrotta per decisione del proprietario, senza risultati: l'harness misura il primo contenuto, non le rivalutazioni a pagina aperta che D12 riduce. Prossimo passo, se servirà: `scripts/ui-benchmark.py` con gli scenari `recordings-1000` e `recordings-5000` di D07 su entrambe le revisioni, più una traccia Time Profiler della pagina durante gli aggiornamenti del controller. Nessun beneficio temporale rivendicato; la riduzione dimostrata è strutturale (contatori nei test).
 
 ### I11 — Errori nelle opzioni benchmark rifiutati prima del lavoro
 

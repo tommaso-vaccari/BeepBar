@@ -154,8 +154,16 @@ final class StatusItemController: NSObject, NSMenuDelegate {
         // Budget: 1 ms (AGENTS.md, Performance). The interval shows the build in Instruments.
         let trace = PerformanceTrace.shared.begin("ui.menuNeedsUpdate", category: .ui)
         defer { PerformanceTrace.shared.end("ui.menuNeedsUpdate", category: .ui, state: trace) }
+        Self.build(from: authentication.menuBarSnapshot, into: menu, target: self)
+    }
+
+    /// The whole menu, from `snapshot` alone, replacing what `menu` held: status, detail, action,
+    /// the recordings section (`addRecordingItems`), separator, Open, Quit. `nonisolated` and
+    /// static for the same reason as `menuNeedsUpdate` (it runs inside that AppKit callback and
+    /// must not touch main-actor state), and so tests can check the item order without a status
+    /// item; `target` is nil there. The three actions keep their `Task { @MainActor in … }` hops.
+    nonisolated static func build(from snapshot: MenuBarSnapshot, into menu: NSMenu, target: StatusItemController?) {
         menu.removeAllItems()
-        let snapshot = authentication.menuBarSnapshot
 
         let titleItem = NSMenuItem()
         titleItem.title = snapshot.title
@@ -171,33 +179,34 @@ final class StatusItemController: NSObject, NSMenuDelegate {
         menu.addItem(detailItem)
 
         let actionItem = NSMenuItem(title: snapshot.actionTitle, action: #selector(performAction), keyEquivalent: "")
-        actionItem.target = self
+        actionItem.target = target
         menu.addItem(actionItem)
 
-        Self.addRecordingItems(from: snapshot, to: menu)
+        addRecordingItems(from: snapshot, to: menu)
 
         menu.addItem(.separator())
 
         let openItem = NSMenuItem(title: snapshot.openTitle, action: #selector(openConfiguration), keyEquivalent: "")
-        openItem.target = self
+        openItem.target = target
         menu.addItem(openItem)
 
         let quitItem = NSMenuItem(title: snapshot.quitTitle, action: #selector(quit), keyEquivalent: "")
-        quitItem.target = self
+        quitItem.target = target
         menu.addItem(quitItem)
     }
 
     /// The recordings section: nothing when `snapshot.recordingLines` is empty, otherwise a
-    /// separator, the header and one line per course. Every item is disabled text with no target
-    /// or action, so this section adds no AppKit-to-main-actor path (issue #30): it reads the
-    /// snapshot it is given and nothing else. Static so tests can check the items without a
-    /// status item.
+    /// separator, the "Registrazioni" section header (`NSMenuItem.sectionHeader`, macOS 14, the
+    /// deployment target) and one disabled line per course. No item has a target or action, so
+    /// this section adds no AppKit-to-main-actor path (issue #30): it reads the snapshot it is
+    /// given and nothing else.
     nonisolated static func addRecordingItems(from snapshot: MenuBarSnapshot, to menu: NSMenu) {
         guard !snapshot.recordingLines.isEmpty else { return }
         menu.addItem(.separator())
-        for title in [snapshot.recordingsTitle] + snapshot.recordingLines {
+        menu.addItem(.sectionHeader(title: snapshot.recordingsTitle))
+        for line in snapshot.recordingLines {
             let item = NSMenuItem()
-            item.title = title
+            item.title = line
             item.isEnabled = false
             menu.addItem(item)
         }

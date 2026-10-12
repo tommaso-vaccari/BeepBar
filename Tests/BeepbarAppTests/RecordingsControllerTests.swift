@@ -2684,7 +2684,7 @@ struct RecordingsAccountTests {
 
     /// A different account signing in clears the previous account's stored places even when
     /// nothing created Recordings in this launch; the same account's are kept.
-    /// Mutation: remove the `else` branch in `siteInfo.didSet`.
+    /// Mutation: remove `forgetResumePoints(in:notOwnedBy:)` from `siteInfo.didSet`.
     @Test(arguments: [9, 7])
     func anAccountChangeForgetsPlacesEvenWithoutRecordings(storedOwner: Int) async throws {
         defer { try? FileManager.default.removeItem(at: root) }

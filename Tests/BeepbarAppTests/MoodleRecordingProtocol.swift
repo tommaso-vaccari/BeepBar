@@ -22,6 +22,7 @@ final class MoodleRecordingProtocol: URLProtocol, @unchecked Sendable {
         var files: [Int64: [String]]
         var requests: [RecordedRequest] = []
         var onHotspot = false
+        var userID = 7
     }
 
     /// What a download records as its `function`.
@@ -30,10 +31,11 @@ final class MoodleRecordingProtocol: URLProtocol, @unchecked Sendable {
     private static let accounts = OSAllocatedUnfairLock(initialState: [String: Account]())
 
     /// A fresh token whose account lists `courses`, in this order, as its enrolled courses, and
-    /// `files` (one-byte files, by course) in their contents.
-    static func register(courses: [(id: Int64, name: String)], files: [Int64: [String]] = [:]) -> String {
+    /// `files` (one-byte files, by course) in their contents. `userID` is what the site info
+    /// answers for it: 7 unless a test needs two different WeBeep accounts.
+    static func register(courses: [(id: Int64, name: String)], files: [Int64: [String]] = [:], userID: Int = 7) -> String {
         let token = UUID().uuidString
-        accounts.withLock { $0[token] = Account(courses: courses, files: files) }
+        accounts.withLock { $0[token] = Account(courses: courses, files: files, userID: userID) }
         return token
     }
 
@@ -105,7 +107,7 @@ final class MoodleRecordingProtocol: URLProtocol, @unchecked Sendable {
         case (nil, _):
             json = #"{"exception":"invalidtoken","errorcode":"invalidtoken"}"#
         case (_, "core_webservice_get_site_info"):
-            json = #"{"userid":7,"siteurl":"https://webeep.polimi.it","functions":[{"name":"core_enrol_get_users_courses"},{"name":"core_course_get_contents"}]}"#
+            json = #"{"userid":\#(account?.userID ?? 7),"siteurl":"https://webeep.polimi.it","functions":[{"name":"core_enrol_get_users_courses"},{"name":"core_course_get_contents"}]}"#
         case (let account?, "core_enrol_get_users_courses"):
             json = "[" + account.courses.map { #"{"id":\#($0.id),"shortname":"\#($0.name)","fullname":"\#($0.name)","visible":1}"# }.joined(separator: ",") + "]"
         case (let account?, "core_course_get_contents"):

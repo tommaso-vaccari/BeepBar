@@ -510,15 +510,14 @@ struct MenuBarSnapshot: Sendable {
                 watchSummaries = [:]
                 return
             }
-            if let recordingsStorage {
-                recordingsStorage.webBeepAccountChanged(to: userID)
-            } else {
-                // Nothing created Recordings in this launch, but the previous account's
-                // places in lectures and watch summaries may still be stored: they go with the
-                // account (#148).
-                RecordingsController.forgetResumePoints(in: operationDefaults, notOwnedBy: userID)
-                RecordingsController.forgetWatchSummary(in: operationDefaults, notOwnedBy: userID)
-            }
+            // The previous account's places in lectures and watch summaries go with the account
+            // (#148). Always, not only without a controller: one that exists but has no Polimi
+            // session yet (`sessionOwner` nil) forgets nothing in `webBeepAccountChanged`, and
+            // an earlier launch's copy for another account must not stay on disk. Both forgets
+            // are cheap and idempotent (one settings read, a removal only for another owner).
+            RecordingsController.forgetResumePoints(in: operationDefaults, notOwnedBy: userID)
+            RecordingsController.forgetWatchSummary(in: operationDefaults, notOwnedBy: userID)
+            recordingsStorage?.webBeepAccountChanged(to: userID)
             // After the forgets above, so a previous account's numbers can't be read back. Read
             // here, once per account, and never by creating the controller: the menu shows the
             // last known numbers without a request (lazy guarantee of `recordingsStorage`).
@@ -749,7 +748,8 @@ struct MenuBarSnapshot: Sendable {
     /// The Recordings session goes to `recordingsStore`, or to a throwaway folder: never to the
     /// real one, which a sign-out in any test would otherwise delete. `site` is Polimi unless a
     /// test needs another university from the first moment (Recordings exist only for Polimi).
-    init(testRootURL: URL, database: SyncDatabase? = nil, rootID: UUID? = nil, notificationCenter: NotificationCenterClient = InertNotificationCenter(), fileOpener: ActivityFileOpening = InertFileOpener(), apiClient: WeBeepAPIClient? = nil, downloader: RemoteDownloader? = nil, credentialVault: CredentialVault? = nil, deleteCredential: (() throws -> Void)? = nil, defaults: UserDefaults? = nil, automaticSyncEnvironment: AutomaticSyncEnvironment = .fixed(), recordingsStore: RecordingsSessionStore? = nil, recordingsBrowser: (@MainActor () -> RecmanBrowsing)? = nil, site: MoodleSite = .site(id: nil)) {
+    /// `language` sets the controller's own `language` only (see the init body).
+    init(testRootURL: URL, database: SyncDatabase? = nil, rootID: UUID? = nil, notificationCenter: NotificationCenterClient = InertNotificationCenter(), fileOpener: ActivityFileOpening = InertFileOpener(), apiClient: WeBeepAPIClient? = nil, downloader: RemoteDownloader? = nil, credentialVault: CredentialVault? = nil, deleteCredential: (() throws -> Void)? = nil, defaults: UserDefaults? = nil, automaticSyncEnvironment: AutomaticSyncEnvironment = .fixed(), recordingsStore: RecordingsSessionStore? = nil, recordingsBrowser: (@MainActor () -> RecmanBrowsing)? = nil, site: MoodleSite = .site(id: nil), language: AppLanguage = .italian) {
         deleteCredentialForTesting = deleteCredential
         let throwawayRecordingsFolder = FileManager.default.temporaryDirectory.appendingPathComponent("beepbar-recordings-test-\(UUID().uuidString)", isDirectory: true)
         recordingsStoreForTesting = recordingsStore ?? RecordingsSessionStore { throwawayRecordingsFolder }
@@ -764,7 +764,9 @@ struct MenuBarSnapshot: Sendable {
         notificationsEnabled = Self.storedNotificationsEnabled(in: isolatedDefaults)
         rootURL = testRootURL
         needsOnboarding = false
-        language = .italian
+        // Only this controller's `language`, never `AppLanguage.current` (process-global, shared
+        // by tests running in parallel); the menu bar's recordings section reads this one.
+        self.language = language
         enabledCourseIDs = [1]
         automaticSyncEnabled = false
         automaticSyncInterval = 28_800
@@ -1176,7 +1178,10 @@ struct MenuBarSnapshot: Sendable {
     }
 
     private func refreshMenuBarSnapshot() {
-        let recordings = Self.recordingMenuSection(recordingMenuLines, language: AppLanguage.current)
+        // `language` mirrors `AppLanguage.current` (both set in `init` and `setLanguage`); reading
+        // the property lets a test check an English menu without switching the process-global
+        // language.
+        let recordings = Self.recordingMenuSection(recordingMenuLines, language: language)
         menuBarSnapshot = MenuBarSnapshot(
             title: menuBarTitle,
             detail: menuBarDetail,
@@ -1213,8 +1218,11 @@ struct MenuBarSnapshot: Sendable {
     /// the Recordings page names them, at most `maxRecordingMenuLines`.
     /// - A course with no known summary is left out, never shown as "0/0" (nothing before a page
     ///   has loaded it once); so is one with `total == 0` (see `RecordingWatchProgress.menuLine`).
-    /// - Two WeBeep courses with the same archive key show the same recordings: one line, the
-    ///   first course's.
+    /// - Two WeBeep courses with the same archive key (two sections of one course) show the same
+    ///   recordings and the same summary: one line, the first course's. The Recordings page
+    ///   (`RecordingsPresentation.syncedCourses`) still lists both rows, so either can be opened;
+    ///   the menu is a glance, where the same numbers twice would read as two courses. The
+    ///   difference between page and menu is intentional.
     nonisolated static func recordingMenuLines(courses: [RemoteCourseSummary], enabledIDs: Set<Int64>, summaries: [RecmanCourseKey: CourseWatchSummary]) -> [BilingualText] {
         guard !summaries.isEmpty, !enabledIDs.isEmpty else { return [] }
         var lines: [BilingualText] = []

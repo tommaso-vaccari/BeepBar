@@ -39,21 +39,44 @@ struct RecordingsMenuBarTests {
     /// A relaunch: a fresh account controller on `defaults`, signed in to the local Moodle as user 7
     /// with `accountCourses`, Recordings never touched. `deleteCredential` is inert so a sign-out
     /// never reaches the real token file.
-    private func signedIn(defaults: UserDefaults, site: MoodleSite = .polimi, browser: FakeRecmanBrowser? = nil) async throws -> WeBeepAuthenticationController {
+    private func signedIn(defaults: UserDefaults, site: MoodleSite = .polimi, browser: FakeRecmanBrowser? = nil, language: AppLanguage = .italian) async throws -> WeBeepAuthenticationController {
+        let controller = try await makeController(defaults: defaults, site: site, browser: browser, language: language)
+        await signIn(controller, as: 7)
+        return controller
+    }
+
+    /// The token the vault hands out: the last account signed in, as the real vault saves it.
+    private final class TokenBox: @unchecked Sendable {
+        private let lock = NSLock()
+        private var token = ""
+        var value: String {
+            get { lock.withLock { token } }
+            set { lock.withLock { token = newValue } }
+        }
+    }
+    private let tokens = TokenBox()
+
+    /// A fresh account controller on `defaults` (a relaunch), not signed in yet.
+    private func makeController(defaults: UserDefaults, site: MoodleSite = .polimi, browser: FakeRecmanBrowser? = nil, language: AppLanguage = .italian) async throws -> WeBeepAuthenticationController {
         let sync = root.appendingPathComponent("sync", isDirectory: true)
         try FileManager.default.createDirectory(at: sync, withIntermediateDirectories: true)
         let database = try SyncDatabase(url: root.appending(path: "state-\(UUID().uuidString).sqlite"))
         let rootID = UUID()
         try await database.registerRoot(id: rootID, canonicalPath: sync.path)
-        let token = MoodleRecordingProtocol.register(courses: accountCourses)
-        let vault = CredentialVault(read: { _ in token }, write: { _ in })
+        let tokens = tokens
+        let vault = CredentialVault(read: { _ in tokens.value }, write: { tokens.value = $0 })
         var makeBrowser: (@MainActor () -> RecmanBrowsing)?
         if let browser { makeBrowser = { browser } }
-        let controller = WeBeepAuthenticationController(testRootURL: sync, database: database, rootID: rootID, apiClient: MoodleRecordingProtocol.makeClient(), credentialVault: vault, deleteCredential: {}, defaults: defaults, recordingsStore: store, recordingsBrowser: makeBrowser, site: site)
+        return WeBeepAuthenticationController(testRootURL: sync, database: database, rootID: rootID, apiClient: MoodleRecordingProtocol.makeClient(), credentialVault: vault, deleteCredential: {}, defaults: defaults, recordingsStore: store, recordingsBrowser: makeBrowser, site: site, language: language)
+    }
+
+    /// Signs `controller` in to the local Moodle as WeBeep user `userID` with `accountCourses`,
+    /// through the real login path (`siteInfo` changes directly, without passing through nil).
+    private func signIn(_ controller: WeBeepAuthenticationController, as userID: Int) async {
+        let token = MoodleRecordingProtocol.register(courses: accountCourses, userID: userID)
         await controller.completeLoginForTesting(moodleLoginCallback(token: token))
         #expect(controller.courseLoadError == nil)
         #expect(controller.courses.count == accountCourses.count)
-        return controller
     }
 
     /// Selects exactly `ids` for sync, as the Corsi page does.
@@ -276,11 +299,12 @@ struct RecordingsMenuBarTests {
 
     // MARK: Language
 
-    /// The lines are kept in both languages and resolved at every snapshot refresh, so the
-    /// language switch (`setLanguage`, which refreshes the snapshot) shows them in the new one.
-    /// Checked through the explicit language, never by switching the process-wide one.
-    /// Mutations: resolve with `.italian` always in `recordingMenuSection` (English test red);
-    /// build the snapshot from something other than `recordingMenuLines` (snapshot test red).
+    /// `recordingMenuSection` resolves the header and the lines in the language it is given, and
+    /// the controller keeps the lines in both languages (no resolved string cached), with the
+    /// snapshot built from them. It does not exercise `setLanguage` itself (that would switch the
+    /// process-global language); `theSnapshotUsesTheControllersLanguage` covers the wiring.
+    /// Mutations: resolve with `.italian` always in `recordingMenuSection`; build the snapshot's
+    /// lines from something other than `recordingMenuLines`.
     @Test func theSectionFollowsTheLanguage() async throws {
         let lines = [
             RecordingWatchProgress.menuLine(courseName: "Analisi 2", CourseWatchSummary(done: 30, total: 30, remainingMinutes: 0, unknownDurationCount: 0)),
@@ -299,20 +323,37 @@ struct RecordingsMenuBarTests {
         let controller = try await signedIn(defaults: defaults)
         select([11], on: controller)
         #expect(controller.recordingMenuLines == [BilingualText("ANALISI 2 — 30/30 · tutte fatte", "ANALISI 2 — 30/30 · all done")], "both languages kept, no resolved string cached")
-        #expect(controller.menuBarSnapshot.recordingLines == WeBeepAuthenticationController.recordingMenuSection(controller.recordingMenuLines, language: AppLanguage.current).lines)
+        #expect(controller.menuBarSnapshot.recordingLines == WeBeepAuthenticationController.recordingMenuSection(controller.recordingMenuLines, language: .italian).lines)
+    }
+
+    /// The snapshot's header and lines are resolved in the controller's language (which mirrors
+    /// `AppLanguage.current` and changes with `setLanguage`), here English through the test
+    /// init's `language:`, which leaves the process-global language untouched. Guards against an
+    /// English menu with an Italian recordings section.
+    /// Mutations: pass `.italian` (or `AppLanguage.current`, Italian in tests) instead of
+    /// `language` in `refreshMenuBarSnapshot`; hardcode `recordingsTitle` there.
+    @Test func theSnapshotUsesTheControllersLanguage() async throws {
+        defer { try? FileManager.default.removeItem(at: root) }
+        let defaults = WeBeepAuthenticationController.throwawayDefaults()
+        try storeSummaries([analisi: CourseWatchSummary(done: 30, total: 30, remainingMinutes: 0, unknownDurationCount: 0)], owner: 7, in: defaults)
+        let controller = try await signedIn(defaults: defaults, language: .english)
+        select([11], on: controller)
+        #expect(controller.menuBarSnapshot.recordingsTitle == "Recordings")
+        #expect(lines(controller) == ["ANALISI 2 — 30/30 · all done"])
     }
 
     // MARK: Menu items
 
-    /// The menu draws the section from the snapshot alone: nothing when there are no lines,
-    /// otherwise a separator, the header and one line per course, all disabled text with no
-    /// target or action (no new AppKit-to-main-actor path, issue #30). Guards the menu's shape.
+    private func snapshot(_ lines: [String]) -> MenuBarSnapshot {
+        MenuBarSnapshot(title: "Sincronizzato", detail: "3 nuovi", actionTitle: "Sincronizza ora", openTitle: "Apri BeepBar…", quitTitle: "Esci da BeepBar", recordingsTitle: "Registrazioni", recordingLines: lines)
+    }
+
+    /// The recordings section alone: nothing when there are no lines, otherwise a separator, the
+    /// "Registrazioni" section header and one line per course, all with no target or action (no
+    /// new AppKit-to-main-actor path, issue #30), the lines disabled.
     /// Mutations: drop the empty guard (a lone separator and header appear); drop
-    /// `isEnabled = false` (the lines look clickable and do nothing).
+    /// `isEnabled = false` (the lines look clickable and do nothing); a plain item as header.
     @Test func theMenuSectionIsDisabledTextAfterASeparator() {
-        func snapshot(_ lines: [String]) -> MenuBarSnapshot {
-            MenuBarSnapshot(title: "", detail: "", actionTitle: "", openTitle: "", quitTitle: "", recordingsTitle: "Registrazioni", recordingLines: lines)
-        }
         let empty = NSMenu()
         StatusItemController.addRecordingItems(from: snapshot([]), to: empty)
         #expect(empty.items.isEmpty)
@@ -322,10 +363,107 @@ struct RecordingsMenuBarTests {
         #expect(menu.items.count == 4)
         #expect(menu.items.first?.isSeparatorItem == true)
         #expect(menu.items.dropFirst().map(\.title) == ["Registrazioni", "Analisi 2 — 12/30 · ~14 h", "Fisica — 3/10 · ~45 min"])
+        #expect(menu.items[1].isSectionHeader)
         for item in menu.items.dropFirst() {
-            #expect(!item.isEnabled)
             #expect(item.action == nil)
             #expect(item.target == nil)
         }
+        for item in menu.items.dropFirst(2) { #expect(!item.isEnabled) }
+    }
+
+    /// The whole menu `menuNeedsUpdate` draws, in order: status, detail, action, the recordings
+    /// section, separator, Open, Quit; without lines, no recordings items at all. The three
+    /// actions keep their selectors. Guards the section being wired into the real menu and not
+    /// displacing the existing items.
+    /// Mutation: delete the `addRecordingItems` call in `build`.
+    @Test func theMenuShowsTheSectionBetweenTheActionAndOpen() {
+        let menu = NSMenu()
+        menu.addItem(withTitle: "left over from the last opening", action: nil, keyEquivalent: "")
+        StatusItemController.build(from: snapshot(["Analisi 2 — 12/30 · ~14 h", "Fisica — 3/10 · ~45 min"]), into: menu, target: nil)
+        #expect(menu.items.map { $0.isSeparatorItem ? "—" : $0.title } == [
+            "Sincronizzato", "3 nuovi", "Sincronizza ora",
+            "—", "Registrazioni", "Analisi 2 — 12/30 · ~14 h", "Fisica — 3/10 · ~45 min",
+            "—", "Apri BeepBar…", "Esci da BeepBar",
+        ])
+        #expect(menu.items[2].action == NSSelectorFromString("performAction"))
+        #expect(menu.items[8].action == NSSelectorFromString("openConfiguration"))
+        #expect(menu.items[9].action == NSSelectorFromString("quit"))
+
+        StatusItemController.build(from: snapshot([]), into: menu, target: nil)
+        #expect(menu.items.map { $0.isSeparatorItem ? "—" : $0.title } == ["Sincronizzato", "3 nuovi", "Sincronizza ora", "—", "Apri BeepBar…", "Esci da BeepBar"])
+    }
+
+    // MARK: Account changes around the seed
+
+    /// A Recordings controller that already exists (the window was opened before WeBeep named the
+    /// account) doesn't stop the menu from showing the account's saved numbers when it becomes
+    /// known (nil → 7). Mutation: seed only when no controller exists.
+    @Test func anExistingControllerStillGetsTheSeededLines() async throws {
+        defer { try? FileManager.default.removeItem(at: root) }
+        let defaults = WeBeepAuthenticationController.throwawayDefaults()
+        try storeSummaries([analisi: analisiSummary], owner: 7, in: defaults)
+        let controller = try await makeController(defaults: defaults)
+        let recordings = controller.recordings
+        #expect(recordings.isEnabled)
+        await signIn(controller, as: 7)
+        select([11], on: controller)
+        #expect(lines(controller) == ["ANALISI 2 — 12/30 · ~14 h"])
+        await recordings.settleSessionFile()
+    }
+
+    /// Another account signing in directly (7 → 9, without a sign-out in between) never shows
+    /// 7's numbers, with or without a Recordings controller, and 7's saved copy goes.
+    /// Mutation: seed with `stored ?? watchSummaries` (9 keeps 7's lines).
+    @Test(arguments: [false, true])
+    func aDirectAccountSwitchNeverShowsThePreviousAccountsLines(withController: Bool) async throws {
+        defer { try? FileManager.default.removeItem(at: root) }
+        let defaults = WeBeepAuthenticationController.throwawayDefaults()
+        try storeSummaries([analisi: analisiSummary], owner: 7, in: defaults)
+        let controller = try await signedIn(defaults: defaults)
+        select([11], on: controller)
+        #expect(lines(controller).count == 1)
+        if withController { _ = controller.recordings }
+
+        await signIn(controller, as: 9)
+        select([11], on: controller)
+        #expect(lines(controller).isEmpty)
+        #expect(controller.watchSummaries.isEmpty)
+        #expect(defaults.data(forKey: RecordingsController.watchSummaryKey) == nil)
+        if withController { await controller.recordings.settleSessionFile() }
+    }
+
+    /// Reloading the course list for the same account (WeBeep answers the same user again)
+    /// doesn't re-read the saved numbers: the seed happens once per account, and the controller's
+    /// pushes stay authoritative afterwards. Mutation: drop the same-user guard at the top of
+    /// `siteInfo.didSet` (the reload reads the changed copy and the line changes).
+    @Test func reloadingTheSameAccountDoesNotReseed() async throws {
+        defer { try? FileManager.default.removeItem(at: root) }
+        let defaults = WeBeepAuthenticationController.throwawayDefaults()
+        try storeSummaries([analisi: analisiSummary], owner: 7, in: defaults)
+        let controller = try await signedIn(defaults: defaults)
+        select([11], on: controller)
+        #expect(lines(controller) == ["ANALISI 2 — 12/30 · ~14 h"])
+
+        try storeSummaries([analisi: fisicaSummary], owner: 7, in: defaults)
+        controller.loadCourses()
+        await controller.waitForCourseLoadForTesting()
+        #expect(controller.courseLoadError == nil)
+        #expect(lines(controller) == ["ANALISI 2 — 12/30 · ~14 h"], "not read again for the same account")
+    }
+
+    /// A controller that exists but never had a Polimi session (`sessionOwner` nil, so its own
+    /// `webBeepAccountChanged` forgets nothing) still lets the previous account's saved numbers
+    /// go when another account signs in. Guards retention of another account's data on disk.
+    /// Mutation: call `forgetWatchSummary(in:notOwnedBy:)` only when no controller exists.
+    @Test func anotherAccountsSavedNumbersGoEvenWithAControllerWithoutSession() async throws {
+        defer { try? FileManager.default.removeItem(at: root) }
+        let defaults = WeBeepAuthenticationController.throwawayDefaults()
+        try storeSummaries([analisi: analisiSummary], owner: 7, in: defaults)
+        let controller = try await makeController(defaults: defaults)
+        let recordings = controller.recordings
+        await signIn(controller, as: 9)
+        #expect(defaults.data(forKey: RecordingsController.watchSummaryKey) == nil)
+        #expect(lines(controller).isEmpty)
+        await recordings.settleSessionFile()
     }
 }

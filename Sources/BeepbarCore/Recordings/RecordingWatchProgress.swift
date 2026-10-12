@@ -262,15 +262,20 @@ public enum RecordingWatchProgress {
         if summary.done >= summary.total {
             return BilingualText(head + count + " · tutte fatte", head + count + " · all done")
         }
-        let left: String
-        if summary.remainingMinutes <= 0 {
+        guard let left = remainingTimeText(minutes: summary.remainingMinutes) else {
             return BilingualText(head + count, head + count)
-        } else if summary.remainingMinutes < 60 {
-            left = "~\(summary.remainingMinutes) min"
-        } else {
-            left = "~\(Int((Double(summary.remainingMinutes) / 60).rounded())) h"
         }
         return BilingualText(head + count + " · " + left, head + count + " · " + left)
+    }
+
+    /// The time left as the menu bar and the Recordings window both show it: "~45 min" under an
+    /// hour, whole hours from 60 minutes on, rounded half away from zero (150 min → "~3 h"), nil
+    /// when nothing is left. The same in both languages. One function so the two places can never
+    /// round differently.
+    public static func remainingTimeText(minutes: Int) -> String? {
+        if minutes <= 0 { return nil }
+        if minutes < 60 { return "~\(minutes) min" }
+        return "~\(Int((Double(minutes) / 60).rounded())) h"
     }
 
     /// `value` clamped to 0...1, or nil when it is not finite.

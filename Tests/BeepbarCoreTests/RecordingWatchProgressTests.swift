@@ -284,6 +284,18 @@ struct RecordingWatchProgressTests {
         #expect(line(0, 0, 0) == BilingualText("Analisi 2 — nessuna registrazione", "Analisi 2 — no recordings"))
     }
 
+    /// The time-left text shared by the menu bar and the window's course header: nothing when
+    /// nothing is left (never "~0 min"), minutes under an hour, rounded hours after. Mutation:
+    /// drop the `<= 0` guard and a finished course reads "~0 min" in the window header.
+    @Test func remainingTimeTextIsSharedAndOmitsZero() {
+        #expect(Progress.remainingTimeText(minutes: 0) == nil)
+        #expect(Progress.remainingTimeText(minutes: -5) == nil)
+        #expect(Progress.remainingTimeText(minutes: 1) == "~1 min")
+        #expect(Progress.remainingTimeText(minutes: 59) == "~59 min")
+        #expect(Progress.remainingTimeText(minutes: 60) == "~1 h")
+        #expect(Progress.remainingTimeText(minutes: 150) == "~3 h")
+    }
+
     // MARK: Duration
 
     /// The minutes in Recman's duration, shared by the row and the estimate: "0 min" is 0 (not

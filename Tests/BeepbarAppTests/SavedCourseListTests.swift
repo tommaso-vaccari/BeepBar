@@ -84,8 +84,11 @@ import BeepbarCore
         return controller
     }
 
+    /// A hang detector, not a timing bound: on the 3-core CI runner an actor hop can wait behind a
+    /// busy cooperative pool for well over 10 s, which failed two tests after #138 merged (as in
+    /// 02b7dad). Locally these conditions hold within milliseconds.
     private func waitUntil(_ condition: () -> Bool) async throws {
-        let deadline = ContinuousClock.now.advanced(by: .seconds(10))
+        let deadline = ContinuousClock.now.advanced(by: .seconds(120))
         while !condition(), ContinuousClock.now < deadline { try await Task.sleep(for: .milliseconds(5)) }
         try #require(condition())
     }

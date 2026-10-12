@@ -155,8 +155,10 @@ struct RecmanWebSessionScriptTests {
     private static let stalled = "return new Promise(() => {})"
 
     /// A backstop on how soon an interruption ends a stalled script. Interrupted calls end in
-    /// milliseconds; the bound is loose because a full parallel suite keeps the main actor busy.
-    private static let interruptBound: Duration = .seconds(5)
+    /// milliseconds; the bound is loose because a full parallel suite keeps the main actor busy
+    /// (CI's runner took 5.6 s on 911b46d). It only has to stay below the 20 s `scriptTimeout`
+    /// these tests use: `call.outcome == .interrupted` is what proves the timeout didn't end it.
+    private static let interruptBound: Duration = .seconds(15)
 
     private func openSession(scriptTimeout: Duration) async -> RecmanWebSession {
         let session = RecmanWebSession()
@@ -214,7 +216,9 @@ struct RecmanWebSessionScriptTests {
         await #expect(throws: RecmanBrowserError.unavailable) { try await session.runScript(Self.stalled, arguments: [:]) }
         let elapsed = clock.now - started
         #expect(elapsed >= .milliseconds(300))
-        #expect(elapsed < .seconds(5))
+        // Loose for the same reason as `interruptBound` (CI took 5.9 s): the failure guarded
+        // against is a wait that never ends, which would also hit the time limit.
+        #expect(elapsed < .seconds(15))
         #expect(!session.hasPendingScript)
     }
 

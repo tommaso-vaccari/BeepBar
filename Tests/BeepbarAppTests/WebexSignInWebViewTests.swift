@@ -93,8 +93,9 @@ struct WebexSignInWebViewTests {
 
     /// How `task` ended. A sign-in still running after `bound` is cancelled, so a regression
     /// that leaves it waiting (for a ticket it never notices, say) fails as "cancelled" instead of
-    /// hanging the suite: the time limit alone can't end an unstructured task.
-    private func outcome(_ task: Task<Void, Error>, within bound: Duration = .seconds(10)) async -> String {
+    /// hanging the suite: the time limit alone can't end an unstructured task. The bound is wide
+    /// because CI's full parallel suite slows every main-actor step several times over.
+    private func outcome(_ task: Task<Void, Error>, within bound: Duration = .seconds(20)) async -> String {
         let watchdog = Task {
             try await Task.sleep(for: bound)
             task.cancel()
@@ -112,7 +113,10 @@ struct WebexSignInWebViewTests {
     @Test(.timeLimit(.minutes(1))) func thePlaybackPageIsCancelledAndTheTicketEndsTheSignIn() async throws {
         let harness = Harness()
         defer { harness.session.close() }
-        try await harness.open(fixture: "<script>setTimeout(() => { location.href = '\(Self.page)' }, 50)</script>")
+        // A long grace: the ticket is set only after the test sees the cancelled page, and on a
+        // loaded CI runner that took longer than the default 300 ms grace, which then ended the
+        // sign-in as "back at the playback page without a ticket" first.
+        try await harness.open(fixture: "<script>setTimeout(() => { location.href = '\(Self.page)' }, 50)</script>", grace: .seconds(30))
         let task = harness.start()
         try await harness.until { harness.session.cancelledPlaybackPages == 1 }
         #expect(harness.session.webView?.url?.absoluteString != Self.page)
@@ -187,7 +191,9 @@ struct WebexSignInWebViewTests {
     @Test(.timeLimit(.minutes(1))) func thePlaybackPageWithoutATicketEndsInTheBrowser() async throws {
         let harness = Harness()
         defer { harness.session.close() }
-        try await harness.open(fixture: "<script>location.href = '\(Self.page)'</script>", stall: .milliseconds(300))
+        // A long stall timeout: with both timers at 300 ms, a loaded CI runner let the stall fire
+        // first and bring up the window, which is not the path this test is about.
+        try await harness.open(fixture: "<script>location.href = '\(Self.page)'</script>", stall: .seconds(30))
         #expect(await outcome(harness.start()) == "playbackUnavailable")
         #expect(harness.windowsShown == 0)
         #expect(harness.session.cancelledPlaybackPages == 1)
@@ -353,13 +359,14 @@ struct WebexSignInWebViewTests {
             await session.open(cookies: [])
             defer { session.close() }
             let task = Task { try await session.stream(player: URL(string: Self.page)!, email: nil) }
-            // If the wiring broke, the Play would wait out the transport: cancel it after 10 s
-            // so the timing check below fails fast instead of the suite hanging.
+            // If the wiring broke, the Play would wait out the transport: the watchdog cancels it
+            // after 20 s so the suite doesn't hang, and says it did, which fails the test. A
+            // wall-clock bound alone was flaky: CI's loaded runner took 5.6 s for a working close.
             let watchdog = Task {
-                try await Task.sleep(for: .seconds(10))
+                do { try await Task.sleep(for: .seconds(20)) } catch { return false }
                 task.cancel()
+                return true
             }
-            defer { watchdog.cancel() }
             try await Task.sleep(for: .milliseconds(200))
             let clock = ContinuousClock()
             let started = clock.now
@@ -370,8 +377,10 @@ struct WebexSignInWebViewTests {
             }
             let result: String
             do { _ = try await task.value; result = "stream" } catch is CancellationError { result = "cancelled" } catch { result = "\(error)" }
+            watchdog.cancel()
             #expect(result == "cancelled", "\(interruption)")
-            #expect(clock.now - started < .seconds(5), "\(interruption)")
+            #expect(await watchdog.value == false, "\(interruption)")
+            #expect(clock.now - started < .seconds(15), "\(interruption)")
         }
     }
 

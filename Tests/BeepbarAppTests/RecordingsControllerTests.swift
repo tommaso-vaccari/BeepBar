@@ -892,6 +892,22 @@ struct RecordingsControllerTests {
         #expect(browser.listCalls.count == calls + 1)
     }
 
+    /// The selected course is pinned with the page's keys even when it is not among them (#100):
+    /// its listing, loaded earlier, stays while the page lists other courses past the bound.
+    /// Fails if `refresh` pins only `keys`: listing `other` would then evict the selected course.
+    @Test func theSelectedCourseIsKeptEvenWhenNotAmongThePageKeys() async throws {
+        defer { cleanUp() }
+        for key in [course, other] { browser.listResults[key.courseCode] = .success([recording("r\(key.courseCode)", key)]) }
+        let controller = await readyController(listingCapacity: 1)
+        controller.refresh([course], selected: course)
+        await settle("selected listed") { controller.listing(for: course)?.recordings != nil }
+
+        controller.refresh([other], selected: course)
+        await settle("other listed") { controller.listing(for: other)?.recordings != nil }
+        #expect(controller.listing(for: course)?.recordings != nil, "the selected course was evicted")
+        #expect(controller.listings.pinnedKeys == [course, other])
+    }
+
     /// Asking again for an unchanged page publishes nothing (#100): `listings` is published and
     /// the page asks for its courses on every appearance and change, so re-pinning the same keys
     /// would redraw the whole page for nothing. Fails if the pins are rewritten unconditionally.

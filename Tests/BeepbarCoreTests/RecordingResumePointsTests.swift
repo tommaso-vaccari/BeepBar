@@ -48,18 +48,28 @@ struct RecordingResumePointsTests {
     /// `.remember` always return true and the "no change" expectations fail.
     @Test func applyingReports() {
         var points = RecordingResumePoints(owner: 42)
-        do { let changed = points.apply(.remember(100), for: "a"); #expect(changed) }
+        // Each mutating `apply` runs outside `#expect`: the macro captures its subject as an
+        // immutable closure parameter, so `#expect(points.apply(…))` doesn't compile.
+        var changed = points.apply(.remember(100), for: "a")
+        #expect(changed)
         #expect(points.position(for: "a") == 100)
-        do { let changed = points.apply(.remember(100), for: "a"); #expect(!changed, "same position: nothing to write") }
-        do { let changed = points.apply(.remember(250), for: "a"); #expect(changed) }
+        changed = points.apply(.remember(100), for: "a")
+        #expect(!changed, "same position: nothing to write")
+        changed = points.apply(.remember(250), for: "a")
+        #expect(changed)
         #expect(points.position(for: "a") == 250)
-        do { let changed = points.apply(.ignore, for: "a"); #expect(!changed) }
-        do { let changed = points.apply(.finished, for: "unknown"); #expect(!changed, "forgetting what isn't there changes nothing") }
+        changed = points.apply(.ignore, for: "a")
+        #expect(!changed)
+        changed = points.apply(.finished, for: "unknown")
+        #expect(!changed, "forgetting what isn't there changes nothing")
 
-        do { let changed = points.apply(.finished, for: "a"); #expect(changed) }
+        changed = points.apply(.finished, for: "a")
+        #expect(changed)
         #expect(points.position(for: "a") == nil)
-        do { let changed = points.apply(.remember(300), for: "a"); #expect(changed) }
-        do { let changed = points.apply(.startOver, for: "a"); #expect(changed) }
+        changed = points.apply(.remember(300), for: "a")
+        #expect(changed)
+        changed = points.apply(.startOver, for: "a")
+        #expect(changed)
         #expect(points.position(for: "a") == nil)
         #expect(points.entries.isEmpty)
     }

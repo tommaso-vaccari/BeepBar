@@ -1,5 +1,7 @@
 import AppKit
+import Combine
 import Foundation
+import os
 import Testing
 import BeepbarCore
 @testable import BeepbarApp
@@ -127,6 +129,11 @@ import BeepbarCore
     var onProgress: ((String, TimeInterval, TimeInterval?) -> Void)?
     var onFailure: ((String, RecordingPlaybackFailure) -> Void)?
     private(set) var plays: [Play] = []
+    /// The `index`th play, or a recorded failure instead of a crash when the controller started
+    /// fewer: an out-of-range index would end the whole test process and hide every other result.
+    func play(_ index: Int, sourceLocation: SourceLocation = #_sourceLocation) throws -> Play {
+        try #require(plays.indices.contains(index) ? plays[index] : nil, sourceLocation: sourceLocation)
+    }
     private(set) var closes = 0
     private(set) var adoptedPolicies: [NSApplication.ActivationPolicy] = []
     /// The lecture on screen and where it is: what the real player would report.
@@ -399,7 +406,7 @@ struct RecordingsControllerTests {
     }
     private var sessionFile: URL { folder.appendingPathComponent(RecordingsSessionStore.fileName) }
 
-    private func makeController(useDefault: Bool = false) -> RecordingsController {
+    private func makeController(useDefault: Bool = false, listingCapacity: Int = RecordingsController.listingCapacity, playbackURLCapacity: Int = RecordingsController.playbackURLCapacity) -> RecordingsController {
         if !useDefault && defaults.object(forKey: RecordingsController.enabledKey) == nil {
             defaults.set(false, forKey: RecordingsController.enabledKey)
             defaults.resetWrites()
@@ -428,7 +435,9 @@ struct RecordingsControllerTests {
                 world.profileEmailCalls += 1
                 await world.profileGate?.wait()
                 return world.profileEmail
-            }
+            },
+            listingCapacity: listingCapacity,
+            playbackURLCapacity: playbackURLCapacity
         )
     }
 
@@ -470,8 +479,8 @@ struct RecordingsControllerTests {
 
     /// Turned on, signed in, session saved, browser closed again, then the page shown: the state
     /// after enabling the switch and opening Registrazioni.
-    private func readyController() async -> RecordingsController {
-        let controller = makeController()
+    private func readyController(listingCapacity: Int = RecordingsController.listingCapacity, playbackURLCapacity: Int = RecordingsController.playbackURLCapacity) async -> RecordingsController {
+        let controller = makeController(listingCapacity: listingCapacity, playbackURLCapacity: playbackURLCapacity)
         controller.setEnabled(true)
         await settle("sign-in finished and browser closed") { controller.access == .ready && !browser.isOpen }
         controller.pageAppeared()
@@ -991,6 +1000,91 @@ struct RecordingsControllerTests {
         world.now.addTimeInterval(RecordingsController.freshness + 1)
         controller.refresh([course], selected: course)
         await settle("stale course asked again") { browser.listCalls.count == 7 }
+    }
+
+    /// Bounded retention (#100): listings of courses that left the page are forgotten past the
+    /// bound, oldest first, while the page's own courses are pinned and kept even beyond it, so
+    /// going back to one of them is immediate. A forgotten course is simply asked for again.
+    /// Fails with the old unbounded dictionary (the first courses stay) and if pins are ignored
+    /// (the page's second course evicts its first before both are listed).
+    @Test func listingsOffThePageAreBoundedWhileThePageKeepsItsOwn() async throws {
+        defer { cleanUp() }
+        for key in [course, other, third] { browser.listResults[key.courseCode] = .success([recording("r\(key.courseCode)", key)]) }
+        let controller = await readyController(listingCapacity: 1)
+        controller.refresh([course, other], selected: course)
+        await settle("both listed") { [course, other].allSatisfy { controller.listing(for: $0)?.recordings != nil } }
+        #expect(controller.listings.count == 2, "the page's own courses exceed the bound rather than vanish")
+
+        controller.refresh([third], selected: third)
+        await settle("third listed") { controller.listing(for: third)?.recordings != nil }
+        #expect(controller.listing(for: course) == nil)
+        #expect(controller.listing(for: other) == nil)
+        #expect(controller.listings.count == 1)
+
+        let calls = browser.listCalls.count
+        controller.refresh([course], selected: course)
+        await settle("forgotten course listed again") { controller.listing(for: course)?.recordings != nil }
+        #expect(browser.listCalls.count == calls + 1)
+    }
+
+    /// The selected course is pinned with the page's keys even when it is not among them (#100):
+    /// its listing, loaded earlier, stays while the page lists other courses past the bound.
+    /// Fails if `refresh` pins only `keys`: listing `other` would then evict the selected course.
+    @Test func theSelectedCourseIsKeptEvenWhenNotAmongThePageKeys() async throws {
+        defer { cleanUp() }
+        for key in [course, other] { browser.listResults[key.courseCode] = .success([recording("r\(key.courseCode)", key)]) }
+        let controller = await readyController(listingCapacity: 1)
+        controller.refresh([course], selected: course)
+        await settle("selected listed") { controller.listing(for: course)?.recordings != nil }
+
+        controller.refresh([other], selected: course)
+        await settle("other listed") { controller.listing(for: other)?.recordings != nil }
+        #expect(controller.listing(for: course)?.recordings != nil, "the selected course was evicted")
+        #expect(controller.listings.pinnedKeys == [course, other])
+    }
+
+    /// Asking again for an unchanged page publishes nothing (#100): `listings` is published and
+    /// the page asks for its courses on every appearance and change, so re-pinning the same keys
+    /// would redraw the whole page for nothing. Fails if the pins are rewritten unconditionally.
+    @Test func refreshingTheSamePageDoesNotRepublish() async throws {
+        defer { cleanUp() }
+        for key in [course, other] { browser.listResults[key.courseCode] = .success([recording("r\(key.courseCode)", key)]) }
+        let controller = await readyController()
+        controller.refresh([course, other], selected: course)
+        await settle("both listed") { [course, other].allSatisfy { controller.listing(for: $0)?.recordings != nil } }
+        await drainTasks()
+        var changes = 0
+        let subscription = controller.objectWillChange.sink { changes += 1 }
+        defer { subscription.cancel() }
+        controller.refresh([course, other], selected: course)
+        #expect(changes == 0, "an unchanged page republished the controller")
+        #expect(controller.listings.pinnedKeys == [course, other])
+    }
+
+    /// Remembered Webex players are bounded too (#100): within the bound a second opening needs
+    /// no lookup, past it the least recently found player is looked up again. Fails with the old
+    /// unbounded dictionary, which never looks a player up twice.
+    @Test func rememberedPlayersAreBounded() async throws {
+        defer { cleanUp() }
+        let a = recording("a")
+        let b = recording("b")
+        browser.listResults[course.courseCode] = .success([a, b])
+        browser.playbackResults["a"] = .success(URL(string: "https://politecnicomilano.webex.com/a")!)
+        browser.playbackResults["b"] = .success(URL(string: "https://politecnicomilano.webex.com/b")!)
+        let controller = await readyController(playbackURLCapacity: 1)
+        controller.refresh([course], selected: course)
+        await settle("listed") { controller.listing(for: course)?.recordings != nil }
+
+        controller.play(a)
+        await settle("a opened") { world.opened.count == 1 }
+        controller.play(a)
+        await settle("a opened again") { world.opened.count == 2 }
+        #expect(browser.playCalls == ["play a"], "a remembered player was looked up again")
+        controller.play(b)
+        await settle("b opened") { world.opened.count == 3 }
+        controller.play(a)
+        await settle("a opened once more") { world.opened.count == 4 }
+        #expect(browser.playCalls == ["play a", "play b", "play a"], "past the bound the oldest player is forgotten")
     }
 
     /// A lapsed Polimi session stops the batch and asks for the sign-in, without saving; signing
@@ -1950,6 +2044,57 @@ struct RecordingsControllerTests {
         #expect(Controller.recovery(for: .duringPlayback(nil, position: 321), alreadyRecovered: true) == .browser)
     }
 
+    /// Package F diagnostics: each way a Play can miss the player is logged under its own
+    /// reason, with what happens next, and the line holds only names (no email, address or
+    /// title). Before the fix all of them logged the same "opening the browser" line. Mutation:
+    /// map `.needsEmail` to `.nativeUnavailable` in `playFailureReason` and the no-email row fails.
+    @Test func everyPlayFailureIsLoggedUnderItsOwnReason() {
+        typealias Controller = RecordingsController
+        #expect(Controller.playDiagnosis(RecmanBrowserError.playbackUnavailable) == "play: fallback=browser reason=native-unavailable error=playbackUnavailable")
+        #expect(Controller.playDiagnosis(RecmanBrowserError.needsEmail) == "play: fallback=none reason=no-email error=needsEmail")
+        #expect(Controller.playDiagnosis(RecmanBrowserError.needsSignIn) == "play: fallback=none reason=needs-sign-in error=needsSignIn")
+        #expect(Controller.playDiagnosis(RecmanBrowserError.unavailable) == "play: fallback=none reason=unreachable error=unavailable")
+        #expect(Controller.playDiagnosis(RecmanBrowserError.unrecognized) == "play: fallback=browser reason=stream-error error=unrecognized")
+        #expect(Controller.playDiagnosis(CancellationError()) == "play: fallback=none reason=cancelled error=cancelled")
+        // A URLError's user info carries the failing address: only its code is written.
+        let network = URLError(.timedOut, userInfo: [NSURLErrorFailingURLStringErrorKey: "https://nfg1wss.webex.com/nbr/secret/hls.m3u8"])
+        #expect(Controller.playDiagnosis(network) == "play: fallback=browser reason=stream-error error=URLError(-1001)")
+
+        // A stream that was found but never played: the player's failure, with AVFoundation's
+        // domain and code and the underlying cause, never the address in its user info.
+        let underlying = NSError(domain: "CoreMediaErrorDomain", code: -12660)
+        let avError = NSError(domain: "AVFoundationErrorDomain", code: -11800, userInfo: [
+            NSUnderlyingErrorKey: underlying,
+            NSURLErrorFailingURLErrorKey: URL(string: "https://nfg1wss.webex.com/nbr/secret/hls.m3u8")!,
+        ])
+        let beforeReady = Controller.playerFailureDiagnosis(.beforeReady(avError), recovery: .browser)
+        #expect(beforeReady == "play: player failed phase=before-ready recovery=browser reason=player-failure error=AVFoundationErrorDomain(-11800) underlying=CoreMediaErrorDomain(-12660)")
+        #expect(Controller.playerFailureDiagnosis(.duringPlayback(nil, position: 30), recovery: .freshStream(at: 30))
+            == "play: player failed phase=during-playback recovery=fresh-stream reason=player-failure error=none")
+        #expect(!beforeReady.contains("secret") && !beforeReady.contains("http"))
+    }
+
+    /// "Apri nel browser" in a row's menu opens the Webex player in the browser and never asks
+    /// for a stream; before the fix it called `play` and started BeepBar's player despite its
+    /// name. A second click is answered from the cached link. Mutation: point the case's
+    /// `finishOpening` at `.play`'s path (`playNatively`) and `streamCalls` is no longer empty.
+    @Test func openInBrowserOpensTheBrowserWithoutTheNativePlayer() async throws {
+        defer { cleanUp() }
+        browser.playbackResults["a"] = .success(playerLink("a"))
+        browser.streamResults["a"] = [.success(stream("a"))]
+        let controller = await readyController()
+        controller.openInBrowser(recording("a"))
+        await settle("browser opened") { world.opened == [playerLink("a")] }
+        #expect(browser.streamCalls.isEmpty, "no stream is asked for")
+        #expect(world.player.plays.isEmpty)
+        #expect(world.playersMade == 0)
+        #expect(controller.openingRecordingID == nil)
+        controller.openInBrowser(recording("a"))
+        await settle("opened again") { world.opened.count == 2 }
+        #expect(browser.playCalls.count == 1, "the second click uses the cached link")
+        controller.turnOff()
+    }
+
     /// A click replaced by a newer one while the stream is being found never starts the older
     /// lecture. Mutation: remove `guard request == openingRequest` in `playNatively`.
     @Test func onlyTheLatestPlayStartsTheNativePlayer() async {
@@ -2002,7 +2147,7 @@ struct RecordingsControllerTests {
         let controller = await readyController()
         controller.play(recording("a"))
         await settle("a playing") { world.player.plays.count == 1 }
-        #expect(world.player.plays[0].startAt == nil)
+        #expect(try world.player.play(0).startAt == nil)
         #expect(resumeWrites() == 0, "nothing is written until the player reports")
 
         world.player.pause(at: 1_800)
@@ -2013,10 +2158,10 @@ struct RecordingsControllerTests {
 
         controller.play(recording("b"))
         await settle("b playing") { world.player.plays.count == 2 }
-        #expect(world.player.plays[1].startAt == nil, "another lecture starts from the beginning")
+        #expect(try world.player.play(1).startAt == nil, "another lecture starts from the beginning")
         controller.play(recording("a"))
         await settle("a again") { world.player.plays.count == 3 }
-        #expect(world.player.plays[2].startAt == 1_800)
+        #expect(try world.player.play(2).startAt == 1_800)
         controller.turnOff()
     }
 
@@ -2035,7 +2180,7 @@ struct RecordingsControllerTests {
         #expect(defaults.object(forKey: resumeKey) == nil, "the last place is forgotten, and so is an empty memory")
         controller.play(recording("a"))
         await settle("a again") { world.player.plays.count == 2 }
-        #expect(world.player.plays[1].startAt == nil)
+        #expect(try world.player.play(1).startAt == nil)
         world.player.pause(at: 2)
         #expect(defaults.object(forKey: resumeKey) == nil)
         controller.turnOff()
@@ -2053,7 +2198,7 @@ struct RecordingsControllerTests {
         let controller = await readyController()
         controller.play(recording("a"))
         await settle("a playing") { world.player.plays.count == 1 }
-        #expect(world.player.plays[0].startAt == (owner == 42 ? 999 : nil))
+        #expect(try world.player.play(0).startAt == (owner == 42 ? 999 : nil))
         controller.turnOff()
     }
 
@@ -2061,7 +2206,9 @@ struct RecordingsControllerTests {
     /// own last report is refused instead of being written and then erased: the stored place
     /// is written once and removed once, nothing in between.
     /// Mutation: call `player?.close()` before clearing `nowPlaying` in
-    /// `closePlayerForIdentityChange` and the write count is 3.
+    /// `closePlayerForIdentityChange` and the write count is 3. The address removal
+    /// (`emailDeclinedKey`) goes too: drop `forgetEmailOptOut()` from `turnOff` or
+    /// `webBeepAccountChanged` and the next account would never get its address pre-filled.
     @Test(arguments: ["turn off", "account change"])
     func identityChangesCloseThePlayerAndForgetPlaces(change: String) async throws {
         defer { cleanUp() }
@@ -2072,6 +2219,7 @@ struct RecordingsControllerTests {
         world.player.pause(at: 1_800)
         #expect(defaults.data(forKey: resumeKey) != nil)
         world.player.move(to: 2_500)
+        defaults.set(42, forKey: RecordingsController.emailDeclinedKey)
 
         if change == "turn off" {
             controller.setEnabled(false)
@@ -2083,6 +2231,7 @@ struct RecordingsControllerTests {
         #expect(!world.player.isOpen)
         #expect(defaults.object(forKey: resumeKey) == nil)
         #expect(resumeWrites() == 2, "one write, one removal: the close's report at 2 500 s wrote nothing")
+        #expect(defaults.object(forKey: RecordingsController.emailDeclinedKey) == nil, "a removed address belongs to the account that removed it")
         await controller.settleSessionFile()
         #expect(try store.load() == nil)
         controller.turnOff()
@@ -2109,7 +2258,7 @@ struct RecordingsControllerTests {
     /// second failure in the same Play opens the browser and closes the dead window. Guards
     /// against a lecture left frozen, and against retrying forever.
     /// Mutation: never insert into `recoveredLectures` and the third stream request happens.
-    @Test func aStreamThatDiesIsResolvedOnceMoreThenTheBrowserOpens() async {
+    @Test func aStreamThatDiesIsResolvedOnceMoreThenTheBrowserOpens() async throws {
         defer { cleanUp() }
         browser.streamResults["a"] = [.success(stream("a")), .success(stream("a")), .success(stream("a"))]
         browser.playbackResults["a"] = .success(playerLink("a"))
@@ -2119,8 +2268,8 @@ struct RecordingsControllerTests {
 
         world.player.failDuringPlayback(at: 1_234)
         await settle("resumed") { world.player.plays.count == 2 }
-        #expect(world.player.plays[1].startAt == 1_234)
-        #expect(world.player.plays[1].recordingID == "a")
+        #expect(try world.player.play(1).startAt == 1_234)
+        #expect(try world.player.play(1).recordingID == "a")
         #expect(world.opened.isEmpty)
 
         world.player.failDuringPlayback(at: 2_000)
@@ -2222,7 +2371,7 @@ struct RecordingsControllerTests {
         controller.pageAppeared()
         await controller.prepareEmailField()
         #expect(controller.confirmedEmail?.value == "a.b@polimi.it")
-        #expect(controller.suggestedEmail == nil)
+        #expect(!controller.emailFromProfile)
         #expect(world.profileEmailCalls == 0, "no profile read when an address is already confirmed")
         controller.play(recording("a"))
         await settle("a playing") { world.player.plays.count == 1 }
@@ -2230,40 +2379,132 @@ struct RecordingsControllerTests {
         controller.turnOff()
     }
 
-    /// Without a confirmed address the WeBeep profile's is only offered, never stored: the file
-    /// has no email and Play still asks for none until the student confirms; any profile failure
-    /// or a non-Polimi address means an empty field. Mutation: store the suggestion in
-    /// `prepareEmailField` and the file expectation fails.
+    /// Product decision (2026-10-11): the WeBeep profile's Polimi address is in use without a
+    /// confirmation step, stored in the session file like a typed one, and Play sends it. A
+    /// profile failure, no address or a non-Polimi address leave none, and Play still ends on the
+    /// message. Replaces the earlier "only a suggestion" test. Mutation: drop
+    /// `confirmedEmail = email` in `performEmailLookup` and the Polimi row fails (no address, no
+    /// file email, Play gets nil).
     @Test(arguments: ["polimi address", "personal address", "no address"])
-    func theProfileAddressIsOnlyASuggestion(profile: String) async throws {
+    func theProfileAddressIsUsedWithoutConfirmation(profile: String) async throws {
         defer { cleanUp() }
         world.profileEmail = switch profile {
         case "polimi address": "Mario.Rossi@mail.polimi.it"
         case "personal address": "mario@gmail.com"
         default: nil
         }
-        browser.streamResults["a"] = [.failure(RecmanBrowserError.needsEmail), .success(stream("a"))]
+        let usable = profile == "polimi address"
+        browser.streamResults["a"] = usable ? [.success(stream("a"))] : [.failure(RecmanBrowserError.needsEmail)]
         let controller = await readyController()
         await controller.prepareEmailField()
         #expect(world.profileEmailCalls == 1)
-        #expect(controller.suggestedEmail?.value == (profile == "polimi address" ? "mario.rossi@mail.polimi.it" : nil))
-        #expect(controller.confirmedEmail == nil)
+        #expect(controller.confirmedEmail?.value == (usable ? "mario.rossi@mail.polimi.it" : nil))
+        #expect(controller.emailFromProfile == usable)
         await controller.settleSessionFile()
-        #expect(try savedEmail() == nil, "a suggestion is not stored")
+        #expect(try savedEmail() == (usable ? "mario.rossi@mail.polimi.it" : nil), "stored like a typed address")
 
         controller.play(recording("a"))
-        await settle("needs an email") { controller.openingProblem == .playbackUnavailable }
-        #expect(browser.streamEmails == [nil])
-        #expect(world.player.plays.isEmpty)
-
-        if let suggestion = controller.suggestedEmail {
-            #expect(controller.confirmEmail(suggestion.value) == .saved)
-            #expect(controller.suggestedEmail == nil)
-            controller.play(recording("a"))
+        if usable {
             await settle("a playing") { world.player.plays.count == 1 }
-            #expect(browser.streamEmails == [nil, suggestion.value])
+            #expect(browser.streamEmails == ["mario.rossi@mail.polimi.it"])
+        } else {
+            await settle("needs an email") { controller.openingProblem == .playbackUnavailable }
+            #expect(browser.streamEmails == [nil])
+            #expect(world.player.plays.isEmpty)
         }
+        #expect(world.profileEmailCalls == 1, "the Play doesn't ask WeBeep again in the same epoch")
         controller.turnOff()
+    }
+
+    /// The first Play works without the Settings row ever appearing: Play itself takes the
+    /// profile's address, once, and the save after the Play keeps it in the file. Guards against
+    /// the lookup depending on the Settings view (the user's report: "Couldn't open this
+    /// recording." until the address was confirmed by hand). Mutation: remove the `learnEmail()`
+    /// call in `playNatively` and `streamEmails` is `[nil]`.
+    @Test func theFirstPlayUsesTheProfileAddressWithoutSettings() async throws {
+        defer { cleanUp() }
+        world.profileEmail = "mario.rossi@mail.polimi.it"
+        browser.streamResults["a"] = [.success(stream("a")), .success(stream("a"))]
+        let controller = await readyController()
+        #expect(world.profileEmailCalls == 0, "nothing is asked at rest")
+        controller.play(recording("a"))
+        await settle("a playing") { world.player.plays.count == 1 }
+        #expect(browser.streamEmails == ["mario.rossi@mail.polimi.it"])
+        #expect(controller.emailFromProfile)
+        await settle("stored") { (try? self.savedEmail()) == "mario.rossi@mail.polimi.it" }
+        controller.play(recording("a"))
+        await settle("played again") { world.player.plays.count == 2 }
+        #expect(world.profileEmailCalls == 1)
+        controller.turnOff()
+    }
+
+    /// The student's choice beats the profile: an edited address is the one used, and a removed
+    /// one stays removed, in this launch and after a relaunch (`emailDeclinedKey`), so the
+    /// profile is never asked again for that account; entering an address again lifts it.
+    /// Mutations: drop the `emailDeclined(by:)` guard in `performEmailLookup`, or the
+    /// `defaults.set(owner, forKey: emailDeclinedKey)` in `setConfirmedEmail`, and the relaunch
+    /// expectations fail; drop `forgetEmailOptOut()` for a new address and the last one fails.
+    /// (In the same launch the removal is also covered by the epoch's single lookup.)
+    @Test func theStudentsEditOrRemovalWinsOverTheProfile() async throws {
+        defer { cleanUp() }
+        world.profileEmail = "mario.rossi@mail.polimi.it"
+        let controller = await readyController()
+        await controller.prepareEmailField()
+        #expect(controller.confirmedEmail?.value == "mario.rossi@mail.polimi.it")
+        #expect(controller.confirmEmail("m.rossi@polimi.it") == .saved)
+        #expect(!controller.emailFromProfile)
+        #expect(controller.confirmEmail("") == .cleared)
+        await controller.learnEmail()
+        #expect(controller.confirmedEmail == nil, "no re-prefill after a removal")
+        #expect(world.profileEmailCalls == 1)
+        await controller.settleSessionFile()
+        #expect(try savedEmail() == nil)
+        #expect(defaults.integer(forKey: RecordingsController.emailDeclinedKey) == 42)
+
+        let relaunched = makeController()
+        relaunched.pageAppeared()
+        await relaunched.prepareEmailField()
+        #expect(relaunched.confirmedEmail == nil, "the removal survives a relaunch")
+        #expect(world.profileEmailCalls == 1, "WeBeep is not asked for a removed address")
+        #expect(relaunched.confirmEmail("a.b@polimi.it") == .saved)
+        #expect(defaults.object(forKey: RecordingsController.emailDeclinedKey) == nil, "an address entered again lifts the removal")
+        relaunched.turnOff()
+    }
+
+    /// A Play that starts while the Settings row's lookup is still waiting for WeBeep uses its
+    /// answer instead of going on without an address or asking twice. Mutation: drop the shared
+    /// `emailLookup` (always start a new lookup) and the Play gets nil.
+    @Test func aPlayDuringTheSettingsLookupWaitsForIt() async throws {
+        defer { cleanUp() }
+        world.profileEmail = "mario.rossi@mail.polimi.it"
+        browser.streamResults["a"] = [.success(stream("a"))]
+        let controller = await readyController()
+        let gate = FakeRecmanBrowser.Gate()
+        defer { gate.release() }
+        world.profileGate = gate
+        let settings = Task { await controller.prepareEmailField() }
+        await settle("profile read held") { gate.isWaiting }
+        controller.play(recording("a"))
+        await drainTasks()
+        #expect(browser.streamCalls.isEmpty, "the Play waits for the address")
+        gate.release()
+        await settings.value
+        await settle("a playing") { world.player.plays.count == 1 }
+        #expect(browser.streamEmails == ["mario.rossi@mail.polimi.it"])
+        #expect(world.profileEmailCalls == 1)
+        controller.turnOff()
+    }
+
+    /// The Play log says where the address came from and never contains it.
+    /// Mutation: return "confirmed" for every address in `emailDiagnosis` and the profile row fails.
+    @Test func thePlayLogNamesTheAddressSourceOnly() throws {
+        let email = try #require(PolimiEmail("mario.rossi@mail.polimi.it"))
+        #expect(RecordingsController.emailDiagnosis(email, fromProfile: true) == "profile")
+        #expect(RecordingsController.emailDiagnosis(email, fromProfile: false) == "confirmed")
+        #expect(RecordingsController.emailDiagnosis(nil, fromProfile: true) == "none")
+        for fromProfile in [true, false] {
+            #expect(!RecordingsController.emailDiagnosis(email, fromProfile: fromProfile).contains("mario"))
+        }
     }
 
     /// Typed before any session exists, the address waits in memory and the sign-in writes it.
@@ -2292,29 +2533,41 @@ struct RecordingsControllerTests {
         world.owner = 7
         controller.webBeepAccountChanged(to: 7)
         #expect(controller.confirmedEmail == nil)
-        #expect(controller.suggestedEmail == nil)
+        #expect(!controller.emailFromProfile)
         await controller.settleSessionFile()
         #expect(try store.load() == nil)
         controller.turnOff()
     }
 
-    /// A profile answer that arrives after an account change is dropped instead of being offered
-    /// to the next account. Mutation: remove the `epoch == emailEpoch` check in
-    /// `prepareEmailField` and the suggestion appears.
-    @Test func aLateProfileAnswerAfterAnAccountChangeIsDropped() async {
+    /// A profile answer that arrives after an account change is dropped instead of becoming the
+    /// next account's address, whether the Settings row or a Play asked. Mutation: remove the
+    /// `epoch == emailEpoch` check after `fetchProfileEmail` in `performEmailLookup` and the
+    /// address appears (and reaches the file).
+    @Test(arguments: [false, true])
+    func aLateProfileAnswerAfterAnAccountChangeIsDropped(fromPlay: Bool) async throws {
         defer { cleanUp() }
         let controller = await readyController()
         let gate = FakeRecmanBrowser.Gate()
         defer { gate.release() }
         world.profileGate = gate
         world.profileEmail = "previous.account@mail.polimi.it"
-        let task = Task { await controller.prepareEmailField() }
+        var settings: Task<Void, Never>?
+        if fromPlay {
+            controller.play(recording("a"))
+        } else {
+            settings = Task { await controller.prepareEmailField() }
+        }
         await settle("profile read held") { gate.isWaiting }
         world.owner = 7
         controller.webBeepAccountChanged(to: 7)
         gate.release()
-        await task.value
-        #expect(controller.suggestedEmail == nil)
+        await settings?.value
+        await drainTasks()
+        #expect(controller.confirmedEmail == nil)
+        #expect(!controller.emailFromProfile)
+        #expect(browser.streamEmails.allSatisfy { $0 == nil })
+        await controller.settleSessionFile()
+        #expect(try store.load() == nil, "nothing of the old account's answer is written")
         controller.turnOff()
     }
 
@@ -2351,7 +2604,7 @@ struct RecordingsControllerTests {
     /// Mutation: make `suspend()` always `invalidate()` and close the browser (drop the
     /// `hasRecovery` branch) and both variants stay at one play.
     @Test(arguments: ["running", "queued"])
-    func aRecoveryOutlivesTheWindowClosing(scenario: String) async {
+    func aRecoveryOutlivesTheWindowClosing(scenario: String) async throws {
         defer { cleanUp() }
         browser.streamResults["a"] = [.success(stream("a")), .success(stream("a"))]
         let controller = await readyController()
@@ -2373,7 +2626,7 @@ struct RecordingsControllerTests {
         controller.windowClosed()
         gate.release()
         await settle("resumed after the window closed") { world.player.plays.count == 2 }
-        #expect(world.player.plays[1].startAt == 700)
+        #expect(try world.player.play(1).startAt == 700)
         await settle("browser closed again") { !browser.isOpen }
         #expect(world.player.isOpen)
         controller.turnOff()
@@ -2402,6 +2655,160 @@ struct RecordingsControllerTests {
         controller.turnOff()
     }
 
+    /// PR #152 review P0: an address learned while no Polimi session exists yet (sign-in never
+    /// finished) belongs to the WeBeep account signed in then. After an account change it must
+    /// not be shown, written into the next account's session file or sent to Webex as its
+    /// sign-in hint. Mutation: remove the `emailAccount` check in `webBeepAccountChanged` and the
+    /// old address stays, is saved with the new session and reaches `stream`.
+    @Test(arguments: ["profile", "typed"])
+    func anAddressLearnedBeforeAnyPolimiSessionStaysWithItsAccount(source: String) async throws {
+        defer { cleanUp() }
+        browser.signInError = CancellationError()
+        world.profileEmail = "previous.account@mail.polimi.it"
+        let controller = makeController()
+        controller.setEnabled(true)
+        await settle("sign-in cancelled") { controller.access == .needsSignIn(nil) }
+        if source == "profile" {
+            await controller.prepareEmailField()
+        } else {
+            #expect(controller.confirmEmail("previous.account@mail.polimi.it") == .saved)
+        }
+        #expect(controller.confirmedEmail == PolimiEmail("previous.account@mail.polimi.it"))
+        #expect(try store.load() == nil, "no session file yet: the address lives in memory only")
+
+        world.owner = 7
+        world.profileEmail = nil
+        controller.webBeepAccountChanged(to: 7)
+        #expect(controller.confirmedEmail == nil)
+        #expect(!controller.emailFromProfile)
+
+        browser.signInError = nil
+        controller.signIn()
+        await settle("signed in and closed") { controller.access == .ready && !browser.isOpen }
+        await controller.settleSessionFile()
+        #expect(try savedEmail() == nil, "the new account's session holds no address of the old one")
+        controller.pageAppeared()
+        controller.play(recording("a"))
+        await settle("stream asked") { browser.streamCalls.count == 1 }
+        #expect(browser.streamEmails == [nil])
+        controller.turnOff()
+    }
+
+    /// PR #152 review P1: closing the window while a lecture recovery runs keeps the recovery but
+    /// drops a Play clicked meanwhile: nobody is looking, and it would otherwise replace the
+    /// recovered lecture, open a browser or show a sign-in window afterwards. Mutation: remove
+    /// `dropQueuedOpenings()` from `suspend` and "b" is streamed and played.
+    @Test func closingTheWindowDropsAPlayQueuedBehindARecovery() async throws {
+        defer { cleanUp() }
+        browser.streamResults["a"] = [.success(stream("a")), .success(stream("a"))]
+        browser.streamResults["b"] = [.success(stream("b"))]
+        let controller = await readyController()
+        controller.play(recording("a"))
+        await settle("a playing") { world.player.plays.count == 1 }
+        let gate = FakeRecmanBrowser.Gate()
+        defer { gate.release() }
+        browser.streamGates["a"] = gate
+        world.player.failDuringPlayback(at: 700)
+        await settle("recovery running") { gate.isWaiting }
+        controller.play(recording("b"))
+        #expect(controller.openingRecordingID == "b")
+        controller.windowClosed()
+        #expect(controller.openingRecordingID == nil, "the dropped click stops spinning")
+        gate.release()
+        await settle("a resumed") { world.player.plays.count == 2 }
+        await settle("browser closed") { !browser.isOpen }
+        #expect(world.player.plays.map(\.recordingID) == ["a", "a"])
+        #expect(try world.player.play(1).startAt == 700)
+        #expect(!browser.streamCalls.contains("stream b"))
+        #expect(world.opened.isEmpty)
+        controller.turnOff()
+    }
+
+    /// PR #152 review P1: when the stream lookup fails after the archive gave the player link,
+    /// the browser fallback opens that link instead of walking the archive again, on a Play and
+    /// on a failed recovery. Mutation: drop `found:` from either `playerLink` call and the
+    /// archive is asked (`play a` appears) — and fails here, since it has no link to give.
+    @Test(arguments: ["play", "recovery"])
+    func aStreamFailureAfterTheLinkOpensThatLink(path: String) async {
+        defer { cleanUp() }
+        let failure = RecmanStreamFailure(player: playerLink("a"), underlying: RecmanBrowserError.playbackUnavailable)
+        browser.streamResults["a"] = path == "play" ? [.failure(failure)] : [.success(stream("a")), .failure(failure)]
+        let controller = await readyController()
+        controller.play(recording("a"))
+        if path == "recovery" {
+            await settle("a playing") { world.player.plays.count == 1 }
+            world.player.failDuringPlayback(at: 700)
+        }
+        await settle("browser opened") { world.opened == [playerLink("a")] }
+        #expect(browser.playCalls.isEmpty, "the archive is not walked a second time")
+        #expect(controller.openingProblem == nil)
+        controller.turnOff()
+    }
+
+    /// The wrapper never changes the decision, on a Play or a recovery: a missing email found
+    /// after the link shows its sentence, a lapsed Polimi session asks for a sign-in, and a
+    /// cancellation stays silent — none opens the browser or walks the archive. Mutation: throw
+    /// or decide on the wrapper instead of `streamFailureCause(error).cause` (either path) and
+    /// the problem becomes `unrecognized`, the sign-in isn't asked or cancellation shows an error.
+    @Test(arguments: ["play", "recovery"], ["needsEmail", "needsSignIn", "cancelled"])
+    func aWrappedReportedFailureIsStillReported(path: String, cause: String) async {
+        defer { cleanUp() }
+        let underlying: Error = switch cause {
+        case "needsEmail": RecmanBrowserError.needsEmail
+        case "needsSignIn": RecmanBrowserError.needsSignIn
+        default: CancellationError()
+        }
+        let failure = Result<RecordingStream, Error>.failure(RecmanStreamFailure(player: playerLink("a"), underlying: underlying))
+        browser.streamResults["a"] = path == "play" ? [failure] : [.success(stream("a")), failure]
+        let controller = await readyController()
+        controller.play(recording("a"))
+        if path == "recovery" {
+            await settle("a playing") { world.player.plays.count == 1 }
+            world.player.failDuringPlayback(at: 700)
+        }
+        await settle("stream answered") { browser.streamCalls.count == (path == "play" ? 1 : 2) }
+        switch cause {
+        case "needsEmail":
+            await settle("sentence shown") { controller.openingProblem == .playbackUnavailable }
+        case "needsSignIn":
+            await settle("sign-in asked") { controller.access == .needsSignIn(nil) }
+        default:
+            await drainTasks()
+            #expect(controller.openingProblem == nil)
+            #expect(controller.access == .ready)
+        }
+        #expect(world.opened.isEmpty)
+        #expect(browser.playCalls.isEmpty)
+        controller.turnOff()
+    }
+
+    /// PR #152 review: with no WeBeep account known (expired token at launch) a typed address is
+    /// refused, since it could only end up with whichever account signs in next, and the Settings
+    /// field is disabled (`canConfirmEmail`). Mutation: drop the owner check in `canConfirmEmail`
+    /// and the address is kept and later sent for account 7.
+    @Test func anAddressIsRefusedWhileNoAccountIsKnown() async throws {
+        defer { cleanUp() }
+        browser.signInError = CancellationError()
+        let controller = makeController()
+        controller.setEnabled(true)
+        await settle("sign-in cancelled") { controller.access == .needsSignIn(nil) }
+        #expect(controller.canConfirmEmail)
+        world.owner = nil
+        #expect(!controller.canConfirmEmail, "the Settings field is disabled and says why")
+        #expect(controller.confirmEmail("someone.else@mail.polimi.it") == .unchanged)
+        #expect(controller.confirmedEmail == nil)
+        world.owner = 7
+        controller.webBeepAccountChanged(to: 7)
+        browser.signInError = nil
+        controller.signIn()
+        await settle("signed in and closed") { controller.access == .ready && !browser.isOpen }
+        controller.pageAppeared()
+        controller.play(recording("a"))
+        await settle("stream asked") { browser.streamCalls.count == 1 }
+        #expect(browser.streamEmails == [nil])
+        controller.turnOff()
+    }
+
     /// The controller's plumbing to the player: no player until a Play, and a policy handed over
     /// reaches it. Mutation: make `keepPolicyAfterLecture` do nothing.
     @Test func thePolicyHandOverReachesTheOpenPlayer() async {
@@ -2420,8 +2827,9 @@ struct RecordingsControllerTests {
     }
 
     /// A saved session of another account found when it is read closes the player and forgets
-    /// the places, like any account change. Mutation: remove `closePlayerForIdentityChange()` or
-    /// `forgetResumePoints()` from the owner-mismatch branch of `adopt`.
+    /// the places and the address removal, like any account change. Mutation: remove
+    /// `closePlayerForIdentityChange()`, `forgetResumePoints()` or `forgetEmailOptOut()` from the
+    /// owner-mismatch branch of `adopt`.
     @Test func aSessionOfAnotherAccountFoundOnReadClosesThePlayer() async throws {
         defer { cleanUp() }
         browser.streamResults["a"] = [.success(stream("a"))]
@@ -2430,6 +2838,7 @@ struct RecordingsControllerTests {
         await settle("a playing") { world.player.plays.count == 1 }
         world.player.pause(at: 1_800)
         #expect(defaults.data(forKey: resumeKey) != nil)
+        defaults.set(42, forKey: RecordingsController.emailDeclinedKey)
         controller.windowClosed()
         await drainTasks()
         try store.save(RecmanSessionCodec.encode([FakeRecmanBrowser.cookie("SSO_LOGIN", value: "other")], ownerUserID: 9, now: world.now))
@@ -2438,6 +2847,7 @@ struct RecordingsControllerTests {
         await settle("signed in again") { controller.access == .ready && !browser.isOpen }
         #expect(defaults.object(forKey: resumeKey) == nil)
         #expect(resumeWrites() == 2, "one write, one removal: the close's report wrote nothing")
+        #expect(defaults.object(forKey: RecordingsController.emailDeclinedKey) == nil)
     }
 
     /// A stream that dies mid-lecture stores where it stopped at once, from the `.failed`
@@ -2464,7 +2874,7 @@ struct RecordingsControllerTests {
     /// left alone and its one retry is not spent, so after signing in again it still recovers.
     /// Mutation: insert into `recoveredLectures` in `playerFailed` again (before the access
     /// guard) and the last expectation fails.
-    @Test func aFailureWhileSignedOutDoesNotSpendTheRetry() async {
+    @Test func aFailureWhileSignedOutDoesNotSpendTheRetry() async throws {
         defer { cleanUp() }
         browser.streamResults["a"] = [.success(stream("a")), .success(stream("a"))]
         let controller = await readyController()
@@ -2485,7 +2895,7 @@ struct RecordingsControllerTests {
         await settle("signed in") { controller.access == .ready }
         world.player.failDuringPlayback(at: 99)
         await settle("recovered after signing in") { world.player.plays.count == 2 }
-        #expect(world.player.plays[1].startAt == 99)
+        #expect(try world.player.play(1).startAt == 99)
         controller.turnOff()
     }
 
@@ -2699,6 +3109,7 @@ struct RecordingsAccountTests {
         var points = RecordingResumePoints(owner: storedOwner)
         points.apply(.remember(100), for: "2026:058167:a")
         defaults.set(try PropertyListEncoder().encode(points), forKey: RecordingsController.resumePointsKey)
+        defaults.set(storedOwner, forKey: RecordingsController.emailDeclinedKey)
         let controller = WeBeepAuthenticationController(testRootURL: sync, database: database, rootID: rootID, apiClient: MoodleRecordingProtocol.makeClient(), credentialVault: vault, defaults: defaults, recordingsStore: store)
         #expect(controller.recordingsIfCreated == nil)
 
@@ -2706,6 +3117,55 @@ struct RecordingsAccountTests {
         await controller.completeLoginForTesting(moodleLoginCallback(token: token))
         #expect(controller.recordingsIfCreated == nil)
         #expect((defaults.data(forKey: RecordingsController.resumePointsKey) != nil) == (storedOwner == 7))
+        #expect((defaults.object(forKey: RecordingsController.emailDeclinedKey) != nil) == (storedOwner == 7))
+    }
+
+    /// The profile address is asked only when WeBeep lists the function for this token, and the
+    /// listed case returns the address (so the unlisted nil is not a broken fixture).
+    /// Mutation: drop the `availableFunctions` check in `profileEmail` and the unlisted case
+    /// sends the request.
+    @Test(arguments: [true, false])
+    func theProfileAddressIsAskedOnlyWhenWeBeepListsIt(listed: Bool) async throws {
+        defer { try? FileManager.default.removeItem(at: root) }
+        let (controller, token) = try await signedInAccount(userID: 7, email: "mario.rossi@mail.polimi.it", listed: listed)
+        let address = await controller.profileEmailForTesting()
+        #expect(address == (listed ? "mario.rossi@mail.polimi.it" : nil))
+        let asked = MoodleRecordingProtocol.requests(token: token).contains { $0.function == WeBeepAPIClient.ownEmailFunction }
+        #expect(asked == listed)
+    }
+
+    /// An address that arrives after another WeBeep account signed in is not offered: it is the
+    /// previous account's. Mutation: return `address` without comparing `siteInfo?.userID` in
+    /// `profileEmail` and the late answer is returned.
+    @Test func aProfileAddressArrivingAfterAnAccountChangeIsDropped() async throws {
+        defer { try? FileManager.default.removeItem(at: root) }
+        let (controller, token) = try await signedInAccount(userID: 7, email: "mario.rossi@mail.polimi.it", listed: true)
+        MoodleRecordingProtocol.holdEmails(token: token)
+        let lookup = Task { await controller.profileEmailForTesting() }
+        for _ in 0..<2_000 where MoodleRecordingProtocol.heldEmailCount(token: token) == 0 { try await Task.sleep(for: .milliseconds(1)) }
+        #expect(MoodleRecordingProtocol.heldEmailCount(token: token) == 1)
+
+        let other = MoodleRecordingProtocol.register(courses: [(1, "Course")], userID: 8)
+        await controller.completeLoginForTesting(moodleLoginCallback(token: other))
+        MoodleRecordingProtocol.releaseEmails(token: token)
+        #expect(await lookup.value == nil)
+    }
+
+    /// A controller signed in to the local Moodle as `userID`, whose profile holds `email`.
+    private func signedInAccount(userID: Int, email: String, listed: Bool) async throws -> (WeBeepAuthenticationController, String) {
+        let sync = root.appendingPathComponent("sync", isDirectory: true)
+        try FileManager.default.createDirectory(at: sync, withIntermediateDirectories: true)
+        let database = try SyncDatabase(url: root.appending(path: "state.sqlite"))
+        let rootID = UUID()
+        try await database.registerRoot(id: rootID, canonicalPath: sync.path)
+        let token = MoodleRecordingProtocol.register(courses: [(1, "Course")], userID: userID)
+        MoodleRecordingProtocol.setProfileEmail(token: token, email, listed: listed)
+        let current = OSAllocatedUnfairLock(initialState: token)
+        let vault = CredentialVault(read: { _ in current.withLock { $0 } }, write: { new in current.withLock { $0 = new } })
+        let controller = WeBeepAuthenticationController(testRootURL: sync, database: database, rootID: rootID, apiClient: MoodleRecordingProtocol.makeClient(), credentialVault: vault, defaults: WeBeepAuthenticationController.throwawayDefaults(), recordingsStore: store)
+        await controller.completeLoginForTesting(moodleLoginCallback(token: token))
+        #expect(controller.courseLoadError == nil)
+        return (controller, token)
     }
 
 }

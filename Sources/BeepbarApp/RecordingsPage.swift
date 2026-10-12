@@ -2,43 +2,28 @@ import SwiftUI
 import BeepbarCore
 
 /// The rules of what the Recordings page shows, kept out of the views so tests can pin them.
+/// The list rules live in Core (`RecmanPresentation`, `RecmanCourseSidebar`), where the page's
+/// cached derivations use them (#100); these forward to them, so the page and its tests can never
+/// disagree with what the cache derives.
 enum RecordingsPresentation {
+    typealias WeekSection = RecmanPresentation.WeekSection
+
     static func syncedCourses(_ courses: [RemoteCourseSummary], enabledIDs: Set<Int64>) -> [RemoteCourseSummary] {
-        courses.filter { enabledIDs.contains($0.id) }
+        RecmanCourseSidebar(.init(courses: courses, enabledIDs: enabledIDs)).courses
     }
 
     static func selectedCourse(_ courses: [RemoteCourseSummary], selectedID: Int64?) -> RemoteCourseSummary? {
-        courses.first { $0.id == selectedID }
-            ?? courses.first { RecmanCourseKey(course: $0) != nil }
-            ?? courses.first
+        RecmanCourseSidebar(.init(courses: courses, enabledIDs: Set(courses.map(\.id)))).selectedCourse(id: selectedID)
     }
 
     /// Hide recognized archive identifiers without changing the course's wording or acronyms.
     static func courseName(_ course: RemoteCourseSummary) -> String {
-        let displayName = course.displayName.trimmingCharacters(in: .whitespacesAndNewlines)
-        let name = displayName.isEmpty ? course.shortName.trimmingCharacters(in: .whitespacesAndNewlines) : displayName
-        guard let key = RecmanCourseKey(course: course) else { return name }
-        let nextYear = key.academicYear + 1
-        let year = "\(key.academicYear)\\s*[-/]\\s*(?:\(nextYear)|\(String(format: "%02d", nextYear % 100)))"
-        let suffix = "\\s*(?:\\[\\s*\(year)\\s*\\]|\\(\\s*\(year)\\s*\\))\\s*$"
-        let cleaned = name
-            .replacingOccurrences(of: #"^\s*[0-9]{6}\s*-\s*"#, with: "", options: .regularExpression)
-            .replacingOccurrences(of: suffix, with: "", options: .regularExpression)
-            .trimmingCharacters(in: .whitespacesAndNewlines)
-        return cleaned.isEmpty ? name : cleaned
-    }
-
-    struct WeekSection: Equatable {
-        let title: String
-        let recordings: [RecmanRecording]
+        RecmanCourseSidebar.courseName(course)
     }
 
     /// Weeks start on Monday, as Polimi's timetable does, whatever the Mac's region says.
     static func calendar(timeZone: TimeZone = .current) -> Calendar {
-        var calendar = Calendar(identifier: .gregorian)
-        calendar.firstWeekday = 2
-        calendar.timeZone = timeZone
-        return calendar
+        RecmanPresentation.calendar(timeZone: timeZone)
     }
 
     /// The minutes in Recman's duration ("97 min"); the parser accepts no other shape. Delegates to
@@ -47,66 +32,21 @@ enum RecordingsPresentation {
         RecmanRecording.minutes(inDuration: duration)
     }
 
-    /// "45 min", "1 h 37 min", "36 h".
-    static func durationText(minutes: Int) -> String {
-        let hours = minutes / 60
-        let rest = minutes % 60
-        if hours == 0 { return "\(rest) min" }
-        return rest == 0 ? "\(hours) h" : "\(hours) h \(rest) min"
-    }
+    static func durationText(minutes: Int) -> String { RecmanPresentation.durationText(minutes: minutes) }
 
-    /// Newest first, grouped by calendar week: "Questa settimana", "Settimana scorsa", then the
-    /// week's dates ("14 – 20 set"), with the year only when it isn't the current one.
     static func weekSections(_ recordings: [RecmanRecording], now: Date, calendar: Calendar, locale: Locale) -> [WeekSection] {
-        guard let thisWeek = calendar.dateInterval(of: .weekOfYear, for: now)?.start else { return [] }
-        let lastWeek = calendar.date(byAdding: .weekOfYear, value: -1, to: thisWeek)
-        var sections: [(start: Date, recordings: [RecmanRecording])] = []
-        for recording in recordings.sorted(by: { $0.recordedAt > $1.recordedAt }) {
-            guard let start = calendar.dateInterval(of: .weekOfYear, for: recording.recordedAt)?.start else { continue }
-            if sections.last?.start == start {
-                sections[sections.count - 1].recordings.append(recording)
-            } else {
-                sections.append((start, [recording]))
-            }
-        }
-        return sections.map { section in
-            let title: String
-            if section.start == thisWeek {
-                title = tr("Questa settimana", "This week")
-            } else if section.start == lastWeek {
-                title = tr("Settimana scorsa", "Last week")
-            } else {
-                title = weekRange(from: section.start, now: now, calendar: calendar, locale: locale)
-            }
-            return WeekSection(title: title, recordings: section.recordings)
-        }
+        RecmanPresentation.weekSections(recordings, now: now, calendar: calendar, locale: locale)
     }
 
     static func weekRange(from start: Date, now: Date, calendar: Calendar, locale: Locale) -> String {
-        let end = calendar.date(byAdding: .day, value: 6, to: start) ?? start
-        var style = Date.FormatStyle(timeZone: calendar.timeZone).day().month(.abbreviated).locale(locale)
-        if calendar.component(.year, from: end) != calendar.component(.year, from: now) { style = style.year() }
-        let sameMonth = calendar.component(.month, from: start) == calendar.component(.month, from: end)
-        let startText = sameMonth ? Date.FormatStyle(timeZone: calendar.timeZone).day().locale(locale).format(start) : style.format(start)
-        return "\(startText) – \(style.format(end))"
+        RecmanPresentation.weekRange(from: start, now: now, calendar: calendar, locale: locale)
     }
 
-    /// Each recording's place in its course, oldest first, as students count lessons ("#12").
-    static func numbers(_ recordings: [RecmanRecording]) -> [String: Int] {
-        let ordered = recordings.sorted { ($0.recordedAt, $0.id) < ($1.recordedAt, $1.id) }
-        return Dictionary(ordered.enumerated().map { ($0.element.id, $0.offset + 1) }, uniquingKeysWith: { first, _ in first })
-    }
+    static func numbers(_ recordings: [RecmanRecording]) -> [String: Int] { RecmanPresentation.numbers(recordings) }
 
-    /// What a row is called: Recman's title, or the kind of lesson when the teacher left it empty.
-    static func title(_ recording: RecmanRecording) -> String {
-        recording.title.isEmpty ? recording.kind : recording.title
-    }
+    static func title(_ recording: RecmanRecording) -> String { RecmanPresentation.title(recording) }
 
-    static func matches(_ recording: RecmanRecording, query: String) -> Bool {
-        let needle = query.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !needle.isEmpty else { return true }
-        return recording.title.localizedStandardContains(needle) || recording.kind.localizedStandardContains(needle)
-    }
+    static func matches(_ recording: RecmanRecording, query: String) -> Bool { RecmanPresentation.matches(recording, query: query) }
 
     // MARK: Watch progress
 
@@ -218,20 +158,22 @@ enum RecordingsPresentation {
 struct RecordingsPage: View {
     @ObservedObject var authentication: WeBeepAuthenticationController
     @ObservedObject var recordings: RecordingsController
+    /// The sidebar derived from the synced courses (#100). The page observes every publication of
+    /// both controllers (a spinner, a row opening, a bookmark), and each archive key costs two
+    /// regular expressions per course name and each display name two more: they are worked out
+    /// again only when the course list or the courses chosen for syncing change. The course shown
+    /// on the right is not part of the key: picking it is a lookup in the result. A cache, not
+    /// view state: filling it during `body` changes nothing SwiftUI observes.
+    @State private var sidebarCache = DerivedValueCache<RecmanCourseSidebar.Inputs, RecmanCourseSidebar>()
 
-    private var courses: [RemoteCourseSummary] {
-        RecordingsPresentation.syncedCourses(authentication.courses, enabledIDs: authentication.enabledCourseIDs)
+    /// Every use in one `body` after the first is an equality check of the inputs. For arrays the
+    /// controllers republish unchanged it is a storage comparison; equal content in new storage
+    /// is compared once, after which the cache holds the new array.
+    private var model: RecmanCourseSidebar {
+        sidebarCache.value(for: .init(courses: authentication.courses, enabledIDs: authentication.enabledCourseIDs), compute: RecmanCourseSidebar.init)
     }
 
-    private var searchableCourses: [(course: RemoteCourseSummary, key: RecmanCourseKey)] {
-        courses.compactMap { course in RecmanCourseKey(course: course).map { (course, $0) } }
-    }
-
-    private var unsearchableCourses: [RemoteCourseSummary] {
-        courses.filter { RecmanCourseKey(course: $0) == nil }
-    }
-
-    private var keys: [RecmanCourseKey] { searchableCourses.map(\.key) }
+    private var keys: [RecmanCourseKey] { model.keys }
 
     private var selectedCourseID: Int64? {
         if case .course(let id) = recordings.study.destination { return id }
@@ -244,7 +186,13 @@ struct RecordingsPage: View {
     }
 
     private var selectedCourse: RemoteCourseSummary? {
-        RecordingsPresentation.selectedCourse(courses, selectedID: selectedCourseID)
+        model.selectedCourse(id: selectedCourseID)
+    }
+
+    /// The selected course's archive entry, nil when its name carries no code and year.
+    private var selectedEntry: RecmanCourseSidebar.Entry? {
+        guard let selectedCourse else { return nil }
+        return model.searchable.first { $0.course.id == selectedCourse.id }
     }
 
     var body: some View {
@@ -269,7 +217,7 @@ struct RecordingsPage: View {
     private func refresh(force: Bool = false) {
         let savedKeys = recordings.study.bookmarks.compactMap { RecmanCourseKey(courseCode: $0.recording.courseCode, academicYear: $0.recording.academicYear) }
         let requested = destination == .watchlist ? Array(Set(keys + savedKeys)).sorted { ($0.academicYear, $0.courseCode) < ($1.academicYear, $1.courseCode) } : keys
-        recordings.refresh(requested, selected: destination == .watchlist ? nil : selectedCourse.flatMap(RecmanCourseKey.init(course:)), force: force)
+        recordings.refresh(requested, selected: destination == .watchlist ? nil : selectedEntry?.key, force: force)
     }
 
     // MARK: Sign-in
@@ -283,8 +231,8 @@ struct RecordingsPage: View {
             SymbolTile(systemImage: "play.rectangle.fill", size: 52)
             Text(tr("Registrazioni delle lezioni", "Lecture recordings"))
                 .font(.title3.weight(.semibold))
-            Text(tr("Trova le registrazioni dei corsi che sincronizzi, cerca una lezione e riproducila nel browser. Accedi con Polimi per iniziare. Se non ti serve questa funzione, disattiva Registrazioni in Impostazioni.",
-                    "Find recordings for the courses you sync, search for a lecture and play it in your browser. Sign in with Polimi to get started. If you don't need this feature, turn off Recordings in Settings."))
+            Text(tr("Trova le registrazioni dei corsi che sincronizzi, cerca una lezione e riproducila in BeepBar. Accedi con Polimi per iniziare. Se non ti serve questa funzione, disattiva Registrazioni in Impostazioni.",
+                    "Find recordings for the courses you sync, search for a lecture and play it in BeepBar. Sign in with Polimi to get started. If you don't need this feature, turn off Recordings in Settings."))
                 .multilineTextAlignment(.center)
                 .foregroundStyle(.secondary)
                 .frame(maxWidth: 420)
@@ -355,19 +303,19 @@ struct RecordingsPage: View {
                 .tag(RecordingsDestination.watchlist)
             }
             Section(tr("I tuoi corsi", "Your courses")) {
-                ForEach(searchableCourses, id: \.course.id) { entry in
-                    CourseRow(name: RecordingsPresentation.courseName(entry.course), key: entry.key, listing: recordings.listing(for: entry.key), newCount: recordings.newCount(for: entry.key))
+                ForEach(model.searchable) { entry in
+                    CourseRow(name: entry.name, key: entry.key, listing: recordings.listing(for: entry.key), newCount: recordings.newCount(for: entry.key))
                         .tag(RecordingsDestination.course(entry.course.id))
                 }
             }
-            if !unsearchableCourses.isEmpty {
+            if !model.unsearchable.isEmpty {
                 Section(tr("Senza codice o anno", "No code or year")) {
-                    ForEach(unsearchableCourses) { course in
-                        Text(RecordingsPresentation.courseName(course))
+                    ForEach(model.unsearchable) { entry in
+                        Text(entry.name)
                             .lineLimit(3)
                             .fixedSize(horizontal: false, vertical: true)
                             .foregroundStyle(.secondary)
-                            .tag(RecordingsDestination.course(course.id))
+                            .tag(RecordingsDestination.course(entry.course.id))
                     }
                 }
             }
@@ -381,14 +329,14 @@ struct RecordingsPage: View {
         if destination == .watchlist {
             WatchlistRecordings(recordings: recordings) { refresh(force: true) }
         } else if let course = selectedCourse {
-            if let key = RecmanCourseKey(course: course) {
-                CourseRecordings(name: RecordingsPresentation.courseName(course), key: key, recordings: recordings) {
+            if let entry = selectedEntry {
+                CourseRecordings(name: entry.name, key: entry.key, recordings: recordings) {
                     refresh(force: true)
                 }
                 .id(course.id)
             } else {
                 ContentUnavailableView {
-                    Label(RecordingsPresentation.courseName(course), systemImage: "questionmark.folder")
+                    Label(model.unsearchable.first { $0.course.id == course.id }?.name ?? RecordingsPresentation.courseName(course), systemImage: "questionmark.folder")
                 } description: {
                     Text(tr("Il nome del corso su WeBeep non riporta codice e anno accademico, quindi BeepBar non sa quali registrazioni cercare.",
                             "The course's name on WeBeep doesn't carry its code and academic year, so BeepBar can't tell which recordings to look for."))
@@ -454,8 +402,25 @@ private struct CourseRecordings: View {
     @State private var query = ""
     @State private var selection: String?
     @FocusState private var searchFocused: Bool
+    /// The pane's rows and week sections (#100). The pane observes the whole controller, so its
+    /// `body` runs again when a spinner flips, a row starts opening or another course's listing
+    /// arrives; the search and the grouping by week (a calendar lookup per recording) are redone
+    /// only when the listing, the search, the language, the time zone or the day changes.
+    /// `RecmanCourseListDerivation.Inputs` says why each is there.
+    @State private var derivation = DerivedValueCache<RecmanCourseListDerivation.Inputs, RecmanCourseListDerivation>()
+    /// Lesson numbers and total minutes, which depend on the listing alone: typing in the search
+    /// doesn't sort the whole list again.
+    @State private var summaryCache = DerivedValueCache<[RecmanRecording], RecmanCourseListSummary>()
 
     private var listing: RecordingsListing? { recordings.listing(for: key) }
+
+    private func derivedList(_ list: [RecmanRecording]) -> RecmanCourseListDerivation {
+        derivation.value(for: .init(recordings: list, query: query, language: AppLanguage.current, timeZone: .current, now: Date()), compute: RecmanCourseListDerivation.init)
+    }
+
+    private func summary(_ list: [RecmanRecording]) -> RecmanCourseListSummary {
+        summaryCache.value(for: list, compute: RecmanCourseListSummary.init)
+    }
 
     var body: some View {
         VStack(spacing: 0) {
@@ -534,7 +499,7 @@ private struct CourseRecordings: View {
         guard let list = listing?.recordings else {
             return listing?.isLoading == true ? "\(year) · \(tr("caricamento…", "loading…"))" : year
         }
-        let minutes = list.compactMap { RecordingsPresentation.minutes($0.duration) }.reduce(0, +)
+        let minutes = summary(list).totalMinutes
         var parts = [year, tr("\(list.count) registrazioni", englishCount(list.count, "recording", "recordings"))]
         if minutes > 0 { parts.append(RecordingsPresentation.durationText(minutes: minutes)) }
         return parts.joined(separator: " · ")
@@ -566,17 +531,17 @@ private struct CourseRecordings: View {
 
     @ViewBuilder private var content: some View {
         if let list = listing?.recordings {
-            let shown = list.filter { RecordingsPresentation.matches($0, query: query) }
+            let model = derivedList(list)
             if list.isEmpty {
                 ContentUnavailableView {
                     Label(tr("Ancora nessuna registrazione", "No recordings yet"), systemImage: "video.slash")
                 } description: {
                     Text(tr("Quando ne viene pubblicata una, la trovi qui.", "When one is published, you'll find it here."))
                 }
-            } else if shown.isEmpty {
+            } else if model.shown.isEmpty {
                 ContentUnavailableView.search(text: query)
             } else {
-                recordingList(shown, numbers: RecordingsPresentation.numbers(list))
+                recordingList(model, numbers: summary(list).numbers)
             }
         } else if listing?.isLoading == true {
             VStack(spacing: 10) {
@@ -588,15 +553,17 @@ private struct CourseRecordings: View {
         }
     }
 
-    private func recordingList(_ shown: [RecmanRecording], numbers: [String: Int]) -> some View {
-        let sections = RecordingsPresentation.weekSections(shown, now: Date(), calendar: RecordingsPresentation.calendar(), locale: BeepbarStyle.locale)
-        let byID = Dictionary(shown.map { ($0.id, $0) }, uniquingKeysWith: { first, _ in first })
+    private func recordingList(_ model: RecmanCourseListDerivation, numbers: [String: Int]) -> some View {
+        let byID = model.byID
+        let firstID = model.shown.first?.id
+        // One set per `body` instead of a scan of every bookmark for every row.
+        let watchlisted = Set(recordings.study.bookmarks.map(\.id))
         let canEditProgress = recordings.canEditProgress
         // Sections, filtering and numbering stay here (this view doesn't observe the progress
         // model); a tick re-runs only the reader's closure below, see `WatchProgressReader`.
         return WatchProgressReader(progress: recordings.watchProgress) { progress in
             List(selection: $selection) {
-                ForEach(sections, id: \.title) { section in
+                ForEach(model.sections, id: \.title) { section in
                     Section(section.title) {
                         ForEach(section.recordings) { recording in
                             RecordingRow(
@@ -604,7 +571,7 @@ private struct CourseRecordings: View {
                                 number: numbers[recording.id],
                                 isNew: recordings.isNew(recording),
                                 isOpening: recordings.openingRecordingID == recording.id,
-                                isWatchlisted: recordings.study.contains(recording),
+                                isWatchlisted: watchlisted.contains(RecordingsStudyState.identity(recording)),
                                 canEdit: recordings.canEditStudy,
                                 canPlay: recordings.access == .ready,
                                 watchlistCourseName: name,
@@ -616,7 +583,7 @@ private struct CourseRecordings: View {
                                 )
                             )
                             .equatable()
-                            .uiContentReady(.recordings, enabled: recording.id == shown.first?.id)
+                            .uiContentReady(.recordings, enabled: recording.id == firstID)
                             .tag(recording.id)
                         }
                     }
@@ -628,7 +595,9 @@ private struct CourseRecordings: View {
         // Double click and Return open the player, the way Finder opens a file.
         .contextMenu(forSelectionType: String.self) { ids in
             if let recording = ids.first.flatMap({ byID[$0] }) {
-                Button(tr("Apri nel browser", "Open in browser")) { recordings.play(recording) }
+                // Really the browser: Play (double click, Return, the row's button) is BeepBar's
+                // own player since #148, and this item is the way around it.
+                Button(tr("Apri nel browser", "Open in browser")) { recordings.openInBrowser(recording) }
                 Button(tr("Copia link", "Copy link")) { recordings.copyLink(recording) }
                 Button(recordings.study.contains(recording) ? tr("Rimuovi dalla watchlist", "Remove from watchlist") : tr("Aggiungi alla watchlist", "Add to watchlist")) { recordings.toggleWatchlist(recording, courseName: name) }
                     .disabled(!recordings.canEditStudy)
@@ -645,8 +614,19 @@ private struct WatchlistRecordings: View {
     let refresh: () -> Void
     @State private var query = ""
     @State private var selection: String?
+    /// The bookmarks matching the search, newest first (#100): filtered and sorted again only when
+    /// the bookmarks or the search change, not on every publication of the controller.
+    @State private var shownCache = DerivedValueCache<ShownInputs, [RecordingsStudyState.Bookmark]>()
 
-    private var shown: [RecordingsStudyState.Bookmark] { recordings.study.visibleBookmarks(query: query) }
+    private struct ShownInputs: Equatable {
+        let bookmarks: [RecordingsStudyState.Bookmark]
+        let query: String
+    }
+
+    private var shown: [RecordingsStudyState.Bookmark] {
+        let study = recordings.study
+        return shownCache.value(for: ShownInputs(bookmarks: study.bookmarks, query: query)) { study.visibleBookmarks(query: $0.query) }
+    }
 
     private var listings: [RecordingsListing] {
         let keys = Set(recordings.study.bookmarks.compactMap {
@@ -655,9 +635,13 @@ private struct WatchlistRecordings: View {
         return keys.sorted { ($0.academicYear, $0.courseCode) < ($1.academicYear, $1.courseCode) }
             .compactMap { recordings.listing(for: $0) }
     }
-    private var isLoading: Bool { listings.contains { $0.isLoading } }
 
+    // `listings` looks up every bookmarked course, and depends on listings the controller updates
+    // all the time: worked out once per `body` and passed down, not once per use (#100).
     var body: some View {
+        let shown = self.shown
+        let listings = self.listings
+        let isLoading = listings.contains { $0.isLoading }
         VStack(spacing: 0) {
             VStack(alignment: .leading, spacing: 6) {
                 Text(tr("Watchlist", "Watchlist")).font(.title3.weight(.semibold))
@@ -722,7 +706,7 @@ private struct WatchlistRecordings: View {
                     if let bookmark = shown.first(where: { ids.contains($0.id) }) {
                         Button(tr("Rimuovi dalla watchlist", "Remove from watchlist")) { recordings.toggleWatchlist(bookmark.recording, courseName: bookmark.courseName) }
                             .disabled(!recordings.canEditStudy)
-                        Button(tr("Apri nel browser", "Open in browser")) { recordings.play(bookmark.recording) }
+                        Button(tr("Apri nel browser", "Open in browser")) { recordings.openInBrowser(bookmark.recording) }
                             .disabled(recordings.access != .ready || bookmark.unavailable)
                     }
                 } primaryAction: { ids in
@@ -872,7 +856,9 @@ struct RecordingRow: View, Equatable {
             }
             .buttonStyle(.plain)
             .disabled(!canPlay)
-            .help(tr("Apri nel browser", "Open in browser"))
+            // Play is BeepBar's own player since #148 (the browser only when that isn't possible);
+            // "Apri nel browser" is the row menu's item.
+            .help(tr("Riproduci", "Play"))
             .accessibilityLabel(tr("Riproduci \(RecordingsPresentation.title(recording))", "Play \(RecordingsPresentation.title(recording))"))
         }
         .padding(.vertical, 9)

@@ -134,14 +134,33 @@ struct RecordingsListing: Equatable {
     /// (`StoredWatchSummaries`), so the menu bar can show it without a network request or a
     /// controller. Written only when a value changes; removed with the session.
     nonisolated static let watchSummaryKey = "io.github.tvaccari.beepbar.recordings-watch-summary.v1"
+    /// The WeBeep account (numeric user id) whose student removed the Polimi email in Settings:
+    /// the profile's address is then never taken again for that account, also after a relaunch
+    /// (an empty session file can't tell "removed" from "never set"). Holds no address. Removed
+    /// with the session's identity (turn-off, disconnect, account change) and when the student
+    /// enters an address again.
+    nonisolated static let emailDeclinedKey = "io.github.tvaccari.beepbar.recordings-email-declined.v1"
     /// A course shown again within this time isn't asked for again unless the user refreshes.
     static let freshness: TimeInterval = 300
 
-    enum OpenAction: Equatable { case play, copyLink }
+    /// `play`: BeepBar's player, the browser only as a fallback (#148). `browser`: the Webex
+    /// player in the default browser, on purpose (the rows' "Apri nel browser" menu item, which
+    /// before the package F fix ran a native Play despite its name). `copyLink`: the clipboard.
+    enum OpenAction: Equatable { case play, browser, copyLink }
 
     @Published private(set) var isEnabled: Bool
     @Published private(set) var access: RecordingsAccess
-    @Published private(set) var listings: [RecmanCourseKey: RecordingsListing] = [:]
+    /// How many course listings stay in memory (#100), the page's own included. The page's courses
+    /// are pinned and never evicted, even past the bound, so reopening one stays immediate; the
+    /// others (courses deselected since, bookmarked courses of other years) fill what is left and
+    /// go least recently updated first. Well above a semester's courses plus a watchlist's, so in
+    /// normal use nothing a user goes back to is reloaded; the bound is for sessions that stay
+    /// open for weeks.
+    nonisolated static let listingCapacity = 64
+    /// Webex players remembered for an instant second opening; a few hundred bytes each.
+    nonisolated static let playbackURLCapacity = 512
+
+    @Published private(set) var listings: BoundedCache<RecmanCourseKey, RecordingsListing>
     /// The recording whose player is being looked up, for its row's spinner.
     @Published private(set) var openingRecordingID: String?
     /// Why the last attempt to open a recording failed, until the next one.
@@ -234,20 +253,35 @@ struct RecordingsListing: Equatable {
     /// The account `watchSummaries` was read for; nil until the first use with a known account.
     private var watchSummaryOwner: Int?
 
-    /// The Polimi address the student confirmed for the Webex sign-in; lives in the session file.
+    /// The Polimi address in use for the Webex sign-in: the one the student typed, the one the
+    /// session file holds, or (product decision 2026-10-11) the WeBeep profile's, taken as
+    /// confirmed without a confirmation step (`learnEmail`). Lives in the session file.
     @Published private(set) var confirmedEmail: PolimiEmail? = nil
-    /// The address the WeBeep profile offers, valid but not confirmed yet.
-    @Published private(set) var suggestedEmail: PolimiEmail? = nil
+    /// Whether `confirmedEmail` was taken from the WeBeep profile in this session (the Settings
+    /// field says so, and the Play diagnostics log `email=profile`). False once the student
+    /// edits it, and for an address read from the session file.
+    @Published private(set) var emailFromProfile = false
     /// Whether the saved session was read, so `confirmedEmail` says what the file holds.
     private var emailLoaded = false
-    /// The student changed the address in this launch: it wins over what a late read finds.
+    /// The student changed or removed the address in this launch: it wins over what a late read
+    /// finds, and the profile is not asked again.
     private var emailEditedByUser = false
     /// Bumped whenever the session (and so the email) is discarded: a late profile answer or
     /// read from before it is dropped.
     private var emailEpoch = 0
-    /// The profile was asked (or is being asked) in this session: a failed or empty answer is
-    /// not asked again at every Settings appearance.
+    /// The profile was asked (or is being asked) in this epoch: a failed or empty answer is not
+    /// asked again at every Settings appearance or Play.
     private var suggestionAttempted = false
+    /// The one profile lookup of the current epoch, shared by the Settings field and Play so a
+    /// Play that starts while the Settings row is already asking waits for the same answer
+    /// instead of going on without an address.
+    private var emailLookup: (epoch: Int, task: Task<Void, Never>)?
+    /// The WeBeep account the in-memory address (or the profile lookup) belongs to. Needed because
+    /// an address can exist before any Polimi session does (the Settings field or a Play read the
+    /// profile, or the student typed one, while the Polimi sign-in never completed): then
+    /// `sessionOwner` is nil, and without this an account change would keep the previous
+    /// account's address and send it to Webex for the new one (PR #152 review, P0).
+    private var emailAccount: Int?
 
     private let makeBrowser: @MainActor () -> RecmanBrowsing
     private let store: RecordingsSessionStore
@@ -278,8 +312,9 @@ struct RecordingsListing: Equatable {
     private var initialSessionCheck: Int?
     /// Identifies each first-visit check, so a superseded one can't apply its answer.
     private var initialSessionChecks = 0
-    /// Webex players already found, so opening a recording again is instant.
-    private var playbackURLs: [String: URL] = [:]
+    /// Webex players already found, so opening a recording again is instant. Bounded (#100): it
+    /// used to grow with every recording opened until the feature was turned off.
+    private var playbackURLs: BoundedCache<String, URL>
 
     private enum Job: Equatable {
         case list(RecmanCourseKey)
@@ -323,10 +358,14 @@ struct RecordingsListing: Equatable {
         },
         now: @escaping () -> Date = Date.init,
         makePlayer: @escaping @MainActor () -> RecordingPlaying = { RecordingPlayerController() },
-        fetchProfileEmail: @escaping @MainActor () async -> String? = { nil }
+        fetchProfileEmail: @escaping @MainActor () async -> String? = { nil },
+        listingCapacity: Int = RecordingsController.listingCapacity,
+        playbackURLCapacity: Int = RecordingsController.playbackURLCapacity
     ) {
         self.makePlayer = makePlayer
         self.fetchProfileEmail = fetchProfileEmail
+        listings = BoundedCache(capacity: listingCapacity)
+        playbackURLs = BoundedCache(capacity: playbackURLCapacity)
         self.makeBrowser = makeBrowser
         self.store = store
         self.vault = RecmanSessionVault(storage: .init(load: { try store.load() }, save: { try store.save($0) }, delete: { try store.delete() }))
@@ -456,13 +495,15 @@ struct RecordingsListing: Equatable {
         closeBrowser()
         isEnabled = false
         access = .off
-        listings = [:]
+        listings.removeAll()
+        listings.pin([])
         openingProblem = nil
-        playbackURLs = [:]
+        playbackURLs.removeAll()
         pageKeys = []
         selectedKey = nil
         forgetSeen()
         forgetResumePoints()
+        forgetEmailOptOut()
         studyLoaded = false
         loadStudy()
         defaults.removeObject(forKey: Self.enabledKey)
@@ -520,16 +561,23 @@ struct RecordingsListing: Equatable {
     /// account is dropped together with what that account had seen.
     func webBeepAccountChanged(to userID: Int) {
         loadStudy()
+        // Before the session check: an address learned with no Polimi session yet belongs to the
+        // account that was signed in then, not to this one.
+        if let emailAccount, emailAccount != userID {
+            log.notice("Polimi email belongs to another WeBeep account: dropped")
+            resetEmail()
+        }
         guard let sessionOwner, sessionOwner != userID else { return }
         log.notice("Polimi session belongs to another WeBeep account: dropped")
         supersedeInitialSessionCheck()
         closePlayerForIdentityChange()
         invalidate()
         closeBrowser()
-        listings = [:]
-        playbackURLs = [:]
+        listings.removeAll()
+        playbackURLs.removeAll()
         forgetSeen()
         forgetResumePoints()
+        forgetEmailOptOut()
         discardSessionFile()
         if isEnabled { access = .needsSignIn(nil) }
     }
@@ -596,6 +644,7 @@ struct RecordingsListing: Equatable {
         guard access != .signingIn else { return }
         if hasRecovery {
             dropQueuedListings()
+            dropQueuedOpenings()
             closesBrowserWhenIdle = true
             return
         }
@@ -616,6 +665,17 @@ struct RecordingsListing: Equatable {
         queue.removeAll { if case .list = $0 { true } else { false } }
     }
 
+    /// Removes the clicks still waiting (Play, Open in browser, Copy link) and their spinner: with
+    /// the window closed nobody is waiting for them, and a Play would otherwise start a lecture,
+    /// a browser or a sign-in window after the recovery ahead of it (PR #152 review). The one in
+    /// flight, if any, finishes, as it did before the recovery exception.
+    private func dropQueuedOpenings() {
+        for job in queue {
+            if case .open(let recording, _, _) = job, openingRecordingID == recording.id { openingRecordingID = nil }
+        }
+        queue.removeAll { if case .open = $0 { true } else { false } }
+    }
+
     /// Brings the page's courses up to date: `selected` first, then the others, which only feed
     /// their badges. A course loaded in the last few minutes is skipped unless `force` (the
     /// refresh button), so moving around the page doesn't keep asking Polimi.
@@ -623,6 +683,10 @@ struct RecordingsListing: Equatable {
         guard isEnabled, visiblePages > 0 else { return }
         pageKeys = keys
         selectedKey = selected
+        // What the page shows is never evicted, so going back to one of its courses is immediate.
+        // Compared first: `listings` is published, and an unchanged page must not redraw.
+        let onPage = Set(keys + [selected].compactMap { $0 })
+        if listings.pinnedKeys != onPage { listings.pin(onPage) }
         guard access == .ready else { return }
         // The initial check enqueues these keys itself once it knows a session exists.
         guard initialSessionCheck == nil else { return }
@@ -638,6 +702,11 @@ struct RecordingsListing: Equatable {
     /// Plays the recording in BeepBar's own player; when that isn't possible, opens its Webex
     /// player in the default browser, as Play did before native playback.
     func play(_ recording: RecmanRecording) { open(recording, .play) }
+
+    /// Opens the recording's Webex player in the default browser, without trying BeepBar's own
+    /// player: the menu item that says so. Like Copy link, it is answered from the cached link
+    /// when there is one.
+    func openInBrowser(_ recording: RecmanRecording) { open(recording, .browser) }
 
     /// Copies the link of the recording's Webex player.
     func copyLink(_ recording: RecmanRecording) { open(recording, .copyLink) }
@@ -656,9 +725,9 @@ struct RecordingsListing: Equatable {
             if case .recover = job { return action == .play }
             return false
         }
-        // Only the link can be answered from memory: a native Play always asks for a fresh
-        // stream, since its address is short-lived and tied to a sign-in.
-        if action == .copyLink, let url = playbackURLs[recording.id] {
+        // Only the link can be answered from memory (Copy link, Open in browser): a native Play
+        // always asks for a fresh stream, since its address is short-lived and tied to a sign-in.
+        if action != .play, let url = playbackURLs[recording.id] {
             finishOpening(recording, url: url, action: action)
             return
         }
@@ -670,7 +739,7 @@ struct RecordingsListing: Equatable {
     private func finishOpening(_ recording: RecmanRecording, url: URL, action: OpenAction) {
         markOpened(recording)
         switch action {
-        case .play: openURL(url)
+        case .play, .browser: openURL(url)
         case .copyLink: copy(url)
         }
     }
@@ -886,6 +955,11 @@ struct RecordingsListing: Equatable {
                     guard generation == self.generation else { return }
                     playbackURLs[recording.id] = url
                     if request == openingRequest { finishOpening(recording, url: url, action: .copyLink) }
+                case .open(let recording, .browser, let request):
+                    let url = try await playerLink(for: recording, browser: browser)
+                    guard generation == self.generation else { return }
+                    playbackURLs[recording.id] = url
+                    if request == openingRequest { finishOpening(recording, url: url, action: .browser) }
                 case .open(let recording, .play, let request):
                     try await playNatively(recording, request: request, browser: browser, generation: generation)
                     guard generation == self.generation else { return }
@@ -923,9 +997,17 @@ struct RecordingsListing: Equatable {
     // MARK: Native playback (#148)
 
     /// The Webex player link of a recording, from memory when it was found before.
-    private func playerLink(for recording: RecmanRecording, browser: RecmanBrowsing) async throws -> URL {
+    private func playerLink(for recording: RecmanRecording, browser: RecmanBrowsing, found: URL? = nil) async throws -> URL {
+        if let found { return found }
         if let cached = playbackURLs[recording.id] { return cached }
         return try await browser.playbackURL(for: recording)
+    }
+
+    /// What actually failed in a stream lookup, and the player link it had found by then, if any
+    /// (`RecmanStreamFailure`). Every decision and log line reads the cause, never the wrapper.
+    nonisolated static func streamFailureCause(_ error: Error) -> (cause: Error, player: URL?) {
+        if let failure = error as? RecmanStreamFailure { return (failure.underlying, failure.player) }
+        return (error, nil)
     }
 
     /// What a failed stream lookup means for a Play. Pure, so it is tested without a browser.
@@ -960,15 +1042,99 @@ struct RecordingsListing: Equatable {
         }
     }
 
+    /// Why a Play didn't reach BeepBar's player, for the Play diagnostics (#148, package F fix).
+    /// Before them every such Play logged the same "opening the browser" line, so a user report
+    /// ("Play opens the browser") couldn't say which step failed.
+    enum PlayFailureReason: String, Equatable {
+        /// Webex answered something native playback doesn't handle (`playbackUnavailable`): the
+        /// resolver's own `stream:` lines say which step and what it saw.
+        case nativeUnavailable = "native-unavailable"
+        /// The Polimi session lapsed: the page asks for a sign-in.
+        case needsSignIn = "needs-sign-in"
+        /// Webex needs a sign-in and no Polimi email was confirmed in Settings.
+        case noEmail = "no-email"
+        /// Polimi or Webex didn't answer (offline, a timeout).
+        case unreachable = "unreachable"
+        /// Interrupted (a newer operation, the user closed the sign-in window).
+        case cancelled = "cancelled"
+        /// Any other error on the way to the stream (the archive looked different, an error
+        /// BeepBar doesn't know).
+        case streamError = "stream-error"
+        /// The stream was found but the player couldn't play it.
+        case playerFailure = "player-failure"
+    }
+
+    nonisolated static func playFailureReason(_ error: Error) -> PlayFailureReason {
+        if error is CancellationError { return .cancelled }
+        switch error as? RecmanBrowserError {
+        case .playbackUnavailable: return .nativeUnavailable
+        case .needsSignIn: return .needsSignIn
+        case .needsEmail: return .noEmail
+        case .unavailable: return .unreachable
+        case .unrecognized, .incomplete, .yearUnavailable, nil: return .streamError
+        }
+    }
+
+    /// The log line of a Play whose stream lookup failed: what happens next (the browser, or
+    /// nothing but the page's message), why, and the error's privacy-safe name. Pure, so tests
+    /// read exactly what is logged; never the email, an address or a title.
+    nonisolated static func playDiagnosis(_ error: Error) -> String {
+        let next = streamFailureOutcome(error) == .browser ? "browser" : "none"
+        return "play: fallback=\(next) reason=\(playFailureReason(error).rawValue) error=\(PlaybackDiagnostics.errorName(error))"
+    }
+
+    /// The log line of a play the player reported as failed, with the phase and the error's
+    /// domain and code (AVFoundation's, and the underlying one that names the real cause).
+    nonisolated static func playerFailureDiagnosis(_ failure: RecordingPlaybackFailure, recovery: Recovery) -> String {
+        let phase: String
+        let cause: Error?
+        switch failure {
+        case .beforeReady(let error):
+            phase = "before-ready"
+            cause = error
+        case .duringPlayback(let error, _):
+            phase = "during-playback"
+            cause = error
+        }
+        let next: String
+        switch recovery {
+        case .browser: next = "browser"
+        case .freshStream: next = "fresh-stream"
+        }
+        // `recovery`: what the controller decides (`recovery(for:alreadyRecovered:)`); with no
+        // Polimi session it shows the page's message instead.
+        return "play: player failed phase=\(phase) recovery=\(next) reason=\(PlayFailureReason.playerFailure.rawValue) error=\(PlaybackDiagnostics.errorName(cause))"
+    }
+
+    /// `confirmed` (typed, or read from the session file), `profile` (taken from WeBeep in this
+    /// session) or `none`: the Play log's word for the address, which is never logged itself.
+    nonisolated static func emailDiagnosis(_ email: PolimiEmail?, fromProfile: Bool) -> String {
+        guard email != nil else { return "none" }
+        return fromProfile ? "profile" : "confirmed"
+    }
+
     private func playNatively(_ recording: RecmanRecording, request: Int, browser: RecmanBrowsing, generation: Int) async throws {
+        // No address yet: the WeBeep profile's is taken now (at most once per epoch), so the
+        // very first Play works without the Settings row ever having appeared.
+        if confirmedEmail == nil {
+            await learnEmail()
+            guard generation == self.generation else { return }
+        }
+        // Where the address came from, never the address: with none, a Play that needs a Webex
+        // sign-in can only show the message.
+        let emailState = Self.emailDiagnosis(confirmedEmail, fromProfile: emailFromProfile)
+        PlaybackDiagnostics.log.notice("play: start email=\(emailState, privacy: .public)")
         let stream: RecordingStream
         do {
             stream = try await browser.stream(for: recording, email: confirmedEmail)
         } catch {
             guard generation == self.generation else { return }
-            guard Self.streamFailureOutcome(error) == .browser else { throw error }
+            let (cause, found) = Self.streamFailureCause(error)
+            let diagnosis = Self.playDiagnosis(cause)
+            PlaybackDiagnostics.log.notice("\(diagnosis, privacy: .public)")
+            guard Self.streamFailureOutcome(cause) == .browser else { throw cause }
             log.notice("Native playback not available: opening the browser")
-            let url = try await playerLink(for: recording, browser: browser)
+            let url = try await playerLink(for: recording, browser: browser, found: found)
             guard generation == self.generation else { return }
             playbackURLs[recording.id] = url
             if request == openingRequest { finishOpening(recording, url: url, action: .play) }
@@ -978,6 +1144,7 @@ struct RecordingsListing: Equatable {
         // A newer click replaced this one while the stream was being found: it wins.
         guard request == openingRequest else { return }
         recoveredLectures.remove(recording.id)
+        PlaybackDiagnostics.log.notice("play: stream found, handing it to the player")
         startPlayer(stream, for: recording, startAt: RecordingPlaybackProgress.startAt(stored: storedPosition(for: recording)))
         markOpened(recording)
     }
@@ -1093,6 +1260,24 @@ struct RecordingsListing: Equatable {
         guard let data = defaults.data(forKey: resumePointsKey) else { return }
         if let stored = try? PropertyListDecoder().decode(RecordingResumePoints.self, from: data), stored.owner == owner { return }
         defaults.removeObject(forKey: resumePointsKey)
+    }
+
+    /// Removes the "email removed" marker (`emailDeclinedKey`) unless it is `owner`'s, without a
+    /// controller: an account change in a launch that never created Recordings.
+    nonisolated static func forgetEmailOptOut(in defaults: UserDefaults, notOwnedBy owner: Int) {
+        guard defaults.object(forKey: emailDeclinedKey) != nil, defaults.integer(forKey: emailDeclinedKey) != owner else { return }
+        defaults.removeObject(forKey: emailDeclinedKey)
+    }
+
+    /// The marker goes with the identity: turn-off, disconnect and account change.
+    private func forgetEmailOptOut() {
+        if defaults.object(forKey: Self.emailDeclinedKey) != nil { defaults.removeObject(forKey: Self.emailDeclinedKey) }
+    }
+
+    /// Whether the student of `owner` removed the address in Settings (in any launch).
+    private func emailDeclined(by owner: Int?) -> Bool {
+        guard let owner, defaults.object(forKey: Self.emailDeclinedKey) != nil else { return false }
+        return defaults.integer(forKey: Self.emailDeclinedKey) == owner
     }
 
     /// Positions go with the session: turn-off, disconnect and account change.
@@ -1408,6 +1593,10 @@ struct RecordingsListing: Equatable {
         // that can't be recovered now (no Polimi session) or a recovery that never starts must
         // not use it up.
         let recovery = Self.recovery(for: failure, alreadyRecovered: recoveredLectures.contains(id))
+        // A stream that was found but never played ends in the browser from here: without this
+        // line it looked exactly like a stream that was never found (#148, package F diagnostics).
+        let diagnosis = Self.playerFailureDiagnosis(failure, recovery: recovery)
+        PlaybackDiagnostics.log.notice("\(diagnosis, privacy: .public)")
         guard access == .ready else {
             // No Polimi session to look anything up with: the student has to sign in again.
             if case .beforeReady = failure { openingProblem = .playbackUnavailable }
@@ -1419,9 +1608,15 @@ struct RecordingsListing: Equatable {
     }
 
     private func recoverPlayback(_ recording: RecmanRecording, _ recovery: Recovery, browser: RecmanBrowsing, generation: Int) async throws {
+        // The player link a failed fresh-stream lookup already found, for the browser below.
+        var found: URL?
         if case .freshStream(let position) = recovery {
             guard stillShowing(recording) else { return }
             recoveredLectures.insert(recording.id)
+            if confirmedEmail == nil {
+                await learnEmail()
+                guard generation == self.generation else { return }
+            }
             do {
                 let stream = try await browser.stream(for: recording, email: confirmedEmail)
                 guard generation == self.generation, stillShowing(recording) else { return }
@@ -1429,11 +1624,15 @@ struct RecordingsListing: Equatable {
                 return
             } catch {
                 guard generation == self.generation else { return }
-                if error is CancellationError || (error as? RecmanBrowserError) == .needsSignIn { throw error }
-                if (error as? RecmanBrowserError) == .needsEmail {
+                let (cause, player) = Self.streamFailureCause(error)
+                found = player
+                let diagnosis = "play: recovery stream failed reason=\(Self.playFailureReason(cause).rawValue) error=\(PlaybackDiagnostics.errorName(cause))"
+                PlaybackDiagnostics.log.notice("\(diagnosis, privacy: .public)")
+                if cause is CancellationError || (cause as? RecmanBrowserError) == .needsSignIn { throw cause }
+                if (cause as? RecmanBrowserError) == .needsEmail {
                     // Same decision as for Play: no Webex page for the student, only the sentence.
                     // The window stays, paused at the place it stopped.
-                    openingProblem = RecordingsProblem(error)
+                    openingProblem = RecordingsProblem(cause)
                     log.notice("Fresh stream needs a confirmed email")
                     return
                 }
@@ -1441,7 +1640,7 @@ struct RecordingsListing: Equatable {
             }
         }
         do {
-            let url = try await playerLink(for: recording, browser: browser)
+            let url = try await playerLink(for: recording, browser: browser, found: found)
             guard generation == self.generation else { return }
             playbackURLs[recording.id] = url
             // The window of a lecture that can't continue is no use next to the browser. Closing
@@ -1618,37 +1817,81 @@ struct RecordingsListing: Equatable {
         case invalid
     }
 
-    /// Called when the Settings field appears: learns the confirmed address from the saved
-    /// session, and, when there is none, offers the WeBeep profile's. Reads the session file once
-    /// (off the main actor) and asks WeBeep only when it is needed; a profile that can't be read,
-    /// a function the token isn't allowed to call and an address that isn't Polimi's all mean an
-    /// empty field for the student to fill in, never an error. Nothing is stored here: only
-    /// `confirmEmail` saves.
+    /// Whether the Settings field can take an address now: the feature is on and a WeBeep account
+    /// is known to own it (see `confirmEmail`). The field is disabled and says why otherwise.
+    var canConfirmEmail: Bool { isEnabled && (sessionOwner ?? ownerUserID()) != nil }
+
+    /// Called when the Settings field appears: the same lookup as a Play's (`learnEmail`).
     func prepareEmailField() async {
+        await learnEmail()
+    }
+
+    /// Learns the address to sign in to Webex with, when none is known: first the saved
+    /// session's, then (product decision 2026-10-11) the WeBeep profile's, taken as confirmed
+    /// with no confirmation step, so the first Play works without opening Settings.
+    ///
+    /// - Lazy and bounded: called by the Settings field and by Play when no address is known,
+    ///   never at rest; WeBeep is asked at most once per epoch (`suggestionAttempted`), and
+    ///   concurrent callers share one lookup (`emailLookup`).
+    /// - The student wins: nothing is taken after they edited or removed the address in this
+    ///   launch (`emailEditedByUser`), or removed it for this account in any launch
+    ///   (`emailDeclinedKey`).
+    /// - Identity: an answer that arrives after a turn-off, logout or account change (a new
+    ///   `emailEpoch`) is dropped; `fetchProfileEmail` itself checks the account is unchanged.
+    /// - Failure is silent: a profile that can't be read, a function the token isn't allowed to
+    ///   call or an address that isn't Polimi's leave no address (Play then shows its message),
+    ///   never an error. The address is never logged.
+    /// - Stored like a typed one: into the session file now when there is one
+    ///   (`storeEmail`), and by the next save (`saveSession`, fingerprint included) otherwise.
+    func learnEmail() async {
+        // Before the cache: a lookup refused while the feature is off must not stand for the
+        // epoch once it is turned on.
         guard isEnabled else { return }
+        if let emailLookup, emailLookup.epoch == emailEpoch {
+            await emailLookup.task.value
+            return
+        }
         let epoch = emailEpoch
+        let task: Task<Void, Never> = Task { [weak self] in
+            guard let self else { return }
+            await self.performEmailLookup(epoch: epoch)
+        }
+        emailLookup = (epoch, task)
+        await task.value
+    }
+
+    private func performEmailLookup(epoch: Int) async {
+        guard isEnabled, epoch == emailEpoch else { return }
         if !emailLoaded {
             _ = await savedCookies()
             // No browser means no opening cycle to share the read with: don't keep it around.
             if browser == nil { sessionLoad = nil }
             guard epoch == emailEpoch, isEnabled else { return }
         }
-        guard confirmedEmail == nil, suggestedEmail == nil, !emailEditedByUser, !suggestionAttempted else { return }
+        guard confirmedEmail == nil, !emailEditedByUser, !suggestionAttempted,
+              !emailDeclined(by: sessionOwner ?? ownerUserID()) else { return }
         suggestionAttempted = true
+        emailAccount = sessionOwner ?? ownerUserID()
         let raw = await fetchProfileEmail()
         // A reset (turn-off, account change) already cleared the flag for its own cycle.
         guard epoch == emailEpoch else { return }
         guard isEnabled, confirmedEmail == nil, !emailEditedByUser, let raw, let email = PolimiEmail(raw) else { return }
-        suggestedEmail = email
+        confirmedEmail = email
+        emailFromProfile = true
+        storeEmail(email)
     }
 
     /// The student confirms, changes or removes the address. Only a Polimi address is accepted
     /// (`PolimiEmail`); an empty field removes it. It is written into the saved session at once,
     /// keeping its cookies; with no saved session yet it stays in memory and the next successful
     /// sign-in writes it. It is never logged.
+    ///
+    /// Refused while no WeBeep account is known (an expired token at launch, before a new
+    /// sign-in): an address must belong to an account (`emailAccount`), and one typed then could
+    /// only be handed to whichever account signs in next (PR #152 review).
     @discardableResult
     func confirmEmail(_ text: String) -> EmailEntry {
-        guard isEnabled else { return .unchanged }
+        guard canConfirmEmail else { return .unchanged }
         switch Self.emailFieldState(draft: text, confirmed: confirmedEmail) {
         case .invalid: return .invalid
         case .empty, .confirmed: return .unchanged
@@ -1663,8 +1906,23 @@ struct RecordingsListing: Equatable {
 
     private func setConfirmedEmail(_ email: PolimiEmail?) {
         confirmedEmail = email
-        suggestedEmail = nil
+        emailFromProfile = false
         emailEditedByUser = true
+        let owner = sessionOwner ?? ownerUserID()
+        emailAccount = owner
+        // A removal is remembered for the account, so the profile's address doesn't come back
+        // at the next launch (the empty file alone can't say it was removed on purpose).
+        if email == nil, let owner {
+            defaults.set(owner, forKey: Self.emailDeclinedKey)
+        } else if email != nil {
+            forgetEmailOptOut()
+        }
+        storeEmail(email)
+    }
+
+    /// Writes the address into the existing session file at once, keeping its cookies; with no
+    /// file yet the next sign-in's save writes it.
+    private func storeEmail(_ email: PolimiEmail?) {
         guard let owner = sessionOwner ?? ownerUserID() else { return }
         let update = vault.updateEmail(email?.value, ownerUserID: owner, epoch: vault.epoch, now: now())
         Task { [log] in
@@ -1679,10 +1937,12 @@ struct RecordingsListing: Equatable {
     private func resetEmail() {
         emailEpoch += 1
         confirmedEmail = nil
-        suggestedEmail = nil
+        emailFromProfile = false
         emailLoaded = false
         emailEditedByUser = false
         suggestionAttempted = false
+        emailLookup = nil
+        emailAccount = nil
     }
 
     // MARK: Browser and session file
@@ -1749,10 +2009,11 @@ struct RecordingsListing: Equatable {
         if let current = ownerUserID(), current != snapshot.ownerUserID {
             log.notice("Saved Polimi session belongs to another WeBeep account: dropped")
             closePlayerForIdentityChange()
-            listings = [:]
-            playbackURLs = [:]
+            listings.removeAll()
+            playbackURLs.removeAll()
             forgetSeen()
             forgetResumePoints()
+            forgetEmailOptOut()
             discardSessionFile()
             return []
         }
@@ -1760,7 +2021,15 @@ struct RecordingsListing: Equatable {
         legacyOwner = snapshot.ownerUserID
         // What the file says, unless the student has already changed it in this launch. An
         // address that isn't a Polimi one (a damaged or foreign file) is simply not an address.
-        if !emailEditedByUser { confirmedEmail = snapshot.email.flatMap(PolimiEmail.init) }
+        // A profile address taken in this launch also stays when a later read finds a file
+        // without one: it is not written yet (no session file then, or a write still queued),
+        // and the next save writes it.
+        let fileEmail = snapshot.email.flatMap(PolimiEmail.init)
+        if !emailEditedByUser, !(emailFromProfile && fileEmail == nil) {
+            if fileEmail != confirmedEmail { emailFromProfile = false }
+            confirmedEmail = fileEmail
+        }
+        emailAccount = snapshot.ownerUserID
         emailLoaded = true
         return snapshot.cookies
     }

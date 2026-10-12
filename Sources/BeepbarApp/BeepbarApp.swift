@@ -319,6 +319,8 @@ final class StatusItemController: NSObject, NSMenuDelegate {
             // Dropping the hierarchy doesn't reliably report the Recordings page as gone, and its
             // browser must not outlive the window (quiet at rest).
             self.authentication?.recordingsIfCreated?.windowClosed()
+            // A course list load waiting for a sync to end is not wanted without a window (#98).
+            self.authentication?.windowClosed()
         }
     }
 

@@ -4,14 +4,16 @@
 
 ### New
 
-- Watch lecture recordings right inside BeepBar instead of in the browser, with the usual video controls, speeds from 0.5x to 3x, 10 and 30 second skips and keyboard shortcuts. A lecture picks up where you stopped, and if the connection drops it resumes on its own. If a recording can't be played inside BeepBar, it still opens in your browser.
-- In Settings › Recordings, confirm your Polimi email so BeepBar can sign in to Webex for you. It is filled in from your WeBeep profile when available, you can change or remove it, and it stays on your Mac.
-- **After updating:** the first time you press Play, BeepBar may sign in to Webex on its own; without a confirmed email, recordings that need that sign-in don't open. Turning Recordings off or disconnecting also deletes the Webex sign-in, the email and where you stopped.
+- Watch lecture recordings right inside BeepBar instead of in the browser, with the usual video controls, speeds from 0.5x to 3x, 10 and 30 second skips and keyboard shortcuts. A lecture picks up where you stopped, and if the connection drops it resumes on its own. If a recording can't be played inside BeepBar, it still opens in your browser, and "Open in browser" in a recording's menu always opens it there.
+- To sign in to Webex for you, BeepBar uses the Polimi email from your WeBeep profile, with nothing to confirm. You can see, change or remove it in Settings › Recordings, and it stays on your Mac.
 - Save lessons from different courses in a single Watchlist inside Recordings. Add or remove bookmarks and find your saved list again after restarting.
 - Telemetry is enabled by default to count active installations and app versions with one daily ping. Turn it off in Settings; the info button explains what is sent. No account, course or file information is included.
 
+**After updating:** the first time you press Play or open Settings › Recordings, BeepBar may read your email from WeBeep and sign in to Webex on its own; if no Polimi email is available, recordings that need that sign-in don't open until you enter one in Settings. Turning Recordings off or disconnecting also deletes the Webex sign-in, the email and where you stopped.
+
 ### Improved
 
+- Opening BeepBar shows your courses straight away, as they were at the last successful refresh, while the current list loads in the background; offline, the saved list stays visible and says it is not yet confirmed. Every sync still asks your university for the current list first. The very first opening after updating still waits for the list once.
 - Cancelling sync stops large local file checks promptly while file changes already underway still finish safely.
 
 - Refreshing unchanged courses avoids unnecessary interface updates while renamed courses and changed selections still appear normally.

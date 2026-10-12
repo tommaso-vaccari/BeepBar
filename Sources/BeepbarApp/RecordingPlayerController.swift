@@ -495,12 +495,16 @@ enum RecordingPlayerError: Error {
             removeProgressObserver()
             let position = reportedPosition(of: player)
             checkpointIfMeaningful(.failed)
-            Self.log.error("Recording playback stopped while playing")
+            // Domain and code only (`PlaybackDiagnostics.errorName`): the error's user info can
+            // carry the stream address and its token.
+            let name = PlaybackDiagnostics.errorName(error)
+            Self.log.error("Recording playback stopped while playing error=\(name, privacy: .public)")
             onFailure?(id, .duringPlayback(error, position: position))
         } else {
             // Nothing ever played: an empty player window is no use, so close it before the
             // caller opens the browser.
-            Self.log.error("Recording playback failed before starting")
+            let name = PlaybackDiagnostics.errorName(error)
+            Self.log.error("Recording playback failed before starting error=\(name, privacy: .public)")
             close()
             onFailure?(id, .beforeReady(error))
         }

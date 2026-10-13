@@ -384,8 +384,8 @@ struct MenuBarSnapshot: Sendable {
     // accountState, hasStoredCredential, recoveryBlocked, conflicts, rootURL, activeOperationID,
     // dataSaverPause), and
     // `setLanguage(_:)` calls it since every label depends on `AppLanguage.current`. The
-    // recordings lines (`recordingMenuLines`) are fed by courses, enabledCourseIDs and
-    // watchSummaries, whose `didSet` calls `recordingMenuInputsChanged()`, which rebuilds the
+    // recordings lines (`recordingMenuLines`) are fed by courses, enabledCourseIDs,
+    // courseFolders and watchSummaries, whose `didSet` calls `recordingMenuInputsChanged()`, which rebuilds the
     // lines and then calls `refreshMenuBarSnapshot()`. If you make
     // those computed properties depend on anything else, add a matching
     // `didSet { refreshMenuBarSnapshot() }` to that property too, or the menu bar will silently
@@ -522,7 +522,9 @@ struct MenuBarSnapshot: Sendable {
             if recoveryBlocked != oldValue { configureBackgroundScheduler() }
         }
     }
-    @Published private(set) var courseFolders: [Int64: String] = [:]
+    @Published private(set) var courseFolders: [Int64: String] = [:] {
+        didSet { if courseFolders != oldValue { recordingMenuInputsChanged() } }
+    }
     @Published private(set) var courseRenameErrors: [Int64: String] = [:]
     @Published private(set) var renamingCourseID: Int64?
     let progressStore = SyncProgressStore()
@@ -1313,12 +1315,12 @@ struct MenuBarSnapshot: Sendable {
     /// purpose (a glance), and the window has them all.
     nonisolated static let maxRecordingMenuLines = 10
 
-    /// Rebuilds `recordingMenuLines` from its three inputs and refreshes the snapshot when they
+    /// Rebuilds `recordingMenuLines` from its inputs and refreshes the snapshot when they
     /// changed. Called from the `didSet` of `courses`, `enabledCourseIDs` and `watchSummaries`
     /// (see the invariant comment on `menuBarSnapshot`). Costs nothing when no summary is known
     /// (every launch without Recordings), since the pure builder returns before any course.
     private func recordingMenuInputsChanged() {
-        let lines = Self.recordingMenuLines(courses: courses, enabledIDs: enabledCourseIDs, summaries: watchSummaries)
+        let lines = Self.recordingMenuLines(courses: courses, enabledIDs: enabledCourseIDs, summaries: watchSummaries, folders: courseFolders)
         guard lines != recordingMenuLines else { return }
         recordingMenuLines = lines
         refreshMenuBarSnapshot()
@@ -1334,14 +1336,14 @@ struct MenuBarSnapshot: Sendable {
     ///   (`RecordingsPresentation.syncedCourses`) still lists both rows, so either can be opened;
     ///   the menu is a glance, where the same numbers twice would read as two courses. The
     ///   difference between page and menu is intentional.
-    nonisolated static func recordingMenuLines(courses: [RemoteCourseSummary], enabledIDs: Set<Int64>, summaries: [RecmanCourseKey: CourseWatchSummary]) -> [BilingualText] {
+    nonisolated static func recordingMenuLines(courses: [RemoteCourseSummary], enabledIDs: Set<Int64>, summaries: [RecmanCourseKey: CourseWatchSummary], folders: [Int64: String] = [:]) -> [BilingualText] {
         guard !summaries.isEmpty, !enabledIDs.isEmpty else { return [] }
         var lines: [BilingualText] = []
         var shown: Set<RecmanCourseKey> = []
         for course in courses where enabledIDs.contains(course.id) {
             guard let key = RecmanCourseKey(course: course), let summary = summaries[key], summary.total > 0,
                   shown.insert(key).inserted else { continue }
-            lines.append(RecordingWatchProgress.menuLine(courseName: RecordingsPresentation.courseName(course), summary))
+            lines.append(RecordingWatchProgress.menuLine(courseName: RecmanCourseSidebar.menuName(courseName: RecordingsPresentation.courseName(course), courseDisplayName: course.displayName, courseID: course.id, localFolderName: folders[course.id]), summary))
             if lines.count == maxRecordingMenuLines { break }
         }
         return lines

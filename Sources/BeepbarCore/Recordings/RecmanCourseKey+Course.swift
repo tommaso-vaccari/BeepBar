@@ -129,15 +129,33 @@ public struct RecmanCourseSidebar: Equatable, Sendable {
     /// as the teacher ("A (B) (C)" keeps "(C)"); a folder that already ends with that group is
     /// not given it twice. Pure and total: odd input yields the cleaned name or the folder.
     public static func sidebarName(courseName: String, courseDisplayName: String, courseID: Int64, localFolderName: String?) -> String {
-        guard let folder = localFolderName?.trimmingCharacters(in: .whitespacesAndNewlines), !folder.isEmpty else { return courseName }
+        guard let folder = renamedFolder(courseDisplayName: courseDisplayName, courseID: courseID, localFolderName: localFolderName) else { return courseName }
+        let key = PathKey.of(folder)
+        guard let teacher = teacherGroup(of: courseName) else { return folder }
+        if key.hasSuffix(PathKey.of(teacher)) { return folder }
+        return "\(folder) \(teacher)"
+    }
+
+    /// The name the status-bar menu shows for a course: the renamed folder alone, no teacher (a
+    /// menu line is a glance and must stay short), else the cleaned name without its trailing
+    /// teacher group. Same "renamed" rule as `sidebarName`. A name that is only a group, or has
+    /// none, is returned as it is.
+    public static func menuName(courseName: String, courseDisplayName: String, courseID: Int64, localFolderName: String?) -> String {
+        if let folder = renamedFolder(courseDisplayName: courseDisplayName, courseID: courseID, localFolderName: localFolderName) { return folder }
+        guard teacherGroup(of: courseName) != nil, let trailingGroup else { return courseName }
+        let stripped = trailingGroup.stringByReplacingMatches(in: courseName, range: NSRange(courseName.startIndex..., in: courseName), withTemplate: "")
+        return stripped.trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    /// The trimmed folder when the student chose it; nil when it is missing, blank or one BeepBar
+    /// generated (slug forms of `defaultFolders`, compared by `PathKey`).
+    private static func renamedFolder(courseDisplayName: String, courseID: Int64, localFolderName: String?) -> String? {
+        guard let folder = localFolderName?.trimmingCharacters(in: .whitespacesAndNewlines), !folder.isEmpty else { return nil }
         let key = PathKey.of(folder)
         let plain = LocalPathPolicy.defaultCourseFolder(courseDisplayName)
         let whole = LocalPathPolicy.courseFolderSlug(courseDisplayName)
         let generated = [plain, whole, LocalPathPolicy.courseFolder(plain, disambiguatedBy: courseID), LocalPathPolicy.courseFolder(whole, disambiguatedBy: courseID)]
-        if generated.contains(where: { PathKey.of($0) == key }) { return courseName }
-        guard let teacher = teacherGroup(of: courseName) else { return folder }
-        if key.hasSuffix(PathKey.of(teacher)) { return folder }
-        return "\(folder) \(teacher)"
+        return generated.contains(where: { PathKey.of($0) == key }) ? nil : folder
     }
 
     /// The teacher group of a cleaned name, nil when there is none or the name is only that group.

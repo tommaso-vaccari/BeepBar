@@ -139,7 +139,9 @@ struct RecordingsMenuBarTests {
         #expect(lines(controller) == ["ANALISI 2 — 12/30 · ~14 h"])
 
         controller.setCoursesForTesting([course(11, "058167 - ANALISI MATEMATICA 2 [2026-27]")])
-        #expect(lines(controller) == ["ANALISI MATEMATICA 2 — 12/30 · ~14 h"], "renamed on WeBeep")
+        // The folder BeepBar generated for the old name is still saved (this seam doesn't run the
+        // restore that regenerates it), so it now reads as the student's choice and names the line.
+        #expect(lines(controller) == ["058167-analisi-2-2026-27 — 12/30 · ~14 h"], "renamed on WeBeep")
         controller.setCoursesForTesting([])
         #expect(lines(controller).isEmpty, "no longer in the list")
         #expect(controller.enabledCourseIDs == [11])
@@ -465,5 +467,25 @@ struct RecordingsMenuBarTests {
         #expect(defaults.data(forKey: RecordingsController.watchSummaryKey) == nil)
         #expect(lines(controller).isEmpty)
         await recordings.settleSessionFile()
+    }
+
+    /// Renaming a course's local folder redraws its menu line with the folder name alone, and
+    /// the line keeps its numbers. Guards against a menu that keeps the WeBeep name until
+    /// something else changes, because `courseFolders` was not an input of the lines.
+    /// Mutation: drop `recordingMenuInputsChanged()` from `courseFolders.didSet`.
+    @Test func renamingAFolderRedrawsTheLine() async throws {
+        defer { try? FileManager.default.removeItem(at: root) }
+        let defaults = WeBeepAuthenticationController.throwawayDefaults()
+        try storeSummaries([analisi: analisiSummary], owner: 7, in: defaults)
+        let controller = try await signedIn(defaults: defaults)
+        select([11], on: controller)
+        #expect(lines(controller) == ["ANALISI 2 — 12/30 · ~14 h"])
+        let analisiCourse = try #require(controller.courses.first { $0.id == 11 })
+        controller.renameFolder(for: analisiCourse, to: "AN2")
+        for _ in 0..<400 where controller.renamingCourseID != nil || controller.courseFolders[11] == nil {
+            try await Task.sleep(for: .milliseconds(5))
+        }
+        #expect(controller.courseFolders[11] == "AN2")
+        #expect(lines(controller) == ["AN2 — 12/30 · ~14 h"])
     }
 }

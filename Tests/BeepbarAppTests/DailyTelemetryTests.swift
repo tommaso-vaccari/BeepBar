@@ -579,7 +579,7 @@ struct DailyTelemetryTests {
     }
 
     @MainActor private final class Harness {
-        let suite = "BeepbarTests.Telemetry.\(UUID().uuidString)"
+        let suite = WeBeepAuthenticationController.throwawayDefaultsSuite()
         let defaults: UserDefaults
         var callbacks: [@Sendable (@escaping NSBackgroundActivityScheduler.CompletionHandler) -> Void] = []
         var intervals: [TimeInterval] = []
@@ -598,6 +598,9 @@ struct DailyTelemetryTests {
                 callbacks[index]({ _ in continuation.resume() })
             }
         }
-        func remove() { defaults.removePersistentDomain(forName: suite) }
+        func remove() {
+            defaults.removePersistentDomain(forName: suite)
+            try? FileManager.default.removeItem(at: URL(fileURLWithPath: suite).deletingLastPathComponent())
+        }
     }
 }

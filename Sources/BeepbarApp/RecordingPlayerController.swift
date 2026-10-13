@@ -615,6 +615,9 @@ enum RecordingPlayerError: Error {
         // enough data before starting or resuming, which suits network streams and works with the
         // bounded forward buffer.
         let player = makePlayer()
+        // macOS defaults this to false. Let AVFoundation prevent display and device idle sleep
+        // during video playback and release its protection when playback stops (#157).
+        player.preventsDisplaySleepDuringVideoPlayback = true
         view.frame = NSRect(x: 0, y: 0, width: 960, height: 540)
         view.setValue(player, forKey: "player")
         let window = RecordingPlayerWindow(contentRect: view.frame, styleMask: [.titled, .closable, .miniaturizable, .resizable], backing: .buffered, defer: true)

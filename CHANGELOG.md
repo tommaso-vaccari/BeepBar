@@ -24,6 +24,8 @@
 
 ### Fixed
 
+- Watching a lecture in BeepBar keeps the display and Mac awake during video playback.
+
 - Renaming a course folder works after restoring or copying your files to another Mac, without extra prompts and while keeping your files tracked.
 
 - Old lecture recordings stay marked as seen even after browsing more than 5,000 recordings across courses. After updating, recordings forgotten by earlier versions may still need “Mark as seen”.

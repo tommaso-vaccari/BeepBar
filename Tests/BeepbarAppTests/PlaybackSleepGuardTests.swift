@@ -216,11 +216,15 @@ struct PlayerKeepAwakeTests {
     /// call at the end of `play`.
     @Test func replacementOfAPlayingLectureKeepsItHeld() async throws {
         let fake = FakeAssertions()
-        let (controller, _) = try await playing(fake)
-        controller.play(try await TestMedia.shared.url(), title: "Lezione 2", cookies: [])
-        try await Self.waitUntil { fake.held == 1 }
+        let (controller, player) = try await playing(fake)
+        // Pinned at playing, as a player that moves on across the replacement reports it.
+        player.report(.playing)
+        let media = try await TestMedia.shared.url()
+        controller.play(media, title: "Lezione 2", cookies: [])
+        #expect(fake.held == 1, "taken again inside play, with no status report needed")
         await Self.settle()
         #expect(fake.held == 1)
+        player.report(nil)
         controller.close()
         #expect(fake.held == 0)
     }

@@ -27,4 +27,4 @@
 - [[90 Operations/Lint 2026-10-10]] — verifica iniziale.
 - [Manifest e hash](source-manifest.json).
 
-- [[20 Sources/S-0007 BeepBar telemetria]] — aggiornamento dev d3a42dc; verifica pre-release aperta.
+- [[20 Sources/S-0007 BeepBar telemetria]] — aggiornamento dev 50177f3; verifica pre-release aperta.

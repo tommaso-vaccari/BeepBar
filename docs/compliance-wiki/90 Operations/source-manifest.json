@@ -71,5 +71,14 @@
     "sha256": "5fa18baa8a2d18f41d40bca2eb8a0f6043a8c62f401d5edc859338dac28ba0f3",
     "bytes": 11961,
     "raw": "S-0007-telemetry-d3a42dc.md"
+  },
+  {
+    "id": "S-0007",
+    "title": "BeepBar telemetry code",
+    "commit": "50177f3905d50d9fa4252fc952a2fa8bf275de0d",
+    "retrieved_date": "2026-10-13",
+    "sha256": "8f392f9d2a173c5e5f9b582e66639b160c9432b523fd7aca75a0700b54ec0963",
+    "bytes": 19651,
+    "raw": "S-0007-telemetry-50177f3.md"
   }
 ]

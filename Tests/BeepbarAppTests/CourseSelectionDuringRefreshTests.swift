@@ -8,6 +8,49 @@ import BeepbarCore
 struct CourseSelectionDuringRefreshTests {
     private let course = RemoteCourseSummary(id: 1, shortName: "1", displayName: "Course", isVisible: true, startDate: nil, endDate: nil)
 
+    @Test @MainActor func renamingARestoredCourseFolderNeedsNoPrompt() async throws {
+        let root = FileManager.default.temporaryDirectory.appending(path: UUID().uuidString)
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let database = try SyncDatabase(url: root.appending(path: "state.sqlite"))
+        let rootID = UUID()
+        try await database.registerRoot(id: rootID, canonicalPath: root.path)
+        let store = try FileStore(root: root)
+        let identity = try await store.ensureTopLevelDirectory("Course").identity
+        try await database.upsertScope(SyncScope(rootID: rootID, courseID: 1, displayName: "Course", localFolder: "Course", enabled: true, managedDirectory: DirectoryIdentity(device: identity.device + 1, inode: identity.inode + 1)))
+        try Data("local notes".utf8).write(to: root.appending(path: "Course/notes.txt"))
+        let controller = WeBeepAuthenticationController(testRootURL: root, database: database, rootID: rootID)
+        try await controller.restoreScopesForTesting([course])
+        controller.renameFolder(for: course, to: "Renamed")
+        for _ in 0..<200 where controller.renamingCourseID != nil {
+            try await Task.sleep(for: .milliseconds(5))
+        }
+        #expect(controller.renamingCourseID == nil)
+        #expect(controller.courseRenameErrors.isEmpty)
+        #expect(controller.courseFolders[1] == "Renamed")
+        #expect(try String(contentsOf: root.appending(path: "Renamed/notes.txt"), encoding: .utf8) == "local notes")
+        #expect(try await database.scope(rootID: rootID, courseID: 1)?.managedDirectory == identity)
+    }
+
+    @Test @MainActor func automaticLegacyFolderRenameKeepsTheRestoredIdentity() async throws {
+        let root = FileManager.default.temporaryDirectory.appending(path: UUID().uuidString)
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let database = try SyncDatabase(url: root.appending(path: "state.sqlite"))
+        let rootID = UUID()
+        try await database.registerRoot(id: rootID, canonicalPath: root.path)
+        let store = try FileStore(root: root)
+        let oldFolder = "Numerical Analysis"
+        let identity = try await store.ensureTopLevelDirectory(oldFolder).identity
+        let course = RemoteCourseSummary(id: 1, shortName: "1", displayName: oldFolder, isVisible: true, startDate: nil, endDate: nil)
+        try await database.upsertScope(SyncScope(rootID: rootID, courseID: 1, displayName: oldFolder, localFolder: oldFolder, enabled: true, managedDirectory: DirectoryIdentity(device: identity.device + 1, inode: identity.inode + 1)))
+        let controller = WeBeepAuthenticationController(testRootURL: root, database: database, rootID: rootID)
+        try await controller.restoreScopesForTesting([course])
+        #expect(controller.courseFolders[1] == "numerical-analysis")
+        #expect(try await database.scope(rootID: rootID, courseID: 1)?.managedDirectory == identity)
+        #expect(FileManager.default.fileExists(atPath: root.appending(path: "numerical-analysis").path))
+    }
+
     @Test @MainActor func unreadableScopesFailRefreshInsteadOfUsingGeneratedFolders() async throws {
         let root = FileManager.default.temporaryDirectory.appending(path: UUID().uuidString)
         try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)

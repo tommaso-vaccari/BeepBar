@@ -182,7 +182,7 @@ final class StatusItemController: NSObject, NSMenuDelegate {
         actionItem.target = target
         menu.addItem(actionItem)
 
-        addRecordingItems(from: snapshot, to: menu)
+        addRecordingItems(from: snapshot, to: menu, target: target)
 
         menu.addItem(.separator())
 
@@ -197,19 +197,61 @@ final class StatusItemController: NSObject, NSMenuDelegate {
 
     /// The recordings section: nothing when `snapshot.recordingLines` is empty, otherwise a
     /// separator, the "Registrazioni" section header (`NSMenuItem.sectionHeader`, macOS 14, the
-    /// deployment target) and one disabled line per course. No item has a target or action, so
-    /// this section adds no AppKit-to-main-actor path (issue #30): it reads the snapshot it is
-    /// given and nothing else.
-    nonisolated static func addRecordingItems(from snapshot: MenuBarSnapshot, to menu: NSMenu) {
+    /// deployment target) and one line per course. It reads the snapshot it is given and nothing
+    /// else.
+    /// - A line is clickable only when it has a target, which `recordingMenuLines` gives only with
+    ///   a known account (owner) and a known next lecture that passes `validatedNext`. It gets
+    ///   `target` (this `StatusItemController`, never `NSApp` or the account controller),
+    ///   `playRecording(_:)`, the `RecordingMenuTarget` as `representedObject`, and the
+    ///   "Riproduci: «…»" tooltip. Its only path to the main actor is that action's
+    ///   `Task { @MainActor in … }` hop (issue #30).
+    /// - A line without one (all done, no known or valid next, no account) stays grey:
+    ///   disabled, no target, no action.
+    /// Enabling relies on NSMenu's autoenabling (an item whose target answers its action is
+    /// enabled, one without an action is not). `validateMenuItem(_:)` is deliberately not
+    /// implemented: its protocol is `@MainActor`, a new AppKit-to-main-actor crossing.
+    nonisolated static func addRecordingItems(from snapshot: MenuBarSnapshot, to menu: NSMenu, target: StatusItemController?) {
         guard !snapshot.recordingLines.isEmpty else { return }
         menu.addItem(.separator())
         menu.addItem(.sectionHeader(title: snapshot.recordingsTitle))
         for line in snapshot.recordingLines {
             let item = NSMenuItem()
-            item.title = line
-            item.isEnabled = false
+            item.title = line.title
+            if let payload = line.target {
+                item.target = target
+                item.action = #selector(playRecording(_:))
+                item.representedObject = payload
+                item.toolTip = line.toolTip
+            } else {
+                item.isEnabled = false
+            }
             menu.addItem(item)
         }
+    }
+
+    /// A click on a recordings line. `nonisolated` on purpose and kept minimal (a log line and the
+    /// dispatch): it reads only the clicked item's `representedObject` (a plain `Sendable`
+    /// value), no main-actor state, not even `menuBarSnapshot`, and hands it to
+    /// `dispatchRecordingClick`, which hops. Never
+    /// mark it `@MainActor` or point the item at a `@MainActor` method: AppKit's Objective-C call
+    /// would then make the Swift runtime verify the executor, the check that crashed with SIGBUS
+    /// after wake (issues #30, #31). `RecordingsMenuBarTests` calls it from a nonisolated
+    /// context, so marking it `@MainActor` no longer compiles.
+    @objc nonisolated func playRecording(_ sender: NSMenuItem) {
+        BeepbarLog.lifecycle.notice("Menu recording line selected")
+        Self.dispatchRecordingClick(sender.representedObject, to: authentication)
+    }
+
+    /// Hands a recordings click to the main actor: anything but a `RecordingMenuTarget` (or
+    /// nothing) is ignored; the target is played by `playNextRecording` inside the
+    /// `Task { @MainActor in … }` hop, the issue #30 fix, like the other actions. Reads no
+    /// main-actor state. To change what a click does, change what runs inside the hop, never
+    /// the hop itself (no `DispatchQueue.main.async`, `MainActor.assumeIsolated`,
+    /// `RunLoop.main.perform`). Static so tests can prove the hop by behaviour without a status
+    /// item.
+    nonisolated static func dispatchRecordingClick(_ payload: Any?, to authentication: WeBeepAuthenticationController) {
+        guard let target = payload as? RecordingMenuTarget else { return }
+        Task { @MainActor in authentication.playNextRecording(target) }
     }
 
     @objc private func performAction() {

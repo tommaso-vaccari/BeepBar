@@ -93,7 +93,8 @@ struct RecordingsSidebarNamesTests {
         #expect(name("analisi-2", cleaned: cleaned, raw: edited) == cleaned)
         #expect(name("analisi-2-11-3", cleaned: cleaned, raw: edited) == cleaned, "counter-suffixed default")
         #expect(name("fisica-è-più-bella", cleaned: cleaned, raw: edited) == cleaned, "accented lowercase slug")
-        #expect(name("Analisi 2 (11)", cleaned: cleaned, raw: edited) == cleaned, "legacy NAME (id)")
+        #expect(name("Analisi 2 (11)", cleaned: cleaned, raw: edited, id: 11) == cleaned, "legacy NAME (id) with the course's own id")
+        #expect(name("analisi-2--11", cleaned: cleaned, raw: edited, id: 11) == cleaned, "a run of hyphens left by truncation")
         #expect(RecmanCourseSidebar.menuName(courseName: cleaned, courseDisplayName: edited, courseID: 11, localFolderName: "058167-analisi-2-2026-27") == "ANALISI 2")
     }
 
@@ -104,6 +105,10 @@ struct RecordingsSidebarNamesTests {
         #expect(name("Gal") == "Gal (Claude Sonnet)")
         #expect(name("Geometria 2") == "Geometria 2 (Claude Sonnet)")
         #expect(name("gal") == Self.cleaned)
+        // The legacy "NAME (id)" form is the course's OWN id only: other numbers are real renames.
+        #expect(name("GAL (2026)") == "GAL (2026) (Claude Sonnet)")
+        #expect(name("Fisica (2)") == "Fisica (2) (Claude Sonnet)")
+        #expect(name("Geometria (7)") == Self.cleaned, "id 7 is this course's own")
     }
 
     /// The trailing part in parentheses is not always a teacher (a section here): it is kept

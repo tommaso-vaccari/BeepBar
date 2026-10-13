@@ -199,11 +199,14 @@ final class StatusItemController: NSObject, NSMenuDelegate {
     /// separator, the "Registrazioni" section header (`NSMenuItem.sectionHeader`, macOS 14, the
     /// deployment target) and one line per course. It reads the snapshot it is given and nothing
     /// else.
-    /// - A line with a target (its course has a next lecture) is clickable: `target` (this
-    ///   `StatusItemController`, never `NSApp` or the account controller), `playRecording(_:)`,
-    ///   the `RecordingMenuTarget` as `representedObject`, and the "Riproduci: «…»" tooltip. Its
-    ///   only path to the main actor is that action's `Task { @MainActor in … }` hop (issue #30).
-    /// - A line without one stays grey: disabled, no target, no action.
+    /// - A line is clickable only when it has a target, which `recordingMenuLines` gives only with
+    ///   a known account (owner) and a known next lecture that passes `validatedNext`. It gets
+    ///   `target` (this `StatusItemController`, never `NSApp` or the account controller),
+    ///   `playRecording(_:)`, the `RecordingMenuTarget` as `representedObject`, and the
+    ///   "Riproduci: «…»" tooltip. Its only path to the main actor is that action's
+    ///   `Task { @MainActor in … }` hop (issue #30).
+    /// - A line without one (all done, no known or valid next, no account) stays grey:
+    ///   disabled, no target, no action.
     /// Enabling relies on NSMenu's autoenabling (an item whose target answers its action is
     /// enabled, one without an action is not). `validateMenuItem(_:)` is deliberately not
     /// implemented: its protocol is `@MainActor`, a new AppKit-to-main-actor crossing.
@@ -226,9 +229,10 @@ final class StatusItemController: NSObject, NSMenuDelegate {
         }
     }
 
-    /// A click on a recordings line. `nonisolated` on purpose and kept to one call: it reads only
-    /// the clicked item's `representedObject` (a plain `Sendable` value), no main-actor state,
-    /// not even `menuBarSnapshot`, and hands it to `dispatchRecordingClick`, which hops. Never
+    /// A click on a recordings line. `nonisolated` on purpose and kept minimal (a log line and the
+    /// dispatch): it reads only the clicked item's `representedObject` (a plain `Sendable`
+    /// value), no main-actor state, not even `menuBarSnapshot`, and hands it to
+    /// `dispatchRecordingClick`, which hops. Never
     /// mark it `@MainActor` or point the item at a `@MainActor` method: AppKit's Objective-C call
     /// would then make the Swift runtime verify the executor, the check that crashed with SIGBUS
     /// after wake (issues #30, #31). `RecordingsMenuBarTests` calls it from a nonisolated

@@ -656,6 +656,11 @@ struct RecordingMenuEntry: Equatable {
     /// the holder rebuilds once at the end.
     private var menuRebuildHolds = 0
     private var menuRebuildPending = false
+#if DEBUG
+    /// How many times the lines were actually recomputed (not held back): lets a test prove the
+    /// rebuild is coalesced during `restoreScopes`.
+    private(set) var menuRebuildCountForTesting = 0
+#endif
     private var database: SyncDatabase?
     /// Created on first use (the window, a sign-out), so a launch with the window closed doesn't
     /// read anything for a feature that may be off.
@@ -1401,6 +1406,9 @@ struct RecordingMenuEntry: Equatable {
     /// returns before any course.
     private func recordingMenuInputsChanged() {
         if menuRebuildHolds > 0 { menuRebuildPending = true; return }
+#if DEBUG
+        menuRebuildCountForTesting += 1
+#endif
         let lines = Self.recordingMenuLines(courses: courses, enabledIDs: enabledCourseIDs, summaries: watchSummaries, owner: recordingsOwnerUserID, folders: courseFolders)
         guard lines != recordingMenuLines else { return }
         recordingMenuLines = lines

@@ -55,6 +55,13 @@ struct RecordingsMenuBarTests {
         }
     }
     private let tokens = TokenBox()
+    /// The database and root of the last controller `makeController` built, so a test can seed
+    /// scopes the way an earlier launch left them.
+    private final class SeedBox: @unchecked Sendable {
+        var database: SyncDatabase?
+        var rootID: UUID?
+    }
+    private let seeds = SeedBox()
 
     /// A fresh account controller on `defaults` (a relaunch), not signed in yet.
     private func makeController(defaults: UserDefaults, site: MoodleSite = .polimi, browser: FakeRecmanBrowser? = nil, language: AppLanguage = .italian) async throws -> WeBeepAuthenticationController {
@@ -63,6 +70,8 @@ struct RecordingsMenuBarTests {
         let database = try SyncDatabase(url: root.appending(path: "state-\(UUID().uuidString).sqlite"))
         let rootID = UUID()
         try await database.registerRoot(id: rootID, canonicalPath: sync.path)
+        seeds.database = database
+        seeds.rootID = rootID
         let tokens = tokens
         let vault = CredentialVault(read: { _ in tokens.value }, write: { tokens.value = $0 })
         var makeBrowser: (@MainActor () -> RecmanBrowsing)?
@@ -502,6 +511,33 @@ struct RecordingsMenuBarTests {
         defaults.set(false, forKey: RecordingsController.enabledKey)
         controller.seedWatchSummariesIfNeeded()
         #expect(controller.watchSummaries.isEmpty)
+    }
+
+    /// The real restore path (`restoreScopes`, run at launch) is where `courseFolders` is filled,
+    /// and nothing else rebuilds the menu afterwards: with saved summaries and renamed folders the
+    /// lines must show the folder names once the restore ends, and be rebuilt ONCE for the whole
+    /// restore, not once per course (quadratic at launch).
+    /// Mutations: drop the flush in `restoreScopes`' `defer` (the lines keep the WeBeep names);
+    /// drop the hold (`menuRebuildHolds += 1`: one rebuild per course).
+    @Test func restoringRenamedFoldersRebuildsTheMenuOnce() async throws {
+        defer { try? FileManager.default.removeItem(at: root) }
+        let defaults = WeBeepAuthenticationController.throwawayDefaults()
+        try storeSummaries([analisi: analisiSummary, fisica: fisicaSummary], owner: 7, in: defaults)
+        let controller = try await signedIn(defaults: defaults)
+        select([11, 12], on: controller)
+        #expect(lines(controller) == ["FISICA — 3/10 · ~45 min", "ANALISI 2 — 12/30 · ~14 h"])
+
+        // Selecting queued scope writes; a first restore waits for them, so they can't land
+        // over the scopes seeded below.
+        try await controller.restoreScopesForTesting(controller.courses)
+        let database = try #require(seeds.database), rootID = try #require(seeds.rootID)
+        try await database.upsertScope(SyncScope(rootID: rootID, courseID: 11, displayName: "058167 - ANALISI 2 [2026-27]", localFolder: "MAT Due", enabled: true))
+        try await database.upsertScope(SyncScope(rootID: rootID, courseID: 12, displayName: "052499 - FISICA [2026-27]", localFolder: "FIS", enabled: true))
+        let before = controller.menuRebuildCountForTesting
+        try await controller.restoreScopesForTesting(controller.courses)
+        #expect(controller.courseFolders[11] == "MAT Due" && controller.courseFolders[12] == "FIS")
+        #expect(lines(controller) == ["FIS — 3/10 · ~45 min", "MAT Due — 12/30 · ~14 h"])
+        #expect(controller.menuRebuildCountForTesting - before == 1, "one rebuild for the whole restore")
     }
 
     /// Renaming a course's local folder redraws its menu line with the folder name alone, and

@@ -34,6 +34,8 @@ final class MoodleRecordingProtocol: URLProtocol, @unchecked Sendable {
         var listsEmailFunction = false
         var holdsEmails = false
         var heldEmails: [@Sendable () -> Void] = []
+        var holdsCourseImages = false
+        var heldCourseImages: [@Sendable () -> Void] = []
     }
 
     /// What a download records as its `function`.
@@ -81,6 +83,26 @@ final class MoodleRecordingProtocol: URLProtocol, @unchecked Sendable {
             let held = accounts[token]?.heldEmails ?? []
             accounts[token]?.holdsEmails = false
             accounts[token]?.heldEmails = []
+            return held
+        }
+        held.forEach { $0() }
+    }
+
+    /// Holds every course-picture download (`/course/overviewfiles/`) for this account until
+    /// `releaseCourseImages(token:)`: lets a test change the account while a picture is on its way.
+    static func holdCourseImages(token: String) {
+        accounts.withLock { $0[token]?.holdsCourseImages = true }
+    }
+
+    static func heldCourseImageCount(token: String) -> Int {
+        accounts.withLock { $0[token]?.heldCourseImages.count ?? 0 }
+    }
+
+    static func releaseCourseImages(token: String) {
+        let held = accounts.withLock { accounts -> [@Sendable () -> Void] in
+            let held = accounts[token]?.heldCourseImages ?? []
+            accounts[token]?.holdsCourseImages = false
+            accounts[token]?.heldCourseImages = []
             return held
         }
         held.forEach { $0() }
@@ -177,6 +199,24 @@ final class MoodleRecordingProtocol: URLProtocol, @unchecked Sendable {
         }
         if let account, account.offline {
             client?.urlProtocol(self, didFailWithError: URLError(.notConnectedToInternet))
+            return
+        }
+        if isDownload, url.path.contains("/course/overviewfiles/") {
+            // A course picture: three bytes are enough, the tests check what reaches the caller.
+            let this = self
+            let deliver: @Sendable () -> Void = {
+                let found = MoodleRecordingProtocol.accounts.withLock { $0[token] } != nil
+                let response = HTTPURLResponse(url: url, statusCode: found ? 200 : 404, httpVersion: "HTTP/1.1", headerFields: ["Content-Type": "image/png"])!
+                this.client?.urlProtocol(this, didReceive: response, cacheStoragePolicy: .notAllowed)
+                if found { this.client?.urlProtocol(this, didLoad: Data([1, 2, 3])) }
+                this.client?.urlProtocolDidFinishLoading(this)
+            }
+            let held = Self.accounts.withLock { accounts in
+                guard accounts[token]?.holdsCourseImages == true else { return false }
+                accounts[token]?.heldCourseImages.append(deliver)
+                return true
+            }
+            if !held { deliver() }
             return
         }
         if isDownload {

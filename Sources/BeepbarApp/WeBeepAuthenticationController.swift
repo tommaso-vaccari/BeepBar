@@ -1287,6 +1287,8 @@ struct RecordingMenuEntry: Equatable {
     /// The profile lookup Recordings uses, called directly so tests can check its own guards
     /// (the listed function, the account after the answer) apart from Recordings' epochs.
     func profileEmailForTesting() async -> String? { await profileEmail() }
+    /// The course-picture fetch the player is given, called directly to test its identity guard.
+    func courseImageForTesting(_ url: URL) async throws -> Data { try await courseImage(url) }
 
     private var controllerDefaultsHaveNoWatchlist: Bool {
         operationDefaults.data(forKey: RecordingsController.studyKey(owner: 1)) == nil

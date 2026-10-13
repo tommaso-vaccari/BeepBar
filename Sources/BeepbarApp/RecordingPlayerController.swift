@@ -26,7 +26,9 @@ import OSLog
     /// `startAt` resumes from that position once the stream is ready, unless it is within a few
     /// seconds of either end (`RecordingPlayerPolicy.resumePosition`). `recordingID` is the
     /// caller's key for the recording, handed back with every checkpoint and failure.
-    func play(_ url: URL, title: String, cookies: [HTTPCookie], startAt: TimeInterval?, recordingID: String)
+    /// `metadata` is what macOS's Now Playing shows (lecture, course, course picture); nil shows
+    /// `title` alone. Playback never waits for it: the picture arrives later, if at all.
+    func play(_ url: URL, title: String, cookies: [HTTPCookie], startAt: TimeInterval?, recordingID: String, metadata: RecordingPlaybackMetadata?)
     /// Pauses playback, keeping the window and the position.
     func pause()
     /// Stops playback and releases the player and its window. Safe to call at any time.
@@ -35,6 +37,13 @@ import OSLog
     /// regular app and finds a lecture open when it is done; see
     /// `RecordingPlayerController.adoptPolicyToRestore`.
     func adoptPolicyToRestore(_ policy: NSApplication.ActivationPolicy)
+}
+
+extension RecordingPlaying {
+    /// A play without Now Playing metadata: the window title is the only text shown.
+    func play(_ url: URL, title: String, cookies: [HTTPCookie], startAt: TimeInterval?, recordingID: String) {
+        play(url, title: title, cookies: cookies, startAt: startAt, recordingID: recordingID, metadata: nil)
+    }
 }
 
 /// One report of where the student stopped in a lecture (`RecordingPlaying.onPositionCheckpoint`).
@@ -261,6 +270,30 @@ enum RecordingPlayerError: Error {
     /// did not change it.
     private var policyToRestore: NSApplication.ActivationPolicy?
 
+    // MARK: Now Playing state (see `RecordingNowPlaying.swift` for why the player publishes it)
+
+    /// Whether `nowPlaying` took over Now Playing for the current window (AVKit's own
+    /// publication is then off). False before the first play, after close, and when MediaPlayer
+    /// could not load, in which case AVKit keeps publishing as before.
+    private(set) var isPublishingNowPlaying = false
+    /// The lecture's title, course and accepted artwork address (`RecordingNowPlayingPolicy.resolved`).
+    private(set) var nowPlayingMetadata: RecordingPlaybackMetadata?
+    /// The artwork address being shown or fetched, nil for none. The picture belongs to it.
+    private(set) var artworkURL: URL?
+    /// The course picture for `artworkURL`, once it arrived. Released on close and as soon as a
+    /// lecture of another course plays: at most one picture is held.
+    private(set) var artwork: RecordingArtworkImage?
+    /// The one artwork fetch in flight, cancelled on close and when a lecture of another course
+    /// plays.
+    private var artworkTask: Task<Void, Never>?
+    /// Bumped whenever `artworkURL` changes and on close. A fetch lands only if it still matches,
+    /// so a late picture of a previous course never shows for the next lecture, nor after close.
+    private(set) var artworkSerial = 0
+    /// How many artwork fetches this player started; tests count them.
+    private(set) var artworkFetches = 0
+    /// The record last published, so an identical one is not published again.
+    private var lastNowPlaying: NowPlayingState?
+
     private let present: @MainActor (NSWindow) -> Void
     private let makePlayerView: @MainActor () -> NSView?
     private let makePlayer: @MainActor () -> AVPlayer
@@ -270,6 +303,8 @@ enum RecordingPlayerError: Error {
     private let notificationCenter: NotificationCenter
     private let toggleFullScreen: @MainActor (NSWindow) -> Void
     private let progressInterval: CMTime
+    private let nowPlaying: NowPlayingPublishing
+    private let artworkLoader: RecordingArtwork.Loader?
 
     /// How often, in media time, `onProgress` reports while playing. Thirty seconds of lecture
     /// keeps the window's progress bar moving visibly (a lecture lasts 1-2 hours, so a step is
@@ -309,6 +344,10 @@ enum RecordingPlayerError: Error {
     ///   - toggleFullScreen: what F does; tests record it instead of animating a window.
     ///   - progressInterval: seconds of media time between `onProgress` ticks; tests shorten it
     ///     to see real ticks within the 60 s fixture.
+    ///   - nowPlaying: publishes the Now Playing record and receives the remote commands; tests
+    ///     pass a fake.
+    ///   - artworkLoader: fetches a course picture (`RecordingArtwork.webeep` holds the token);
+    ///     nil fetches nothing and Now Playing shows the app's icon.
     init(present: @escaping @MainActor (NSWindow) -> Void = RecordingPlayerController.bringToFront,
          makePlayerView: @escaping @MainActor () -> NSView? = AVKitLoader.makePlayerView,
          makePlayer: @escaping @MainActor () -> AVPlayer = { AVPlayer() },
@@ -317,8 +356,12 @@ enum RecordingPlayerError: Error {
          defaults: UserDefaults = .standard,
          notificationCenter: NotificationCenter = .default,
          toggleFullScreen: @escaping @MainActor (NSWindow) -> Void = { $0.toggleFullScreen(nil) },
-         progressInterval: TimeInterval = RecordingPlayerController.progressInterval) {
+         progressInterval: TimeInterval = RecordingPlayerController.progressInterval,
+         nowPlaying: NowPlayingPublishing = SystemNowPlaying(),
+         artworkLoader: RecordingArtwork.Loader? = nil) {
         self.progressInterval = CMTime(seconds: progressInterval, preferredTimescale: 600)
+        self.nowPlaying = nowPlaying
+        self.artworkLoader = artworkLoader
         self.present = present
         self.makePlayerView = makePlayerView
         self.makePlayer = makePlayer
@@ -335,7 +378,7 @@ enum RecordingPlayerError: Error {
     /// `recordingID`: a `String` rather than `AnyHashable` or a generic, because the Recordings
     /// flow keys saved positions by recording in persisted storage, where a string round-trips
     /// as is, and a concrete type keeps the protocol usable as an existential with fakes.
-    func play(_ url: URL, title: String, cookies: [HTTPCookie], startAt: TimeInterval?, recordingID: String) {
+    func play(_ url: URL, title: String, cookies: [HTTPCookie], startAt: TimeInterval?, recordingID: String, metadata: RecordingPlaybackMetadata?) {
         Self.log.notice("Playing a recording from \(url.host ?? "-", privacy: .public)")
         // A newer lecture closes the one on screen: report where the student left it, with its
         // own id, while the old item is still in place.
@@ -370,7 +413,14 @@ enum RecordingPlayerError: Error {
         // player stays paused until the seek lands. Paused before the new observers exist, so this
         // pause reports nothing (the old lecture was reported above).
         if isResuming { player.pause() }
-        window?.title = title
+        let shown = RecordingNowPlayingPolicy.resolved(metadata, fallbackTitle: title)
+        nowPlayingMetadata = shown
+        // The title bar names the lecture and, under it, the course. The app itself stays
+        // "BeepBar" in the Dock and the app switcher: that is the app's name, not the lecture's.
+        window?.title = metadata == nil ? title : shown.title
+        window?.subtitle = shown.courseName
+        // Never awaited: the picture is fetched while the stream loads and shows when it lands.
+        updateArtwork(shown.artworkURL)
         preferredSpeed = RecordingPlayerPolicy.storedSpeed(defaults.object(forKey: RecordingPlayerPolicy.speedDefaultsKey))
 
         let asset = AVURLAsset(url: url, options: Self.assetOptions(cookies: cookies))
@@ -435,6 +485,8 @@ enum RecordingPlayerError: Error {
         // already moving and stays so across the replacement, no report would come to add the
         // progress observer for the new item, so it is added here from the current status.
         updateProgressObserver(generation: observedGeneration)
+        // Title and course now, before the stream has loaded a byte.
+        publishNowPlaying()
         if let window { present(window) }
     }
 
@@ -545,6 +597,8 @@ enum RecordingPlayerError: Error {
         // A zoom kept across a recovery was limited by the whole view while the new item had no
         // size yet: now the video's real frame is known.
         zoomGeometryChanged()
+        // The duration is known now.
+        publishNowPlaying()
         guard let startAt = pendingStartAt else {
             settleStart()
             return
@@ -734,6 +788,7 @@ enum RecordingPlayerError: Error {
         if player.defaultRate != speed { player.defaultRate = speed }
         if player.rate != 0, player.rate != speed { player.rate = speed }
         updateSpeedControls()
+        publishNowPlaying()
     }
 
     private func defaultRateChanged(generation observed: Int) {
@@ -759,6 +814,7 @@ enum RecordingPlayerError: Error {
             checkpointedSincePlaying = false
         }
         updateProgressObserver(generation: observed)
+        publishNowPlaying()
     }
 
     /// Keeps the one periodic time observer in step with the player: present while it is not
@@ -843,6 +899,7 @@ enum RecordingPlayerError: Error {
                 guard let self, observed == self.generation else { return }
                 if self.pendingSeekTarget == seconds { self.pendingSeekTarget = nil }
                 if settlesStart { self.settleStart() }
+                self.publishNowPlaying()
             }
         }
     }
@@ -882,8 +939,114 @@ enum RecordingPlayerError: Error {
         self.playerView = view
         self.window = window
         installedViewSpeeds = nil
+        takeOverNowPlaying(of: view)
         promoteToRegularApp()
         return player
+    }
+
+    // MARK: Now Playing
+
+    /// Makes the player, not AVKit, publish Now Playing for this window: AVKit's record has no
+    /// lecture, course or picture on macOS, so the system showed "BeepBar" (see
+    /// `RecordingNowPlaying.swift`). Only when `nowPlaying` could take over and AVKit's own
+    /// publication can be switched off (two publishers would overwrite each other); otherwise
+    /// AVKit keeps publishing, and handling the media keys, as before.
+    private func takeOverNowPlaying(of view: NSView) {
+        let setter = NSSelectorFromString("setUpdatesNowPlayingInfoCenter:")
+        let isAVKitView = NSStringFromClass(type(of: view)) == "AVPlayerView"
+        guard !isAVKitView || view.responds(to: setter),
+              nowPlaying.activate(onCommand: { [weak self] command in self?.handleRemoteCommand(command) }) else { return }
+        if view.responds(to: setter) { view.setValue(false, forKey: "updatesNowPlayingInfoCenter") }
+        isPublishingNowPlaying = true
+        lastNowPlaying = nil
+    }
+
+    /// A command from Control Center, the media keys or headphones, on the main actor. Each one
+    /// does what the same control in the window does, so the resume and checkpoint rules hold.
+    /// Internal so tests can deliver commands MediaPlayer never sends to a test process.
+    func handleRemoteCommand(_ command: NowPlayingCommand) {
+        guard let player else { return }
+        switch command {
+        case .play:
+            if isResuming { playWhenSettled = true } else { player.play() }
+        case .pause:
+            pause()
+        case .togglePlayPause:
+            performShortcut(.togglePlayPause)
+        case .skip(let delta):
+            skip(by: delta)
+        case .seek(let position):
+            guard isCurrentItemReady, position.isFinite, let item = player.currentItem else { return }
+            let upper = Self.seconds(item.duration) ?? max(0, position)
+            seek(to: min(max(0, position), upper))
+        }
+    }
+
+    /// Publishes the record for the lecture on screen, unless it is identical to the last one.
+    /// Called at the moments it changes (a play, the item ready, play/pause, a seek landing, a
+    /// speed change, the picture arriving), never on a clock: the system extrapolates the time
+    /// from the rate and the elapsed time.
+    private func publishNowPlaying() {
+        guard isPublishingNowPlaying, let player, let metadata = nowPlayingMetadata else { return }
+        let state = NowPlayingState(
+            title: metadata.title,
+            artist: metadata.courseName,
+            duration: player.currentItem.flatMap { Self.seconds($0.duration) },
+            elapsed: reportedPosition(of: player),
+            rate: player.rate,
+            defaultRate: appliedSpeed,
+            isPlaying: player.timeControlStatus != .paused,
+            artwork: artwork)
+        guard state != lastNowPlaying else { return }
+        lastNowPlaying = state
+        nowPlaying.publish(state)
+    }
+
+    /// Shows the picture at `url` (already accepted by `RecordingNowPlayingPolicy.resolved`):
+    /// - the same address as now: nothing changes, the picture (or its fetch) is kept, so another
+    ///   lecture of the same course costs no request;
+    /// - another one, or none: the old fetch is cancelled and the old picture released at once,
+    ///   so the next record shows the app's icon rather than another course's picture, and a new
+    ///   fetch starts when there is an address and a loader.
+    /// The fetch runs off the main actor (`RecordingArtwork.load`) and lands only while
+    /// `artworkSerial` is unchanged.
+    private func updateArtwork(_ url: URL?) {
+        guard url != artworkURL else { return }
+        cancelArtwork()
+        artworkURL = url
+        guard let url, let artworkLoader else { return }
+        let serial = artworkSerial
+        artworkFetches += 1
+        artworkTask = Task { [weak self] in
+            let result: Result<RecordingArtworkImage, Error>
+            do { result = .success(try await RecordingArtwork.load(url, loader: artworkLoader)) }
+            catch { result = .failure(error) }
+            self?.artworkLoaded(result, serial: serial)
+        }
+    }
+
+    /// Where a fetch lands, on the main actor. Internal so tests can deliver a late result.
+    func artworkLoaded(_ result: Result<RecordingArtworkImage, Error>, serial: Int) {
+        guard serial == artworkSerial else { return }
+        artworkTask = nil
+        switch result {
+        case .success(let image):
+            artwork = image
+            publishNowPlaying()
+        case .failure(let error):
+            // The record keeps its title and course, with the app's icon. Never the address.
+            if !(error is CancellationError) {
+                Self.log.notice("Course artwork unavailable reason=\(RecordingArtwork.logDescription(error), privacy: .public)")
+            }
+        }
+    }
+
+    /// Cancels the fetch and releases the picture; a fetch still landing is dropped.
+    private func cancelArtwork() {
+        artworkSerial += 1
+        artworkTask?.cancel()
+        artworkTask = nil
+        artwork = nil
     }
 
     /// The speed menu at the trailing end of the title bar: always visible, it shows the current
@@ -1033,6 +1196,16 @@ enum RecordingPlayerError: Error {
         playerView?.setValue(nil, forKey: "player")
         player = nil
         menuActions = []
+        // Nothing of the lecture survives the window: no fetch, no picture, no record, no
+        // remote commands.
+        cancelArtwork()
+        artworkURL = nil
+        nowPlayingMetadata = nil
+        lastNowPlaying = nil
+        if isPublishingNowPlaying {
+            isPublishingNowPlaying = false
+            nowPlaying.deactivate()
+        }
         // The window goes with the lecture: the next one opens at fit. The view is not touched,
         // it is being released.
         zoom = .fit

@@ -6,7 +6,8 @@ import Foundation
 /// An actor, so the encode/decode and file work run off the main actor: the controller awaits a
 /// result and never touches the file itself. Written like the token: created 0600, replaced
 /// whole with one rename, so a crash never leaves a half list and the names are never on disk
-/// under default permissions. The file holds course names and ids only, never the token.
+/// under default permissions. The file holds course names, ids and image addresses only, never
+/// the token.
 ///
 /// Every rejected file (unreadable, foreign identity, too old, too large, future version) is
 /// deleted on load, so a bad file is paid for once and an old account's list cannot linger.

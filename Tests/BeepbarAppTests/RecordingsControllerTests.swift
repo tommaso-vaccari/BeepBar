@@ -129,6 +129,8 @@ import BeepbarCore
     var onProgress: ((String, TimeInterval, TimeInterval?) -> Void)?
     var onFailure: ((String, RecordingPlaybackFailure) -> Void)?
     private(set) var plays: [Play] = []
+    /// The Now Playing metadata of each play, in order (nil: the caller gave none).
+    private(set) var metadatas: [RecordingPlaybackMetadata?] = []
     /// The `index`th play, or a recorded failure instead of a crash when the controller started
     /// fewer: an out-of-range index would end the whole test process and hide every other result.
     func play(_ index: Int, sourceLocation: SourceLocation = #_sourceLocation) throws -> Play {
@@ -141,7 +143,8 @@ import BeepbarCore
     /// The duration the fake lecture reports.
     var duration: TimeInterval? = 6_000
 
-    func play(_ url: URL, title: String, cookies: [HTTPCookie], startAt: TimeInterval?, recordingID: String) {
+    func play(_ url: URL, title: String, cookies: [HTTPCookie], startAt: TimeInterval?, recordingID: String, metadata: RecordingPlaybackMetadata?) {
+        metadatas.append(metadata)
         report(.replaced)
         plays.append(Play(url: url, title: title, startAt: startAt, recordingID: recordingID, cookies: cookies.count))
         isOpen = true

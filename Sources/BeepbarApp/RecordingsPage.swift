@@ -48,6 +48,31 @@ enum RecordingsPresentation {
 
     static func matches(_ recording: RecmanRecording, query: String) -> Bool { RecmanPresentation.matches(recording, query: query) }
 
+    /// The sidebar row's title: the course name, or the renamed local folder plus the part in
+    /// parentheses at the end of the WeBeep name (usually the teacher).
+    /// See `RecmanCourseSidebar.sidebarName`.
+    static func sidebarName(courseName: String, courseDisplayName: String, courseID: Int64 = 0, localFolderName: String?) -> String {
+        RecmanCourseSidebar.sidebarName(courseName: courseName, courseDisplayName: courseDisplayName, courseID: courseID, localFolderName: localFolderName)
+    }
+
+    /// Whether the sidebar row shows the orange "lectures to watch" marker: only for a known
+    /// summary of a course with recordings that are not all done. An unknown summary (nil: the
+    /// listing was never loaded, another account) claims nothing; a course with none (0/0) or all
+    /// done shows nothing (`done < total` is false for both). `next` is not used: it is nil for old saved data that still has counts.
+    static func hasLecturesToWatch(summary: CourseWatchSummary?) -> Bool {
+        guard let summary else { return false }
+        return summary.done < summary.total
+    }
+
+    /// VoiceOver's label of that marker.
+    static let lecturesToWatchLabel = BilingualText("Lezioni da guardare", "Lectures to watch")
+
+    /// VoiceOver's value of that marker: how many lectures are left.
+    static func lecturesToWatchValue(_ summary: CourseWatchSummary) -> BilingualText {
+        let left = max(0, summary.total - summary.done)
+        return BilingualText("\(left) da guardare", "\(left) left")
+    }
+
     // MARK: Watch progress
 
     /// What one row shows of its watch progress, as plain values: the row compares it with `==`,
@@ -202,7 +227,7 @@ struct RecordingsPage: View {
     /// controllers republish unchanged it is a storage comparison; equal content in new storage
     /// is compared once, after which the cache holds the new array.
     private var model: RecmanCourseSidebar {
-        sidebarCache.value(for: .init(courses: authentication.courses, enabledIDs: authentication.enabledCourseIDs), compute: RecmanCourseSidebar.init)
+        sidebarCache.value(for: .init(courses: authentication.courses, enabledIDs: authentication.enabledCourseIDs, folders: authentication.courseFolders), compute: RecmanCourseSidebar.init)
     }
 
     private var keys: [RecmanCourseKey] { model.keys }
@@ -237,6 +262,7 @@ struct RecordingsPage: View {
             }
         }
         .onAppear {
+            authentication.seedWatchSummariesIfNeeded()
             recordings.pageAppeared()
             refresh()
         }
@@ -335,15 +361,26 @@ struct RecordingsPage: View {
                 .tag(RecordingsDestination.watchlist)
             }
             Section(tr("I tuoi corsi", "Your courses")) {
+                // The marker reads the committed summaries the menu bar uses
+                // (`authentication.watchSummaries`: seeded from storage when the account is
+                // known, so it shows before any listing loads or without a Polimi session, and
+                // `@Published`, so the page redraws on a commit). Not the window's live
+                // summaries and not a `WatchProgressReader`: a ~30 s tick publishes neither this
+                // page nor these values. `CourseRow` is `Equatable` on plain values.
+                // The row shows the sidebar name (renamed folder + trailing part); the detail
+                // header keeps the WeBeep name on purpose: owner decision, sidebar and menu only.
                 ForEach(model.searchable) { entry in
-                    CourseRow(name: entry.name, key: entry.key, listing: recordings.listing(for: entry.key), newCount: recordings.newCount(for: entry.key))
+                    let summary = authentication.watchSummaries[entry.key]
+                    CourseRow(name: entry.sidebarName, key: entry.key, subtitle: CourseRow.subtitle(for: recordings.listing(for: entry.key)), newCount: recordings.newCount(for: entry.key),
+                              toWatch: RecordingsPresentation.hasLecturesToWatch(summary: summary) ? summary.map(RecordingsPresentation.lecturesToWatchValue) : nil)
+                        .equatable()
                         .tag(RecordingsDestination.course(entry.course.id))
                 }
             }
             if !model.unsearchable.isEmpty {
                 Section(tr("Senza codice o anno", "No code or year")) {
                     ForEach(model.unsearchable) { entry in
-                        Text(entry.name)
+                        Text(entry.sidebarName)
                             .lineLimit(3)
                             .fixedSize(horizontal: false, vertical: true)
                             .foregroundStyle(.secondary)
@@ -379,13 +416,21 @@ struct RecordingsPage: View {
 }
 
 /// A course in the sidebar keeps its code and year visible to distinguish matching names.
-private struct CourseRow: View {
+///
+/// `Equatable` on plain values on purpose (see `WatchProgressReader`): the sidebar sits inside a
+/// reader that runs on every progress publication, and equal values skip this body.
+private struct CourseRow: View, Equatable {
     let name: String
     let key: RecmanCourseKey
-    let listing: RecordingsListing?
+    let subtitle: String
     let newCount: Int
+    /// Non-nil (the lectures left, as VoiceOver's value) when the orange marker shows.
+    let toWatch: BilingualText?
 
     var body: some View {
+#if DEBUG
+        let _ = RecordingsPageProbes.sidebarRow?(name, toWatch != nil)
+#endif
         HStack(spacing: 8) {
             VStack(alignment: .leading, spacing: 2) {
                 Text(name)
@@ -401,6 +446,17 @@ private struct CourseRow: View {
                     .lineLimit(1)
             }
             Spacer(minLength: 0)
+            // The marker sits before the "new" badge in the same trailing stack: both can show,
+            // side by side, without overlapping. Orange is not the accent colour of the badge.
+            if let toWatch {
+                Circle()
+                    .fill(Color.orange)
+                    .frame(width: 8, height: 8)
+                    .help(RecordingsPresentation.lecturesToWatchLabel.text)
+                    .accessibilityElement()
+                    .accessibilityLabel(RecordingsPresentation.lecturesToWatchLabel.text)
+                    .accessibilityValue(toWatch.text)
+            }
             if newCount > 0 {
                 Text(newCount, format: .number)
                     .font(.caption2.weight(.bold))
@@ -415,7 +471,7 @@ private struct CourseRow: View {
         .padding(.vertical, 2)
     }
 
-    private var subtitle: String {
+    static func subtitle(for listing: RecordingsListing?) -> String {
         if let count = listing?.recordings?.count {
             return count == 0 ? tr("Nessuna registrazione", "No recordings") : tr("\(count) registrazioni", englishCount(count, "recording", "recordings"))
         }
@@ -810,6 +866,8 @@ struct WatchProgressReader<Content: View>: View {
 @MainActor enum RecordingsPageProbes {
     static var row: ((RecordingRow) -> Void)?
     static var header: ((String) -> Void)?
+    /// A sidebar course row's body: its title and whether the orange marker shows.
+    static var sidebarRow: ((_ name: String, _ marker: Bool) -> Void)?
 }
 #endif
 

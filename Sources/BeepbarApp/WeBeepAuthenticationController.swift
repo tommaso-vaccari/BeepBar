@@ -420,8 +420,8 @@ struct RecordingMenuEntry: Equatable {
     // dataSaverPause), and
     // `setLanguage(_:)` calls it since every label depends on `AppLanguage.current`. The
     // recordings lines (`recordingMenuLines`) are fed by courses, enabledCourseIDs,
-    // watchSummaries and siteInfo (the account is the `owner` of each line's click target, so a
-    // menu drawn for one account never plays for another), whose `didSet` calls
+    // courseFolders, watchSummaries and siteInfo (the account is the `owner` of each line's click
+    // target, so a menu drawn for one account never plays for another), whose `didSet` calls
     // `recordingMenuInputsChanged()`, which rebuilds the lines (text, tooltip and click target)
     // and then calls `refreshMenuBarSnapshot()`. If you make
     // those computed properties depend on anything else, add a matching
@@ -559,7 +559,9 @@ struct RecordingMenuEntry: Equatable {
             if recoveryBlocked != oldValue { configureBackgroundScheduler() }
         }
     }
-    @Published private(set) var courseFolders: [Int64: String] = [:]
+    @Published private(set) var courseFolders: [Int64: String] = [:] {
+        didSet { if courseFolders != oldValue { recordingMenuInputsChanged() } }
+    }
     @Published private(set) var courseRenameErrors: [Int64: String] = [:]
     @Published private(set) var renamingCourseID: Int64?
     let progressStore = SyncProgressStore()
@@ -617,15 +619,43 @@ struct RecordingMenuEntry: Equatable {
     /// "none", so this is never overwritten from the controller's state, only from its pushes.
     /// Cleared when the account goes; a push of `[:]` is a reset (turn-off, account change).
     /// A deselected course keeps its entry here and is only hidden by `recordingMenuLines`.
-    private(set) var watchSummaries: [RecmanCourseKey: CourseWatchSummary] = [:] {
+    ///
+    /// `@Published` so the Recordings sidebar's orange marker (which reads it, not the Recordings
+    /// controller's copy, empty until a listing loads) redraws on a commit and only then: it never
+    /// changes on a playback tick. Assigned only when the value changes, except by the account
+    /// handlers above. Everything observing `authentication` (every page, not only this sidebar)
+    /// redraws when a saved summary changes: at a checkpoint, a completion or a listing change,
+    /// never on ticks.
+    @Published private(set) var watchSummaries: [RecmanCourseKey: CourseWatchSummary] = [:] {
         didSet { if watchSummaries != oldValue { recordingMenuInputsChanged() } }
     }
+
+    /// Reads the saved summaries when the Recordings page opens with none in memory: the seed
+    /// in `siteInfo.didSet` is empty when Recordings was switched on after the account became
+    /// known. Cheap (one settings read, once per appearance), never creates the Recordings
+    /// controller, and does nothing without an account or with Recordings off.
+    func seedWatchSummariesIfNeeded() {
+        guard watchSummaries.isEmpty, let userID = siteInfo?.userID, selectedSite.university == .polimi,
+              recordingsStorage?.isEnabled ?? RecordingsController.isSwitchedOn(in: operationDefaults),
+              let stored = RecordingsController.storedWatchSummaries(in: operationDefaults, owner: userID) else { return }
+        watchSummaries = stored
+    }
+
+#if DEBUG
+    /// Test seams for the sidebar tests: set what the page reads, as a commit or a rename would.
+    func setWatchSummariesForTesting(_ summaries: [RecmanCourseKey: CourseWatchSummary]) { watchSummaries = summaries }
+    func setCourseFoldersForTesting(_ folders: [Int64: String]) { courseFolders = folders }
+#endif
     /// The menu's recordings lines in both languages, with their click targets, rebuilt only when
-    /// `courses`, `enabledCourseIDs`, `watchSummaries` or the account (`siteInfo`) change, so the
-    /// frequent snapshot refreshes during a sync don't rerun the course-name regexes. Resolved to
-    /// one language in `refreshMenuBarSnapshot()`, which is why a language switch needs no
-    /// rebuild here.
+    /// `courses`, `enabledCourseIDs`, `courseFolders`, `watchSummaries` or the account (`siteInfo`)
+    /// change, so the frequent snapshot refreshes during a sync don't rerun the course-name
+    /// regexes. Resolved to one language in `refreshMenuBarSnapshot()`, which is why a language
+    /// switch needs no rebuild here.
     private(set) var recordingMenuLines: [RecordingMenuEntry] = []
+    /// While above zero (`restoreScopes`) a change of the menu's inputs only marks the lines stale;
+    /// the holder rebuilds once at the end.
+    private var menuRebuildHolds = 0
+    private var menuRebuildPending = false
     private var database: SyncDatabase?
     /// Created on first use (the window, a sign-out), so a launch with the window closed doesn't
     /// read anything for a feature that may be off.
@@ -1364,13 +1394,14 @@ struct RecordingMenuEntry: Equatable {
     /// purpose (a glance), and the window has them all.
     nonisolated static let maxRecordingMenuLines = 10
 
-    /// Rebuilds `recordingMenuLines` from its four inputs and refreshes the snapshot when they
-    /// changed. Called from the `didSet` of `courses`, `enabledCourseIDs`, `watchSummaries` and
-    /// `siteInfo` (see the invariant comment on `menuBarSnapshot`). Costs nothing when no summary
-    /// is known (every launch without Recordings), since the pure builder returns before any
-    /// course.
+    /// Rebuilds `recordingMenuLines` from its five inputs and refreshes the snapshot when they
+    /// changed. Called from the `didSet` of `courses`, `enabledCourseIDs`, `courseFolders`,
+    /// `watchSummaries` and `siteInfo` (see the invariant comment on `menuBarSnapshot`). Costs
+    /// nothing when no summary is known (every launch without Recordings), since the pure builder
+    /// returns before any course.
     private func recordingMenuInputsChanged() {
-        let lines = Self.recordingMenuLines(courses: courses, enabledIDs: enabledCourseIDs, summaries: watchSummaries, owner: recordingsOwnerUserID)
+        if menuRebuildHolds > 0 { menuRebuildPending = true; return }
+        let lines = Self.recordingMenuLines(courses: courses, enabledIDs: enabledCourseIDs, summaries: watchSummaries, owner: recordingsOwnerUserID, folders: courseFolders)
         guard lines != recordingMenuLines else { return }
         recordingMenuLines = lines
         refreshMenuBarSnapshot()
@@ -1391,14 +1422,17 @@ struct RecordingMenuEntry: Equatable {
     ///   (`owner`) is known; otherwise it stays grey (every lecture done, nothing known to play,
     ///   or a stored `next` that couldn't be played anyway). The click re-checks all of it
     ///   (`menuPlayRecording`): the line only tells the student what a click would do.
-    nonisolated static func recordingMenuLines(courses: [RemoteCourseSummary], enabledIDs: Set<Int64>, summaries: [RecmanCourseKey: CourseWatchSummary], owner: Int?) -> [RecordingMenuEntry] {
+    /// - The line's name is the course's renamed local folder (`folders`), else its name without
+    ///   the part in parentheses at the end (`RecmanCourseSidebar.menuName`).
+    nonisolated static func recordingMenuLines(courses: [RemoteCourseSummary], enabledIDs: Set<Int64>, summaries: [RecmanCourseKey: CourseWatchSummary], owner: Int?, folders: [Int64: String] = [:]) -> [RecordingMenuEntry] {
         guard !summaries.isEmpty, !enabledIDs.isEmpty else { return [] }
         var lines: [RecordingMenuEntry] = []
         var shown: Set<RecmanCourseKey> = []
         for course in courses where enabledIDs.contains(course.id) {
             guard let key = RecmanCourseKey(course: course), let summary = summaries[key], summary.total > 0,
                   shown.insert(key).inserted else { continue }
-            let text = RecordingWatchProgress.menuLine(courseName: RecordingsPresentation.courseName(course), summary)
+            let name = RecmanCourseSidebar.menuName(courseName: RecordingsPresentation.courseName(course), courseDisplayName: course.displayName, courseID: course.id, localFolderName: folders[course.id])
+            let text = RecordingWatchProgress.menuLine(courseName: name, summary)
             if let owner, let next = summary.next, RecordingsController.validatedNext(next, for: key) {
                 lines.append(RecordingMenuEntry(
                     text: text,
@@ -2707,6 +2741,14 @@ struct RecordingMenuEntry: Equatable {
         let restoredSelection = Self.restoredEnabledCourseIDs(scopes: scopes, current: enabledCourseIDs, remoteIDs: remoteIDs)
         // @Published sends even for equal values; unchanged refreshes must leave the UI quiet.
         if enabledCourseIDs != restoredSelection { enabledCourseIDs = restoredSelection }
+        // `courseFolders` is assigned one course at a time below and each assignment would rebuild
+        // the menu lines (a name regex pass over every course: quadratic at launch). The rebuild
+        // is held back and runs once when the loop is done, whichever way it ends.
+        menuRebuildHolds += 1
+        defer {
+            menuRebuildHolds -= 1
+            if menuRebuildHolds == 0, menuRebuildPending { menuRebuildPending = false; recordingMenuInputsChanged() }
+        }
         for course in courses {
             if let scope = scopesByCourse[course.id], !scope.localFolder.isEmpty {
                 let replacement = LocalPathPolicy.generatedCourseFolderReplacement(

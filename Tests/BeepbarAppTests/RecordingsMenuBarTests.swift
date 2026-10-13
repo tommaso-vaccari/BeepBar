@@ -472,6 +472,58 @@ struct RecordingsMenuBarTests {
         await recordings.settleSessionFile()
     }
 
+    /// Opening the Recordings page seeds the saved summaries when the account's seed was empty
+    /// (Recordings switched on after sign-in), without creating the Recordings controller, and
+    /// does not overwrite summaries already in memory. Guards the sidebar's orange markers
+    /// missing until a listing loads.
+    /// Mutation: make `seedWatchSummariesIfNeeded` a no-op, or drop its `isEmpty` guard.
+    @Test func openingThePageSeedsSavedSummariesOnce() async throws {
+        defer { try? FileManager.default.removeItem(at: root) }
+        let defaults = WeBeepAuthenticationController.throwawayDefaults()
+        let controller = try await signedIn(defaults: defaults)
+        #expect(controller.watchSummaries.isEmpty)
+        try storeSummaries([analisi: analisiSummary], owner: 7, in: defaults)
+        controller.seedWatchSummariesIfNeeded()
+        #expect(controller.watchSummaries == [analisi: analisiSummary])
+        #expect(controller.recordingsIfCreated == nil)
+        try storeSummaries([analisi: fisicaSummary], owner: 7, in: defaults)
+        controller.seedWatchSummariesIfNeeded()
+        #expect(controller.watchSummaries == [analisi: analisiSummary], "not read again over what is in memory")
+    }
+
+    /// With Recordings switched off the page seed leaves the summaries empty: saved numbers are
+    /// not read for a feature the student turned off. Mutation: drop the switch check from
+    /// `seedWatchSummariesIfNeeded`.
+    @Test func theSeedDoesNothingWithRecordingsOff() async throws {
+        defer { try? FileManager.default.removeItem(at: root) }
+        let defaults = WeBeepAuthenticationController.throwawayDefaults()
+        let controller = try await signedIn(defaults: defaults)
+        try storeSummaries([analisi: analisiSummary], owner: 7, in: defaults)
+        defaults.set(false, forKey: RecordingsController.enabledKey)
+        controller.seedWatchSummariesIfNeeded()
+        #expect(controller.watchSummaries.isEmpty)
+    }
+
+    /// Renaming a course's local folder redraws its menu line with the folder name alone, and
+    /// the line keeps its numbers. Guards against a menu that keeps the WeBeep name until
+    /// something else changes, because `courseFolders` was not an input of the lines.
+    /// Mutation: drop `recordingMenuInputsChanged()` from `courseFolders.didSet`.
+    @Test func renamingAFolderRedrawsTheLine() async throws {
+        defer { try? FileManager.default.removeItem(at: root) }
+        let defaults = WeBeepAuthenticationController.throwawayDefaults()
+        try storeSummaries([analisi: analisiSummary], owner: 7, in: defaults)
+        let controller = try await signedIn(defaults: defaults)
+        select([11], on: controller)
+        #expect(lines(controller) == ["ANALISI 2 — 12/30 · ~14 h"])
+        let analisiCourse = try #require(controller.courses.first { $0.id == 11 })
+        controller.renameFolder(for: analisiCourse, to: "AN2")
+        for _ in 0..<400 where controller.renamingCourseID != nil || controller.courseFolders[11] == nil {
+            try await Task.sleep(for: .milliseconds(5))
+        }
+        #expect(controller.courseFolders[11] == "AN2")
+        #expect(lines(controller) == ["AN2 — 12/30 · ~14 h"])
+    }
+
     // MARK: Click to play (package P3)
 
     /// An Analisi lecture with an archive preview link that passes `RecmanURLPolicy` (what the

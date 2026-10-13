@@ -27,3 +27,7 @@ Aggiunta alla mappa dei dati la riga del nuovo file locale `course-list.json` (D
 ## [2026-10-12] update | Elenco corsi salvato: conservazione (PR #138)
 
 Riga della mappa dei dati corretta dopo la seconda review: aggiunti `savedAt` e la versione del formato; il limite di 30 giorni era applicato solo alla lettura (apertura della finestra), quindi un utente che usa solo la barra dei menu conservava un elenco scaduto. Ora il file scaduto viene eliminato anche all'avvio e a ogni sync, e la credenziale assente all'avvio lo elimina anche con il recupero bloccato; verificato sul codice e con test del branch della PR. Nessuna nuova fonte; valutazione e piano invariati.
+
+## [2026-10-12] update | Telemetria: identificativo mensile e campi del payload
+
+Sul branch `feature/telemetry-monthly-identity` (non ancora in dev): l'UUID permanente di installazione è sostituito da un UUID casuale per mese UTC, rigenerato in modo indipendente a ogni cambio di mese e cancellato all'opt-out; l'UUID della prima build dev viene cancellato all'avvio. Il payload usa le chiavi standard dell'SDK TelemetryDeck per versione app, piattaforma, versione principale di macOS e lingua, più cinque impostazioni `BeepBar.*` a bassa cardinalità. Aggiornate mappa dei dati, C08 e piano di verifica; nessuna nuova fonte, S-0007 resta lo snapshot di d3a42dc e va rinnovato quando il branch arriva in dev. C08 resta aperto.

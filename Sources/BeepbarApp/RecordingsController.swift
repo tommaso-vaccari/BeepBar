@@ -109,7 +109,13 @@ struct RecordingsListing: Equatable {
 /// - **A failed lecture is recovered once.** A stream that dies mid-lecture is resolved again and
 ///   resumes where it stopped; after that, or if it never started, the browser opens.
 @MainActor final class RecordingsController: ObservableObject {
-    static let enabledKey = "io.github.tvaccari.beepbar.recordings-enabled.v1"
+    nonisolated static let enabledKey = "io.github.tvaccari.beepbar.recordings-enabled.v1"
+
+    /// The switch as saved: on by default, and off wherever the feature isn't available. Shared by
+    /// `init` and by readers that must not create the controller (daily telemetry).
+    nonisolated static func storedEnabled(in defaults: UserDefaults, isAvailable: Bool) -> Bool {
+        (defaults.object(forKey: enabledKey) as? Bool ?? true) && isAvailable
+    }
     static let acknowledgedKey = "io.github.tvaccari.beepbar.recordings-acknowledged.v1"
     static let baselinedKey = "io.github.tvaccari.beepbar.recordings-baselined.v1"
     /// Durable reset tombstone: a failed file removal can never reuse the old namespace.
@@ -318,7 +324,7 @@ struct RecordingsListing: Equatable {
         self.now = now
         // A switch left on for another university (only reachable through an old settings file)
         // counts as off: the feature exists only for Polimi.
-        let enabled = (defaults.object(forKey: Self.enabledKey) as? Bool ?? true) && isAvailable()
+        let enabled = Self.storedEnabled(in: defaults, isAvailable: isAvailable())
         isEnabled = enabled
         access = enabled ? .ready : .off
         legacySeen = .init(ids: enabled ? defaults.stringArray(forKey: Self.acknowledgedKey) ?? [] : [], baselines: enabled ? defaults.stringArray(forKey: Self.baselinedKey) ?? [] : [])

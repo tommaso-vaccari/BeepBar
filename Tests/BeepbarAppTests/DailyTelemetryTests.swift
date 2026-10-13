@@ -317,6 +317,29 @@ struct DailyTelemetryTests {
         controller.stop()
     }
 
+    /// A clock rollback cannot send again until the next UTC day after the last attempt;
+    /// catching up within the saved month retains that month's identifier.
+    @Test func clockRollbackWaitsForTheNextDayAndKeepsTheMonthIdentity() async throws {
+        let harness = Harness()
+        defer { harness.remove() }
+        let recorder = Recorder()
+        // 2027-02-02 00:00 UTC.
+        let clock = Clock(Date(timeIntervalSince1970: 1_801_526_400))
+        let controller = harness.controller(configuration, clock: clock, recorder: recorder)
+        await controller.start()
+        clock.date = Date(timeIntervalSince1970: 1_801_439_999)
+        await controller.checkIn()
+        clock.date = Date(timeIntervalSince1970: 1_801_612_799)
+        await controller.checkIn()
+        #expect(await recorder.count == 1)
+        clock.date += 1
+        await controller.checkIn()
+        let ids = try await recorder.requests.map(identity)
+        try #require(ids.count == 2)
+        #expect(ids[0] == ids[1])
+        controller.stop()
+    }
+
     /// The first build's permanent installation UUID is deleted on construction, enabled or not,
     /// and never used as the identifier.
     @Test func legacyInstallationIDIsDeleted() async throws {

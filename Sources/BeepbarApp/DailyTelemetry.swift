@@ -18,7 +18,7 @@ struct DailyTelemetryContext: Equatable, Sendable {
     /// One of the intervals offered in Settings, already validated by the sync controller.
     var automaticSyncInterval: Int?
     var dataSaverEnabled: Bool?
-    /// Only ever true for Polimi, the one university with Recordings.
+    /// True only when Polimi is selected (the default); it does not prove an authenticated account.
     var recordingsEnabled: Bool?
     /// `nil` while macOS hasn't answered yet.
     var launchAtLogin: Bool?
@@ -187,7 +187,8 @@ enum DailyTelemetryTransport {
 /// different month replaces it with a fresh random one, never derived from the previous one, so the
 /// client keeps no link between months. The payload and source IP may still let the receiver
 /// re-link them; that is a limit of the data, not something the identifier can fix. A clock moved
-/// back sends nothing until it passes the last attempt, then starts a new identifier.
+/// back sends nothing until the UTC day after the last attempt; then the saved identifier is
+/// reused if its month matches, otherwise a fresh one is created.
 /// Daily actives are the signals of a day (one per installation); monthly actives are distinct
 /// identifiers within a calendar month.
 @MainActor

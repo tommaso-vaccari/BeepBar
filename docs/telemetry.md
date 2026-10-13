@@ -13,7 +13,7 @@ Debug builds, tests and UI previews do not use production configuration. Release
 One JSON array containing one signal is POSTed to `https://nom.telemetrydeck.com/v2/namespace/com.beepbar/`:
 
 - `appID`: the public app identifier.
-- `clientUser`: SHA-256 of the App ID and a random UUID that lives for one UTC calendar month. The UUID is never transmitted. When the UTC month changes it is replaced by a fresh random UUID, not derived from the previous one, so the client keeps no link between months (a clock moved back sends nothing until it passes the last attempt, then starts a new UUID). The receiver may still re-link months from the payload and the source IP, see below. Turning telemetry off deletes it; turning it on again starts a new one. The permanent installation UUID of the first `dev` build (`dailyTelemetryInstallationID`, never released) is deleted on launch. TelemetryDeck's Swift SDK states in a code comment that the server hashes and salts `clientUser` again; its public ingest documentation does not say so, so this document does not rely on it.
+- `clientUser`: SHA-256 of the App ID and a random UUID that lives for one UTC calendar month. The UUID is never transmitted. When the UTC month changes it is replaced by a fresh random UUID, not derived from the previous one, so the client keeps no link between months (a clock moved back sends nothing until the UTC day after the last attempt; the next allowed signal reuses the UUID if its month still matches, otherwise it creates a fresh one). The receiver may still re-link months from the payload and the source IP, see below. Turning telemetry off deletes it; turning it on again starts a new one. The permanent installation UUID of the first `dev` build (`dailyTelemetryInstallationID`, never released) is deleted on launch. TelemetryDeck's Swift SDK states in a code comment that the server hashes and salts `clientUser` again; its public ingest documentation does not say so, so this document does not rely on it.
 - `type`: `BeepBar.dailyActive`.
 - `payload`, all values as strings:
 
@@ -26,7 +26,7 @@ One JSON array containing one signal is POSTed to `https://nom.telemetrydeck.com
 | `BeepBar.automaticSync` | `true` / `false` | custom |
 | `BeepBar.automaticSyncInterval` | seconds, one of the Settings options | custom |
 | `BeepBar.dataSaver` | `true` / `false` | custom |
-| `BeepBar.recordings` | `true` / `false` (read without creating the Recordings controller); `true` implies a Polimi account, the only university with Recordings | custom |
+| `BeepBar.recordings` | `true` / `false` (read without creating the Recordings controller); `true` means Polimi is selected (the default), the only university with Recordings; it does not prove an authenticated account | custom |
 | `BeepBar.launchAtLogin` | `true` / `false`; omitted while macOS has not reported the login item | custom |
 
 `BeepBar.*` settings that are unknown when a signal is sent (the login item before macOS answers, or every setting when telemetry is switched on during launch, before the app installed its settings reader) are omitted, never reported as `false`.

@@ -109,6 +109,7 @@ struct RecordingsSidebarNamesTests {
         #expect(name("GAL (2026)") == "GAL (2026) (Claude Sonnet)")
         #expect(name("Fisica (2)") == "Fisica (2) (Claude Sonnet)")
         #expect(name("Geometria (7)") == Self.cleaned, "id 7 is this course's own")
+        #expect(name("GAL(7)") == "GAL(7) (Claude Sonnet)", "the legacy form has a space before the id")
     }
 
     /// The trailing part in parentheses is not always a teacher (a section here): it is kept

@@ -826,7 +826,7 @@ struct RecordingsControllerTests {
         let opens = browser.openedWith.count
         controller.signIn()
         await settle("the sign-in opened the browser") { browser.openedWith.count == opens + 1 }
-        #expect(browser.openedWith.last == ["JSESSIONID", "SSO_LOGIN"], "the sign-in reused a read that no longer matched the file")
+        #expect(browser.openedWith.last == (event == "read error" ? [] : ["JSESSIONID", "SSO_LOGIN"]), "a failed session check starts fresh; a renewed session reuses the current file")
     }
 
     /// A session saved for another WeBeep account is deleted unused, with what that account had
@@ -1080,6 +1080,8 @@ struct RecordingsControllerTests {
         controller.signIn()
         await settle("both reloaded") { controller.listing(for: other)?.recordings != nil && controller.listing(for: course)?.recordings != nil }
         #expect(controller.access == .ready)
+        #expect(browser.openedWith.last == [], "a new sign-in must not reload the rejected session")
+        #expect(try savedSession()?.cookies.map(\.value) == ["fresh"])
     }
 
     /// Offline: the first timeout ends the batch, and every waiting course says why instead of each
@@ -2178,14 +2180,14 @@ struct RecordingsControllerTests {
         controller.turnOff()
     }
 
-    /// Turn-off and an account change forget the places and close the player, and the close's
+    /// Disconnecting and an account change forget the places and close the player, and the close's
     /// own last report is refused instead of being written and then erased: the stored place
     /// is written once and removed once, nothing in between.
     /// Mutation: call `player?.close()` before clearing `nowPlaying` in
     /// `closePlayerForIdentityChange` and the write count is 3. The address removal
     /// (`emailDeclinedKey`) goes too: drop `forgetEmailOptOut()` from `turnOff` or
     /// `webBeepAccountChanged` and the next account would never get its address pre-filled.
-    @Test(arguments: ["turn off", "account change"])
+    @Test(arguments: ["disconnect", "account change"])
     func identityChangesCloseThePlayerAndForgetPlaces(change: String) async throws {
         defer { cleanUp() }
         browser.streamResults["a"] = [.success(stream("a"))]
@@ -2197,8 +2199,8 @@ struct RecordingsControllerTests {
         world.player.move(to: 2_500)
         defaults.set(42, forKey: RecordingsController.emailDeclinedKey)
 
-        if change == "turn off" {
-            controller.setEnabled(false)
+        if change == "disconnect" {
+            controller.turnOff()
         } else {
             world.owner = 7
             controller.webBeepAccountChanged(to: 7)
@@ -2210,6 +2212,45 @@ struct RecordingsControllerTests {
         #expect(defaults.object(forKey: RecordingsController.emailDeclinedKey) == nil, "a removed address belongs to the account that removed it")
         await controller.settleSessionFile()
         #expect(try store.load() == nil)
+        controller.turnOff()
+    }
+
+    /// Disabling keeps the player's final checkpoint, including after a relaunch.
+    /// Removing the preservation flag from setEnabled loses the stored position.
+    @Test func disablingKeepsTheLastPlaybackPosition() async throws {
+        defer { cleanUp() }
+        browser.streamResults["a"] = [.success(stream("a")), .success(stream("a"))]
+        let controller = await readyController()
+        controller.play(recording("a"))
+        await settle("a playing") { world.player.plays.count == 1 }
+        world.player.pause(at: 1_800)
+        world.player.move(to: 2_500)
+        controller.setEnabled(false)
+        #expect(world.player.closes == 1)
+        #expect(defaults.data(forKey: resumeKey) != nil)
+        await controller.settleSessionFile()
+        let relaunched = makeController()
+        relaunched.setEnabled(true)
+        await settle("signed in again") { relaunched.access == .ready }
+        relaunched.play(recording("a"))
+        await settle("a resumed") { world.player.plays.count == 2 }
+        #expect(try world.player.play(1).startAt == 2_500)
+        relaunched.turnOff()
+    }
+
+    @Test(arguments: [42, 7])
+    func accountChangeAfterDisablingChecksTheStoredPositionOwner(owner: Int) async throws {
+        defer { cleanUp() }
+        browser.streamResults["a"] = [.success(stream("a"))]
+        let controller = await readyController()
+        controller.play(recording("a"))
+        await settle("a playing") { world.player.plays.count == 1 }
+        world.player.pause(at: 1_800)
+        controller.setEnabled(false)
+        await controller.settleSessionFile()
+        world.owner = owner
+        controller.webBeepAccountChanged(to: owner)
+        #expect((defaults.data(forKey: resumeKey) != nil) == (owner == 42))
         controller.turnOff()
     }
 

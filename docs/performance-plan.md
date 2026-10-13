@@ -84,6 +84,10 @@ La descrizione della PR include una tabella con scenario/metrica/unità, main, b
 
 Se manca una misura confrontabile, scrivere **non misurato** e indicare il comando/prossimo passo; non sostituire numeri con deduzioni dal codice. Per fix di correttezza senza beneficio temporale dimostrato riportare la regressione red/green e i conteggi pertinenti; per PR solo documentali dichiarare non applicabile. Il report finale deve permettere affermazioni delimitate come «sync invariata: X% meno CPU rispetto a main», non «app X% più veloce» senza misure end-to-end dedicate.
 
+### Correzioni recordings: recupero accesso e checkpoint (2026-10-13)
+
+Branch `fix/recordings-signin-recovery`, base dev `0c9d033`. Il retry dopo una sessione rifiutata apre un browser senza i cookie precedenti; la pagina Polimi «Il servizio richiesto non è presente» termina il tentativo invece di lasciare lo spinner. Disattivare Registrazioni conserva il checkpoint finale, mentre disconnessione e cambio identità continuano a rimuoverlo. Regressioni, mutazioni controllate, fonti Apple e limiti sono in [recordings-validation.md](recordings-validation.md). È una correzione di comportamento: benefici temporali dev → HEAD e main → HEAD **non misurati**, nessuna promessa di prestazioni. La validazione live [R07 / #115](https://github.com/tommaso-vaccari/BeepBar/issues/115) resta aperta e separata; Apple Passwords nella WKWebView non è implementato. La PR di questa consegna registra SHA finale, review, gate locali e CI.
+
 ## Review e battle testing obbligatori
 
 1. Un reviewer senior indipendente, che non ha scritto la modifica, esamina l’intero diff contro i principi qui definiti e le specifiche IT/EN. Per lavoro affidato ad agenti usare un subagente indipendente; il responsabile della modifica non può autocertificare la review.

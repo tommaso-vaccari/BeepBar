@@ -103,7 +103,7 @@ struct RecordingsListing: Equatable {
 ///   Settings window does not: a lecture keeps playing with the window closed.
 /// - **Where you stopped is written only when the player reports it** (pause, close, a newer
 ///   Play, a failure), never on a clock; a lecture watched to the end starts from the beginning
-///   again and counts as seen. The positions are stored per account and deleted with the session.
+///   again and counts as seen. Positions survive disabling; identity changes remove them.
 /// - **The Polimi email stays in the session file** (`RecmanSessionVault`) and nowhere else, is
 ///   never logged, and is deleted with the file.
 /// - **A failed lecture is recovered once.** A stream that dies mid-lecture is resolved again and
@@ -121,7 +121,7 @@ struct RecordingsListing: Equatable {
     /// Durable reset tombstone: a failed file removal can never reuse the old namespace.
     static let historyNamespaceKey = "io.github.tvaccari.beepbar.recordings-history-namespace.v2"
     /// Where the student stopped in each lecture (`RecordingResumePoints`), for one account.
-    /// Removed with the session: turn-off, disconnect and account change.
+    /// Removed on disconnect, university change and account change.
     nonisolated static let resumePointsKey = "io.github.tvaccari.beepbar.recordings-resume.v1"
     /// The WeBeep account (numeric user id) whose student removed the Polimi email in Settings:
     /// the profile's address is then never taken again for that account, also after a relaunch
@@ -404,20 +404,19 @@ struct RecordingsListing: Equatable {
             log.notice("Recordings turned on")
             signIn()
         } else {
-            turnOff()
+            turnOff(preservingResumePoints: true)
             defaults.set(false, forKey: Self.enabledKey)
         }
     }
 
     /// Browser closed and session/history forgotten; a persisted opaque namespace prevents reuse
-    /// if history cleanup fails. Account-scoped study choices survive disabling the feature.
+    /// if history cleanup fails. Account-scoped study choices and playback positions survive disabling the feature.
     /// Also called when the WeBeep account is disconnected or the university changes, whether or
     /// not the feature was on, so no session outlives the account it was made for.
-    func turnOff() {
+    func turnOff(preservingResumePoints: Bool = false) {
         supersedeInitialSessionCheck()
-        // The lecture on screen belongs to the account being forgotten. First, because closing it
-        // reports where the student stopped, and that report must find nothing to write.
-        closePlayerForIdentityChange()
+        // Disabling saves the final checkpoint before clearing the playback identity.
+        closePlayerForIdentityChange(preservingResumePoints: preservingResumePoints)
         invalidate()
         closeBrowser()
         isEnabled = false
@@ -429,7 +428,7 @@ struct RecordingsListing: Equatable {
         pageKeys = []
         selectedKey = nil
         forgetSeen()
-        forgetResumePoints()
+        if !preservingResumePoints { forgetResumePoints() }
         forgetEmailOptOut()
         studyLoaded = false
         loadStudy()
@@ -446,16 +445,18 @@ struct RecordingsListing: Equatable {
         hasCheckedInitialSession = true
         supersedeInitialSessionCheck()
         invalidate()
+        let freshSession: Bool
+        if case .needsSignIn = access { freshSession = true } else { freshSession = false }
         access = .signingIn
         let generation = self.generation
-        signInTask = Task { [weak self] in await self?.runSignIn(generation) }
+        signInTask = Task { [weak self] in await self?.runSignIn(generation, freshSession: freshSession) }
     }
 
-    private func runSignIn(_ generation: Int) async {
+    private func runSignIn(_ generation: Int, freshSession: Bool) async {
         let browser = currentBrowser()
         let cookies = await savedCookies()
         guard generation == self.generation else { return }
-        await browser.open(cookies: cookies)
+        await browser.open(cookies: freshSession ? [] : cookies)
         guard generation == self.generation else { return }
         do {
             try await browser.signIn()
@@ -494,6 +495,8 @@ struct RecordingsListing: Equatable {
             log.notice("Polimi email belongs to another WeBeep account: dropped")
             resetEmail()
         }
+        resumePoints = nil
+        Self.forgetResumePoints(in: defaults, notOwnedBy: userID)
         guard let sessionOwner, sessionOwner != userID else { return }
         log.notice("Polimi session belongs to another WeBeep account: dropped")
         supersedeInitialSessionCheck()
@@ -1094,13 +1097,15 @@ struct RecordingsListing: Equatable {
         player?.adoptPolicyToRestore(policy)
     }
 
-    /// The identity the lecture belongs to is going away (turn-off, disconnect, university or
-    /// account change): the player closes and its last report is refused. Safe with no player.
-    private func closePlayerForIdentityChange() {
+    /// The identity the lecture belongs to is going away (disconnect, university or
+    /// account change): the player closes and its last report is refused. Disabling instead
+    /// preserves its final checkpoint. Safe with no player.
+    private func closePlayerForIdentityChange(preservingResumePoints: Bool = false) {
+        if preservingResumePoints { player?.close() }
         nowPlaying = [:]
         currentLectureID = nil
         recoveredLectures = []
-        player?.close()
+        if !preservingResumePoints { player?.close() }
     }
 
     // MARK: Where you stopped
@@ -1179,7 +1184,7 @@ struct RecordingsListing: Equatable {
         return defaults.integer(forKey: Self.emailDeclinedKey) == owner
     }
 
-    /// Positions go with the session: turn-off, disconnect and account change.
+    /// Positions are removed on disconnect, university change and account change.
     private func forgetResumePoints() {
         resumePoints = nil
         if defaults.object(forKey: Self.resumePointsKey) != nil { defaults.removeObject(forKey: Self.resumePointsKey) }

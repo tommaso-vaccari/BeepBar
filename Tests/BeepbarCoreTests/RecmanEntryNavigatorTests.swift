@@ -25,6 +25,22 @@ struct RecmanEntryNavigatorTests {
     static let credentials = PolimiPageFacts(asksForCredentials: true)
     static let plain = PolimiPageFacts()
 
+    @Test(arguments: [RecmanEntryNavigator.Mode.background, .interactive])
+    func serviceErrorEndsInsteadOfWaiting(mode: RecmanEntryNavigator.Mode) {
+        var replay = Replay(mode)
+        replay.load(Self.loginJSP, PolimiPageFacts(hasServiceError: true))
+        #expect(replay.finished == .failed)
+        #expect(replay.windowShows == 0)
+    }
+
+    @Test func serviceErrorAfterCredentialsEndsVisibleSignIn() {
+        var replay = Replay(.interactive)
+        replay.load(Self.loginJSP, Self.credentials)
+        replay.load(Self.loginJSP, PolimiPageFacts(hasServiceError: true))
+        #expect(replay.finished == .failed)
+        #expect(replay.windowShows == 1)
+    }
+
     /// Replays loads as the web view reports them: each starts, may redirect, then finishes.
     struct Replay {
         var navigator: RecmanEntryNavigator
@@ -240,7 +256,7 @@ struct RecmanEntryNavigatorTests {
         #expect(PolimiPage.isPolimiHost("AUNICALOGIN.POLIMI.IT"))
         #expect(!PolimiPage.isPolimiHost("evilpolimi.it"))
         #expect(!PolimiPage.isPolimiHost("polimi.it.evil.com"))
-        #expect(PolimiPageFacts.decode(#"{"hasArchiveForm":true,"hasAutomaticRedirectForm":false,"asksForCredentials":false}"#) == Self.archiveForm)
+        #expect(PolimiPageFacts.decode(#"{"hasArchiveForm":true,"hasAutomaticRedirectForm":false,"asksForCredentials":false,"hasServiceError":false}"#) == Self.archiveForm)
         #expect(PolimiPageFacts.decode("null") == nil)
         #expect(PolimiPageFacts.decode(#"{"hasArchiveForm":true}"#) == nil)
     }

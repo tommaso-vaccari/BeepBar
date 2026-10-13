@@ -50,6 +50,13 @@ final class MoodleRecordingProtocol: URLProtocol, @unchecked Sendable {
         return token
     }
 
+    /// Makes site info report `userID` for this token from now on: the stored token turning out
+    /// to belong to another account at the next connection check, with nothing else changing
+    /// (the controller caches its token, so a test can't swap the token itself).
+    static func setUserID(token: String, _ userID: Int) {
+        accounts.withLock { $0[token]?.userID = userID }
+    }
+
     /// Gives this account a profile `email`; `listed` says whether site info lists the function
     /// that reads it (a WeBeep token may not be allowed to call it).
     static func setProfileEmail(token: String, _ email: String?, listed: Bool) {

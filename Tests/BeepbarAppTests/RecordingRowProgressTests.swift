@@ -391,4 +391,41 @@ import BeepbarCore
         #expect(!recordings.canEditProgress)
         #expect(!WatchProgressReader(recordings: recordings) { _ in EmptyView() }.values.canEdit)
     }
+
+    /// The sidebar row on the real page: it shows the sidebar name (renamed folder), shows the
+    /// orange marker for a saved summary with lectures left (read from the account controller's
+    /// committed summaries, not from the Recordings controller), redraws when the commit changes
+    /// or the folder is renamed, and does NOT run its body on a playback tick.
+    /// Mutations: show `entry.name` instead of `entry.sidebarName`; never pass the marker;
+    /// drop `folders` from the sidebar cache key (the rename never arrives); read the window's
+    /// live summaries or wrap the rows in the progress reader (the tick reaches the row).
+    @Test(.timeLimit(.minutes(1))) func theSidebarRowShowsItsNameAndMarkerAndIgnoresTicks() async throws {
+        let page = try await HostedPage()
+        defer { RecordingsPageProbes.sidebarRow = nil; page.close() }
+        let (key, playing) = try await page.loadedCourse()
+        let course = try #require(page.fixture.controller.courses.first { RecmanCourseKey(course: $0) == key })
+        var drawn: [(name: String, marker: Bool)] = []
+        RecordingsPageProbes.sidebarRow = { drawn.append(($0, $1)) }
+        let auth = page.fixture.controller
+
+        auth.setWatchSummariesForTesting([key: CourseWatchSummary(done: 1, total: 4, remainingMinutes: 10, unknownDurationCount: 0)])
+        try await page.settle { drawn.last?.marker == true }
+        #expect(drawn.last?.marker == true, "a saved summary with lectures left shows the marker")
+
+        let cleaned = RecordingsPresentation.courseName(course)
+        auth.setCourseFoldersForTesting([course.id: "GAL"])
+        let expected = RecordingsPresentation.sidebarName(courseName: cleaned, courseDisplayName: course.displayName, courseID: course.id, localFolderName: "GAL")
+        #expect(expected != cleaned)
+        try await page.settle { drawn.last?.name == expected }
+        #expect(drawn.last?.name == expected, "the row follows the renamed folder, was \(drawn.last?.name ?? "never drawn")")
+
+        auth.setWatchSummariesForTesting([key: CourseWatchSummary(done: 4, total: 4, remainingMinutes: 0, unknownDurationCount: 0)])
+        try await page.settle { drawn.last?.marker == false }
+        #expect(drawn.last?.marker == false, "all done: the marker goes")
+
+        drawn = []
+        page.recordings.watchProgress.setLive(0.4, for: RecordingsStudyState.identity(playing))
+        try await page.settle()
+        #expect(drawn.isEmpty, "a tick re-ran \(drawn.count) sidebar row bod(ies)")
+    }
 }

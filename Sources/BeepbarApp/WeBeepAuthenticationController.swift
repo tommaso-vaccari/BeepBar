@@ -363,7 +363,42 @@ struct MenuBarSnapshot: Sendable {
     /// One line per synced course with a known watch summary ("Analisi 2 — 12/30 · ~14 h"), at
     /// most `WeBeepAuthenticationController.maxRecordingMenuLines`, already in the current
     /// language. Empty means the menu has no recordings section at all.
-    let recordingLines: [String]
+    let recordingLines: [RecordingMenuLine]
+}
+
+/// What a click on a course's recordings line in the menu bar carries to the main actor: who,
+/// which course, which archive key, and nothing else. The lecture itself is deliberately not in
+/// it: the main actor re-resolves the course's *current* next lecture when the click arrives
+/// (`WeBeepAuthenticationController.playNextRecording`), so a click on a menu drawn before a
+/// checkpoint plays what the student is missing now. A plain `Sendable` value, because it is the
+/// item's `representedObject` and is read by the `nonisolated` menu action, which must touch no
+/// main-actor state (issue #30).
+struct RecordingMenuTarget: Sendable, Equatable {
+    /// The WeBeep account (`recordingsOwnerUserID`) the line was drawn for: a click on a menu
+    /// drawn for another account is ignored.
+    let owner: Int
+    /// The WeBeep course the line stands for, which must still be synced when the click arrives.
+    let courseID: Int64
+    /// The archive key whose summary's `next` is played.
+    let key: RecmanCourseKey
+}
+
+/// One recordings line as the menu draws it, in one language (`recordingMenuSection`).
+/// `target` is nil for a line with nothing to play (every lecture done, or no known next
+/// lecture): such a line stays grey and has no action.
+struct RecordingMenuLine: Sendable, Equatable {
+    let title: String
+    /// "Riproduci: «Lezione 3»", only on a line with a target.
+    let toolTip: String?
+    let target: RecordingMenuTarget?
+}
+
+/// One recordings line in both languages, as `WeBeepAuthenticationController` keeps it between
+/// rebuilds (a language switch needs no rebuild). `hint` and `target` are both set or both nil.
+struct RecordingMenuEntry: Equatable {
+    let text: BilingualText
+    let hint: BilingualText?
+    let target: RecordingMenuTarget?
 }
 
 @MainActor final class WeBeepAuthenticationController: NSObject, ObservableObject {
@@ -384,9 +419,11 @@ struct MenuBarSnapshot: Sendable {
     // accountState, hasStoredCredential, recoveryBlocked, conflicts, rootURL, activeOperationID,
     // dataSaverPause), and
     // `setLanguage(_:)` calls it since every label depends on `AppLanguage.current`. The
-    // recordings lines (`recordingMenuLines`) are fed by courses, enabledCourseIDs and
-    // watchSummaries, whose `didSet` calls `recordingMenuInputsChanged()`, which rebuilds the
-    // lines and then calls `refreshMenuBarSnapshot()`. If you make
+    // recordings lines (`recordingMenuLines`) are fed by courses, enabledCourseIDs,
+    // courseFolders, watchSummaries and siteInfo (the account is the `owner` of each line's click
+    // target, so a menu drawn for one account never plays for another), whose `didSet` calls
+    // `recordingMenuInputsChanged()`, which rebuilds the lines (text, tooltip and click target)
+    // and then calls `refreshMenuBarSnapshot()`. If you make
     // those computed properties depend on anything else, add a matching
     // `didSet { refreshMenuBarSnapshot() }` to that property too, or the menu bar will silently
     // go stale instead of crashing loudly.
@@ -522,7 +559,9 @@ struct MenuBarSnapshot: Sendable {
             if recoveryBlocked != oldValue { configureBackgroundScheduler() }
         }
     }
-    @Published private(set) var courseFolders: [Int64: String] = [:]
+    @Published private(set) var courseFolders: [Int64: String] = [:] {
+        didSet { if courseFolders != oldValue { recordingMenuInputsChanged() } }
+    }
     @Published private(set) var courseRenameErrors: [Int64: String] = [:]
     @Published private(set) var renamingCourseID: Int64?
     let progressStore = SyncProgressStore()
@@ -546,6 +585,11 @@ struct MenuBarSnapshot: Sendable {
             // Only a controller that already exists can hold another account's session; one
             // created later checks the saved session's owner when it reads it.
             guard siteInfo?.userID != oldValue?.userID else { return }
+            // The account is each recordings line's click owner (`RecordingMenuTarget.owner`):
+            // rebuild the lines on every path below, even when `watchSummaries` ends up equal and
+            // its own `didSet` stays silent, or the menu would keep the previous account as owner
+            // and every click would be ignored (or, worse, the lines would outlive the account).
+            defer { recordingMenuInputsChanged() }
             guard let userID = siteInfo?.userID else {
                 // Signed out or another university: no account, so no account's numbers.
                 watchSummaries = [:]
@@ -575,14 +619,48 @@ struct MenuBarSnapshot: Sendable {
     /// "none", so this is never overwritten from the controller's state, only from its pushes.
     /// Cleared when the account goes; a push of `[:]` is a reset (turn-off, account change).
     /// A deselected course keeps its entry here and is only hidden by `recordingMenuLines`.
-    private(set) var watchSummaries: [RecmanCourseKey: CourseWatchSummary] = [:] {
+    ///
+    /// `@Published` so the Recordings sidebar's orange marker (which reads it, not the Recordings
+    /// controller's copy, empty until a listing loads) redraws on a commit and only then: it never
+    /// changes on a playback tick. Assigned only when the value changes, except by the account
+    /// handlers above. Everything observing `authentication` (every page, not only this sidebar)
+    /// redraws when a saved summary changes: at a checkpoint, a completion or a listing change,
+    /// never on ticks.
+    @Published private(set) var watchSummaries: [RecmanCourseKey: CourseWatchSummary] = [:] {
         didSet { if watchSummaries != oldValue { recordingMenuInputsChanged() } }
     }
-    /// The menu's recordings lines in both languages, rebuilt only when `courses`,
-    /// `enabledCourseIDs` or `watchSummaries` change, so the frequent snapshot refreshes during a
-    /// sync don't rerun the course-name regexes. Resolved to one language in
-    /// `refreshMenuBarSnapshot()`, which is why a language switch needs no rebuild here.
-    private(set) var recordingMenuLines: [BilingualText] = []
+
+    /// Reads the saved summaries when the Recordings page opens with none in memory: the seed
+    /// in `siteInfo.didSet` is empty when Recordings was switched on after the account became
+    /// known. Cheap (one settings read, once per appearance), never creates the Recordings
+    /// controller, and does nothing without an account or with Recordings off.
+    func seedWatchSummariesIfNeeded() {
+        guard watchSummaries.isEmpty, let userID = siteInfo?.userID, selectedSite.university == .polimi,
+              recordingsStorage?.isEnabled ?? RecordingsController.isSwitchedOn(in: operationDefaults),
+              let stored = RecordingsController.storedWatchSummaries(in: operationDefaults, owner: userID) else { return }
+        watchSummaries = stored
+    }
+
+#if DEBUG
+    /// Test seams for the sidebar tests: set what the page reads, as a commit or a rename would.
+    func setWatchSummariesForTesting(_ summaries: [RecmanCourseKey: CourseWatchSummary]) { watchSummaries = summaries }
+    func setCourseFoldersForTesting(_ folders: [Int64: String]) { courseFolders = folders }
+#endif
+    /// The menu's recordings lines in both languages, with their click targets, rebuilt only when
+    /// `courses`, `enabledCourseIDs`, `courseFolders`, `watchSummaries` or the account (`siteInfo`)
+    /// change, so the frequent snapshot refreshes during a sync don't rerun the course-name
+    /// regexes. Resolved to one language in `refreshMenuBarSnapshot()`, which is why a language
+    /// switch needs no rebuild here.
+    private(set) var recordingMenuLines: [RecordingMenuEntry] = []
+    /// While above zero (`restoreScopes`) a change of the menu's inputs only marks the lines stale;
+    /// the holder rebuilds once at the end.
+    private var menuRebuildHolds = 0
+    private var menuRebuildPending = false
+#if DEBUG
+    /// How many times the lines were actually recomputed (not held back): lets a test prove the
+    /// rebuild is coalesced during `restoreScopes`.
+    private(set) var menuRebuildCountForTesting = 0
+#endif
     private var database: SyncDatabase?
     /// Created on first use (the window, a sign-out), so a launch with the window closed doesn't
     /// read anything for a feature that may be off.
@@ -644,6 +722,10 @@ struct MenuBarSnapshot: Sendable {
     private var recordingsBrowserForTesting: (@MainActor () -> RecmanBrowsing)?
     /// Set by a test before the first use of `recordings`; the real player is never built in tests.
     var recordingsPlayerForTesting: (@MainActor () -> RecordingPlaying)?
+    /// Replaces opening the window on the Recordings page (`showRecordingsCourse`), so a test can
+    /// see that it was asked for, and for which course (nil: the page as it was), without a
+    /// window.
+    var showRecordingsPageForTesting: (@MainActor (Int64?) -> Void)?
     private var beforeReconciliationStateForTesting: (@MainActor () async -> Void)?
     /// Whether the last sync result to be encoded was encoded on the main thread; nil until one
     /// is (R01, #109). Set by the pre-encode in `finishReconciliation` and by the inline
@@ -1141,6 +1223,10 @@ struct MenuBarSnapshot: Sendable {
         // Pushed from the main actor (never read from the menu's AppKit callback). Each push is
         // the controller's whole picture, `[:]` included: that one is a reset.
         controller.onWatchSummaryChange = { [weak self] summaries in self?.watchSummaries = summaries }
+        // A menu Play that failed with no Recordings page on screen (session lapsed, lecture
+        // can't be opened): show that course's page, where the message or "Accedi con Polimi"
+        // explains it. Called on the main actor, never for a window Play.
+        controller.onMenuPlayNeedsPage = { [weak self] key in self?.showRecordingsCourse(for: key) }
 #if DEBUG
         if Self.isUIPreview && ProcessInfo.processInfo.arguments.contains("--watchlist-preview") {
             if controllerDefaultsHaveNoWatchlist {
@@ -1313,12 +1399,17 @@ struct MenuBarSnapshot: Sendable {
     /// purpose (a glance), and the window has them all.
     nonisolated static let maxRecordingMenuLines = 10
 
-    /// Rebuilds `recordingMenuLines` from its three inputs and refreshes the snapshot when they
-    /// changed. Called from the `didSet` of `courses`, `enabledCourseIDs` and `watchSummaries`
-    /// (see the invariant comment on `menuBarSnapshot`). Costs nothing when no summary is known
-    /// (every launch without Recordings), since the pure builder returns before any course.
+    /// Rebuilds `recordingMenuLines` from its five inputs and refreshes the snapshot when they
+    /// changed. Called from the `didSet` of `courses`, `enabledCourseIDs`, `courseFolders`,
+    /// `watchSummaries` and `siteInfo` (see the invariant comment on `menuBarSnapshot`). Costs
+    /// nothing when no summary is known (every launch without Recordings), since the pure builder
+    /// returns before any course.
     private func recordingMenuInputsChanged() {
-        let lines = Self.recordingMenuLines(courses: courses, enabledIDs: enabledCourseIDs, summaries: watchSummaries)
+        if menuRebuildHolds > 0 { menuRebuildPending = true; return }
+#if DEBUG
+        menuRebuildCountForTesting += 1
+#endif
+        let lines = Self.recordingMenuLines(courses: courses, enabledIDs: enabledCourseIDs, summaries: watchSummaries, owner: recordingsOwnerUserID, folders: courseFolders)
         guard lines != recordingMenuLines else { return }
         recordingMenuLines = lines
         refreshMenuBarSnapshot()
@@ -1334,26 +1425,129 @@ struct MenuBarSnapshot: Sendable {
     ///   (`RecordingsPresentation.syncedCourses`) still lists both rows, so either can be opened;
     ///   the menu is a glance, where the same numbers twice would read as two courses. The
     ///   difference between page and menu is intentional.
-    nonisolated static func recordingMenuLines(courses: [RemoteCourseSummary], enabledIDs: Set<Int64>, summaries: [RecmanCourseKey: CourseWatchSummary]) -> [BilingualText] {
+    /// - A line is clickable (has a `target` and a "Riproduci: «…»" hint) only when its summary
+    ///   has a `next` lecture that `RecordingsController.validatedNext` accepts and the account
+    ///   (`owner`) is known; otherwise it stays grey (every lecture done, nothing known to play,
+    ///   or a stored `next` that couldn't be played anyway). The click re-checks all of it
+    ///   (`menuPlayRecording`): the line only tells the student what a click would do.
+    /// - The line's name is the course's renamed local folder (`folders`), else its name without
+    ///   the part in parentheses at the end (`RecmanCourseSidebar.menuName`).
+    nonisolated static func recordingMenuLines(courses: [RemoteCourseSummary], enabledIDs: Set<Int64>, summaries: [RecmanCourseKey: CourseWatchSummary], owner: Int?, folders: [Int64: String] = [:]) -> [RecordingMenuEntry] {
         guard !summaries.isEmpty, !enabledIDs.isEmpty else { return [] }
-        var lines: [BilingualText] = []
+        var lines: [RecordingMenuEntry] = []
         var shown: Set<RecmanCourseKey> = []
         for course in courses where enabledIDs.contains(course.id) {
             guard let key = RecmanCourseKey(course: course), let summary = summaries[key], summary.total > 0,
                   shown.insert(key).inserted else { continue }
-            lines.append(RecordingWatchProgress.menuLine(courseName: RecordingsPresentation.courseName(course), summary))
+            let name = RecmanCourseSidebar.menuName(courseName: RecordingsPresentation.courseName(course), courseDisplayName: course.displayName, courseID: course.id, localFolderName: folders[course.id])
+            let text = RecordingWatchProgress.menuLine(courseName: name, summary)
+            if let owner, let next = summary.next, RecordingsController.validatedNext(next, for: key) {
+                lines.append(RecordingMenuEntry(
+                    text: text,
+                    hint: recordingMenuHint(title: RecordingsPresentation.title(next)),
+                    target: RecordingMenuTarget(owner: owner, courseID: course.id, key: key)
+                ))
+            } else {
+                lines.append(RecordingMenuEntry(text: text, hint: nil, target: nil))
+            }
             if lines.count == maxRecordingMenuLines { break }
         }
         return lines
     }
 
+    /// The tooltip of a clickable recordings line: "Riproduci: «title»" / "Play: “title”". The
+    /// archive's title can carry line breaks and runs of spaces, which a one-line tooltip would
+    /// show as gaps or extra lines, so every run of whitespace becomes one space; an empty title
+    /// (nothing left after that) gives just "Riproduci" / "Play" rather than empty quotes.
+    nonisolated static func recordingMenuHint(title: String) -> BilingualText {
+        let clean = title.split(whereSeparator: { $0.isWhitespace || $0.isNewline }).joined(separator: " ")
+        guard !clean.isEmpty else { return BilingualText("Riproduci", "Play") }
+        return BilingualText("Riproduci: «\(clean)»", "Play: “\(clean)”")
+    }
+
     /// The recordings section's header and lines in `language`. Takes the language explicitly
     /// (the app passes `AppLanguage.current`) so tests can check both without switching the
     /// process-global language; resolved at every snapshot refresh, never cached, so
-    /// `setLanguage(_:)` rebuilds it.
-    nonisolated static func recordingMenuSection(_ lines: [BilingualText], language: AppLanguage) -> (title: String, lines: [String]) {
+    /// `setLanguage(_:)` rebuilds it (title and tooltip alike; the target has no text).
+    nonisolated static func recordingMenuSection(_ lines: [RecordingMenuEntry], language: AppLanguage) -> (title: String, lines: [RecordingMenuLine]) {
         let pick = { (text: BilingualText) in language == .italian ? text.italian : text.english }
-        return (pick(BilingualText("Registrazioni", "Recordings")), lines.map(pick))
+        return (pick(BilingualText("Registrazioni", "Recordings")), lines.map {
+            RecordingMenuLine(title: pick($0.text), toolTip: $0.hint.map(pick), target: $0.target)
+        })
+    }
+
+    // MARK: Menu bar Play
+
+    /// A click on a course's recordings line, delivered on the main actor by
+    /// `StatusItemController.dispatchRecordingClick` (after its `Task { @MainActor in … }` hop).
+    /// Plays the course's current next lecture through the Play button's path, without opening
+    /// the window. The click is a stale snapshot (the menu may have been drawn before a sign-out,
+    /// an account change, a turn-off, a deselection or a checkpoint), so everything is re-checked
+    /// here (`menuPlayRecording`); a click that no longer applies does nothing and, in particular,
+    /// never creates the Recordings controller. Only an accepted click uses `recordings` (lazy:
+    /// an explicit user action). When the controller can't play without the window (Recordings
+    /// off for it, the Polimi session needs a sign-in), the course's Recordings page opens,
+    /// where the usual message or "Accedi con Polimi" shows.
+    func playNextRecording(_ target: RecordingMenuTarget) {
+        let switchOn = recordingsStorage?.isEnabled ?? RecordingsController.isSwitchedOn(in: operationDefaults)
+        guard let recording = Self.menuPlayRecording(target: target, owner: recordingsOwnerUserID, isPolimi: selectedSite.university == .polimi,
+                                                     switchOn: switchOn, enabledIDs: enabledCourseIDs, summaries: watchSummaries) else {
+            BeepbarLog.lifecycle.notice("Menu recording click ignored: no longer applies")
+            return
+        }
+        BeepbarLog.lifecycle.notice("Menu recording click: playing the course's next lecture")
+        if !startMenuPlay(recording, owner: target.owner) {
+            showRecordingsCourse(target.courseID)
+        }
+    }
+
+    /// The lecture a menu click on `target` may play, or nil when the click no longer applies:
+    /// - another account than the one the line was drawn for (`owner`), or none;
+    /// - not Polimi, or Recordings switched off;
+    /// - the course no longer synced;
+    /// - no known next lecture for the key (all done since, or a reset);
+    /// - a stored next that fails `RecordingsController.validatedNext`: it was read back from
+    ///   UserDefaults and is untrusted (another course or year, a foreign link).
+    /// Pure, so each rejection is tested without a controller or a window.
+    nonisolated static func menuPlayRecording(target: RecordingMenuTarget, owner: Int?, isPolimi: Bool, switchOn: Bool,
+                                              enabledIDs: Set<Int64>, summaries: [RecmanCourseKey: CourseWatchSummary]) -> RecmanRecording? {
+        guard let owner, owner == target.owner, isPolimi, switchOn, enabledIDs.contains(target.courseID),
+              let next = summaries[target.key]?.next, RecordingsController.validatedNext(next, for: target.key) else { return nil }
+        return next
+    }
+
+    /// The single call into the Recordings controller's menu Play, so the controller's signature
+    /// can change in one place. `owner` is the account the click was made for; the controller
+    /// ignores (true, nothing happens) a click whose owner isn't its own resume owner, and
+    /// answers false when it can't play without the window (off, sign-in needed or running, an
+    /// invalid stored next): the caller then shows the course's page.
+    private func startMenuPlay(_ recording: RecmanRecording, owner: Int) -> Bool {
+        recordings.playFromMenu(recording, owner: owner)
+    }
+
+    /// Opens BeepBar on the Recordings page of WeBeep course `courseID`: the page a menu Play
+    /// needs when it can't go on without the window (sign-in, a lecture that can't be opened).
+    private func showRecordingsCourse(_ courseID: Int64) {
+        recordings.selectDestination(.course(courseID))
+#if DEBUG
+        if let showRecordingsPageForTesting { showRecordingsPageForTesting(courseID); return }
+#endif
+        ConfigurationWindowController.shared.show(self, page: .recordings)
+    }
+
+    /// `onMenuPlayNeedsPage` hands over an archive key: the synced course with that key that the
+    /// menu showed (the first in sidebar order, as `recordingMenuLines` picks it), else any course
+    /// with it; with none (the course left the list meanwhile) the Recordings page opens as it was.
+    private func showRecordingsCourse(for key: RecmanCourseKey) {
+        let matching = courses.filter { RecmanCourseKey(course: $0) == key }
+        if let course = matching.first(where: { enabledCourseIDs.contains($0.id) }) ?? matching.first {
+            showRecordingsCourse(course.id)
+            return
+        }
+#if DEBUG
+        if let showRecordingsPageForTesting { showRecordingsPageForTesting(nil); return }
+#endif
+        ConfigurationWindowController.shared.show(self, page: .recordings)
     }
 
     /// One short line for the status menu; the full sentences live in the window.
@@ -2555,6 +2749,14 @@ struct MenuBarSnapshot: Sendable {
         let restoredSelection = Self.restoredEnabledCourseIDs(scopes: scopes, current: enabledCourseIDs, remoteIDs: remoteIDs)
         // @Published sends even for equal values; unchanged refreshes must leave the UI quiet.
         if enabledCourseIDs != restoredSelection { enabledCourseIDs = restoredSelection }
+        // `courseFolders` is assigned one course at a time below and each assignment would rebuild
+        // the menu lines (a name regex pass over every course: quadratic at launch). The rebuild
+        // is held back and runs once when the loop is done, whichever way it ends.
+        menuRebuildHolds += 1
+        defer {
+            menuRebuildHolds -= 1
+            if menuRebuildHolds == 0, menuRebuildPending { menuRebuildPending = false; recordingMenuInputsChanged() }
+        }
         for course in courses {
             if let scope = scopesByCourse[course.id], !scope.localFolder.isEmpty {
                 let replacement = LocalPathPolicy.generatedCourseFolderReplacement(

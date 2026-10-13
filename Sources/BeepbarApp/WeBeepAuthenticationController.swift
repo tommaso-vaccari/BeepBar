@@ -577,9 +577,31 @@ struct MenuBarSnapshot: Sendable {
     /// "none", so this is never overwritten from the controller's state, only from its pushes.
     /// Cleared when the account goes; a push of `[:]` is a reset (turn-off, account change).
     /// A deselected course keeps its entry here and is only hidden by `recordingMenuLines`.
-    private(set) var watchSummaries: [RecmanCourseKey: CourseWatchSummary] = [:] {
+    ///
+    /// `@Published` so the Recordings sidebar's orange marker (which reads it, not the Recordings
+    /// controller's copy, empty until a listing loads) redraws on a commit and only then: it never
+    /// changes on a playback tick. Assigned only when the value changes, except by the account
+    /// handlers above.
+    @Published private(set) var watchSummaries: [RecmanCourseKey: CourseWatchSummary] = [:] {
         didSet { if watchSummaries != oldValue { recordingMenuInputsChanged() } }
     }
+
+    /// Reads the saved summaries when the Recordings page opens with none in memory: the seed
+    /// in `siteInfo.didSet` is empty when Recordings was switched on after the account became
+    /// known. Cheap (one settings read, once per appearance), never creates the Recordings
+    /// controller, and does nothing without an account or with Recordings off.
+    func seedWatchSummariesIfNeeded() {
+        guard watchSummaries.isEmpty, let userID = siteInfo?.userID, selectedSite.university == .polimi,
+              recordingsStorage?.isEnabled ?? RecordingsController.isSwitchedOn(in: operationDefaults),
+              let stored = RecordingsController.storedWatchSummaries(in: operationDefaults, owner: userID) else { return }
+        watchSummaries = stored
+    }
+
+#if DEBUG
+    /// Test seams for the sidebar tests: set what the page reads, as a commit or a rename would.
+    func setWatchSummariesForTesting(_ summaries: [RecmanCourseKey: CourseWatchSummary]) { watchSummaries = summaries }
+    func setCourseFoldersForTesting(_ folders: [Int64: String]) { courseFolders = folders }
+#endif
     /// The menu's recordings lines in both languages, rebuilt only when `courses`,
     /// `enabledCourseIDs` or `watchSummaries` change, so the frequent snapshot refreshes during a
     /// sync don't rerun the course-name regexes. Resolved to one language in

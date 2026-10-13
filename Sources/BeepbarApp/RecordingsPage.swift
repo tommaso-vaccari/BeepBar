@@ -48,7 +48,8 @@ enum RecordingsPresentation {
 
     static func matches(_ recording: RecmanRecording, query: String) -> Bool { RecmanPresentation.matches(recording, query: query) }
 
-    /// The sidebar row's title: the course name, or the renamed local folder plus the teacher.
+    /// The sidebar row's title: the course name, or the renamed local folder plus the part in
+    /// parentheses at the end of the WeBeep name (usually the teacher).
     /// See `RecmanCourseSidebar.sidebarName`.
     static func sidebarName(courseName: String, courseDisplayName: String, courseID: Int64 = 0, localFolderName: String?) -> String {
         RecmanCourseSidebar.sidebarName(courseName: courseName, courseDisplayName: courseDisplayName, courseID: courseID, localFolderName: localFolderName)
@@ -261,6 +262,7 @@ struct RecordingsPage: View {
             }
         }
         .onAppear {
+            authentication.seedWatchSummariesIfNeeded()
             recordings.pageAppeared()
             refresh()
         }
@@ -359,19 +361,20 @@ struct RecordingsPage: View {
                 .tag(RecordingsDestination.watchlist)
             }
             Section(tr("I tuoi corsi", "Your courses")) {
-                // The reader re-runs the closure when the saved summaries move (a checkpoint, a tick
-                // box, a listing): `refreshWatchSummary` sets the window's summary just before it
-                // saves the committed one. The marker reads the committed `watchSummaries`, so
-                // a ~30 s tick changes no value; `CourseRow` is `Equatable` on plain values and
-                // its body does not run for it.
-                WatchProgressReader(recordings: recordings) { _ in
-                    ForEach(model.searchable) { entry in
-                        let summary = recordings.watchSummaries[entry.key]
-                        CourseRow(name: entry.sidebarName, key: entry.key, subtitle: CourseRow.subtitle(for: recordings.listing(for: entry.key)), newCount: recordings.newCount(for: entry.key),
-                                  toWatch: RecordingsPresentation.hasLecturesToWatch(summary: summary) ? summary.map(RecordingsPresentation.lecturesToWatchValue) : nil)
-                            .equatable()
-                            .tag(RecordingsDestination.course(entry.course.id))
-                    }
+                // The marker reads the committed summaries the menu bar uses
+                // (`authentication.watchSummaries`: seeded from storage when the account is
+                // known, so it shows before any listing loads or without a Polimi session, and
+                // `@Published`, so the page redraws on a commit). Not the window's live
+                // summaries and not a `WatchProgressReader`: a ~30 s tick publishes neither this
+                // page nor these values. `CourseRow` is `Equatable` on plain values.
+                // The row shows the sidebar name (renamed folder + trailing part); the detail
+                // header keeps the WeBeep name on purpose: owner decision, sidebar and menu only.
+                ForEach(model.searchable) { entry in
+                    let summary = authentication.watchSummaries[entry.key]
+                    CourseRow(name: entry.sidebarName, key: entry.key, subtitle: CourseRow.subtitle(for: recordings.listing(for: entry.key)), newCount: recordings.newCount(for: entry.key),
+                              toWatch: RecordingsPresentation.hasLecturesToWatch(summary: summary) ? summary.map(RecordingsPresentation.lecturesToWatchValue) : nil)
+                        .equatable()
+                        .tag(RecordingsDestination.course(entry.course.id))
                 }
             }
             if !model.unsearchable.isEmpty {
@@ -425,6 +428,9 @@ private struct CourseRow: View, Equatable {
     let toWatch: BilingualText?
 
     var body: some View {
+#if DEBUG
+        let _ = RecordingsPageProbes.sidebarRow?(name, toWatch != nil)
+#endif
         HStack(spacing: 8) {
             VStack(alignment: .leading, spacing: 2) {
                 Text(name)
@@ -860,6 +866,8 @@ struct WatchProgressReader<Content: View>: View {
 @MainActor enum RecordingsPageProbes {
     static var row: ((RecordingRow) -> Void)?
     static var header: ((String) -> Void)?
+    /// A sidebar course row's body: its title and whether the orange marker shows.
+    static var sidebarRow: ((_ name: String, _ marker: Bool) -> Void)?
 }
 #endif
 

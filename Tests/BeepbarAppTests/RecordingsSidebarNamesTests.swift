@@ -83,14 +83,33 @@ struct RecordingsSidebarNamesTests {
         #expect(RecmanCourseSidebar.Inputs(courses: courses, enabledIDs: [1], folders: [1: "A"]) != .init(courses: courses, enabledIDs: [1], folders: [1: "B"]))
     }
 
-    /// Searching finds the course under the original or the renamed name, and not under others.
-    @Test func searchMatchesBothNames() {
-        let renamed = name("GAL")
-        #expect(RecmanCourseSidebar.matches(query: "gal", courseName: Self.cleaned, sidebarName: renamed))
-        #expect(RecmanCourseSidebar.matches(query: "geometria", courseName: Self.cleaned, sidebarName: renamed))
-        #expect(RecmanCourseSidebar.matches(query: "  sonnet ", courseName: Self.cleaned, sidebarName: renamed))
-        #expect(RecmanCourseSidebar.matches(query: "", courseName: Self.cleaned, sidebarName: renamed))
-        #expect(!RecmanCourseSidebar.matches(query: "fisica", courseName: Self.cleaned, sidebarName: renamed))
+    /// Regression for the name-edit scenario: BeepBar keeps a folder already in its naming scheme
+    /// when WeBeep edits the course name, so a generated slug of an OLDER name must not be mistaken
+    /// for a student's rename. Fails if "generated" means only "equals the current name's default".
+    @Test func aGeneratedFolderOfAnOlderNameIsNotARename() {
+        let edited = "058167 - ANALISI 2 (ROSSI) [2026-27]"
+        let cleaned = "ANALISI 2 (ROSSI)"
+        #expect(name("058167-analisi-2-2026-27", cleaned: cleaned, raw: edited) == cleaned)
+        #expect(name("analisi-2", cleaned: cleaned, raw: edited) == cleaned)
+        #expect(name("analisi-2-11-3", cleaned: cleaned, raw: edited) == cleaned, "counter-suffixed default")
+        #expect(name("fisica-è-più-bella", cleaned: cleaned, raw: edited) == cleaned, "accented lowercase slug")
+        #expect(name("Analisi 2 (11)", cleaned: cleaned, raw: edited) == cleaned, "legacy NAME (id)")
+        #expect(RecmanCourseSidebar.menuName(courseName: cleaned, courseDisplayName: edited, courseID: 11, localFolderName: "058167-analisi-2-2026-27") == "ANALISI 2")
+    }
+
+    /// The documented trade-off of the slug heuristic: mixed or upper case and names with spaces
+    /// are honoured, an all-lowercase single word is not. Fails if the heuristic is widened or removed.
+    @Test func theSlugHeuristicHonoursMixedCaseButNotPlainLowercase() {
+        #expect(name("GAL") == "GAL (Claude Sonnet)")
+        #expect(name("Gal") == "Gal (Claude Sonnet)")
+        #expect(name("Geometria 2") == "Geometria 2 (Claude Sonnet)")
+        #expect(name("gal") == Self.cleaned)
+    }
+
+    /// The trailing part in parentheses is not always a teacher (a section here): it is kept
+    /// as it is. Fails if the code assumed a teacher's shape.
+    @Test func aSectionInParenthesesIsKeptLikeATeacher() {
+        #expect(name("AN2", cleaned: "ANALISI 2 (sezione B)", raw: "058167 - ANALISI 2 (sezione B) [2026-27]") == "AN2 (sezione B)")
     }
 
     // MARK: Orange marker

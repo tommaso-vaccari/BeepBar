@@ -139,9 +139,7 @@ struct RecordingsMenuBarTests {
         #expect(lines(controller) == ["ANALISI 2 — 12/30 · ~14 h"])
 
         controller.setCoursesForTesting([course(11, "058167 - ANALISI MATEMATICA 2 [2026-27]")])
-        // The folder BeepBar generated for the old name is still saved (this seam doesn't run the
-        // restore that regenerates it), so it now reads as the student's choice and names the line.
-        #expect(lines(controller) == ["058167-analisi-2-2026-27 — 12/30 · ~14 h"], "renamed on WeBeep")
+        #expect(lines(controller) == ["ANALISI MATEMATICA 2 — 12/30 · ~14 h"], "renamed on WeBeep")
         controller.setCoursesForTesting([])
         #expect(lines(controller).isEmpty, "no longer in the list")
         #expect(controller.enabledCourseIDs == [11])
@@ -467,6 +465,25 @@ struct RecordingsMenuBarTests {
         #expect(defaults.data(forKey: RecordingsController.watchSummaryKey) == nil)
         #expect(lines(controller).isEmpty)
         await recordings.settleSessionFile()
+    }
+
+    /// Opening the Recordings page seeds the saved summaries when the account's seed was empty
+    /// (Recordings switched on after sign-in), without creating the Recordings controller, and
+    /// does not overwrite summaries already in memory. Guards the sidebar's orange markers
+    /// missing until a listing loads.
+    /// Mutation: make `seedWatchSummariesIfNeeded` a no-op, or drop its `isEmpty` guard.
+    @Test func openingThePageSeedsSavedSummariesOnce() async throws {
+        defer { try? FileManager.default.removeItem(at: root) }
+        let defaults = WeBeepAuthenticationController.throwawayDefaults()
+        let controller = try await signedIn(defaults: defaults)
+        #expect(controller.watchSummaries.isEmpty)
+        try storeSummaries([analisi: analisiSummary], owner: 7, in: defaults)
+        controller.seedWatchSummariesIfNeeded()
+        #expect(controller.watchSummaries == [analisi: analisiSummary])
+        #expect(controller.recordingsIfCreated == nil)
+        try storeSummaries([analisi: fisicaSummary], owner: 7, in: defaults)
+        controller.seedWatchSummariesIfNeeded()
+        #expect(controller.watchSummaries == [analisi: analisiSummary], "not read again over what is in memory")
     }
 
     /// Renaming a course's local folder redraws its menu line with the folder name alone, and

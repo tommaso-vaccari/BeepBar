@@ -16,6 +16,7 @@
 - In Recordings, a course whose folder you renamed shows the folder name followed by the part in parentheses at the end of its WeBeep name, usually the teacher (for example “GAL (Claude Sonnet)”), and an orange dot marks the courses with saved progress that still have lectures to watch. The menu bar’s Recordings lines show the same folder name, without that part.
 - Opening BeepBar shows your courses straight away, as they were at the last successful refresh, while the current list loads in the background; offline, the saved list stays visible and says it is not yet confirmed. Every sync still asks your university for the current list first. The very first opening after updating still waits for the list once.
 - Cancelling sync stops large local file checks promptly while file changes already underway still finish safely.
+- While a lecture plays in BeepBar, the Mac's Now Playing (in Control Center and the menu bar) shows the lecture's title, its course and the course's picture from WeBeep, instead of just "BeepBar". The keyboard's media keys and Control Center's play, pause, skip and scrub controls drive BeepBar's player.
 
 - Refreshing unchanged courses avoids unnecessary interface updates while renamed courses and changed selections still appear normally.
 - Opening BeepBar restores the previous sync result with less work, keeping the interface available while a large Activity summary is read.

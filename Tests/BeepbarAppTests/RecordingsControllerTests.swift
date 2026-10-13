@@ -129,6 +129,8 @@ import BeepbarCore
     var onProgress: ((String, TimeInterval, TimeInterval?) -> Void)?
     var onFailure: ((String, RecordingPlaybackFailure) -> Void)?
     private(set) var plays: [Play] = []
+    /// The Now Playing metadata of each play, in order (nil: the caller gave none).
+    private(set) var metadatas: [RecordingPlaybackMetadata?] = []
     /// The `index`th play, or a recorded failure instead of a crash when the controller started
     /// fewer: an out-of-range index would end the whole test process and hide every other result.
     func play(_ index: Int, sourceLocation: SourceLocation = #_sourceLocation) throws -> Play {
@@ -141,7 +143,8 @@ import BeepbarCore
     /// The duration the fake lecture reports.
     var duration: TimeInterval? = 6_000
 
-    func play(_ url: URL, title: String, cookies: [HTTPCookie], startAt: TimeInterval?, recordingID: String) {
+    func play(_ url: URL, title: String, cookies: [HTTPCookie], startAt: TimeInterval?, recordingID: String, metadata: RecordingPlaybackMetadata?) {
+        metadatas.append(metadata)
         report(.replaced)
         plays.append(Play(url: url, title: title, startAt: startAt, recordingID: recordingID, cookies: cookies.count))
         isOpen = true
@@ -361,6 +364,8 @@ final class SessionFileProbe: @unchecked Sendable {
     /// The native player, a fake that never touches AVFoundation, and how many were made.
     let player = FakeRecordingPlayer()
     var playersMade = 0
+    /// The WeBeep course list the controller reads when a lecture starts (Now Playing metadata).
+    var courses: [RemoteCourseSummary] = []
     /// What the WeBeep profile answers for the user's email (nil: the profile has none, or it
     /// can't be read), and how often it was asked.
     var profileEmail: String?
@@ -431,6 +436,7 @@ struct RecordingsControllerTests {
             copy: { world.copied.append($0) },
             now: { MainActor.assumeIsolated { world.now } },
             makePlayer: { world.playersMade += 1; return world.player },
+            courses: { world.courses },
             fetchProfileEmail: {
                 world.profileEmailCalls += 1
                 await world.profileGate?.wait()
@@ -2250,6 +2256,79 @@ struct RecordingsControllerTests {
         #expect(world.player.isOpen)
         #expect(world.player.closes == 0)
         controller.turnOff()
+    }
+
+    // MARK: Now Playing metadata (issue #148 follow-up)
+
+    private static let pictureA = URL(string: "https://webeep.polimi.it/webservice/pluginfile.php/1/course/overviewfiles/a.png")!
+    private static let pictureB = URL(string: "https://webeep.polimi.it/webservice/pluginfile.php/2/course/overviewfiles/b.png")!
+
+    private func webeepCourse(_ id: Int64, name: String, picture: URL?) -> RemoteCourseSummary {
+        RemoteCourseSummary(id: id, shortName: "058167 - \(name) [2026-27]", displayName: "058167 - \(name) [2026-27]", isVisible: true, startDate: nil, endDate: nil, imageURL: picture)
+    }
+
+    /// A Play hands the player the lecture's title, its course's name (without code and year) and
+    /// the course picture's address. Guards against Now Playing showing "BeepBar", or the title
+    /// alone, because the controller forgot to pass the metadata.
+    @Test func aPlayHandsThePlayerTheLectureCourseAndPicture() async throws {
+        defer { cleanUp() }
+        world.courses = [webeepCourse(7, name: "NUMERICAL LINEAR ALGEBRA", picture: Self.pictureA)]
+        browser.streamResults["a"] = [.success(stream("a"))]
+        let controller = await readyController()
+        controller.play(recording("a"))
+        await settle("a playing") { world.player.plays.count == 1 }
+        let metadata = try #require(world.player.metadatas.first ?? nil)
+        #expect(metadata == RecordingPlaybackMetadata(title: "Lezione a", courseName: "NUMERICAL LINEAR ALGEBRA", artworkURL: Self.pictureA))
+        controller.turnOff()
+    }
+
+    /// The fresh stream of a recovery keeps the same course and picture, even if the page moved
+    /// to another course meanwhile. Guards against a stream recovery dropping the course and the
+    /// picture from Now Playing.
+    @Test func aRecoveryKeepsTheCourseAndPicture() async throws {
+        defer { cleanUp() }
+        world.courses = [webeepCourse(7, name: "NUMERICAL LINEAR ALGEBRA", picture: Self.pictureA)]
+        browser.streamResults["a"] = [.success(stream("a")), .success(stream("a"))]
+        let controller = await readyController()
+        controller.play(recording("a"))
+        await settle("a playing") { world.player.plays.count == 1 }
+        world.courses = []
+        world.player.failDuringPlayback(at: 1_234)
+        await settle("resumed") { world.player.plays.count == 2 }
+        #expect(world.player.metadatas.count == 2)
+        #expect(world.player.metadatas[1] == world.player.metadatas[0])
+        #expect(world.player.metadatas[1]?.artworkURL == Self.pictureA)
+        controller.turnOff()
+    }
+
+    /// Two WeBeep courses with the same archive key (one course split in two sections): the one
+    /// the student has selected on the page names the lecture, not neither. Guards against
+    /// re-matching by code and year alone, which finds two and drops course and picture.
+    @Test func twoCoursesSharingAKeyUseTheSelectedOne() async throws {
+        defer { cleanUp() }
+        world.courses = [webeepCourse(7, name: "ALGEBRA SEZ. A", picture: Self.pictureA), webeepCourse(8, name: "ALGEBRA SEZ. B", picture: Self.pictureB)]
+        browser.streamResults["a"] = [.success(stream("a"))]
+        let controller = await readyController()
+        controller.selectDestination(.course(8))
+        controller.play(recording("a"))
+        await settle("a playing") { world.player.plays.count == 1 }
+        let metadata = try #require(world.player.metadatas.first ?? nil)
+        #expect(metadata.courseName == "ALGEBRA SEZ. B")
+        #expect(metadata.artworkURL == Self.pictureB)
+        controller.turnOff()
+    }
+
+    /// Pure: the preferred course wins only when it is the recording's own; otherwise exactly one
+    /// course with the recording's key, nil for none or two.
+    @Test func thePlaybackCourseRules() {
+        let a = webeepCourse(7, name: "A", picture: nil)
+        let b = webeepCourse(8, name: "B", picture: nil)
+        let other = RemoteCourseSummary(id: 9, shortName: "099999 - X [2026-27]", displayName: "099999 - X [2026-27]", isVisible: true, startDate: nil, endDate: nil)
+        let lecture = recording("a")
+        #expect(RecordingsController.playbackCourse(for: lecture, preferredID: 8, in: [a, b]) == b)
+        #expect(RecordingsController.playbackCourse(for: lecture, preferredID: nil, in: [a, b]) == nil)
+        #expect(RecordingsController.playbackCourse(for: lecture, preferredID: 9, in: [a, other]) == a)
+        #expect(RecordingsController.playbackCourse(for: lecture, preferredID: nil, in: [other]) == nil)
     }
 
     // MARK: Recovery

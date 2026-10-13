@@ -1199,7 +1199,14 @@ struct RecordingMenuEntry: Equatable {
     private func makeRecordings() -> RecordingsController {
         var store = RecordingsSessionStore.standard
         var makeBrowser: @MainActor () -> RecmanBrowsing = { RecmanWebSession() }
-        var makePlayer: @MainActor () -> RecordingPlaying = { RecordingPlayerController() }
+        // The player fetches the course picture for Now Playing through `courseImage`, which
+        // holds the token; the player never sees it.
+        var makePlayer: @MainActor () -> RecordingPlaying = { [weak self] in
+            RecordingPlayerController(artworkLoader: { [weak self] url in
+                guard let self else { throw CancellationError() }
+                return try await self.courseImage(url)
+            })
+        }
 #if DEBUG
         if let recordingsPlayerForTesting { makePlayer = recordingsPlayerForTesting }
         if let recordingsStoreForTesting { store = recordingsStoreForTesting }
@@ -1218,6 +1225,7 @@ struct RecordingMenuEntry: Equatable {
             ownerUserID: { [weak self] in self?.recordingsOwnerUserID },
             isAvailable: { [weak self] in self?.selectedSite.university == .polimi },
             makePlayer: makePlayer,
+            courses: { [weak self] in self?.courses ?? [] },
             fetchProfileEmail: { [weak self] in await self?.profileEmail() }
         )
         // Pushed from the main actor (never read from the menu's AppKit callback). Each push is
@@ -1249,6 +1257,20 @@ struct RecordingMenuEntry: Equatable {
     /// failure (no function, no token, offline, an odd answer) is nil: the student then types the address, and
     /// nothing reaches the sync status or the log. The address is personal data and is never
     /// logged here.
+    /// The bytes of a WeBeep course picture (`RemoteCourseSummary.imageURL`) for the artwork of
+    /// the lecture playing in Now Playing (issue #148 follow-up). Runs on the main actor only to
+    /// read the client, the account and the token; the request itself is `fetchCourseImage`'s
+    /// (bounded, no redirects, image only, token never logged). A picture that arrives after the
+    /// account or the site changed is refused: it belongs to the previous identity.
+    private func courseImage(_ url: URL) async throws -> Data {
+        let client = apiClient
+        let userID = siteInfo?.userID
+        let token = try await credentialVault.load(.nonInteractive)
+        let data = try await client.fetchCourseImage(url, token: token)
+        guard apiClient === client, siteInfo?.userID == userID else { throw CancellationError() }
+        return data
+    }
+
     private func profileEmail() async -> String? {
         guard let info = siteInfo, info.availableFunctions.contains(WeBeepAPIClient.ownEmailFunction) else { return nil }
         do {
@@ -1496,7 +1518,7 @@ struct RecordingMenuEntry: Equatable {
             return
         }
         BeepbarLog.lifecycle.notice("Menu recording click: playing the course's next lecture")
-        if !startMenuPlay(recording, owner: target.owner) {
+        if !startMenuPlay(recording, owner: target.owner, courseID: target.courseID) {
             showRecordingsCourse(target.courseID)
         }
     }
@@ -1521,8 +1543,8 @@ struct RecordingMenuEntry: Equatable {
     /// ignores (true, nothing happens) a click whose owner isn't its own resume owner, and
     /// answers false when it can't play without the window (off, sign-in needed or running, an
     /// invalid stored next): the caller then shows the course's page.
-    private func startMenuPlay(_ recording: RecmanRecording, owner: Int) -> Bool {
-        recordings.playFromMenu(recording, owner: owner)
+    private func startMenuPlay(_ recording: RecmanRecording, owner: Int, courseID: Int64) -> Bool {
+        recordings.playFromMenu(recording, owner: owner, courseID: courseID)
     }
 
     /// Opens BeepBar on the Recordings page of WeBeep course `courseID`: the page a menu Play

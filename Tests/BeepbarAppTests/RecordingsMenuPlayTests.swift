@@ -52,6 +52,7 @@ struct RecordingsMenuPlayTests {
             copy: { world.copied.append($0) },
             now: { MainActor.assumeIsolated { world.now } },
             makePlayer: { world.playersMade += 1; return world.player },
+            courses: { world.courses },
             bringPlayerForward: { calls.broughtForward += 1 }
         )
         controller.onMenuPlayNeedsPage = { [weak controller] key in
@@ -280,6 +281,27 @@ struct RecordingsMenuPlayTests {
         #expect(browser.calls.filter { $0.hasPrefix("stream ") || $0.hasPrefix("list ") } == ["stream a", "list \(course.courseCode)"], "the Play first, then the listing")
         #expect(calls.needsPage.isEmpty)
         #expect(world.opened.isEmpty)
+        controller.turnOff()
+    }
+
+    /// A menu Play names the lecture after the course of the line clicked, even when another
+    /// WeBeep course shares its archive key. Guards against the menu path re-matching by code
+    /// and year alone, which finds two courses and drops Now Playing's course name and picture.
+    @Test func aMenuPlayUsesTheClickedLinesCourseForNowPlaying() async throws {
+        defer { cleanUp() }
+        let picture = URL(string: "https://webeep.polimi.it/webservice/pluginfile.php/8/course/overviewfiles/b.png")!
+        world.courses = [
+            RemoteCourseSummary(id: 7, shortName: "058167 - SEZ A [2026-27]", displayName: "058167 - SEZ A [2026-27]", isVisible: true, startDate: nil, endDate: nil),
+            RemoteCourseSummary(id: 8, shortName: "058167 - SEZ B [2026-27]", displayName: "058167 - SEZ B [2026-27]", isVisible: true, startDate: nil, endDate: nil, imageURL: picture),
+        ]
+        let controller = await signedInController()
+        browser.listResults[course.courseCode] = .success([recording("a")])
+        browser.streamResults["a"] = [.success(stream("a"))]
+        #expect(controller.playFromMenu(recording("a"), owner: 42, courseID: 8))
+        await settle("a playing") { world.player.plays.count == 1 }
+        let metadata = try #require(world.player.metadatas.first ?? nil)
+        #expect(metadata.courseName == "SEZ B")
+        #expect(metadata.artworkURL == picture)
         controller.turnOff()
     }
 

@@ -38,6 +38,7 @@
 		C4A7E0000000000000000001 /* RecordingsWatchProgressModel.swift in Sources */ = {isa = PBXBuildFile; fileRef = C4A7E0000000000000000002 /* RecordingsWatchProgressModel.swift */; };
 		B14800000000000000000001 /* RecordingPlayerController.swift in Sources */ = {isa = PBXBuildFile; fileRef = B14800000000000000000002 /* RecordingPlayerController.swift */; };
 		B14800000000000000000003 /* RecordingPlayerControls.swift in Sources */ = {isa = PBXBuildFile; fileRef = B14800000000000000000004 /* RecordingPlayerControls.swift */; };
+		B148000000000000000000A1 /* RecordingNowPlaying.swift in Sources */ = {isa = PBXBuildFile; fileRef = B148000000000000000000A2 /* RecordingNowPlaying.swift */; };
 		B14800000000000000000A01 /* PlayerZoom.swift in Sources */ = {isa = PBXBuildFile; fileRef = B14800000000000000000A02 /* PlayerZoom.swift */; };
 /* End PBXBuildFile section */
 
@@ -74,6 +75,7 @@
 		C4A7E0000000000000000002 /* RecordingsWatchProgressModel.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = RecordingsWatchProgressModel.swift; sourceTree = "<group>"; };
 		B14800000000000000000002 /* RecordingPlayerController.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = RecordingPlayerController.swift; sourceTree = "<group>"; };
 		B14800000000000000000004 /* RecordingPlayerControls.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = RecordingPlayerControls.swift; sourceTree = "<group>"; };
+		B148000000000000000000A2 /* RecordingNowPlaying.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = RecordingNowPlaying.swift; sourceTree = "<group>"; };
 		B14800000000000000000A02 /* PlayerZoom.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PlayerZoom.swift; sourceTree = "<group>"; };
 /* End PBXFileReference section */
 
@@ -142,6 +144,7 @@
 				C4A7E0000000000000000002 /* RecordingsWatchProgressModel.swift */,
 				B14800000000000000000002 /* RecordingPlayerController.swift */,
 				B14800000000000000000004 /* RecordingPlayerControls.swift */,
+				B148000000000000000000A2 /* RecordingNowPlaying.swift */,
 				B14800000000000000000A02 /* PlayerZoom.swift */,
 			);
 			name = Sources;
@@ -260,6 +263,7 @@
 				C4A7E0000000000000000001 /* RecordingsWatchProgressModel.swift in Sources */,
 				B14800000000000000000001 /* RecordingPlayerController.swift in Sources */,
 				B14800000000000000000003 /* RecordingPlayerControls.swift in Sources */,
+				B148000000000000000000A1 /* RecordingNowPlaying.swift in Sources */,
 				B14800000000000000000A01 /* PlayerZoom.swift in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;

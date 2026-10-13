@@ -36,7 +36,7 @@ struct RecordingPlayerControllerTests {
                                 toggleFullScreen: @escaping @MainActor (NSWindow) -> Void = { _ in }) -> RecordingPlayerController {
         RecordingPlayerController(present: { _ in }, makePlayerView: makePlayerView, makePlayer: makePlayer, activationPolicy: policy.control,
                                   frameAutosaveName: frameAutosaveName, defaults: defaults, notificationCenter: notificationCenter,
-                                  toggleFullScreen: toggleFullScreen)
+                                  toggleFullScreen: toggleFullScreen, nowPlaying: SilentNowPlaying())
     }
 
     private static func player(of view: NSView?) -> AVPlayer? {

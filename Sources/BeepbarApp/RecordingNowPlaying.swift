@@ -121,8 +121,9 @@ enum RecordingNowPlayingPolicy {
     static let playingState = 1
     static let pausedState = 2
     static let stoppedState = 4
-    /// `MPRemoteCommandHandlerStatus`: success, and "no such content" for a command that cannot
-    /// apply (a seek before the lecture has a timeline).
+    /// `MPRemoteCommandHandlerStatus.success`, the only status returned: the handler answers at
+    /// once and hands the command to the main actor, where one that cannot apply (a seek before
+    /// the lecture has a timeline) simply does nothing.
     static let commandSucceeded = 0
     /// The skip the remote commands offer, as the player's own ±10 s (`PlayerShortcut`).
     static let skipInterval: TimeInterval = 10
@@ -190,7 +191,7 @@ final class RecordingArtworkImage: Equatable, @unchecked Sendable {
 enum RecordingArtwork {
     /// Fetches the bytes at an address `RecordingNowPlayingPolicy.acceptsArtworkURL` accepted.
     /// Injected into the player, so tests never reach the network and the token stays with the
-    /// code that owns it (`webeep(client:token:)`).
+    /// code that owns it (`WeBeepAuthenticationController.courseImage`).
     typealias Loader = @Sendable (URL) async throws -> Data
 
     static let maximumBytes = WeBeepAPIClient.courseImageByteLimit
@@ -206,13 +207,6 @@ enum RecordingArtwork {
         case timedOut
         case tooLarge
         case undecodable
-    }
-
-    /// The loader for WeBeep: `token` is read at each fetch, so a sign-out or an account change
-    /// is followed, and the request goes through `WeBeepAPIClient.fetchCourseImage` (no redirect,
-    /// capped, image only, token never logged).
-    static func webeep(client: WeBeepAPIClient, token: @escaping @Sendable () async throws -> String) -> Loader {
-        { url in try await client.fetchCourseImage(url, token: try await token()) }
     }
 
     /// Fetches and decodes `url`. Runs off the main actor (`@concurrent`), so neither the wait nor
@@ -348,7 +342,7 @@ enum RecordingArtwork {
         guard let center else { return }
         var info = RecordingNowPlayingPolicy.info(state)
         if let artwork = artwork(for: state.artwork) { info[RecordingNowPlayingPolicy.Key.artwork] = artwork }
-        center.setValue(info, forKey: "nowPlayingInfo")
+        Self.setInfo(info, on: center)
         if center.responds(to: NSSelectorFromString("setPlaybackState:")) {
             let playback = state.isPlaying ? RecordingNowPlayingPolicy.playingState : RecordingNowPlayingPolicy.pausedState
             center.setValue(playback, forKey: "playbackState")
@@ -363,7 +357,7 @@ enum RecordingArtwork {
         artworkObject = nil
         guard let center else { return }
         self.center = nil
-        center.setValue(nil, forKey: "nowPlayingInfo")
+        Self.setInfo(nil, on: center)
         if center.responds(to: NSSelectorFromString("setPlaybackState:")) {
             center.setValue(RecordingNowPlayingPolicy.stoppedState, forKey: "playbackState")
         }
@@ -404,6 +398,12 @@ enum RecordingArtwork {
         guard let allocated = alloc(artworkClass, allocSelector),
               let initialized = initialize(allocated, initSelector, picture.size, handler as AnyObject) else { return nil }
         return Unmanaged<NSObject>.fromOpaque(initialized).takeRetainedValue()
+    }
+
+    /// Sets `nowPlayingInfo`, only if the center has the setter (see the type's comment).
+    private static func setInfo(_ info: [String: Any]?, on center: NSObject) {
+        guard center.responds(to: NSSelectorFromString("setNowPlayingInfo:")) else { return }
+        center.setValue(info, forKey: "nowPlayingInfo")
     }
 
     /// `[Class sharedThing]` for a class loaded at runtime, or nil.

@@ -76,6 +76,9 @@ public enum WeBeepCourseImage {
               var components = URLComponents(url: url, resolvingAgainstBaseURL: false) else { return nil }
         if (components.queryItems ?? []).contains(where: { ["token", "wstoken"].contains($0.name.lowercased()) }) { return nil }
         if components.percentEncodedPath.lowercased().hasSuffix(".svg") { return nil }
+        // No `.` or `..` segment, spelled out or percent-encoded (`%2e%2e`): the prefix check
+        // must not be escaped into another script of the site once the server normalizes it.
+        if components.path.split(separator: "/", omittingEmptySubsequences: false).contains(where: { $0 == "." || $0 == ".." }) { return nil }
         if components.percentEncodedPath.hasPrefix("/pluginfile.php/") {
             components.percentEncodedPath = "/webservice" + components.percentEncodedPath
         }

@@ -193,6 +193,16 @@ struct RecordingsListing: Equatable {
     // MARK: Native playback state (#148)
 
     private let makePlayer: @MainActor () -> RecordingPlaying
+    /// The WeBeep course list, read when a lecture starts: its course's name and picture go to
+    /// macOS's Now Playing (`RecordingPlaybackMetadata`, issue #148 follow-up).
+    private let courses: @MainActor () -> [RemoteCourseSummary]
+    /// The WeBeep course of the last menu Play (`RecordingMenuTarget.courseID`), by recording id:
+    /// the course the student clicked, used for Now Playing when two courses share an archive key.
+    private var menuPlayCourse: (recordingID: String, courseID: Int64)?
+    /// The Now Playing metadata of the lecture last handed to the player, so a recovery
+    /// (`startPlayer` again with a fresh stream) shows the same course and picture even if the
+    /// page has moved to another course meanwhile. Cleared with the player on identity change.
+    private var playbackMetadata: (recordingID: String, metadata: RecordingPlaybackMetadata)?
     /// The WeBeep profile's email address, or nil: any failure is "ask the user", never an error.
     private let fetchProfileEmail: @MainActor () async -> String?
     /// Brings the lecture already playing forward for a menu Play of that same lecture
@@ -400,12 +410,14 @@ struct RecordingsListing: Equatable {
         },
         now: @escaping () -> Date = Date.init,
         makePlayer: @escaping @MainActor () -> RecordingPlaying = { RecordingPlayerController() },
+        courses: @escaping @MainActor () -> [RemoteCourseSummary] = { [] },
         fetchProfileEmail: @escaping @MainActor () async -> String? = { nil },
         bringPlayerForward: @escaping @MainActor () -> Void = { NSApplication.shared.activate() },
         listingCapacity: Int = RecordingsController.listingCapacity,
         playbackURLCapacity: Int = RecordingsController.playbackURLCapacity
     ) {
         self.makePlayer = makePlayer
+        self.courses = courses
         self.fetchProfileEmail = fetchProfileEmail
         self.bringPlayerForward = bringPlayerForward
         listings = BoundedCache(capacity: listingCapacity)
@@ -804,7 +816,7 @@ struct RecordingsListing: Equatable {
     /// `recording` comes from the saved summary (UserDefaults), so it is untrusted: the caller
     /// checks it with `validatedNext` first, and it is checked again here; an invalid one is
     /// never opened, and the course page is asked for instead (false) so the click isn't silent.
-    func playFromMenu(_ recording: RecmanRecording, owner: Int) -> Bool {
+    func playFromMenu(_ recording: RecmanRecording, owner: Int, courseID: Int64? = nil) -> Bool {
         guard isEnabled else { return false }
         switch access {
         case .off, .needsSignIn, .signingIn: return false
@@ -818,6 +830,7 @@ struct RecordingsListing: Equatable {
         }
         open(recording, .play)
         menuPlay = (openingRequest, key)
+        menuPlayCourse = courseID.map { (recording.id, $0) }
         if needsLoad(key, force: false), !queue.contains(.list(key)) {
             listings[key, default: RecordingsListing()].isLoading = true
             listings[key]?.problem = nil
@@ -1308,11 +1321,39 @@ struct RecordingsListing: Equatable {
         currentLectureID = recording.id
         // The replaced lecture's report inside `play` reads this to tell an end from a re-play.
         pendingPlayID = recording.id
-        player.play(stream.url, title: recording.title.isEmpty ? (stream.title ?? "") : recording.title, cookies: [], startAt: startAt, recordingID: recording.id)
+        let metadata = playbackMetadata(for: recording, stream: stream)
+        playbackMetadata = (recording.id, metadata)
+        player.play(stream.url, title: recording.title.isEmpty ? (stream.title ?? "") : recording.title, cookies: [], startAt: startAt, recordingID: recording.id, metadata: metadata)
         pendingPlayID = nil
         nowPlaying = nowPlaying.filter { $0.key == recording.id }
         recoveredLectures = recoveredLectures.intersection(nowPlaying.keys)
         startWatchSession(for: recording, at: startAt ?? 0, streamDuration: stream.duration)
+    }
+
+    /// What Now Playing shows for `recording`: the same metadata as before when this is the
+    /// lecture already handed to the player (a recovery, a Play again), else its title with the
+    /// course the student chose (`playbackCourse`).
+    private func playbackMetadata(for recording: RecmanRecording, stream: RecordingStream) -> RecordingPlaybackMetadata {
+        if let playbackMetadata, playbackMetadata.recordingID == recording.id { return playbackMetadata.metadata }
+        var preferred: Int64?
+        if let menuPlayCourse, menuPlayCourse.recordingID == recording.id { preferred = menuPlayCourse.courseID }
+        else if case .course(let id) = study.destination { preferred = id }
+        menuPlayCourse = nil
+        let course = Self.playbackCourse(for: recording, preferredID: preferred, in: courses())
+        return RecordingPlaybackMetadata(recording: recording, course: course, streamTitle: stream.title)
+    }
+
+    /// The WeBeep course `recording` is played from: the course the student chose
+    /// (`preferredID`: the menu line's course, or the page's selected course) when it is the
+    /// recording's own (same archive key); otherwise the one course with that key, nil when none
+    /// or several. Two WeBeep courses can share a key (a course split in sections): re-matching
+    /// alone would then drop the name and picture of the one the student opened.
+    nonisolated static func playbackCourse(for recording: RecmanRecording, preferredID: Int64?, in courses: [RemoteCourseSummary]) -> RemoteCourseSummary? {
+        if let preferredID, let course = courses.first(where: { $0.id == preferredID }),
+           let key = RecmanCourseKey(course: course), key == RecmanCourseKey(courseCode: recording.courseCode, academicYear: recording.academicYear) {
+            return course
+        }
+        return RecordingPlaybackMetadata.course(of: recording, in: courses)
     }
 
     private func currentPlayer() -> RecordingPlaying {
@@ -1346,6 +1387,8 @@ struct RecordingsListing: Equatable {
         nowPlaying = [:]
         currentLectureID = nil
         recoveredLectures = []
+        playbackMetadata = nil
+        menuPlayCourse = nil
         // The sessions belong to the account going away; `forgetSeen` clears the rest.
         sessions = [:]
         player?.close()

@@ -95,9 +95,17 @@ struct RecordingNowPlayingTests {
         }
     }
 
+    /// A player whose `timeControlStatus` a test can force, to stand for buffering, which a
+    /// local file never does on demand.
+    final class StatusPlayer: AVPlayer, @unchecked Sendable {
+        var forcedStatus: AVPlayer.TimeControlStatus?
+        override var timeControlStatus: AVPlayer.TimeControlStatus { forcedStatus ?? super.timeControlStatus }
+    }
+
     private func makeController(publisher: FakePublisher, loader: RecordingArtwork.Loader? = nil,
-                                makePlayerView: @escaping @MainActor () -> NSView? = AVKitLoader.makePlayerView) -> RecordingPlayerController {
-        RecordingPlayerController(present: { _ in }, makePlayerView: makePlayerView,
+                                makePlayerView: @escaping @MainActor () -> NSView? = AVKitLoader.makePlayerView,
+                                makePlayer: @escaping @MainActor () -> AVPlayer = { AVPlayer() }) -> RecordingPlayerController {
+        RecordingPlayerController(present: { _ in }, makePlayerView: makePlayerView, makePlayer: makePlayer,
                                   activationPolicy: ActivationPolicyControl(current: { .regular }, set: { _ in }),
                                   frameAutosaveName: nil, defaults: PlayerTestDefaults.throwaway(),
                                   nowPlaying: publisher, artworkLoader: loader)
@@ -413,7 +421,7 @@ struct RecordingNowPlayingTests {
         let publisher = FakePublisher()
         let gate = GatedLoader()
         let controller = makeController(publisher: publisher, loader: gate.loader)
-        controller.play(media, title: "Lezione 7", cookies: [], startAt: nil, recordingID: "7")
+        controller.play(media, title: "Lezione 7", cookies: [], startAt: nil, recordingID: "7", metadata: nil)
         #expect(controller.window?.title == "Lezione 7")
         #expect(publisher.published.last?.title == "Lezione 7")
         #expect(publisher.published.last?.artist == "")
@@ -435,7 +443,7 @@ struct RecordingNowPlayingTests {
         let publisher = FakePublisher()
         let controller = makeController(publisher: publisher)
         #expect(publisher.activations == 0)
-        controller.play(media, title: "1", cookies: [], startAt: nil, recordingID: "1")
+        controller.play(media, title: "1", cookies: [], startAt: nil, recordingID: "1", metadata: nil)
         let view = try #require(controller.playerView)
         #expect(view.value(forKey: "updatesNowPlayingInfoCenter") as? Bool == false)
         #expect(controller.isPublishingNowPlaying)
@@ -444,7 +452,7 @@ struct RecordingNowPlayingTests {
         let missing = FakePublisher()
         missing.available = false
         let fallback = makeController(publisher: missing)
-        fallback.play(media, title: "1", cookies: [], startAt: nil, recordingID: "1")
+        fallback.play(media, title: "1", cookies: [], startAt: nil, recordingID: "1", metadata: nil)
         let avkitView = try #require(fallback.playerView)
         #expect(avkitView.value(forKey: "updatesNowPlayingInfoCenter") as? Bool == true)
         #expect(fallback.isPublishingNowPlaying == false)
@@ -459,7 +467,7 @@ struct RecordingNowPlayingTests {
         let media = try await TestMedia.shared.url()
         let publisher = FakePublisher()
         let controller = makeController(publisher: publisher)
-        controller.play(media, title: "1", cookies: [], startAt: nil, recordingID: "1")
+        controller.play(media, title: "1", cookies: [], startAt: nil, recordingID: "1", metadata: nil)
         await Self.waitUntil { publisher.published.last?.duration != nil && publisher.published.last?.isPlaying == true }
         #expect(abs((publisher.published.last?.duration ?? 0) - TestMedia.duration) < 1)
         controller.pause()
@@ -474,7 +482,7 @@ struct RecordingNowPlayingTests {
         let media = try await TestMedia.shared.url()
         let publisher = FakePublisher()
         let controller = makeController(publisher: publisher)
-        controller.play(media, title: "1", cookies: [], startAt: nil, recordingID: "1")
+        controller.play(media, title: "1", cookies: [], startAt: nil, recordingID: "1", metadata: nil)
         await Self.waitUntil { controller.isCurrentItemReady }
         let send = try #require(publisher.onCommand)
         send(.pause)
@@ -502,6 +510,8 @@ struct RecordingNowPlayingTests {
         let first = system.activate(onCommand: { _ in })
         let again = system.activate(onCommand: { _ in })
         #expect(first && again)
+        // Every command has exactly one target, ours: a second activate adds none.
+        for name in Self.commandNames { #expect(try Self.targetCount(name) == 1, "\(name)") }
         let picture = RecordingArtworkImage(try #require(RecordingArtwork.decode(Self.png(width: 32, height: 32))))
         system.publish(NowPlayingState(title: "Lezione", artist: "Corso", duration: 60, elapsed: 1, rate: 1, defaultRate: 1, isPlaying: true, artwork: picture))
         let center = try #require((NSClassFromString("MPNowPlayingInfoCenter") as? NSObject.Type)?.perform(NSSelectorFromString("defaultCenter"))?.takeUnretainedValue() as? NSObject)
@@ -512,9 +522,137 @@ struct RecordingNowPlayingTests {
         #expect(artist == "Corso")
         let artwork = try #require(info[RecordingNowPlayingPolicy.Key.artwork] as? NSObject)
         #expect(NSStringFromClass(type(of: artwork)).contains("MPMediaItemArtwork"))
+        // The numbers MediaPlayer reads: video, playing; then paused.
+        let mediaType = info[RecordingNowPlayingPolicy.Key.mediaType] as? Int
+        #expect(mediaType == 2)
+        let playing = center.value(forKey: "playbackState") as? Int
+        #expect(playing == 1)
+        system.publish(NowPlayingState(title: "Lezione", artist: "Corso", duration: 60, elapsed: 1, rate: 0, defaultRate: 1, isPlaying: false, artwork: picture))
+        let paused = center.value(forKey: "playbackState") as? Int
+        #expect(paused == 2)
         system.deactivate()
         #expect(center.value(forKey: "nowPlayingInfo") == nil)
+        let stopped = center.value(forKey: "playbackState") as? Int
+        #expect(stopped == 4)
+        for name in Self.commandNames { #expect(try Self.targetCount(name) == 0, "\(name) still has a target") }
         system.deactivate()
+        // Activated again (the next lecture window): one target each, not two.
+        let reactivated = system.activate(onCommand: { _ in })
+        #expect(reactivated)
+        for name in Self.commandNames { #expect(try Self.targetCount(name) == 1, "\(name)") }
+        system.deactivate()
+    }
+
+    private static let commandNames = ["playCommand", "pauseCommand", "togglePlayPauseCommand", "skipForwardCommand", "skipBackwardCommand", "changePlaybackPositionCommand"]
+
+    /// How many targets a real `MPRemoteCommand` holds: its `_handlers` dictionary when the
+    /// class has one (read through the runtime, never key-value coding on a missing key), else
+    /// 1 or 0 from its `hasTargets`.
+    private static func targetCount(_ name: String) throws -> Int {
+        let center = try #require((NSClassFromString("MPRemoteCommandCenter") as? NSObject.Type)?.perform(NSSelectorFromString("sharedCommandCenter"))?.takeUnretainedValue() as? NSObject)
+        let command = try #require(center.value(forKey: name) as? NSObject)
+        if let ivar = class_getInstanceVariable(type(of: command), "_handlers"), let handlers = object_getIvar(command, ivar) as? NSDictionary {
+            return handlers.count
+        }
+        try #require(command.responds(to: NSSelectorFromString("hasTargets")))
+        return (command.value(forKey: "hasTargets") as? Bool) == true ? 1 : 0
+    }
+
+    // MARK: Publication events
+
+    /// While the player buffers, the record says rate 0, so Control Center does not run the
+    /// clock ahead of a lecture that is not moving. Guards against publishing `player.rate`
+    /// (the requested rate) during `waitingToPlay…`.
+    @Test(.timeLimit(.minutes(1))) func bufferingPublishesNoMovingClock() async throws {
+        let media = try await TestMedia.shared.url()
+        let publisher = FakePublisher()
+        var made: StatusPlayer?
+        let controller = makeController(publisher: publisher, makePlayer: { let player = StatusPlayer(); made = player; return player })
+        controller.play(media, title: "1", cookies: [], startAt: nil, recordingID: "1", metadata: nil)
+        await Self.waitUntil { controller.isCurrentItemReady && publisher.published.last?.rate == 1 }
+        made?.forcedStatus = .waitingToPlayAtSpecifiedRate
+        controller.selectSpeed(1.5)
+        #expect(controller.player?.rate == 1.5)
+        #expect(publisher.published.last?.rate == 0)
+        #expect(publisher.published.last?.defaultRate == 1.5)
+        made?.forcedStatus = nil
+        controller.close()
+    }
+
+    /// Without a record (MediaPlayer missing, AVKit publishing) no picture is fetched: nothing
+    /// would show it. Guards against network use for nothing.
+    @Test(.timeLimit(.minutes(1))) func noPictureIsFetchedWithoutARecord() async throws {
+        let media = try await TestMedia.shared.url()
+        let missing = FakePublisher()
+        missing.available = false
+        let gate = GatedLoader()
+        let controller = makeController(publisher: missing, loader: gate.loader)
+        controller.play(media, title: "1", cookies: [], startAt: nil, recordingID: "1", metadata: Self.metadata())
+        await Self.settle()
+        #expect(gate.fetchCount == 0)
+        #expect(controller.artworkFetches == 0)
+        controller.close()
+    }
+
+    /// A failed fetch is tried again by the next lecture of the same course (once per play).
+    /// Guards against a network blip leaving the course without its picture until relaunch.
+    @Test(.timeLimit(.minutes(1))) func aFailedPictureIsRetriedByTheNextPlay() async throws {
+        let media = try await TestMedia.shared.url()
+        let gate = GatedLoader()
+        gate.answer(Self.courseA, with: .failure(URLError(.timedOut)))
+        let controller = makeController(publisher: FakePublisher(), loader: gate.loader)
+        controller.play(media, title: "1", cookies: [], startAt: nil, recordingID: "1", metadata: Self.metadata("Uno"))
+        await Self.waitUntil { gate.fetchCount == 1 && controller.artworkURL == nil }
+        gate.answer(Self.courseA, with: .success(Self.png(width: 16, height: 16)))
+        controller.play(media, title: "2", cookies: [], startAt: nil, recordingID: "2", metadata: Self.metadata("Due"))
+        await Self.waitUntil { controller.artwork != nil }
+        #expect(gate.fetchCount == 2)
+        controller.close()
+    }
+
+    /// An identical record is not published twice; a seek that lands and a speed change are.
+    /// Guards against redundant work on every event (R4), a Control Center timeline left at the
+    /// old position after scrubbing (R6), and a stale speed (R7).
+    @Test(.timeLimit(.minutes(1))) func theRecordIsRepublishedOnlyWhenItChanges() async throws {
+        let media = try await TestMedia.shared.url()
+        let publisher = FakePublisher()
+        let controller = makeController(publisher: publisher)
+        controller.play(media, title: "1", cookies: [], startAt: nil, recordingID: "1", metadata: nil)
+        await Self.waitUntil { controller.isCurrentItemReady }
+        controller.pause()
+        await Self.waitUntil { publisher.published.last?.isPlaying == false }
+        await Self.settle()
+        let count = publisher.published.count
+        controller.selectSpeed(1)  // the speed it already has: the same record
+        #expect(publisher.published.count == count)
+
+        // The seek lands while playing: the record then says 20 s, not the old position.
+        publisher.onCommand?(.play)
+        await Self.waitUntil { publisher.published.last?.isPlaying == true }
+        publisher.onCommand?(.seek(20))
+        await Self.waitUntil { controller.pendingSeekTarget == nil && ((publisher.published.last?.elapsed ?? 0) >= 19) }
+        controller.selectSpeed(2)
+        #expect(publisher.published.last?.defaultRate == 2)
+        controller.close()
+    }
+
+    /// A remote Play while the resume seek is under way does not start the lecture at 0: it
+    /// only asks for playback once the resume lands. Guards against Control Center's play
+    /// button bypassing the resume (R5).
+    @Test(.timeLimit(.minutes(1))) func aRemotePlayDuringTheResumeWaitsForIt() async throws {
+        let media = try await TestMedia.shared.url()
+        let publisher = FakePublisher()
+        let controller = makeController(publisher: publisher)
+        controller.play(media, title: "1", cookies: [], startAt: 30, recordingID: "1", metadata: nil)
+        #expect(controller.isResuming)
+        controller.pause()
+        publisher.onCommand?(.play)
+        #expect(controller.player?.rate == 0)
+        #expect(controller.playWhenSettled)
+        await Self.waitUntil { !controller.isResuming && controller.player?.rate != 0 }
+        let position = controller.player?.currentTime().seconds ?? 0
+        #expect(position >= 28)
+        controller.close()
     }
 
     /// The app never links MediaPlayer: no source imports it and neither build system links it.

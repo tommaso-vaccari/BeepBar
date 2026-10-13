@@ -39,13 +39,6 @@ import OSLog
     func adoptPolicyToRestore(_ policy: NSApplication.ActivationPolicy)
 }
 
-extension RecordingPlaying {
-    /// A play without Now Playing metadata: the window title is the only text shown.
-    func play(_ url: URL, title: String, cookies: [HTTPCookie], startAt: TimeInterval?, recordingID: String) {
-        play(url, title: title, cookies: cookies, startAt: startAt, recordingID: recordingID, metadata: nil)
-    }
-}
-
 /// One report of where the student stopped in a lecture (`RecordingPlaying.onPositionCheckpoint`).
 ///
 /// The reason is part of the report because the caller treats the moments differently: a pause
@@ -346,7 +339,8 @@ enum RecordingPlayerError: Error {
     ///     to see real ticks within the 60 s fixture.
     ///   - nowPlaying: publishes the Now Playing record and receives the remote commands; tests
     ///     pass a fake.
-    ///   - artworkLoader: fetches a course picture (`RecordingArtwork.webeep` holds the token);
+    ///   - artworkLoader: fetches a course picture (`WeBeepAuthenticationController.courseImage`
+    ///     holds the token);
     ///     nil fetches nothing and Now Playing shows the app's icon.
     init(present: @escaping @MainActor (NSWindow) -> Void = RecordingPlayerController.bringToFront,
          makePlayerView: @escaping @MainActor () -> NSView? = AVKitLoader.makePlayerView,
@@ -993,7 +987,9 @@ enum RecordingPlayerError: Error {
             artist: metadata.courseName,
             duration: player.currentItem.flatMap { Self.seconds($0.duration) },
             elapsed: reportedPosition(of: player),
-            rate: player.rate,
+            // Only a lecture actually playing advances: while it buffers (`waitingToPlay…`) the
+            // system must not run the clock on from a rate the player has not reached.
+            rate: player.timeControlStatus == .playing ? player.rate : 0,
             defaultRate: appliedSpeed,
             isPlaying: player.timeControlStatus != .paused,
             artwork: artwork)
@@ -1013,6 +1009,12 @@ enum RecordingPlayerError: Error {
     private func updateArtwork(_ url: URL?) {
         guard url != artworkURL else { return }
         cancelArtwork()
+        // No record, no picture: when AVKit publishes (MediaPlayer missing) nothing would show
+        // it, so nothing is fetched.
+        guard isPublishingNowPlaying else {
+            artworkURL = nil
+            return
+        }
         artworkURL = url
         guard let url, let artworkLoader else { return }
         let serial = artworkSerial
@@ -1034,6 +1036,9 @@ enum RecordingPlayerError: Error {
             artwork = image
             publishNowPlaying()
         case .failure(let error):
+            // Forgotten, so the next lecture of this course tries again (once per play): a
+            // network blip must not leave the course without its picture for the session.
+            artworkURL = nil
             // The record keeps its title and course, with the app's icon. Never the address.
             if !(error is CancellationError) {
                 Self.log.notice("Course artwork unavailable reason=\(RecordingArtwork.logDescription(error), privacy: .public)")

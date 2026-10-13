@@ -52,6 +52,16 @@ final class FakePlayerView: NSView {
     @objc dynamic var player: AVPlayer?
 }
 
+/// A Now Playing publisher that takes over (so AVKit publishes nothing either) and does nothing:
+/// player tests must not register remote commands with the real system, or the media keys of
+/// the developer running `swift test` would go to the test runner. Only
+/// `RecordingNowPlayingTests.theSystemPublisherLoadsAndClears` uses the real one.
+@MainActor final class SilentNowPlaying: NowPlayingPublishing {
+    func activate(onCommand: @escaping @MainActor (NowPlayingCommand) -> Void) -> Bool { true }
+    func publish(_ state: NowPlayingState) {}
+    func deactivate() {}
+}
+
 /// A view without a `player` key: key-value coding on it would raise an uncatchable exception.
 final class ViewWithoutPlayer: NSView {}
 
@@ -148,7 +158,7 @@ final class SeekRecordingPlayer: CountingPlayer, @unchecked Sendable {
 extension RecordingPlayerController {
     /// Test shorthand: the title doubles as the recording id.
     func play(_ url: URL, title: String, cookies: [HTTPCookie], startAt: TimeInterval? = nil) {
-        play(url, title: title, cookies: cookies, startAt: startAt, recordingID: title)
+        play(url, title: title, cookies: cookies, startAt: startAt, recordingID: title, metadata: nil)
     }
 }
 
@@ -197,7 +207,7 @@ struct RecordingPlayerMVPTests {
                                                    activationPolicy: policy, frameAutosaveName: nil, defaults: defaults,
                                                    notificationCenter: notificationCenter,
                                                    toggleFullScreen: { _ in recorder?.fullScreenToggles += 1 },
-                                                   progressInterval: progressInterval)
+                                                   progressInterval: progressInterval, nowPlaying: SilentNowPlaying())
         if let recorder {
             controller.onPositionCheckpoint = { checkpoint in
                 recorder.checkpoints.append(checkpoint)
@@ -679,14 +689,14 @@ struct RecordingPlayerMVPTests {
         let media = try await TestMedia.shared.url()
 
         // Replaced by a lecture with a resume position: held paused, so no observer at all.
-        controller.play(media, title: "Altra", cookies: [], startAt: 30, recordingID: "rec-2")
+        controller.play(media, title: "Altra", cookies: [], startAt: 30, recordingID: "rec-2", metadata: nil)
         #expect(player.active == 0, "the replaced lecture's observer is gone at once")
         #expect(recorder.checkpoints.last?.reason == .replaced)
         try await Self.waitUntil { controller.isStartSettled && player.active == 1 }
 
         // Replaced while playing, without a resume position: the old observer goes, one new one.
         let removed = player.counts.withLock { $0.removed }
-        controller.play(media, title: "Terza", cookies: [], startAt: nil, recordingID: "rec-3")
+        controller.play(media, title: "Terza", cookies: [], startAt: nil, recordingID: "rec-3", metadata: nil)
         #expect(player.counts.withLock { $0.removed } == removed + 1)
         #expect(player.active == 1, "re-added within `play`, not left to a status report that may never come")
         try await Self.waitUntil { player.timeControlStatus == .playing && player.active == 1 }
@@ -742,7 +752,7 @@ struct RecordingPlayerMVPTests {
         try await playReady(controller)
         let old = controller.generation
         let media = try await TestMedia.shared.url()
-        controller.play(media, title: "Altra", cookies: [], startAt: nil, recordingID: "rec-2")
+        controller.play(media, title: "Altra", cookies: [], startAt: nil, recordingID: "rec-2", metadata: nil)
         try await Self.waitUntil { controller.isStartSettled && controller.progressObserverSerial != nil }
         let serial = try #require(controller.progressObserverSerial)
         recorder.ticks.removeAll()
@@ -1035,7 +1045,7 @@ struct RecordingPlayerMVPTests {
         let log = PolicyLog()
         let controller = RecordingPlayerController(present: { _ in }, makePlayerView: { FakePlayerView() },
                                                    activationPolicy: ActivationPolicyControl(current: { log.current }, set: { log.current = $0; log.sets.append($0) }),
-                                                   frameAutosaveName: nil, defaults: PlayerTestDefaults.throwaway())
+                                                   frameAutosaveName: nil, defaults: PlayerTestDefaults.throwaway(), nowPlaying: SilentNowPlaying())
         let media = try await TestMedia.shared.url()
         controller.play(media, title: "Lezione", cookies: [], startAt: nil)
         // BeepBar was already regular when the lecture opened, so the player holds nothing to restore.
@@ -1047,7 +1057,7 @@ struct RecordingPlayerMVPTests {
         let idle = PolicyLog()
         let idlePlayer = RecordingPlayerController(present: { _ in }, makePlayerView: { FakePlayerView() },
                                                    activationPolicy: ActivationPolicyControl(current: { idle.current }, set: { idle.current = $0; idle.sets.append($0) }),
-                                                   frameAutosaveName: nil, defaults: PlayerTestDefaults.throwaway())
+                                                   frameAutosaveName: nil, defaults: PlayerTestDefaults.throwaway(), nowPlaying: SilentNowPlaying())
         idlePlayer.adoptPolicyToRestore(.accessory)
         idlePlayer.close()
         #expect(idle.sets.isEmpty)
@@ -1078,7 +1088,7 @@ struct RecordingPlayerMVPTests {
         try await park(controller, at: 40)
         let before = recorder.checkpoints.count
         let media = try await TestMedia.shared.url()
-        controller.play(media, title: "Altra", cookies: [], startAt: nil, recordingID: "rec-2")
+        controller.play(media, title: "Altra", cookies: [], startAt: nil, recordingID: "rec-2", metadata: nil)
         #expect(recorder.checkpoints.count == before + 1)
         #expect(abs((recorder.checkpoints.last?.position ?? 0) - 40) < 0.5)
         #expect(recorder.checkpoints.last?.id == "Lezione", "The replaced lecture's id, not the new one")

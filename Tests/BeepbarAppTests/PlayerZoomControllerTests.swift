@@ -71,7 +71,8 @@ struct PlayerZoomControllerTests {
         let policy = ActivationPolicyControl(current: { .regular }, set: { _ in })
         let controller = RecordingPlayerController(present: { _ in }, makePlayerView: makePlayerView, makePlayer: makePlayer,
                                                    activationPolicy: policy, frameAutosaveName: nil, defaults: defaults,
-                                                   notificationCenter: notificationCenter, toggleFullScreen: { _ in })
+                                                   notificationCenter: notificationCenter, toggleFullScreen: { _ in },
+                                                   nowPlaying: SilentNowPlaying())
         if let recorder {
             controller.onFailure = { _, failure in recorder.failures.append(failure) }
             controller.onPositionCheckpoint = { recorder.checkpoints.append($0) }
@@ -81,7 +82,7 @@ struct PlayerZoomControllerTests {
 
     private func playReady(_ controller: RecordingPlayerController, id: String = "Lezione", startAt: TimeInterval? = nil) async throws {
         let media = try await TestMedia.shared.url()
-        controller.play(media, title: id, cookies: [], startAt: startAt, recordingID: id)
+        controller.play(media, title: id, cookies: [], startAt: startAt, recordingID: id, metadata: nil)
         try await Self.waitUntil { controller.isStartSettled }
     }
 
@@ -268,7 +269,7 @@ struct PlayerZoomControllerTests {
         #expect(controller.playerView === view, "same window and view")
 
         let media = try await TestMedia.shared.url()
-        controller.play(media, title: "Altra", cookies: [], startAt: nil, recordingID: "Altra")
+        controller.play(media, title: "Altra", cookies: [], startAt: nil, recordingID: "Altra", metadata: nil)
         #expect(controller.zoom.scale == 1 && controller.zoom.origin == .zero, "another lecture starts at fit")
         #expect(view.magnifications.last?.scale == 1)
         #expect(view.scrollView.magnification == 1)
@@ -304,7 +305,7 @@ struct PlayerZoomControllerTests {
     @Test func resizesAndANewItemReclamp() async throws {
         let controller = makeController()
         let media = try await TestMedia.shared.url()
-        controller.play(media, title: "Lezione", cookies: [], startAt: nil, recordingID: "Lezione")
+        controller.play(media, title: "Lezione", cookies: [], startAt: nil, recordingID: "Lezione", metadata: nil)
         let (window, view) = try parts(controller)
         // Before the item is ready: the whole view limits the pan, so x 50 is allowed.
         controller.handleZoomInput(.magnify(1, at: CGPoint(x: 100, y: 270)))

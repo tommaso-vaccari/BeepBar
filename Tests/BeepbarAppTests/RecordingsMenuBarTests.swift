@@ -385,8 +385,8 @@ struct RecordingsMenuBarTests {
         for item in menu.items.dropFirst(2) { #expect(!item.isEnabled) }
     }
 
-    /// The whole menu `menuNeedsUpdate` draws, in order: status, detail, action, the recordings
-    /// section, separator, Open, Quit; without lines, no recordings items at all. The three
+    /// The whole menu `menuNeedsUpdate` draws, in order: status, detail, action, Open (right under
+    /// Sync now), the recordings section, separator, Quit; without lines, no recordings items at all. The three
     /// actions keep their selectors. Guards the section being wired into the real menu and not
     /// displacing the existing items.
     /// Mutation: delete the `addRecordingItems` call in `build`.
@@ -395,16 +395,16 @@ struct RecordingsMenuBarTests {
         menu.addItem(withTitle: "left over from the last opening", action: nil, keyEquivalent: "")
         StatusItemController.build(from: snapshot(["Analisi 2 — 12/30 · ~14 h", "Fisica — 3/10 · ~45 min"]), into: menu, target: nil)
         #expect(menu.items.map { $0.isSeparatorItem ? "—" : $0.title } == [
-            "Sincronizzato", "3 nuovi", "Sincronizza ora",
+            "Sincronizzato", "3 nuovi", "Sincronizza ora", "Apri BeepBar…",
             "—", "Registrazioni", "Analisi 2 — 12/30 · ~14 h", "Fisica — 3/10 · ~45 min",
-            "—", "Apri BeepBar…", "Esci da BeepBar",
+            "—", "Esci da BeepBar",
         ])
         #expect(menu.items[2].action == NSSelectorFromString("performAction"))
-        #expect(menu.items[8].action == NSSelectorFromString("openConfiguration"))
+        #expect(menu.items[3].action == NSSelectorFromString("openConfiguration"))
         #expect(menu.items[9].action == NSSelectorFromString("quit"))
 
         StatusItemController.build(from: snapshot([String]()), into: menu, target: nil)
-        #expect(menu.items.map { $0.isSeparatorItem ? "—" : $0.title } == ["Sincronizzato", "3 nuovi", "Sincronizza ora", "—", "Apri BeepBar…", "Esci da BeepBar"])
+        #expect(menu.items.map { $0.isSeparatorItem ? "—" : $0.title } == ["Sincronizzato", "3 nuovi", "Sincronizza ora", "Apri BeepBar…", "—", "Esci da BeepBar"])
     }
 
     // MARK: Account changes around the seed

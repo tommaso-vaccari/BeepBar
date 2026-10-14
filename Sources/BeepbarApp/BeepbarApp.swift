@@ -158,7 +158,7 @@ final class StatusItemController: NSObject, NSMenuDelegate {
     }
 
     /// The whole menu, from `snapshot` alone, replacing what `menu` held: status, detail, action,
-    /// the recordings section (`addRecordingItems`), separator, Open, Quit. `nonisolated` and
+    /// Open, the recordings section (`addRecordingItems`), separator, Quit. `nonisolated` and
     /// static for the same reason as `menuNeedsUpdate` (it runs inside that AppKit callback and
     /// must not touch main-actor state), and so tests can check the item order without a status
     /// item; `target` is nil there. The three actions keep their `Task { @MainActor in … }` hops.
@@ -182,13 +182,14 @@ final class StatusItemController: NSObject, NSMenuDelegate {
         actionItem.target = target
         menu.addItem(actionItem)
 
-        addRecordingItems(from: snapshot, to: menu, target: target)
-
-        menu.addItem(.separator())
-
+        // Open sits right under the action (Sync now), not at the end of the menu.
         let openItem = NSMenuItem(title: snapshot.openTitle, action: #selector(openConfiguration), keyEquivalent: "")
         openItem.target = target
         menu.addItem(openItem)
+
+        addRecordingItems(from: snapshot, to: menu, target: target)
+
+        menu.addItem(.separator())
 
         let quitItem = NSMenuItem(title: snapshot.quitTitle, action: #selector(quit), keyEquivalent: "")
         quitItem.target = target

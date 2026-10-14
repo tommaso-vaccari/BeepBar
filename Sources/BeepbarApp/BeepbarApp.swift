@@ -170,7 +170,7 @@ final class StatusItemController: NSObject, NSMenuDelegate {
     }
 
     /// The whole menu, from `snapshot` alone, replacing what `menu` held: status, detail, action,
-    /// Open, the recordings section (`addRecordingItems`), separator, Quit. `nonisolated` and
+    /// Open, separator, Quit. `nonisolated` and
     /// static for the same reason as `menuNeedsUpdate` (it runs inside that AppKit callback and
     /// must not touch main-actor state), and so tests can check the item order without a status
     /// item; `target` is nil there. The three actions keep their `Task { @MainActor in … }` hops.
@@ -199,8 +199,6 @@ final class StatusItemController: NSObject, NSMenuDelegate {
         openItem.target = target
         menu.addItem(openItem)
 
-        addRecordingItems(from: snapshot, to: menu, target: target)
-
         menu.addItem(.separator())
 
         let quitItem = NSMenuItem(title: snapshot.quitTitle, action: #selector(quit), keyEquivalent: "")
@@ -208,6 +206,10 @@ final class StatusItemController: NSObject, NSMenuDelegate {
         menu.addItem(quitItem)
     }
 
+    /// Not called by `build` since issue #164: the icon popup shows no recordings section.
+    /// Kept, with its tests, because the issue discussion proposes bringing the section back
+    /// behind a Settings option; remove it together with `recordingLines` if that is dropped.
+    ///
     /// The recordings section: nothing when `snapshot.recordingLines` is empty, otherwise a
     /// separator, the "Registrazioni" section header (`NSMenuItem.sectionHeader`, macOS 14, the
     /// deployment target) and one line per course. It reads the snapshot it is given and nothing

@@ -385,26 +385,21 @@ struct RecordingsMenuBarTests {
         for item in menu.items.dropFirst(2) { #expect(!item.isEnabled) }
     }
 
-    /// The whole menu `menuNeedsUpdate` draws, in order: status, detail, action, Open (right under
-    /// Sync now), the recordings section, separator, Quit; without lines, no recordings items at all. The three
-    /// actions keep their selectors. Guards the section being wired into the real menu and not
-    /// displacing the existing items.
-    /// Mutation: delete the `addRecordingItems` call in `build`.
-    @Test func theMenuShowsTheSectionBetweenTheActionAndOpen() {
+    /// Saved course summaries must never appear in the icon popup. Restoring the
+    /// addRecordingItems call in build makes this fail while preserving the other actions.
+    @Test func theMenuOmitsRecordingsEvenWithSavedCourseSummaries() {
         let menu = NSMenu()
         menu.addItem(withTitle: "left over from the last opening", action: nil, keyEquivalent: "")
-        StatusItemController.build(from: snapshot(["Analisi 2 — 12/30 · ~14 h", "Fisica — 3/10 · ~45 min"]), into: menu, target: nil)
-        #expect(menu.items.map { $0.isSeparatorItem ? "—" : $0.title } == [
-            "Sincronizzato", "3 nuovi", "Sincronizza ora", "Apri BeepBar",
-            "—", "Registrazioni", "Analisi 2 — 12/30 · ~14 h", "Fisica — 3/10 · ~45 min",
-            "—", "Esci da BeepBar",
-        ])
-        #expect(menu.items[2].action == NSSelectorFromString("performAction"))
-        #expect(menu.items[3].action == NSSelectorFromString("openConfiguration"))
-        #expect(menu.items[9].action == NSSelectorFromString("quit"))
-
-        StatusItemController.build(from: snapshot([String]()), into: menu, target: nil)
-        #expect(menu.items.map { $0.isSeparatorItem ? "—" : $0.title } == ["Sincronizzato", "3 nuovi", "Sincronizza ora", "Apri BeepBar", "—", "Esci da BeepBar"])
+        for lines in [["Analisi 2 — 12/30 · ~14 h", "Fisica — 10/10 · tutte fatte"], []] {
+            StatusItemController.build(from: snapshot(lines), into: menu, target: nil)
+            #expect(menu.items.map { $0.isSeparatorItem ? "—" : $0.title } == [
+                "Sincronizzato", "3 nuovi", "Sincronizza ora", "Apri BeepBar", "—", "Esci da BeepBar",
+            ])
+            #expect(menu.items[2].action == NSSelectorFromString("performAction"))
+            #expect(menu.items[3].action == NSSelectorFromString("openConfiguration"))
+            #expect(menu.items[5].action == NSSelectorFromString("quit"))
+            #expect(!menu.items.contains { $0.isSectionHeader || $0.representedObject is RecordingMenuTarget })
+        }
     }
 
     // MARK: Account changes around the seed
@@ -671,15 +666,15 @@ struct RecordingsMenuBarTests {
         let status = StatusItemController(authentication: controller)
         let payload = RecordingMenuTarget(owner: 7, courseID: 11, key: analisi)
         let menu = NSMenu()
-        StatusItemController.build(from: snapshot([
+        StatusItemController.addRecordingItems(from: snapshot([
             RecordingMenuLine(title: "ANALISI 2 — 12/30 · ~14 h", toolTip: "Riproduci: «Lezione a»", target: payload),
             RecordingMenuLine(title: "FISICA — 10/10 · tutte fatte", toolTip: nil, target: nil),
-        ]), into: menu, target: status)
+        ]), to: menu, target: status)
         menu.update()
-        // status, detail, Sync now, Open, separator, header, then the lines.
-        #expect(menu.items[5].isSectionHeader)
-        let clickable = menu.items[6]
-        let grey = menu.items[7]
+        // separator, header, then the lines.
+        #expect(menu.items[1].isSectionHeader)
+        let clickable = menu.items[2]
+        let grey = menu.items[3]
         #expect(clickable.target === status)
         #expect(clickable.action == NSSelectorFromString("playRecording:"))
         #expect(clickable.representedObject as? RecordingMenuTarget == payload)
@@ -718,7 +713,7 @@ struct RecordingsMenuBarTests {
 
         let status = StatusItemController(authentication: controller)
         let menu = NSMenu()
-        StatusItemController.build(from: controller.menuBarSnapshot, into: menu, target: status)
+        StatusItemController.addRecordingItems(from: controller.menuBarSnapshot, to: menu, target: status)
         let clickable = menu.items.indices.filter { menu.items[$0].representedObject is RecordingMenuTarget }
         #expect(clickable.count == 2)
         let index = try #require(clickable.last)

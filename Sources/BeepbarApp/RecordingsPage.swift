@@ -156,6 +156,7 @@ enum RecordingsPresentation {
         let entries: [String: RecordingWatchEntry]
         let live: [String: Double]
         let pending: Set<String>
+        let pendingCourses: Set<RecmanCourseKey>
         let known: Set<String>
         /// Each loaded course's summary, live position included: the course header's line.
         let summaries: [RecmanCourseKey: CourseWatchSummary]
@@ -167,6 +168,7 @@ enum RecordingsPresentation {
             entries = model.entries
             live = model.live
             pending = model.pending
+            pendingCourses = model.pendingCourses
             known = model.known
             summaries = model.summaries
             self.canEdit = canEdit
@@ -180,7 +182,23 @@ enum RecordingsPresentation {
             guard known.contains(identity) else { return .unknown }
             let entry = entries[identity] ?? .untouched
             return WatchRow(known: true, fraction: max(entry.furthest, live[identity] ?? 0), completed: entry.isCompleted,
-                            pending: pending.contains(identity), canEdit: canEdit)
+                            pending: pending.contains(identity) || RecmanCourseKey(courseCode: recording.courseCode, academicYear: recording.academicYear).map(pendingCourses.contains) == true, canEdit: canEdit)
+        }
+
+        /// Uses the whole loaded listing, never search results; unknown or pending entries
+        /// cannot authorize a bulk change. The label follows committed entries only. A course
+        /// with a bulk save in flight is covered through `row(for:)`, which counts every row of a
+        /// `pendingCourses` course as pending, also rows a refresh added meanwhile.
+        func bulkAction(for key: RecmanCourseKey, recordings: [RecmanRecording]?) -> BulkAction {
+            guard let recordings, !recordings.isEmpty else { return BulkAction(allDone: false, enabled: false) }
+            var allDone = true
+            var enabled = canEdit
+            for recording in recordings {
+                let value = row(for: recording)
+                allDone = allDone && value.known && value.completed
+                enabled = enabled && value.checkboxEnabled
+            }
+            return BulkAction(allDone: allDone, enabled: enabled)
         }
 
         /// The course header's summary line: `base` ("2026/27 · 30 registrazioni · 36 h"), then
@@ -188,6 +206,15 @@ enum RecordingsPresentation {
         func headerLine(_ base: String, for key: RecmanCourseKey) -> String {
             guard let watched = RecordingsPresentation.watchSummaryText(summaries[key]) else { return base }
             return "\(base) · \(watched.text)"
+        }
+    }
+
+    struct BulkAction: Equatable {
+        let allDone: Bool
+        let enabled: Bool
+        var label: BilingualText {
+            allDone ? BilingualText("Segna tutte come non viste", "Mark all as unseen") :
+                BilingualText("Segna tutte come completate", "Mark all as completed")
         }
     }
 
@@ -563,6 +590,14 @@ private struct CourseRecordings: View {
         HStack(spacing: 12) {
             searchField
             Spacer(minLength: 0)
+            WatchProgressReader(recordings: recordings) { progress in
+                let action = progress.bulkAction(for: key, recordings: listing?.recordings)
+                Button(action.label.text) { recordings.toggleAllDone(key) }
+                    .buttonStyle(.borderless)
+                    .font(.callout)
+                    .fixedSize()
+                    .disabled(!action.enabled)
+            }
             if recordings.newCount(for: key) > 0 {
                 Button(tr("Segna novità come lette", "Mark new recordings as read")) { recordings.markSeen(key) }
                     .buttonStyle(.borderless)

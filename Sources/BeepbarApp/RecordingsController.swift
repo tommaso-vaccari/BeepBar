@@ -307,6 +307,12 @@ struct RecordingsListing: Equatable {
     /// How many un-ticks were queued per identity in this account's lifetime. A checkpoint
     /// records the count when queued; a retry that finds it changed was overtaken by an un-tick.
     private var untickCounts: [String: Int] = [:]
+    /// The bulk save that holds each course's lock (`watchProgress.pendingCourses`). Only that
+    /// save releases it, also when it stops at an identity change that resets nothing (the
+    /// WeBeep account changing with no saved Polimi session): without this the whole course
+    /// would stay disabled until the next reset. A save superseded by a reset finds another
+    /// token, or none, and leaves the new account's locks alone.
+    private var bulkTokens: [RecmanCourseKey: UUID] = [:]
     /// The last saved summary of each course, for the menu bar (package F reads it through
     /// `onWatchSummaryChange` and `storedWatchSummaries(in:owner:)`). Changes only when a listing
     /// is published or a progress write commits, never on a tick: the in-memory position moves
@@ -1022,7 +1028,7 @@ struct RecordingsListing: Equatable {
         "\(courseCode)-\(academicYear)"
     }
 
-    private func scheduleAcknowledge(_ ids: [String], for key: RecmanCourseKey, opening: Int? = nil) {
+    private func scheduleAcknowledge(_ ids: [String], for key: RecmanCourseKey, opening: Int? = nil, preserveHistoryProblem: Bool = false) {
         guard let owner = sessionOwner ?? ownerUserID(), !ids.isEmpty else { return }
         let pending = pendingAcknowledgementIDs[key] ?? []
         let added = ids.filter { !(listings[key]?.seenIDs?.contains($0) ?? false) && !pending.contains($0) }
@@ -1060,7 +1066,7 @@ struct RecordingsListing: Equatable {
                 if self.listings[key]?.seenIDs != nil { self.listings[key]?.seenIDs?.formUnion(added) }
                 // The unseen count of the saved summary (menu line) changes with the dots.
                 if self.listings[key]?.seenIDs != nil { self.refreshWatchSummary(for: key, persist: true) }
-                if self.listings[key]?.historyReadFailed != true, self.listings[key]?.problem == .historyUnavailable { self.listings[key]?.problem = nil }
+                if !preserveHistoryProblem, self.listings[key]?.historyReadFailed != true, self.listings[key]?.problem == .historyUnavailable { self.listings[key]?.problem = nil }
             } catch {
                 guard self.isCurrentHistory(history, owner: owner, generation: generation) else { return }
                 self.listings[key]?.problem = .historyUnavailable
@@ -1103,6 +1109,7 @@ struct RecordingsListing: Equatable {
         sessions = [:]
         unsavedCheckpoints = [:]
         untickCounts = [:]
+        bulkTokens = [:]
         progressChain = nil
         watchSummaryOwner = nil
         // The menu may hold summaries this controller never loaded (seeded from the saved copy
@@ -1886,6 +1893,62 @@ struct RecordingsListing: Equatable {
         enqueueProgress(.manual(done: done), for: recording, owner: owner, serial: nil, untickEpoch: untickCounts[identity, default: 0])
     }
 
+    /// One serial operation for the full course listing. Entries publish only after their
+    /// commits; summary and acknowledgement are batched once, avoiding a full-list scan per row.
+    /// Capture the history and owner before queueing so a reset cannot redirect these writes.
+    func toggleAllDone(_ key: RecmanCourseKey) {
+        let recordings = listings[key]?.recordings
+        let action = RecordingsPresentation.WatchValues(watchProgress, canEdit: canEditProgress)
+            .bulkAction(for: key, recordings: recordings)
+        guard action.enabled, let recordings, let owner = resumeOwner(),
+              recordings.allSatisfy({ Self.courseKey(of: $0) == key }) else { return }
+        let done = !action.allDone
+        let identities = Set(recordings.map(RecordingsStudyState.identity))
+        if !done {
+            for recording in recordings {
+                sessions[recording.id]?.progress.resetCrossing()
+                untickCounts[RecordingsStudyState.identity(recording), default: 0] += 1
+            }
+        }
+        watchProgress.setPending(true, for: identities, course: key)
+        let token = UUID()
+        bulkTokens[key] = token
+        let history = seenHistory
+        let reset = historyResetTask
+        let previous = progressChain
+        progressChain = Task { [weak self] in
+            await previous?.value
+            await reset?.value
+            guard let self else { return }
+            defer {
+                if self.bulkTokens[key] == token {
+                    self.bulkTokens[key] = nil
+                    self.watchProgress.setPending(false, for: identities, course: key)
+                }
+            }
+            var completed: [String] = []
+            var failed = false
+            for recording in recordings {
+                guard self.isCurrentIdentity(history, owner: owner) else { return }
+                let changedDone = await self.commitProgress(.manual(done: done), for: recording, key: key,
+                    owner: owner, history: history, serial: nil,
+                    untickEpoch: self.untickCounts[RecordingsStudyState.identity(recording), default: 0],
+                    deferCourseUpdate: true)
+                guard let changedDone else { failed = true; break }
+                if changedDone { completed.append(recording.id) }
+            }
+            guard self.isCurrentIdentity(history, owner: owner) else { return }
+            self.refreshWatchSummary(for: key, persist: true)
+            // A refresh may have evicted the listing meanwhile, and then the summary above can't
+            // be recomputed: drop a saved `next` that was just completed, as the per-row path does.
+            let completedIDs = Set(completed)
+            for recording in recordings where completedIDs.contains(recording.id) {
+                self.clearSavedNextIfCompleted(recording, in: key)
+            }
+            self.scheduleAcknowledge(completed, for: key, preserveHistoryProblem: failed)
+        }
+    }
+
     /// Appends one write to the serial chain. The task is unstructured and kept only as the next
     /// write's predecessor: nothing cancels it, so the store's cancellation check can't drop it.
     /// The history actor is captured now, not when the write runs: a write queued before a reset
@@ -1914,20 +1977,21 @@ struct RecordingsListing: Equatable {
     ///   instead of overwriting it), the course summary, and the "new" dot when it is done.
     /// - Other errors: a checkpoint is kept for the next one, logged, no banner; a tick shows the
     ///   history banner and the row keeps its saved value.
-    private func commitProgress(_ event: RecordingProgressEvent, for recording: RecmanRecording, key: RecmanCourseKey, owner: Int, history: RecordingsSeenHistory, serial: Int?, untickEpoch: Int) async {
+    @discardableResult
+    private func commitProgress(_ event: RecordingProgressEvent, for recording: RecmanRecording, key: RecmanCourseKey, owner: Int, history: RecordingsSeenHistory, serial: Int?, untickEpoch: Int, deferCourseUpdate: Bool = false) async -> Bool? {
         let identity = RecordingsStudyState.identity(recording)
         let isManual = if case .manual = event { true } else { false }
-        guard isCurrentIdentity(history, owner: owner) else { return }
+        guard isCurrentIdentity(history, owner: owner) else { return nil }
         let result: RecordingProgressResult
         do {
             result = try await history.applyProgress(owner: owner, key: key, id: recording.id, event: event)
         } catch is CancellationError {
-            if isManual, isCurrentIdentity(history, owner: owner) { watchProgress.setPending(false, for: identity) }
-            return
+            if isManual, !deferCourseUpdate, isCurrentIdentity(history, owner: owner) { watchProgress.setPending(false, for: identity) }
+            return nil
         } catch {
-            guard isCurrentIdentity(history, owner: owner) else { return }
+            guard isCurrentIdentity(history, owner: owner) else { return nil }
             if isManual {
-                watchProgress.setPending(false, for: identity)
+                if !deferCourseUpdate { watchProgress.setPending(false, for: identity) }
                 listings[key]?.problem = .historyUnavailable
                 log.error("Couldn't save a lecture's done mark")
             } else if let serial {
@@ -1943,24 +2007,25 @@ struct RecordingsListing: Equatable {
                 }
                 log.error("Couldn't save watch progress; retried at the next checkpoint")
             }
-            return
+            return nil
         }
         // Not only a second layer behind the store's own invalidation (which reports a commit
         // racing a reset as a cancellation): the WeBeep account can change without a reset when
         // no Polimi session was saved, and then only this check keeps the old account's entry off
         // the screen.
-        guard isCurrentIdentity(history, owner: owner) else { return }
-        if isManual { watchProgress.setPending(false, for: identity) }
+        guard isCurrentIdentity(history, owner: owner) else { return nil }
+        if isManual && !deferCourseUpdate { watchProgress.setPending(false, for: identity) }
         // An ended session's position now lives in the entry (or never will, if the save failed
         // and is waiting for a retry): the live value goes unless the lecture is playing again.
         if case .checkpoint(_, true) = event, sessions[recording.id] == nil { watchProgress.setLive(nil, for: identity) }
         let published = watchProgress.setEntry(result.entry, for: identity)
         if result.changed { historyRevision[key, default: 0] += 1 }
-        if result.changed || published { refreshWatchSummary(for: key, persist: true) }
-        if result.changed, result.entry?.isCompleted == true {
+        if !deferCourseUpdate && (result.changed || published) { refreshWatchSummary(for: key, persist: true) }
+        if !deferCourseUpdate, result.changed, result.entry?.isCompleted == true {
             clearSavedNextIfCompleted(recording, in: key)
             scheduleAcknowledge([recording.id], for: key)
         }
+        return result.changed && result.entry?.isCompleted == true
     }
 
     private static func courseKey(of recording: RecmanRecording) -> RecmanCourseKey? {

@@ -1500,7 +1500,7 @@ enum MaterialsRunEnd: Equatable, Sendable {
             title: menuBarTitle,
             detail: menuBarDetail,
             actionTitle: menuBarActionTitle,
-            openTitle: tr("Apri BeepBar…", "Open BeepBar…"),
+            openTitle: tr("Apri BeepBar", "Open BeepBar"),
             quitTitle: tr("Esci da BeepBar", "Quit BeepBar"),
             recordingsTitle: recordings.title,
             recordingLines: recordings.lines

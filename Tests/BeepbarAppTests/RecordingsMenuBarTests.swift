@@ -358,7 +358,7 @@ struct RecordingsMenuBarTests {
     }
 
     private func snapshot(_ lines: [RecordingMenuLine]) -> MenuBarSnapshot {
-        MenuBarSnapshot(title: "Sincronizzato", detail: "3 nuovi", actionTitle: "Sincronizza ora", openTitle: "Apri BeepBar…", quitTitle: "Esci da BeepBar", recordingsTitle: "Registrazioni", recordingLines: lines)
+        MenuBarSnapshot(title: "Sincronizzato", detail: "3 nuovi", actionTitle: "Sincronizza ora", openTitle: "Apri BeepBar", quitTitle: "Esci da BeepBar", recordingsTitle: "Registrazioni", recordingLines: lines)
     }
 
     /// The recordings section alone: nothing when there are no lines, otherwise a separator, the
@@ -395,7 +395,7 @@ struct RecordingsMenuBarTests {
         menu.addItem(withTitle: "left over from the last opening", action: nil, keyEquivalent: "")
         StatusItemController.build(from: snapshot(["Analisi 2 — 12/30 · ~14 h", "Fisica — 3/10 · ~45 min"]), into: menu, target: nil)
         #expect(menu.items.map { $0.isSeparatorItem ? "—" : $0.title } == [
-            "Sincronizzato", "3 nuovi", "Sincronizza ora", "Apri BeepBar…",
+            "Sincronizzato", "3 nuovi", "Sincronizza ora", "Apri BeepBar",
             "—", "Registrazioni", "Analisi 2 — 12/30 · ~14 h", "Fisica — 3/10 · ~45 min",
             "—", "Esci da BeepBar",
         ])
@@ -404,7 +404,7 @@ struct RecordingsMenuBarTests {
         #expect(menu.items[9].action == NSSelectorFromString("quit"))
 
         StatusItemController.build(from: snapshot([String]()), into: menu, target: nil)
-        #expect(menu.items.map { $0.isSeparatorItem ? "—" : $0.title } == ["Sincronizzato", "3 nuovi", "Sincronizza ora", "Apri BeepBar…", "—", "Esci da BeepBar"])
+        #expect(menu.items.map { $0.isSeparatorItem ? "—" : $0.title } == ["Sincronizzato", "3 nuovi", "Sincronizza ora", "Apri BeepBar", "—", "Esci da BeepBar"])
     }
 
     // MARK: Account changes around the seed

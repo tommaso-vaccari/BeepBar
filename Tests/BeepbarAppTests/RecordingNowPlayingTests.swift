@@ -98,7 +98,9 @@ struct RecordingNowPlayingTests {
     /// A player whose `timeControlStatus` a test can force, to stand for buffering, which a
     /// local file never does on demand.
     final class StatusPlayer: AVPlayer, @unchecked Sendable {
-        var forcedStatus: AVPlayer.TimeControlStatus?
+        /// Read by the nonisolated `timeControlStatus` override and written only by the test on the
+        /// main actor before the player runs: `nonisolated(unsafe)` says so to the compiler.
+        nonisolated(unsafe) var forcedStatus: AVPlayer.TimeControlStatus?
         override var timeControlStatus: AVPlayer.TimeControlStatus { forcedStatus ?? super.timeControlStatus }
     }
 
@@ -373,7 +375,7 @@ struct RecordingNowPlayingTests {
         let controller = makeController(publisher: publisher, loader: gate.loader)
         controller.play(media, title: "1", cookies: [], startAt: nil, recordingID: "1", metadata: Self.metadata())
         await Self.waitUntil { controller.artwork != nil }
-        weak var weakPicture = controller.artwork
+        weak let weakPicture = controller.artwork
         controller.close()
         #expect(controller.artwork == nil)
         #expect(controller.artworkURL == nil)

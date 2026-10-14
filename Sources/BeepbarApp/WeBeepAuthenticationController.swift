@@ -756,7 +756,8 @@ enum MaterialsRunEnd: Equatable, Sendable {
     /// How each operation's materials run ended, recorded by its ending path while it is still
     /// the active operation and taken once by the tail that starts the follow-up. An operation
     /// with no entry was superseded: no follow-up (`MaterialsRunEnd.superseded`).
-    private var materialsRunEnds: [UUID: MaterialsRunEnd] = [:]
+    /// At most one operation is ever active, so one entry is enough and a stale one can't pile up.
+    private var materialsRunEnd: (operationID: UUID, end: MaterialsRunEnd)?
     /// How the last recordings follow-up ended, memory only (for the "N nuove registrazioni"
     /// notification and the menu, package D). Nil until one ends, and again with the account.
     private(set) var lastRecordingsOutcome: RecordingsSyncOutcome?
@@ -1123,6 +1124,12 @@ enum MaterialsRunEnd: Equatable, Sendable {
     /// Ends `operationID` through `failedSync`, as a run that failed with `error` would.
     func failSyncForTesting(_ operationID: UUID, error: WeBeepAPIError?, automatic: Bool) async {
         await failedSync(operationID, error: error, automatic: automatic)
+    }
+
+    /// Starts the follow-up of `operationID` the way the manual tail does, and returns its task.
+    @discardableResult
+    func startFollowUpForTesting(_ operationID: UUID, trigger: RecordingsSyncTrigger) -> Task<Void, Never>? {
+        followUpAfterRun(operationID, trigger: trigger)
     }
 
     /// Takes what `operationID`'s ending path recorded, as the follow-up's tail does.
@@ -3296,6 +3303,114 @@ enum MaterialsRunEnd: Equatable, Sendable {
         return startRecordingsFollowUp(after: schedulerCancelled ? .cancelled : end, trigger: trigger)
     }
 
+    /// Records how `operationID`'s materials run ended. Only the active operation records: a
+    /// superseded one (sign-out, site or folder change mid-run) leaves nothing, and so starts no
+    /// follow-up.
+    private func recordRunEnd(_ operationID: UUID, _ end: MaterialsRunEnd) {
+        guard activeOperationID == operationID else { return }
+        materialsRunEnd = (operationID, end)
+    }
+
+    /// Takes (and forgets) what `operationID` recorded; nil for a superseded or never-started run.
+    private func takeRunEnd(_ operationID: UUID) -> MaterialsRunEnd? {
+        defer { materialsRunEnd = nil }
+        guard let recorded = materialsRunEnd, recorded.operationID == operationID else { return nil }
+        return recorded.end
+    }
+
+    /// The mapping table of `RecordingsMaterialsOutcome`, as one pure function. nil means nothing
+    /// ended for the operation: no follow-up, not even a skipping one.
+    nonisolated static func recordingsOutcome(for end: MaterialsRunEnd) -> RecordingsMaterialsOutcome? {
+        switch end {
+        case .completed(let conflicts, let failures):
+            if conflicts > 0 { return .conflicts }
+            return failures > 0 ? .partial : .synced
+        case .pendingChoicesUnreadable, .localFailure: return .localFailure
+        case .cancelled, .scheduleChanged: return .cancelled
+        case .serviceFailure(let error): return .failed(SyncServiceFailure(error))
+        case .pausedMidRun(let pause): return .pausedByDataSaver(pause)
+        case .notRun(let decision): return .notRun(decision)
+        case .unconfigured: return .notRun(.skipUnconfigured)
+        case .deferredWhileBusy: return .notRun(.deferWhileBusy)
+        case .credentialUnavailable: return .accountUnavailable
+        case .superseded: return nil
+        }
+    }
+
+    /// The Recman keys the follow-up refreshes: the selected courses, deduplicated. A manual sync
+    /// has loaded `courses` by now; an automatic one uses what `fetchEnrolledCourses` returned
+    /// (`lastRunCourses`), so no extra WeBeep request is made.
+    private func recordingsSyncKeys(trigger: RecordingsSyncTrigger) -> Set<RecmanCourseKey> {
+        let source = trigger == .manual ? courses : lastRunCourses
+        return Set(RecordingsPresentation.syncedCourses(source, enabledIDs: enabledCourseIDs).compactMap { RecmanCourseKey(course: $0) })
+    }
+
+    /// The gate's inputs, read without creating `RecordingsController`: with no controller the
+    /// switch is read from defaults and access can only be `.ready` (a missing session is found
+    /// by the refresh itself, never here).
+    private func recordingsSyncDecision(after outcome: RecordingsMaterialsOutcome, trigger: RecordingsSyncTrigger, network: NetworkPathConditions?) -> (RecordingsSyncDecision, Set<RecmanCourseKey>) {
+        let switchedOn = recordingsStorage?.isEnabled ?? RecordingsController.isSwitchedOn(in: operationDefaults)
+        let access: RecordingsSyncAccess
+        switch recordingsStorage?.access {
+        case nil, .ready?: access = switchedOn ? .ready : .off
+        case .off?: access = .off
+        case .signingIn?: access = .signingIn
+        case .needsSignIn?: access = .needsSignIn
+        }
+        // The keys are only computed when the cheap standing reasons don't already skip.
+        let keys = switchedOn && selectedSite.university == .polimi ? recordingsSyncKeys(trigger: trigger) : []
+        let decision = RecordingsSyncPolicy.decision(switchedOn: switchedOn, university: selectedSite.university, ownerKnown: recordingsOwnerUserID != nil, courseKeys: keys, outcome: outcome, trigger: trigger, dataSaverEnabled: dataSaverEnabled, currentNetwork: network, access: access)
+        return (decision, keys)
+    }
+
+    /// Starts the Recordings listings refresh that follows a materials run, or nothing when the
+    /// gate skips it (silently: a skip is never a failure). Returns the running task (new, or the
+    /// one it merges into), nil when skipped.
+    ///
+    /// Never calls `setSyncState`, never touches `activeOperationID`, never notifies a failure and
+    /// is not returned by `prepareForTermination`: the materials result stays what the menu and
+    /// Home show, and a quit never waits for WebKit (AGENTS.md, quit path). The decision is taken
+    /// twice: now without the network (cheap skips, and the merge), and again inside the task right
+    /// before the refresh, for an automatic run with Data Saver on with the network read then,
+    /// since the Mac may have moved to a hotspot during the run. Merge: a refresh already running
+    /// serves this request too (a manual request does not upgrade a running automatic one to
+    /// `force`; the next manual sync will).
+    @discardableResult
+    private func startRecordingsFollowUp(after end: MaterialsRunEnd, trigger: RecordingsSyncTrigger) -> Task<Void, Never>? {
+        guard let materials = Self.recordingsOutcome(for: end) else { return nil }
+        guard case .refresh = recordingsSyncDecision(after: materials, trigger: trigger, network: nil).0 else { return nil }
+        if let recordingsFollowUp { return recordingsFollowUp }
+        let generation = recordingsFollowUpGeneration
+        let id = UUID()
+        recordingsFollowUpID = id
+        let task = Task { @MainActor [weak self] in
+            guard let self else { return }
+            defer { if self.recordingsFollowUpID == id { self.recordingsFollowUp = nil; self.recordingsFollowUpID = nil } }
+            // Only an automatic run with Data Saver on cares about the network now; a nil network
+            // (unknown) never pauses.
+            let network: NetworkPathConditions? = trigger == .automatic && self.dataSaverEnabled ? await self.automaticSyncEnvironment.currentNetwork() : nil
+            guard !Task.isCancelled, self.recordingsFollowUpGeneration == generation else { return }
+            let (decision, keys) = self.recordingsSyncDecision(after: materials, trigger: trigger, network: network)
+            guard case .refresh(let force) = decision else { return }
+            let result = await self.recordingsRefresh(keys, force)
+            // An account, site or folder change meanwhile: the result belongs to a world that is gone.
+            guard self.recordingsFollowUpGeneration == generation else { return }
+            self.lastRecordingsOutcome = result
+            // TODO(rsync D): announceRecordingsRefresh(outcome, isCurrent:)
+        }
+        recordingsFollowUp = task
+        return task
+    }
+
+    /// Stops the follow-up of a context that no longer exists (sign-out, site, account, folder
+    /// change): it publishes nothing and the seam is told through task cancellation.
+    private func cancelRecordingsFollowUp() {
+        recordingsFollowUpGeneration += 1
+        recordingsFollowUp?.cancel()
+        recordingsFollowUp = nil
+        recordingsFollowUpID = nil
+    }
+
     nonisolated static func automaticTargets(scopes: [SyncScope], enrolledCourseIDs: Set<Int64>) -> [SyncTarget] {
         scopes.filter { $0.enabled && enrolledCourseIDs.contains($0.courseID) }
             .map { SyncTarget(courseID: $0.courseID, localFolder: $0.localFolder) }
@@ -3341,12 +3456,14 @@ enum MaterialsRunEnd: Equatable, Sendable {
         } catch {
             guard activeOperationID == operationID else { return }
             if Task.isCancelled { cancelledSync(operationID); return }
+            recordRunEnd(operationID, .pendingChoicesUnreadable)
             reportPendingChoicesReadFailure()
             endOperation(operationID)
             return
         }
         guard activeOperationID == operationID else { return }
         guard !Task.isCancelled else { cancelledSync(operationID); return }
+        recordRunEnd(operationID, .completed(conflicts: summary.conflicts, failures: summary.failures))
         if summary.failures == 0 { notificationCoordinator.clearFailure() }
         BeepbarLog.sync.notice("Synchronization completed automatic=\(automatic, privacy: .public) total=\(summary.total, privacy: .public) installed=\(summary.installed, privacy: .public) conflicts=\(summary.conflicts, privacy: .public) failures=\(summary.failures, privacy: .public)")
         configureBackgroundScheduler()
@@ -3383,6 +3500,7 @@ enum MaterialsRunEnd: Equatable, Sendable {
     private func cancelledSync(_ operationID: UUID) {
         guard activeOperationID == operationID else { return }
         BeepbarLog.sync.notice("Synchronization cancelled")
+        recordRunEnd(operationID, .cancelled)
         setSyncState(.readyUnchecked)
         endOperation(operationID)
     }
@@ -3390,6 +3508,7 @@ enum MaterialsRunEnd: Equatable, Sendable {
     /// A manual sync found the folder busy with a rename, a module move or a conflict being resolved.
     private func busySync(_ operationID: UUID) {
         guard activeOperationID == operationID else { return }
+        recordRunEnd(operationID, .localFailure)
         setSyncState(.failed(.local(BilingualText("Un'altra operazione è in corso sulla cartella. Riprova tra poco.", "Another operation is running on the folder. Try again shortly."))))
         endOperation(operationID)
     }
@@ -3410,6 +3529,7 @@ enum MaterialsRunEnd: Equatable, Sendable {
         // An ordinary network now: the refusal was a real outage, reported as one.
         guard let pause = AutomaticSyncPolicy.dataSaverPause(for: network) else { return false }
         BeepbarLog.sync.notice("Automatic synchronization deferred midway reason=data-saver")
+        recordRunEnd(operationID, .pausedMidRun(pause))
         automaticOutcome = .deferred
         setSyncState(Self.stateAfterPauseMidway(stateBeforeRun))
         // Turned off while the run was going: nothing to show, and the retry runs without limits.
@@ -3433,6 +3553,7 @@ enum MaterialsRunEnd: Equatable, Sendable {
 
     private func deferredAutomaticSync(_ operationID: UUID) {
         guard activeOperationID == operationID else { return }
+        recordRunEnd(operationID, .deferredWhileBusy)
         automaticOutcome = .deferred
         setSyncState(.readyUnchecked)
         endOperation(operationID)
@@ -3440,6 +3561,7 @@ enum MaterialsRunEnd: Equatable, Sendable {
 
     private func failedSync(_ operationID: UUID, error: WeBeepAPIError?, automatic: Bool) async {
         guard activeOperationID == operationID else { return }
+        recordRunEnd(operationID, error.map(MaterialsRunEnd.serviceFailure) ?? .localFailure)
         BeepbarLog.sync.error("Synchronization failed automatic=\(automatic, privacy: .public) errorType=\(error.map { String(reflecting: type(of: $0)) } ?? "unknown", privacy: .public)")
         let issue: AutomaticNotificationIssue?
         if let error {

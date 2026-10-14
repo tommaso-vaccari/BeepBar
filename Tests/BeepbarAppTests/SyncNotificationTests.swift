@@ -13,6 +13,8 @@ private final class FakeNotificationCenter: NotificationCenterClient, @unchecked
         var authorization: NotificationAuthorization
         var authorizationAfterRequest: NotificationAuthorization
         var sent: [Sent] = []
+        /// The body of each entry in `sent`, kept apart so `Sent` stays as the older tests build it.
+        var bodies: [String] = []
         var requests = 0
         var authorizationReads = 0
     }
@@ -30,6 +32,7 @@ private final class FakeNotificationCenter: NotificationCenterClient, @unchecked
     }
 
     var sent: [Sent] { state.withLock { $0.sent } }
+    var bodies: [String] { state.withLock { $0.bodies } }
     var requests: Int { state.withLock { $0.requests } }
     /// Every contact with macOS: permission reads, requests and sends.
     var contacts: Int { state.withLock { $0.authorizationReads + $0.requests + $0.sent.count } }
@@ -41,7 +44,7 @@ private final class FakeNotificationCenter: NotificationCenterClient, @unchecked
     }
     func requestAuthorization() async { state.withLock { $0.requests += 1; $0.authorization = $0.authorizationAfterRequest } }
     func send(identifier: String, title: String, body: String, destination: NotificationDestination) async {
-        state.withLock { $0.sent.append(Sent(identifier: identifier, title: title, destination: destination)) }
+        state.withLock { $0.sent.append(Sent(identifier: identifier, title: title, destination: destination)); $0.bodies.append(body) }
         onSend?()
     }
 }

@@ -390,7 +390,7 @@ public enum RecordingWatchProgress {
     ///   " · 2 new" (" · 1 nuova" in the singular). Without them the line is exactly what it was
     ///   before `newCount` existed. An empty course never gets the suffix, and neither does a
     ///   course with every lecture done: "30/30 · tutte fatte · 3 nuove" would contradict itself.
-    ///   The caller (package D) counts `newCount` as lectures unseen AND not completed, so a lecture
+    ///   `RecordingsController`, which stores the summary, counts `newCount` as lectures unseen AND not completed, so a lecture
     ///   ticked as attended in person without being opened isn't "new"; the done guard here is the
     ///   backstop for a summary where the two disagree.
     public static func menuLine(courseName: String, _ summary: CourseWatchSummary) -> BilingualText {

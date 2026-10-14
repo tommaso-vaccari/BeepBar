@@ -401,6 +401,39 @@ struct RecordingMenuEntry: Equatable {
     let target: RecordingMenuTarget?
 }
 
+/// How one materials run ended, named after the app's own code paths, so each path records what
+/// happened and the mapping to `RecordingsMaterialsOutcome` stays one pure, table-tested function
+/// (`WeBeepAuthenticationController.recordingsOutcome(for:)`). A run that never ended for its own
+/// operation (superseded, never started) records nothing at all: there is deliberately no case
+/// that a forgotten path could fall into by default.
+enum MaterialsRunEnd: Equatable, Sendable {
+    /// `completeSync` finished and published its result.
+    case completed(conflicts: Int, failures: Int)
+    /// `completeSync`: `finishReconciliation` threw (the pending choices couldn't be read).
+    case pendingChoicesUnreadable
+    /// `cancelledSync`, from any path ("Annulla", a cancelled task, quit).
+    case cancelled
+    /// `failedSync` with a WeBeep error.
+    case serviceFailure(WeBeepAPIError)
+    /// A local failure: `failedSync(error: nil)`, `busySync`, the enabled scopes unreadable.
+    case localFailure
+    /// `pausedMidRun`: Data Saver stopped an automatic run midway.
+    case pausedMidRun(DataSaverPause)
+    /// `runAutomaticSync`: `AutomaticSyncPolicy.decision` held the run back.
+    case notRun(AutomaticSyncDecision)
+    /// `runAutomaticSync`: the schedule was rebuilt while the network was read.
+    case scheduleChanged
+    /// Nothing to sync with: no root or database, no enabled course, nothing selected, no folder.
+    case unconfigured
+    /// `deferredAutomaticSync`: the folder was busy (`RootOperationGateError`) for an automatic run.
+    case deferredWhileBusy
+    /// `handleCredentialStorageError`, from a manual or an automatic run.
+    case credentialUnavailable
+    /// Superseded (sign-out, site or folder change mid-run) or never started (another operation
+    /// was active): nothing ended for this operation.
+    case superseded
+}
+
 @MainActor final class WeBeepAuthenticationController: NSObject, ObservableObject {
     // Plain, non-isolated, single-writer/single-reader-on-main-thread cache of the menu bar's
     // derived text. StatusItemController's NSMenuDelegate/target-action methods are invoked by
@@ -419,7 +452,8 @@ struct RecordingMenuEntry: Equatable {
     // accountState, hasStoredCredential, recoveryBlocked, conflicts, rootURL, activeOperationID,
     // dataSaverPause), and
     // `setLanguage(_:)` calls it since every label depends on `AppLanguage.current`. The
-    // recordings lines (`recordingMenuLines`) are fed by courses, enabledCourseIDs,
+    // recordings lines (`recordingMenuLines`) are fed by courses, lastRunCourses (stands in for
+    // `courses` while it is empty), enabledCourseIDs,
     // courseFolders, watchSummaries and siteInfo (the account is the `owner` of each line's click
     // target, so a menu drawn for one account never plays for another), whose `didSet` calls
     // `recordingMenuInputsChanged()`, which rebuilds the lines (text, tooltip and click target)
@@ -585,6 +619,11 @@ struct RecordingMenuEntry: Equatable {
             // Only a controller that already exists can hold another account's session; one
             // created later checks the saved session's owner when it reads it.
             guard siteInfo?.userID != oldValue?.userID else { return }
+            // A recordings follow-up belongs to the account it started for (its owner namespace
+            // and keys): another account, or none, stops it and publishes nothing.
+            cancelRecordingsFollowUp()
+            // The previous account's enrolled courses must not name the new account's menu lines.
+            if oldValue != nil { lastRunCourses = [] }
             // The account is each recordings line's click owner (`RecordingMenuTarget.owner`):
             // rebuild the lines on every path below, even when `watchSummaries` ends up equal and
             // its own `didSet` stays silent, or the menu would keep the previous account as owner
@@ -646,9 +685,18 @@ struct RecordingMenuEntry: Equatable {
     func setWatchSummariesForTesting(_ summaries: [RecmanCourseKey: CourseWatchSummary]) { watchSummaries = summaries }
     func setCourseFoldersForTesting(_ folders: [Int64: String]) { courseFolders = folders }
 #endif
+    /// The enrolled courses the last automatic run fetched from WeBeep (`fetchEnrolledCourses`),
+    /// memory only. An automatic run never sets `courses` (only the window and "Sincronizza ora"
+    /// do), so in a launch where the window was never opened the menu's recordings lines and the
+    /// recordings follow-up's keys come from here instead; while `courses` is loaded it wins and
+    /// this changes nothing. Cleared with the account (`forgetCourseList`). Feeds the menu: its
+    /// `didSet` calls `recordingMenuInputsChanged()` (invariant on `menuBarSnapshot`).
+    private(set) var lastRunCourses: [RemoteCourseSummary] = [] {
+        didSet { if lastRunCourses != oldValue { recordingMenuInputsChanged() } }
+    }
     /// The menu's recordings lines in both languages, with their click targets, rebuilt only when
-    /// `courses`, `enabledCourseIDs`, `courseFolders`, `watchSummaries` or the account (`siteInfo`)
-    /// change, so the frequent snapshot refreshes during a sync don't rerun the course-name
+    /// `courses` (or `lastRunCourses`), `enabledCourseIDs`, `courseFolders`, `watchSummaries` or the
+    /// account (`siteInfo`) change, so the frequent snapshot refreshes during a sync don't rerun the course-name
     /// regexes. Resolved to one language in `refreshMenuBarSnapshot()`, which is why a language
     /// switch needs no rebuild here.
     private(set) var recordingMenuLines: [RecordingMenuEntry] = []
@@ -691,6 +739,32 @@ struct RecordingMenuEntry: Equatable {
     }
     private var bootstrapTask: Task<Void, Never>?
     private var syncTask: Task<Void, Never>?
+    /// The Recordings listings refresh that follows a sync run (owner decision 2026-10-12, see
+    /// `RecordingsSyncPolicy`). Deliberately OUTSIDE `syncTask`: "Esci" and a quit from outside
+    /// wait for `syncTask` (`prepareForTermination`), and a WebKit listing must never hold a quit
+    /// (AGENTS.md, quit path). For the same reason `prepareForTermination` neither returns nor
+    /// touches it: the process simply exits under it. It never calls `setSyncState`, never touches
+    /// `activeOperationID` and never notifies a failure, so the menu and Home keep showing the
+    /// materials result only. At most one runs: a sync ending while it runs merges into it.
+    /// Cancelled with the identity it was started for (`cancelRecordingsFollowUp`).
+    private var recordingsFollowUp: Task<Void, Never>?
+    /// Identifies `recordingsFollowUp`, so a finishing task clears only itself.
+    private var recordingsFollowUpID: UUID?
+    /// Bumped by `cancelRecordingsFollowUp`: a follow-up that resumes under an older value belongs
+    /// to an account, site or folder that is gone and publishes nothing.
+    private var recordingsFollowUpGeneration = 0
+    /// How each operation's materials run ended, recorded by its ending path while it is still
+    /// the active operation and taken once by the tail that starts the follow-up. An operation
+    /// with no entry was superseded: no follow-up (`MaterialsRunEnd.superseded`).
+    private var materialsRunEnds: [UUID: MaterialsRunEnd] = [:]
+    /// How the last recordings follow-up ended, memory only (for the "N nuove registrazioni"
+    /// notification and the menu, package D). Nil until one ends, and again with the account.
+    private(set) var lastRecordingsOutcome: RecordingsSyncOutcome?
+    /// Refreshes the Recordings listings of `keys` for a sync follow-up; the Bool is `force`
+    /// (ignore the 300 s freshness window: manual sync only). A seam so the integration is tested
+    /// with a fake, without WebKit.
+    // TODO(rsync B): wire to recordings.refreshForSync(keys, force:) once package B is merged
+    var recordingsRefresh: @MainActor (Set<RecmanCourseKey>, Bool) async -> RecordingsSyncOutcome = { _, _ in .skipped(.noCourses) }
     private var scopeWriteTask: Task<Void, Never>?
     // Published because views read it through `isSyncActive` / `canSynchronize` (Annulla vs
     // Sincronizza ora). An operation often ends after a suspension (the new-materials notification,
@@ -1042,6 +1116,17 @@ struct RecordingMenuEntry: Equatable {
 
     /// Waits for the sync `synchronizeNow()` started, which it does not return.
     func waitForSyncForTesting() async { await syncTask?.value }
+
+    /// The running recordings follow-up, nil when none runs.
+    var recordingsFollowUpForTesting: Task<Void, Never>? { recordingsFollowUp }
+
+    /// Ends `operationID` through `failedSync`, as a run that failed with `error` would.
+    func failSyncForTesting(_ operationID: UUID, error: WeBeepAPIError?, automatic: Bool) async {
+        await failedSync(operationID, error: error, automatic: automatic)
+    }
+
+    /// Takes what `operationID`'s ending path recorded, as the follow-up's tail does.
+    func takeRunEndForTesting(_ operationID: UUID) -> MaterialsRunEnd? { takeRunEnd(operationID) }
 
     var isMenuQuitInProgressForTesting: Bool { menuQuitInProgress }
 
@@ -1423,8 +1508,8 @@ struct RecordingMenuEntry: Equatable {
     /// purpose (a glance), and the window has them all.
     nonisolated static let maxRecordingMenuLines = 10
 
-    /// Rebuilds `recordingMenuLines` from its five inputs and refreshes the snapshot when they
-    /// changed. Called from the `didSet` of `courses`, `enabledCourseIDs`, `courseFolders`,
+    /// Rebuilds `recordingMenuLines` from its inputs and refreshes the snapshot when they
+    /// changed. Called from the `didSet` of `courses`, `lastRunCourses`, `enabledCourseIDs`, `courseFolders`,
     /// `watchSummaries` and `siteInfo` (see the invariant comment on `menuBarSnapshot`). Costs
     /// nothing when no summary is known (every launch without Recordings), since the pure builder
     /// returns before any course.
@@ -1433,7 +1518,9 @@ struct RecordingMenuEntry: Equatable {
 #if DEBUG
         menuRebuildCountForTesting += 1
 #endif
-        let lines = Self.recordingMenuLines(courses: courses, enabledIDs: enabledCourseIDs, summaries: watchSummaries, owner: recordingsOwnerUserID, folders: courseFolders)
+        // `lastRunCourses` only while `courses` is empty: a window-less launch still gets its
+        // lines from what the last automatic run fetched, and a loaded list changes nothing.
+        let lines = Self.recordingMenuLines(courses: courses.isEmpty ? lastRunCourses : courses, enabledIDs: enabledCourseIDs, summaries: watchSummaries, owner: recordingsOwnerUserID, folders: courseFolders)
         guard lines != recordingMenuLines else { return }
         recordingMenuLines = lines
         refreshMenuBarSnapshot()
@@ -1836,6 +1923,8 @@ struct RecordingMenuEntry: Equatable {
             }
             guard report.unresolved.isEmpty else { throw SyncDatabaseError.execution }
             rootURL = selectedURL; rootID = selectedID; recoveryBlocked = false; hasPendingModuleMoves = false
+            // Started for the previous folder's run: the new folder's next sync decides again.
+            cancelRecordingsFollowUp()
             activityItemProblems = [:]
             dataSaverPause = nil
             courseFolders = [:]; conflicts = []; remoteChanges = []
@@ -2091,6 +2180,10 @@ struct RecordingMenuEntry: Equatable {
         // Through the helper, not the coordinator directly: it also refreshes the Settings footer.
         Task { await requestNotificationPermissionIfNeeded() }
         syncTask = Task { [weak self] in
+            // On every exit, once the run has ended (its operation, `syncTask` included, is over
+            // by then): the recordings follow-up starts as a task of its own, never awaited here,
+            // so "Esci" never waits for it. A superseded run recorded nothing and starts nothing.
+            defer { self?.followUpAfterRun(operationID, trigger: .manual) }
             do {
                 guard let self else { return }
                 await self.bootstrapTask?.value
@@ -2111,12 +2204,14 @@ struct RecordingMenuEntry: Equatable {
                 // (not connected), a saved list on screen still selects nothing (#98).
                 let selected = self.courseListFreshness == .current ? self.courses.filter { self.enabledCourseIDs.contains($0.id) } : []
                 guard !selected.isEmpty else {
+                    self.recordRunEnd(operationID, .unconfigured)
                     self.setSyncState(.readyUnchecked)
                     self.endOperation(operationID)
                     return
                 }
                 guard let database = self.database else { throw SyncDatabaseError.open }
                 guard let rootURL = self.rootURL, let rootID = self.rootID else {
+                    self.recordRunEnd(operationID, .unconfigured)
                     self.setSyncState(.needsFolder)
                     self.endOperation(operationID)
                     return
@@ -2132,6 +2227,7 @@ struct RecordingMenuEntry: Equatable {
             } catch let error as WeBeepAPIError {
                 await self?.failedSync(operationID, error: error, automatic: false)
             } catch let error as CredentialStorageError {
+                self?.recordRunEnd(operationID, .credentialUnavailable)
                 await self?.handleCredentialStorageError(error)
                 self?.endOperation(operationID)
             } catch is RootOperationGateError {
@@ -2597,6 +2693,11 @@ struct RecordingMenuEntry: Equatable {
     /// so a refresh, a restore or a save still running for that account is dropped (#98).
     private func forgetCourseList() {
         courseListEpoch += 1
+        // The account goes: its recordings follow-up, its last fetched enrollments and the last
+        // follow-up's result go with it (memory only).
+        cancelRecordingsFollowUp()
+        lastRunCourses = []
+        lastRecordingsOutcome = nil
         courses = []
         courseListFreshness = .unknown
         isPreparingCourseList = false
@@ -3067,20 +3168,25 @@ struct RecordingMenuEntry: Equatable {
             // clears it has already happened.
             guard !Task.isCancelled, schedulerGeneration == generation else {
                 BeepbarLog.sync.notice("Automatic synchronization skipped reason=schedule-changed")
+                startRecordingsFollowUp(after: .scheduleChanged, trigger: .automatic)
                 return .finished
             }
         }
-        switch AutomaticSyncPolicy.decision(lowPowerMode: lowPowerMode, busy: activeOperationID != nil || isLoadingCourses, configured: isAutomaticSyncConfigured, dataSaverEnabled: dataSaverEnabled, network: network) {
+        let decision = AutomaticSyncPolicy.decision(lowPowerMode: lowPowerMode, busy: activeOperationID != nil || isLoadingCourses, configured: isAutomaticSyncConfigured, dataSaverEnabled: dataSaverEnabled, network: network)
+        switch decision {
         case .deferForLowPowerMode:
             BeepbarLog.sync.notice("Automatic synchronization deferred reason=low-power")
+            startRecordingsFollowUp(after: .notRun(decision), trigger: .automatic)
             return .deferred
         case .deferWhileBusy:
             BeepbarLog.sync.notice("Automatic synchronization deferred reason=operation-active")
+            startRecordingsFollowUp(after: .notRun(decision), trigger: .automatic)
             return .deferred
         case .skipUnconfigured:
             BeepbarLog.sync.notice("Automatic synchronization skipped reason=configuration-unavailable")
             // Finishing leaves no retry behind, so a pause from an earlier attempt must go too.
             dataSaverPause = nil
+            startRecordingsFollowUp(after: .notRun(decision), trigger: .automatic)
             return .finished
         case .pause(let pause):
             // Nothing is sent and the state on screen is left alone (the last result, "sincronizzato
@@ -3088,11 +3194,15 @@ struct RecordingMenuEntry: Equatable {
             // instead of waiting a whole interval.
             BeepbarLog.sync.notice("Automatic synchronization deferred reason=data-saver")
             dataSaverPause = pause
+            startRecordingsFollowUp(after: .notRun(decision), trigger: .automatic)
             return .deferred
         case .run:
             break
         }
-        guard let rootURL, let rootID, let database else { return .finished }
+        guard let rootURL, let rootID, let database else {
+            startRecordingsFollowUp(after: .unconfigured, trigger: .automatic)
+            return .finished
+        }
         dataSaverPause = nil
         pruneExpiredCourseList()
         // Captured once: switching "Risparmio dati" during the run changes the next run, not this one.
@@ -3108,14 +3218,18 @@ struct RecordingMenuEntry: Equatable {
         catch {
             guard activeOperationID == operationID else { return .cancelled }
             guard !Task.isCancelled else { cancelledSync(operationID); return .cancelled }
+            recordRunEnd(operationID, .localFailure)
             setSyncState(.failed(.local(BilingualText("Impossibile leggere i corsi selezionati. Riprova.", "Couldn't read selected courses. Try again."))))
             endOperation(operationID)
+            followUpAfterRun(operationID, trigger: .automatic)
             return .finished
         }
         guard !automaticScopes.isEmpty else {
             guard activeOperationID == operationID else { return .cancelled }
             BeepbarLog.sync.notice("Automatic synchronization skipped reason=no-enabled-courses")
+            recordRunEnd(operationID, .unconfigured)
             endOperation(operationID)
+            followUpAfterRun(operationID, trigger: .automatic)
             return .finished
         }
         guard activeOperationID == operationID else { return .cancelled }
@@ -3133,7 +3247,11 @@ struct RecordingMenuEntry: Equatable {
                 let token = try await self.credentialVault.load(.nonInteractive)
                 // A course stays enabled in the database after the user leaves it; only the courses
                 // the account is still enrolled in are checked.
-                let enrolled = Set(try await self.fetchEnrolledCourses(token: token).map(\.id))
+                let enrolledCourses = try await self.fetchEnrolledCourses(token: token)
+                // Kept for the menu's recordings lines and the recordings follow-up's keys in a
+                // launch where the window never loaded `courses`: no extra WeBeep request.
+                if self.lastRunCourses != enrolledCourses { self.lastRunCourses = enrolledCourses }
+                let enrolled = Set(enrolledCourses.map(\.id))
                 let targets = Self.automaticTargets(scopes: automaticScopes, enrolledCourseIDs: enrolled)
                 let coordinator = try SyncCoordinator(rootID: rootID, rootURL: rootURL, database: database, gate: gate, apiClient: apiClient, downloader: downloader, platformName: platformName)
                 let run = self.beginTransfer(operationID, automatic: true)
@@ -3146,6 +3264,7 @@ struct RecordingMenuEntry: Equatable {
                 if networkAccess == .dataSaver, await self.pausedMidRun(operationID, error: error, restoring: stateBeforeRun) { return }
                 await self.failedSync(operationID, error: error, automatic: true)
             } catch let error as CredentialStorageError {
+                self?.recordRunEnd(operationID, .credentialUnavailable)
                 await self?.handleCredentialStorageError(error)
                 self?.endOperation(operationID)
             } catch is RootOperationGateError {
@@ -3156,7 +3275,25 @@ struct RecordingMenuEntry: Equatable {
         }
         syncTask = task
         await task.value
-        return Task.isCancelled ? .cancelled : automaticOutcome
+        // Captured before the follow-up, which never changes the materials outcome.
+        let outcome = Task.isCancelled ? AutomaticSyncOutcome.cancelled : automaticOutcome
+        // After the run and before the scheduler's `completion`: the system activity that ran the
+        // materials covers the recordings listings too, with no timer of our own. Never inside
+        // `task` (`syncTask`), which a quit waits for.
+        if let followUp = followUpAfterRun(operationID, trigger: .automatic, schedulerCancelled: Task.isCancelled) {
+            await withTaskCancellationHandler { await followUp.value } onCancel: { followUp.cancel() }
+        }
+        return outcome
+    }
+
+    /// Starts the recordings follow-up of `operationID` from what its ending path recorded, or
+    /// nothing when it recorded nothing (superseded). An automatic run whose scheduler task was
+    /// cancelled ends as `.cancelled` (mapping table: `runAutomaticSync` returning `.cancelled`).
+    /// Returns the task that runs (new or merged into), nil when skipped.
+    @discardableResult
+    private func followUpAfterRun(_ operationID: UUID, trigger: RecordingsSyncTrigger, schedulerCancelled: Bool = false) -> Task<Void, Never>? {
+        guard let end = takeRunEnd(operationID) else { return nil }
+        return startRecordingsFollowUp(after: schedulerCancelled ? .cancelled : end, trigger: trigger)
     }
 
     nonisolated static func automaticTargets(scopes: [SyncScope], enrolledCourseIDs: Set<Int64>) -> [SyncTarget] {

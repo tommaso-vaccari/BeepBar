@@ -31,7 +31,7 @@ struct RecordingsSyncRefreshTests {
             store: RecordingsSessionStore { folder },
             defaults: defaults,
             makeSeenHistory: { namespace in
-                let history = RecordingsSeenHistory(store: RecordingsSeenStore(directory: { folder }, namespace: namespace))
+                let history = RecordingsSeenHistory(store: RecordingsSeenStore(directory: { folder }, namespace: namespace), beforeAcknowledge: { await world.waitForHistoryAcknowledge() })
                 world.historyActors.append(history)
                 return history
             },
@@ -475,10 +475,18 @@ struct RecordingsSyncRefreshTests {
         list(["a", "b", "c", "d"])
         #expect(await controller.refreshForSync([course], force: true) == .refreshed(newlyPublished: 2, failedKeys: 0))
         #expect(savedSummary()?.newCount == 2)
+        // The acknowledgement that follows a completion is held, so the count is read while `d`
+        // is completed but still unseen: only the completed-not-new rule can exclude it.
+        let hold = FakeRecmanBrowser.Gate()
+        world.historyAcknowledgeGate = hold
         controller.setDone(recording("d"), true)
         await controller.settleWatchProgress()
         await drainTasks()
-        #expect(savedSummary()?.newCount == 1, "a completed lecture is not new")
+        #expect(controller.listing(for: course)?.seenIDs?.contains("d") == false)
+        #expect(savedSummary()?.newCount == 1, "a completed lecture is not new, even before its dot clears")
+        hold.release()
+        await drainTasks()
+        #expect(savedSummary()?.newCount == 1)
         defaults.resetWrites()
         #expect(await controller.refreshForSync([course], force: true) == .refreshed(newlyPublished: 0, failedKeys: 0))
         #expect(summaryWrites == 0, "an unchanged count writes nothing")

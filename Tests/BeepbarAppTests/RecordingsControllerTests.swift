@@ -2364,7 +2364,10 @@ struct RecordingsControllerTests {
     /// launch after an update has none yet) shows. A recovery keeps reusing its own metadata
     /// (`aRecoveryKeepsTheCourseAndPicture`). Guards against the metadata of the first Play
     /// sticking to the lecture for the whole session.
-    /// Mutation: reuse `playbackMetadata` for any play of the same id.
+    /// Mutation: reuse `playbackMetadata` for any play of the same id AND stop clearing it on
+    /// close (both lines: the close clear and the `recoveredLectures` condition are redundant
+    /// with each other, so removing only one stays green; the other half is
+    /// `aReplayAfterAWindowClosedBeforeReadyReadsTheCourseAgain`).
     @Test func aReplayAfterCloseReadsTheCourseAgain() async throws {
         defer { cleanUp() }
         world.courses = [webeepCourse(7, name: "ALGEBRA SEZ. A", picture: nil), webeepCourse(8, name: "ALGEBRA SEZ. B", picture: nil)]
@@ -2382,6 +2385,68 @@ struct RecordingsControllerTests {
         let again = try #require(world.player.metadatas.last ?? nil)
         #expect(again.courseName == "ALGEBRA SEZ. B")
         #expect(again.artworkURL == Self.pictureB)
+        controller.turnOff()
+    }
+
+    /// A lecture whose window closed before the stream was ready reports nothing (no checkpoint,
+    /// so the close path does not clear `playbackMetadata`), yet a later Play of it from
+    /// another course's page names that course: the stored metadata is reused only for a
+    /// recovery (`recoveredLectures`), never for "any later play of the same lecture". This is
+    /// the test that tells the two rules apart; `aReplayAfterCloseReadsTheCourseAgain` cannot,
+    /// because its normal close already clears the metadata.
+    /// Mutation: drop `recoveredLectures.contains(recording.id)` from the reuse condition in
+    /// `playbackMetadata(for:stream:)` and the replay names course A.
+    @Test func aReplayAfterAWindowClosedBeforeReadyReadsTheCourseAgain() async throws {
+        defer { cleanUp() }
+        world.courses = [webeepCourse(7, name: "ALGEBRA SEZ. A", picture: Self.pictureA), webeepCourse(8, name: "ALGEBRA SEZ. B", picture: Self.pictureB)]
+        browser.streamResults["a"] = [.success(stream("a")), .success(stream("a"))]
+        let controller = await readyController()
+        controller.selectDestination(.course(7))
+        controller.play(recording("a"))
+        await settle("a playing") { world.player.plays.count == 1 }
+        #expect(world.player.metadatas.first??.courseName == "ALGEBRA SEZ. A")
+        world.player.closeBeforeReady()
+        #expect(!world.player.isOpen)
+        #expect(world.player.closes == 0, "no normal close happened: nothing cleared the metadata")
+        controller.selectDestination(.course(8))
+        controller.play(recording("a"))
+        await settle("a again") { world.player.plays.count == 2 }
+        let again = try #require(world.player.metadatas.last ?? nil)
+        #expect(again.courseName == "ALGEBRA SEZ. B")
+        #expect(again.artworkURL == Self.pictureB)
+        controller.turnOff()
+    }
+
+    /// The course of a menu Play whose stream was never handed to the player (the lookup ended in
+    /// the browser) must not outlive an account change: the next account may list the same
+    /// WeBeep course ids, and the stale preference would win over the course the student has
+    /// selected. This is the one place `menuPlayCourse`'s reset is observable (the playback
+    /// metadata's reset is covered by the recovery list, see `closePlayerForIdentityChange`).
+    /// Mutation: drop `menuPlayCourse = nil` in `closePlayerForIdentityChange` and the replay
+    /// names course B (the stale menu course) instead of the selected course A.
+    @Test func aMenuCourseNeverPlayedDoesNotSurviveAnAccountChange() async throws {
+        defer { cleanUp() }
+        world.courses = [webeepCourse(7, name: "ALGEBRA SEZ. A", picture: nil), webeepCourse(8, name: "ALGEBRA SEZ. B", picture: nil)]
+        let controller = await readyController()
+        // No stream queued: the lookup fails and the Play ends in the browser, never reaching
+        // `startPlayer`, which is the only place the menu course is consumed.
+        // A menu Play only accepts a row whose preview link is the archive's own (`validatedNext`).
+        let base = recording("a")
+        let menuRow = RecmanRecording(id: base.id, courseCode: base.courseCode, academicYear: base.academicYear, title: base.title, recordedAt: base.recordedAt, kind: base.kind, duration: base.duration, size: nil, previewURL: URL(string: "https://onlineservices.polimi.it/recman_frontend/recman_frontend/controller/ArchivioListActivity.do?evn_preview_link=1&transfer_id=a")!)
+        #expect(controller.playFromMenu(menuRow, owner: 42, courseID: 8))
+        await settle("the stream was looked up") { !browser.streamCalls.isEmpty }
+        await drainTasks()
+        #expect(world.player.plays.isEmpty)
+
+        world.owner = 9
+        controller.webBeepAccountChanged(to: 9)
+        controller.signIn()
+        await settle("signed in again") { controller.access == .ready }
+        browser.streamResults["a"] = [.success(stream("a"))]
+        controller.selectDestination(.course(7))
+        controller.play(recording("a"))
+        await settle("a playing") { world.player.plays.count == 1 }
+        #expect(world.player.metadatas.last??.courseName == "ALGEBRA SEZ. A")
         controller.turnOff()
     }
 

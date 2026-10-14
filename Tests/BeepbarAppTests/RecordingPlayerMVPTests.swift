@@ -62,6 +62,19 @@ final class FakePlayerView: NSView {
     func deactivate() {}
 }
 
+/// A view with `AVPlayerView`'s control keys, starting from the values that make the bar large or
+/// crowded (floating style, every optional button on), so a test sees which ones the controller
+/// sets. Without AVKit: only the controller's configuration can change them.
+final class ConfigurablePlayerView: NSView {
+    @objc dynamic var player: AVPlayer?
+    @objc dynamic var controlsStyle = AVKitLoader.floatingControlsStyle
+    @objc dynamic var showsFrameSteppingButtons = true
+    @objc dynamic var showsSharingServiceButton = true
+    @objc dynamic var showsFullScreenToggleButton = true
+    @objc dynamic var showsTimecodes = true
+    @objc dynamic var allowsMagnification = true
+}
+
 /// A view without a `player` key: key-value coding on it would raise an uncatchable exception.
 final class ViewWithoutPlayer: NSView {}
 
@@ -389,6 +402,49 @@ struct RecordingPlayerMVPTests {
         #expect(menu.item(at: 0)?.title == "1,25×")
         #expect(defaults.double(forKey: RecordingPlayerPolicy.speedDefaultsKey) == 1.25)
         controller.close()
+    }
+
+    /// Every view the window gets has the compact controls: inline style (the bar docked at the
+    /// bottom edge, not the large floating panel over the lecture) and no frame stepping, sharing,
+    /// full-screen or timecode button, AVKit's pinch off; also the view built for a Play after the
+    /// window was closed. Guards against the floating panel coming back (the owner's "too high
+    /// and too big"), against a flag left to a default that crowds the bar, and against only the
+    /// first view being configured.
+    @Test func everyPlayerViewGetsTheCompactControls() async throws {
+        var built: [ConfigurablePlayerView] = []
+        let controller = makeController(makePlayerView: {
+            let view = ConfigurablePlayerView()
+            built.append(view)
+            return view
+        })
+        let media = try await TestMedia.shared.url()
+        func expectCompact(_ view: ConfigurablePlayerView, sourceLocation: SourceLocation = #_sourceLocation) {
+            #expect(view.controlsStyle == AVKitLoader.inlineControlsStyle, sourceLocation: sourceLocation)
+            #expect(!view.showsFrameSteppingButtons, sourceLocation: sourceLocation)
+            #expect(!view.showsSharingServiceButton, sourceLocation: sourceLocation)
+            #expect(!view.showsFullScreenToggleButton, sourceLocation: sourceLocation)
+            #expect(!view.showsTimecodes, sourceLocation: sourceLocation)
+            #expect(!view.allowsMagnification, sourceLocation: sourceLocation)
+        }
+        controller.play(media, title: "Lezione", cookies: [], startAt: nil)
+        let first = try #require(controller.playerView as? ConfigurablePlayerView)
+        expectCompact(first)
+        controller.close()
+        controller.play(media, title: "Lezione", cookies: [], startAt: nil)
+        let second = try #require(controller.playerView as? ConfigurablePlayerView)
+        #expect(second !== first, "a Play after closing builds a new view")
+        #expect(built.count == 2)
+        expectCompact(second)
+        controller.close()
+    }
+
+    /// A view lacking some control keys (a test view, or a future AVKit without one) is still
+    /// used, with the keys it has set: key-value coding on a missing key would raise an
+    /// Objective-C exception that ends the process, so each key is checked first.
+    @Test func controlsConfigurationSkipsKeysTheViewLacks() {
+        let view = FakePlayerView()
+        AVKitLoader.configureControls(of: view)
+        #expect(view.player == nil)
     }
 
     /// `AVPlayerView` gets the same speed list, built at runtime without importing AVKit:

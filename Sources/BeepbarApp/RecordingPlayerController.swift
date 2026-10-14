@@ -240,8 +240,8 @@ enum RecordingPlayerError: Error {
     /// `applyZoom` shows it).
     ///
     /// How it is shown: through `AVPlayerView`'s own magnification (macOS 13+, public API, called
-    /// at runtime like the rest of AVKit), not by scaling a view or layer of ours. The floating
-    /// controls are subviews of `AVPlayerView`, so scaling the view would scale and push them off
+    /// at runtime like the rest of AVKit), not by scaling a view or layer of ours. The controls
+    /// (the inline bar docked at the view's bottom edge, `AVKitLoader.controlsConfiguration`) are subviews of `AVPlayerView`, so scaling the view would scale and push them off
     /// screen, and a second `AVPlayerLayer` of our own would hide Live Text and the picture in
     /// picture placeholder and flash black while it loads. AVKit's magnification scales only the
     /// video, in a scroll view of its own, under the controls. AVKit has no public pan API, so the
@@ -924,6 +924,9 @@ enum RecordingPlayerError: Error {
         // enough data before starting or resuming, which suits network streams and works with the
         // bounded forward buffer.
         let player = makePlayer()
+        // Here rather than in `AVKitLoader.makePlayerView`, so every view the window gets (also
+        // after a close and a new Play) has the compact controls, whoever built it.
+        AVKitLoader.configureControls(of: view)
         view.frame = NSRect(x: 0, y: 0, width: 960, height: 540)
         view.setValue(player, forKey: "player")
         let window = RecordingPlayerWindow(contentRect: view.frame, styleMask: [.titled, .closable, .miniaturizable, .resizable], backing: .buffered, defer: true)
@@ -1260,14 +1263,46 @@ enum RecordingPlayerError: Error {
 /// only way to reach a class from a framework the binary does not link.
 @MainActor enum AVKitLoader {
     static let frameworkPath = "/System/Library/Frameworks/AVKit.framework/AVKit"
-    /// `AVPlayerViewControlsStyleFloating`: QuickTime-like controls over the video.
+    /// `AVPlayerViewControlsStyle` raw values, checked against `AVKit/AVPlayerView.h` (macOS 27
+    /// SDK): None 0, Inline 1, Floating 2, Minimal 3, Default = Inline. The enum cannot be named
+    /// without importing AVKit, so the numbers are spelled out here.
+    static let inlineControlsStyle = 1
     static let floatingControlsStyle = 2
+
+    /// What every player view is configured with, in order: key, value. Each key is set only when
+    /// the view has its setter (`configureControls`).
+    ///
+    /// - `controlsStyle` inline: a compact bar docked at the bottom edge of the view, instead of
+    ///   the floating panel the lecture was covered by (product owner, 2026-10-14: "too high and
+    ///   too big"). Measured on macOS 27 with a 960x540 view: the floating panel is 457x100 pt
+    ///   with its bottom 86 pt above the edge (up to 186 pt); the inline bar is 750x36 pt, 6 pt
+    ///   above the edge, with AirPlay and volume moved to two small pills in the top corners.
+    ///   Both keep play/pause, the scrubber with elapsed and remaining time, volume, AirPlay and
+    ///   AVKit's speed button. AVKit always uses the floating style in full screen (header,
+    ///   macOS 11+), which BeepBar cannot change without hiding the system controls altogether.
+    /// - Frame stepping, sharing, full-screen and timecode buttons stay off (AVKit's defaults,
+    ///   set explicitly so a changed default cannot crowd the bar): frame stepping replaces the
+    ///   skips with buttons nobody needs for a lecture, the share button would offer a stream
+    ///   address that needs the Webex ticket, and full screen already has the window's green
+    ///   button and F.
+    /// - `allowsMagnification` off: AVKit's own pinch stays off so it cannot put two handlers on
+    ///   one pinch; the player window handles every pinch itself, see
+    ///   `RecordingPlayerController.zoom`.
+    static let controlsConfiguration: [(key: String, value: Any)] = [
+        ("controlsStyle", inlineControlsStyle),
+        ("showsFrameSteppingButtons", false),
+        ("showsSharingServiceButton", false),
+        ("showsFullScreenToggleButton", false),
+        ("showsTimecodes", false),
+        ("allowsMagnification", false),
+    ]
 
     private static var attempted = false
     private static var playerViewClass: NSView.Type?
 
-    /// A new `AVPlayerView` with floating controls, or nil if AVKit cannot be loaded. The load is
-    /// attempted once per process.
+    /// A new `AVPlayerView`, or nil if AVKit cannot be loaded. The load is attempted once per
+    /// process. Its controls are configured by the controller (`configureControls`), for every
+    /// view it builds, so an injected view is configured the same way.
     static func makePlayerView() -> NSView? {
         loadIfNeeded()
         guard let playerViewClass else { return nil }
@@ -1277,14 +1312,17 @@ enum RecordingPlayerError: Error {
         guard let view = view as? NSView,
               view.responds(to: NSSelectorFromString("setPlayer:")),
               view.responds(to: NSSelectorFromString("setControlsStyle:")) else { return nil }
-        view.setValue(floatingControlsStyle, forKey: "controlsStyle")
-        // AVKit's own pinch stays off (its default, set explicitly so a changed default cannot
-        // put two handlers on one pinch): the player window handles every pinch itself, see
-        // `RecordingPlayerController.zoom`.
-        if view.responds(to: NSSelectorFromString("setAllowsMagnification:")) {
-            view.setValue(false, forKey: "allowsMagnification")
-        }
         return view
+    }
+
+    /// Applies `controlsConfiguration` to `view`, skipping each key whose setter the view lacks
+    /// (a test view, or a future AVKit without it): key-value coding on a missing key raises an
+    /// Objective-C exception Swift cannot catch.
+    static func configureControls(of view: NSView) {
+        for (key, value) in controlsConfiguration {
+            let setter = "set" + key.prefix(1).uppercased() + key.dropFirst() + ":"
+            if view.responds(to: NSSelectorFromString(setter)) { view.setValue(value, forKey: key) }
+        }
     }
 
     /// Calls `-[AVPlayerView setMagnification:centeredAtPoint:]` (macOS 13+): scales the video

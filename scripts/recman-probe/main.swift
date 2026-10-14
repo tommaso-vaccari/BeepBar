@@ -18,6 +18,9 @@ import WebKit
 //   lab <state> code year [n]  unattended, no window, nothing typed: the uuid without a web view,
 //                              the stream API's cookie needs, and what a later Webex login asks
 //                              (see lab.swift)
+//   sync <state> code year [code year ...] [--dry-run]
+//                              one background refresh as the app does it, measured; numbers only
+//                              (see sync.swift)
 
 @MainActor func say(_ line: String) {
     print(line)
@@ -121,6 +124,9 @@ let diagnostics = #"""
 
 @MainActor func run() async -> Int32 {
     let arguments = CommandLine.arguments
+    if arguments.count >= 3, arguments[1] == "sync" {
+        return await syncMode(state: URL(fileURLWithPath: arguments[2]), arguments: Array(arguments.dropFirst(3)))
+    }
     guard arguments.count >= 3, ["cold", "warm", "play", "lab"].contains(arguments[1]), !["play", "lab"].contains(arguments[1]) || arguments.count >= 5 else {
         say("usage: RecmanProbe cold|warm <state folder> [course code] [academic year] | play <state folder> <course code> <academic year> [n]")
         return 2

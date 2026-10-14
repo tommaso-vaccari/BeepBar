@@ -764,8 +764,9 @@ enum MaterialsRunEnd: Equatable, Sendable {
     /// Refreshes the Recordings listings of `keys` for a sync follow-up; the Bool is `force`
     /// (ignore the 300 s freshness window: manual sync only). A seam so the integration is tested
     /// with a fake, without WebKit.
-    // TODO(rsync B): wire to recordings.refreshForSync(keys, force:) once package B is merged
-    var recordingsRefresh: @MainActor (Set<RecmanCourseKey>, Bool) async -> RecordingsSyncOutcome = { _, _ in .skipped(.noCourses) }
+    /// Nil in production: the follow-up then calls `recordings.refreshForSync(keys, force:)`.
+    /// Tests set it to a fake so no WebKit or Polimi request is involved.
+    var recordingsRefresh: (@MainActor (Set<RecmanCourseKey>, Bool) async -> RecordingsSyncOutcome)?
     private var scopeWriteTask: Task<Void, Never>?
     // Published because views read it through `isSyncActive` / `canSynchronize` (Annulla vs
     // Sincronizza ora). An operation often ends after a suspension (the new-materials notification,
@@ -3392,11 +3393,18 @@ enum MaterialsRunEnd: Equatable, Sendable {
             guard !Task.isCancelled, self.recordingsFollowUpGeneration == generation else { return }
             let (decision, keys) = self.recordingsSyncDecision(after: materials, trigger: trigger, network: network)
             guard case .refresh(let force) = decision else { return }
-            let result = await self.recordingsRefresh(keys, force)
+            let result: RecordingsSyncOutcome
+            if let refresh = self.recordingsRefresh {
+                result = await refresh(keys, force)
+            } else {
+                result = await self.recordings.refreshForSync(keys, force: force)
+            }
             // An account, site or folder change meanwhile: the result belongs to a world that is gone.
             guard self.recordingsFollowUpGeneration == generation else { return }
             self.lastRecordingsOutcome = result
-            // TODO(rsync D): announceRecordingsRefresh(outcome, isCurrent:)
+            // One aggregated notification for the lectures first seen by this refresh (nothing for a
+            // baseline, a failure or an expired session; the coordinator applies the Notifiche switch).
+            await self.notificationCoordinator.announceRecordingsRefresh(result, isCurrent: { [weak self] in self?.recordingsFollowUpGeneration == generation })
         }
         recordingsFollowUp = task
         return task

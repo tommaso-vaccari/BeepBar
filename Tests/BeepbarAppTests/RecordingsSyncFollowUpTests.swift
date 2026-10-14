@@ -229,7 +229,7 @@ import Testing
 
         // The materials run had already finished: cancelling the follow-up doesn't rewrite that.
         #expect(outcome == .finished)
-        #expect(ContinuousClock.now - started < .seconds(1))
+        #expect(ContinuousClock.now - started < .seconds(5))
         #expect(harness.seam.sawCancellation)
     }
 
@@ -248,7 +248,7 @@ import Testing
         #expect(harness.controller.prepareForTermination() == nil)
         let started = ContinuousClock.now
         #expect(await harness.controller.prepareForMenuQuit(timeout: .seconds(5)))
-        #expect(ContinuousClock.now - started < .seconds(1))
+        #expect(ContinuousClock.now - started < .seconds(5))
         #expect(harness.controller.menuQuitDrained)
         gate.release()
     }

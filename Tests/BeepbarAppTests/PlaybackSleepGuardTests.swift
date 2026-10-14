@@ -105,6 +105,9 @@ struct PlayerKeepAwakeTests {
                                   activationPolicy: ActivationPolicyControl(current: { .regular }, set: { _ in }),
                                   frameAutosaveName: nil, defaults: PlayerTestDefaults.throwaway(),
                                   toggleFullScreen: { _ in },
+                                  // A silent publisher: the real one registers process-wide remote commands
+                                  // that `RecordingNowPlayingTests.theSystemPublisherLoadsAndClears` counts.
+                                  nowPlaying: SilentNowPlaying(),
                                   sleepGuard: PlaybackSleepGuard(assertion: fake.assertion))
     }
 

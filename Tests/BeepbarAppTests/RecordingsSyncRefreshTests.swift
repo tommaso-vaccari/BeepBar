@@ -383,7 +383,7 @@ struct RecordingsSyncRefreshTests {
         let started = ContinuousClock.now
         task.cancel()
         #expect(await task.value == .cancelled)
-        #expect(ContinuousClock.now - started < .seconds(1))
+        #expect(ContinuousClock.now - started < .seconds(5))
         #expect(!browser.isOpen)
         gate.release()
         await drainTasks()

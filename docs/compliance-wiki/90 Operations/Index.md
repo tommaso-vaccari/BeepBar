@@ -9,7 +9,7 @@
 ## Conoscenza
 
 - [[30 Wiki/GDPR per applicazioni locali]] — ambito, ruoli, requisiti.
-- [[30 Wiki/Mappa dei dati BeepBar]] — flussi e conservazione.
+- [[30 Wiki/Mappa dei dati BeepBar]] — flussi e conservazione; aggiornata il 2026-10-14 per la PR #154 (avanzamento, riepilogo nel menu, richieste in background a ogni sync, Now Playing), solo analisi statica.
 - [[30 Wiki/Valutazione BeepBar]] — finding datati e limiti.
 - [[30 Wiki/Piano di verifica]] — attività e criteri di chiusura.
 

@@ -160,6 +160,192 @@ struct RecordingsWatchProgressTests {
         }
     }
 
+    private func bulkAction(_ controller: RecordingsController, recordings: [RecmanRecording]? = nil, canEdit: Bool? = nil) -> RecordingsPresentation.BulkAction {
+        RecordingsPresentation.WatchValues(controller.watchProgress, canEdit: canEdit ?? controller.canEditProgress)
+            .bulkAction(for: course, recordings: recordings ?? controller.listing(for: course)?.recordings)
+    }
+
+    /// The full listing toggles together, including rows hidden by a search, and another course
+    /// is untouched. Mutations: save the first row only, or refresh the summary per row.
+    @Test func bulkCompletionUsesFullListingAndOneSummary() async throws {
+        defer { cleanUp() }
+        let controller = await listedController(["a", "b", "c"])
+        controller.setDone(recording("outside", in: other), true)
+        await controller.settleWatchProgress()
+        #expect(RecordingsPresentation.matches(recording("a"), query: "Lezione a"))
+        #expect(!RecordingsPresentation.matches(recording("b"), query: "Lezione a"))
+        defaults.resetWrites()
+        controller.toggleAllDone(course)
+        await controller.settleWatchProgress()
+        for id in ["a", "b", "c"] {
+            #expect(try storedEntry(id)?.completed == .manual)
+        }
+        #expect(summaryWrites == 1)
+        #expect(controller.watchSummaries[course]?.done == 3)
+        #expect(bulkAction(controller).allDone)
+        #expect(bulkAction(controller).label.italian == "Segna tutte come non viste")
+        #expect(bulkAction(controller).label.english == "Mark all as unseen")
+        controller.toggleAllDone(course)
+        await controller.settleWatchProgress()
+        for id in ["a", "b", "c"] {
+            #expect(try storedEntry(id)?.completed == nil)
+            #expect(try storedEntry(id)?.autoCompletionBlocked == true)
+        }
+        #expect(controller.watchProgress.isCompleted(recording("outside", in: other)))
+        #expect(!bulkAction(controller).allDone)
+        #expect(bulkAction(controller).label.italian == "Segna tutte come completate")
+        #expect(bulkAction(controller).label.english == "Mark all as completed")
+        controller.turnOff()
+    }
+
+    /// Until commit, every checkbox keeps its old value and stays locked for the whole batch.
+    /// Repeated bulk clicks and individual edits cannot enqueue extra writes. Page closing
+    /// preserves this explicit action. Mutations: optimistic entries or clearing pending early.
+    @Test func bulkPendingValuesStayCommittedAcrossPageClose() async throws {
+        defer { cleanUp() }
+        let controller = await listedController()
+        let gate = FakeRecmanBrowser.Gate()
+        gates.before = gate
+        gates.holdCall = 2
+        controller.toggleAllDone(course)
+        await settle("second bulk write held") { gate.isWaiting }
+        #expect(gates.calls == 2)
+        #expect(controller.watchProgress.entries.values.filter(\.isCompleted).count == 1)
+        #expect(controller.watchProgress.pending == Set([identity("a"), identity("b")]))
+        #expect(!bulkAction(controller).enabled)
+        controller.toggleAllDone(course)
+        controller.setDone(recording("a"), false)
+        controller.pageDisappeared()
+        gate.release()
+        await controller.settleWatchProgress()
+        #expect(gates.calls == 2, "one chain, no duplicate bulk or per-row write")
+        #expect(controller.watchProgress.pending.isEmpty)
+        #expect(controller.watchProgress.pendingCourses.isEmpty)
+        #expect(controller.watchProgress.isCompleted(recording("a")))
+        #expect(controller.watchProgress.isCompleted(recording("b")))
+        controller.turnOff()
+    }
+
+    /// Empty, unread and uneditable listings cannot authorize overwriting unknown history;
+    /// a course lock survives replacing its visible list. Mutation: ignore any bulk guard.
+    @Test func bulkAvailabilityRequiresKnownEditableUnblockedListing() async {
+        defer { cleanUp() }
+        let controller = await listedController()
+        #expect(bulkAction(controller).enabled)
+        #expect(!bulkAction(controller, recordings: []).enabled)
+        #expect(!bulkAction(controller, recordings: [recording("unknown")]).enabled)
+        #expect(!bulkAction(controller, canEdit: false).enabled)
+        controller.toggleAllDone(other)
+        #expect(controller.watchProgress.pending.isEmpty)
+        controller.watchProgress.setPending(true, for: Set([identity("a")]), course: course)
+        #expect(!bulkAction(controller, recordings: [recording("b")]).enabled)
+        controller.watchProgress.setPending(false, for: Set([identity("a")]), course: course)
+        controller.watchProgress.setPending(true, for: identity("b"))
+        #expect(!bulkAction(controller).enabled)
+        controller.watchProgress.setPending(false, for: identity("b"))
+        controller.turnOff()
+    }
+
+    /// A storage failure releases all controls without inventing done values; retry succeeds.
+    /// Mutation: publish before applying progress, omit pending cleanup or the history banner.
+    @Test func bulkFailureKeepsValuesAndAllowsRetry() async throws {
+        defer { cleanUp() }
+        let controller = await listedController()
+        fault.isFailing = true
+        controller.toggleAllDone(course)
+        await controller.settleWatchProgress()
+        #expect(controller.listing(for: course)?.problem == .historyUnavailable)
+        #expect(controller.watchProgress.entries.isEmpty)
+        #expect(controller.watchProgress.pending.isEmpty)
+        #expect(controller.watchProgress.pendingCourses.isEmpty)
+        #expect(bulkAction(controller).enabled)
+        #expect(gates.calls == 1, "stop a failing batch instead of retrying every remaining row")
+        fault.isFailing = false
+        controller.toggleAllDone(course)
+        await controller.settleWatchProgress()
+        #expect(controller.watchSummaries[course]?.done == 2)
+        controller.turnOff()
+    }
+
+    /// Partial commits remain real; their acknowledgement cannot erase a later failed save's
+    /// banner. Mutation: let acknowledgement success clear the bulk failure banner.
+    @Test func bulkPartialFailureKeepsCommittedRowsAndError() async throws {
+        defer { cleanUp() }
+        let controller = await listedController(["a"])
+        browser.listResults[course.courseCode] = .success([recording("a"), recording("b", daysAgo: 0)])
+        controller.refresh([course], selected: course, force: true)
+        await settle("new row listed") { controller.newCount(for: course) == 1 }
+        let gate = FakeRecmanBrowser.Gate()
+        gates.before = gate
+        gates.holdCall = 2
+        controller.toggleAllDone(course)
+        await settle("second bulk save held") { gate.isWaiting }
+        fault.isFailing = true
+        gate.release()
+        await controller.settleWatchProgress()
+        fault.isFailing = false
+        await drainTasks()
+        #expect(controller.watchProgress.entries.values.filter(\.isCompleted).count == 1)
+        #expect(controller.watchSummaries[course]?.done == 1)
+        #expect(controller.listing(for: course)?.problem == .historyUnavailable)
+        #expect(controller.watchProgress.pending.isEmpty)
+        controller.turnOff()
+    }
+
+    /// Unchecking every row resets a crossing at click time and preserves furthest/resume
+    /// positions; closing the player behind the queued batch cannot complete it again.
+    /// Mutations: skip resetting live crossings or untick epochs in the bulk action.
+    @Test func bulkUntickPreservesPositionAndDoesNotRestoreNewDots() async throws {
+        defer { cleanUp() }
+        let controller = await listedController(["a"])
+        browser.listResults[course.courseCode] = .success([recording("a"), recording("b", daysAgo: 0)])
+        controller.refresh([course], selected: course, force: true)
+        await settle("new row listed") { controller.newCount(for: course) == 1 }
+        controller.toggleAllDone(course)
+        await controller.settleWatchProgress()
+        await settle("acknowledged") { controller.newCount(for: course) == 0 }
+        await play("a", on: controller)
+        world.player.tick(at: 5_700)
+        let gate = FakeRecmanBrowser.Gate()
+        gates.before = gate
+        controller.toggleAllDone(course)
+        await settle("untick held") { gate.isWaiting }
+        world.player.close()
+        gate.release()
+        await controller.settleWatchProgress()
+        let entry = try #require(try storedEntry("a"))
+        #expect(entry.furthest == 0.95)
+        #expect(entry.completed == nil)
+        #expect(entry.autoCompletionBlocked)
+        #expect(controller.newCount(for: course) == 0)
+        let resume = try #require(defaults.data(forKey: RecordingsController.resumePointsKey))
+        #expect(try PropertyListDecoder().decode(RecordingResumePoints.self, from: resume).position(for: identity("a")) == 5_700)
+        controller.turnOff()
+    }
+
+    /// An account/reset boundary invalidates the captured actor and stops the remaining batch;
+    /// neither account sees stale values. Mutation: fetch the current actor within the loop.
+    @Test(arguments: ["turn off", "account change"])
+    func bulkCannotCrossIdentityBoundary(change: String) async throws {
+        defer { cleanUp() }
+        let controller = await listedController()
+        let gate = FakeRecmanBrowser.Gate()
+        gates.before = gate
+        controller.toggleAllDone(course)
+        await settle("bulk held") { gate.isWaiting }
+        if change == "turn off" { controller.setEnabled(false) }
+        else { world.owner = 7; controller.webBeepAccountChanged(to: 7) }
+        gate.release()
+        await controller.settleWatchProgress()
+        #expect(controller.watchProgress.entries.isEmpty)
+        #expect(controller.watchProgress.pending.isEmpty)
+        #expect(controller.watchProgress.pendingCourses.isEmpty)
+        #expect(try storedEntry("a", owner: 42) == nil)
+        #expect(try storedEntry("b", owner: 42) == nil)
+        #expect(try storedEntry("a", owner: 7) == nil)
+        #expect(gates.calls == 1)
+    }
+
     // MARK: Ticks
 
     /// A tick moves the window's bar and live summary and nothing else: no database transaction,

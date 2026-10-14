@@ -39,6 +39,8 @@ import BeepbarCore
     @Published private(set) var live: [String: Double] = [:]
     /// Identities whose tick or un-tick is being saved: the checkbox is disabled until then.
     @Published private(set) var pending: Set<String> = []
+    /// Courses with a bulk save in flight, including across a listing refresh.
+    @Published private(set) var pendingCourses: Set<RecmanCourseKey> = []
     /// Each loaded course's summary including `live`, for the window. The menu bar and the
     /// persisted copy use `RecordingsController.watchSummaries`, which ignores ticks.
     @Published private(set) var summaries: [RecmanCourseKey: CourseWatchSummary] = [:]
@@ -97,6 +99,11 @@ import BeepbarCore
         else if pending.contains(identity) { pending.remove(identity) }
     }
 
+    func setPending(_ isPending: Bool, for identities: Set<String>, course: RecmanCourseKey) {
+        if isPending { pending.formUnion(identities); pendingCourses.insert(course) }
+        else { pending.subtract(identities); pendingCourses.remove(course) }
+    }
+
     func setSummary(_ summary: CourseWatchSummary?, for key: RecmanCourseKey) {
         if summaries[key] != summary { summaries[key] = summary }
     }
@@ -106,6 +113,7 @@ import BeepbarCore
         if !entries.isEmpty { entries = [:] }
         if !live.isEmpty { live = [:] }
         if !pending.isEmpty { pending = [] }
+        if !pendingCourses.isEmpty { pendingCourses = [] }
         if !summaries.isEmpty { summaries = [:] }
         if !known.isEmpty { known = [] }
     }

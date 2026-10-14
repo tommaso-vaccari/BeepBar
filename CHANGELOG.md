@@ -7,11 +7,12 @@
 
 ### New
 
+- Mark every lecture in a course completed with one command, or mark them all unseen again when all are completed. Playback progress and resume positions are kept.
 - Watch lecture recordings right inside BeepBar instead of in the browser, with the usual video controls in a slim bar along the bottom edge that covers little of the lecture, speeds from 0.5x to 3x, 10 and 30 second skips and keyboard shortcuts. A lecture picks up where you stopped, and if the connection drops it resumes on its own. If a recording can't be played inside BeepBar, it still opens in your browser, and "Open in browser" in a recording's menu always opens it there.
 - To sign in to Webex for you, BeepBar uses the Polimi email from your WeBeep profile, with nothing to confirm. You can see, change or remove it in Settings › Recordings, and it stays on your Mac.
 - Save lessons from different courses in a single Watchlist inside Recordings. Add or remove bookmarks and find your saved list again after restarting.
 - Follow your progress in Recordings: every lecture shows how much you have watched, and a “Done” checkbox lets you mark lectures you watched elsewhere or attended in person. A lecture counts as done when you close it after watching at least 90%. Each course shows how many lectures are done and roughly how much time is left.
-- The BeepBar menu has a new Recordings section with one line per course (lectures done, time left and any new recordings). Click a line to play the next lecture you haven't finished, without opening the window. “Open BeepBar” now sits right under “Sync now”.
+- In the BeepBar menu, “Open BeepBar” now sits right under “Sync now”.
 - BeepBar now keeps your recordings up to date: after every sync it checks your selected courses for new recordings (it never downloads video) and, if notifications are on, tells you once with “N new recordings”; a click opens Recordings. It never opens a window or asks you to sign in on its own: if your Polimi sign-in has expired, Recordings shows the prompt next time you open it.
 - Zoom into the lecture video in the player with a pinch or with ⌘+, ⌘− and ⌘0, and drag to move around while zoomed.
 - Telemetry is enabled by default to count how many people use BeepBar and how, with one daily ping: the app and macOS versions, the language and which settings are on, under a random identifier that changes every month. Turn it off in Settings, which also deletes the identifier; the info button explains what is sent. No account, course or file information is included.

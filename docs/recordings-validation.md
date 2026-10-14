@@ -96,3 +96,28 @@ Primary sources consulted:
 Verification: the complete suite passed 1,104 tests (530 core Swift Testing, 31 benchmark Swift Testing, 529 app Swift Testing, 14 app XCTest); the unsigned Release build and `git diff --check` passed. Independent review found an account-owner cleanup edge case after disabling; it was fixed and the same reviewer reported no remaining actionable findings. The regression covers retaining positions for the same account and removing them for another account even with no remaining Polimi session.
 
 In a disposable source copy, removing fresh-cookie retry, service-error classification and toggle preservation caused assertion failures in their new regressions. Separately removing owner cleanup while retaining toggle preservation failed the owner-change regression. No compilation failure was counted as regression evidence. The complete suite passed again on the original sources after those mutations (the same 1,104 tests). No app-wide performance claim is made; comparative performance measurements are not applicable to these correctness fixes.
+
+## How to run the live sync measurement
+
+`scripts/recman-probe.sh sync` measures one background refresh the way the app does it at a sync: one entry into the archive from the saved probe session (`RecmanWebSession.recordings(for:)` enters in the background on its first call), then each requested course listed in turn. It is the evidence step of the Recordings cost model; **it contacts Polimi with the owner's saved session, so it runs only on the owner's explicit go, never by an agent or in CI.**
+
+```
+scripts/recman-probe.sh warm 058167 2026                      # once, if there is no saved session yet (cold signs in by hand)
+scripts/recman-probe.sh sync 058167 2026                      # one course
+scripts/recman-probe.sh sync 058167 2026 051234 2025          # several courses, sequential, one entry
+scripts/recman-probe.sh sync 058167 2026 --dry-run            # no network: checks arguments and output format only
+scripts/recman-probe.sh sync --help
+```
+
+Course codes are 6 digits and years 4 digits; anything else prints the usage and exits 2 before anything is built. Exit 0 means every listing completed; 1 means a failure, `needs-sign-in` (run `cold`) or no saved session.
+
+What the lines mean:
+
+- `ENTRY`: time, finished page loads and failed loads for the background entry, number of entries (more than 1 means the session lapsed mid-run and the app's retry fired), and the navigator's outcome.
+- `COURSE n`: listing time with the entry subtracted, page loads, result pages read, recordings found (a count), whether the listing was complete, and whether the entry happened inside this course's call (normally only course 1).
+- `TOTAL`: web session opened to last listing.
+- `MEMORY`: resident size of the WebKit helper processes (WebContent, Networking, GPU) started by the run, before, at peak (sampled every 250 ms) and after closing the web view plus a 2 s settle. Helpers are XPC services, not children, so they are identified as "appeared after the run began and answer to the same responsible process as the probe"; helpers that already existed are not counted. Run it with no other WebKit app starting at the same time. A helper or two may still be alive after the settle: that is WebKit's own lingering and is part of the answer.
+- `COOKIES`: whether the session cookie fingerprint (value and expiry hashed, never printed) differs between the start and the end, using the same rule as `RecmanSessionVault`. `yes` means every sync would rewrite the session file; the counts say whether values or only expiries moved.
+- `SIGN-IN`: whether the entry needed the user. The mode never shows a window and never types; it reports `needs-sign-in` instead.
+
+Not printed, by construction: any address (even redacted), cookie name or value, ticket, title, course code or e-mail. Courses are numbered, and every line passes a guard that withholds anything URL-, mail- or ticket-shaped. Not measurable from WKWebView: bytes received and sub-resource requests (printed as `n/a`); "page loads" are finished main-frame loads only. The saved session is read, never rewritten, so the run can be repeated.

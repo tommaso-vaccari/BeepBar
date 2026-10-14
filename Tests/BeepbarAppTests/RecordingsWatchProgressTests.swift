@@ -366,7 +366,8 @@ struct RecordingsWatchProgressTests {
     }
 
     /// An account/reset boundary invalidates the captured actor and stops the remaining batch;
-    /// neither account sees stale values. Mutation: fetch the current actor within the loop.
+    /// neither account sees stale values and the old batch's lock is gone. Mutation: drop the
+    /// identity check inside the loop (the remaining row is saved under the new account).
     @Test(arguments: ["turn off", "account change"])
     func bulkCannotCrossIdentityBoundary(change: String) async throws {
         defer { cleanUp() }
@@ -386,6 +387,37 @@ struct RecordingsWatchProgressTests {
         #expect(try storedEntry("b", owner: 42) == nil)
         #expect(try storedEntry("a", owner: 7) == nil)
         #expect(gates.calls == 1)
+    }
+
+    /// Signed in to Polimi while the WeBeep account was still unknown, so no session owner was
+    /// saved: an account change then resets nothing and the bulk save simply stops. It must
+    /// still release the course lock, or every checkbox and the button stay disabled until the
+    /// next reset. Mutation: release the lock only on the success path (drop the `defer`).
+    @Test func bulkStoppedByAnUnresetAccountChangeReleasesTheCourse() async throws {
+        defer { cleanUp() }
+        let controller = makeController()
+        controller.setEnabled(true)
+        // WeBeep's account goes unknown (offline) while the Polimi sign-in runs.
+        world.owner = nil
+        await settle("sign-in finished") { controller.access == .ready && !browser.isOpen }
+        world.owner = 42
+        controller.pageAppeared()
+        browser.listResults[course.courseCode] = .success([recording("a"), recording("b")])
+        controller.refresh([course], selected: course)
+        await settle("listed") { controller.listing(for: course)?.recordings != nil }
+        #expect(bulkAction(controller).enabled)
+        let gate = FakeRecmanBrowser.Gate()
+        gates.before = gate
+        controller.toggleAllDone(course)
+        await settle("bulk held") { gate.isWaiting }
+        world.owner = 7
+        controller.webBeepAccountChanged(to: 7)
+        gate.release()
+        await controller.settleWatchProgress()
+        #expect(controller.watchProgress.pendingCourses.isEmpty)
+        #expect(controller.watchProgress.pending.isEmpty)
+        #expect(gates.calls == 1, "the rest of the batch never reaches the next account")
+        controller.turnOff()
     }
 
     // MARK: Ticks

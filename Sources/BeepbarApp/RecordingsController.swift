@@ -307,6 +307,12 @@ struct RecordingsListing: Equatable {
     /// How many un-ticks were queued per identity in this account's lifetime. A checkpoint
     /// records the count when queued; a retry that finds it changed was overtaken by an un-tick.
     private var untickCounts: [String: Int] = [:]
+    /// The bulk save that holds each course's lock (`watchProgress.pendingCourses`). Only that
+    /// save releases it, also when it stops at an identity change that resets nothing (the
+    /// WeBeep account changing with no saved Polimi session): without this the whole course
+    /// would stay disabled until the next reset. A save superseded by a reset finds another
+    /// token, or none, and leaves the new account's locks alone.
+    private var bulkTokens: [RecmanCourseKey: UUID] = [:]
     /// The last saved summary of each course, for the menu bar (package F reads it through
     /// `onWatchSummaryChange` and `storedWatchSummaries(in:owner:)`). Changes only when a listing
     /// is published or a progress write commits, never on a tick: the in-memory position moves
@@ -1103,6 +1109,7 @@ struct RecordingsListing: Equatable {
         sessions = [:]
         unsavedCheckpoints = [:]
         untickCounts = [:]
+        bulkTokens = [:]
         progressChain = nil
         watchSummaryOwner = nil
         // The menu may hold summaries this controller never loaded (seeded from the saved copy
@@ -1904,6 +1911,8 @@ struct RecordingsListing: Equatable {
             }
         }
         watchProgress.setPending(true, for: identities, course: key)
+        let token = UUID()
+        bulkTokens[key] = token
         let history = seenHistory
         let reset = historyResetTask
         let previous = progressChain
@@ -1911,6 +1920,12 @@ struct RecordingsListing: Equatable {
             await previous?.value
             await reset?.value
             guard let self else { return }
+            defer {
+                if self.bulkTokens[key] == token {
+                    self.bulkTokens[key] = nil
+                    self.watchProgress.setPending(false, for: identities, course: key)
+                }
+            }
             var completed: [String] = []
             var failed = false
             for recording in recordings {
@@ -1923,8 +1938,13 @@ struct RecordingsListing: Equatable {
                 if changedDone { completed.append(recording.id) }
             }
             guard self.isCurrentIdentity(history, owner: owner) else { return }
-            self.watchProgress.setPending(false, for: identities, course: key)
             self.refreshWatchSummary(for: key, persist: true)
+            // A refresh may have evicted the listing meanwhile, and then the summary above can't
+            // be recomputed: drop a saved `next` that was just completed, as the per-row path does.
+            let completedIDs = Set(completed)
+            for recording in recordings where completedIDs.contains(recording.id) {
+                self.clearSavedNextIfCompleted(recording, in: key)
+            }
             self.scheduleAcknowledge(completed, for: key, preserveHistoryProblem: failed)
         }
     }

@@ -1,4 +1,5 @@
 import AppKit
+import BeepbarCore
 import Testing
 @testable import BeepbarApp
 
@@ -155,6 +156,34 @@ struct RecordingPlayerPolicyTests {
         #expect(map("") == nil)
     }
 
+    /// The zoom chords, and only they among ⌘ chords: ⌘= / ⌘+ (Shift, the keypad, and the
+    /// Italian layout's Shift+0 that types "=") zoom in, ⌘- zooms out, ⌘0 fits; with Control or
+    /// Option added, or without ⌘, they are not zoom keys (plain 0 stays "jump to the start").
+    /// Guards against the zoom taking other ⌘ chords (⌘W, ⌘1) or missing a layout's variant.
+    @Test func zoomChordsMapAndNothingElse() {
+        func map(_ characters: String, _ modifiers: NSEvent.ModifierFlags, ignoring: String? = nil) -> PlayerShortcut? {
+            Policy.shortcut(characters: characters, charactersIgnoringModifiers: ignoring ?? characters, specialKey: nil, modifiers: modifiers)
+        }
+        #expect(map("=", [.command]) == .zoomIn)
+        #expect(map("+", [.command, .shift]) == .zoomIn)
+        #expect(map("=", [.command, .shift], ignoring: "=") == .zoomIn)
+        #expect(map("+", [.command, .numericPad]) == .zoomIn)
+        #expect(map("-", [.command]) == .zoomOut)
+        #expect(map("-", [.command, .numericPad]) == .zoomOut)
+        #expect(map("0", [.command]) == .zoomReset)
+        #expect(map("0", [.command, .numericPad]) == .zoomReset)
+        #expect(map("0", [.command, .option]) == nil)
+        #expect(map("=", [.command, .control]) == nil)
+        #expect(map("-", [.control]) == nil)
+        #expect(map("1", [.command]) == nil)
+        #expect(map("w", [.command]) == nil)
+        #expect(map(")", [.command, .shift]) == nil)
+        #expect(map("=", []) == nil)
+        #expect(map("-", []) == nil)
+        #expect(map("+", [.shift]) == nil)
+        #expect(map("0", []) == .jump(0))
+    }
+
     /// Layouts that type non-Latin letters fall back to the physical key; Latin layouts keep the
     /// typed letter (AZERTY's M is not on QWERTY's M key), and an unknown physical key maps to
     /// nothing.
@@ -176,10 +205,12 @@ struct RecordingPlayerPolicyTests {
         #expect(Policy.shortcut(characters: "\u{043E}", charactersIgnoringModifiers: "\u{043E}", specialKey: nil, modifiers: [.command], keyCode: 38) == nil)
     }
 
-    /// Only skips and speed steps repeat while a key is held; toggles would flicker.
+    /// Only skips, speed steps and zoom steps repeat while a key is held; toggles (and fitting
+    /// again) would flicker or do nothing.
     @Test func onlyStepsRepeat() {
         #expect(PlayerShortcut.skip(10).repeats && PlayerShortcut.slower.repeats && PlayerShortcut.faster.repeats)
-        for shortcut in [PlayerShortcut.togglePlayPause, .pause, .toggleFullScreen, .toggleMute, .jump(0.5)] {
+        #expect(PlayerShortcut.zoomIn.repeats && PlayerShortcut.zoomOut.repeats)
+        for shortcut in [PlayerShortcut.togglePlayPause, .pause, .toggleFullScreen, .toggleMute, .jump(0.5), .zoomReset] {
             #expect(!shortcut.repeats)
         }
     }
@@ -193,7 +224,22 @@ struct RecordingPlayerPolicyTests {
         #expect(Policy.speedLabel(2.5) == "2,5×")
         #expect(Policy.speedLabel(3) == "3×")
         let help = Policy.shortcutHelp()
-        #expect(help.count == 9)
+        #expect(help.count == 12)
         #expect(help.allSatisfy { !$0.keys.isEmpty && !$0.action.isEmpty })
+        #expect(help.map(\.keys) == Policy.shortcutHelpEntries.map(\.keys.italian), "resolved in the current (Italian) language")
+    }
+
+    /// The help lists the zoom keys and the pinch in both languages, read through
+    /// `BilingualText` (the language is never switched in tests). Guards against a zoom entry
+    /// missing, or a translation left in the other language.
+    @Test func theHelpListsTheZoomInBothLanguages() throws {
+        let entries = Policy.shortcutHelpEntries
+        let zoom = try #require(entries.first { $0.keys.italian == "⌘+  ⌘−" })
+        #expect(zoom.action == BilingualText("Ingrandisci / riduci il video", "Zoom the video in / out"))
+        let fit = try #require(entries.first { $0.keys.english == "⌘0" })
+        #expect(fit.action == BilingualText("Adatta il video alla finestra", "Fit the video to the window"))
+        let pinch = try #require(entries.first { $0.keys == BilingualText("Pizzica", "Pinch") })
+        #expect(pinch.action == BilingualText("Ingrandisci; trascina o scorri per spostarti", "Zoom; drag or scroll to move around"))
+        #expect(entries.allSatisfy { !$0.action.italian.isEmpty && !$0.action.english.isEmpty && $0.action.italian != $0.action.english })
     }
 }

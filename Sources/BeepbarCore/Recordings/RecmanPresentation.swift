@@ -23,9 +23,11 @@ public enum RecmanPresentation {
         return calendar
     }
 
-    /// The minutes in Recman's duration ("97 min"); the parser accepts no other shape.
+    /// The minutes in Recman's duration ("97 min"); the parser accepts no other shape. Delegates to
+    /// `RecmanRecording.minutes(inDuration:)` so the course header's total, the row and the
+    /// hours-left estimate read the same number, and an implausible length never traps the sum.
     public static func minutes(_ duration: String) -> Int? {
-        Int(duration.prefix { $0.isNumber })
+        RecmanRecording.minutes(inDuration: duration)
     }
 
     /// "45 min", "1 h 37 min", "36 h".

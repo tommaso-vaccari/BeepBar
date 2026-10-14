@@ -27,10 +27,15 @@ public struct RecmanCourseSidebar: Equatable, Sendable {
     public struct Inputs: Equatable, Sendable {
         public var courses: [RemoteCourseSummary]
         public var enabledIDs: Set<Int64>
+        /// The local folder of each course, as the app already holds it in memory
+        /// (`WeBeepAuthenticationController.courseFolders`). Part of the cache key, so renaming a
+        /// folder renames the sidebar row, and nothing is read from disk to draw it.
+        public var folders: [Int64: String]
 
-        public init(courses: [RemoteCourseSummary], enabledIDs: Set<Int64>) {
+        public init(courses: [RemoteCourseSummary], enabledIDs: Set<Int64>, folders: [Int64: String] = [:]) {
             self.courses = courses
             self.enabledIDs = enabledIDs
+            self.folders = folders
         }
     }
 
@@ -38,12 +43,16 @@ public struct RecmanCourseSidebar: Equatable, Sendable {
         public let course: RemoteCourseSummary
         public let key: RecmanCourseKey
         public let name: String
+        /// What the sidebar row shows: `name`, with the base part replaced by the course's
+        /// renamed local folder (`sidebarName`). Titles, headers and lookups keep using `name`.
+        public let sidebarName: String
         public var id: Int64 { course.id }
     }
 
     public struct Unsearchable: Equatable, Sendable, Identifiable {
         public let course: RemoteCourseSummary
         public let name: String
+        public let sidebarName: String
         public var id: Int64 { course.id }
     }
 
@@ -61,9 +70,11 @@ public struct RecmanCourseSidebar: Equatable, Sendable {
         var unsearchable: [Unsearchable] = []
         for course in courses {
             if let key = RecmanCourseKey(course: course) {
-                searchable.append(Entry(course: course, key: key, name: Self.courseName(course, key: key)))
+                let name = Self.courseName(course, key: key)
+                searchable.append(Entry(course: course, key: key, name: name, sidebarName: Self.sidebarName(courseName: name, courseDisplayName: course.displayName, courseID: course.id, localFolderName: inputs.folders[course.id])))
             } else {
-                unsearchable.append(Unsearchable(course: course, name: Self.courseName(course, key: nil)))
+                let name = Self.courseName(course, key: nil)
+                unsearchable.append(Unsearchable(course: course, name: name, sidebarName: Self.sidebarName(courseName: name, courseDisplayName: course.displayName, courseID: course.id, localFolderName: inputs.folders[course.id])))
             }
         }
         self.searchable = searchable
@@ -93,5 +104,75 @@ public struct RecmanCourseSidebar: Equatable, Sendable {
             .replacingOccurrences(of: suffix, with: "", options: .regularExpression)
             .trimmingCharacters(in: .whitespacesAndNewlines)
         return cleaned.isEmpty ? name : cleaned
+    }
+
+    // MARK: Renamed folders
+
+    /// The part in parentheses at the end of a course name, which on WeBeep is usually the teacher
+    /// ("CODE - NAME (Teacher) [2026-27]"; once `courseName` has removed the code and the year
+    /// the group is last) but may be a section ("ANALISI 2 (sezione B)"). It is kept or dropped as
+    /// a whole, whatever it holds. Only one level of parentheses: a nested group is not matched.
+    private static let trailingGroup = try? NSRegularExpression(pattern: #"\s*(\([^()]*\))\s*$"#)
+
+    /// The name the sidebar row shows. `courseName` is the cleaned name (`courseName(_:)`),
+    /// `courseDisplayName` the raw WeBeep one the default folder is derived from
+    /// (`LocalPathPolicy.defaultCourseFolder`), `localFolderName` the folder BeepBar syncs into.
+    ///
+    /// The student may rename that folder to something short ("GAL"); the row then follows it, but
+    /// keeps the teacher, who tells apart two courses with the same name: "Geometria algebra
+    /// lineare (Claude Sonnet)" with the folder "GAL" reads "GAL (Claude Sonnet)".
+    ///
+    /// The cleaned name is returned unchanged when there is no folder (nil, empty, blank) or when
+    /// the folder matches a generated name (`renamedFolder`). Anything else is the student's
+    /// choice. Only the trailing parenthesised part is kept ("A (B) (C)" keeps "(C)"); a folder
+    /// that already ends with that part is not given it twice. Pure and total: odd input yields
+    /// the cleaned name or the folder.
+    public static func sidebarName(courseName: String, courseDisplayName: String, courseID: Int64, localFolderName: String?) -> String {
+        guard let folder = renamedFolder(courseDisplayName: courseDisplayName, courseID: courseID, localFolderName: localFolderName) else { return courseName }
+        let key = PathKey.of(folder)
+        guard let teacher = teacherGroup(of: courseName) else { return folder }
+        if key.hasSuffix(PathKey.of(teacher)) { return folder }
+        return "\(folder) \(teacher)"
+    }
+
+    /// The name the status-bar menu shows for a course: the renamed folder alone, no teacher (a
+    /// menu line is a glance and must stay short), else the cleaned name without its trailing
+    /// teacher group. Same "renamed" rule as `sidebarName`. A name that is only a group, or has
+    /// none, is returned as it is.
+    public static func menuName(courseName: String, courseDisplayName: String, courseID: Int64, localFolderName: String?) -> String {
+        if let folder = renamedFolder(courseDisplayName: courseDisplayName, courseID: courseID, localFolderName: localFolderName) { return folder }
+        guard teacherGroup(of: courseName) != nil, let trailingGroup else { return courseName }
+        let stripped = trailingGroup.stringByReplacingMatches(in: courseName, range: NSRange(courseName.startIndex..., in: courseName), withTemplate: "")
+        return stripped.trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    private static let folderTeacherGroup = try? NSRegularExpression(pattern: #"\s+\([^()]*\)(?=\s*(?:\[[^\]]*\])?\s*$)"#)
+
+    /// Match generated names, not their character shape: lowercase custom names are valid.
+    /// A historical default that cannot be derived from the current course is kept as its name.
+    private static func renamedFolder(courseDisplayName: String, courseID: Int64, localFolderName: String?) -> String? {
+        guard let folder = localFolderName?.trimmingCharacters(in: .whitespacesAndNewlines), !folder.isEmpty else { return nil }
+        let key = PathKey.of(folder)
+        let withoutTeacher = folderTeacherGroup?.stringByReplacingMatches(in: courseDisplayName, range: NSRange(courseDisplayName.startIndex..., in: courseDisplayName), withTemplate: "") ?? courseDisplayName
+        let generated = [courseDisplayName, withoutTeacher].flatMap { name in
+            let plain = LocalPathPolicy.defaultCourseFolder(name)
+            let whole = LocalPathPolicy.courseFolderSlug(name)
+            return [plain, whole, LocalPathPolicy.courseFolder(plain, disambiguatedBy: courseID), LocalPathPolicy.courseFolder(whole, disambiguatedBy: courseID)]
+        }
+        if generated.contains(where: { PathKey.of($0) == key }) { return nil }
+        if let counter = folder.split(separator: "-").last.flatMap({ Int64($0) }), counter >= 2,
+           generated.filter({ $0.hasSuffix("-\(courseID)") }).contains(where: { PathKey.of(LocalPathPolicy.courseFolder($0, disambiguatedBy: counter)) == key }) { return nil }
+        if LocalPathPolicy.generatedCourseFolderReplacement(storedFolder: folder, storedCourseName: courseDisplayName, currentCourseName: courseDisplayName, courseID: courseID) != nil { return nil }
+        return folder
+    }
+
+    /// The teacher group of a cleaned name, nil when there is none or the name is only that group.
+    private static func teacherGroup(of name: String) -> String? {
+        guard let trailingGroup else { return nil }
+        let range = NSRange(name.startIndex..., in: name)
+        guard let match = trailingGroup.firstMatch(in: name, range: range),
+              let whole = Range(match.range, in: name), let group = Range(match.range(at: 1), in: name),
+              !name[..<whole.lowerBound].trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return nil }
+        return String(name[group])
     }
 }

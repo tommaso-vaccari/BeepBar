@@ -153,6 +153,7 @@ final class UIFixtureProtocol: URLProtocol, @unchecked Sendable {
     func cookies() async -> [HTTPCookie] { [Self.cookie] }
     func signIn() async throws { throw UIFixtureError.unexpectedResponse }
     func playbackURL(for recording: RecmanRecording) async throws -> URL { throw UIFixtureError.unexpectedResponse }
+    /// The UI fixture never plays: no Webex request, so any native-playback attempt is a harness bug.
     func stream(for recording: RecmanRecording, email: PolimiEmail?) async throws -> RecordingStream { throw UIFixtureError.unexpectedResponse }
     func close() { isOpen = false }
     func recordings(for key: RecmanCourseKey) async throws -> [RecmanRecording] {

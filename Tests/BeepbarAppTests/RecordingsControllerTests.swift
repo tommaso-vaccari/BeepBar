@@ -112,8 +112,9 @@ import BeepbarCore
 }
 
 /// The native player as the controller sees it, without AVFoundation. Behaves like the real one
-/// where the controller depends on it: a newer `play` first reports the lecture it replaces, and
-/// `close()` reports the lecture on screen before it goes.
+/// where the controller depends on it: a newer `play` first reports the lecture it replaces
+/// (`.replaced`), `close()` reports the lecture on screen before it goes (`.closed`), a pause
+/// reports `.paused`, a mid-lecture failure `.failed`, and `tick(at:)` reaches `onProgress` only.
 @MainActor final class FakeRecordingPlayer: RecordingPlaying {
     struct Play: Equatable {
         let url: URL
@@ -124,9 +125,12 @@ import BeepbarCore
     }
 
     private(set) var isOpen = false
-    var onPositionCheckpoint: ((String, TimeInterval, TimeInterval?) -> Void)?
+    var onPositionCheckpoint: ((RecordingCheckpoint) -> Void)?
+    var onProgress: ((String, TimeInterval, TimeInterval?) -> Void)?
     var onFailure: ((String, RecordingPlaybackFailure) -> Void)?
     private(set) var plays: [Play] = []
+    /// The Now Playing metadata of each play, in order (nil: the caller gave none).
+    private(set) var metadatas: [RecordingPlaybackMetadata?] = []
     /// The `index`th play, or a recorded failure instead of a crash when the controller started
     /// fewer: an out-of-range index would end the whole test process and hide every other result.
     func play(_ index: Int, sourceLocation: SourceLocation = #_sourceLocation) throws -> Play {
@@ -139,8 +143,9 @@ import BeepbarCore
     /// The duration the fake lecture reports.
     var duration: TimeInterval? = 6_000
 
-    func play(_ url: URL, title: String, cookies: [HTTPCookie], startAt: TimeInterval?, recordingID: String) {
-        if isOpen, let current { onPositionCheckpoint?(current.id, current.position, current.duration) }
+    func play(_ url: URL, title: String, cookies: [HTTPCookie], startAt: TimeInterval?, recordingID: String, metadata: RecordingPlaybackMetadata?) {
+        metadatas.append(metadata)
+        report(.replaced)
         plays.append(Play(url: url, title: title, startAt: startAt, recordingID: recordingID, cookies: cookies.count))
         isOpen = true
         current = (recordingID, startAt ?? 0, duration)
@@ -150,21 +155,36 @@ import BeepbarCore
 
     func close() {
         closes += 1
-        if isOpen, let current { onPositionCheckpoint?(current.id, current.position, current.duration) }
+        report(.closed)
         isOpen = false
         current = nil
     }
 
     func adoptPolicyToRestore(_ policy: NSApplication.ActivationPolicy) { adoptedPolicies.append(policy) }
 
+    /// Reports the lecture on screen, if any, with `reason`: what the real player's checkpoint
+    /// carries.
+    private func report(_ reason: RecordingCheckpoint.Reason) {
+        guard isOpen, let current else { return }
+        onPositionCheckpoint?(RecordingCheckpoint(id: current.id, position: current.position, duration: current.duration, reason: reason))
+    }
+
     /// The lecture plays on to `position` without any report, as it does between pauses.
     func move(to position: TimeInterval) { current?.position = position }
 
+    /// The lecture plays on to `position` and the periodic observer ticks there: `onProgress`
+    /// only, never a checkpoint, as the real player does while playing.
+    func tick(at position: TimeInterval) {
+        guard let current else { return }
+        self.current?.position = position
+        onProgress?(current.id, position, current.duration)
+    }
+
     /// The student pauses at `position`: the report the real player makes.
     func pause(at position: TimeInterval) {
-        guard let id = current?.id else { return }
+        guard current != nil else { return }
         current?.position = position
-        onPositionCheckpoint?(id, position, duration)
+        report(.paused)
     }
 
     /// The stream dies mid-lecture at `position`, as the real player reports it: the position
@@ -172,8 +192,15 @@ import BeepbarCore
     func failDuringPlayback(at position: TimeInterval) {
         guard let id = current?.id else { return }
         current?.position = position
-        onPositionCheckpoint?(id, position, duration)
+        report(.failed)
         onFailure?(id, .duringPlayback(nil, position: position))
+    }
+
+    /// The student closes the window before the stream is ready: the real player reports nothing
+    /// then (no settled position), and no failure either.
+    func closeBeforeReady() {
+        isOpen = false
+        current = nil
     }
 
     /// The stream never starts: the window closes itself and the failure is reported.
@@ -337,6 +364,8 @@ final class SessionFileProbe: @unchecked Sendable {
     /// The native player, a fake that never touches AVFoundation, and how many were made.
     let player = FakeRecordingPlayer()
     var playersMade = 0
+    /// The WeBeep course list the controller reads when a lecture starts (Now Playing metadata).
+    var courses: [RemoteCourseSummary] = []
     /// What the WeBeep profile answers for the user's email (nil: the profile has none, or it
     /// can't be read), and how often it was asked.
     var profileEmail: String?
@@ -407,6 +436,7 @@ struct RecordingsControllerTests {
             copy: { world.copied.append($0) },
             now: { MainActor.assumeIsolated { world.now } },
             makePlayer: { world.playersMade += 1; return world.player },
+            courses: { world.courses },
             fetchProfileEmail: {
                 world.profileEmailCalls += 1
                 await world.profileGate?.wait()
@@ -2269,6 +2299,194 @@ struct RecordingsControllerTests {
         controller.turnOff()
     }
 
+    // MARK: Now Playing metadata (issue #148 follow-up)
+
+    private static let pictureA = URL(string: "https://webeep.polimi.it/webservice/pluginfile.php/1/course/overviewfiles/a.png")!
+    private static let pictureB = URL(string: "https://webeep.polimi.it/webservice/pluginfile.php/2/course/overviewfiles/b.png")!
+
+    private func webeepCourse(_ id: Int64, name: String, picture: URL?) -> RemoteCourseSummary {
+        RemoteCourseSummary(id: id, shortName: "058167 - \(name) [2026-27]", displayName: "058167 - \(name) [2026-27]", isVisible: true, startDate: nil, endDate: nil, imageURL: picture)
+    }
+
+    /// A Play hands the player the lecture's title, its course's name (without code and year) and
+    /// the course picture's address. Guards against Now Playing showing "BeepBar", or the title
+    /// alone, because the controller forgot to pass the metadata.
+    @Test func aPlayHandsThePlayerTheLectureCourseAndPicture() async throws {
+        defer { cleanUp() }
+        world.courses = [webeepCourse(7, name: "NUMERICAL LINEAR ALGEBRA", picture: Self.pictureA)]
+        browser.streamResults["a"] = [.success(stream("a"))]
+        let controller = await readyController()
+        controller.play(recording("a"))
+        await settle("a playing") { world.player.plays.count == 1 }
+        let metadata = try #require(world.player.metadatas.first ?? nil)
+        #expect(metadata == RecordingPlaybackMetadata(title: "Lezione a", courseName: "NUMERICAL LINEAR ALGEBRA", artworkURL: Self.pictureA))
+        controller.turnOff()
+    }
+
+    /// The fresh stream of a recovery keeps the same course and picture, even if the page moved
+    /// to another course meanwhile. Guards against a stream recovery dropping the course and the
+    /// picture from Now Playing.
+    @Test func aRecoveryKeepsTheCourseAndPicture() async throws {
+        defer { cleanUp() }
+        world.courses = [webeepCourse(7, name: "NUMERICAL LINEAR ALGEBRA", picture: Self.pictureA)]
+        browser.streamResults["a"] = [.success(stream("a")), .success(stream("a"))]
+        let controller = await readyController()
+        controller.play(recording("a"))
+        await settle("a playing") { world.player.plays.count == 1 }
+        world.courses = []
+        world.player.failDuringPlayback(at: 1_234)
+        await settle("resumed") { world.player.plays.count == 2 }
+        #expect(world.player.metadatas.count == 2)
+        #expect(world.player.metadatas[1] == world.player.metadatas[0])
+        #expect(world.player.metadatas[1]?.artworkURL == Self.pictureA)
+        controller.turnOff()
+    }
+
+    /// Two WeBeep courses with the same archive key (one course split in two sections): the one
+    /// the student has selected on the page names the lecture, not neither. Guards against
+    /// re-matching by code and year alone, which finds two and drops course and picture.
+    @Test func twoCoursesSharingAKeyUseTheSelectedOne() async throws {
+        defer { cleanUp() }
+        world.courses = [webeepCourse(7, name: "ALGEBRA SEZ. A", picture: Self.pictureA), webeepCourse(8, name: "ALGEBRA SEZ. B", picture: Self.pictureB)]
+        browser.streamResults["a"] = [.success(stream("a"))]
+        let controller = await readyController()
+        controller.selectDestination(.course(8))
+        controller.play(recording("a"))
+        await settle("a playing") { world.player.plays.count == 1 }
+        let metadata = try #require(world.player.metadatas.first ?? nil)
+        #expect(metadata.courseName == "ALGEBRA SEZ. B")
+        #expect(metadata.artworkURL == Self.pictureB)
+        controller.turnOff()
+    }
+
+    /// A new Play of a lecture that was closed reads its course again: from another course's
+    /// page it shows that course, and a picture the course list gained meanwhile (the first
+    /// launch after an update has none yet) shows. A recovery keeps reusing its own metadata
+    /// (`aRecoveryKeepsTheCourseAndPicture`). Guards against the metadata of the first Play
+    /// sticking to the lecture for the whole session.
+    /// Mutation: reuse `playbackMetadata` for any play of the same id AND stop clearing it on
+    /// close (both lines: the close clear and the `recoveredLectures` condition are redundant
+    /// with each other, so removing only one stays green; the other half is
+    /// `aReplayAfterAWindowClosedBeforeReadyReadsTheCourseAgain`).
+    @Test func aReplayAfterCloseReadsTheCourseAgain() async throws {
+        defer { cleanUp() }
+        world.courses = [webeepCourse(7, name: "ALGEBRA SEZ. A", picture: nil), webeepCourse(8, name: "ALGEBRA SEZ. B", picture: nil)]
+        browser.streamResults["a"] = [.success(stream("a")), .success(stream("a"))]
+        let controller = await readyController()
+        controller.selectDestination(.course(7))
+        controller.play(recording("a"))
+        await settle("a playing") { world.player.plays.count == 1 }
+        #expect(world.player.metadatas.first??.courseName == "ALGEBRA SEZ. A")
+        world.player.close()
+        world.courses = [webeepCourse(7, name: "ALGEBRA SEZ. A", picture: Self.pictureA), webeepCourse(8, name: "ALGEBRA SEZ. B", picture: Self.pictureB)]
+        controller.selectDestination(.course(8))
+        controller.play(recording("a"))
+        await settle("a again") { world.player.plays.count == 2 }
+        let again = try #require(world.player.metadatas.last ?? nil)
+        #expect(again.courseName == "ALGEBRA SEZ. B")
+        #expect(again.artworkURL == Self.pictureB)
+        controller.turnOff()
+    }
+
+    /// A lecture whose window closed before the stream was ready reports nothing (no checkpoint,
+    /// so the close path does not clear `playbackMetadata`), yet a later Play of it from
+    /// another course's page names that course: the stored metadata is reused only for a
+    /// recovery (`recoveredLectures`), never for "any later play of the same lecture". This is
+    /// the test that tells the two rules apart; `aReplayAfterCloseReadsTheCourseAgain` cannot,
+    /// because its normal close already clears the metadata.
+    /// Mutation: drop `recoveredLectures.contains(recording.id)` from the reuse condition in
+    /// `playbackMetadata(for:stream:)` and the replay names course A.
+    @Test func aReplayAfterAWindowClosedBeforeReadyReadsTheCourseAgain() async throws {
+        defer { cleanUp() }
+        world.courses = [webeepCourse(7, name: "ALGEBRA SEZ. A", picture: Self.pictureA), webeepCourse(8, name: "ALGEBRA SEZ. B", picture: Self.pictureB)]
+        browser.streamResults["a"] = [.success(stream("a")), .success(stream("a"))]
+        let controller = await readyController()
+        controller.selectDestination(.course(7))
+        controller.play(recording("a"))
+        await settle("a playing") { world.player.plays.count == 1 }
+        #expect(world.player.metadatas.first??.courseName == "ALGEBRA SEZ. A")
+        world.player.closeBeforeReady()
+        #expect(!world.player.isOpen)
+        #expect(world.player.closes == 0, "no normal close happened: nothing cleared the metadata")
+        controller.selectDestination(.course(8))
+        controller.play(recording("a"))
+        await settle("a again") { world.player.plays.count == 2 }
+        let again = try #require(world.player.metadatas.last ?? nil)
+        #expect(again.courseName == "ALGEBRA SEZ. B")
+        #expect(again.artworkURL == Self.pictureB)
+        controller.turnOff()
+    }
+
+    /// The course of a menu Play whose stream was never handed to the player (the lookup ended in
+    /// the browser) must not outlive an account change: the next account may list the same
+    /// WeBeep course ids, and the stale preference would win over the course the student has
+    /// selected. This is the one place `menuPlayCourse`'s reset is observable (the playback
+    /// metadata's reset is covered by the recovery list, see `closePlayerForIdentityChange`).
+    /// Mutation: drop `menuPlayCourse = nil` in `closePlayerForIdentityChange` and the replay
+    /// names course B (the stale menu course) instead of the selected course A.
+    @Test func aMenuCourseNeverPlayedDoesNotSurviveAnAccountChange() async throws {
+        defer { cleanUp() }
+        world.courses = [webeepCourse(7, name: "ALGEBRA SEZ. A", picture: nil), webeepCourse(8, name: "ALGEBRA SEZ. B", picture: nil)]
+        let controller = await readyController()
+        // No stream queued: the lookup fails and the Play ends in the browser, never reaching
+        // `startPlayer`, which is the only place the menu course is consumed.
+        // A menu Play only accepts a row whose preview link is the archive's own (`validatedNext`).
+        let base = recording("a")
+        let menuRow = RecmanRecording(id: base.id, courseCode: base.courseCode, academicYear: base.academicYear, title: base.title, recordedAt: base.recordedAt, kind: base.kind, duration: base.duration, size: nil, previewURL: URL(string: "https://onlineservices.polimi.it/recman_frontend/recman_frontend/controller/ArchivioListActivity.do?evn_preview_link=1&transfer_id=a")!)
+        #expect(controller.playFromMenu(menuRow, owner: 42, courseID: 8))
+        await settle("the stream was looked up") { !browser.streamCalls.isEmpty }
+        await drainTasks()
+        #expect(world.player.plays.isEmpty)
+
+        world.owner = 9
+        controller.webBeepAccountChanged(to: 9)
+        controller.signIn()
+        await settle("signed in again") { controller.access == .ready }
+        browser.streamResults["a"] = [.success(stream("a"))]
+        controller.selectDestination(.course(7))
+        controller.play(recording("a"))
+        await settle("a playing") { world.player.plays.count == 1 }
+        #expect(world.player.metadatas.last??.courseName == "ALGEBRA SEZ. A")
+        controller.turnOff()
+    }
+
+    /// After an account change, the same lecture played again shows the new account's course
+    /// and picture, never the previous account's. Guards against Now Playing metadata outliving
+    /// the identity it was read for.
+    @Test func anAccountChangeDropsThePlaybackMetadata() async throws {
+        defer { cleanUp() }
+        world.courses = [webeepCourse(7, name: "ALGEBRA VECCHIO", picture: Self.pictureA)]
+        browser.streamResults["a"] = [.success(stream("a")), .success(stream("a"))]
+        let controller = await readyController()
+        controller.play(recording("a"))
+        await settle("a playing") { world.player.plays.count == 1 }
+        world.owner = 9
+        world.courses = [webeepCourse(70, name: "ALGEBRA NUOVO", picture: Self.pictureB)]
+        controller.webBeepAccountChanged(to: 9)
+        #expect(!world.player.isOpen)
+        controller.signIn()
+        await settle("signed in again") { controller.access == .ready }
+        controller.play(recording("a"))
+        await settle("a again") { world.player.plays.count == 2 }
+        let again = try #require(world.player.metadatas.last ?? nil)
+        #expect(again.courseName == "ALGEBRA NUOVO")
+        #expect(again.artworkURL == Self.pictureB)
+        controller.turnOff()
+    }
+
+    /// Pure: the preferred course wins only when it is the recording's own; otherwise exactly one
+    /// course with the recording's key, nil for none or two.
+    @Test func thePlaybackCourseRules() {
+        let a = webeepCourse(7, name: "A", picture: nil)
+        let b = webeepCourse(8, name: "B", picture: nil)
+        let other = RemoteCourseSummary(id: 9, shortName: "099999 - X [2026-27]", displayName: "099999 - X [2026-27]", isVisible: true, startDate: nil, endDate: nil)
+        let lecture = recording("a")
+        #expect(RecordingsController.playbackCourse(for: lecture, preferredID: 8, in: [a, b]) == b)
+        #expect(RecordingsController.playbackCourse(for: lecture, preferredID: nil, in: [a, b]) == nil)
+        #expect(RecordingsController.playbackCourse(for: lecture, preferredID: 9, in: [a, other]) == a)
+        #expect(RecordingsController.playbackCourse(for: lecture, preferredID: nil, in: [other]) == nil)
+    }
+
     // MARK: Recovery
 
     /// A stream that dies mid-lecture is resolved again once and resumes where it stopped; a
@@ -2711,11 +2929,13 @@ struct RecordingsControllerTests {
         controller.turnOff()
     }
 
-    /// PR #152 review P1: closing the window while a lecture recovery runs keeps the recovery but
-    /// drops a Play clicked meanwhile: nobody is looking, and it would otherwise replace the
-    /// recovered lecture, open a browser or show a sign-in window afterwards. Mutation: remove
-    /// `dropQueuedOpenings()` from `suspend` and "b" is streamed and played.
-    @Test func closingTheWindowDropsAPlayQueuedBehindARecovery() async throws {
+    /// Closing the window while a lecture recovery runs keeps both the recovery and a Play
+    /// clicked meanwhile: the student asked for "b", and closing Settings doesn't cancel a Play
+    /// (menu bar Play decision, 2026-10-12, which replaced the PR #152 review's "drop it"). The
+    /// browser still closes once both have run. Guards a Play pressed just before closing the
+    /// window being silently lost. Mutations: drop the queued-Play case from `hasPlayOrRecovery`
+    /// or let `dropQueuedOpenings` drop Plays ("b" is never streamed).
+    @Test func closingTheWindowKeepsAPlayQueuedBehindARecovery() async throws {
         defer { cleanUp() }
         browser.streamResults["a"] = [.success(stream("a")), .success(stream("a"))]
         browser.streamResults["b"] = [.success(stream("b"))]
@@ -2728,16 +2948,42 @@ struct RecordingsControllerTests {
         world.player.failDuringPlayback(at: 700)
         await settle("recovery running") { gate.isWaiting }
         controller.play(recording("b"))
+        controller.windowClosed()
+        #expect(controller.openingRecordingID == "b", "the kept Play keeps spinning")
+        gate.release()
+        await settle("b played after the recovery") { world.player.plays.count == 3 }
+        await settle("browser closed") { !browser.isOpen }
+        #expect(world.player.plays.map(\.recordingID) == ["a", "a", "b"])
+        #expect(try world.player.play(1).startAt == 700)
+        #expect(world.opened.isEmpty)
+        controller.turnOff()
+    }
+
+    /// PR #152 review P1, still true for the clicks that aren't a Play: closing the window while
+    /// a recovery runs drops a Copy link (or Open in browser) clicked meanwhile and its spinner;
+    /// nobody is looking, and it would otherwise open a browser or sign-in window afterwards.
+    /// Mutation: remove `dropQueuedOpenings()` from `suspend` and "b"'s link is looked up.
+    @Test func closingTheWindowDropsACopyQueuedBehindARecovery() async throws {
+        defer { cleanUp() }
+        browser.streamResults["a"] = [.success(stream("a")), .success(stream("a"))]
+        browser.playbackResults["b"] = .success(URL(string: "https://politecnicomilano.webex.com/recordingservice/sites/politecnicomilano/recording/playback/b")!)
+        let controller = await readyController()
+        controller.play(recording("a"))
+        await settle("a playing") { world.player.plays.count == 1 }
+        let gate = FakeRecmanBrowser.Gate()
+        defer { gate.release() }
+        browser.streamGates["a"] = gate
+        world.player.failDuringPlayback(at: 700)
+        await settle("recovery running") { gate.isWaiting }
+        controller.copyLink(recording("b"))
         #expect(controller.openingRecordingID == "b")
         controller.windowClosed()
         #expect(controller.openingRecordingID == nil, "the dropped click stops spinning")
         gate.release()
         await settle("a resumed") { world.player.plays.count == 2 }
         await settle("browser closed") { !browser.isOpen }
-        #expect(world.player.plays.map(\.recordingID) == ["a", "a"])
-        #expect(try world.player.play(1).startAt == 700)
-        #expect(!browser.streamCalls.contains("stream b"))
-        #expect(world.opened.isEmpty)
+        #expect(!browser.playCalls.contains("play b"))
+        #expect(world.copied.isEmpty)
         controller.turnOff()
     }
 
@@ -2861,10 +3107,30 @@ struct RecordingsControllerTests {
         try store.save(RecmanSessionCodec.encode([FakeRecmanBrowser.cookie("SSO_LOGIN", value: "other")], ownerUserID: 9, now: world.now))
         controller.signIn()
         await settle("player closed by the mismatch") { world.player.closes == 1 }
-        await settle("signed in again") { controller.access == .ready && !browser.isOpen }
+        await settle("signed in again") { controller.access == .ready }
         #expect(defaults.object(forKey: resumeKey) == nil)
         #expect(resumeWrites() == 2, "one write, one removal: the close's report wrote nothing")
         #expect(defaults.object(forKey: RecordingsController.emailDeclinedKey) == nil)
+    }
+
+    /// A stream that dies mid-lecture stores where it stopped at once, from the `.failed`
+    /// checkpoint alone, with no pause or close after it: if the student then quits, the place
+    /// survives. Guards against handling only some checkpoint reasons now that reports carry one.
+    /// Mutation: in `currentPlayer` ignore checkpoints whose reason is `.failed` and nothing is
+    /// stored.
+    @Test func aFailureMidLectureStoresThePlaceAtOnce() async throws {
+        defer { cleanUp() }
+        browser.streamResults["a"] = [.success(stream("a")), .success(stream("a"))]
+        let controller = await readyController()
+        controller.play(recording("a"))
+        await settle("a playing") { world.player.plays.count == 1 }
+        #expect(resumeWrites() == 0)
+
+        world.player.failDuringPlayback(at: 1_234)
+        #expect(resumeWrites() == 1, "written by the failure's own report")
+        #expect(try storedResumePoints()?.position(for: RecordingsStudyState.identity(recording("a"))) == 1_234)
+        await settle("resumed") { world.player.plays.count == 2 }
+        controller.turnOff()
     }
 
     /// While the Polimi session is gone nothing can look a stream up: a lecture that stops is
@@ -3091,7 +3357,7 @@ struct RecordingsAccountTests {
 
     /// A different account signing in clears the previous account's stored places even when
     /// nothing created Recordings in this launch; the same account's are kept.
-    /// Mutation: remove the `else` branch in `siteInfo.didSet`.
+    /// Mutation: remove `forgetResumePoints(in:notOwnedBy:)` from `siteInfo.didSet`.
     @Test(arguments: [9, 7])
     func anAccountChangeForgetsPlacesEvenWithoutRecordings(storedOwner: Int) async throws {
         defer { try? FileManager.default.removeItem(at: root) }
@@ -3146,6 +3412,29 @@ struct RecordingsAccountTests {
         await controller.completeLoginForTesting(moodleLoginCallback(token: other))
         MoodleRecordingProtocol.releaseEmails(token: token)
         #expect(await lookup.value == nil)
+    }
+
+    /// The course picture for Now Playing arrives for the account that asked; one that arrives
+    /// after another account signed in is dropped (it is the previous account's). Guards against
+    /// a late picture of account A showing in account B's player.
+    /// Mutation: drop the `apiClient === client, siteInfo?.userID == userID` guard in
+    /// `courseImage` and the late picture is returned.
+    @Test func aCoursePictureArrivingAfterAnAccountChangeIsDropped() async throws {
+        defer { try? FileManager.default.removeItem(at: root) }
+        let (controller, token) = try await signedInAccount(userID: 7, email: "mario.rossi@mail.polimi.it", listed: false)
+        let picture = URL(string: "https://webeep.polimi.it/webservice/pluginfile.php/1/course/overviewfiles/a.png")!
+        let delivered = try await controller.courseImageForTesting(picture)
+        #expect(delivered == Data([1, 2, 3]), "the same account gets its picture")
+
+        MoodleRecordingProtocol.holdCourseImages(token: token)
+        let fetch = Task { try await controller.courseImageForTesting(picture) }
+        for _ in 0..<2_000 where MoodleRecordingProtocol.heldCourseImageCount(token: token) == 0 { try await Task.sleep(for: .milliseconds(1)) }
+        #expect(MoodleRecordingProtocol.heldCourseImageCount(token: token) == 1)
+        let other = MoodleRecordingProtocol.register(courses: [(1, "Course")], userID: 8)
+        await controller.completeLoginForTesting(moodleLoginCallback(token: other))
+        MoodleRecordingProtocol.releaseCourseImages(token: token)
+        let late = await fetch.result
+        #expect((try? late.get()) == nil, "the previous account's picture was delivered")
     }
 
     /// A controller signed in to the local Moodle as `userID`, whose profile holds `email`.

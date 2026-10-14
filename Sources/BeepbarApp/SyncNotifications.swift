@@ -31,12 +31,17 @@ struct SystemNotificationCenter: NotificationCenterClient {
         _ = try? await UNUserNotificationCenter.current().requestAuthorization(options: [.alert, .sound])
     }
 
+    /// What a notification carries for its click: read back by `NotificationResponder.route`.
+    /// Only the destination's raw value, which older and newer builds both read safely.
+    static func userInfo(for destination: NotificationDestination) -> [AnyHashable: Any] {
+        [NotificationPolicy.destinationKey: destination.rawValue]
+    }
+
     func send(identifier: String, title: String, body: String, destination: NotificationDestination) async {
         let content = UNMutableNotificationContent()
         content.title = title
         content.body = body
-        // Read back by `NotificationResponder` when the user clicks the notification.
-        content.userInfo = [NotificationPolicy.destinationKey: destination.rawValue]
+        content.userInfo = Self.userInfo(for: destination)
         try? await UNUserNotificationCenter.current().add(UNNotificationRequest(identifier: identifier, content: content, trigger: nil))
     }
 }
@@ -77,7 +82,8 @@ enum AutomaticNotificationIssue: String {
     }
 }
 
-/// Decides and sends every BeepBar notification. Each path checks the "Notifiche" switch
+/// Decides and sends every BeepBar notification: the materials results of a sync and, after its
+/// Recordings follow-up, "N nuove registrazioni" (`announceRecordingsRefresh`). Each path checks the "Notifiche" switch
 /// (`NotificationPolicy.enabledKey` in `defaults`) and macOS's permission before recording
 /// anything as notified: with the switch off nothing reaches the notification center and nothing
 /// is recorded, so a conflict still open when notifications come back on is still announced (#64).
@@ -151,6 +157,39 @@ enum AutomaticNotificationIssue: String {
         await center.send(identifier: "beepbar-\(issue.rawValue)", title: issue.title, body: issue.body, destination: .home)
     }
 
+    /// Identifier of the new-recordings notification. Fixed, so a later post replaces the one
+    /// still in Notification Centre instead of stacking "1 nuova registrazione" after every sync:
+    /// the Recordings page's dots list every unseen lecture anyway. Never change it: an older
+    /// notification would then stack next to the new one.
+    static let recordingsIdentifier = "beepbar-new-recordings"
+
+    /// The single entry point of the Recordings follow-up of a sync (automatic or manual): it
+    /// announces the lectures that refresh first observed, and nothing for any other ending.
+    /// The follow-up (`WeBeepAuthenticationController`) calls it once, after the refresh ends:
+    /// `await notificationCoordinator.announceRecordingsRefresh(outcome, isCurrent: isCurrent)`.
+    /// The decision is `RecordingsNotificationDecision` (pure, in Core); the switch is read here
+    /// and read again, with macOS's permission and `isCurrent`, at send time.
+    func announceRecordingsRefresh(_ outcome: RecordingsSyncOutcome, isCurrent: @MainActor () -> Bool = { true }) async {
+        guard let count = RecordingsNotificationDecision.count(for: outcome, notificationsEnabled: isEnabled) else { return }
+        await postRecordingsSummary(newCount: count, isCurrent: isCurrent)
+    }
+
+    /// Sends "N nuove registrazioni", opening Registrazioni on click, when `newCount` is above
+    /// zero, the "Notifiche" switch is on, macOS allows it and the result is still current
+    /// (`isCurrent`: a sign-out, account or site change while the permission read was pending
+    /// must not announce the old account's lectures). Same gating as the materials notifications
+    /// (`canSend`, then a synchronous `isEnabled` with no suspension before the send).
+    ///
+    /// No deduplication record: `newCount` already counts only lectures first observed in this
+    /// refresh, so a later run that finds nothing new posts nothing, and a fingerprint on the
+    /// count would wrongly swallow a genuine second "1 nuova registrazione". The text carries the
+    /// count only, never a course or lecture name (`NotificationPolicy.recordingsNotification`).
+    func postRecordingsSummary(newCount: Int, isCurrent: @MainActor () -> Bool = { true }) async {
+        guard let text = NotificationPolicy.recordingsNotification(newCount: newCount), isCurrent() else { return }
+        guard await canSend(), isCurrent(), isEnabled else { return }
+        await center.send(identifier: Self.recordingsIdentifier, title: text.title.text, body: text.body.text, destination: .recordings)
+    }
+
     func clearFailure() {
         for issue in [AutomaticNotificationIssue.authenticationExpired, .serviceUnavailable, .incompatibleResponse, .partialSync] {
             deduplication.resolve(condition: issue.rawValue)
@@ -191,12 +230,18 @@ final class NotificationResponder: NSObject, UNUserNotificationCenterDelegate, S
     }
 
     func userNotificationCenter(_ center: UNUserNotificationCenter, didReceive response: UNNotificationResponse, withCompletionHandler completionHandler: @escaping () -> Void) {
-        let destination = NotificationPolicy.destination(
-            isDefaultAction: response.actionIdentifier == UNNotificationDefaultActionIdentifier,
-            userInfo: response.notification.request.content.userInfo
-        )
+        let isDefaultAction = response.actionIdentifier == UNNotificationDefaultActionIdentifier
+        let userInfo = response.notification.request.content.userInfo
         completionHandler()
-        guard let destination else { return }
+        route(isDefaultAction: isDefaultAction, userInfo: userInfo)
+    }
+
+    /// The click path without `UNNotificationResponse` (which tests can't build): reads the
+    /// destination from the notification's plain values and opens it inside the main-actor hop.
+    /// A destination this build doesn't know (sent by a newer build, clicked after a rollback)
+    /// opens Courses (`NotificationPolicy.destination`); a dismissal opens nothing.
+    func route(isDefaultAction: Bool, userInfo: [AnyHashable: Any]) {
+        guard let destination = NotificationPolicy.destination(isDefaultAction: isDefaultAction, userInfo: userInfo) else { return }
         let open = open
         Task { @MainActor in open(destination) }
     }
@@ -208,6 +253,7 @@ extension ShellPage {
         case .conflicts: self = .conflicts
         case .activity: self = .activity
         case .home: self = .home
+        case .recordings: self = .recordings
         }
     }
 }

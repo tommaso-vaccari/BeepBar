@@ -16,14 +16,74 @@ public struct RemoteCourseSummary: Sendable, Equatable, Identifiable {
     public let isVisible: Bool?
     public let startDate: Date?
     public let endDate: Date?
+    /// The course's image on WeBeep (the picture Moodle shows on the course card), as a
+    /// `/webservice/pluginfile.php/` address on the site's own host, without any credential:
+    /// fetching it takes the token (`WeBeepAPIClient.fetchCourseImage`). Nil when the course has
+    /// none, or Moodle only offers its generated pattern. Shown as the artwork of the lecture
+    /// playing in macOS's Now Playing (issue #148 follow-up). Chosen by `WeBeepCourseImage.select`.
+    public let imageURL: URL?
 
-    public init(id: Int64, shortName: String, displayName: String, isVisible: Bool?, startDate: Date?, endDate: Date?) {
+    public init(id: Int64, shortName: String, displayName: String, isVisible: Bool?, startDate: Date?, endDate: Date?, imageURL: URL? = nil) {
         self.id = id
         self.shortName = shortName
         self.displayName = displayName
         self.isVisible = isVisible
         self.startDate = startDate
         self.endDate = endDate
+        self.imageURL = imageURL
+    }
+}
+
+/// Which of the images `core_enrol_get_users_courses` lists for a course BeepBar uses, and in
+/// which form (issue #148 follow-up, "Now Playing artwork"). Pure, so every rule is tested.
+///
+/// Moodle offers two: `overviewfiles`, the files a teacher uploaded as the course image, already
+/// as web-service addresses (`/webservice/pluginfile.php/…`), and, on newer versions,
+/// `courseimage`, the same picture as a browser address (`/pluginfile.php/…`) or, when there is
+/// none, a generated SVG pattern as a `data:` URI. Only a real picture is kept: a `data:` URI, an
+/// SVG (ImageIO cannot draw it), another host, plain HTTP, an address already carrying a token,
+/// or anything outside `pluginfile.php` is dropped, and the course simply has no image.
+///
+/// A `/pluginfile.php/` address is rewritten to `/webservice/pluginfile.php/`, as the Moodle app
+/// does: only the web-service path accepts the token BeepBar has, the browser path wants a
+/// session cookie. The address kept never contains a credential, so it can be stored with the
+/// course list (`CourseListSnapshot`) and compared freely.
+public enum WeBeepCourseImage {
+    /// One entry of `overviewfiles`, as far as this choice needs it.
+    public struct OverviewFile: Sendable, Equatable {
+        public let fileURL: String?
+        public let mimeType: String?
+        public init(fileURL: String?, mimeType: String?) {
+            self.fileURL = fileURL
+            self.mimeType = mimeType
+        }
+    }
+
+    /// The image to keep for a course, or nil. The first acceptable overview file wins (a teacher
+    /// can upload several; Moodle shows the first), then `courseimage`.
+    public static func select(overviewFiles: [OverviewFile], courseImage: String?, policy: WeBeepServerPolicy) -> URL? {
+        for file in overviewFiles {
+            if let mime = file.mimeType?.lowercased(), !mime.hasPrefix("image/") || mime.contains("svg") { continue }
+            if let url = acceptable(file.fileURL, policy: policy) { return url }
+        }
+        return acceptable(courseImage, policy: policy)
+    }
+
+    /// `text` as a credential-free web-service address on the site's host, or nil.
+    public static func acceptable(_ text: String?, policy: WeBeepServerPolicy) -> URL? {
+        guard let text, text.utf8.count <= 2_048, let url = URL(string: text),
+              url.scheme?.lowercased() == "https", policy.acceptsPluginURL(url),
+              var components = URLComponents(url: url, resolvingAgainstBaseURL: false) else { return nil }
+        if (components.queryItems ?? []).contains(where: { ["token", "wstoken"].contains($0.name.lowercased()) }) { return nil }
+        if components.percentEncodedPath.lowercased().hasSuffix(".svg") { return nil }
+        // No `.` or `..` segment, spelled out or percent-encoded (`%2e%2e`): the prefix check
+        // must not be escaped into another script of the site once the server normalizes it.
+        if components.path.split(separator: "/", omittingEmptySubsequences: false).contains(where: { $0 == "." || $0 == ".." }) { return nil }
+        if components.percentEncodedPath.hasPrefix("/pluginfile.php/") {
+            components.percentEncodedPath = "/webservice" + components.percentEncodedPath
+        }
+        guard let rewritten = components.url, policy.acceptsPluginURL(rewritten) else { return nil }
+        return rewritten
     }
 }
 
@@ -239,8 +299,43 @@ public final class WeBeepAPIClient: @unchecked Sendable {
                   let shortName = MoodleText.normalized(course.shortname), !shortName.isEmpty, shortName.utf8.count <= 512 else {
                 throw WeBeepAPIError.malformedPayload
             }
-            return RemoteCourseSummary(id: course.id, shortName: shortName, displayName: name, isVisible: course.visible.map { $0 != 0 }, startDate: course.startdate.map(Date.init(timeIntervalSince1970:)), endDate: course.enddate.map(Date.init(timeIntervalSince1970:)))
+            let image = WeBeepCourseImage.select(overviewFiles: course.overviewfiles, courseImage: course.courseimage, policy: policy)
+            return RemoteCourseSummary(id: course.id, shortName: shortName, displayName: name, isVisible: course.visible.map { $0 != 0 }, startDate: course.startdate.map(Date.init(timeIntervalSince1970:)), endDate: course.enddate.map(Date.init(timeIntervalSince1970:)), imageURL: image)
         }
+    }
+
+    /// Largest course image BeepBar accepts. A course card picture is a few hundred kilobytes;
+    /// anything bigger is cut off during reception, never buffered whole.
+    public static let courseImageByteLimit = 2_097_152
+    /// The longest a course image may take to start answering or between two chunks. The
+    /// artwork is a nicety: a slow WeBeep must never keep a request open for long.
+    public static let courseImageTimeout: TimeInterval = 10
+
+    /// The bytes of a course image (`RemoteCourseSummary.imageURL`), for the artwork of the
+    /// lecture playing (issue #148 follow-up).
+    ///
+    /// Same guarantees as every WeBeep request: this client's ephemeral session (no cache, no
+    /// cookies kept), redirects refused (a redirect fails the request rather than taking the token
+    /// to another address), reception capped at `courseImageByteLimit`, and an `image/*` answer
+    /// required. The address must be a web-service `pluginfile.php` address on the site's own
+    /// host over HTTPS, without a credential of its own; the token is appended here, and neither
+    /// it nor the address is ever logged. Cancellation cancels the request.
+    public func fetchCourseImage(_ url: URL, token: String) async throws -> Data {
+        guard url.scheme?.lowercased() == "https", WeBeepCourseImage.acceptable(url.absoluteString, policy: policy) == url else {
+            throw WeBeepAPIError.unexpectedSite
+        }
+        var request: URLRequest
+        do { request = try RemoteDownloader.request(url: url, token: token, policy: policy) }
+        catch { throw WeBeepAPIError.unexpectedSite }
+        request.setValue("image/*", forHTTPHeaderField: "Accept")
+        request.timeoutInterval = Self.courseImageTimeout
+        let receiver = BoundedMetadataResponse(limit: Self.courseImageByteLimit, acceptsContentType: { $0?.lowercased().hasPrefix("image/") == true })
+        do { return try await receiver.run(request, in: session) }
+        catch let error as WeBeepAPIError { throw error }
+        catch is CancellationError { throw CancellationError() }
+        catch let error as URLError where error.code == .cancelled { throw CancellationError() }
+        catch let error as URLError { throw WeBeepAPIError.network(NetworkFailure(error.code)) }
+        catch { throw WeBeepAPIError.invalidResponse }
     }
 
     public func fetchContents(courseID: Int64, token: String) async throws -> RemoteCourseContents {
@@ -440,7 +535,14 @@ final class BoundedMetadataResponse: NSObject, URLSessionDataDelegate, @unchecke
     private var consumerInstalled = false
     private var earlyResult: Result<Data, Error>?
 
-    init(limit: Int) { self.limit = limit }
+    /// Which `Content-Type` an answer must have to be read: JSON for every web-service call, an
+    /// image for `fetchCourseImage`. Anything else is refused before a byte is buffered.
+    private let acceptsContentType: @Sendable (String?) -> Bool
+
+    init(limit: Int, acceptsContentType: @escaping @Sendable (String?) -> Bool = { $0?.lowercased().contains("application/json") == true }) {
+        self.limit = limit
+        self.acceptsContentType = acceptsContentType
+    }
 
     /// No async byte sequence or main-actor hop: URLSession supplies background chunk callbacks.
     func run(_ request: URLRequest, in session: URLSession) async throws -> Data {
@@ -478,7 +580,7 @@ final class BoundedMetadataResponse: NSObject, URLSessionDataDelegate, @unchecke
         let failure: WeBeepAPIError?
         if let http = response as? HTTPURLResponse {
             if !(200...299).contains(http.statusCode) { failure = .transport(http.statusCode) }
-            else if http.value(forHTTPHeaderField: "Content-Type")?.lowercased().contains("application/json") != true { failure = .invalidResponse }
+            else if !acceptsContentType(http.value(forHTTPHeaderField: "Content-Type")) { failure = .invalidResponse }
             else if http.expectedContentLength > Int64(limit) { failure = .responseTooLarge }
             else { failure = nil }
         } else { failure = .invalidResponse }
@@ -667,6 +769,33 @@ private struct CourseResponse: Decodable {
     let visible: Int?
     let startdate: TimeInterval?
     let enddate: TimeInterval?
+    /// The course image fields (`WeBeepCourseImage`). Decoded leniently: they are a nicety, and
+    /// an unexpected shape must cost the course its picture, never the whole course list.
+    let overviewfiles: [WeBeepCourseImage.OverviewFile]
+    let courseimage: String?
+
+    private enum CodingKeys: String, CodingKey {
+        case id, shortname, fullname, displayname, visible, startdate, enddate, overviewfiles, courseimage
+    }
+
+    private struct OverviewFileResponse: Decodable {
+        let fileurl: String?
+        let mimetype: String?
+    }
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        id = try container.decode(Int64.self, forKey: .id)
+        shortname = try container.decodeIfPresent(String.self, forKey: .shortname)
+        fullname = try container.decodeIfPresent(String.self, forKey: .fullname)
+        displayname = try container.decodeIfPresent(String.self, forKey: .displayname)
+        visible = try container.decodeIfPresent(Int.self, forKey: .visible)
+        startdate = try container.decodeIfPresent(TimeInterval.self, forKey: .startdate)
+        enddate = try container.decodeIfPresent(TimeInterval.self, forKey: .enddate)
+        let files = (try? container.decodeIfPresent(LossyArray<OverviewFileResponse>.self, forKey: .overviewfiles))??.elements ?? []
+        overviewfiles = files.prefix(20).map { WeBeepCourseImage.OverviewFile(fileURL: $0.fileurl, mimeType: $0.mimetype) }
+        courseimage = (try? container.decodeIfPresent(String.self, forKey: .courseimage)) ?? nil
+    }
 }
 
 private struct LossyArray<Element: Decodable>: Decodable {

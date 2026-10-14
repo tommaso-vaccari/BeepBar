@@ -35,3 +35,12 @@ Sul branch `feature/telemetry-monthly-identity` (non ancora in dev): l'UUID perm
 ## 2026-10-13 — Snapshot telemetria dopo il merge
 
 PR #158 integrata in dev a `50177f3905d50d9fa4252fc952a2fa8bf275de0d`. Rinnovata S-0007 con snapshot immutabile del codice integrato e dei lettori di impostazioni; conservati snapshot e hash precedenti. Registrati revisione, test e build sul candidato integrato, limiti di collegabilità, semantica dell'ateneo selezionato e recupero dell'orologio. C08 e la verifica pre-release restano aperti.
+
+## [2026-10-14] update | Avanzamento, riepilogo nel menu, aggiornamento a ogni sync e Now Playing (PR #154, draft)
+
+Aggiornata la mappa dei dati sul branch `feature/recordings-progress-and-player` (punta d85b090, base dev 38702ea), solo per analisi statica del codice: nuove righe per la tabella `progress` (stesso file SQLite dello stato «visto») e per il riepilogo per il menu in UserDefaults (compresa la prossima lezione come riga completa dell'archivio, accettata dal responsabile); riga «Archivio Polimi» corretta da «quando la pagina è aperta» a «anche in background a ogni sync»; indirizzo dell'immagine del corso nell'elenco corsi salvato e riga Now Playing riferite alla PR. Nessun nuovo destinatario né telemetria. Nessuna nuova fonte esterna. **La passata GDPR completa su codice e binario di release NON è stata eseguita: è un'attività da fare prima del rilascio (piano di verifica, punto 6). Nessuna affermazione di conformità.** Aperti: contenuto del link di anteprima salvato nel riepilogo; costo reale delle richieste in background (non misurato); verifica a runtime di eliminazione dei nuovi dati a logout e cambio account. Test e build non rieseguiti per questa voce.
+
+
+### 2026-10-14 — Minimizzazione riepilogo PR #154
+
+Analisi statica del completamento della PR: `StoredCourseWatchSummary` scrive solo ID, codice/anno, titolo e durata della prossima lezione. URL originale, query, data, tipo e dimensione esclusi; URL ricostruito da ID validato. Le righe legacy restano sul disco fino alla successiva riscrittura o rimozione. Aggiornata la mappa, nessuna nuova fonte esterna né conclusione giuridica; verifica pre-release ancora aperta.

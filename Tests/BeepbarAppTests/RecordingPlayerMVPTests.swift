@@ -52,27 +52,92 @@ final class FakePlayerView: NSView {
     @objc dynamic var player: AVPlayer?
 }
 
+/// A Now Playing publisher that takes over (so AVKit publishes nothing either) and does nothing:
+/// player tests must not register remote commands with the real system, or the media keys of
+/// the developer running `swift test` would go to the test runner. Only
+/// `RecordingNowPlayingTests.theSystemPublisherLoadsAndClears` uses the real one.
+@MainActor final class SilentNowPlaying: NowPlayingPublishing {
+    func activate(onCommand: @escaping @MainActor (NowPlayingCommand) -> Void) -> Bool { true }
+    func publish(_ state: NowPlayingState) {}
+    func deactivate() {}
+}
+
+/// A view with `AVPlayerView`'s control keys, starting from the values that make the bar large or
+/// crowded (floating style, every optional button on), so a test sees which ones the controller
+/// sets. Without AVKit: only the controller's configuration can change them.
+final class ConfigurablePlayerView: NSView {
+    @objc dynamic var player: AVPlayer?
+    @objc dynamic var controlsStyle = AVKitLoader.floatingControlsStyle
+    @objc dynamic var showsFrameSteppingButtons = true
+    @objc dynamic var showsSharingServiceButton = true
+    @objc dynamic var showsFullScreenToggleButton = true
+    @objc dynamic var showsTimecodes = true
+    @objc dynamic var allowsMagnification = true
+}
+
 /// A view without a `player` key: key-value coding on it would raise an uncatchable exception.
 final class ViewWithoutPlayer: NSView {}
 
-/// Counts periodic and boundary time observers: the player must never register either.
-final class CountingPlayer: AVPlayer, @unchecked Sendable {
-    let timeObservers = OSAllocatedUnfairLock(initialState: 0)
+/// Counts time observers added and removed, and the intervals asked for: the player may hold one
+/// periodic observer only while playing, and never a boundary observer.
+class CountingPlayer: AVPlayer, @unchecked Sendable {
+    struct Counts {
+        var periodicAdded = 0
+        var boundaryAdded = 0
+        var removed = 0
+        var intervals: [Double] = []
+    }
+    let counts = OSAllocatedUnfairLock(initialState: Counts())
+    /// Observers registered and not yet removed.
+    var active: Int { counts.withLock { $0.periodicAdded + $0.boundaryAdded - $0.removed } }
 
     override func addPeriodicTimeObserver(forInterval interval: CMTime, queue: DispatchQueue?, using block: @escaping @Sendable (CMTime) -> Void) -> Any {
-        timeObservers.withLock { $0 += 1 }
+        counts.withLock {
+            $0.periodicAdded += 1
+            $0.intervals.append(interval.seconds)
+        }
         return super.addPeriodicTimeObserver(forInterval: interval, queue: queue, using: block)
     }
 
     override func addBoundaryTimeObserver(forTimes times: [NSValue], queue: DispatchQueue?, using block: @escaping @Sendable () -> Void) -> Any {
-        timeObservers.withLock { $0 += 1 }
+        counts.withLock { $0.boundaryAdded += 1 }
         return super.addBoundaryTimeObserver(forTimes: times, queue: queue, using: block)
+    }
+
+    override func removeTimeObserver(_ observer: Any) {
+        counts.withLock { $0.removed += 1 }
+        super.removeTimeObserver(observer)
+    }
+
+    /// Runs inside every `play()`, before the player starts: lets a test see the controller's
+    /// state at the exact moment it starts playback, before any status report can change it.
+    /// Tests only call `play()` on the main thread.
+    nonisolated(unsafe) var onPlay: (@MainActor () -> Void)?
+
+    override func play() {
+        if let onPlay { MainActor.assumeIsolated { onPlay() } }
+        super.play()
+    }
+
+    private let forcedStatus = OSAllocatedUnfairLock<AVPlayer.TimeControlStatus?>(initialState: nil)
+
+    override var timeControlStatus: AVPlayer.TimeControlStatus {
+        forcedStatus.withLock { $0 } ?? super.timeControlStatus
+    }
+
+    /// Reports `status` (nil: the real one) through the `timeControlStatus` KVO, as AVFoundation
+    /// does when a stream stalls and waits for data: a state the local fixture never reaches.
+    func report(_ status: AVPlayer.TimeControlStatus?) {
+        willChangeValue(forKey: "timeControlStatus")
+        forcedStatus.withLock { $0 = status }
+        didChangeValue(forKey: "timeControlStatus")
     }
 }
 
 /// Records every seek's tolerances and can hold seeks in flight, to observe the moment between
-/// a resume seek being issued and landing.
-final class SeekRecordingPlayer: AVPlayer, @unchecked Sendable {
+/// a resume seek being issued and landing. A `CountingPlayer`, so a held resume can also force
+/// its status and count its time observers.
+final class SeekRecordingPlayer: CountingPlayer, @unchecked Sendable {
     struct Seek { let target: Double; let before: CMTime; let after: CMTime }
     private struct Held { let time: CMTime; let before: CMTime; let after: CMTime; let completion: @Sendable (Bool) -> Void }
     private let state = OSAllocatedUnfairLock(initialState: (seeks: [Seek](), hold: false, held: [Held]()))
@@ -106,7 +171,7 @@ final class SeekRecordingPlayer: AVPlayer, @unchecked Sendable {
 extension RecordingPlayerController {
     /// Test shorthand: the title doubles as the recording id.
     func play(_ url: URL, title: String, cookies: [HTTPCookie], startAt: TimeInterval? = nil) {
-        play(url, title: title, cookies: cookies, startAt: startAt, recordingID: title)
+        play(url, title: title, cookies: cookies, startAt: startAt, recordingID: title, metadata: nil)
     }
 }
 
@@ -136,7 +201,8 @@ final class CountingCenter: NotificationCenter, @unchecked Sendable {
 @Suite(.serialized)
 struct RecordingPlayerMVPTests {
     @MainActor final class Recorder {
-        var checkpoints: [(id: String, position: TimeInterval, duration: TimeInterval?)] = []
+        var checkpoints: [RecordingCheckpoint] = []
+        var ticks: [(id: String, position: TimeInterval, duration: TimeInterval?)] = []
         var failures: [RecordingPlaybackFailure] = []
         var failureIDs: [String] = []
         var events: [String] = []
@@ -147,16 +213,22 @@ struct RecordingPlayerMVPTests {
                                 makePlayerView: @escaping @MainActor () -> NSView? = { FakePlayerView() },
                                 makePlayer: @escaping @MainActor () -> AVPlayer = { AVPlayer() },
                                 notificationCenter: NotificationCenter = .default,
+                                progressInterval: TimeInterval = RecordingPlayerController.progressInterval,
                                 recorder: Recorder? = nil) -> RecordingPlayerController {
         let policy = ActivationPolicyControl(current: { .regular }, set: { _ in })
         let controller = RecordingPlayerController(present: { _ in }, makePlayerView: makePlayerView, makePlayer: makePlayer,
                                                    activationPolicy: policy, frameAutosaveName: nil, defaults: defaults,
                                                    notificationCenter: notificationCenter,
-                                                   toggleFullScreen: { _ in recorder?.fullScreenToggles += 1 })
+                                                   toggleFullScreen: { _ in recorder?.fullScreenToggles += 1 },
+                                                   progressInterval: progressInterval, nowPlaying: SilentNowPlaying())
         if let recorder {
-            controller.onPositionCheckpoint = { id, position, duration in
-                recorder.checkpoints.append((id, position, duration))
+            controller.onPositionCheckpoint = { checkpoint in
+                recorder.checkpoints.append(checkpoint)
                 recorder.events.append("checkpoint")
+            }
+            controller.onProgress = { id, position, duration in
+                // Not in `events`: a tick AVFoundation queued before a pause may land after it.
+                recorder.ticks.append((id, position, duration))
             }
             controller.onFailure = { id, failure in
                 recorder.failureIDs.append(id)
@@ -330,6 +402,49 @@ struct RecordingPlayerMVPTests {
         #expect(menu.item(at: 0)?.title == "1,25×")
         #expect(defaults.double(forKey: RecordingPlayerPolicy.speedDefaultsKey) == 1.25)
         controller.close()
+    }
+
+    /// Every view the window gets has the compact controls: inline style (the bar docked at the
+    /// bottom edge, not the large floating panel over the lecture) and no frame stepping, sharing,
+    /// full-screen or timecode button, AVKit's pinch off; also the view built for a Play after the
+    /// window was closed. Guards against the floating panel coming back (the owner's "too high
+    /// and too big"), against a flag left to a default that crowds the bar, and against only the
+    /// first view being configured.
+    @Test func everyPlayerViewGetsTheCompactControls() async throws {
+        var built: [ConfigurablePlayerView] = []
+        let controller = makeController(makePlayerView: {
+            let view = ConfigurablePlayerView()
+            built.append(view)
+            return view
+        })
+        let media = try await TestMedia.shared.url()
+        func expectCompact(_ view: ConfigurablePlayerView, sourceLocation: SourceLocation = #_sourceLocation) {
+            #expect(view.controlsStyle == AVKitLoader.inlineControlsStyle, sourceLocation: sourceLocation)
+            #expect(!view.showsFrameSteppingButtons, sourceLocation: sourceLocation)
+            #expect(!view.showsSharingServiceButton, sourceLocation: sourceLocation)
+            #expect(!view.showsFullScreenToggleButton, sourceLocation: sourceLocation)
+            #expect(!view.showsTimecodes, sourceLocation: sourceLocation)
+            #expect(!view.allowsMagnification, sourceLocation: sourceLocation)
+        }
+        controller.play(media, title: "Lezione", cookies: [], startAt: nil)
+        let first = try #require(controller.playerView as? ConfigurablePlayerView)
+        expectCompact(first)
+        controller.close()
+        controller.play(media, title: "Lezione", cookies: [], startAt: nil)
+        let second = try #require(controller.playerView as? ConfigurablePlayerView)
+        #expect(second !== first, "a Play after closing builds a new view")
+        #expect(built.count == 2)
+        expectCompact(second)
+        controller.close()
+    }
+
+    /// A view lacking some control keys (a test view, or a future AVKit without one) is still
+    /// used, with the keys it has set: key-value coding on a missing key would raise an
+    /// Objective-C exception that ends the process, so each key is checked first.
+    @Test func controlsConfigurationSkipsKeysTheViewLacks() {
+        let view = FakePlayerView()
+        AVKitLoader.configureControls(of: view)
+        #expect(view.player == nil)
     }
 
     /// `AVPlayerView` gets the same speed list, built at runtime without importing AVKit:
@@ -512,19 +627,237 @@ struct RecordingPlayerMVPTests {
 
     // MARK: Checkpoints
 
-    /// While playing, nothing is reported and no periodic or boundary time observer exists: the
-    /// position is never sampled on a clock. Guards against a "save every N seconds" creeping in.
-    @Test func playbackAloneReportsNothingAndUsesNoTimeObserver() async throws {
+    /// Exactly one periodic time observer exists while the lecture plays, at 30 s of media time,
+    /// and none once it pauses (the pause removes it; resuming adds it again, once) or closes;
+    /// never a boundary observer. Guards the "quiet at rest" budget: a paused or closed lecture
+    /// must cost no wakeups. (The observer added while the item loads is replaced once when the
+    /// start settles, see `settleStart`, so only the live count is exact at that point.)
+    /// Mutations: skip the removal on `.paused` in `updateProgressObserver` and the wait for 0
+    /// after the pause times out; drop the `progressObservation == nil` guard and the status
+    /// reports while playing leave more than one alive; drop the removal in `removeItemObservers`
+    /// and close leaves 1 behind.
+    @Test func onePeriodicObserverExistsOnlyWhilePlaying() async throws {
         let recorder = Recorder()
         var created: CountingPlayer?
         let controller = makeController(makePlayer: { let player = CountingPlayer(); created = player; return player }, recorder: recorder)
         try await playReady(controller)
-        try await Task.sleep(for: .milliseconds(1500))
-        #expect(recorder.checkpoints.isEmpty)
-        #expect(controller.player?.rate != 0)
         let player = try #require(created)
+        try await Self.waitUntil { player.timeControlStatus == .playing }
+        await Self.settle()
+        #expect(player.active == 1, "several status reports while playing keep one observer")
+        let added = player.counts.withLock { $0.periodicAdded }
+        #expect(player.counts.withLock { $0.boundaryAdded } == 0)
+        #expect(player.counts.withLock { $0.intervals }.allSatisfy { $0 == RecordingPlayerController.progressInterval })
+        #expect(RecordingPlayerController.progressInterval == 30)
+        await Self.settle()
+        #expect(player.counts.withLock { $0.periodicAdded } == added, "playing on adds nothing")
+
+        controller.pause()
+        try await Self.waitUntil { player.active == 0 }
+        await Self.settle()
+        #expect(player.active == 0, "paused: no clock")
+        #expect(recorder.checkpoints.map(\.reason) == [.paused])
+
+        player.play()
+        try await Self.waitUntil { player.active == 1 }
+        await Self.settle()
+        #expect(player.active == 1)
+        #expect(player.counts.withLock { $0.periodicAdded } == added + 1, "resuming adds exactly one")
+
         controller.close()
-        #expect(player.timeObservers.withLock { $0 } == 0)
+        #expect(player.active == 0, "closed: removed synchronously")
+        await Self.settle()
+        #expect(player.active == 0)
+        #expect(player.counts.withLock { $0.periodicAdded } == added + 1)
+    }
+
+    /// When the student started the held player during the resume and its status reports are
+    /// all handled before the seek lands, landing may bring no further status change: the
+    /// observer replaced in `settleStart` must be added again right there, or the lecture plays
+    /// to its end with no progress at all. The state is read inside the `play()` that
+    /// `settleStart` makes after the replacement, so a later status report cannot hide a missing
+    /// observer by adding one back (it did in the first version of this test). The status is
+    /// also pinned to `.playing`. Mutations: drop the `updateProgressObserver` call after
+    /// `removeProgressObserver()` in `settleStart` and the serial seen at that moment is nil;
+    /// drop the whole replacement and it is the early one.
+    @Test func settlingReplacesTheEarlyObserverWithALiveOne() async throws {
+        let recorder = Recorder()
+        let (controller, player) = try await makeHeldResume(recorder: recorder)
+        player.play()
+        try await Self.waitUntil { player.timeControlStatus == .playing && controller.progressObserverSerial != nil }
+        await Self.settle()
+        let early = try #require(controller.progressObserverSerial)
+        player.report(.playing)
+        var serialWhenSettled: Int?? = .none
+        player.onPlay = { serialWhenSettled = .some(controller.progressObserverSerial) }
+        player.releaseSeeks()
+        try await Self.waitUntil { controller.isStartSettled }
+        player.onPlay = nil
+        let seen = try #require(serialWhenSettled, "settling restarts playback")
+        #expect(seen != nil, "still playing: the observer must exist when the start settles")
+        #expect(seen != early, "a fresh observer, not the early one")
+        await Self.settle()
+        #expect(player.active == 1)
+        player.report(nil)
+        controller.close()
+        #expect(player.active == 0)
+    }
+
+    /// A lecture that stalls (waiting for data at a rate) is still moving: the observer stays,
+    /// so progress resumes the moment data arrives, and no checkpoint is made, since the student
+    /// did not pause. Only `.paused` removes it. Guards against a buffering stream being treated
+    /// as a pause. Mutation: add the observer only for `.playing` in `updateProgressObserver` and
+    /// the observer is gone while waiting.
+    @Test func aStalledLectureKeepsItsObserver() async throws {
+        let recorder = Recorder()
+        var created: CountingPlayer?
+        let controller = makeController(makePlayer: { let player = CountingPlayer(); created = player; return player }, recorder: recorder)
+        try await playReady(controller)
+        let player = try #require(created)
+        try await Self.waitUntil { player.timeControlStatus == .playing && player.active == 1 }
+        player.report(.waitingToPlayAtSpecifiedRate)
+        await Self.settle()
+        #expect(player.active == 1, "waiting for data is not a pause")
+        #expect(recorder.checkpoints.isEmpty)
+        player.report(nil)
+        await Self.settle()
+        #expect(player.active == 1)
+        controller.close()
+        #expect(player.active == 0)
+    }
+
+    /// A replacement removes the old lecture's observer before anything else (with a resume
+    /// position the player is held paused, so none exists until the resume lands), and a failure
+    /// mid-lecture removes it before `onFailure` runs. Guards against an observer left ticking on
+    /// a replaced item or on a failed stream. A replacement while playing adds the new item's
+    /// observer inside `play` itself, since the new `timeControlStatus` observation reports
+    /// changes only. Mutations: drop the removal in `removeItemObservers` and the synchronous
+    /// expectation after the replacement fails; drop the `updateProgressObserver` call at the end
+    /// of `play` and the synchronous count after the second replacement is 0; drop the removal in
+    /// `fail` and the count seen from `onFailure` is 1.
+    @Test func theObserverGoesOnReplacementAndFailure() async throws {
+        let recorder = Recorder()
+        var created: CountingPlayer?
+        let controller = makeController(makePlayer: { let player = CountingPlayer(); created = player; return player }, recorder: recorder)
+        try await playReady(controller)
+        let player = try #require(created)
+        try await Self.waitUntil { player.timeControlStatus == .playing && player.active == 1 }
+        let media = try await TestMedia.shared.url()
+
+        // Replaced by a lecture with a resume position: held paused, so no observer at all.
+        controller.play(media, title: "Altra", cookies: [], startAt: 30, recordingID: "rec-2", metadata: nil)
+        #expect(player.active == 0, "the replaced lecture's observer is gone at once")
+        #expect(recorder.checkpoints.last?.reason == .replaced)
+        try await Self.waitUntil { controller.isStartSettled && player.active == 1 }
+
+        // Replaced while playing, without a resume position: the old observer goes, one new one.
+        let removed = player.counts.withLock { $0.removed }
+        controller.play(media, title: "Terza", cookies: [], startAt: nil, recordingID: "rec-3", metadata: nil)
+        #expect(player.counts.withLock { $0.removed } == removed + 1)
+        #expect(player.active == 1, "re-added within `play`, not left to a status report that may never come")
+        try await Self.waitUntil { player.timeControlStatus == .playing && player.active == 1 }
+        await Self.settle()
+        #expect(player.active == 1)
+
+        var activeAtFailure: Int?
+        controller.onFailure = { _, _ in activeAtFailure = player.active }
+        let item = try #require(player.currentItem)
+        NotificationCenter.default.post(name: AVPlayerItem.failedToPlayToEndTimeNotification, object: item)
+        try await Self.waitUntil { activeAtFailure != nil }
+        #expect(activeAtFailure == 0, "removed before the caller hears of the failure")
+        #expect(recorder.checkpoints.last?.reason == .failed)
+        await Self.settle()
+        #expect(player.active == 0)
+        controller.close()
+        #expect(player.active == 0)
+    }
+
+    /// While playing, ticks reach `onProgress` with the lecture's id, position and duration, and
+    /// never produce a checkpoint: only pauses, closes, replacements and failures do. Guards
+    /// against a "save every N seconds" creeping in through the ticks. The interval is shortened
+    /// so real AVFoundation ticks arrive within the fixture. Mutations: make `progressTicked`
+    /// call `checkpointIfMeaningful(.paused)` and the checkpoints are no longer empty; forward
+    /// nothing and the wait for ticks times out.
+    @Test func ticksReportProgressAndNeverCheckpoint() async throws {
+        let recorder = Recorder()
+        let controller = makeController(progressInterval: 0.2, recorder: recorder)
+        try await playReady(controller)
+        try await Self.waitUntil { recorder.ticks.count >= 3 }
+        #expect(recorder.checkpoints.isEmpty, "ticks are never checkpoints")
+        #expect(recorder.ticks.allSatisfy { $0.id == "Lezione" && $0.duration == TestMedia.duration })
+        let positions = recorder.ticks.map(\.position)
+        #expect(positions.allSatisfy { $0 >= 0 && $0 <= TestMedia.duration })
+        #expect((positions.last ?? 0) > (positions.first ?? 0), "the position moves on")
+        #expect(controller.player?.rate != 0)
+        controller.close()
+        #expect(recorder.checkpoints.map(\.reason) == [.closed])
+        let ticks = recorder.ticks.count
+        try await Task.sleep(for: .milliseconds(600))
+        #expect(recorder.ticks.count == ticks, "nothing after close")
+    }
+
+    /// A tick from a replaced or closed item is dropped by the generation check, and a tick that
+    /// is not a finite, non-negative position is dropped too. Guards against a late tick
+    /// crediting the previous lecture's position to the new one, and against NaN or a negative
+    /// time reaching watch progress. Mutations: drop `observed == generation` and the
+    /// replaced-generation tick is delivered; drop `position.isFinite, position >= 0` and the
+    /// NaN and -1 ticks are delivered.
+    @Test func ticksFromAReplacedItemOrWithoutAPositionAreDropped() async throws {
+        let recorder = Recorder()
+        let controller = makeController(recorder: recorder)
+        try await playReady(controller)
+        let old = controller.generation
+        let media = try await TestMedia.shared.url()
+        controller.play(media, title: "Altra", cookies: [], startAt: nil, recordingID: "rec-2", metadata: nil)
+        try await Self.waitUntil { controller.isStartSettled && controller.progressObserverSerial != nil }
+        let serial = try #require(controller.progressObserverSerial)
+        recorder.ticks.removeAll()
+        controller.progressTicked(generation: old, observer: serial, position: 5)
+        #expect(recorder.ticks.isEmpty, "a tick from the replaced lecture is dropped")
+        controller.progressTicked(generation: controller.generation, observer: serial, position: .nan)
+        controller.progressTicked(generation: controller.generation, observer: serial, position: -1)
+        #expect(recorder.ticks.isEmpty, "no position, no tick")
+        controller.progressTicked(generation: controller.generation, observer: serial, position: 5)
+        #expect(recorder.ticks.count == 1)
+        #expect(recorder.ticks.first?.id == "rec-2")
+        #expect(recorder.ticks.first?.position == 5)
+        #expect(recorder.ticks.first?.duration == TestMedia.duration)
+        controller.close()
+        controller.progressTicked(generation: controller.generation, observer: serial, position: 6)
+        #expect(recorder.ticks.count == 1, "nothing after close")
+    }
+
+    /// The race behind P2-1 of the review: during a resume the student starts the held player
+    /// from the system controls, so the observer exists while the player still shows ~0. A tick
+    /// AVFoundation read then can land after the resume settles; it must be dropped, or a lecture
+    /// resumed at 92% would report "below 90%" and closing could re-complete a lecture the
+    /// student un-ticked. Before the start settles, ticks are dropped outright. Mutations: drop
+    /// the re-arm in `settleStart` and the pre-settle tick delivered after the landing gets
+    /// through; drop `isStartSettled` in `progressTicked` and the tick during the resume gets
+    /// through; drop `observer == progressObserverSerial` and the pre-settle tick gets through.
+    @Test func aTickReadBeforeTheResumeLandedIsDroppedAfterIt() async throws {
+        let recorder = Recorder()
+        let (controller, player) = try await makeHeldResume(recorder: recorder)
+        // The student presses play on the system controls before the resume seek lands.
+        player.play()
+        try await Self.waitUntil { controller.progressObserverSerial != nil }
+        let early = try #require(controller.progressObserverSerial)
+        controller.progressTicked(generation: controller.generation, observer: early, position: 0.5)
+        #expect(recorder.ticks.isEmpty, "the resume has not landed: 0.5 is not where the student is")
+
+        player.releaseSeeks()
+        try await Self.waitUntil { controller.isStartSettled }
+        // A tick the early observer read at 0.5 s, delivered only now. Real ticks may arrive
+        // too (AVFoundation fires on start and after the seek), all at or after the resume
+        // target, so the check is that nothing below it got through.
+        controller.progressTicked(generation: controller.generation, observer: early, position: 0.5)
+        #expect(!recorder.ticks.contains { $0.position < 29 }, "read before the resume landed: dropped")
+        let current = try #require(controller.progressObserverSerial)
+        #expect(current != early, "the start settling replaced the observer")
+        controller.progressTicked(generation: controller.generation, observer: current, position: 31)
+        #expect(recorder.ticks.contains { $0.position == 31 }, "the new observer's ticks go through")
+        #expect(recorder.checkpoints.isEmpty)
+        controller.close()
     }
 
     /// A pause reports once, with the position and duration: `pause()`, a pause from outside
@@ -557,6 +890,7 @@ struct RecordingPlayerMVPTests {
         try await Self.waitUntil { recorder.checkpoints.count == 3 }
         await Self.settle()
         #expect(recorder.checkpoints.count == 3)
+        #expect(recorder.checkpoints.map(\.reason) == [.paused, .paused, .paused])
         controller.close()
     }
 
@@ -570,14 +904,15 @@ struct RecordingPlayerMVPTests {
         try await playReady(controller)
         try await park(controller, at: 25)
         let before = recorder.checkpoints.count
-        controller.onPositionCheckpoint = { id, position, duration in
+        controller.onPositionCheckpoint = { checkpoint in
             openWhenReported = controller.player != nil
-            recorder.checkpoints.append((id, position, duration))
+            recorder.checkpoints.append(checkpoint)
         }
         if byUser { controller.window?.close() } else { controller.close() }
         #expect(recorder.checkpoints.count == before + 1)
         #expect(openWhenReported == true)
         #expect(abs((recorder.checkpoints.last?.position ?? 0) - 25) < 0.5)
+        #expect(recorder.checkpoints.last?.reason == .closed)
         controller.close()
         await Self.settle()
         #expect(recorder.checkpoints.count == before + 1)
@@ -622,6 +957,7 @@ struct RecordingPlayerMVPTests {
         #expect(abs(time(controller)) < 0.5)
         controller.close()
         #expect(recorder.checkpoints.map(\.position) == [30])
+        #expect(recorder.checkpoints.map(\.reason) == [.closed])
     }
 
     /// A failure while the resume seek is in flight reports the resume position, in the
@@ -765,7 +1101,7 @@ struct RecordingPlayerMVPTests {
         let log = PolicyLog()
         let controller = RecordingPlayerController(present: { _ in }, makePlayerView: { FakePlayerView() },
                                                    activationPolicy: ActivationPolicyControl(current: { log.current }, set: { log.current = $0; log.sets.append($0) }),
-                                                   frameAutosaveName: nil, defaults: PlayerTestDefaults.throwaway())
+                                                   frameAutosaveName: nil, defaults: PlayerTestDefaults.throwaway(), nowPlaying: SilentNowPlaying())
         let media = try await TestMedia.shared.url()
         controller.play(media, title: "Lezione", cookies: [], startAt: nil)
         // BeepBar was already regular when the lecture opened, so the player holds nothing to restore.
@@ -777,7 +1113,7 @@ struct RecordingPlayerMVPTests {
         let idle = PolicyLog()
         let idlePlayer = RecordingPlayerController(present: { _ in }, makePlayerView: { FakePlayerView() },
                                                    activationPolicy: ActivationPolicyControl(current: { idle.current }, set: { idle.current = $0; idle.sets.append($0) }),
-                                                   frameAutosaveName: nil, defaults: PlayerTestDefaults.throwaway())
+                                                   frameAutosaveName: nil, defaults: PlayerTestDefaults.throwaway(), nowPlaying: SilentNowPlaying())
         idlePlayer.adoptPolicyToRestore(.accessory)
         idlePlayer.close()
         #expect(idle.sets.isEmpty)
@@ -808,10 +1144,11 @@ struct RecordingPlayerMVPTests {
         try await park(controller, at: 40)
         let before = recorder.checkpoints.count
         let media = try await TestMedia.shared.url()
-        controller.play(media, title: "Altra", cookies: [], startAt: nil, recordingID: "rec-2")
+        controller.play(media, title: "Altra", cookies: [], startAt: nil, recordingID: "rec-2", metadata: nil)
         #expect(recorder.checkpoints.count == before + 1)
         #expect(abs((recorder.checkpoints.last?.position ?? 0) - 40) < 0.5)
         #expect(recorder.checkpoints.last?.id == "Lezione", "The replaced lecture's id, not the new one")
+        #expect(recorder.checkpoints.last?.reason == .replaced)
         #expect(controller.recordingID == "rec-2")
         controller.close()
     }
@@ -831,6 +1168,7 @@ struct RecordingPlayerMVPTests {
         try await Self.waitUntil { !recorder.failures.isEmpty }
         await Self.settle()
         #expect(recorder.events == ["checkpoint", "failure"])
+        #expect(recorder.checkpoints.map(\.reason) == [.failed])
         controller.close()
 
         let early = Recorder()

@@ -14,7 +14,7 @@ import Foundation
 ///
 /// What it is not: an authorization. Saved enrollments never decide what is synced (every sync
 /// asks Moodle for the current list first) and never replace the sync metadata of a course. It
-/// carries no token, no folder names (those belong to the sync database, which stays
+/// carries no token (a course image address is stored bare, `Course.imageURL`), no folder names (those belong to the sync database, which stays
 /// authoritative), no selection (the defaults and the database) and no Moodle user id: the
 /// credential fingerprint already ties it to one account, so the id would be personal data kept
 /// for nothing.
@@ -59,6 +59,14 @@ public struct CourseListSnapshot: Codable, Equatable, Sendable {
         public let isVisible: Bool?
         public let startDate: Date?
         public let endDate: Date?
+        /// `RemoteCourseSummary.imageURL`: the course picture's address, never a credential (the
+        /// token is added only when it is fetched). Optional and added without a version bump
+        /// (issue #148 follow-up, "Now Playing artwork"), so both directions keep working for
+        /// users who skip releases: a file written before the field existed decodes with nil (the
+        /// synthesized decoder uses `decodeIfPresent` for optionals), and an older BeepBar reading
+        /// a newer file ignores the unknown key. A nil value is omitted when encoding, so a list
+        /// without images is written byte for byte as before.
+        public let imageURL: URL?
 
         public init(_ course: RemoteCourseSummary) {
             id = course.id
@@ -67,10 +75,11 @@ public struct CourseListSnapshot: Codable, Equatable, Sendable {
             isVisible = course.isVisible
             startDate = course.startDate
             endDate = course.endDate
+            imageURL = course.imageURL
         }
 
         public var summary: RemoteCourseSummary {
-            RemoteCourseSummary(id: id, shortName: shortName, displayName: displayName, isVisible: isVisible, startDate: startDate, endDate: endDate)
+            RemoteCourseSummary(id: id, shortName: shortName, displayName: displayName, isVisible: isVisible, startDate: startDate, endDate: endDate, imageURL: imageURL)
         }
     }
 

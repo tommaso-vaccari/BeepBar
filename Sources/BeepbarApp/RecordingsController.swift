@@ -1638,6 +1638,14 @@ struct RecordingsListing: Equatable {
         nowPlaying = [:]
         currentLectureID = nil
         recoveredLectures = []
+        // `playbackMetadata = nil` is a defensive duplicate: the metadata is only read for a
+        // lecture in `recoveredLectures` (`playbackMetadata(for:stream:)`), which was just emptied,
+        // so no test can tell it from the line above (`anAccountChangeDropsThePlaybackMetadata`
+        // checks the observable result). It stays so the previous account's course name and
+        // picture address never linger in memory if that read condition is ever loosened.
+        // `menuPlayCourse = nil` is NOT redundant: it is consumed only by a Play that reaches the
+        // player, so one that ended in the browser leaves it set, and it beats the selected course
+        // (`aMenuCourseNeverPlayedDoesNotSurviveAnAccountChange`).
         playbackMetadata = nil
         menuPlayCourse = nil
         // The sessions belong to the account going away; `forgetSeen` clears the rest.
@@ -1679,6 +1687,10 @@ struct RecordingsListing: Equatable {
     private func playerCheckpoint(_ checkpoint: RecordingCheckpoint) {
         let id = checkpoint.id
         // The lecture left the player: its Now Playing metadata is no longer a recovery's to reuse.
+        // A defensive duplicate of the `recoveredLectures` condition in `playbackMetadata(for:stream:)`
+        // (a fresh Play removes the lecture from that set first); it only frees the stored value.
+        // The rule itself is tested by `aReplayAfterAWindowClosedBeforeReadyReadsTheCourseAgain`,
+        // which closes without a checkpoint so only the set's condition decides.
         if checkpoint.reason == .closed, playbackMetadata?.recordingID == id { playbackMetadata = nil }
         guard let recording = nowPlaying[id], let owner = resumeOwner() else { return }
         recordWatchCheckpoint(checkpoint, of: recording, owner: owner)

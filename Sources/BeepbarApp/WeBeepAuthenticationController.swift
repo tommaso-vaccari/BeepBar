@@ -1367,6 +1367,10 @@ enum MaterialsRunEnd: Equatable, Sendable {
         let userID = siteInfo?.userID
         let token = try await credentialVault.load(.nonInteractive)
         let data = try await client.fetchCourseImage(url, token: token)
+        // The account clause is what `aCoursePictureArrivingAfterAnAccountChangeIsDropped` pins.
+        // `apiClient === client` is a defensive duplicate for a site change: `selectSite` swaps
+        // the client but also clears `siteInfo`, so `userID` already differs; it is kept for the
+        // case where a future site switch keeps `siteInfo` (same user id on two sites).
         guard apiClient === client, siteInfo?.userID == userID else { throw CancellationError() }
         return data
     }

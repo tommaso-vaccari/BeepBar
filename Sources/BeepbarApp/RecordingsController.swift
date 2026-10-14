@@ -73,9 +73,11 @@ struct RecordingsListing: Equatable {
 ///   its notification settings and history (an opaque reset namespace remains). Personal study choices
 ///   remain account-scoped. Another WeBeep account never inherits a Polimi session:
 ///   the saved one names its owner and is dropped when the known account differs.
-/// - **Quiet at rest.** Nothing runs and no file is read until the Recordings page is shown or a
-///   sign-in starts; the browser is closed as soon as the page is gone, unless a sign-in is on
-///   screen. Nothing here takes part in quitting or in `expireCredential()`.
+/// - **Quiet at rest.** Nothing runs on its own: no timer, no observer. Work starts only when the
+///   Recordings page is shown, a sign-in starts, a lecture is played, or a sync run asks for its
+///   listings follow-up (`refreshForSync`, see below). The browser is closed as soon as none of
+///   these needs it any more, unless a sign-in is on screen. Nothing here takes part in quitting
+///   or in `expireCredential()`.
 /// - **Nothing new writes nothing.** The session file is rewritten only when its cookies changed,
 ///   and the seen-recordings lists only when a recording is first seen or opened.
 /// - **The session file never touches the main actor (#97).** It is read, written and deleted by
@@ -136,6 +138,25 @@ struct RecordingsListing: Equatable {
 ///   as it never cancelled a recovery (`suspend`). Accepted consequence (owner, 2026-10-12): a
 ///   Webex sign-in window or the browser fallback of that Play may appear seconds after
 ///   Settings was closed.
+///
+/// Refreshing the listings at every sync (owner decision 2026-10-12; `refreshForSync`, called by
+/// the sync's follow-up, which decides first with Core's `RecordingsSyncPolicy`). What this class
+/// keeps, each guarded by `RecordingsSyncRefreshTests`:
+/// - **Listings and seen state only.** The same `.list` jobs as the page's, through the same
+///   worker and `record`: never a stream, never a download, never a window. A lapsed Polimi
+///   session ends it as `.needsSignIn` (no sign-in window, no activation); no saved session
+///   ends it before the browser is even created.
+/// - **Free when there is nothing to do.** Off, no account, a sign-in running or needed, no
+///   courses, or every course listed within `freshness` (automatic runs only; "Sincronizza ora"
+///   passes `force`): no file read, no browser, no write.
+/// - **Next to the page, never in its way.** Its courses go after what the page queued and
+///   never replace it; the page's own `enqueue` and closing the window don't drop them
+///   (`backgroundKeys`); one browser, one request at a time, as always. With no page on screen
+///   the browser closes when the queue has drained.
+/// - **Answered exactly once.** The caller's await ends when its courses are done, when the
+///   identity changes (turn-off, sign-out, account or university change, a sign-in:
+///   `invalidate`), or when its task is cancelled (well within a second: nothing is awaited
+///   first). A failure of this refresh is never shown as a sync failure.
 @MainActor final class RecordingsController: ObservableObject {
     static let enabledKey = "io.github.tvaccari.beepbar.recordings-enabled.v1"
     static let acknowledgedKey = "io.github.tvaccari.beepbar.recordings-acknowledged.v1"
@@ -400,6 +421,35 @@ struct RecordingsListing: Equatable {
     private var pageKeys: [RecmanCourseKey] = []
     private var selectedKey: RecmanCourseKey?
 
+    // MARK: Sync refresh state
+
+    /// One caller of `refreshForSync` still waiting for its courses.
+    private struct BackgroundWaiter {
+        /// Its courses not finished yet: queued (by it or by the page) or in flight.
+        var pending: Set<RecmanCourseKey>
+        /// The courses it appended to the queue itself, the only ones a cancellation may drop.
+        var added: Set<RecmanCourseKey>
+        var newlyPublished = 0
+        var failedKeys = 0
+        /// Nil only between registration and the moment the caller starts waiting (no
+        /// suspension point in between today; `backgroundResults` covers it regardless).
+        var continuation: CheckedContinuation<RecordingsSyncOutcome, Never>?
+    }
+    /// The callers of `refreshForSync` still waiting, by id. Every way out goes through
+    /// `resolveBackground`, which removes the entry before resuming: that is what makes each
+    /// continuation resume exactly once.
+    private var backgroundWaiters: [Int: BackgroundWaiter] = [:]
+    /// Outcomes decided before their caller attached its continuation; taken when it does.
+    private var backgroundResults: [Int: RecordingsSyncOutcome] = [:]
+    private var backgroundWaiterSerial = 0
+
+    /// The courses some sync refresh is still waiting for. The page's `enqueue`, closing the
+    /// window (`suspend`) and `dropQueuedListings` keep these queued: only `clearQueue` (which
+    /// answers the waiters) and a cancellation of their own caller remove them.
+    private var backgroundKeys: Set<RecmanCourseKey> {
+        backgroundWaiters.values.reduce(into: Set<RecmanCourseKey>()) { $0.formUnion($1.pending) }
+    }
+
     init(
         makeBrowser: @escaping @MainActor () -> RecmanBrowsing = { RecmanWebSession() },
         store: RecordingsSessionStore = .standard,
@@ -650,31 +700,49 @@ struct RecordingsListing: Equatable {
         // Keep launch and disabled recordings quiet; check only the first visit, before refresh
         // can open WebKit. Later visits must preserve a session established by explicit sign-in.
         guard isEnabled, access == .ready, !hasCheckedInitialSession else { return }
-        hasCheckedInitialSession = true
-        initialSessionChecks += 1
-        let check = initialSessionChecks
-        initialSessionCheck = check
+        let check = beginInitialSessionCheck()
         // Not tied to `generation`: closing the page while the file is read must not lose the
         // answer, or the next visit would open the browser without a session to show.
         Task { [weak self] in
             guard let self else { return }
             let cookies = await self.savedCookies()
-            guard self.initialSessionCheck == check else { return }
-            self.initialSessionCheck = nil
-            guard self.isEnabled, self.access == .ready else { return }
-            if cookies.isEmpty {
-                // A menu Play queued while the file was read can't run without a session.
-                let needsPage = self.takeMenuPlayNeedingPage(failing: nil, queued: true)
-                self.clearQueue()
-                self.access = .needsSignIn(nil)
-                if let needsPage { self.onMenuPlayNeedsPage?(needsPage) }
-                return
-            }
-            // What the page asked for while the file was read. No `force` to carry over: this is
-            // the first visit, so nothing has been listed yet and every key loads anyway.
-            if self.visiblePages > 0 { self.enqueue(self.pageKeys, selected: self.selectedKey, force: false) }
-            self.startWorker()
+            _ = self.answerInitialSessionCheck(check, cookies: cookies)
         }
+    }
+
+    /// Starts the one check of the saved session per launch (the page's first visit, or a sync
+    /// refresh that comes first). Until it answers, `startWorker` opens nothing.
+    private func beginInitialSessionCheck() -> Int {
+        hasCheckedInitialSession = true
+        initialSessionChecks += 1
+        initialSessionCheck = initialSessionChecks
+        return initialSessionChecks
+    }
+
+    private enum InitialSessionAnswer { case superseded, noSession, session }
+
+    /// Applies the first check's answer, for the page and for a sync refresh alike.
+    /// - Superseded (sign-in, turn-off, an account change) or no longer ready: nothing.
+    /// - No saved session: `.needsSignIn`, and whatever was queued meanwhile is dropped (a menu
+    ///   Play asks for its page; a sync refresh is answered `.needsSignIn`). No browser was or
+    ///   will be created for it: the student's own "Accedi con Polimi" is the only way on.
+    /// - A session: what the page asked for while the file was read is queued (no `force` to
+    ///   carry over: nothing has been listed yet, so every key loads anyway), and the worker starts.
+    private func answerInitialSessionCheck(_ check: Int, cookies: [HTTPCookie]) -> InitialSessionAnswer {
+        guard initialSessionCheck == check else { return .superseded }
+        initialSessionCheck = nil
+        guard isEnabled, access == .ready else { return .superseded }
+        if cookies.isEmpty {
+            // A menu Play queued while the file was read can't run without a session.
+            let needsPage = takeMenuPlayNeedingPage(failing: nil, queued: true)
+            clearQueue(background: .needsSignIn)
+            access = .needsSignIn(nil)
+            if let needsPage { onMenuPlayNeedsPage?(needsPage) }
+            return .noSession
+        }
+        if visiblePages > 0 { enqueue(pageKeys, selected: selectedKey, force: false) }
+        startWorker()
+        return .session
     }
 
     /// Deferred by one main-actor turn: a language switch rebuilds the page, which disappears and
@@ -709,11 +777,13 @@ struct RecordingsListing: Equatable {
     ///   already outlives the window), so it doesn't stop one that is about to start either.
     ///   Before the menu bar Play this closed-window case cancelled a window Play in flight;
     ///   now a window Play pressed just before closing the window still starts.
-    /// Only the course listings and the other clicks (Open in browser, Copy link) are dropped
-    /// then; the browser closes when the queue has drained (`closesBrowserWhenIdle`).
+    /// A sync refresh still waiting (`backgroundWaiters`) is the third exception: it was never
+    /// the page's, so closing the window doesn't cancel it either.
+    /// Only the listings the page alone wanted and the other clicks (Open in browser, Copy link)
+    /// are dropped then; the browser closes when the queue has drained (`closesBrowserWhenIdle`).
     private func suspend() {
         guard access != .signingIn else { return }
-        if hasPlayOrRecovery {
+        if hasPlayOrRecovery || hasBackgroundRequest {
             dropQueuedListings()
             dropQueuedOpenings()
             closesBrowserWhenIdle = true
@@ -722,6 +792,9 @@ struct RecordingsListing: Equatable {
         invalidate()
         closeBrowser()
     }
+
+    /// Whether a sync refresh is still waiting for its courses (`refreshForSync`).
+    private var hasBackgroundRequest: Bool { !backgroundWaiters.isEmpty }
 
     /// Whether a recovery or a Play is queued or running: work for a lecture the student asked
     /// to watch, which closing the window must not cancel (`suspend`).
@@ -734,12 +807,17 @@ struct RecordingsListing: Equatable {
         }
     }
 
-    /// Removes the listings still waiting (not the one in flight) and their spinners.
+    /// Removes the listings still waiting (not the one in flight) and their spinners, except
+    /// those a sync refresh is waiting for (`backgroundKeys`): they were never the page's to drop.
     private func dropQueuedListings() {
-        for job in queue {
+        let kept = backgroundKeys
+        let dropped: (Job) -> Bool = { job in
+            if case .list(let key) = job { !kept.contains(key) } else { false }
+        }
+        for job in queue where dropped(job) {
             if case .list(let key) = job, key != runningKey { listings[key]?.isLoading = false }
         }
-        queue.removeAll { if case .list = $0 { true } else { false } }
+        queue.removeAll(where: dropped)
     }
 
     /// Removes the clicks still waiting other than a Play (Open in browser, Copy link) and their
@@ -979,6 +1057,8 @@ struct RecordingsListing: Equatable {
                 // results here: only merge the committed IDs into a current matching snapshot.
                 // Opening before the first listing still does not establish a baseline.
                 if self.listings[key]?.seenIDs != nil { self.listings[key]?.seenIDs?.formUnion(added) }
+                // The unseen count of the saved summary (menu line) changes with the dots.
+                if self.listings[key]?.seenIDs != nil { self.refreshWatchSummary(for: key, persist: true) }
                 if self.listings[key]?.historyReadFailed != true, self.listings[key]?.problem == .historyUnavailable { self.listings[key]?.problem = nil }
             } catch {
                 guard self.isCurrentHistory(history, owner: owner, generation: generation) else { return }
@@ -1066,14 +1146,20 @@ struct RecordingsListing: Equatable {
         for key in [selected].compactMap({ $0 }).filter({ keys.contains($0) }) + keys where !ordered.contains(key) { ordered.append(key) }
         let wanted = ordered.filter { needsLoad($0, force: force) }
         let opens = queue.filter(Self.isOpening)
+        // A sync refresh's queued courses stay, after the page's, in their order: the page
+        // replaces only what it asked for itself (`backgroundKeys`).
+        let background = backgroundKeys
+        let kept = queue.filter { job in
+            if case .list(let key) = job { background.contains(key) && !wanted.contains(key) } else { false }
+        }
         // The page's current keys replace queued listings. Keep explicit openings and the
         // in-flight listing, but stop showing spinners for work that will no longer run.
         for job in queue {
-            if case .list(let key) = job, !wanted.contains(key), key != runningKey {
+            if case .list(let key) = job, !wanted.contains(key), !background.contains(key), key != runningKey {
                 listings[key]?.isLoading = false
             }
         }
-        queue = opens + wanted.map(Job.list)
+        queue = opens + wanted.map(Job.list) + kept
         for key in wanted {
             // A new attempt replaces the last one's failure: its banner next to the spinner read
             // as the new attempt having failed already.
@@ -1081,6 +1167,150 @@ struct RecordingsListing: Equatable {
             listings[key]?.problem = nil
         }
         startWorker()
+    }
+
+    // MARK: Sync refresh (listings at every sync)
+
+    /// Refreshes the listings of `keys` in the background, for the follow-up of a sync run, and
+    /// answers when they are done. Listings and seen state only (never a stream, never a window).
+    ///
+    /// - Zero-cost answers, before anything is read or opened: switched off, owner unknown, a
+    ///   sign-in running or needed, no courses; and courses all listed within `freshness` when
+    ///   `force` is false (an automatic run; "Sincronizza ora" passes `force`).
+    /// - No session checked yet this launch: the session file is read once. Without cookies the
+    ///   answer is `.needsSignIn` and no browser was created.
+    /// - The courses are appended after what the page queued (`enqueueBackground`); the page's
+    ///   own queue is never replaced, and its window closing doesn't cancel them (`suspend`).
+    /// - The task's cancellation ends the wait at once: with nothing else needing the browser
+    ///   (`backgroundCancelled`) it stops the worker and closes the browser, otherwise it only
+    ///   drops the courses nobody else wants.
+    ///
+    /// The continuation resumes exactly once, through `resolveBackground`.
+    func refreshForSync(_ keys: Set<RecmanCourseKey>, force: Bool) async -> RecordingsSyncOutcome {
+        guard isEnabled else { return .skipped(.switchedOff) }
+        guard sessionOwner ?? ownerUserID() != nil else { return .skipped(.ownerUnknown) }
+        switch access {
+        case .off: return .skipped(.switchedOff)
+        case .signingIn: return .skipped(.signingIn)
+        case .needsSignIn: return .skipped(.needsSignIn)
+        case .ready: break
+        }
+        guard !keys.isEmpty else { return .skipped(.noCourses) }
+        guard !Task.isCancelled else { return .cancelled }
+        let wanted = keys.filter { $0 == runningKey || needsLoad($0, force: force) }
+            .sorted { ($0.courseCode, $0.academicYear) < ($1.courseCode, $1.academicYear) }
+        // Everything is fresh: nothing to ask, nothing to write.
+        guard !wanted.isEmpty else { return .refreshed(newlyPublished: 0, failedKeys: 0) }
+
+        backgroundWaiterSerial += 1
+        let id = backgroundWaiterSerial
+        let queued = Set(queue.compactMap { job -> RecmanCourseKey? in if case .list(let key) = job { key } else { nil } })
+        backgroundWaiters[id] = BackgroundWaiter(pending: Set(wanted),
+                                                 added: Set(wanted).subtracting(queued).subtracting([runningKey].compactMap { $0 }))
+        // With a page on screen the browser stays for it; otherwise it closes when the queue drains.
+        if visiblePages == 0 { closesBrowserWhenIdle = true }
+        // The session check first: `startWorker` opens nothing while it is pending, and without
+        // a saved session the browser must never be created.
+        if !hasCheckedInitialSession {
+            let check = beginInitialSessionCheck()
+            Task { [weak self] in
+                guard let self else { return }
+                let cookies = await self.savedCookies()
+                _ = self.answerInitialSessionCheck(check, cookies: cookies)
+            }
+        }
+        enqueueBackground(wanted)
+        return await withTaskCancellationHandler {
+            await withCheckedContinuation { (continuation: CheckedContinuation<RecordingsSyncOutcome, Never>) in
+                if let result = backgroundResults.removeValue(forKey: id) {
+                    continuation.resume(returning: result)
+                } else if backgroundWaiters[id] != nil {
+                    backgroundWaiters[id]?.continuation = continuation
+                } else {
+                    continuation.resume(returning: .cancelled)
+                }
+            }
+        } onCancel: {
+            Task { @MainActor [weak self] in self?.backgroundCancelled(id) }
+        }
+    }
+
+    /// Appends the courses not queued or in flight yet, after everything already queued: the
+    /// page's listings, its openings and any Play keep their place. Unlike `enqueue`, never
+    /// removes anything.
+    private func enqueueBackground(_ keys: [RecmanCourseKey]) {
+        for key in keys where key != runningKey && !queue.contains(.list(key)) {
+            queue.append(.list(key))
+            listings[key, default: RecordingsListing()].isLoading = true
+            listings[key]?.problem = nil
+        }
+        startWorker()
+    }
+
+    /// A course of some waiting refresh finished (listed and recorded, or failed). The waiters
+    /// answer when the worker has saved the session and closed the browser
+    /// (`resolveFinishedBackground`), not here.
+    private func finishBackgroundKey(_ key: RecmanCourseKey, _ result: RecordResult) {
+        for id in Array(backgroundWaiters.keys) {
+            guard backgroundWaiters[id]?.pending.contains(key) == true else { continue }
+            switch result {
+            case .published(let newly):
+                backgroundWaiters[id]?.pending.remove(key)
+                backgroundWaiters[id]?.newlyPublished += newly
+            case .failed:
+                backgroundWaiters[id]?.pending.remove(key)
+                backgroundWaiters[id]?.failedKeys += 1
+            case .stale:
+                // The identity moved on while the history was read: nothing was published.
+                resolveBackground(id, .cancelled)
+            }
+        }
+    }
+
+    /// Answers the waiters whose courses are all done. A course that is neither queued nor in
+    /// flight any more cannot be coming: counted as failed rather than waited for forever.
+    private func resolveFinishedBackground() {
+        for id in Array(backgroundWaiters.keys) {
+            guard var waiter = backgroundWaiters[id] else { continue }
+            waiter.pending = waiter.pending.filter { key in queue.contains(.list(key)) || key == runningKey }
+            let lost = (backgroundWaiters[id]?.pending.count ?? 0) - waiter.pending.count
+            if waiter.pending.isEmpty {
+                resolveBackground(id, .refreshed(newlyPublished: waiter.newlyPublished, failedKeys: waiter.failedKeys + lost))
+            }
+        }
+    }
+
+    /// The only way a waiter ends: removes it first, so its continuation resumes exactly once. A
+    /// result decided before the caller attached its continuation is kept for it.
+    private func resolveBackground(_ id: Int, _ outcome: RecordingsSyncOutcome) {
+        guard let waiter = backgroundWaiters.removeValue(forKey: id) else { return }
+        if let continuation = waiter.continuation {
+            continuation.resume(returning: outcome)
+        } else {
+            backgroundResults[id] = outcome
+        }
+    }
+
+    /// The caller's task was cancelled. Nothing is awaited first, so the answer is immediate.
+    /// - Nothing else needs the browser (no page, no sign-in, no Play or recovery, no other
+    ///   waiter): the whole thing stops, like a window closing used to (`invalidate`), and the
+    ///   browser goes.
+    /// - Otherwise only the courses this refresh added and nobody else wants are dropped; an
+    ///   in-flight listing finishes and is recorded as usual.
+    private func backgroundCancelled(_ id: Int) {
+        guard let waiter = backgroundWaiters[id] else { return }
+        let othersWait = backgroundWaiters.contains { $0.key != id }
+        if visiblePages == 0, access != .signingIn, !hasPlayOrRecovery, !othersWait {
+            invalidate()
+            closeBrowser()
+            resolveBackground(id, .cancelled)
+            return
+        }
+        let wantedByOthers = backgroundWaiters.filter { $0.key != id }.reduce(into: Set<RecmanCourseKey>()) { $0.formUnion($1.value.pending) }
+        let drop = waiter.added.subtracting(wantedByOthers)
+        for key in drop where key != runningKey { listings[key]?.isLoading = false }
+        queue.removeAll { if case .list(let key) = $0 { drop.contains(key) } else { false } }
+        resolveBackground(id, .cancelled)
     }
 
     private func startWorker() {
@@ -1109,9 +1339,10 @@ struct RecordingsListing: Equatable {
                     runningKey = key
                     let recordings = try await browser.recordings(for: key)
                     guard generation == self.generation else { return }
-                    await record(recordings, for: key, generation: generation)
+                    let recorded = await record(recordings, for: key, generation: generation)
                     guard generation == self.generation else { return }
                     runningKey = nil
+                    finishBackgroundKey(key, recorded)
                 case .open(let recording, .copyLink, let request):
                     let url = try await playerLink(for: recording, browser: browser)
                     guard generation == self.generation else { return }
@@ -1150,13 +1381,16 @@ struct RecordingsListing: Equatable {
         if succeeded, saves { await saveSession(generation) }
         guard generation == self.generation else { return }
         worker = nil
-        // A recovery or a Play (from the menu bar, or from a window closed meanwhile) ran while
-        // no Recordings page was on screen: the browser it needed has no reason to stay open
-        // (the stream doesn't use it).
+        // A recovery, a Play (from the menu bar, or from a window closed meanwhile) or a sync
+        // refresh ran while no Recordings page was on screen: the browser it needed has no
+        // reason to stay open (a stream doesn't use it).
         if closesBrowserWhenIdle, queue.isEmpty, visiblePages == 0, access != .signingIn {
             closesBrowserWhenIdle = false
             closeBrowser()
         }
+        // After the save and the close, so a caller that returns finds both done (and the
+        // system activity of an automatic sync covers them).
+        resolveFinishedBackground()
         // Courses asked for while the session was being saved.
         startWorker()
     }
@@ -1726,20 +1960,30 @@ struct RecordingsListing: Equatable {
     /// A course whose listing isn't loaded keeps its last saved summary (but see
     /// `clearSavedNextIfCompleted`).
     ///
-    /// `newCount` (new recordings, shown on the menu line) is not computed here yet: the sync
-    /// controller package will. Until then the saved one of the course, if any, is carried over
-    /// unchanged into both summaries, so recomputing the counts never drops it.
+    /// `newCount` (the menu line's " · N nuove") is computed here from the listing in memory:
+    /// the lectures of the listing that are unseen (no "new" dot cleared yet: `seenIDs`) AND not
+    /// completed. A lecture ticked as attended in person without being opened is therefore not
+    /// "new", and `menuLine`'s "all done" guard never has to hide a contradiction. Nil (nothing
+    /// claimed) while the listing's seen state is unknown (its history read failed, or it was
+    /// forgotten with the account). Callers recompute it whenever one of its inputs changes: a
+    /// listing (`record`), a committed acknowledgement (`scheduleAcknowledge`) and a committed
+    /// progress write (`commitProgress`); the saved summary is rewritten only when the value
+    /// differs (`storeWatchSummary`), so a refresh that finds nothing new writes nothing.
     private func refreshWatchSummary(for key: RecmanCourseKey, persist: Bool) {
-        guard let recordings = listings[key]?.recordings else { return }
+        guard let listing = listings[key], let recordings = listing.recordings else { return }
         let owner = resumeOwner()
         if let owner { loadWatchSummaries(owner: owner) }
-        let newCount = owner == nil ? nil : watchSummaries[key]?.newCount
         var entries: [String: RecordingWatchEntry] = [:]
         var live: [String: Double] = [:]
         for recording in recordings {
             let identity = RecordingsStudyState.identity(recording)
             entries[recording.id] = watchProgress.entries[identity]
             live[recording.id] = watchProgress.live[identity]
+        }
+        let newCount = listing.seenIDs.map { seen in
+            recordings.reduce(0) { count, recording in
+                count + (!seen.contains(recording.id) && entries[recording.id]?.isCompleted != true ? 1 : 0)
+            }
         }
         watchProgress.setSummary(RecordingWatchProgress.courseSummary(recordings: recordings, entries: entries, live: live, newCount: newCount), for: key)
         guard persist, let owner else { return }
@@ -1895,29 +2139,54 @@ struct RecordingsListing: Equatable {
         currentLectureID == recording.id && (player?.isOpen ?? false)
     }
 
-    private func record(_ recordings: [RecmanRecording], for key: RecmanCourseKey, generation: Int) async {
+    /// What `record` did with a complete listing, for a sync refresh waiting on its course.
+    private enum RecordResult: Equatable {
+        /// Published with its seen state; `newlyPublished` lectures were first observed now.
+        case published(newlyPublished: Int)
+        /// The history couldn't be read (or no account is known): the previous list stays.
+        case failed
+        /// The identity changed while the history was read: nothing was published.
+        case stale
+    }
+
+    /// The only publisher of a listing: the list, its seen IDs and its watch progress together.
+    /// Called only with a complete listing (a partial one throws `incomplete` before), so the
+    /// #106 baseline is created only here; every failure keeps the previous list and seen state.
+    @discardableResult
+    private func record(_ recordings: [RecmanRecording], for key: RecmanCourseKey, generation: Int) async -> RecordResult {
         guard let owner = sessionOwner ?? ownerUserID() else {
             listings[key]?.isLoading = false
             listings[key]?.problem = .historyUnavailable
-            return
+            return .failed
         }
         let history = seenHistory
         let legacy = legacy(for: owner)
         await historyResetTask?.value
-        guard isCurrentHistory(history, owner: owner, generation: generation) else { return }
+        guard isCurrentHistory(history, owner: owner, generation: generation) else { return .stale }
         do {
             let ids = recordings.map(\.id)
             var snapshot: RecordingsHistorySnapshot
             while true {
                 let revision = historyRevision[key, default: 0]
                 snapshot = try await history.seenAndProgress(owner: owner, key: key, ids: ids, legacy: legacy)
-                guard isCurrentHistory(history, owner: owner, generation: generation) else { return }
+                guard isCurrentHistory(history, owner: owner, generation: generation) else { return .stale }
                 // An acknowledgement or a progress write can commit/publish while this snapshot
                 // returns. Requery rather than overwrite that newer state with an older snapshot.
                 if historyRevision[key, default: 0] == revision { break }
             }
             let seen = snapshot.seen
             discardLegacyDefaults()
+            // Read before anything below replaces them: the listing held in memory and the
+            // saved summary's total are what "first observed in this refresh" compares with.
+            // `isBaseline` is false on purpose: the store creates a baseline by marking every
+            // listed ID seen in the same transaction (#106), so a baseline listing has no unseen
+            // lecture and counts 0 whatever the flag says; the snapshot doesn't report whether
+            // this read created it, and the controller must not guess from its own memory.
+            loadWatchSummaries(owner: owner)
+            let newlyPublished = RecordingsSyncPolicy.newlyPublishedCount(
+                previousIDs: listings[key]?.recordings.map { Set($0.map(\.id)) },
+                currentIDs: Set(ids), seenIDs: seen, isBaseline: false,
+                storedTotal: watchSummaries[key]?.total)
             var listing = listings[key] ?? RecordingsListing()
             listing.recordings = recordings
             listing.seenIDs = seen
@@ -1941,12 +2210,14 @@ struct RecordingsListing: Equatable {
             watchProgress.setEntries(entries, for: identities)
             refreshWatchSummary(for: key, persist: true)
             updateStudy { $0.reconcile(recordings, for: key) }
+            return .published(newlyPublished: newlyPublished)
         } catch {
-            guard isCurrentHistory(history, owner: owner, generation: generation) else { return }
+            guard isCurrentHistory(history, owner: owner, generation: generation) else { return .stale }
             listings[key, default: RecordingsListing()].isLoading = queue.contains(.list(key))
             listings[key]?.problem = .historyUnavailable
             listings[key]?.historyReadFailed = true
             log.error("Couldn't load recording history")
+            return .failed
         }
     }
 
@@ -1960,7 +2231,9 @@ struct RecordingsListing: Equatable {
             // found the session gone, needs the page's "Accedi con Polimi".
             needsPage = takeMenuPlayNeedingPage(failing: job, queued: true)
             access = .needsSignIn(nil)
-            clearQueue()
+            // A sync refresh ends here too, silently: no sign-in window, no activation; every
+            // later sync skips Recordings until the student signs in again.
+            clearQueue(background: .needsSignIn)
             closeBrowser()
             return .stopWithoutSaving
         }
@@ -1970,7 +2243,7 @@ struct RecordingsListing: Equatable {
             // The menu Play's job goes with the queue and nobody is told (a cancellation is
             // never the student's problem): forgotten, so `menuPlay` names only a live job.
             menuPlay = nil
-            clearQueue()
+            clearQueue(background: .cancelled)
             return .stopWithoutSaving
         }
         let problem = RecordingsProblem(error)
@@ -1979,6 +2252,9 @@ struct RecordingsListing: Equatable {
         case .list(let key):
             listings[key, default: RecordingsListing()].problem = problem
             listings[key]?.isLoading = queue.contains(.list(key))
+            // One course that couldn't be read is counted and the batch goes on; Polimi not
+            // answering ends every waiter as `.unavailable` below instead.
+            if problem != .unavailable { finishBackgroundKey(key, .failed) }
         case .open(let recording, _, _):
             if openingRecordingID == recording.id { openingRecordingID = nil }
             openingProblem = problem
@@ -2001,17 +2277,21 @@ struct RecordingsListing: Equatable {
             case .recover: break
             }
         }
-        clearQueue()
+        clearQueue(background: .unavailable)
         return .stop
     }
 
-    private func clearQueue() {
+    /// Empties the queue, and with it every sync refresh still waiting, answered `background`
+    /// (what emptied it: the session lapsed, Polimi not answering, a cancellation). Required, so
+    /// no new way of clearing the queue can leave a caller of `refreshForSync` waiting forever.
+    private func clearQueue(background outcome: RecordingsSyncOutcome) {
         queue.removeAll()
         runningKey = nil
         openingRecordingID = nil
         for key in listings.keys where listings[key]?.isLoading == true {
             listings[key]?.isLoading = false
         }
+        for id in Array(backgroundWaiters.keys) { resolveBackground(id, outcome) }
     }
 
     /// Sign-in, turn-off and an account change decide access themselves: the first visit's check
@@ -2032,7 +2312,9 @@ struct RecordingsListing: Equatable {
         worker = nil
         signInTask?.cancel()
         signInTask = nil
-        clearQueue()
+        // Turn-off, sign-out, an account or university change, a sign-in: a sync refresh's
+        // results would belong to a generation that no longer exists.
+        clearQueue(background: .cancelled)
     }
 
     // MARK: Polimi email for the Webex sign-in (#148)

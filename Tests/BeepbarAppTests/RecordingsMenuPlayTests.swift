@@ -151,19 +151,19 @@ struct RecordingsMenuPlayTests {
         controller.turnOff()
     }
 
-    /// Until the sync controller computes it, a stored `newCount` survives the recomputation of
-    /// its course's summary (a listing, a checkpoint): recomputing counts and `next` must not
-    /// erase the menu's "· 3 nuove". Mutation: pass `newCount: nil` in `refreshWatchSummary`
-    /// (the saved count is dropped).
-    @Test func aStoredNewCountIsCarriedOver() async throws {
+    /// The saved `newCount` is recomputed with the listing (unseen and not completed lectures,
+    /// `refreshWatchSummary`), not carried over from an older one: a first listing is a baseline,
+    /// so the stale "· 3 nuove" is replaced by nothing (zero is stored as nil) in both the saved summary and the window's.
+    /// Mutation: pass the saved `watchSummaries[key]?.newCount` into `courseSummary` again (still 3).
+    @Test func aStoredNewCountIsRecomputedByTheListing() async throws {
         defer { cleanUp() }
         let stored = RecordingsController.StoredWatchSummaries(owner: 42, courses: ["058167-2026": CourseWatchSummary(done: 0, total: 1, remainingMinutes: 90, unknownDurationCount: 0, newCount: 3)])
         defaults.set(try PropertyListEncoder().encode(stored), forKey: RecordingsController.watchSummaryKey)
         let controller = await listedController([recording("a", daysAgo: 2), recording("b", daysAgo: 1)])
         let saved = try #require(RecordingsController.storedWatchSummaries(in: defaults, owner: 42)?[course])
         #expect(saved.total == 2 && saved.next == recording("a", daysAgo: 2), "recomputed")
-        #expect(saved.newCount == 3, "but the new-recordings count is kept")
-        #expect(controller.watchProgress.summaries[course]?.newCount == 3, "the window agrees")
+        #expect(saved.newCount == nil, "the baseline has nothing new")
+        #expect(controller.watchProgress.summaries[course]?.newCount == nil, "the window agrees")
         controller.turnOff()
     }
 

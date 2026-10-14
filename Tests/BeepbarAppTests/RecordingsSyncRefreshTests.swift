@@ -31,7 +31,7 @@ struct RecordingsSyncRefreshTests {
             store: RecordingsSessionStore { folder },
             defaults: defaults,
             makeSeenHistory: { namespace in
-                let history = RecordingsSeenHistory(store: RecordingsSeenStore(directory: { folder }, namespace: namespace))
+                let history = RecordingsSeenHistory(store: RecordingsSeenStore(directory: { folder }, namespace: namespace), beforeAcknowledge: { await world.waitForHistoryAcknowledge() })
                 world.historyActors.append(history)
                 return history
             },
@@ -366,7 +366,7 @@ struct RecordingsSyncRefreshTests {
 
     // MARK: Cancellation
 
-    /// Cancelling the caller with no page on screen answers `.cancelled` well within a second,
+    /// Cancelling the caller with no page on screen answers `.cancelled` without waiting for the page (the product target is 1 s),
     /// stops the worker, closes the browser and publishes nothing; the late answer is ignored
     /// and nothing resumes twice (a second resume would trap).
     /// Guards a cancelled sync leaving WebKit working for a minute. Mutations: drop the
@@ -380,10 +380,13 @@ struct RecordingsSyncRefreshTests {
         list(["a"])
         let task = Task { await controller.refreshForSync([course], force: false) }
         await settle("listing in flight") { gate.isWaiting }
-        let started = ContinuousClock.now
         task.cancel()
+        // Answered while Polimi's page is still pending (the gate is closed): nothing is awaited
+        // first. A wall-clock bound is deliberately not asserted: parallel @MainActor suites can
+        // starve the main actor for seconds on a loaded machine, and the property is "not
+        // waiting for the page", not a stopwatch.
         #expect(await task.value == .cancelled)
-        #expect(ContinuousClock.now - started < .seconds(5))
+        #expect(gate.isWaiting, "the listing is still parked: the caller was not made to wait for it")
         #expect(!browser.isOpen)
         gate.release()
         await drainTasks()
@@ -475,10 +478,18 @@ struct RecordingsSyncRefreshTests {
         list(["a", "b", "c", "d"])
         #expect(await controller.refreshForSync([course], force: true) == .refreshed(newlyPublished: 2, failedKeys: 0))
         #expect(savedSummary()?.newCount == 2)
+        // The acknowledgement that follows a completion is held, so the count is read while `d`
+        // is completed but still unseen: only the completed-not-new rule can exclude it.
+        let hold = FakeRecmanBrowser.Gate()
+        world.historyAcknowledgeGate = hold
         controller.setDone(recording("d"), true)
         await controller.settleWatchProgress()
         await drainTasks()
-        #expect(savedSummary()?.newCount == 1, "a completed lecture is not new")
+        #expect(controller.listing(for: course)?.seenIDs?.contains("d") == false)
+        #expect(savedSummary()?.newCount == 1, "a completed lecture is not new, even before its dot clears")
+        hold.release()
+        await drainTasks()
+        #expect(savedSummary()?.newCount == 1)
         defaults.resetWrites()
         #expect(await controller.refreshForSync([course], force: true) == .refreshed(newlyPublished: 0, failedKeys: 0))
         #expect(summaryWrites == 0, "an unchanged count writes nothing")

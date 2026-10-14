@@ -783,7 +783,7 @@ struct RecordingsListing: Equatable {
     /// are dropped then; the browser closes when the queue has drained (`closesBrowserWhenIdle`).
     private func suspend() {
         guard access != .signingIn else { return }
-        if hasPlayOrRecovery || !backgroundWaiters.isEmpty {
+        if hasPlayOrRecovery || hasBackgroundRequest {
             dropQueuedListings()
             dropQueuedOpenings()
             closesBrowserWhenIdle = true
@@ -792,6 +792,9 @@ struct RecordingsListing: Equatable {
         invalidate()
         closeBrowser()
     }
+
+    /// Whether a sync refresh is still waiting for its courses (`refreshForSync`).
+    private var hasBackgroundRequest: Bool { !backgroundWaiters.isEmpty }
 
     /// Whether a recovery or a Play is queued or running: work for a lecture the student asked
     /// to watch, which closing the window must not cancel (`suspend`).
@@ -1054,6 +1057,8 @@ struct RecordingsListing: Equatable {
                 // results here: only merge the committed IDs into a current matching snapshot.
                 // Opening before the first listing still does not establish a baseline.
                 if self.listings[key]?.seenIDs != nil { self.listings[key]?.seenIDs?.formUnion(added) }
+                // The unseen count of the saved summary (menu line) changes with the dots.
+                if self.listings[key]?.seenIDs != nil { self.refreshWatchSummary(for: key, persist: true) }
                 if self.listings[key]?.historyReadFailed != true, self.listings[key]?.problem == .historyUnavailable { self.listings[key]?.problem = nil }
             } catch {
                 guard self.isCurrentHistory(history, owner: owner, generation: generation) else { return }
@@ -1162,6 +1167,148 @@ struct RecordingsListing: Equatable {
             listings[key]?.problem = nil
         }
         startWorker()
+    }
+
+    // MARK: Sync refresh (listings at every sync)
+
+    /// Refreshes the listings of `keys` in the background, for the follow-up of a sync run, and
+    /// answers when they are done. Listings and seen state only (never a stream, never a window).
+    ///
+    /// - Zero-cost answers, before anything is read or opened: switched off, owner unknown, a
+    ///   sign-in running or needed, no courses; and courses all listed within `freshness` when
+    ///   `force` is false (an automatic run; "Sincronizza ora" passes `force`).
+    /// - No session checked yet this launch: the session file is read once. Without cookies the
+    ///   answer is `.needsSignIn` and no browser was created.
+    /// - The courses are appended after what the page queued (`enqueueBackground`); the page's
+    ///   own queue is never replaced, and its window closing doesn't cancel them (`suspend`).
+    /// - The task's cancellation ends the wait at once: with nothing else needing the browser
+    ///   (`backgroundCancelled`) it stops the worker and closes the browser, otherwise it only
+    ///   drops the courses nobody else wants.
+    ///
+    /// The continuation resumes exactly once, through `resolveBackground`.
+    func refreshForSync(_ keys: Set<RecmanCourseKey>, force: Bool) async -> RecordingsSyncOutcome {
+        guard isEnabled else { return .skipped(.switchedOff) }
+        guard sessionOwner ?? ownerUserID() != nil else { return .skipped(.ownerUnknown) }
+        switch access {
+        case .off: return .skipped(.switchedOff)
+        case .signingIn: return .skipped(.signingIn)
+        case .needsSignIn: return .skipped(.needsSignIn)
+        case .ready: break
+        }
+        guard !keys.isEmpty else { return .skipped(.noCourses) }
+        guard !Task.isCancelled else { return .cancelled }
+        let wanted = keys.filter { $0 == runningKey || needsLoad($0, force: force) }
+            .sorted { ($0.courseCode, $0.academicYear) < ($1.courseCode, $1.academicYear) }
+        // Everything is fresh: nothing to ask, nothing to write.
+        guard !wanted.isEmpty else { return .refreshed(newlyPublished: 0, failedKeys: 0) }
+
+        backgroundWaiterSerial += 1
+        let id = backgroundWaiterSerial
+        let queued = Set(queue.compactMap { job -> RecmanCourseKey? in if case .list(let key) = job { key } else { nil } })
+        backgroundWaiters[id] = BackgroundWaiter(pending: Set(wanted),
+                                                 added: Set(wanted).subtracting(queued).subtracting([runningKey].compactMap { $0 }))
+        // With a page on screen the browser stays for it; otherwise it closes when the queue drains.
+        if visiblePages == 0 { closesBrowserWhenIdle = true }
+        enqueueBackground(wanted)
+        if !hasCheckedInitialSession {
+            let check = beginInitialSessionCheck()
+            Task { [weak self] in
+                guard let self else { return }
+                let cookies = await self.savedCookies()
+                _ = self.answerInitialSessionCheck(check, cookies: cookies)
+            }
+        }
+        return await withTaskCancellationHandler {
+            await withCheckedContinuation { (continuation: CheckedContinuation<RecordingsSyncOutcome, Never>) in
+                if let result = backgroundResults.removeValue(forKey: id) {
+                    continuation.resume(returning: result)
+                } else if backgroundWaiters[id] != nil {
+                    backgroundWaiters[id]?.continuation = continuation
+                } else {
+                    continuation.resume(returning: .cancelled)
+                }
+            }
+        } onCancel: {
+            Task { @MainActor [weak self] in self?.backgroundCancelled(id) }
+        }
+    }
+
+    /// Appends the courses not queued or in flight yet, after everything already queued: the
+    /// page's listings, its openings and any Play keep their place. Unlike `enqueue`, never
+    /// removes anything.
+    private func enqueueBackground(_ keys: [RecmanCourseKey]) {
+        for key in keys where key != runningKey && !queue.contains(.list(key)) {
+            queue.append(.list(key))
+            listings[key, default: RecordingsListing()].isLoading = true
+            listings[key]?.problem = nil
+        }
+        startWorker()
+    }
+
+    /// A course of some waiting refresh finished (listed and recorded, or failed). The waiters
+    /// answer when the worker has saved the session and closed the browser
+    /// (`resolveFinishedBackground`), not here.
+    private func finishBackgroundKey(_ key: RecmanCourseKey, _ result: RecordResult) {
+        for id in Array(backgroundWaiters.keys) {
+            guard backgroundWaiters[id]?.pending.contains(key) == true else { continue }
+            switch result {
+            case .published(let newly):
+                backgroundWaiters[id]?.pending.remove(key)
+                backgroundWaiters[id]?.newlyPublished += newly
+            case .failed:
+                backgroundWaiters[id]?.pending.remove(key)
+                backgroundWaiters[id]?.failedKeys += 1
+            case .stale:
+                // The identity moved on while the history was read: nothing was published.
+                resolveBackground(id, .cancelled)
+            }
+        }
+    }
+
+    /// Answers the waiters whose courses are all done. A course that is neither queued nor in
+    /// flight any more cannot be coming: counted as failed rather than waited for forever.
+    private func resolveFinishedBackground() {
+        for id in Array(backgroundWaiters.keys) {
+            guard var waiter = backgroundWaiters[id] else { continue }
+            waiter.pending = waiter.pending.filter { key in queue.contains(.list(key)) || key == runningKey }
+            let lost = (backgroundWaiters[id]?.pending.count ?? 0) - waiter.pending.count
+            if waiter.pending.isEmpty {
+                resolveBackground(id, .refreshed(newlyPublished: waiter.newlyPublished, failedKeys: waiter.failedKeys + lost))
+            }
+        }
+    }
+
+    /// The only way a waiter ends: removes it first, so its continuation resumes exactly once. A
+    /// result decided before the caller attached its continuation is kept for it.
+    private func resolveBackground(_ id: Int, _ outcome: RecordingsSyncOutcome) {
+        guard let waiter = backgroundWaiters.removeValue(forKey: id) else { return }
+        if let continuation = waiter.continuation {
+            continuation.resume(returning: outcome)
+        } else {
+            backgroundResults[id] = outcome
+        }
+    }
+
+    /// The caller's task was cancelled. Nothing is awaited first, so the answer is immediate.
+    /// - Nothing else needs the browser (no page, no sign-in, no Play or recovery, no other
+    ///   waiter): the whole thing stops, like a window closing used to (`invalidate`), and the
+    ///   browser goes.
+    /// - Otherwise only the courses this refresh added and nobody else wants are dropped; an
+    ///   in-flight listing finishes and is recorded as usual.
+    private func backgroundCancelled(_ id: Int) {
+        guard let waiter = backgroundWaiters[id] else { return }
+        let othersWait = backgroundWaiters.contains { $0.key != id }
+        if visiblePages == 0, access != .signingIn, !hasPlayOrRecovery, !othersWait {
+            invalidate()
+            closeBrowser()
+            resolveBackground(id, .cancelled)
+            return
+        }
+        let wantedByOthers = backgroundWaiters.filter { $0.key != id }.reduce(into: Set<RecmanCourseKey>()) { $0.formUnion($1.value.pending) }
+        let drop = waiter.added.subtracting(wantedByOthers)
+        for key in drop where key != runningKey { listings[key]?.isLoading = false }
+        queue.removeAll { if case .list(let key) = $0 { drop.contains(key) } else { false } }
+        resolveBackground(id, .cancelled)
     }
 
     private func startWorker() {

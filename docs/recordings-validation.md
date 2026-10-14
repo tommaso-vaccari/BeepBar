@@ -125,7 +125,7 @@ Not printed, by construction: any address (even redacted), cookie name or value,
 
 ## PR #154 completion measurement (2026-10-14)
 
-One explicitly authorized live run on Apple M2 / 8 GB, macOS 27.0.1, AC power, low-power mode off. Source checkpoint `092d113` plus the completion changes: the probe explicitly disables listing retry and caps results at three pages. One course, one cycle, no concurrent live probe, interactive login, stream request or video download. The saved probe session was read without rewriting it.
+One explicitly authorized live run on Apple M5 / 32 GB (Mac17,3), macOS 27.0.1, AC power, low-power mode off. Source checkpoint `092d113` plus the completion changes: the probe explicitly disables listing retry and caps results at three pages. One course, one cycle, no concurrent live probe, interactive login, stream request or video download. The saved probe session was read without rewriting it.
 
 | Measurement | Result |
 | --- | --- |
@@ -153,4 +153,25 @@ Source: `092d113` plus the uncommitted completion patch; these checks are not an
 - Naming: 17 focused tests passed; lowercase/hyphenated names are honored, unknown historical slugs retain their existing names.
 - Independent final reviews of player/naming/privacy/docs and controller/sync/auth/notification fixes found no remaining P0/P1/P2. Core progress/store/reset and status-item paths were also reviewed during completion. Reviews are static and the live evidence remains the single bounded run above.
 
-Pending: publish on a committed source revision, the 1,000-row UI benchmark on that revision, final exact-commit suite/build, and the PR's manual appearance/VoiceOver/menu-wake/Now Playing/display-sleep/notification checks. Issue #162 remains open for its manual gate. The requested iterative dev-to-main review follows an eventual dev merge; no release or installed-app replacement is authorized here.
+Pending: final exact-commit suite/build and publication, plus the PR's manual appearance/VoiceOver/menu-wake/Now Playing/display-sleep/notification checks. Issue #162 remains open for its manual gate. The requested iterative dev-to-main review follows an eventual dev merge; no release or installed-app replacement is authorized here.
+
+## Committed-source UI benchmark (PR #154, 2026-10-14)
+
+Source: `1f413dbc4bd6fad6668d501b9cda9981966962ba`; the subsequent evidence update changes documentation only. Apple M5 / 32 GB (`Mac17,3`), arm64, macOS 27.0.1, AC power. Every sample reports low-power mode off and nominal thermal state. Command: `python3 scripts/ui-benchmark.py --out work/pr154-ui-recordings-1000 --ref 1f413db --runs 5 --warmup 1 --scenarios recordings-1000 --dependency-cache .build`.
+
+The isolated Release fixture is compiled with DEBUG dependency-injection seams and disabled controls, and uses 100 synthetic courses and 1,000 recordings, one warm-up and five measured fresh-process samples. No production scheduler, login, notifications, updater or Polimi requests. The series and all required Time Profiler/signpost exports are valid.
+
+| Sample | Window key (ms) | First recording content (ms) | Footprint after close (MiB) |
+| --- | --- | --- | --- |
+| 1 | 105.010 | 191.976 | 53.048 |
+| 2 | 95.474 | 184.663 | 52.595 |
+| 3 | 92.497 | 185.877 | 52.860 |
+| 4 | 88.556 | 181.867 | 53.063 |
+| 5 | 97.257 | 189.969 | 53.173 |
+| Median | 95.474 | 185.877 | 53.048 |
+
+All window-key samples satisfy the 250 ms first-window target. Content is SwiftUI `onAppear`, not compositor presentation. Five samples do not establish a reliable p95, scrolling smoothness, every 16 ms stall, production launch, repeated-cycle memory or a gain against dev/main; those comparisons are unmeasured. The 30-minute idle scenario was not run. Raw reports and traces are retained locally in `PerformanceReports/pr154-ui-recordings-1000` (moved from the command’s output directory after validation) for independent inspection.
+
+Independent trace inspection checked successful fixture identity and main-thread stacks in all five exports, plus four required UI signposts per run. The open-to-content interval contains 740 main-thread CPU samples in total: 552 include AppKit layout frames, 426 AttributeGraph update frames, 255 `ConfigurationWindow.makeWindow`, 54 Recordings frames and three watch-progress frames. These are overlapping inclusive stack counts, not elapsed CPU time or exclusive percentages. Layout/runtime work dominates the sampled stacks; the trace does not establish smooth scrolling or rule out unsampled stalls.
+
+Toolchain: Xcode 27.0; Build version 27A266a. Instruments: xctrace version 27.0 (27A266a). Driver SHA-256: `d604e575cfd2a4a4092fd90e5720b6981f36c3d0e9643d4229f5a82a11cd6570`; fixture binary SHA-256: `e91d125ad35200241fae321ac0308b3c97bdaea9ca2cd5670e9b051ca02052e0`.

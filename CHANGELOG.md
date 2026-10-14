@@ -13,6 +13,7 @@
 
 ### Improved
 
+- Your Mac no longer goes to standby or turns off the screen while you watch a recording; it behaves normally again as soon as you pause or close the player.
 - In Recordings, a course whose folder you renamed shows the folder name followed by the part in parentheses at the end of its WeBeep name, usually the teacher (for example “GAL (Claude Sonnet)”), and an orange dot marks the courses with saved progress that still have lectures to watch. The menu bar’s Recordings lines show the same folder name, without that part.
 - Opening BeepBar shows your courses straight away, as they were at the last successful refresh, while the current list loads in the background; offline, the saved list stays visible and says it is not yet confirmed. Every sync still asks your university for the current list first. The very first opening after updating still waits for the list once.
 - Cancelling sync stops large local file checks promptly while file changes already underway still finish safely.

@@ -298,6 +298,10 @@ enum RecordingPlayerError: Error {
     private let progressInterval: CMTime
     private let nowPlaying: NowPlayingPublishing
     private let artworkLoader: RecordingArtwork.Loader?
+    /// Keeps the display awake while, and only while, `timeControlStatus` is `.playing`
+    /// (`PlaybackSleepGuard`). Invariant: every path that pauses, replaces, fails or closes ends
+    /// in `removeItemObservers()` or `fail`, which release it; its `deinit` covers the controller.
+    private let sleepGuard: PlaybackSleepGuard
 
     /// How often, in media time, `onProgress` reports while playing. Thirty seconds of lecture
     /// keeps the window's progress bar moving visibly (a lecture lasts 1-2 hours, so a step is
@@ -352,7 +356,9 @@ enum RecordingPlayerError: Error {
          toggleFullScreen: @escaping @MainActor (NSWindow) -> Void = { $0.toggleFullScreen(nil) },
          progressInterval: TimeInterval = RecordingPlayerController.progressInterval,
          nowPlaying: NowPlayingPublishing = SystemNowPlaying(),
-         artworkLoader: RecordingArtwork.Loader? = nil) {
+         artworkLoader: RecordingArtwork.Loader? = nil,
+         sleepGuard: PlaybackSleepGuard = PlaybackSleepGuard()) {
+        self.sleepGuard = sleepGuard
         self.progressInterval = CMTime(seconds: progressInterval, preferredTimescale: 600)
         self.nowPlaying = nowPlaying
         self.artworkLoader = artworkLoader
@@ -481,6 +487,9 @@ enum RecordingPlayerError: Error {
         updateProgressObserver(generation: observedGeneration)
         // Title and course now, before the stream has loaded a byte.
         publishNowPlaying()
+        // Released by `removeItemObservers` above; a player that kept moving across the
+        // replacement gets no status report, so take it again from the current status.
+        sleepGuard.update(isPlaying: player.timeControlStatus == .playing)
         if let window { present(window) }
     }
 
@@ -564,6 +573,7 @@ enum RecordingPlayerError: Error {
             playWhenSettled = false
             // No clock on a failed stream, even before the pause's KVO lands.
             removeProgressObserver()
+            sleepGuard.update(isPlaying: false)
             let position = reportedPosition(of: player)
             checkpointIfMeaningful(.failed)
             // Domain and code only (`PlaybackDiagnostics.errorName`): the error's user info can
@@ -807,6 +817,8 @@ enum RecordingPlayerError: Error {
         } else {
             checkpointedSincePlaying = false
         }
+        // Only `.playing` keeps the display awake: not paused, not stalled waiting for data.
+        sleepGuard.update(isPlaying: player.timeControlStatus == .playing)
         updateProgressObserver(generation: observed)
         publishNowPlaying()
     }
@@ -1172,6 +1184,7 @@ enum RecordingPlayerError: Error {
     /// every replacement and, through `stopPlayback`, on close.
     private func removeItemObservers() {
         removeProgressObserver()
+        sleepGuard.update(isPlaying: false)
         statusObservation?.invalidate()
         statusObservation = nil
         timeControlObservation?.invalidate()

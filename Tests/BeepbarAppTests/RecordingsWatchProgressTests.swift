@@ -304,6 +304,33 @@ struct RecordingsWatchProgressTests {
         controller.turnOff()
     }
 
+    /// A bulk untick that fails midway leaves the first row unticked and the second still done,
+    /// so the label follows the saved state back to "Mark all as completed", as the spec says.
+    /// Guards a label stuck on "unseen" (or computed from what was requested) after a failure.
+    @Test func bulkUntickFailureLabelFollowsSavedState() async throws {
+        defer { cleanUp() }
+        let controller = await listedController()
+        controller.toggleAllDone(course)
+        await controller.settleWatchProgress()
+        #expect(bulkAction(controller).allDone)
+        let gate = FakeRecmanBrowser.Gate()
+        gates.before = gate
+        gates.holdCall = gates.calls + 2
+        controller.toggleAllDone(course)
+        await settle("second untick held") { gate.isWaiting }
+        fault.isFailing = true
+        gate.release()
+        await controller.settleWatchProgress()
+        fault.isFailing = false
+        #expect(controller.watchProgress.entries.values.filter(\.isCompleted).count == 1)
+        #expect(controller.listing(for: course)?.problem == .historyUnavailable)
+        let action = bulkAction(controller)
+        #expect(!action.allDone)
+        #expect(action.enabled)
+        #expect(action.label.english == "Mark all as completed")
+        controller.turnOff()
+    }
+
     /// Unchecking every row resets a crossing at click time and preserves furthest/resume
     /// positions; closing the player behind the queued batch cannot complete it again.
     /// Mutations: skip resetting live crossings or untick epochs in the bulk action.

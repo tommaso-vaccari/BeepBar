@@ -448,13 +448,26 @@ struct RecordingPlayerControllerTests {
         #expect((options[AVURLAssetHTTPCookiesKey] as? [HTTPCookie]) == [cookie])
     }
 
-    /// The runtime loader really produces an `AVPlayerView` with floating (QuickTime-like)
-    /// controls that accepts a player. Guards against a wrong path, class name or key silently
-    /// turning every Play into a browser fallback.
-    @Test func theRuntimeLoaderBuildsAFloatingPlayerView() throws {
+    /// The runtime loader really produces an `AVPlayerView` that accepts a player, and the
+    /// controls configuration really reaches it: inline style and every optional button off.
+    /// A fresh view reports AVKit's default style, which the header defines as Inline, so this
+    /// also pins `inlineControlsStyle` to the number AVKit means by it (the enum cannot be named
+    /// without importing AVKit). Guards against a wrong path, class name or key silently turning
+    /// every Play into a browser fallback, and against a wrong number bringing back the floating
+    /// panel (or hiding the controls).
+    @Test func theRuntimeLoaderBuildsAnInlinePlayerView() throws {
         let view = try #require(AVKitLoader.makePlayerView())
         #expect(NSStringFromClass(type(of: view)) == "AVPlayerView")
-        #expect(view.value(forKey: "controlsStyle") as? Int == AVKitLoader.floatingControlsStyle)
+        #expect(view.value(forKey: "controlsStyle") as? Int == AVKitLoader.inlineControlsStyle, "AVPlayerViewControlsStyleDefault is Inline")
+        view.setValue(AVKitLoader.floatingControlsStyle, forKey: "controlsStyle")
+        view.setValue(true, forKey: "showsFrameSteppingButtons")
+        view.setValue(true, forKey: "showsSharingServiceButton")
+        view.setValue(true, forKey: "showsFullScreenToggleButton")
+        AVKitLoader.configureControls(of: view)
+        #expect(view.value(forKey: "controlsStyle") as? Int == AVKitLoader.inlineControlsStyle)
+        for key in ["showsFrameSteppingButtons", "showsSharingServiceButton", "showsFullScreenToggleButton", "showsTimecodes", "allowsMagnification"] {
+            #expect(view.value(forKey: key) as? Bool == false, "\(key)")
+        }
         let player = AVPlayer()
         view.setValue(player, forKey: "player")
         #expect(Self.player(of: view) === player)

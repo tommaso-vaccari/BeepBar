@@ -348,11 +348,13 @@ struct PlayerGestureTracker: Equatable, Sendable {
 ///
 /// `AVPlayerView` is loaded at runtime (`AVKitLoader`) and its subviews are private, so nothing
 /// here names an AVKit class. The video is recognised by what it displays: the view whose layer
-/// holds the `AVPlayerLayer` (an AVFoundation class, linked normally). The floating controls
-/// live on a different branch of the view tree, so a point is over the video when the view
+/// holds the `AVPlayerLayer` (an AVFoundation class, linked normally). The controls live on a
+/// different branch of the view tree, so a point is over the video when the view
 /// AppKit would hand the event to is that view, one of its descendants (Live Text overlays), or
 /// one of its ancestors (containers hit only where nothing else is). Verified on macOS 27: the
-/// play button, scrubber, volume slider and the panel's background are all on the other branch.
+/// play button, scrubber, volume slider and the panel's background are all on the other branch,
+/// with the floating panel and with the inline bar the player uses now (its bottom bar and its
+/// two top-corner pills sit in the same sibling container as the floating panel did).
 enum PlayerVideoViews {
     /// The view displaying the video in `playerView`, nil when there is none (no player yet, or a
     /// test view without one).

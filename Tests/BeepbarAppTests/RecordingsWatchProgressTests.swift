@@ -10,6 +10,9 @@ import BeepbarCore
 @MainActor final class ProgressGates {
     var before: FakeRecmanBrowser.Gate?
     var after: FakeRecmanBrowser.Gate?
+    /// Holds every `acknowledge` (the "new" dots being saved), so a test can choose the storage
+    /// state that acknowledgement meets instead of racing it.
+    var acknowledge: FakeRecmanBrowser.Gate?
     var holdCall: Int?
     private(set) var calls = 0
     func waitBefore() async {
@@ -18,6 +21,7 @@ import BeepbarCore
         await before?.wait()
     }
     func waitAfter() async { await after?.wait() }
+    func waitAcknowledge() async { await acknowledge?.wait() }
 }
 
 /// Makes the history folder unreachable while set: every store operation started meanwhile
@@ -67,7 +71,7 @@ struct RecordingsWatchProgressTests {
                     if fault.isFailing { throw CocoaError(.fileWriteNoPermission) }
                     return folder
                 }, namespace: namespace, removeFile: { try FileManager.default.removeItem(at: $0) }, probe: probe)
-                let history = RecordingsSeenHistory(store: storage, afterRead: { await world.waitAfterHistoryRead() }, beforeProgress: { await gates.waitBefore() }, afterProgress: { await gates.waitAfter() })
+                let history = RecordingsSeenHistory(store: storage, beforeAcknowledge: { await gates.waitAcknowledge() }, afterRead: { await world.waitAfterHistoryRead() }, beforeProgress: { await gates.waitBefore() }, afterProgress: { await gates.waitAfter() })
                 world.historyActors.append(history)
                 return history
             },
@@ -267,26 +271,34 @@ struct RecordingsWatchProgressTests {
         controller.turnOff()
     }
 
-    /// Partial commits remain real; their acknowledgement cannot erase a later failed save's
-    /// banner. Mutation: let acknowledgement success clear the bulk failure banner.
+    /// Partial commits remain real, and their acknowledgement succeeding afterwards cannot erase
+    /// the banner of the save that failed later in the same batch. Two new rows guarantee that a
+    /// new row is among the committed ones whatever the listing order, so an acknowledgement
+    /// really runs; its gate makes it run with storage healthy again, after the failure.
+    /// Mutation: drop `preserveHistoryProblem` (the acknowledgement clears the banner).
     @Test func bulkPartialFailureKeepsCommittedRowsAndError() async throws {
         defer { cleanUp() }
         let controller = await listedController(["a"])
-        browser.listResults[course.courseCode] = .success([recording("a"), recording("b", daysAgo: 0)])
+        browser.listResults[course.courseCode] = .success([recording("a"), recording("b", daysAgo: 0), recording("c", daysAgo: 0)])
         controller.refresh([course], selected: course, force: true)
-        await settle("new row listed") { controller.newCount(for: course) == 1 }
+        await settle("new rows listed") { controller.newCount(for: course) == 2 }
         let gate = FakeRecmanBrowser.Gate()
         gates.before = gate
-        gates.holdCall = 2
+        gates.holdCall = 3
+        let acknowledge = FakeRecmanBrowser.Gate()
+        gates.acknowledge = acknowledge
         controller.toggleAllDone(course)
-        await settle("second bulk save held") { gate.isWaiting }
+        await settle("third bulk save held") { gate.isWaiting }
         fault.isFailing = true
         gate.release()
         await controller.settleWatchProgress()
+        await settle("acknowledgement queued") { acknowledge.isWaiting }
         fault.isFailing = false
+        acknowledge.release()
+        await settle("committed new row acknowledged") { controller.newCount(for: course) == 1 }
         await drainTasks()
-        #expect(controller.watchProgress.entries.values.filter(\.isCompleted).count == 1)
-        #expect(controller.watchSummaries[course]?.done == 1)
+        #expect(controller.watchProgress.entries.values.filter(\.isCompleted).count == 2)
+        #expect(controller.watchSummaries[course]?.done == 2)
         #expect(controller.listing(for: course)?.problem == .historyUnavailable)
         #expect(controller.watchProgress.pending.isEmpty)
         controller.turnOff()
@@ -320,6 +332,36 @@ struct RecordingsWatchProgressTests {
         #expect(controller.newCount(for: course) == 0)
         let resume = try #require(defaults.data(forKey: RecordingsController.resumePointsKey))
         #expect(try PropertyListDecoder().decode(RecordingResumePoints.self, from: resume).position(for: identity("a")) == 5_700)
+        controller.turnOff()
+    }
+
+    /// The bulk un-tick counts as a later un-tick for a close whose save failed before it: when
+    /// that close is retried, it must not complete the lecture again. Same scenario as
+    /// `aRetriedCloseCannotUndoALaterUnTick`, through the bulk command.
+    /// Mutation: skip the `untickCounts` bump in `toggleAllDone` (the retry completes "a").
+    @Test func bulkUntickWinsOverAnEarlierFailedClose() async throws {
+        defer { cleanUp() }
+        let controller = await listedController()
+        await play("a", on: controller)
+        world.player.tick(at: 5_700)
+        fault.isFailing = true
+        world.player.close()
+        await controller.settleWatchProgress()
+        fault.isFailing = false
+        controller.toggleAllDone(course)
+        await controller.settleWatchProgress()
+        #expect(bulkAction(controller).allDone)
+        controller.toggleAllDone(course)
+        await controller.settleWatchProgress()
+        #expect(try storedEntry("a")?.completed == nil)
+
+        await play("b", on: controller)
+        world.player.pause(at: 600)
+        await controller.settleWatchProgress()
+        let entry = try #require(try storedEntry("a"))
+        #expect(entry.completed == nil, "the old close was retried without its crossing")
+        #expect(entry.autoCompletionBlocked)
+        #expect(!controller.watchProgress.isCompleted(recording("a")))
         controller.turnOff()
     }
 

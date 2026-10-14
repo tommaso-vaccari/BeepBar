@@ -186,11 +186,13 @@ enum RecordingsPresentation {
         }
 
         /// Uses the whole loaded listing, never search results; unknown or pending entries
-        /// cannot authorize a bulk change. The label follows committed entries only.
+        /// cannot authorize a bulk change. The label follows committed entries only. A course
+        /// with a bulk save in flight is covered through `row(for:)`, which counts every row of a
+        /// `pendingCourses` course as pending, also rows a refresh added meanwhile.
         func bulkAction(for key: RecmanCourseKey, recordings: [RecmanRecording]?) -> BulkAction {
             guard let recordings, !recordings.isEmpty else { return BulkAction(allDone: false, enabled: false) }
             var allDone = true
-            var enabled = canEdit && !pendingCourses.contains(key)
+            var enabled = canEdit
             for recording in recordings {
                 let value = row(for: recording)
                 allDone = allDone && value.known && value.completed

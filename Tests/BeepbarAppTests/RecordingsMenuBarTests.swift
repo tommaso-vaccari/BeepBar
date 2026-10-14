@@ -676,9 +676,10 @@ struct RecordingsMenuBarTests {
             RecordingMenuLine(title: "FISICA — 10/10 · tutte fatte", toolTip: nil, target: nil),
         ]), into: menu, target: status)
         menu.update()
-        #expect(menu.items[4].isSectionHeader)
-        let clickable = menu.items[5]
-        let grey = menu.items[6]
+        // status, detail, Sync now, Open, separator, header, then the lines.
+        #expect(menu.items[5].isSectionHeader)
+        let clickable = menu.items[6]
+        let grey = menu.items[7]
         #expect(clickable.target === status)
         #expect(clickable.action == NSSelectorFromString("playRecording:"))
         #expect(clickable.representedObject as? RecordingMenuTarget == payload)

@@ -254,18 +254,10 @@ struct RecordingsListing: Equatable {
     private var resumePoints: RecordingResumePoints?
     /// A recovery ran with no Recordings page on screen: the browser it opened closes after it.
     private var closesBrowserWhenIdle = false
-    /// A recovery job is executing (it has left the queue).
-    private var runningRecovery = false
-    /// A Play job is executing (it has left the queue): with `runningRecovery`, what `suspend`
-    /// must not cancel (`hasPlayOrRecovery`).
-    ///
-    /// Known limitation: neither flag is scoped to `generation`. Both are reset by their
-    /// `defer` when the job's `await` returns, so after an `invalidate` (turn-off, sign-in) an
-    /// old worker still parked in that job can keep a flag set until its answer arrives; a
-    /// `suspend` meanwhile then takes the exemption branch (drops queued listings, keeps the
-    /// browser until the next drain) instead of closing the browser at once. Harmless to data,
-    /// and short-lived; scoping them would need the worker's generation here.
-    private var runningPlay = false
+    /// The generation of a recovery or Play executing outside the queue. An invalidated
+    /// worker must neither keep the browser alive nor clear a newer worker's running state.
+    private var runningRecoveryGeneration: Int?
+    private var runningPlayGeneration: Int?
 
     // MARK: Menu bar Play state
 
@@ -808,7 +800,7 @@ struct RecordingsListing: Equatable {
     /// Whether a recovery or a Play is queued or running: work for a lecture the student asked
     /// to watch, which closing the window must not cancel (`suspend`).
     private var hasPlayOrRecovery: Bool {
-        runningRecovery || runningPlay || queue.contains { job in
+        runningRecoveryGeneration == generation || runningPlayGeneration == generation || queue.contains { job in
             switch job {
             case .recover, .open(_, .play, _): true
             case .list, .open: false
@@ -1316,7 +1308,8 @@ struct RecordingsListing: Equatable {
             return
         }
         let wantedByOthers = backgroundWaiters.filter { $0.key != id }.reduce(into: Set<RecmanCourseKey>()) { $0.formUnion($1.value.pending) }
-        let drop = waiter.added.subtracting(wantedByOthers)
+        let wantedByPage = visiblePages > 0 ? Set(pageKeys) : []
+        let drop = waiter.added.subtracting(wantedByOthers).subtracting(wantedByPage)
         for key in drop where key != runningKey { listings[key]?.isLoading = false }
         queue.removeAll { if case .list(let key) = $0 { drop.contains(key) } else { false } }
         resolveBackground(id, .cancelled)
@@ -1363,15 +1356,15 @@ struct RecordingsListing: Equatable {
                     playbackURLs[recording.id] = url
                     if request == openingRequest { finishOpening(recording, url: url, action: .browser) }
                 case .open(let recording, .play, let request):
-                    runningPlay = true
-                    defer { runningPlay = false }
+                    runningPlayGeneration = generation
+                    defer { if runningPlayGeneration == generation { runningPlayGeneration = nil } }
                     try await playNatively(recording, request: request, browser: browser, generation: generation)
                     guard generation == self.generation else { return }
                     // Reached the player or the browser fallback: no longer the menu's to report.
                     if menuPlay?.request == request { menuPlay = nil }
                 case .recover(let recording, let recovery):
-                    runningRecovery = true
-                    defer { runningRecovery = false }
+                    runningRecoveryGeneration = generation
+                    defer { if runningRecoveryGeneration == generation { runningRecoveryGeneration = nil } }
                     try await recoverPlayback(recording, recovery, browser: browser, generation: generation)
                     guard generation == self.generation else { return }
                 }
@@ -2053,11 +2046,30 @@ struct RecordingsListing: Equatable {
         watchSummaries = updated
     }
 
-    /// What `watchSummaryKey` holds: one account's summaries, by "code-year". Numbers only, so the
-    /// menu rebuilds its text in the current language.
+    /// What `watchSummaryKey` holds: one account's counts and minimal next-lecture targets,
+    /// by "code-year". The menu rebuilds its text in the current language.
     struct StoredWatchSummaries: Codable, Equatable {
         let owner: Int
         let courses: [String: CourseWatchSummary]
+
+        private enum CodingKeys: String, CodingKey { case owner, courses }
+
+        init(owner: Int, courses: [String: CourseWatchSummary]) {
+            self.owner = owner
+            self.courses = courses
+        }
+
+        init(from decoder: Decoder) throws {
+            let values = try decoder.container(keyedBy: CodingKeys.self)
+            owner = try values.decode(Int.self, forKey: .owner)
+            courses = try values.decode([String: StoredCourseWatchSummary].self, forKey: .courses).mapValues(\.summary)
+        }
+
+        func encode(to encoder: Encoder) throws {
+            var values = encoder.container(keyedBy: CodingKeys.self)
+            try values.encode(owner, forKey: .owner)
+            try values.encode(courses.mapValues { StoredCourseWatchSummary($0) }, forKey: .courses)
+        }
     }
 
     /// The saved summaries of `owner`, or nil when there are none, they are unreadable, or they

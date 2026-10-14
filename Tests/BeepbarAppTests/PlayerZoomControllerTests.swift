@@ -156,6 +156,32 @@ struct PlayerZoomControllerTests {
         controller.close()
     }
 
+    @Test func oldWindowInputsCannotControlAReopenedWindow() async throws {
+        let controller = makeController()
+        try await playReady(controller, id: "first")
+        let (oldWindow, _) = try parts(controller)
+        let oldShortcut = try #require(oldWindow.shortcutHandler)
+        let oldZoom = try #require(oldWindow.zoomHandler)
+        let oldSpeed = try #require(controller.speedPopUp?.menu?.items.first {
+            ($0.representedObject as? NSNumber)?.floatValue == 1.5
+        }?.target as? PlayerMenuAction)
+        controller.close()
+        try await playReady(controller, id: "second")
+
+        oldShortcut(.zoomIn)
+        oldZoom(.magnify(0.5, at: CGPoint(x: 480, y: 300)))
+        #expect(controller.zoom == .fit)
+        oldShortcut(.togglePlayPause)
+        #expect(controller.player?.rate != 0)
+        oldSpeed.invoke(nil)
+        await Self.drainHops()
+        #expect(controller.preferredSpeed == 1)
+        let (newWindow, _) = try parts(controller)
+        newWindow.shortcutHandler?(.zoomIn)
+        #expect(controller.zoom.scale == 1.5)
+        controller.close()
+    }
+
     /// A pinch begun over a control does nothing, for its whole length, even when it moves onto
     /// the video; one begun over the video zooms around the fingers: the video point under them
     /// stays there, in the model and on screen. Guards "a pinch over the controls does nothing"

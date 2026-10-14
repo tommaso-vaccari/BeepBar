@@ -99,7 +99,7 @@ In a disposable source copy, removing fresh-cookie retry, service-error classifi
 
 ## How to run the live sync measurement
 
-`scripts/recman-probe.sh sync` measures one background refresh the way the app does it at a sync: one entry into the archive from the saved probe session (`RecmanWebSession.recordings(for:)` enters in the background on its first call), then each requested course listed in turn. It is the evidence step of the Recordings cost model; **it contacts Polimi with the owner's saved session, so it runs only on the owner's explicit go, never by an agent or in CI.**
+`scripts/recman-probe.sh sync` measures one background refresh the way the app does it at a sync: one entry into the archive from the saved probe session (`RecmanWebSession.recordings(for:)` enters in the background on its first call), then each requested course listed in turn. The probe disables the app's retry and stops before fetching a fourth results page; the app retains its normal retry and pagination limits. It is the evidence step of the Recordings cost model; **it contacts Polimi with the owner's saved session, so it runs only on the owner's explicit go, including an authorized agent, never automatically or in CI.**
 
 ```
 scripts/recman-probe.sh warm 058167 2026                      # once, if there is no saved session yet (cold signs in by hand)
@@ -113,11 +113,44 @@ Course codes are 6 digits and years 4 digits; anything else prints the usage and
 
 What the lines mean:
 
-- `ENTRY`: time, finished page loads and failed loads for the background entry, number of entries (more than 1 means the session lapsed mid-run and the app's retry fired), and the navigator's outcome.
+- `ENTRY`: time, finished page loads and failed loads for the background entry, number of entries (the probe makes no retry), and the navigator's outcome.
 - `COURSE n`: listing time with the entry subtracted, page loads, result pages read, recordings found (a count), whether the listing was complete, and whether the entry happened inside this course's call (normally only course 1).
 - `TOTAL`: web session opened to last listing.
 - `MEMORY`: resident size of the WebKit helper processes (WebContent, Networking, GPU) started by the run, before, at peak (sampled every 250 ms) and after closing the web view plus a 2 s settle. Helpers are XPC services, not children, so they are identified as "appeared after the run began and answer to the same responsible process as the probe"; helpers that already existed are not counted. Run it with no other WebKit app starting at the same time. A helper or two may still be alive after the settle: that is WebKit's own lingering and is part of the answer.
-- `COOKIES`: whether the session cookie fingerprint (value and expiry hashed, never printed) differs between the start and the end, using the same rule as `RecmanSessionVault`. `yes` means every sync would rewrite the session file; the counts say whether values or only expiries moved.
+- `COOKIES`: whether the session cookie fingerprint (value and expiry hashed, never printed) differs between the start and the end, using the same rule as `RecmanSessionVault`. `yes` means this run changed the fingerprint and a save of this snapshot would rewrite the session file; the counts say whether values or only expiries moved.
 - `SIGN-IN`: whether the entry needed the user. The mode never shows a window and never types; it reports `needs-sign-in` instead.
 
 Not printed, by construction: any address (even redacted), cookie name or value, ticket, title, course code or e-mail. Courses are numbered, and every line passes a guard that withholds anything URL-, mail- or ticket-shaped. Not measurable from WKWebView: bytes received and sub-resource requests (printed as `n/a`); "page loads" are finished main-frame loads only. The saved session is read, never rewritten, so the run can be repeated.
+
+
+## PR #154 completion measurement (2026-10-14)
+
+One explicitly authorized live run on Apple M2 / 8 GB, macOS 27.0.1, AC power, low-power mode off. Source checkpoint `092d113` plus the completion changes: the probe explicitly disables listing retry and caps results at three pages. One course, one cycle, no concurrent live probe, interactive login, stream request or video download. The saved probe session was read without rewriting it.
+
+| Measurement | Result |
+| --- | --- |
+| Background entry | 1,947 ms; 2 completed main-frame loads, 0 load failures |
+| Listing, entry excluded | 432 ms; 1 main-frame load, 1 results page, 5 recordings, complete |
+| Total, open to listing complete | 2,487 ms |
+| WebKit helper RSS before / sampled peak / after close + 2 s | 0 / 247.6 / 29.4 MB; 0 / 3 / 1 processes |
+| Session cookie fingerprint | Unchanged; 12 before and after, no added, removed or changed values/expiries |
+| User interaction | None; sign-in not needed and no window requested |
+| All HTTP requests / bytes | Not observable; `n/a` |
+
+The helper-process identification is a sampling estimate, excluding helpers already present. A sandbox-extension diagnostic occurred but the listing completed. This single small course does not establish multi-course scaling, repeated-cycle memory, expired-session behavior, idle wakeups or an app-wide performance gain. No further live request was made for this completion pass.
+
+The completion review also reproduced a materials-follow-up race with delayed notification delivery: two completed runs could lose their follow-ups, and changing the root while delivery waited could start the old run's follow-up for the new root. Two deterministic regressions failed with four assertion failures before the fix. Run endings now retain their operation ID and context generation, are consumed separately, and are discarded when the context changes. The focused follow-up, finalization and redraw checks passed 44 tests in four suites after the fix, using synthetic services only.
+
+## Final local completion validation (PR #154, 2026-10-14)
+
+Source: `092d113` plus the uncommitted completion patch; these checks are not an exact-commit publication gate yet.
+
+- Full `swift test --disable-sandbox`: 614 Core, 31 benchmark, 758 app Swift Testing and 14 app XCTest tests passed (1,417 total).
+- Unsigned CI-style Release build succeeded; `otool -L` confirms neither AVKit nor MediaPlayer is linked.
+- Isolated `scripts/quit-probe.sh`: both legacy modes hang as expected, corrected menu and external quit exit. No installed-app verification was performed.
+- Privacy regression: restoring full-row persistence produced two assertion failures; restoring the minimal target passed. Legacy input and older-reader counters are covered.
+- Window-lifetime mutation: removing the four window guards produced six assertions across two tests; restored guards passed both.
+- Naming: 17 focused tests passed; lowercase/hyphenated names are honored, unknown historical slugs retain their existing names.
+- Independent final reviews of player/naming/privacy/docs and controller/sync/auth/notification fixes found no remaining P0/P1/P2. Core progress/store/reset and status-item paths were also reviewed during completion. Reviews are static and the live evidence remains the single bounded run above.
+
+Pending: publish on a committed source revision, the 1,000-row UI benchmark on that revision, final exact-commit suite/build, and the PR's manual appearance/VoiceOver/menu-wake/Now Playing/display-sleep/notification checks. Issue #162 remains open for its manual gate. The requested iterative dev-to-main review follows an eventual dev merge; no release or installed-app replacement is authorized here.

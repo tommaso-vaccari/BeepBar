@@ -200,12 +200,15 @@ struct RecmanStreamFailure: Error {
         try await enterInBackground(operation: operation)
     }
 
+    var listingAttempts = 2
+    var listingPageLimit = RecmanArchiveListing.maximumPages
+
     func recordings(for key: RecmanCourseKey) async throws -> [RecmanRecording] {
         let operation = beginOperation()
         // A second attempt starts over from a fresh entry: the Recman session can lapse between
         // two uses even when the single sign-on is still alive, and the archive then answers a
         // search with its start page or a sign-in redirect.
-        for attempt in 1...2 {
+        for attempt in 1...max(1, listingAttempts) {
             if attempt == 2 {
                 trace("search left the archive: starting over")
                 try await enterInBackground(operation: operation)
@@ -214,7 +217,7 @@ struct RecmanStreamFailure: Error {
             }
             do {
                 return try await search(key, operation: operation)
-            } catch is LeftTheSearch where attempt == 1 {
+            } catch is LeftTheSearch where attempt < listingAttempts {
                 continue
             } catch is LeftTheSearch {
                 throw RecmanBrowserError.unrecognized
@@ -643,6 +646,7 @@ struct RecmanStreamFailure: Error {
         default: throw RecmanBrowserError.unrecognized
         }
         var listing = RecmanArchiveListing(key: key)
+        var pages = 0
         while true {
             guard try await isOnArchive(operation: operation) else { throw LeftTheSearch() }
             let page: RecmanResultsPage
@@ -662,7 +666,9 @@ struct RecmanStreamFailure: Error {
             } catch {
                 throw RecmanBrowserError.incomplete
             }
+            pages += 1
             guard more else { return listing.recordings }
+            guard pages < listingPageLimit else { throw RecmanBrowserError.incomplete }
             guard try await submit(RecmanScripts.nextPage, operation: operation) == "submitted" else { throw RecmanBrowserError.incomplete }
         }
     }

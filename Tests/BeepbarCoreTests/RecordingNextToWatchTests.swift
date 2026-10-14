@@ -21,6 +21,35 @@ struct RecordingNextToWatchTests {
 
     // MARK: Choice
 
+    @Test func menuPersistenceKeepsOnlyPlaybackFields() throws {
+        let row = RecmanRecording(id: "lecture_1", courseCode: "058167", academicYear: 2026,
+                                 title: "Lecture", recordedAt: Date(), kind: "Lezione", duration: "90 min", size: "400 MB",
+                                 previewURL: URL(string: "https://onlineservices.polimi.it\(RecmanURLPolicy.archivePath)?evn_preview_link&transfer_id=lecture_1&ticket=secret")!)
+        let summary = CourseWatchSummary(done: 1, total: 2, remainingMinutes: 90, unknownDurationCount: 0, next: row, newCount: 1)
+        let data = try PropertyListEncoder().encode(StoredCourseWatchSummary(summary))
+        let object = try #require(PropertyListSerialization.propertyList(from: data, format: nil) as? [String: Any])
+        let target = try #require(object["next"] as? [String: Any])
+        #expect(target.keys.sorted() == ["academicYear", "courseCode", "duration", "id", "title"])
+        let decoded = try PropertyListDecoder().decode(StoredCourseWatchSummary.self, from: data).summary
+        let next = try #require(decoded.next)
+        #expect(next.id == row.id && next.title == row.title && next.duration == row.duration)
+        #expect(next.courseCode == row.courseCode && next.academicYear == row.academicYear)
+        #expect(RecmanURLPolicy.previewTransferID(next.previewURL) == row.id)
+        #expect(!next.previewURL.absoluteString.contains("secret"))
+        #expect(next.size == nil && next.kind.isEmpty && next.recordedAt == Date(timeIntervalSince1970: 0))
+        #expect(decoded.done == 1 && decoded.newCount == 1)
+        let legacy = try PropertyListDecoder().decode(StoredCourseWatchSummary.self, from: PropertyListEncoder().encode(summary)).summary
+        #expect(legacy == decoded)
+        #expect(try PropertyListDecoder().decode(OldSummary.self, from: data) == OldSummary(done: 1, total: 2, remainingMinutes: 90, unknownDurationCount: 0))
+        let oldReader = try PropertyListDecoder().decode(CourseWatchSummary.self, from: data)
+        #expect(oldReader.next == nil && oldReader.done == 1 && oldReader.newCount == 1)
+        for malformed in [#"{"id":"a","title":"x"}"#, #"{"id":"a?ticket=secret","courseCode":"058167","academicYear":2026,"title":"x","duration":"90 min"}"#, "null"] {
+            let data = Data(#"{"done":1,"total":2,"remainingMinutes":90,"unknownDurationCount":0,"next":\#(malformed)}"#.utf8)
+            let decoded = try JSONDecoder().decode(StoredCourseWatchSummary.self, from: data).summary
+            #expect(decoded.next == nil && decoded.done == 1 && decoded.total == 2)
+        }
+    }
+
     /// With nothing partly watched, the oldest lecture not done is picked, whatever the input
     /// order. Guards against playing the newest lecture first. Mutation: swap `<` for `>` in
     /// `precedes` and the newest ("c") is returned.

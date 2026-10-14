@@ -74,8 +74,8 @@ struct RecordingsSidebarNamesTests {
     /// used elsewhere (`name`) do not, and a course with no entry keeps its own.
     @Test func theSidebarFollowsTheFolderMap() {
         let courses = [course(1, Self.raw), course(2, "058168 - FISICA [2026-27]"), course(3, "Seminar (Rossi)")]
-        let sidebar = RecmanCourseSidebar(.init(courses: courses, enabledIDs: [1, 2, 3], folders: [1: "GAL", 3: "Sem"]))
-        #expect(sidebar.searchable.map(\.sidebarName) == ["GAL (Claude Sonnet)", "FISICA"])
+        let sidebar = RecmanCourseSidebar(.init(courses: courses, enabledIDs: [1, 2, 3], folders: [1: "gal", 3: "Sem"]))
+        #expect(sidebar.searchable.map(\.sidebarName) == ["gal (Claude Sonnet)", "FISICA"])
         #expect(sidebar.searchable.map(\.name) == [Self.cleaned, "FISICA"])
         #expect(sidebar.unsearchable.map(\.sidebarName) == ["Sem (Rossi)"])
         #expect(sidebar.searchable.map(\.key) == RecmanCourseSidebar(.init(courses: courses, enabledIDs: [1, 2, 3])).searchable.map(\.key))
@@ -83,32 +83,30 @@ struct RecordingsSidebarNamesTests {
         #expect(RecmanCourseSidebar.Inputs(courses: courses, enabledIDs: [1], folders: [1: "A"]) != .init(courses: courses, enabledIDs: [1], folders: [1: "B"]))
     }
 
-    /// Regression for the name-edit scenario: BeepBar keeps a folder already in its naming scheme
-    /// when WeBeep edits the course name, so a generated slug of an OLDER name must not be mistaken
-    /// for a student's rename. Fails if "generated" means only "equals the current name's default".
+    /// Known defaults before adding a teacher and actual legacy/collision names stay hidden.
     @Test func aGeneratedFolderOfAnOlderNameIsNotARename() {
         let edited = "058167 - ANALISI 2 (ROSSI) [2026-27]"
         let cleaned = "ANALISI 2 (ROSSI)"
         #expect(name("058167-analisi-2-2026-27", cleaned: cleaned, raw: edited) == cleaned)
         #expect(name("analisi-2", cleaned: cleaned, raw: edited) == cleaned)
-        #expect(name("analisi-2-11-3", cleaned: cleaned, raw: edited) == cleaned, "counter-suffixed default")
-        #expect(name("fisica-è-più-bella", cleaned: cleaned, raw: edited) == cleaned, "accented lowercase slug")
+        #expect(name("analisi-2-7-3", cleaned: cleaned, raw: edited) == cleaned, "counter-suffixed default")
+        #expect(name("fisica-è-più-bella", cleaned: cleaned, raw: edited) == "fisica-è-più-bella (ROSSI)", "an unrelated existing name is respected")
         #expect(name("Analisi 2 (11)", cleaned: cleaned, raw: edited, id: 11) == cleaned, "legacy NAME (id) with the course's own id")
-        #expect(name("analisi-2--11", cleaned: cleaned, raw: edited, id: 11) == cleaned, "a run of hyphens left by truncation")
+        #expect(name("analisi-2--11", cleaned: cleaned, raw: edited, id: 11) == "analisi-2--11 (ROSSI)", "unknown spelling is respected")
         #expect(RecmanCourseSidebar.menuName(courseName: cleaned, courseDisplayName: edited, courseID: 11, localFolderName: "058167-analisi-2-2026-27") == "ANALISI 2")
     }
 
-    /// The documented trade-off of the slug heuristic: mixed or upper case and names with spaces
-    /// are honoured, an all-lowercase single word is not. Fails if the heuristic is widened or removed.
-    @Test func theSlugHeuristicHonoursMixedCaseButNotPlainLowercase() {
+    /// Custom folder names are honoured regardless of their capitalization or slug shape.
+    @Test func customNamesAreHonouredRegardlessOfCase() {
         #expect(name("GAL") == "GAL (Claude Sonnet)")
         #expect(name("Gal") == "Gal (Claude Sonnet)")
         #expect(name("Geometria 2") == "Geometria 2 (Claude Sonnet)")
-        #expect(name("gal") == Self.cleaned)
-        // The legacy "NAME (id)" form is the course's OWN id only: other numbers are real renames.
+        #expect(name("gal") == "gal (Claude Sonnet)")
+        #expect(name("algebra-lineare") == "algebra-lineare (Claude Sonnet)")
+        // An arbitrary name with an ID suffix remains a rename.
         #expect(name("GAL (2026)") == "GAL (2026) (Claude Sonnet)")
         #expect(name("Fisica (2)") == "Fisica (2) (Claude Sonnet)")
-        #expect(name("Geometria (7)") == Self.cleaned, "id 7 is this course's own")
+        #expect(name("Geometria (7)") == "Geometria (7) (Claude Sonnet)", "not an actual legacy course name")
         #expect(name("GAL(7)") == "GAL(7) (Claude Sonnet)", "the legacy form has a space before the id")
     }
 

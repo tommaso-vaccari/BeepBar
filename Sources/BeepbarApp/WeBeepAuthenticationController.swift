@@ -756,8 +756,8 @@ enum MaterialsRunEnd: Equatable, Sendable {
     /// How each operation's materials run ended, recorded by its ending path while it is still
     /// the active operation and taken once by the tail that starts the follow-up. An operation
     /// with no entry was superseded: no follow-up (`MaterialsRunEnd.superseded`).
-    /// At most one operation is ever active, so one entry is enough and a stale one can't pile up.
-    private var materialsRunEnd: (operationID: UUID, end: MaterialsRunEnd)?
+    /// Notification delivery can suspend after the active operation ends, allowing another run.
+    private var materialsRunEnds: [UUID: (generation: Int, end: MaterialsRunEnd)] = [:]
     /// How the last recordings follow-up ended, memory only (for the "N nuove registrazioni"
     /// notification and the menu, package D). Nil until one ends, and again with the account.
     private(set) var lastRecordingsOutcome: RecordingsSyncOutcome?
@@ -3320,13 +3320,13 @@ enum MaterialsRunEnd: Equatable, Sendable {
     /// follow-up.
     private func recordRunEnd(_ operationID: UUID, _ end: MaterialsRunEnd) {
         guard activeOperationID == operationID else { return }
-        materialsRunEnd = (operationID, end)
+        materialsRunEnds[operationID] = (recordingsFollowUpGeneration, end)
     }
 
     /// Takes (and forgets) what `operationID` recorded; nil for a superseded or never-started run.
     private func takeRunEnd(_ operationID: UUID) -> MaterialsRunEnd? {
-        defer { materialsRunEnd = nil }
-        guard let recorded = materialsRunEnd, recorded.operationID == operationID else { return nil }
+        guard let recorded = materialsRunEnds.removeValue(forKey: operationID),
+              recorded.generation == recordingsFollowUpGeneration else { return nil }
         return recorded.end
     }
 
@@ -3425,6 +3425,7 @@ enum MaterialsRunEnd: Equatable, Sendable {
     /// change): it publishes nothing and the seam is told through task cancellation.
     private func cancelRecordingsFollowUp() {
         recordingsFollowUpGeneration += 1
+        materialsRunEnds.removeAll()
         recordingsFollowUp?.cancel()
         recordingsFollowUp = nil
         recordingsFollowUpID = nil

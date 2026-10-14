@@ -136,8 +136,8 @@ struct RecordingsMenuBarTests {
     }
 
     /// A new course list from WeBeep (a reload, a renamed or removed course) redraws the lines
-    /// with the selection unchanged. Guards against a menu naming a course that is no longer in
-    /// the list, or keeping its old name.
+    /// with the selection unchanged. An unrecognized historical folder keeps its own name;
+    /// a removed course must disappear from the menu.
     /// Mutation: drop `recordingMenuInputsChanged()` from `courses.didSet`.
     @Test func aNewCourseListRedrawsTheLines() async throws {
         defer { try? FileManager.default.removeItem(at: root) }
@@ -148,7 +148,7 @@ struct RecordingsMenuBarTests {
         #expect(lines(controller) == ["ANALISI 2 — 12/30 · ~14 h"])
 
         controller.setCoursesForTesting([course(11, "058167 - ANALISI MATEMATICA 2 [2026-27]")])
-        #expect(lines(controller) == ["ANALISI MATEMATICA 2 — 12/30 · ~14 h"], "renamed on WeBeep")
+        #expect(lines(controller) == ["058167-analisi-2-2026-27 — 12/30 · ~14 h"], "an unrecognized historical folder keeps its existing name")
         controller.setCoursesForTesting([])
         #expect(lines(controller).isEmpty, "no longer in the list")
         #expect(controller.enabledCourseIDs == [11])
@@ -832,7 +832,10 @@ struct RecordingsMenuBarTests {
         await controller.validateConnection()?.value
         #expect(controller.recordingsOwnerUserID == 9)
         #expect(controller.courses.count == accountCourses.count, "the course list wasn't touched")
-        #expect(controller.watchSummaries[analisi] == summary(next: lecture("a")))
+        let restored = try #require(controller.watchSummaries[analisi])
+        let expected = summary(next: lecture("a"))
+        #expect(restored.done == expected.done && restored.total == expected.total && restored.remainingMinutes == expected.remainingMinutes && restored.unknownDurationCount == expected.unknownDurationCount)
+        #expect(restored.next?.id == expected.next?.id && restored.newCount == expected.newCount)
         #expect(target(controller)?.owner == 9, "lines rebuilt for the new account")
 
         StatusItemController.dispatchRecordingClick(old, to: controller)

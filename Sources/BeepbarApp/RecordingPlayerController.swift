@@ -926,8 +926,14 @@ enum RecordingPlayerError: Error {
         window.collectionBehavior.insert(.fullScreenPrimary)
         window.contentView = view
         window.delegate = self
-        window.shortcutHandler = { [weak self] shortcut in self?.performShortcut(shortcut) }
-        window.zoomHandler = { [weak self] input in self?.handleZoomInput(input) }
+        window.shortcutHandler = { [weak self, weak window] shortcut in
+            guard let self, let window, self.window === window else { return }
+            self.performShortcut(shortcut)
+        }
+        window.zoomHandler = { [weak self, weak window] input in
+            guard let self, let window, self.window === window else { return }
+            self.handleZoomInput(input)
+        }
         window.addTitlebarAccessoryViewController(makeSpeedAccessory())
         if let frameAutosaveName {
             if !window.setFrameUsingName(frameAutosaveName) { window.center() }
@@ -939,7 +945,7 @@ enum RecordingPlayerError: Error {
         self.playerView = view
         self.window = window
         installedViewSpeeds = nil
-        takeOverNowPlaying(of: view)
+        takeOverNowPlaying(of: view, window: window)
         promoteToRegularApp()
         return player
     }
@@ -951,11 +957,14 @@ enum RecordingPlayerError: Error {
     /// `RecordingNowPlaying.swift`). Only when `nowPlaying` could take over and AVKit's own
     /// publication can be switched off (two publishers would overwrite each other); otherwise
     /// AVKit keeps publishing, and handling the media keys, as before.
-    private func takeOverNowPlaying(of view: NSView) {
+    private func takeOverNowPlaying(of view: NSView, window: NSWindow) {
         let setter = NSSelectorFromString("setUpdatesNowPlayingInfoCenter:")
         let isAVKitView = NSStringFromClass(type(of: view)) == "AVPlayerView"
         guard !isAVKitView || view.responds(to: setter),
-              nowPlaying.activate(onCommand: { [weak self] command in self?.handleRemoteCommand(command) }) else { return }
+              nowPlaying.activate(onCommand: { [weak self, weak window] command in
+                  guard let self, let window, self.window === window else { return }
+                  self.handleRemoteCommand(command)
+              }) else { return }
         if view.responds(to: setter) { view.setValue(false, forKey: "updatesNowPlayingInfoCenter") }
         isPublishingNowPlaying = true
         lastNowPlaying = nil
@@ -1095,7 +1104,11 @@ enum RecordingPlayerError: Error {
         header.isEnabled = false
         menu.addItem(header)
         for speed in RecordingPlayerPolicy.speeds {
-            let action = PlayerMenuAction { [weak self] in self?.selectSpeed(speed) }
+            let window = self.window
+            let action = PlayerMenuAction { [weak self, weak window] in
+                guard let self, let window, self.window === window else { return }
+                self.selectSpeed(speed)
+            }
             menuActions.append(action)
             let item = NSMenuItem(title: RecordingPlayerPolicy.speedLabel(speed), action: #selector(PlayerMenuAction.invoke(_:)), keyEquivalent: "")
             item.target = action

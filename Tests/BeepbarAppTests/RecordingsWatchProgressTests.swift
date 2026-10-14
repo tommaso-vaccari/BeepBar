@@ -86,7 +86,7 @@ struct RecordingsWatchProgressTests {
     /// the archive doesn't give.
     private func recording(_ id: String, daysAgo: Double = 1, in key: RecmanCourseKey? = nil, duration: String = "90 min") -> RecmanRecording {
         let key = key ?? course
-        return RecmanRecording(id: id, courseCode: key.courseCode, academicYear: key.academicYear, title: "Lezione \(id)", recordedAt: world.now.addingTimeInterval(-daysAgo * 86_400), kind: "Lezione", duration: duration, size: nil, previewURL: URL(string: "https://onlineservices.polimi.it/x?transfer_id=\(id)")!)
+        return RecmanRecording(id: id, courseCode: key.courseCode, academicYear: key.academicYear, title: "Lezione \(id)", recordedAt: world.now.addingTimeInterval(-daysAgo * 86_400), kind: "Lezione", duration: duration, size: nil, previewURL: URL(string: "https://onlineservices.polimi.it/recman_frontend/recman_frontend/controller/ArchivioListActivity.do?evn_preview_link&transfer_id=\(id)")!)
     }
 
     private func stream(_ id: String, duration: TimeInterval? = 6_000) -> RecordingStream {
@@ -484,7 +484,10 @@ struct RecordingsWatchProgressTests {
         await settle("listed after relaunch") { relaunched.listing(for: course)?.recordings != nil }
         #expect(relaunched.watchProgress.fraction(for: recording("a")) == 0.5)
         #expect(relaunched.watchSummaries[course] == summary)
-        #expect(RecordingsController.storedWatchSummaries(in: defaults, owner: 42)?[course] == summary)
+        let saved = try #require(RecordingsController.storedWatchSummaries(in: defaults, owner: 42)?[course])
+        #expect(saved.done == summary?.done && saved.total == summary?.total)
+        #expect(saved.remainingMinutes == summary?.remainingMinutes && saved.unknownDurationCount == summary?.unknownDurationCount)
+        #expect(saved.next?.id == summary?.next?.id && saved.newCount == summary?.newCount)
         controller.turnOff()
     }
 
@@ -794,7 +797,9 @@ struct RecordingsWatchProgressTests {
         await settle("listed after relaunch") { relaunched.listing(for: course)?.recordings?.count == 2 }
         let stored = try #require(RecordingsController.storedWatchSummaries(in: defaults, owner: 42))
         #expect(stored[course]?.total == 2, "the changed course is saved")
-        #expect(stored[other] == CourseWatchSummary(done: 0, total: 1, remainingMinutes: 90, unknownDurationCount: 0, next: recording("x", in: other)), "the other course is kept")
+        let retained = try #require(stored[other])
+        #expect(retained.done == 0 && retained.total == 1 && retained.remainingMinutes == 90 && retained.unknownDurationCount == 0, "the other course is kept")
+        #expect(retained.next?.id == "x" && retained.next?.courseCode == other.courseCode && retained.next?.academicYear == other.academicYear)
         controller.turnOff()
     }
 

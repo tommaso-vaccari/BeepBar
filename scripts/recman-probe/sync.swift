@@ -350,6 +350,8 @@ func syncFailureKind(_ error: Error) -> String {
         }
     }
     let session = RecmanWebSession()
+    session.listingAttempts = 1
+    session.listingPageLimit = 3
     session.traceHandler = { tally.note($0) }
     // A background entry never asks for a window; if it ever did, nothing would be shown.
     session.presentSignInWindow = { _ in }

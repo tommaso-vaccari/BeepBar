@@ -45,7 +45,7 @@ All findings below come from `scripts/recman-probe.sh play` / `lab` runs on 2026
 | G | Player MVP in `RecordingPlayerController` / `RecordingPlayerControls`: speeds 0.5–3x (`defaultRate`, `timeDomain` pitch set explicitly, last speed in `recordingPlayerSpeed`, written only on change; 2.5x/3x only when the item reports `canPlayFastForward`, 0.5x/0.75x only with `canPlaySlowForward`, both followed by KVO), ±10/30 s skips with a 1 s seek tolerance, window-level shortcuts (decided synchronously from the event, run through a main-actor hop; physical J/K/L/F/M on non-Latin layouts), a title-bar speed menu listing the shortcuts, `play(…, startAt:, recordingID:)`, `onPositionCheckpoint(recordingID, position, duration)` and `onFailure(recordingID, failure)` (checkpoints on pause, close, replacement, mid-playback failure; never periodic, nothing before the item is ready; while a seek or the resume is in flight its target is the position; PR #154 adds `onProgress`, a memory-only tick, see "Watch progress" below) | integrated (its two open P2s are fixed in F) |
 | D | Core parsing of Webex pages and the stream API answer, URL policy | integrated |
 | E | `RecmanWebSession.stream(for:email:)` per the design above | integrated |
-| F | Controller/UI integration, settings email confirmation, specs, CHANGELOG, compliance wiki, measurements | merged into the integration branch after two independent static review rounds (no P0/P1 left), but **never compiled or run** (written on a machine without Swift): the first Mac run must do `swift test`, the Release build, `otool -L` (no AVKit), the mutation checks and `scripts/quit-probe.sh`. Open optional P2s: (A) vault `keepingFileEmail` writes no email when the file is still unreadable at save time, (B) a failed session-file delete followed by the same account signing in brings the old email back, (C) check `anAccountChangeForgetsPlacesEvenWithoutRecordings` assumes login never creates Recordings, (D) `closesBrowserWhenIdle` may stay set (harmless), and the chmod-000 test needs a root guard. Measurements still to do |
+| F | Controller/UI integration, settings email confirmation, specs, CHANGELOG, compliance wiki, measurements | merged into the integration branch after two independent static review rounds (no P0/P1 left), initially **not compiled or run** (written on a machine without Swift): the initial Mac checklist required `swift test`, the Release build, `otool -L` (no AVKit), the mutation checks and `scripts/quit-probe.sh`. Open optional P2s: (A) vault `keepingFileEmail` writes no email when the file is still unreadable at save time, (B) a failed session-file delete followed by the same account signing in brings the old email back, (C) check `anAccountChangeForgetsPlacesEvenWithoutRecordings` assumes login never creates Recordings, (D) `closesBrowserWhenIdle` may stay set (harmless), and the chmod-000 test needs a root guard. The completion checkpoint below supersedes the initial measurement status |
 
 Decisions by the product owner: native window (not QuickTime Player); email read from the WeBeep profile (since 2026-10-11 used without a confirmation step, see below); player MVP = system controls (PiP, AirPlay, Now Playing), speed 0.5–3x, ±10/30 s skips and shortcuts, resume where you left off (saved on pause/close only, tied to the watchlist/seen state), recovery after errors or expired URLs. v2: transcript (VTT) with search, chapters, audio-only (`audioURL`), bookmarks, slide capture, next-lecture queue, floating window. Out: adaptive bitrate (single level), offline download (#87, honour `preventDownload`).
 
@@ -122,7 +122,7 @@ Wiring: `RecordingsController.startPlayer` passes `RecordingPlaybackMetadata(rec
 
 To verify by hand (cannot be tested in CI): what Control Center's Now Playing, the menu bar Now Playing item and the media keys show and do while a lecture plays, and how the course picture looks.
 
-Privacy and data: the title and the course name are readable by other processes through MediaRemote while the player is open and are cleared on close; the picture address is the only new stored value (an optional field of the saved course list, no token); the picture itself and its bytes never reach disk. No new network recipient: the picture comes from the same WeBeep host as the course list. See the compliance wiki's data map.
+Privacy and data: the title and the course name are readable by other processes through MediaRemote while the player is open and are cleared on close; the picture address is an optional field of the saved course list; the menu summary also stores the next lecture's id, course code/year, title and duration, without its original URL, date, kind or size; the picture itself and its bytes never reach disk. No new network recipient: the picture comes from the same WeBeep host as the course list. See the compliance wiki's data map.
 
 ## Zoom (PR #154)
 
@@ -149,7 +149,7 @@ A click on a course's line in the status menu reaches `WeBeepAuthenticationContr
 
 ## Refreshing listings at every sync never plays (PR #154)
 
-`RecordingsController.refreshForSync`, called by the sync's follow-up after Core's `RecordingsSyncPolicy` decided, queues only `.list` jobs through the same worker and `record` as the page: **it never calls `stream(for:)`**, never opens a player, a browser window or a sign-in window, and never downloads video (offline download stays out, #87). A lapsed Polimi session ends it as `.needsSignIn` without a window; with no saved session the browser is not even created. Its courses go after what the page queued and never replace it; the browser closes when the queue has drained if no page is on screen. The follow-up lives outside the sync task, so the quit path is unchanged. Cost measurement of this refresh against the live service is **not done**: see the performance plan and `recordings-validation.md`.
+`RecordingsController.refreshForSync`, called by the sync's follow-up after Core's `RecordingsSyncPolicy` decided, queues only `.list` jobs through the same worker and `record` as the page: **it never calls `stream(for:)`**, never opens a player, a browser window or a sign-in window, and never downloads video (offline download stays out, #87). A lapsed Polimi session ends it as `.needsSignIn` without a window; with no saved session the browser is not even created. Its courses go after what the page queued and never replace it; the browser closes when the queue has drained if no page is on screen. The follow-up lives outside the sync task, so the quit path is unchanged. One bounded live refresh was measured in `recordings-validation.md`; request totals and bytes remain unavailable, and repeated/multi-course costs are unmeasured.
 
 ## Compact controls
 
@@ -158,9 +158,18 @@ The inline controls style (measurements in "Player findings" above) is applied b
 ## Open items
 
 - By hand on a Mac (PR #154): Control Center / menu bar Now Playing and the media keys while a lecture plays; the course picture; pinch and ⌘+/−/0 with a real stream; the compact bar in windowed and full-screen modes; a menu bar Play with a lapsed Polimi session; closing Settings right after pressing Play.
-- Live cost of the sync refresh (`scripts/recman-probe.sh sync`, owner's go only).
+- Repeated and multi-course refresh costs remain unmeasured; do not repeat live probes without the owner's explicit request.
 
 - Lifetime of `hlsURL` beyond 10 min and server-side lifetime of `ticket` / idbroker sessions beyond ~30 min.
 - Live confirmation (with consent) that the `email=` hint with the real address completes the sign-in unattended.
 - The `viewFrom` value of the webappng login URL (packages D/E leave the parameter out), and the unit of the stream API's `duration` (read as seconds).
 - Energy comparison native player vs Webex web page (measurement in progress).
+
+
+## Completion fixes (PR #154, 2026-10-14)
+
+Custom course-folder names, including `gal`, `GAL`, `Gal` and lowercase hyphenated names, are respected. Generated names are recognized by comparing actual current defaults and known legacy/collision forms. Unknown historical slugs are shown as existing names because no rename provenance is stored.
+
+The persisted menu target contains only id, course code/year, title and duration. Its validated Polimi preview URL is reconstructed locally; the original query, recording date, kind and size are discarded. Older full-row summaries remain readable and are minimized when next rewritten. Older released builds retain the counts and ignore the shortcut. Window-scoped player callbacks cannot control a newly opened player after their original window closes. Listing cancellation preserves courses subsequently requested by the visible page; running Play/recovery state belongs to its generation, so stale jobs cannot cancel the current Play when Settings closes.
+
+Materials completion outcomes are consumed by operation ID and follow-up generation. Overlapping notification waits cannot overwrite another run's outcome, and a context change invalidates pending outcomes before they can start a listings refresh.

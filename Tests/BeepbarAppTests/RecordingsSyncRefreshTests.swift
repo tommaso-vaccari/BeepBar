@@ -422,6 +422,28 @@ struct RecordingsSyncRefreshTests {
         controller.turnOff()
     }
 
+    @Test func cancellationKeepsACourseThePageRequestedAfterTheBackgroundRefresh() async throws {
+        defer { cleanUp() }
+        let controller = try launched()
+        let gate = FakeRecmanBrowser.Gate()
+        defer { gate.release() }
+        browser.listGates[course.courseCode] = gate
+        list(["a"]); list(["b"], for: other)
+        controller.pageAppeared()
+        controller.refresh([course], selected: course)
+        await settle("page listing in flight") { gate.isWaiting }
+        let task = Task { await controller.refreshForSync([other], force: false) }
+        await settle("background course queued") { controller.listing(for: other)?.isLoading == true }
+        controller.refresh([course, other], selected: other)
+        task.cancel()
+        #expect(await task.value == .cancelled)
+        gate.release()
+        await settle("later page request listed") { controller.listing(for: other)?.recordings != nil }
+        #expect(browser.listCalls == [course.courseCode, other.courseCode])
+        #expect(browser.isOpen)
+        controller.turnOff()
+    }
+
     // MARK: Writes and freshness
 
     /// A second identical refresh writes nothing: no summary, no settings key, the session file

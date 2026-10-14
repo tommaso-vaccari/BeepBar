@@ -115,8 +115,8 @@ public enum RecordingCheckpointReason: String, Sendable, CaseIterable {
 }
 
 /// What a course's recordings add up to: shown as "12/30 · ~14 h" in the window and the menu bar,
-/// plus the lecture a click on the course's menu line plays (`next`). Stored as numbers and one
-/// archive row (never as text), so it follows a language switch.
+/// plus the lecture a click on the course's menu line plays (`next`). The app persists its menu
+/// copy through `StoredCourseWatchSummary`, retaining only the playback target and counts.
 ///
 /// Persistence: the app saves `[course: CourseWatchSummary]` under the UserDefaults key
 /// `io.github.tvaccari.beepbar.recordings-watch-summary.v1` (`RecordingsController.StoredWatchSummaries`)
@@ -204,6 +204,69 @@ public struct CourseWatchSummary: Codable, Equatable, Sendable {
         try container.encode(unknownDurationCount, forKey: .unknownDurationCount)
         try container.encodeIfPresent(next, forKey: .next)
         try container.encodeIfPresent(newCount, forKey: .newCount)
+    }
+}
+
+public struct StoredCourseWatchSummary: Codable {
+    public let summary: CourseWatchSummary
+
+    public init(_ summary: CourseWatchSummary) { self.summary = summary }
+
+    private struct Target: Codable {
+        let id: String
+        let courseCode: String
+        let academicYear: Int
+        let title: String
+        let duration: String
+
+        init?(_ recording: RecmanRecording) {
+            guard RecmanCourseKey(courseCode: recording.courseCode, academicYear: recording.academicYear) != nil,
+                  RecmanURLPolicy.previewTransferID(recording.previewURL) == recording.id else { return nil }
+            id = recording.id
+            courseCode = recording.courseCode
+            academicYear = recording.academicYear
+            title = recording.title
+            duration = recording.duration
+        }
+
+        var recording: RecmanRecording? {
+            guard RecmanCourseKey(courseCode: courseCode, academicYear: academicYear) != nil,
+                  id.range(of: #"^[A-Za-z0-9_-]+$"#, options: .regularExpression) != nil else { return nil }
+            var url = URLComponents()
+            url.scheme = "https"
+            url.host = RecmanURLPolicy.archiveHost
+            url.path = RecmanURLPolicy.archivePath
+            url.queryItems = [URLQueryItem(name: "evn_preview_link", value: nil), URLQueryItem(name: "transfer_id", value: id)]
+            guard let previewURL = url.url else { return nil }
+            return RecmanRecording(id: id, courseCode: courseCode, academicYear: academicYear, title: title,
+                                   recordedAt: Date(timeIntervalSince1970: 0), kind: "", duration: duration,
+                                   size: nil, previewURL: previewURL)
+        }
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case done, total, remainingMinutes, unknownDurationCount, next, newCount
+    }
+
+    public init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        let target = try? container.decodeIfPresent(Target.self, forKey: .next)
+        summary = CourseWatchSummary(done: try container.decode(Int.self, forKey: .done),
+                                     total: try container.decode(Int.self, forKey: .total),
+                                     remainingMinutes: try container.decode(Int.self, forKey: .remainingMinutes),
+                                     unknownDurationCount: try container.decode(Int.self, forKey: .unknownDurationCount),
+                                     next: target?.recording,
+                                     newCount: try? container.decodeIfPresent(Int.self, forKey: .newCount))
+    }
+
+    public func encode(to encoder: Encoder) throws {
+        var container = encoder.container(keyedBy: CodingKeys.self)
+        try container.encode(summary.done, forKey: .done)
+        try container.encode(summary.total, forKey: .total)
+        try container.encode(summary.remainingMinutes, forKey: .remainingMinutes)
+        try container.encode(summary.unknownDurationCount, forKey: .unknownDurationCount)
+        try container.encodeIfPresent(summary.next.flatMap(Target.init), forKey: .next)
+        try container.encodeIfPresent(summary.newCount, forKey: .newCount)
     }
 }
 

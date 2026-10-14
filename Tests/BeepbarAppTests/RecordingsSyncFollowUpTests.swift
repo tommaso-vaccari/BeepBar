@@ -111,6 +111,66 @@ import Testing
 
     // MARK: Independence from the materials result
 
+    @Test func overlappingNotificationTailsPreserveBothRunFollowUps() async throws {
+        let harness = try await Harness()
+        defer { harness.remove() }
+        let gates = [FakeRecmanBrowser.Gate(), FakeRecmanBrowser.Gate()]
+        var notifications = 0
+        harness.controller.setBeforeNotificationForTesting {
+            let gate = gates[notifications]
+            notifications += 1
+            await gate.wait()
+        }
+        let summary = SyncProgress(completed: 0, total: 0, added: 0, updated: 0, preservedLocal: 0, unchanged: 0, conflicts: 0, failures: 0)
+        let firstID = UUID()
+        harness.controller.setOperationForTesting(firstID)
+        let first = Task { @MainActor in
+            await harness.controller.completeSyncForTesting(firstID, summary: summary)
+            await harness.controller.startFollowUpForTesting(firstID, trigger: .manual)?.value
+        }
+        while !gates[0].isWaiting { await Task.yield() }
+        #expect(!harness.controller.isSyncActive)
+        let secondID = UUID()
+        harness.controller.setOperationForTesting(secondID)
+        let second = Task { @MainActor in
+            await harness.controller.completeSyncForTesting(secondID, summary: summary)
+            await harness.controller.startFollowUpForTesting(secondID, trigger: .manual)?.value
+        }
+        while !gates[1].isWaiting { await Task.yield() }
+
+        gates[0].release()
+        await first.value
+        #expect(harness.seam.calls.count == 1)
+        gates[1].release()
+        await second.value
+        #expect(harness.seam.calls.count == 2)
+        #expect(harness.seam.calls.allSatisfy { $0.keys == [Self.key] && $0.force })
+    }
+
+    @Test func changingTheRootWhileNotificationWaitsRetiresTheOldRunFollowUp() async throws {
+        let harness = try await Harness()
+        defer { harness.remove() }
+        let gate = FakeRecmanBrowser.Gate()
+        harness.controller.setBeforeNotificationForTesting { await gate.wait() }
+        let operationID = UUID()
+        harness.controller.setOperationForTesting(operationID)
+        let completed = Task { @MainActor in
+            await harness.controller.completeSyncForTesting(operationID, summary: SyncProgress(completed: 0, total: 0, added: 0, updated: 0, preservedLocal: 0, unchanged: 0, conflicts: 0, failures: 0))
+            await harness.controller.startFollowUpForTesting(operationID, trigger: .manual)?.value
+        }
+        while !gate.isWaiting { await Task.yield() }
+        let newRoot = harness.root.appending(path: "new-root", directoryHint: .isDirectory)
+        try FileManager.default.createDirectory(at: newRoot, withIntermediateDirectories: true)
+        await harness.controller.useRootForTesting(newRoot)
+        #expect(harness.controller.rootURL == newRoot)
+        #expect(harness.controller.enabledCourseIDs == [1])
+
+        gate.release()
+        await completed.value
+        #expect(harness.seam.calls.isEmpty)
+        #expect(harness.controller.lastRecordingsOutcome == nil)
+    }
+
     /// Proves that a refresh ending `.unavailable`, `.needsSignIn` or `.cancelled` leaves the
     /// materials state and the notifications exactly as a refresh that skipped would. Guards
     /// against the follow-up reporting its trouble through `setSyncState` or a failure notification.

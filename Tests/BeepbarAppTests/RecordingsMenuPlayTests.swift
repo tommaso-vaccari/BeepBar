@@ -146,7 +146,7 @@ struct RecordingsMenuPlayTests {
         defer { cleanUp() }
         let controller = await listedController([recording("b", daysAgo: 1), recording("a", daysAgo: 2)])
         #expect(controller.watchSummaries[course]?.next == recording("a", daysAgo: 2))
-        #expect(savedNext() == recording("a", daysAgo: 2), "stored for the menu bar at the next launch")
+        #expect(savedNext()?.id == "a", "stored for the menu bar at the next launch")
         #expect(controller.watchProgress.summaries[course]?.next == recording("a", daysAgo: 2), "the window agrees")
         controller.turnOff()
     }
@@ -161,7 +161,7 @@ struct RecordingsMenuPlayTests {
         defaults.set(try PropertyListEncoder().encode(stored), forKey: RecordingsController.watchSummaryKey)
         let controller = await listedController([recording("a", daysAgo: 2), recording("b", daysAgo: 1)])
         let saved = try #require(RecordingsController.storedWatchSummaries(in: defaults, owner: 42)?[course])
-        #expect(saved.total == 2 && saved.next == recording("a", daysAgo: 2), "recomputed")
+        #expect(saved.total == 2 && saved.next?.id == "a", "recomputed")
         #expect(saved.newCount == nil, "the baseline has nothing new")
         #expect(controller.watchProgress.summaries[course]?.newCount == nil, "the window agrees")
         controller.turnOff()
@@ -202,7 +202,7 @@ struct RecordingsMenuPlayTests {
     @Test func aCheckpointOrACompletionMovesTheNextLecture() async throws {
         defer { cleanUp() }
         let controller = await listedController([recording("a", daysAgo: 2), recording("b", daysAgo: 1)])
-        #expect(savedNext() == recording("a", daysAgo: 2))
+        #expect(savedNext()?.id == "a")
         browser.streamResults["b"] = [.success(stream("b"))]
         controller.play(recording("b"))
         await settle("b playing") { world.player.plays.count == 1 }
@@ -211,13 +211,13 @@ struct RecordingsMenuPlayTests {
 
         world.player.pause(at: 600)
         await controller.settleWatchProgress()
-        #expect(savedNext() == recording("b"), "a partly watched lecture comes first")
+        #expect(savedNext()?.id == "b", "a partly watched lecture comes first")
         #expect(summaryWrites == 1)
 
         world.player.move(to: 5_700)
         world.player.close()
         await controller.settleWatchProgress()
-        #expect(savedNext() == recording("a", daysAgo: 2), "done lectures are never next")
+        #expect(savedNext()?.id == "a", "done lectures are never next")
         #expect(controller.watchSummaries[course]?.done == 1)
         controller.turnOff()
     }
@@ -233,7 +233,7 @@ struct RecordingsMenuPlayTests {
         let first = await listedController([recording("a", daysAgo: 2), recording("b", daysAgo: 1)])
         first.windowClosed()
         let saved = try #require(RecordingsController.storedWatchSummaries(in: defaults, owner: 42)?[course])
-        #expect(saved.next == recording("a", daysAgo: 2))
+        #expect(saved.next?.id == "a")
 
         // A relaunch: nothing in memory; the archive now fails to list the course.
         let controller = makeController()
@@ -566,6 +566,43 @@ struct RecordingsMenuPlayTests {
             #expect(world.player.plays.last?.recordingID == id)
         }
         #expect(calls.needsPage.isEmpty)
+        controller.turnOff()
+    }
+
+    @Test(arguments: [false, true])
+    func closingTheWindowPreservesCurrentWorkAfterAnInvalidatedWorkerReturns(recovery: Bool) async throws {
+        defer { cleanUp() }
+        let controller = await signedInController()
+        controller.pageAppeared()
+        func startBlockedWork(_ id: String, gate: FakeRecmanBrowser.Gate) async {
+            browser.streamResults[id] = [.success(stream(id)), .success(stream(id))]
+            if recovery {
+                controller.play(recording(id))
+                await settle("\(id) initially playing") { world.player.plays.last?.recordingID == id }
+                await drainTasks()
+                browser.streamGates[id] = gate
+                world.player.failDuringPlayback(at: 120)
+            } else {
+                browser.streamGates[id] = gate
+                controller.play(recording(id))
+            }
+            await settle("\(id) waiting for stream") { gate.isWaiting }
+        }
+        let oldGate = FakeRecmanBrowser.Gate()
+        let currentGate = FakeRecmanBrowser.Gate()
+        defer { oldGate.release(); currentGate.release() }
+        await startBlockedWork("old", gate: oldGate)
+        controller.signIn()
+        await settle("new sign-in finished") { controller.access == .ready }
+        await startBlockedWork("current", gate: currentGate)
+        let plays = world.player.plays.count
+        oldGate.release()
+        await drainTasks()
+        controller.windowClosed()
+        currentGate.release()
+        await settle("current work reached player") { world.player.plays.count == plays + 1 }
+        #expect(world.player.plays.last?.recordingID == "current")
+        await settle("browser closed") { !browser.isOpen }
         controller.turnOff()
     }
 

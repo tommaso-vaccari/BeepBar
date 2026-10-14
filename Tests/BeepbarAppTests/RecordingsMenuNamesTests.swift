@@ -16,6 +16,9 @@ struct RecordingsMenuNamesTests {
     /// which would print "GAL (Claude Sonnet)" in the menu. Fails if the teacher is appended.
     @Test func aRenamedFolderIsShownAlone() {
         #expect(menu("GAL") == "GAL")
+        #expect(menu("gal") == "gal")
+        #expect(menu("Gal") == "Gal")
+        #expect(menu("algebra-lineare") == "algebra-lineare")
         #expect(menu("  GAL \n") == "GAL")
         #expect(menu("Algebra (Claude Sonnet)") == "Algebra (Claude Sonnet)", "the student's own text is never edited")
     }
@@ -50,8 +53,8 @@ struct RecordingsMenuNamesTests {
                                    recordedAt: Date(timeIntervalSince1970: 1_790_000_000), kind: "Lezione", duration: "90 min", size: nil,
                                    previewURL: URL(string: "https://onlineservices.polimi.it/recman_frontend/recman_frontend/controller/ArchivioListActivity.do?evn_preview_link=1&transfer_id=9")!)
         let summary = CourseWatchSummary(done: 3, total: 10, remainingMinutes: 45, unknownDurationCount: 0, next: next)
-        let lines = WeBeepAuthenticationController.recordingMenuLines(courses: [course], enabledIDs: [1], summaries: [key: summary], owner: 7, folders: [1: "GAL"])
-        #expect(lines.first?.text.italian == "GAL — 3/10 · ~45 min")
+        let lines = WeBeepAuthenticationController.recordingMenuLines(courses: [course], enabledIDs: [1], summaries: [key: summary], owner: 7, folders: [1: "gal"])
+        #expect(lines.first?.text.italian == "gal — 3/10 · ~45 min")
         #expect(lines.first?.target == RecordingMenuTarget(owner: 7, courseID: 1, key: key))
         #expect(lines.first?.hint != nil)
     }

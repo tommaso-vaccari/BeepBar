@@ -504,6 +504,25 @@ struct RecordingNowPlayingTests {
         #expect(publisher.onCommand == nil)
     }
 
+    @Test(.timeLimit(.minutes(1))) func anOldRemoteCommandCannotControlAReopenedWindow() async throws {
+        let media = try await TestMedia.shared.url()
+        let publisher = FakePublisher()
+        let controller = makeController(publisher: publisher)
+        controller.play(media, title: "1", cookies: [], startAt: nil, recordingID: "1", metadata: nil)
+        let oldCommand = try #require(publisher.onCommand)
+        controller.close()
+        controller.play(media, title: "2", cookies: [], startAt: nil, recordingID: "2", metadata: nil)
+        await Self.waitUntil { controller.isCurrentItemReady }
+
+        oldCommand(.seek(40))
+        #expect(controller.pendingSeekTarget == nil)
+        oldCommand(.pause)
+        #expect(controller.player?.rate != 0)
+        publisher.onCommand?(.pause)
+        #expect(controller.player?.rate == 0)
+        controller.close()
+    }
+
     /// The real publisher works in this process: MediaPlayer loads on demand, takes over and
     /// gives everything back. Guards against the runtime calls (class names, selectors, the
     /// artwork initializer) silently failing, which would leave AVKit's "BeepBar" in place.

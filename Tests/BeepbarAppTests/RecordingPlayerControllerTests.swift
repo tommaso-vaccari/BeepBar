@@ -83,6 +83,31 @@ struct RecordingPlayerControllerTests {
         controller.close()
     }
 
+    /// macOS defaults sleep prevention off: every newly created player must opt in, including
+    /// one opened after closing the previous lecture. AVFoundation owns the playback assertion.
+    @Test func videoPlaybackPreventsIdleSleepAcrossReplacementAndReopen() async throws {
+        let media = try await TestMedia.shared.url()
+        let controller = makeController(makePlayerView: { FakePlayerView() }, makePlayer: {
+            let player = AVPlayer()
+            player.preventsDisplaySleepDuringVideoPlayback = false
+            return player
+        })
+        defer { controller.close() }
+        controller.play(media, title: "Lezione 1", cookies: [])
+        let first = try #require(controller.player)
+        #expect(first.preventsDisplaySleepDuringVideoPlayback)
+        controller.play(media, title: "Lezione 2", cookies: [])
+        #expect(controller.player === first)
+        #expect(first.preventsDisplaySleepDuringVideoPlayback)
+        controller.close()
+        #expect(first.rate == 0)
+        #expect(first.currentItem == nil)
+        controller.play(media, title: "Lezione 3", cookies: [])
+        let reopened = try #require(controller.player)
+        #expect(reopened !== first)
+        #expect(reopened.preventsDisplaySleepDuringVideoPlayback)
+    }
+
     /// `close()` releases the AVPlayer, its view, its item and the window, and is idempotent.
     /// Guards against a closed player keeping AVFoundation (and its buffers) alive at rest.
     @Test func closeReleasesEverythingAndIsIdempotent() async throws {

@@ -55,8 +55,20 @@ struct BeepbarApp: App {
         BeepbarLog.lifecycle.notice("Application launched version=\(version, privacy: .public) build=\(build, privacy: .public)")
         _ = UpdaterController.shared
         // Once per install: on by default, never re-applied after the user turns it off.
-        Task { await LaunchAtLoginController.shared.applyDefaultOnLaunch() }
-        Task { await DailyTelemetryController.shared.startForApplication() }
+        // Telemetry starts after it, so the day's first signal reports the login item's real state.
+        Task { [authentication] in
+            await LaunchAtLoginController.shared.applyDefaultOnLaunch()
+            await DailyTelemetryController.shared.startForApplication(context: {
+                DailyTelemetryContext(
+                    language: .current,
+                    systemMajorVersion: ProcessInfo.processInfo.operatingSystemVersion.majorVersion,
+                    automaticSyncEnabled: authentication.automaticSyncEnabled,
+                    automaticSyncInterval: authentication.automaticSyncInterval,
+                    dataSaverEnabled: authentication.dataSaverEnabled,
+                    recordingsEnabled: authentication.recordingsEnabledWithoutCreating,
+                    launchAtLogin: LaunchAtLoginController.shared.status.map(LaunchAtLoginPolicy.isOn))
+            })
+        }
         statusItemController = StatusItemController(authentication: authentication)
 #if DEBUG
         if ProcessInfo.processInfo.arguments.contains("--ui-preview") {

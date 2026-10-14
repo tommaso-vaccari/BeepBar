@@ -1279,6 +1279,13 @@ enum MaterialsRunEnd: Equatable, Sendable {
     /// create it just to tell it nothing is happening (the window closing).
     var recordingsIfCreated: RecordingsController? { recordingsStorage }
 
+    /// Whether Recordings is on, read without creating its controller (daily telemetry asks once a
+    /// day and must not build the feature just to report it is off).
+    var recordingsEnabledWithoutCreating: Bool {
+        if let recordingsStorage { return recordingsStorage.isEnabled }
+        return RecordingsController.storedEnabled(in: operationDefaults, isAvailable: selectedSite.university == .polimi)
+    }
+
     /// The WeBeep account the saved Polimi session is bound to; nil until the account is
     /// validated in this launch (`siteInfo`).
     var recordingsOwnerUserID: Int? {

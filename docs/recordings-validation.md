@@ -51,3 +51,48 @@ The existing live probe is `scripts/recman-probe.sh cold <course> <year>` follow
 - Full `swift test`: 618 tests passed (337 core, 24 benchmark, 243 app Swift Testing, 14 app XCTest). The unsigned Release build and `git diff --check` passed.
 - Independent Sol 6.1 medium review reported no actionable findings. Coverage includes missing, empty, expired, corrupt, unreadable and wrong-owner sessions, matching saved-session reuse, disabled behavior, page reconstruction and explicit sign-in before the first visit.
 - Live Polimi sign-in and the installed beta were not exercised for this change.
+
+
+## Embedded sign-in recovery and playback positions (2026-10-13)
+
+Local worktree `fix/recordings-signin-recovery` starts from dev `0c9d033b322e0eec272cbc83567461c091307db9`; the delivery is committed for integration into dev; the installed app is unchanged. The delivery PR records the final commit and CI results. The screenshot reports “Il servizio richiesto non è presente.” A cookie-free GET of service 2314 returned the normal sign-in page. This does not prove the server-side cause of the user's earlier failure: no personal SSO session was replayed.
+
+- Explicit sign-in after `needsSignIn` creates the existing nonpersistent browser with no saved cookies, while retaining session-owner checks. A still-reusable session keeps its warm path.
+- The visible service-unavailable text on a trusted Polimi login host finishes the navigator with failure, including after the sign-in window has appeared. Hidden page text does not trigger it. The existing error UI permits retry.
+- Disabling Recordings previously removed `resumePointsKey`. It now closes the player while the playback identity is still valid, stores the final checkpoint, and preserves positions across re-enable/relaunch. Disconnect, university change and account change still clear positions and refuse the closing player's final report. Already removed positions cannot be reconstructed by this fix.
+- Tests use synthetic preferences, cookies and WebKit fixtures. Live Polimi/SPID login and actual Apple Passwords selection have not been validated.
+
+## Apple Passwords with an internal window: API investigation (2026-10-13)
+
+The required experience is Apple Passwords suggestions directly in the website fields inside the existing BeepBar window, as in Safari. Neither opening Safari nor adding a separate native credential panel meets the clarified requirement. The following APIs have different roles and must not be treated as interchangeable switches.
+
+| Mechanism | Public support / constraint | Decision for BeepBar |
+| --- | --- | --- |
+| HTML `autocomplete=username/current-password/one-time-code` | Apple documents semantic hints for web inputs. They help a supported AutoFill implementation identify fields; they do not themselves enable the macOS Passwords picker in a WKWebView. | Verify actual login markup before changing hints. No blanket rewriting of third-party forms. |
+| AppKit `NSTextField.contentType = .username`, `NSSecureTextField.contentType = .password` | Apple explicitly documents AppKit AutoFill since macOS 11; these declarations are present in the local SDK. | Applies to native AppKit fields, not HTML fields in WKWebView. A separate native credential panel does not meet the clarified requirement and will not be added. |
+| `ASAuthorizationPasswordProvider` | Available on macOS, but website credential sharing requires the app/site association and user consent. The request has no arbitrary target-domain parameter in the SDK. | Cannot independently request the user's Polimi/Sielte password by adding a domain to BeepBar's entitlement; the site administrator must approve the app in its AASA file. |
+| System AutoFill context menu | WWDC24 describes inserting usernames, passwords or codes into text fields. Its `ProvidesTextToInsert` configuration belongs to a credential-provider extension. | Preserve WebKit's default context menu. BeepBar is a consumer; adding provider plist keys does not grant access to Apple Passwords. Generic manual selection differs from domain-filtered suggestions. |
+| `performAutoFillAssistedRequests()` | The local AuthenticationServices header marks it unavailable on macOS. | Not a macOS WKWebView solution. |
+| `ASCredentialDataManager.save(password:for:title:anchor:)` and `ASAutoFillURLScope` | Save/update credentials; requires webcredentials association or the browser entitlement. | No read/select-credentials API; not a solution for filling an existing Polimi password. |
+| `ASAuthorizationWebBrowserPublicKeyCredentialManager` | Browser access to passkeys / WebAuthn challenges. | Does not expose saved ordinary passwords. |
+| macOS 27 `WKContentWorld.Configuration.autofillScriptingEnabled` | Enables extra capabilities for app-authored autofill scripts; Apple's documentation says it does not change default WebKit behavior. | Not an Apple Passwords enablement flag. |
+| `ASWebAuthenticationSession` | System-mediated web authentication, requiring an appropriate callback contract. | Does not meet the retained embedded WKWebView/cookie flow as a drop-in replacement. |
+
+The code retains the WebKit context menu and routes Cmd-V through the responder chain; there is no existing overridden context menu suppressing Passwords. No public API was identified that guarantees Safari-style password suggestions for arbitrary third-party domains in this macOS WKWebView. This is a scoped research result, not proof that every future system context-menu path is impossible.
+
+The earlier native-panel recommendation is withdrawn following the clarified requirement. No panel or credential-transfer bridge was added. Direct in-page Apple Passwords suggestions remain unimplemented: the documented native-field APIs do not establish support for this WKWebView, and HTML autocomplete hints alone are not evidence of a working integration. The branch does not advertise Apple Passwords integration or add private APIs.
+
+Primary sources consulted:
+
+- [Apple: AutoFill everywhere, WWDC20](https://developer.apple.com/videos/play/wwdc2020/10115/) — AppKit fields and content types.
+- [Apple: HTML AutoFill hints](https://developer.apple.com/documentation/security/enabling-password-autofill-on-an-html-input-element).
+- [Apple Platform Security: app access to saved passwords](https://support.apple.com/en-ca/guide/security/sec8762eb992/web) — mutual app/site approval and consent.
+- [Apple: credential managers, WWDC24](https://developer.apple.com/videos/play/wwdc2024/10125/) — text insertion and provider capabilities.
+- [Apple: ProvidesTextToInsert](https://developer.apple.com/documentation/bundleresources/information-property-list/providestexttoinsert).
+- [Apple: credential save API](https://developer.apple.com/documentation/authenticationservices/ascredentialdatamanager/save(password:for:title:anchor:)).
+- [Apple: browser WebAuthn support](https://developer.apple.com/documentation/authenticationservices/password-use-in-web-browsers).
+- [Apple: WKContentWorld.Configuration](https://developer.apple.com/documentation/webkit/wkcontentworld/configuration).
+
+Verification: the complete suite passed 1,104 tests (530 core Swift Testing, 31 benchmark Swift Testing, 529 app Swift Testing, 14 app XCTest); the unsigned Release build and `git diff --check` passed. Independent review found an account-owner cleanup edge case after disabling; it was fixed and the same reviewer reported no remaining actionable findings. The regression covers retaining positions for the same account and removing them for another account even with no remaining Polimi session.
+
+In a disposable source copy, removing fresh-cookie retry, service-error classification and toggle preservation caused assertion failures in their new regressions. Separately removing owner cleanup while retaining toggle preservation failed the owner-change regression. No compilation failure was counted as regression evidence. The complete suite passed again on the original sources after those mutations (the same 1,104 tests). No app-wide performance claim is made; comparative performance measurements are not applicable to these correctness fixes.

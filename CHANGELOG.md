@@ -2,14 +2,17 @@
 
 ## Unreleased
 
+- Retry an expired Polimi sign-in with a fresh session. A service-unavailable page ends the attempt instead of leaving Recordings waiting.
+- Keep playback positions when Recordings is turned off and back on.
+
 ### New
 
 - Watch lecture recordings right inside BeepBar instead of in the browser, with the usual video controls, speeds from 0.5x to 3x, 10 and 30 second skips and keyboard shortcuts. A lecture picks up where you stopped, and if the connection drops it resumes on its own. If a recording can't be played inside BeepBar, it still opens in your browser, and "Open in browser" in a recording's menu always opens it there.
 - To sign in to Webex for you, BeepBar uses the Polimi email from your WeBeep profile, with nothing to confirm. You can see, change or remove it in Settings › Recordings, and it stays on your Mac.
 - Save lessons from different courses in a single Watchlist inside Recordings. Add or remove bookmarks and find your saved list again after restarting.
-- Telemetry is enabled by default to count active installations and app versions with one daily ping. Turn it off in Settings; the info button explains what is sent. No account, course or file information is included.
+- Telemetry is enabled by default to count how many people use BeepBar and how, with one daily ping: the app and macOS versions, the language and which settings are on, under a random identifier that changes every month. Turn it off in Settings, which also deletes the identifier; the info button explains what is sent. No account, course or file information is included.
 
-**After updating:** the first time you press Play or open Settings › Recordings, BeepBar may read your email from WeBeep and sign in to Webex on its own; if no Polimi email is available, recordings that need that sign-in don't open until you enter one in Settings. Turning Recordings off or disconnecting also deletes the Webex sign-in, the email and where you stopped.
+**After updating:** the first time you press Play or open Settings › Recordings, BeepBar may read your email from WeBeep and sign in to Webex on its own; if no Polimi email is available, recordings that need that sign-in don't open until you enter one in Settings. Turning Recordings off deletes the Webex sign-in and the email but preserves where you stopped. Disconnecting also removes playback positions.
 
 ### Improved
 
@@ -26,6 +29,8 @@
 - Expanding a course in Activity with more than 200 new, moved or failed files now shows the first 200, with a link below them (“Mostra altri…”) that reveals more, down to the last one, so opening a large course stays quick.
 
 ### Fixed
+
+- Watching a lecture in BeepBar keeps the display and Mac awake during video playback.
 
 - Renaming a course folder works after restoring or copying your files to another Mac, without extra prompts and while keeping your files tracked.
 

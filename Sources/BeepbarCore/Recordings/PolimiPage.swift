@@ -9,11 +9,13 @@ public struct PolimiPageFacts: Sendable, Equatable, Codable {
     public var hasAutomaticRedirectForm: Bool
     /// A visible password or one-time-code field: only the user can fill it in.
     public var asksForCredentials: Bool
+    public var hasServiceError: Bool
 
-    public init(hasArchiveForm: Bool = false, hasAutomaticRedirectForm: Bool = false, asksForCredentials: Bool = false) {
+    public init(hasArchiveForm: Bool = false, hasAutomaticRedirectForm: Bool = false, asksForCredentials: Bool = false, hasServiceError: Bool = false) {
         self.hasArchiveForm = hasArchiveForm
         self.hasAutomaticRedirectForm = hasAutomaticRedirectForm
         self.asksForCredentials = asksForCredentials
+        self.hasServiceError = hasServiceError
     }
 
     /// Nil when the probe's output isn't what it returns, so an unreadable page is never
@@ -49,6 +51,7 @@ public enum PolimiPage {
     public enum Verdict: Sendable, Equatable {
         /// The archive with its search form: where every entry is headed.
         case archive
+        case serviceUnavailable
         /// A page only the user can move on (credentials, 2FA).
         case needsUser
         /// A page that should move on by itself. If it is still there after `patience`, it is
@@ -72,6 +75,7 @@ public enum PolimiPage {
             return .archive
         }
         let isLoginHost = loginHosts.contains(host)
+        if isLoginHost, facts.hasServiceError { return .serviceUnavailable }
         if facts.hasAutomaticRedirectForm {
             return .transit(patience: autoSubmitPatience, ifStill: isLoginHost ? .needsUser : .unrecognized)
         }

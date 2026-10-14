@@ -109,6 +109,13 @@ struct RecmanScriptsTests {
         #expect(PolimiPageFacts.decode(try #require(await partial.run(RecmanScripts.pageFacts)))?.hasArchiveForm == false)
     }
 
+    @Test func pageFactsDetectThePolimiServiceError() async throws {
+        let page = await FixturePage("<div>Il servizio richiesto non è presente.</div>")
+        #expect(PolimiPageFacts.decode(try #require(await page.run(RecmanScripts.pageFacts)))?.hasServiceError == true)
+        let hidden = await FixturePage("<div style='display:none'>Il servizio richiesto non è presente.</div><input type='password'>")
+        #expect(PolimiPageFacts.decode(try #require(await hidden.run(RecmanScripts.pageFacts)))?.hasServiceError == false)
+    }
+
     // MARK: Search
 
     /// The search sets the course and year and empties every other filter, so a date range or a

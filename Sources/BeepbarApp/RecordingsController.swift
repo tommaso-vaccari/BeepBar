@@ -1209,7 +1209,8 @@ struct RecordingsListing: Equatable {
                                                  added: Set(wanted).subtracting(queued).subtracting([runningKey].compactMap { $0 }))
         // With a page on screen the browser stays for it; otherwise it closes when the queue drains.
         if visiblePages == 0 { closesBrowserWhenIdle = true }
-        enqueueBackground(wanted)
+        // The session check first: `startWorker` opens nothing while it is pending, and without
+        // a saved session the browser must never be created.
         if !hasCheckedInitialSession {
             let check = beginInitialSessionCheck()
             Task { [weak self] in
@@ -1218,6 +1219,7 @@ struct RecordingsListing: Equatable {
                 _ = self.answerInitialSessionCheck(check, cookies: cookies)
             }
         }
+        enqueueBackground(wanted)
         return await withTaskCancellationHandler {
             await withCheckedContinuation { (continuation: CheckedContinuation<RecordingsSyncOutcome, Never>) in
                 if let result = backgroundResults.removeValue(forKey: id) {

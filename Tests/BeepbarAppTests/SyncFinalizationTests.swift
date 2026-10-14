@@ -881,11 +881,23 @@ struct ConflictChoiceFeedbackTests {
         #expect(controller.conflictChoiceFeedback == nil)
     }
 
+    /// Waits until the controller's resolve `Task` has finished.
+    ///
+    /// The old version spun on `Task.yield()` with a 5 s deadline and threw `CocoaError(.userCancelled)`
+    /// (the "Code=3072 The operation was cancelled" seen in CI run 38532584874). Under the full parallel
+    /// suite the whole process stalled for ~12 s (every test in that window reports ~12.3 s), so the
+    /// resolve Task (database + file store hops) was starved, not stuck, and the short deadline fired.
+    /// The yield loop also kept the main actor busy, competing with the Task it waited for. Now it
+    /// sleeps between checks with a generous deadline; a real hang still fails, with a message that
+    /// says what was waited for.
     @MainActor private func waitForChoice(_ controller: WeBeepAuthenticationController) async throws {
-        let deadline = ContinuousClock.now + .seconds(5)
+        let deadline = ContinuousClock.now + .seconds(60)
         while controller.resolvingConflictID != nil || controller.resolvingRemoteChangeID != nil {
-            guard ContinuousClock.now < deadline else { throw CocoaError(.userCancelled) }
-            await Task.yield()
+            guard ContinuousClock.now < deadline else {
+                Issue.record("The conflict choice never finished (resolving flags still set after 60 s).")
+                return
+            }
+            try? await Task.sleep(for: .milliseconds(2))
         }
     }
 }

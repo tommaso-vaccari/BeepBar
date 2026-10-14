@@ -201,7 +201,11 @@ struct RecordingsListing: Equatable {
     private var menuPlayCourse: (recordingID: String, courseID: Int64)?
     /// The Now Playing metadata of the lecture last handed to the player, so a recovery
     /// (`startPlayer` again with a fresh stream) shows the same course and picture even if the
-    /// page has moved to another course meanwhile. Cleared with the player on identity change.
+    /// page has moved to another course meanwhile. Reused only for a recovery
+    /// (`recoveredLectures`), never for a new Play of the same lecture: that one may come from
+    /// another course's page, or after the course list gained the picture (the first launch
+    /// after an update has none yet). Cleared when the player closes, on identity change, and
+    /// replaced by the next lecture.
     private var playbackMetadata: (recordingID: String, metadata: RecordingPlaybackMetadata)?
     /// The WeBeep profile's email address, or nil: any failure is "ask the user", never an error.
     private let fetchProfileEmail: @MainActor () async -> String?
@@ -1330,11 +1334,13 @@ struct RecordingsListing: Equatable {
         startWatchSession(for: recording, at: startAt ?? 0, streamDuration: stream.duration)
     }
 
-    /// What Now Playing shows for `recording`: the same metadata as before when this is the
-    /// lecture already handed to the player (a recovery, a Play again), else its title with the
-    /// course the student chose (`playbackCourse`).
+    /// What Now Playing shows for `recording`: the same metadata as before when this is a
+    /// recovery of the lecture still in the player, else its title with the course the student
+    /// chose (`playbackCourse`), read afresh.
     private func playbackMetadata(for recording: RecmanRecording, stream: RecordingStream) -> RecordingPlaybackMetadata {
-        if let playbackMetadata, playbackMetadata.recordingID == recording.id { return playbackMetadata.metadata }
+        if let playbackMetadata, playbackMetadata.recordingID == recording.id, recoveredLectures.contains(recording.id) {
+            return playbackMetadata.metadata
+        }
         var preferred: Int64?
         if let menuPlayCourse, menuPlayCourse.recordingID == recording.id { preferred = menuPlayCourse.courseID }
         else if case .course(let id) = study.destination { preferred = id }
@@ -1427,6 +1433,8 @@ struct RecordingsListing: Equatable {
     /// same report is a watch-progress checkpoint (`recordWatchCheckpoint`).
     private func playerCheckpoint(_ checkpoint: RecordingCheckpoint) {
         let id = checkpoint.id
+        // The lecture left the player: its Now Playing metadata is no longer a recovery's to reuse.
+        if checkpoint.reason == .closed, playbackMetadata?.recordingID == id { playbackMetadata = nil }
         guard let recording = nowPlaying[id], let owner = resumeOwner() else { return }
         recordWatchCheckpoint(checkpoint, of: recording, owner: owner)
         let update = RecordingPlaybackProgress.update(position: checkpoint.position, duration: checkpoint.duration)

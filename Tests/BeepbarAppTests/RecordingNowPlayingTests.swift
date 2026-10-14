@@ -554,6 +554,11 @@ struct RecordingNowPlayingTests {
         if let ivar = class_getInstanceVariable(type(of: command), "_handlers"), let handlers = object_getIvar(command, ivar) as? NSDictionary {
             return handlers.count
         }
+        // A weaker check from here on (it cannot see two targets): make that visible rather than
+        // let "one target each after a re-activate" pass silently.
+        withKnownIssue("MPRemoteCommand._handlers is gone on this macOS: counting targets with hasTargets, which cannot see a doubled target", isIntermittent: true) {
+            Issue.record("\(name): target count read from hasTargets")
+        }
         try #require(command.responds(to: NSSelectorFromString("hasTargets")))
         return (command.value(forKey: "hasTargets") as? Bool) == true ? 1 : 0
     }

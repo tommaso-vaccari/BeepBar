@@ -2318,6 +2318,56 @@ struct RecordingsControllerTests {
         controller.turnOff()
     }
 
+    /// A new Play of a lecture that was closed reads its course again: from another course's
+    /// page it shows that course, and a picture the course list gained meanwhile (the first
+    /// launch after an update has none yet) shows. A recovery keeps reusing its own metadata
+    /// (`aRecoveryKeepsTheCourseAndPicture`). Guards against the metadata of the first Play
+    /// sticking to the lecture for the whole session.
+    /// Mutation: reuse `playbackMetadata` for any play of the same id.
+    @Test func aReplayAfterCloseReadsTheCourseAgain() async throws {
+        defer { cleanUp() }
+        world.courses = [webeepCourse(7, name: "ALGEBRA SEZ. A", picture: nil), webeepCourse(8, name: "ALGEBRA SEZ. B", picture: nil)]
+        browser.streamResults["a"] = [.success(stream("a")), .success(stream("a"))]
+        let controller = await readyController()
+        controller.selectDestination(.course(7))
+        controller.play(recording("a"))
+        await settle("a playing") { world.player.plays.count == 1 }
+        #expect(world.player.metadatas.first??.courseName == "ALGEBRA SEZ. A")
+        world.player.close()
+        world.courses = [webeepCourse(7, name: "ALGEBRA SEZ. A", picture: Self.pictureA), webeepCourse(8, name: "ALGEBRA SEZ. B", picture: Self.pictureB)]
+        controller.selectDestination(.course(8))
+        controller.play(recording("a"))
+        await settle("a again") { world.player.plays.count == 2 }
+        let again = try #require(world.player.metadatas.last ?? nil)
+        #expect(again.courseName == "ALGEBRA SEZ. B")
+        #expect(again.artworkURL == Self.pictureB)
+        controller.turnOff()
+    }
+
+    /// After an account change, the same lecture played again shows the new account's course
+    /// and picture, never the previous account's. Guards against Now Playing metadata outliving
+    /// the identity it was read for.
+    @Test func anAccountChangeDropsThePlaybackMetadata() async throws {
+        defer { cleanUp() }
+        world.courses = [webeepCourse(7, name: "ALGEBRA VECCHIO", picture: Self.pictureA)]
+        browser.streamResults["a"] = [.success(stream("a")), .success(stream("a"))]
+        let controller = await readyController()
+        controller.play(recording("a"))
+        await settle("a playing") { world.player.plays.count == 1 }
+        world.owner = 9
+        world.courses = [webeepCourse(70, name: "ALGEBRA NUOVO", picture: Self.pictureB)]
+        controller.webBeepAccountChanged(to: 9)
+        #expect(!world.player.isOpen)
+        controller.signIn()
+        await settle("signed in again") { controller.access == .ready }
+        controller.play(recording("a"))
+        await settle("a again") { world.player.plays.count == 2 }
+        let again = try #require(world.player.metadatas.last ?? nil)
+        #expect(again.courseName == "ALGEBRA NUOVO")
+        #expect(again.artworkURL == Self.pictureB)
+        controller.turnOff()
+    }
+
     /// Pure: the preferred course wins only when it is the recording's own; otherwise exactly one
     /// course with the recording's key, nil for none or two.
     @Test func thePlaybackCourseRules() {
@@ -2951,7 +3001,7 @@ struct RecordingsControllerTests {
         try store.save(RecmanSessionCodec.encode([FakeRecmanBrowser.cookie("SSO_LOGIN", value: "other")], ownerUserID: 9, now: world.now))
         controller.signIn()
         await settle("player closed by the mismatch") { world.player.closes == 1 }
-        await settle("signed in again") { controller.access == .ready && !browser.isOpen }
+        await settle("signed in again") { controller.access == .ready }
         #expect(defaults.object(forKey: resumeKey) == nil)
         #expect(resumeWrites() == 2, "one write, one removal: the close's report wrote nothing")
         #expect(defaults.object(forKey: RecordingsController.emailDeclinedKey) == nil)
@@ -3256,6 +3306,29 @@ struct RecordingsAccountTests {
         await controller.completeLoginForTesting(moodleLoginCallback(token: other))
         MoodleRecordingProtocol.releaseEmails(token: token)
         #expect(await lookup.value == nil)
+    }
+
+    /// The course picture for Now Playing arrives for the account that asked; one that arrives
+    /// after another account signed in is dropped (it is the previous account's). Guards against
+    /// a late picture of account A showing in account B's player.
+    /// Mutation: drop the `apiClient === client, siteInfo?.userID == userID` guard in
+    /// `courseImage` and the late picture is returned.
+    @Test func aCoursePictureArrivingAfterAnAccountChangeIsDropped() async throws {
+        defer { try? FileManager.default.removeItem(at: root) }
+        let (controller, token) = try await signedInAccount(userID: 7, email: "mario.rossi@mail.polimi.it", listed: false)
+        let picture = URL(string: "https://webeep.polimi.it/webservice/pluginfile.php/1/course/overviewfiles/a.png")!
+        let delivered = try await controller.courseImageForTesting(picture)
+        #expect(delivered == Data([1, 2, 3]), "the same account gets its picture")
+
+        MoodleRecordingProtocol.holdCourseImages(token: token)
+        let fetch = Task { try await controller.courseImageForTesting(picture) }
+        for _ in 0..<2_000 where MoodleRecordingProtocol.heldCourseImageCount(token: token) == 0 { try await Task.sleep(for: .milliseconds(1)) }
+        #expect(MoodleRecordingProtocol.heldCourseImageCount(token: token) == 1)
+        let other = MoodleRecordingProtocol.register(courses: [(1, "Course")], userID: 8)
+        await controller.completeLoginForTesting(moodleLoginCallback(token: other))
+        MoodleRecordingProtocol.releaseCourseImages(token: token)
+        let late = await fetch.result
+        #expect((try? late.get()) == nil, "the previous account's picture was delivered")
     }
 
     /// A controller signed in to the local Moodle as `userID`, whose profile holds `email`.

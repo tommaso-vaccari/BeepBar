@@ -366,7 +366,7 @@ struct RecordingsSyncRefreshTests {
 
     // MARK: Cancellation
 
-    /// Cancelling the caller with no page on screen answers `.cancelled` well within a second,
+    /// Cancelling the caller with no page on screen answers `.cancelled` without waiting for the page (the product target is 1 s),
     /// stops the worker, closes the browser and publishes nothing; the late answer is ignored
     /// and nothing resumes twice (a second resume would trap).
     /// Guards a cancelled sync leaving WebKit working for a minute. Mutations: drop the
@@ -380,10 +380,13 @@ struct RecordingsSyncRefreshTests {
         list(["a"])
         let task = Task { await controller.refreshForSync([course], force: false) }
         await settle("listing in flight") { gate.isWaiting }
-        let started = ContinuousClock.now
         task.cancel()
+        // Answered while Polimi's page is still pending (the gate is closed): nothing is awaited
+        // first. A wall-clock bound is deliberately not asserted: parallel @MainActor suites can
+        // starve the main actor for seconds on a loaded machine, and the property is "not
+        // waiting for the page", not a stopwatch.
         #expect(await task.value == .cancelled)
-        #expect(ContinuousClock.now - started < .seconds(1))
+        #expect(gate.isWaiting, "the listing is still parked: the caller was not made to wait for it")
         #expect(!browser.isOpen)
         gate.release()
         await drainTasks()

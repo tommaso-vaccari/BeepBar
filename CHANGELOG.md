@@ -35,6 +35,8 @@
 
 ### Fixed
 
+- Zooming while a lecture loads keeps the intended part of the picture in view, including after playback recovers.
+
 - Moving a local file to Trash and recovering a course-folder rename now preserve your files when the materials folder changes or a filesystem operation fails.
 
 - Closing a lecture or starting another one now cancels any late playback recovery for the previous lecture.

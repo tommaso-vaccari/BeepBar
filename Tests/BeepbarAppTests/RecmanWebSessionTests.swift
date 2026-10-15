@@ -97,7 +97,8 @@ struct RecmanWebSessionTests {
         let session = RecmanWebSession()
         await session.open(cookies: [])
         defer { session.close() }
-        #expect(session.webView?.url == nil)
+        let webView = try #require(session.webView)
+        #expect(webView.url == nil)
         #expect(try await session.probeArchive() == false)
         #expect(session.lastScriptCall == nil)
     }

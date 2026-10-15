@@ -99,15 +99,27 @@ enum RemoteMoveJournal {
         guard !pending.isEmpty else { return }
         for batch in Dictionary(grouping: pending, by: \.batchID).values {
             var arrived = true
+            var unchanged = true
             for move in batch {
-                guard case .present(let there)? = try? await fileStore.snapshotRegularFile(move.to, checksCancellation: false), there.sha256 == move.sha256 else { arrived = false; break }
-                if batch.count == 1, case .present(let left)? = try? await fileStore.snapshotRegularFile(move.from, checksCancellation: false), left.sha256 == move.sha256 { arrived = false; break }
+                let destination = try await fileStore.snapshotRegularFile(move.to, checksCancellation: false)
+                let source = try await fileStore.snapshotRegularFile(move.from, checksCancellation: false)
+                let destinationMatches: Bool
+                if case .present(let there) = destination { destinationMatches = there.sha256 == move.sha256 }
+                else { destinationMatches = false }
+                let sourceMatches: Bool
+                if case .present(let left) = source { sourceMatches = left.sha256 == move.sha256 }
+                else { sourceMatches = false }
+                arrived = arrived && destinationMatches && (batch.count > 1 || !sourceMatches)
+                unchanged = unchanged && sourceMatches
             }
-            if arrived, (try? await database.commitRemoteMoves(rootID: rootID, batch)) != nil {
+            if arrived {
+                try await database.commitRemoteMoves(rootID: rootID, batch)
                 if let move = batch.first, batch.count == 1 { try? await fileStore.removeEmptyParentDirectories(of: move.from) }
-                continue
+            } else if unchanged {
+                try await database.discardRemoteMoves(rootID: rootID, remoteIDs: batch.map(\.remoteID))
+            } else {
+                throw SyncDatabaseError.execution
             }
-            try await database.discardRemoteMoves(rootID: rootID, remoteIDs: batch.map(\.remoteID))
         }
     }
 }

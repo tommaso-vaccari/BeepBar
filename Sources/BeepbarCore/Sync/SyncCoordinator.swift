@@ -57,6 +57,7 @@ public actor SyncCoordinator {
     private func synchronizeWithinLease(targets: [SyncTarget], token: String, mode: SyncCoordinatorMode, networkAccess: NetworkAccess, progress: @escaping @Sendable (SyncProgress) async -> Void) async throws -> SyncProgress {
         try Task.checkCancellation()
         guard try await database.hasPendingModuleMoves(rootID: rootID) == false else { throw SyncDatabaseError.execution }
+        guard try await database.pendingScopeMoves().contains(where: { $0.rootID == rootID }) == false else { throw SyncDatabaseError.execution }
         guard !targets.isEmpty else { return SyncProgress(completed: 0, total: 0, installed: 0, preservedLocal: 0, unchanged: 0, conflicts: 0, failures: 0) }
         // Before any baseline is read: a move interrupted by a crash is completed or dropped first.
         try await RemoteMoveJournal.recover(rootID: rootID, database: database, fileStore: fileStore)
@@ -542,6 +543,8 @@ public actor SyncCoordinator {
                 try await database.discardRemoteMoves(rootID: rootID, remoteIDs: [mover.id, holder.id])
                 try await move(mover, to: try await numberedFreePath(for: mover.target, owners: state.owners), state: &state)
                 continue
+            } catch FileStoreError.mutationNotDurable {
+                throw FileStoreError.mutationNotDurable
             } catch {
                 try await database.discardRemoteMoves(rootID: rootID, remoteIDs: [mover.id, holder.id])
                 continue
@@ -574,6 +577,8 @@ public actor SyncCoordinator {
                 try await database.discardRemoteMoves(rootID: rootID, remoteIDs: [mover.id])
                 candidate = try await numberedFreePath(for: mover.target, owners: state.owners)
                 continue
+            } catch FileStoreError.mutationNotDurable {
+                throw FileStoreError.mutationNotDurable
             } catch {
                 try await database.discardRemoteMoves(rootID: rootID, remoteIDs: [mover.id])
                 if error is CancellationError { throw error }
@@ -705,6 +710,7 @@ public actor SyncCoordinator {
             let step = PendingRemoteMove(batchID: UUID(), remoteID: ghost.remoteID, from: ghost.relativePath, to: destination, sha256: snapshot.sha256, placement: RemotePlacement(file))
             try await database.beginRemoteMoves(rootID: rootID, [step])
             do { try await fileStore.moveRegularFile(from: ghost.relativePath, to: destination, expected: snapshot) }
+            catch FileStoreError.mutationNotDurable { throw FileStoreError.mutationNotDurable }
             catch {
                 try await database.discardRemoteMoves(rootID: rootID, remoteIDs: [ghost.remoteID])
                 if error is CancellationError { throw error }

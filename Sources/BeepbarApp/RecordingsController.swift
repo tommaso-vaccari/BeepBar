@@ -159,6 +159,7 @@ struct RecordingsListing: Equatable {
 ///   first). A failure of this refresh is never shown as a sync failure.
 @MainActor final class RecordingsController: ObservableObject {
     nonisolated static let enabledKey = "io.github.tvaccari.beepbar.recordings-enabled.v1"
+    private static let sessionDiscardedKey = "io.github.tvaccari.beepbar.recordings-session-discarded.v1"
 
     /// The switch as saved: on by default, and off wherever the feature isn't available. Shared by
     /// `init` and by readers that must not create the controller (daily telemetry).
@@ -249,6 +250,7 @@ struct RecordingsListing: Equatable {
     private var nowPlaying: [String: RecmanRecording] = [:]
     /// The lecture last handed to the player, for recoveries that outlive a newer Play.
     private var currentLectureID: String?
+    private var playbackIntent = 0
     /// Lectures already given their one fresh stream since the student pressed Play.
     private var recoveredLectures: Set<String> = []
     private var resumePoints: RecordingResumePoints?
@@ -961,6 +963,7 @@ struct RecordingsListing: Equatable {
         // A newer click replaces a menu Play: its failure is no longer the menu's.
         menuPlay = nil
         openingRequest += 1
+        if action == .play { playbackIntent += 1 }
         openingProblem = nil
         openingRecordingID = recording.id
         // The cached path must replace pending openings too, or a slow lookup can later
@@ -1686,6 +1689,7 @@ struct RecordingsListing: Equatable {
     /// same report is a watch-progress checkpoint (`recordWatchCheckpoint`).
     private func playerCheckpoint(_ checkpoint: RecordingCheckpoint) {
         let id = checkpoint.id
+        if checkpoint.reason == .closed, currentLectureID == id { playbackIntent += 1 }
         // The lecture left the player: its Now Playing metadata is no longer a recovery's to reuse.
         // A defensive duplicate of the `recoveredLectures` condition in `playbackMetadata(for:stream:)`
         // (a fresh Play removes the lecture from that set first); it only frees the stored value.
@@ -2188,20 +2192,27 @@ struct RecordingsListing: Equatable {
     private func recoverPlayback(_ recording: RecmanRecording, _ recovery: Recovery, browser: RecmanBrowsing, generation: Int) async throws {
         // The player link a failed fresh-stream lookup already found, for the browser below.
         var found: URL?
+        let intent = playbackIntent
+        let needsOpenPlayer: Bool
+        if case .freshStream = recovery { needsOpenPlayer = true } else { needsOpenPlayer = false }
+        let isCurrent = {
+            generation == self.generation && intent == self.playbackIntent
+                && self.currentLectureID == recording.id && (!needsOpenPlayer || self.stillShowing(recording))
+        }
         if case .freshStream(let position) = recovery {
             guard stillShowing(recording) else { return }
             recoveredLectures.insert(recording.id)
             if confirmedEmail == nil {
                 await learnEmail()
-                guard generation == self.generation else { return }
+                guard isCurrent() else { return }
             }
             do {
                 let stream = try await browser.stream(for: recording, email: confirmedEmail)
-                guard generation == self.generation, stillShowing(recording) else { return }
+                guard isCurrent() else { return }
                 startPlayer(stream, for: recording, startAt: position)
                 return
             } catch {
-                guard generation == self.generation else { return }
+                guard isCurrent() else { return }
                 let (cause, player) = Self.streamFailureCause(error)
                 found = player
                 let diagnosis = "play: recovery stream failed reason=\(Self.playFailureReason(cause).rawValue) error=\(PlaybackDiagnostics.errorName(cause))"
@@ -2219,14 +2230,14 @@ struct RecordingsListing: Equatable {
         }
         do {
             let url = try await playerLink(for: recording, browser: browser, found: found)
-            guard generation == self.generation else { return }
+            guard isCurrent() else { return }
             playbackURLs[recording.id] = url
             // The window of a lecture that can't continue is no use next to the browser. Closing
             // it reports the position, so the student's place is kept.
             if currentLectureID == recording.id { player?.close() }
             openURL(url)
         } catch {
-            guard generation == self.generation else { return }
+            guard isCurrent() else { return }
             if error is CancellationError || (error as? RecmanBrowserError) == .needsSignIn { throw error }
             openingProblem = RecordingsProblem(error)
             log.error("Couldn't open a failed lecture in the browser")
@@ -2596,6 +2607,10 @@ struct RecordingsListing: Equatable {
     /// right now (a disk error) is kept for the next try. Read off the main actor, once per
     /// opening cycle: later callers in the same cycle share the first read.
     private func savedCookies() async -> [HTTPCookie] {
+        if defaults.bool(forKey: Self.sessionDiscardedKey) {
+            emailLoaded = true
+            return []
+        }
         if let sessionLoad { return await sessionLoad.task.value }
         sessionLoads += 1
         let id = sessionLoads
@@ -2614,7 +2629,7 @@ struct RecordingsListing: Equatable {
     /// Applies a finished read on the main actor, unless turn-off, logout or an account change
     /// discarded the session since it started: what was read is being deleted.
     private func adopt(_ outcome: RecmanSessionVault.LoadOutcome, epoch: Int, load: Int) -> [HTTPCookie] {
-        guard vault.epoch == epoch else { return [] }
+        guard vault.epoch == epoch, !defaults.bool(forKey: Self.sessionDiscardedKey) else { return [] }
         let snapshot: RecmanSessionCodec.Snapshot
         switch outcome {
         case .unreadable:
@@ -2693,10 +2708,15 @@ struct RecordingsListing: Equatable {
         let keepFileEmail = !emailLoaded && !emailEditedByUser
         switch await vault.save(cookies, ownerUserID: owner, email: confirmedEmail?.value, keepingFileEmail: keepFileEmail, epoch: epoch, now: now()).value {
         case .saved:
+            if generation == self.generation, vault.epoch == epoch, defaults.bool(forKey: Self.sessionDiscardedKey) {
+                defaults.removeObject(forKey: Self.sessionDiscardedKey)
+            }
             // The cycle's cached read now describes an older file.
             sessionLoad = nil
         case .unchanged:
-            break
+            if generation == self.generation, vault.epoch == epoch, defaults.bool(forKey: Self.sessionDiscardedKey) {
+                defaults.removeObject(forKey: Self.sessionDiscardedKey)
+            }
         case .stale:
             log.notice("Polimi session not saved: discarded while saving")
         case .failed(let errorType):
@@ -2707,6 +2727,7 @@ struct RecordingsListing: Equatable {
     /// Bumps the vault epoch now, so every save already under way is refused, and deletes the
     /// file in turn, off the main actor.
     private func discardSessionFile() {
+        defaults.set(true, forKey: Self.sessionDiscardedKey)
         sessionOwner = nil
         sessionLoad = nil
         // The email lives in the file and goes with it, in memory too.

@@ -17,7 +17,7 @@
 - Zoom into the lecture video in the player with a pinch or with ⌘+, ⌘− and ⌘0, and drag to move around while zoomed.
 - Telemetry is enabled by default to count how many people use BeepBar and how, with one daily ping: the app and macOS versions, the language and which settings are on, under a random identifier that changes every month. Turn it off in Settings, which also deletes the identifier; the info button explains what is sent. No account, course or file information is included.
 
-**After updating:** the first time you press Play or open Settings › Recordings, BeepBar may read your email from WeBeep and sign in to Webex on its own; if no Polimi email is available, recordings that need that sign-in don't open until you enter one in Settings. Turning Recordings off deletes the Webex sign-in and the email but preserves where you stopped. Disconnecting also removes playback positions. Every lecture starts at 0% progress after updating: tick “Done” for the ones you have already watched. The menu's Recordings lines appear once a course's recordings have been loaded, which happens at your next sync if you are signed in to Polimi; the first load of a course never triggers a “new recordings” notification, and turning Recordings off removes your progress.
+**After updating:** the first time you press Play or open Settings › Recordings, BeepBar may read your email from WeBeep and sign in to Webex on its own; if no Polimi email is available, recordings that need that sign-in don't open until you enter one in Settings. Turning Recordings off deletes the Webex sign-in and the email but preserves where you stopped. Disconnecting also removes playback positions. Every lecture starts at 0% progress after updating: tick “Done” for the ones you have already watched. The first load of a course never triggers a “new recordings” notification, and turning Recordings off removes your progress.
 
 ### Improved
 
@@ -34,6 +34,12 @@
 - Expanding a course in Activity with more than 200 new, moved or failed files now shows the first 200, with a link below them (“Mostra altri…”) that reveals more, down to the last one, so opening a large course stays quick.
 
 ### Fixed
+
+- Moving a local file to Trash and recovering a course-folder rename now preserve your files when the materials folder changes or a filesystem operation fails.
+
+- Closing a lecture or starting another one now cancels any late playback recovery for the previous lecture.
+
+- Turning Recordings off keeps the discarded Webex sign-in and email from returning, even if their saved file could not be deleted.
 
 - After a period offline, the course list no longer stays on “Couldn't refresh courses” once you are back online: with the window open, BeepBar tries again by itself when the connection returns, and the message goes away as soon as the list is updated.
 

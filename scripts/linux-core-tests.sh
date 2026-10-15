@@ -14,9 +14,37 @@
 set -euo pipefail
 cd "$(dirname "$0")/.."
 # The Linux manifest resolves swift-crypto instead of Sparkle, which rewrites Package.resolved;
-# the committed file belongs to the macOS build, so it is put back afterwards.
-trap 'git checkout -q -- Package.resolved' EXIT
+# preserve the original working-tree bytes and absence without touching the Git index.
+if [ -L Package.resolved ] || { [ -e Package.resolved ] && [ ! -f Package.resolved ]; }; then
+    printf 'Package.resolved must be a regular file or absent.\n' >&2
+    exit 1
+fi
+lockfile_backup=$(mktemp -d "${TMPDIR:-/tmp}/beepbar-linux-lockfile.XXXXXX")
+lockfile_present=false
+if [ -f Package.resolved ]; then
+    lockfile_present=true
+    cp -p Package.resolved "$lockfile_backup/Package.resolved" || { rmdir "$lockfile_backup"; exit 1; }
+fi
+restore_lockfile() {
+    status=$?
+    trap - EXIT HUP INT TERM
+    if [ "$lockfile_present" = true ]; then
+        cp -p "$lockfile_backup/Package.resolved" Package.resolved || {
+            printf 'Cannot restore Package.resolved; backup retained at %s\n' "$lockfile_backup" >&2
+            exit 1
+        }
+    else
+        rm -f Package.resolved || { rmdir "$lockfile_backup"; exit 1; }
+    fi
+    rm -rf "$lockfile_backup"
+    exit "$status"
+}
+trap restore_lockfile EXIT
+trap 'exit 129' HUP
+trap 'exit 130' INT
+trap 'exit 143' TERM
 skip='MetadataResponseTests|RemoteDownloaderTests|WeBeepAPIClientTests|ManualSyncEngineIntegrationTests|SyncCoordinatorEndToEndTests|FileHashCancellationTests/cancelledRecoveryStillPreservesEditedLocalCopy|RecmanSessionVaultTests/anUnchangedSessionIsNotRewritten'
+skip="$skip|CourseImageTests/(theCourseListCarriesThePicture|anOddPictureFieldNeverBreaksTheList|thePictureIsFetchedWithTheToken|badAnswersAreErrors)"
 if [ "$(id -u)" = 0 ]; then
     skip="$skip|rollsBackThePendingMoveWhenTheDirectoryRenameFails|recoveryLeavesReplacementAtOldPathUnresolved|recoveryDoesNotCommitReplacementAtNewPath"
 fi

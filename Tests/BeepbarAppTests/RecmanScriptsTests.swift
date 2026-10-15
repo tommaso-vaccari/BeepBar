@@ -11,15 +11,16 @@ import BeepbarCore
 struct RecmanScriptsTests {
     private static let archiveURL = URL(string: "https://onlineservices.polimi.it\(RecmanURLPolicy.archivePath)")!
 
-    /// Loads `body` as if served at `url` and waits until WebKit has finished loading it. After
-    /// that, every page load the fixture asks for is recorded and refused, so a test sees where a
-    /// script would have gone without any request leaving the machine.
+    /// Loads `body` as if served at `url` and waits until WebKit has finished loading it. Subframes
+    /// are always refused; after loading, main-frame navigation is recorded and refused too, so
+    /// tests see where scripts would have gone without any request leaving the machine.
     @MainActor private final class FixturePage: NSObject, WKNavigationDelegate {
         let webView: WKWebView
         private var finished: CheckedContinuation<Void, Never>?
         private var loaded = false
         /// The page loads asked for since the fixture finished loading, in order.
         private(set) var requestedLoads: [URL] = []
+        private(set) var refusedFrameLoads: [URL] = []
 
         init(_ body: String, at url: URL = RecmanScriptsTests.archiveURL) async {
             let configuration = WKWebViewConfiguration()
@@ -40,7 +41,11 @@ struct RecmanScriptsTests {
         }
 
         func webView(_ webView: WKWebView, decidePolicyFor action: WKNavigationAction, decisionHandler: @escaping @MainActor (WKNavigationActionPolicy) -> Void) {
-            guard loaded, action.targetFrame?.isMainFrame ?? true else { return decisionHandler(.allow) }
+            guard action.targetFrame?.isMainFrame ?? true else {
+                if let url = action.request.url { refusedFrameLoads.append(url) }
+                return decisionHandler(.cancel)
+            }
+            guard loaded else { return decisionHandler(.allow) }
             if let url = action.request.url { requestedLoads.append(url) }
             decisionHandler(.cancel)
         }
@@ -261,6 +266,7 @@ struct RecmanScriptsTests {
         let linked = await FixturePage("<a href='https://example.com/x'>x</a><a href='https://politecnicomilano.webex.com/politecnicomilano/ldr.php?RCID=abc'>Guarda</a>")
         #expect(await linked.run(RecmanScripts.playbackLink) == "https://politecnicomilano.webex.com/politecnicomilano/ldr.php?RCID=abc")
         let framed = await FixturePage("<iframe src='https://politecnicomilano.webex.com/recordingservice/sites/politecnicomilano/recording/playback/abc'></iframe>")
+        #expect(framed.refusedFrameLoads.contains(URL(string: "https://politecnicomilano.webex.com/recordingservice/sites/politecnicomilano/recording/playback/abc")!))
         #expect(await framed.run(RecmanScripts.playbackLink)?.hasSuffix("/recording/playback/abc") == true)
         let lookalike = await FixturePage("<a href='https://politecnicomilano.webex.com.evil.com/ldr.php?RCID=a'>x</a>")
         #expect(await lookalike.run(RecmanScripts.playbackLink) == "")

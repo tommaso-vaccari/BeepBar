@@ -3,6 +3,30 @@ import Testing
 @testable import BeepbarCore
 
 struct CourseFolderRenamerTests {
+    @Test func retainsTheScopeJournalWhenDirectorySyncFailsAfterRename() async throws {
+        let root = try temporaryRoot()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let rootID = UUID()
+        let databaseURL = root.appending(path: "state.sqlite")
+        let database = try SyncDatabase(url: databaseURL)
+        try await database.registerRoot(id: rootID, canonicalPath: root.path)
+        let store = try FileStore(root: root, beforeMove: nil, syncDirectory: { _ in throw FileStoreError.ioFailure })
+        let identity = try await store.ensureTopLevelDirectory("Old").identity
+        try Data("local edit".utf8).write(to: root.appending(path: "Old/file.txt"))
+        try await database.upsertScope(SyncScope(rootID: rootID, courseID: 1, displayName: "Course", localFolder: "Old", enabled: true, managedDirectory: identity))
+        try await database.upsertBaseline(rootID: rootID, baseline: Baseline(remoteID: "file", relativePath: RelativePath("Old/file.txt"), sha256: "original", remoteRevision: "1"))
+        let renamer = CourseFolderRenamer(database: database, fileStore: store, gate: RootOperationGate())
+        await #expect(throws: FileStoreError.self) { try await renamer.rename(rootID: rootID, courseID: 1, from: "Old", to: "New") }
+        #expect(try await database.pendingScopeMoves().count == 1)
+        #expect(try await database.scope(rootID: rootID, courseID: 1)?.localFolder == "Old")
+        #expect(try Data(contentsOf: root.appending(path: "New/file.txt")) == Data("local edit".utf8))
+        let reopened = try SyncDatabase(url: databaseURL)
+        _ = try await RecoveryCoordinator(rootID: rootID, database: reopened, fileStore: FileStore(root: root)).recover()
+        #expect(try await reopened.pendingScopeMoves().isEmpty)
+        #expect(try await reopened.scope(rootID: rootID, courseID: 1)?.localFolder == "New")
+        #expect(try await reopened.baseline(rootID: rootID, remoteID: "file")?.relativePath == RelativePath("New/file.txt"))
+    }
+
     @Test func renamesDirectoryCreatedAfterScopeRegistration() async throws {
         let root = try temporaryRoot()
         defer { try? FileManager.default.removeItem(at: root) }

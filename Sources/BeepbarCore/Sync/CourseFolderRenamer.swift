@@ -53,6 +53,8 @@ public actor CourseFolderRenamer {
             try interruption?(.journaled)
             do {
                 try await fileStore.renameTopLevelDirectory(from: oldFolder, to: newFolder, expectedIdentity: currentIdentity)
+            } catch FileStoreError.mutationNotDurable {
+                throw FileStoreError.mutationNotDurable
             } catch {
                 // Nothing moved, so the prepared row describes a move that will never happen. Leaving
                 // it behind would trip the table's unique constraints on every later rename of this

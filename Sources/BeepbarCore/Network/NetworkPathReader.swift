@@ -6,7 +6,8 @@ import Network
 import os
 #endif
 
-/// Takes one network-path snapshot for Data Saver, without leaving a monitor running at rest.
+/// Network-path reads that never leave a monitor running at rest: one snapshot for Data Saver, or
+/// changes watched only for as long as the caller iterates them.
 public enum NetworkPathReader {
     /// Returns `nil` on timeout or cancellation. Callers must check cancellation before starting work.
     public static func current(timeout: Duration = .seconds(2)) async -> NetworkPathConditions? {
@@ -34,6 +35,34 @@ public enum NetworkPathReader {
             }
         }
 #endif
+    }
+
+    /// Whether the Mac has a usable route, first now and then at every network-path change, for
+    /// as long as the stream is iterated. The monitor stops when the iterating task is cancelled
+    /// or the stream is dropped, so callers own its lifetime: the course list watches only while
+    /// the window shows a connection failure, never at rest (#168). Only the latest value is
+    /// kept, so a slow consumer never builds a queue.
+    public static func reachabilityChanges() -> AsyncStream<Bool> {
+#if !canImport(Network)
+        return AsyncStream { $0.finish() }
+#else
+        return reachabilityChanges { yield in
+            let monitor = NWPathMonitor()
+            monitor.pathUpdateHandler = { yield($0.status == .satisfied) }
+            monitor.start(queue: DispatchQueue(label: "io.github.tvaccari.beepbar.network-return"))
+            return { monitor.cancel() }
+        }
+#endif
+    }
+
+    /// The stream around any monitor: `start` begins delivering values and returns what stops
+    /// it, which runs once the stream ends (consumer cancelled or stream dropped). Lets Core tests
+    /// prove the stop without a real `NWPathMonitor`.
+    internal static func reachabilityChanges(start: (@escaping @Sendable (Bool) -> Void) -> @Sendable () -> Void) -> AsyncStream<Bool> {
+        AsyncStream(bufferingPolicy: .bufferingNewest(1)) { continuation in
+            let stop = start { continuation.yield($0) }
+            continuation.onTermination = { _ in stop() }
+        }
     }
 
     internal static func current(start: @Sendable (

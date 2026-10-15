@@ -46,12 +46,12 @@ struct SettingsPage: View {
     }
 
     private var telemetrySection: some View {
-        Section("Telemetry") {
+        Section(tr("Telemetria", "Telemetry")) {
             Toggle(isOn: Binding(
                 get: { telemetry.isEnabled },
                 set: { telemetry.setEnabled($0) }
             )) {
-                SettingLabel("Telemetry", explanation: tr("Serve solo a contare quanti usano BeepBar e come. Invia a TelemetryDeck un ping al giorno con un identificativo casuale che cambia ogni mese, la versione dell’app e di macOS, la lingua e quali impostazioni sono attive (sincronizzazione automatica e frequenza, Risparmio dati, Registrazioni, apertura al login). Nessun dato dell’account, corso o file. Se lo spegni, l’identificativo viene cancellato.", "Used only to count how many people use BeepBar and how. Sends TelemetryDeck one daily ping with a random identifier that changes every month, the app and macOS versions, the language and which settings are on (automatic sync and its frequency, Data Saver, Recordings, open at login). No account, course or file data. Turning it off deletes the identifier."))
+                SettingLabel(tr("Telemetria", "Telemetry"), explanation: tr("Serve solo a contare quanti usano BeepBar e come. Invia a TelemetryDeck un ping al giorno con un identificativo casuale che cambia ogni mese, la versione dell’app e di macOS, la lingua e quali impostazioni sono attive (sincronizzazione automatica e frequenza, Risparmio dati, Registrazioni, apertura al login). Nessun dato dell’account, corso o file. Se lo spegni, l’identificativo viene cancellato.", "Used only to count how many people use BeepBar and how. Sends TelemetryDeck one daily ping with a random identifier that changes every month, the app and macOS versions, the language and which settings are on (automatic sync and its frequency, Data Saver, Recordings, open at login). No account, course or file data. Turning it off deletes the identifier."))
             }
             .disabled(!telemetry.isConfigured)
         }

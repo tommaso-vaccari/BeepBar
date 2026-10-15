@@ -3716,8 +3716,8 @@ enum MaterialsRunEnd: Equatable, Sendable {
     /// the file should be, or missing permissions), since the folder stays blocked until it is fixed.
     nonisolated static func unreadableMoveMessage(_ path: RelativePath) -> BilingualText {
         BilingualText(
-            "BeepBar non riesce a leggere «\(path.value)», dove stava spostando un file per seguire Moodle. Controlla che non ci sia un alias o una cartella al suo posto e che il file sia accessibile, poi sincronizza di nuovo.",
-            "BeepBar can't read “\(path.value)”, where it was moving a file to follow Moodle. Check that there's no alias or folder in its place and that the file is accessible, then sync again.")
+            "BeepBar non riesce a leggere «\(path.value)», che fa parte di uno spostamento per seguire Moodle rimasto a metà. Controlla che al suo posto non ci sia un alias o una cartella e che il file sia accessibile, poi premi «Sincronizza ora».",
+            "BeepBar can't read “\(path.value)”, part of a move to follow Moodle that was left halfway. Check that there's no alias or folder in its place and that the file is accessible, then choose “Sync now”.")
     }
 
     private func deferredAutomaticSync(_ operationID: UUID) {

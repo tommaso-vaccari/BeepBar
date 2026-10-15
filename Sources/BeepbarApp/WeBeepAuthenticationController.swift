@@ -512,6 +512,18 @@ enum MaterialsRunEnd: Equatable, Sendable {
     /// Bumped when the configuration window closes, so a window-open refresh still waiting for
     /// the bootstrap or the saved list knows its window is gone and loads nothing (#98).
     private var windowGeneration = 0
+    /// Whether the configuration window is open: from `refreshOnWindowOpen()` to `windowClosed()`.
+    /// A failed course refresh is retried by itself only while someone can see it (#168).
+    private var isWindowOpen = false
+    /// Watches the network while the window shows a course refresh that failed for lack of a
+    /// connection, and retries when the network comes back (#168). Without it, a window opened
+    /// right after waking, before Wi-Fi was up, kept "Impossibile aggiornare i corsi" until the
+    /// refresh button was pressed. Started by that failure, stopped when the list is confirmed,
+    /// on sign-out and when the window closes: never running at rest.
+    private var networkReturnWatch: Task<Void, Never>?
+    /// The network-path changes `networkReturnWatch` follows; tests drive it by hand, and no test
+    /// reaches the real `NWPathMonitor`.
+    private let reachabilityChanges: @Sendable () -> AsyncStream<Bool>
     /// True once the launch bootstrap has finished (always, in a test controller): until then the
     /// account isn't known, so an opening window shows the loading state, not a sign-in prompt.
     private var hasBootstrapped = false
@@ -864,6 +876,7 @@ enum MaterialsRunEnd: Equatable, Sendable {
         Self.defaults.set(storedAutomaticSyncInterval, forKey: Self.autoSyncIntervalKey)
         dataSaverEnabled = Self.storedDataSaverEnabled(in: Self.defaults)
         automaticSyncEnvironment = .system
+        reachabilityChanges = { NetworkPathReader.reachabilityChanges() }
         rootID = Self.storedRootID()
         // Resolved once here (a path lookup, no file is touched): the store calls it off the main
         // actor, where the preview flags can't be read.
@@ -959,7 +972,7 @@ enum MaterialsRunEnd: Equatable, Sendable {
     /// its own over the same folder, as two launches would have. `site` is Polimi unless a test
     /// needs another university from the first moment (Recordings exist only for Polimi).
     /// `language` sets the controller's own `language` only (see the init body).
-    init(testRootURL: URL, database: SyncDatabase? = nil, rootID: UUID? = nil, notificationCenter: NotificationCenterClient = InertNotificationCenter(), fileOpener: ActivityFileOpening = InertFileOpener(), apiClient: WeBeepAPIClient? = nil, downloader: RemoteDownloader? = nil, credentialVault: CredentialVault? = nil, deleteCredential: (() throws -> Void)? = nil, defaults: UserDefaults? = nil, automaticSyncEnvironment: AutomaticSyncEnvironment = .fixed(), recordingsStore: RecordingsSessionStore? = nil, recordingsBrowser: (@MainActor () -> RecmanBrowsing)? = nil, courseListStore: CourseListSnapshotStore? = nil, site: MoodleSite = .site(id: nil), language: AppLanguage = .italian) {
+    init(testRootURL: URL, database: SyncDatabase? = nil, rootID: UUID? = nil, notificationCenter: NotificationCenterClient = InertNotificationCenter(), fileOpener: ActivityFileOpening = InertFileOpener(), apiClient: WeBeepAPIClient? = nil, downloader: RemoteDownloader? = nil, credentialVault: CredentialVault? = nil, deleteCredential: (() throws -> Void)? = nil, defaults: UserDefaults? = nil, automaticSyncEnvironment: AutomaticSyncEnvironment = .fixed(), reachabilityChanges: @escaping @Sendable () -> AsyncStream<Bool> = { AsyncStream { $0.finish() } }, recordingsStore: RecordingsSessionStore? = nil, recordingsBrowser: (@MainActor () -> RecmanBrowsing)? = nil, courseListStore: CourseListSnapshotStore? = nil, site: MoodleSite = .site(id: nil), language: AppLanguage = .italian) {
         deleteCredentialForTesting = deleteCredential
         let throwawayRecordingsFolder = FileManager.default.temporaryDirectory.appendingPathComponent("beepbar-recordings-test-\(UUID().uuidString)", isDirectory: true)
         recordingsStoreForTesting = recordingsStore ?? RecordingsSessionStore { throwawayRecordingsFolder }
@@ -986,6 +999,7 @@ enum MaterialsRunEnd: Equatable, Sendable {
         registersBackgroundActivity = false
         dataSaverEnabled = Self.storedDataSaverEnabled(in: isolatedDefaults)
         self.automaticSyncEnvironment = automaticSyncEnvironment
+        self.reachabilityChanges = reachabilityChanges
         self.apiClient = apiClient ?? WeBeepAPIClient(policy: site.serverPolicy)
         self.downloader = downloader ?? RemoteDownloader(policy: self.apiClient.policy)
         self.database = database
@@ -1424,6 +1438,7 @@ enum MaterialsRunEnd: Equatable, Sendable {
         siteInfo = nil
         forgetCourseList()
         courseLoadError = nil
+        stopWatchingForNetworkReturn()
         hasStoredCredential = false
         accountState = .notConnected
         setSyncState(recoveryBlocked ? .recoveryBlocked : .loginRequired)
@@ -1844,6 +1859,7 @@ enum MaterialsRunEnd: Equatable, Sendable {
         if !Self.isUIPreview, courseListFreshness != .current, hasBootstrapped ? (hasStoredCredential && accountState == .connected) : true {
             isPreparingCourseList = true
         }
+        isWindowOpen = true
         let generation = windowGeneration
         let refresh = Task { [weak self] in
             guard let self else { return }
@@ -1983,7 +1999,9 @@ enum MaterialsRunEnd: Equatable, Sendable {
     /// longer wanted, so the end of that sync sends no request (quiet at rest, #98).
     func windowClosed() {
         windowGeneration += 1
+        isWindowOpen = false
         isPreparingCourseList = false
+        stopWatchingForNetworkReturn()
     }
 
     func setLanguage(_ newLanguage: AppLanguage) {
@@ -2572,8 +2590,12 @@ enum MaterialsRunEnd: Equatable, Sendable {
                     await self.expireCredential()
                 case let error as WeBeepAPIError where error == .network(.timedOut):
                     self.courseLoadError = BilingualText("\(self.selectedSite.platformName) non risponde. Riprova.", "\(self.selectedSite.platformName) isn't responding. Try again.")
-                case is WeBeepAPIError:
+                    self.watchForNetworkReturn()
+                case let error as WeBeepAPIError:
                     self.courseLoadError = BilingualText("Impossibile aggiornare i corsi da \(self.selectedSite.platformName). Riprova.", "Couldn't refresh courses from \(self.selectedSite.platformName). Try again.")
+                    // Only a connection failure can end when the network comes back; a server
+                    // error or a malformed answer waits for the refresh button.
+                    if case .network = error { self.watchForNetworkReturn() }
                 case let error as CredentialStorageError:
                     await self.handleCredentialStorageError(error)
                 default:
@@ -2605,9 +2627,37 @@ enum MaterialsRunEnd: Equatable, Sendable {
         if self.courses != ordered { self.courses = ordered }
         if courseListFreshness != .current { courseListFreshness = .current }
         if isPreparingCourseList { isPreparingCourseList = false }
+        // Every path that confirms the list ends its error, the sync's own refresh included:
+        // before #168 only a new `loadCourses()` cleared it, so a banner outlived the failure.
+        if courseLoadError != nil { courseLoadError = nil }
+        stopWatchingForNetworkReturn()
         accountState = .connected
         operationDefaults.removeObject(forKey: Self.credentialExpiredKey)
         saveConfirmedCourseList(courses, token: token)
+    }
+
+    /// Starts `networkReturnWatch` if the window is open and none is running. The first value is
+    /// the network as it is now: if it already has a route (Wi-Fi came up between the failure
+    /// and this call) the list is retried at once, and after that at every change that brings a
+    /// route back. One watch per failure episode, so a retry that fails again never restarts it:
+    /// at most one immediate retry, then only real network changes (#168).
+    private func watchForNetworkReturn() {
+        guard isWindowOpen, networkReturnWatch == nil else { return }
+        let changes = reachabilityChanges()
+        networkReturnWatch = Task { [weak self] in
+            for await reachable in changes {
+                guard reachable else { continue }
+                guard let self, !Task.isCancelled else { return }
+                // A retry already in flight clears the error until it ends: not a reason to stop.
+                guard self.courseLoadError != nil, !self.isLoadingCourses else { continue }
+                self.loadCourses()
+            }
+        }
+    }
+
+    private func stopWatchingForNetworkReturn() {
+        networkReturnWatch?.cancel()
+        networkReturnWatch = nil
     }
 
     private func fetchEnrolledCourses(token: String) async throws -> [RemoteCourseSummary] {
@@ -3641,8 +3691,11 @@ enum MaterialsRunEnd: Equatable, Sendable {
         progressStore.closeCurrentRun()
         activeOperationID = nil
         syncTask = nil
-        // The course list the window asked for while this sync ran (#98).
-        if isPreparingCourseList { loadCourses() }
+        // The course list the window asked for while this sync ran (#98). An open window still
+        // showing a refresh error is retried too: `loadCourses` returns during a sync before it
+        // clears the error, and a sync over a confirmed list doesn't refresh it, so the banner of
+        // a failure before the sync would otherwise stay up for good (#168).
+        if isPreparingCourseList || (isWindowOpen && courseLoadError != nil) { loadCourses() }
     }
 
 }

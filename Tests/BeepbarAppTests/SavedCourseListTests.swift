@@ -1,6 +1,7 @@
 import Combine
 import Foundation
 import Testing
+import os
 import BeepbarCore
 @testable import BeepbarApp
 
@@ -48,6 +49,17 @@ import BeepbarCore
                 testRootURL: root, database: database, rootID: rootID,
                 apiClient: MoodleRecordingProtocol.makeClient(), downloader: MoodleRecordingProtocol.makeDownloader(),
                 credentialVault: vault, deleteCredential: {},
+                courseListStore: store()
+            )
+        }
+
+        /// A launch whose network-path changes come from `reachability` (#168).
+        @MainActor func launch(token: String, reachability: FakeReachability) -> WeBeepAuthenticationController {
+            WeBeepAuthenticationController(
+                testRootURL: root, database: database, rootID: rootID,
+                apiClient: MoodleRecordingProtocol.makeClient(), downloader: MoodleRecordingProtocol.makeDownloader(),
+                credentialVault: CredentialVault(read: { _ in token }, write: { _ in }), deleteCredential: {},
+                reachabilityChanges: reachability.changes,
                 courseListStore: store()
             )
         }
@@ -683,4 +695,174 @@ import BeepbarCore
         #expect(relaunched.courseListFreshness == .current)
         #expect(try Data(contentsOf: install.file) == written, "an unchanged list was rewritten at the first sync of a launch")
     }
+
+    // MARK: Refresh error after the connection returns (#168)
+
+    /// The refresh a sync runs over a saved list confirms it, so the error of an earlier offline
+    /// refresh goes with it, even with the window closed (nothing else would retry). Fails if a
+    /// confirmed list leaves `courseLoadError` set, as before #168, when only a new
+    /// `loadCourses()` cleared it.
+    @Test func aSyncThatConfirmsTheListClearsTheRefreshError() async throws {
+        let install = try await Install.make()
+        defer { install.remove() }
+        let token = MoodleRecordingProtocol.register(courses: [(1, "Analisi"), (2, "Fisica")])
+        defer { MoodleRecordingProtocol.revoke(token: token) }
+        _ = await launchAndSave(install, token: token)
+        MoodleRecordingProtocol.setOffline(token: token, true)
+        let relaunched = install.launch(token: token)
+        await relaunched.refreshOnWindowOpen().value
+        try #require(relaunched.courseLoadError != nil)
+        relaunched.windowClosed()
+
+        MoodleRecordingProtocol.setOffline(token: token, false)
+        relaunched.synchronizeNow()
+        await relaunched.waitForSyncForTesting()
+        #expect(relaunched.courseListFreshness == .current)
+        #expect(relaunched.courseLoadError == nil, "the list was confirmed but its old refresh error stayed")
+    }
+
+    /// The reported case where a sync was running: the window opens over an earlier refresh error
+    /// while a sync runs over a list already confirmed. `loadCourses` returns before clearing the
+    /// error and that sync never refreshes the list, so the list is reloaded when the sync ends.
+    /// A window closed before then asks nothing. Fails if `endOperation` reloads only
+    /// `isPreparingCourseList` (the banner stays up until the refresh button is pressed).
+    @Test func aWindowOpenedOverAnErrorDuringASyncRetriesWhenItEnds() async throws {
+        let install = try await Install.make()
+        defer { install.remove() }
+        let token = MoodleRecordingProtocol.register(courses: [(1, "Analisi"), (2, "Fisica")])
+        defer { MoodleRecordingProtocol.revoke(token: token) }
+        let controller = await launchAndSave(install, token: token)
+        MoodleRecordingProtocol.setOffline(token: token, true)
+        controller.loadCourses()
+        await controller.waitForCourseLoadForTesting()
+        try #require(controller.courseLoadError != nil)
+        controller.windowClosed()
+
+        MoodleRecordingProtocol.setOffline(token: token, false)
+        let operation = UUID()
+        controller.setOperationForTesting(operation)
+        await controller.refreshOnWindowOpen().value
+        #expect(controller.courseLoadError != nil, "the error went away without a refresh")
+        await controller.failSyncForTesting(operation)
+        await controller.waitForCourseLoadForTesting()
+        #expect(controller.courseLoadError == nil, "the error of a refresh before the sync stayed up after it")
+        #expect(controller.courseListFreshness == .current)
+
+        // The same, with the window closed before the sync ends: no request for a window nobody sees.
+        MoodleRecordingProtocol.setOffline(token: token, true)
+        controller.loadCourses()
+        await controller.waitForCourseLoadForTesting()
+        try #require(controller.courseLoadError != nil)
+        MoodleRecordingProtocol.setOffline(token: token, false)
+        let second = UUID()
+        controller.setOperationForTesting(second)
+        await controller.refreshOnWindowOpen().value
+        controller.windowClosed()
+        let requests = MoodleRecordingProtocol.requests(token: token).count
+        await controller.failSyncForTesting(second)
+        await controller.waitForCourseLoadForTesting()
+        #expect(MoodleRecordingProtocol.requests(token: token).count == requests, "a closed window reloaded the list when the sync ended")
+    }
+
+    /// The reported bug: the window opens right after waking, before Wi-Fi is up, and the refresh
+    /// fails. When the network comes back the refresh is retried by itself and the banner goes.
+    /// A retry that fails again keeps the same watch (one per failure, so no loop of requests),
+    /// and confirming the list stops it, so nothing watches the network at rest. Fails if the
+    /// watch is never started, retries nothing, or outlives the confirmed list.
+    @Test func aRefreshThatFailedOfflineIsRetriedWhenTheNetworkReturns() async throws {
+        let install = try await Install.make()
+        defer { install.remove() }
+        let token = MoodleRecordingProtocol.register(courses: [(1, "Analisi"), (2, "Fisica")])
+        defer { MoodleRecordingProtocol.revoke(token: token) }
+        _ = await launchAndSave(install, token: token)
+        MoodleRecordingProtocol.setOffline(token: token, true)
+        let reachability = FakeReachability()
+        let controller = install.launch(token: token, reachability: reachability)
+        await controller.refreshOnWindowOpen().value
+        try #require(controller.courseLoadError != nil)
+        #expect(reachability.starts == 1, "a connection failure in an open window started no watch")
+
+        // A route appears but Moodle still can't be reached: one retry, which fails, same watch.
+        var requests = MoodleRecordingProtocol.requests(token: token).count
+        reachability.send(true)
+        try await waitUntil { MoodleRecordingProtocol.requests(token: token).count > requests && !controller.isLoadingCourses && controller.courseLoadError != nil }
+        await controller.waitForCourseLoadForTesting()
+        #expect(reachability.starts == 1, "a failed retry started another watch")
+
+        MoodleRecordingProtocol.setOffline(token: token, false)
+        requests = MoodleRecordingProtocol.requests(token: token).count
+        reachability.send(true)
+        try await waitUntil { controller.courseListFreshness == .current }
+        await controller.waitForCourseLoadForTesting()
+        #expect(MoodleRecordingProtocol.requests(token: token).count > requests)
+        #expect(controller.courseLoadError == nil)
+        try await waitUntil { reachability.terminated == 1 }
+        #expect(reachability.starts == 1)
+    }
+
+    /// Closing the window ends the watch: a failure nobody sees is not retried, and no monitor
+    /// keeps running at rest. Fails if `windowClosed()` leaves the watch alive.
+    @Test func closingTheWindowStopsWatchingTheNetwork() async throws {
+        let install = try await Install.make()
+        defer { install.remove() }
+        let token = MoodleRecordingProtocol.register(courses: [(1, "Analisi")])
+        defer { MoodleRecordingProtocol.revoke(token: token) }
+        MoodleRecordingProtocol.setOffline(token: token, true)
+        let reachability = FakeReachability()
+        let controller = install.launch(token: token, reachability: reachability)
+        await controller.refreshOnWindowOpen().value
+        try #require(controller.courseLoadError != nil)
+        try #require(reachability.starts == 1)
+
+        controller.windowClosed()
+        try await waitUntil { reachability.terminated == 1 }
+    }
+
+    /// Only a connection failure is watched: a server answer that isn't a course list doesn't end
+    /// when the network changes, and a failure while the window is closed has nobody to show it
+    /// to. Fails if either starts a watch.
+    @Test func onlyAConnectionFailureInAnOpenWindowWatchesTheNetwork() async throws {
+        let install = try await Install.make()
+        defer { install.remove() }
+        let token = MoodleRecordingProtocol.register(courses: [(1, "Analisi")])
+        defer { MoodleRecordingProtocol.revoke(token: token) }
+        MoodleRecordingProtocol.setMalformedCourseLists(token: token, true)
+        let reachability = FakeReachability()
+        let controller = install.launch(token: token, reachability: reachability)
+        await controller.refreshOnWindowOpen().value
+        try #require(controller.courseLoadError != nil)
+        #expect(reachability.starts == 0, "a server error started watching the network")
+
+        let closed = install.launch(token: token, reachability: reachability)
+        MoodleRecordingProtocol.setMalformedCourseLists(token: token, false)
+        MoodleRecordingProtocol.setOffline(token: token, true)
+        closed.loadCourses()
+        await closed.waitForCourseLoadForTesting()
+        try #require(closed.courseLoadError != nil)
+        #expect(reachability.starts == 0, "a failure with the window closed started watching the network")
+    }
+}
+
+/// Network-path changes a test sends by hand in place of `NWPathMonitor` (#168). Counts the
+/// watches started and ended, so a test can tell whether anything still watches the network.
+final class FakeReachability: Sendable {
+    private struct State {
+        var continuation: AsyncStream<Bool>.Continuation?
+        var starts = 0
+        var terminated = 0
+    }
+    private let state = OSAllocatedUnfairLock(initialState: State())
+
+    var changes: @Sendable () -> AsyncStream<Bool> {
+        { [self] in
+            let (stream, continuation) = AsyncStream<Bool>.makeStream(bufferingPolicy: .bufferingNewest(1))
+            continuation.onTermination = { [self] _ in state.withLock { $0.terminated += 1 } }
+            state.withLock { $0.continuation = continuation; $0.starts += 1 }
+            return stream
+        }
+    }
+
+    func send(_ reachable: Bool) { _ = state.withLock { $0.continuation }?.yield(reachable) }
+    var starts: Int { state.withLock { $0.starts } }
+    var terminated: Int { state.withLock { $0.terminated } }
 }

@@ -27,6 +27,7 @@ final class MoodleRecordingProtocol: URLProtocol, @unchecked Sendable {
         /// Moodle stopped accepting the token but the account's held answers stay deliverable.
         var rejected = false
         var holdsCourseLists = false
+        var malformedCourseLists = false
         var heldCourseLists: [@Sendable () -> Void] = []
         /// The profile address `core_user_get_users_by_field` answers; site info lists that
         /// function only when `listsEmailFunction` is set.
@@ -173,6 +174,12 @@ final class MoodleRecordingProtocol: URLProtocol, @unchecked Sendable {
         RemoteDownloader(session: makeSession())
     }
 
+    /// Moodle answers the enrolled-courses call with something that isn't a course list: a server
+    /// failure that a network change cannot fix, unlike `setOffline(token:_:)`.
+    static func setMalformedCourseLists(token: String, _ malformed: Bool) {
+        accounts.withLock { $0[token]?.malformedCourseLists = malformed }
+    }
+
     private static func makeSession() -> URLSession {
         let configuration = URLSessionConfiguration.ephemeral
         configuration.protocolClasses = [MoodleRecordingProtocol.self]
@@ -263,6 +270,8 @@ final class MoodleRecordingProtocol: URLProtocol, @unchecked Sendable {
         case (let account?, WeBeepAPIClient.ownEmailFunction):
             guard let email = account.email else { return "[]" }
             return #"[{"id":\#(account.userID),"email":"\#(email)"}]"#
+        case (let account?, "core_enrol_get_users_courses") where account.malformedCourseLists:
+            return "{"
         case (let account?, "core_enrol_get_users_courses"):
             return "[" + account.courses.map { #"{"id":\#($0.id),"shortname":"\#($0.name)","fullname":"\#($0.name)","visible":1}"# }.joined(separator: ",") + "]"
         case (let account?, "core_course_get_contents"):

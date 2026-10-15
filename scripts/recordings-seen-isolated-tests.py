@@ -2,7 +2,8 @@
 """Run the recordings history fixtures when the local CLT lacks SwiftUI macros.
 
 The copied recordings implementation and tests are unchanged. Only app-global settings
-providers are substitutes. This is a targeted runtime check, not the full app/CI gate.
+providers are substitutes; their pure policy rules are extracted unchanged.
+This is a targeted runtime check, not the full app/CI gate.
 --mutate-cap reintroduces global eviction only in a disposable source copy (expected red).
 """
 import argparse
@@ -29,7 +30,12 @@ with tempfile.TemporaryDirectory(prefix="beepbar-seen-fixture-") as scratch:
         shutil.copytree(root / name, fixture / name)
     app = fixture / "Sources/BeepbarApp"
     app.mkdir(parents=True)
-    for name in ("RecordingsController.swift", "RecordingsSessionStore.swift", "RecordingsStudyState.swift", "RecmanWebSession.swift", "RecmanScripts.swift"):
+    for name in (
+        "RecordingsController.swift", "RecordingsSessionStore.swift", "RecordingsStudyState.swift",
+        "RecmanWebSession.swift", "RecmanScripts.swift", "WebexStreamResolver.swift",
+        "RecordingPlayerController.swift", "RecordingPlayerControls.swift", "RecordingNowPlaying.swift",
+        "PlayerZoom.swift", "RecordingsWatchProgressModel.swift",
+    ):
         shutil.copy(root / "Sources/BeepbarApp" / name, app / name)
     # Watchlist reconciliation now depends on the unchanged pure presentation rules.
     # Extract their source before the SwiftUI page rather than substitute the matcher.
@@ -38,16 +44,24 @@ with tempfile.TemporaryDirectory(prefix="beepbar-seen-fixture-") as scratch:
     if presentation.count(marker) != 1:
         raise SystemExit("Presentation extraction anchor changed; update the isolated fixture")
     (app / "RecordingsPresentation.swift").write_text(presentation.split(marker, 1)[0])
-    (app / "FixtureSupport.swift").write_text('''import Foundation
+    def section(text, start, end):
+        if text.count(start) != 1 or text.count(end) != 1:
+            raise SystemExit("Source extraction anchor changed; update the isolated fixture")
+        return text.split(start, 1)[1].split(end, 1)[0]
+
+    account = (root / "Sources/BeepbarApp/WeBeepAuthenticationController.swift").read_text()
+    policy = section(account, "    /// What `chooseRoot` does with the activation policy once its folder panel is closed.\n", "    func chooseRoot() {")
+    defaults = section(account, "    /// in that folder. Tests that need a second handle on the same suite open it by this name.\n", "    var apiHostForTesting:")
+    cleanup = section((root / "Tests/BeepbarAppTests/SyncNotificationTests.swift").read_text(), "func removeTestDefaults(_ suitePath: String) {", "/// Test defaults must not pile up")
+    (app / "FixtureSupport.swift").write_text('''import AppKit
 // App settings providers only: fixtures never use installed data or UI.
 enum PreviewMode { static let isActive = true }
 enum FileTokenStore { static let directoryName = "isolated-never-production" }
 enum WeBeepAuthenticationController {
-    static func throwawayDefaultsSuite() -> String { "seen-fixture-\\(UUID().uuidString)" }
-}
-''')
+''' + defaults + policy + "}\n")
     tests = fixture / "Tests/BeepbarAppTests"
     tests.mkdir(parents=True)
+    (tests / "FixtureCleanup.swift").write_text("import Foundation\nfunc removeTestDefaults(_ suitePath: String) {" + cleanup)
     text = (root / "Tests/BeepbarAppTests/RecordingsControllerTests.swift").read_text()
     text = text.split("/// Recordings through the real account controller:", 1)[0]
     (tests / "RecordingsControllerTests.swift").write_text(text)

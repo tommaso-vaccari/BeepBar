@@ -2831,6 +2831,83 @@ struct RecordingsControllerTests {
         #expect(Controller.panelPolicyOutcome(previous: .accessory, current: .prohibited, playerOpen: false) == .leave)
     }
 
+    @Test(arguments: ["stream", "link"])
+    func closingThePlayerRejectsALateRecoveryFallback(stage: String) async {
+        defer { cleanUp() }
+        browser.streamResults["a"] = [.success(stream("a")), .failure(RecmanBrowserError.playbackUnavailable)]
+        browser.playbackResults["a"] = .success(playerLink("a"))
+        let controller = await readyController()
+        controller.play(recording("a"))
+        await settle("a playing") { world.player.plays.count == 1 }
+        let gate = FakeRecmanBrowser.Gate()
+        defer { gate.release() }
+        if stage == "stream" { browser.streamGates["a"] = gate }
+        else { browser.playbackGates["a"] = gate }
+        world.player.failDuringPlayback(at: 700)
+        await settle("recovery held") { gate.isWaiting }
+        world.player.close()
+        controller.windowClosed()
+        gate.release()
+        await settle("recovery finished") { !browser.isOpen }
+        #expect(world.opened.isEmpty)
+        #expect(world.player.plays.count == 1)
+        controller.turnOff()
+    }
+
+    @Test(arguments: ["duringPlayback", "beforeReady"])
+    func aNewPlayRejectsALateRecoveryLink(failure: String) async {
+        defer { cleanUp() }
+        browser.streamResults["a"] = [.success(stream("a")), .failure(RecmanBrowserError.playbackUnavailable)]
+        browser.streamResults["b"] = [.success(stream("b"))]
+        browser.playbackResults["a"] = .success(playerLink("a"))
+        let controller = await readyController()
+        controller.play(recording("a"))
+        await settle("a playing") { world.player.plays.count == 1 }
+        let gate = FakeRecmanBrowser.Gate()
+        defer { gate.release() }
+        browser.playbackGates["a"] = gate
+        if failure == "beforeReady" { world.player.failBeforeReady() }
+        else { world.player.failDuringPlayback(at: 700) }
+        await settle("recovery link held") { gate.isWaiting }
+        controller.play(recording("b"))
+        controller.windowClosed()
+        gate.release()
+        await settle("b played") { world.player.plays.count == 2 }
+        await settle("browser closed") { !browser.isOpen }
+        #expect(world.player.plays.map(\.recordingID) == ["a", "b"])
+        #expect(world.opened.isEmpty)
+        controller.turnOff()
+    }
+
+    @Test(arguments: [false, true])
+    func aFailedSessionDeletionCannotRestoreTheDiscardedSession(relaunch: Bool) async throws {
+        defer { try? FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: folder.path); cleanUp() }
+        let data = try RecmanSessionCodec.encode([FakeRecmanBrowser.cookie("SSO_LOGIN", value: "obsolete")], ownerUserID: 42, email: "obsolete@mail.polimi.it", now: world.now)
+        try store.save(data)
+        let controller = makeController()
+        try FileManager.default.setAttributes([.posixPermissions: 0o500], ofItemAtPath: folder.path)
+        controller.setEnabled(false)
+        await controller.settleSessionFile()
+        #expect(try store.load() == data, "failed unlink leaves a readable obsolete session")
+        let next = relaunch ? makeController() : controller
+        next.setEnabled(true)
+        await settle("fresh sign-in finishes") { next.access == .ready && !browser.isOpen }
+        #expect(browser.openedWith == [[]])
+        #expect(next.confirmedEmail == nil)
+        try FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: folder.path)
+        next.signIn()
+        await settle("replacement session saved") { next.access == .ready && !browser.isOpen }
+        await next.settleSessionFile()
+        #expect(try savedEmail() == nil)
+        #expect(try savedSession()?.cookies.first?.value == "fresh")
+        let reopened = makeController(useDefault: true)
+        reopened.pageAppeared()
+        await drainTasks()
+        #expect(reopened.access == .ready, "a successfully saved replacement can be adopted again")
+        reopened.turnOff()
+        await reopened.settleSessionFile()
+    }
+
     // MARK: Review follow-ups (#148)
 
     /// Closing the Settings window (or leaving the page) while a lecture recovery is running or
@@ -2929,10 +3006,10 @@ struct RecordingsControllerTests {
         controller.turnOff()
     }
 
-    /// Closing the window while a lecture recovery runs keeps both the recovery and a Play
+    /// Closing the window while a lecture recovery runs keeps the newer Play
     /// clicked meanwhile: the student asked for "b", and closing Settings doesn't cancel a Play
     /// (menu bar Play decision, 2026-10-12, which replaced the PR #152 review's "drop it"). The
-    /// browser still closes once both have run. Guards a Play pressed just before closing the
+    /// browser still closes once the superseding Play has run. Guards a Play pressed just before closing the
     /// window being silently lost. Mutations: drop the queued-Play case from `hasPlayOrRecovery`
     /// or let `dropQueuedOpenings` drop Plays ("b" is never streamed).
     @Test func closingTheWindowKeepsAPlayQueuedBehindARecovery() async throws {
@@ -2951,10 +3028,9 @@ struct RecordingsControllerTests {
         controller.windowClosed()
         #expect(controller.openingRecordingID == "b", "the kept Play keeps spinning")
         gate.release()
-        await settle("b played after the recovery") { world.player.plays.count == 3 }
+        await settle("b supersedes the recovery") { world.player.plays.count == 2 }
         await settle("browser closed") { !browser.isOpen }
-        #expect(world.player.plays.map(\.recordingID) == ["a", "a", "b"])
-        #expect(try world.player.play(1).startAt == 700)
+        #expect(world.player.plays.map(\.recordingID) == ["a", "b"])
         #expect(world.opened.isEmpty)
         controller.turnOff()
     }

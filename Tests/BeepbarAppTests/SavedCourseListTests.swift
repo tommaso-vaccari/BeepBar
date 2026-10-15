@@ -841,11 +841,199 @@ import BeepbarCore
         try #require(closed.courseLoadError != nil)
         #expect(reachability.starts == 0, "a failure with the window closed started watching the network")
     }
+
+    // MARK: Review round 1 (#168)
+
+    /// How many times this account asked Moodle for its course list.
+    private func courseListRequests(_ token: String) -> Int {
+        MoodleRecordingProtocol.requests(token: token).filter { $0.function == "core_enrol_get_users_courses" }.count
+    }
+
+    /// A sync ending with the window open and no error asks Moodle for nothing: the reload at the
+    /// end of a sync is for a connection failure only. Fails if every sync with the window open
+    /// reloads the list (a site-info and course-list request per sync, for nothing new).
+    @Test func aSyncEndingInAnOpenWindowWithoutAnErrorAsksNothing() async throws {
+        let install = try await Install.make()
+        defer { install.remove() }
+        let token = MoodleRecordingProtocol.register(courses: [(1, "Analisi")])
+        defer { MoodleRecordingProtocol.revoke(token: token) }
+        let controller = await launchAndSave(install, token: token)
+        try #require(controller.courseLoadError == nil)
+        let operation = UUID()
+        controller.setOperationForTesting(operation)
+        let requests = MoodleRecordingProtocol.requests(token: token).count
+        await controller.failSyncForTesting(operation)
+        await controller.waitForCourseLoadForTesting()
+        #expect(MoodleRecordingProtocol.requests(token: token).count == requests, "a sync with no refresh error reloaded the list")
+    }
+
+    /// A server error is not retried by itself, not even when a sync ends with the window open:
+    /// the specification says it waits for the refresh button. Fails if the end of a sync reloads
+    /// on any error.
+    @Test func aServerErrorIsNotRetriedWhenASyncEnds() async throws {
+        let install = try await Install.make()
+        defer { install.remove() }
+        let token = MoodleRecordingProtocol.register(courses: [(1, "Analisi")])
+        defer { MoodleRecordingProtocol.revoke(token: token) }
+        let controller = await launchAndSave(install, token: token)
+        MoodleRecordingProtocol.setMalformedCourseLists(token: token, true)
+        controller.loadCourses()
+        await controller.waitForCourseLoadForTesting()
+        try #require(controller.courseLoadError != nil)
+        let operation = UUID()
+        controller.setOperationForTesting(operation)
+        let requests = courseListRequests(token)
+        await controller.failSyncForTesting(operation)
+        await controller.waitForCourseLoadForTesting()
+        #expect(courseListRequests(token) == requests, "a server error was retried at the end of a sync")
+        #expect(controller.courseLoadError != nil)
+    }
+
+    /// A quit stops the network watch and, winding a sync down, starts no course refresh on its
+    /// way out, even with the window open over a connection failure (no Keychain or network work
+    /// while quitting). Fails if `prepareForTermination` leaves the watch running or
+    /// `endOperation` reloads during termination.
+    @Test func aQuitStopsTheWatchAndStartsNoCourseRefresh() async throws {
+        let install = try await Install.make()
+        defer { install.remove() }
+        let token = MoodleRecordingProtocol.register(courses: [(1, "Analisi")])
+        defer { MoodleRecordingProtocol.revoke(token: token) }
+        MoodleRecordingProtocol.setOffline(token: token, true)
+        let reachability = FakeReachability()
+        let controller = install.launch(token: token, reachability: reachability)
+        await controller.refreshOnWindowOpen().value
+        try #require(controller.courseLoadError != nil)
+        try #require(reachability.starts == 1)
+        MoodleRecordingProtocol.setOffline(token: token, false)
+        let operation = UUID()
+        controller.setOperationForTesting(operation)
+        _ = controller.prepareForTermination()
+        try await waitUntil { reachability.terminated == 1 }
+        let requests = MoodleRecordingProtocol.requests(token: token).count
+        await controller.failSyncForTesting(operation)
+        await controller.waitForCourseLoadForTesting()
+        #expect(MoodleRecordingProtocol.requests(token: token).count == requests, "a quit started a course refresh")
+    }
+
+    /// A refresh that then fails for another reason (a server error, from the refresh button)
+    /// ends the watch: a network change can't fix it. Fails if the watch outlives a failure that
+    /// is not a connection one.
+    @Test func aServerErrorAfterAConnectionFailureStopsTheWatch() async throws {
+        let install = try await Install.make()
+        defer { install.remove() }
+        let token = MoodleRecordingProtocol.register(courses: [(1, "Analisi")])
+        defer { MoodleRecordingProtocol.revoke(token: token) }
+        MoodleRecordingProtocol.setOffline(token: token, true)
+        let reachability = FakeReachability()
+        let controller = install.launch(token: token, reachability: reachability)
+        await controller.refreshOnWindowOpen().value
+        try #require(reachability.starts == 1)
+        MoodleRecordingProtocol.setOffline(token: token, false)
+        MoodleRecordingProtocol.setMalformedCourseLists(token: token, true)
+        controller.loadCourses()
+        await controller.waitForCourseLoadForTesting()
+        try #require(controller.courseLoadError != nil)
+        try await waitUntil { reachability.terminated == 1 }
+    }
+
+    /// A watch whose stream ends by itself (no path monitor available) does not block the next
+    /// one: a later connection failure watches again. Fails if the finished watch stays recorded
+    /// as running.
+    @Test func aWatchWhoseStreamEndedLetsTheNextFailureWatch() async throws {
+        let install = try await Install.make()
+        defer { install.remove() }
+        let token = MoodleRecordingProtocol.register(courses: [(1, "Analisi")])
+        defer { MoodleRecordingProtocol.revoke(token: token) }
+        MoodleRecordingProtocol.setOffline(token: token, true)
+        let reachability = FakeReachability()
+        let controller = install.launch(token: token, reachability: reachability)
+        await controller.refreshOnWindowOpen().value
+        try #require(reachability.starts == 1)
+        reachability.finish()
+        try await waitUntil { !controller.isWatchingForNetworkReturnForTesting }
+        controller.loadCourses()
+        await controller.waitForCourseLoadForTesting()
+        #expect(reachability.starts == 2, "an ended watch kept the next failure from watching")
+    }
+
+    /// `NWPathMonitor` reports the current path at once: if the route is already back when the
+    /// watch starts, the list is retried once straight away, and a retry that fails again waits
+    /// for a real network change instead of looping. Fails if the first value is skipped (Wi-Fi
+    /// back before the watch started would never be retried) or each failure re-arms a watch.
+    @Test func aRouteAlreadyBackIsRetriedOnceAtOnce() async throws {
+        let install = try await Install.make()
+        defer { install.remove() }
+        let token = MoodleRecordingProtocol.register(courses: [(1, "Analisi")])
+        defer { MoodleRecordingProtocol.revoke(token: token) }
+        MoodleRecordingProtocol.setOffline(token: token, true)
+        let reachability = FakeReachability(initial: true)
+        let controller = install.launch(token: token, reachability: reachability)
+        await controller.refreshOnWindowOpen().value
+        // The window's attempt, then one immediate retry, which fails too. Offline, each attempt
+        // stops at its first request (site info), so two attempts are two requests.
+        try await waitUntil { MoodleRecordingProtocol.requests(token: token).count == 2 && !controller.isLoadingCourses && controller.courseLoadError != nil }
+        await controller.waitForCourseLoadForTesting()
+        for _ in 0..<50 { await Task.yield() }
+        #expect(MoodleRecordingProtocol.requests(token: token).count == 2, "a failed retry kept retrying without a network change")
+        #expect(reachability.starts == 1)
+
+        MoodleRecordingProtocol.setOffline(token: token, false)
+        reachability.send(true)
+        try await waitUntil { controller.courseListFreshness == .current }
+        #expect(controller.courseLoadError == nil)
+    }
+
+    /// "WeBeep isn't responding" is a connection failure too: it is watched and retried when the
+    /// network changes. Fails if the timeout branch starts no watch.
+    @Test func aTimeoutIsRetriedWhenTheNetworkReturns() async throws {
+        let install = try await Install.make()
+        defer { install.remove() }
+        let token = MoodleRecordingProtocol.register(courses: [(1, "Analisi")])
+        defer { MoodleRecordingProtocol.revoke(token: token) }
+        MoodleRecordingProtocol.setTimingOut(token: token, true)
+        let reachability = FakeReachability()
+        let controller = install.launch(token: token, reachability: reachability)
+        await controller.refreshOnWindowOpen().value
+        try #require(controller.courseLoadError != nil)
+        #expect(reachability.starts == 1, "a timeout started no watch")
+        MoodleRecordingProtocol.setTimingOut(token: token, false)
+        reachability.send(true)
+        try await waitUntil { controller.courseListFreshness == .current }
+        #expect(controller.courseLoadError == nil)
+    }
+
+    /// Signing out, or the sign-in expiring, ends the watch: the network coming back fixes
+    /// neither. Fails if either leaves the path monitor running with the window open.
+    @Test(arguments: [false, true]) func losingTheAccountStopsWatchingTheNetwork(expire: Bool) async throws {
+        let install = try await Install.make()
+        defer { install.remove() }
+        let token = MoodleRecordingProtocol.register(courses: [(1, "Analisi")])
+        defer { MoodleRecordingProtocol.revoke(token: token) }
+        MoodleRecordingProtocol.setOffline(token: token, true)
+        let reachability = FakeReachability()
+        let controller = install.launch(token: token, reachability: reachability)
+        await controller.refreshOnWindowOpen().value
+        try #require(reachability.starts == 1)
+        if expire {
+            MoodleRecordingProtocol.setOffline(token: token, false)
+            MoodleRecordingProtocol.reject(token: token)
+            reachability.send(true)
+            try await waitUntil { controller.accountState == .expired }
+        } else {
+            controller.signOut(removeFile: { _ in })
+        }
+        try await waitUntil { reachability.terminated == 1 }
+    }
 }
 
 /// Network-path changes a test sends by hand in place of `NWPathMonitor` (#168). Counts the
 /// watches started and ended, so a test can tell whether anything still watches the network.
 final class FakeReachability: Sendable {
+    /// What a new watch hears first, as `NWPathMonitor` reports the current path at once; `nil`
+    /// sends nothing until `send(_:)`.
+    private let initial: Bool?
+    init(initial: Bool? = nil) { self.initial = initial }
+
     private struct State {
         var continuation: AsyncStream<Bool>.Continuation?
         var starts = 0
@@ -858,11 +1046,14 @@ final class FakeReachability: Sendable {
             let (stream, continuation) = AsyncStream<Bool>.makeStream(bufferingPolicy: .bufferingNewest(1))
             continuation.onTermination = { [self] _ in state.withLock { $0.terminated += 1 } }
             state.withLock { $0.continuation = continuation; $0.starts += 1 }
+            if let initial { continuation.yield(initial) }
             return stream
         }
     }
 
     func send(_ reachable: Bool) { _ = state.withLock { $0.continuation }?.yield(reachable) }
+    /// Ends the current watch's stream, as a monitor that stops delivering would.
+    func finish() { state.withLock { $0.continuation }?.finish() }
     var starts: Int { state.withLock { $0.starts } }
     var terminated: Int { state.withLock { $0.terminated } }
 }

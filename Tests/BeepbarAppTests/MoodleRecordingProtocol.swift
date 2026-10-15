@@ -28,6 +28,7 @@ final class MoodleRecordingProtocol: URLProtocol, @unchecked Sendable {
         var rejected = false
         var holdsCourseLists = false
         var malformedCourseLists = false
+        var timesOut = false
         var heldCourseLists: [@Sendable () -> Void] = []
         /// The profile address `core_user_get_users_by_field` answers; site info lists that
         /// function only when `listsEmailFunction` is set.
@@ -180,6 +181,11 @@ final class MoodleRecordingProtocol: URLProtocol, @unchecked Sendable {
         accounts.withLock { $0[token]?.malformedCourseLists = malformed }
     }
 
+    /// Every request fails with `URLError.timedOut`, as a server that never answers does.
+    static func setTimingOut(token: String, _ timesOut: Bool) {
+        accounts.withLock { $0[token]?.timesOut = timesOut }
+    }
+
     private static func makeSession() -> URLSession {
         let configuration = URLSessionConfiguration.ephemeral
         configuration.protocolClasses = [MoodleRecordingProtocol.self]
@@ -202,6 +208,10 @@ final class MoodleRecordingProtocol: URLProtocol, @unchecked Sendable {
         }
         if let account, account.onHotspot, !request.allowsExpensiveNetworkAccess {
             client?.urlProtocol(self, didFailWithError: URLError(.notConnectedToInternet))
+            return
+        }
+        if let account, account.timesOut {
+            client?.urlProtocol(self, didFailWithError: URLError(.timedOut))
             return
         }
         if let account, account.offline {

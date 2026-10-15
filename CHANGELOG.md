@@ -35,7 +35,7 @@
 
 ### Fixed
 
-- After a period offline, the course list no longer stays on “Couldn't refresh courses” once you are back online: BeepBar tries again by itself when the connection returns, and the message goes away as soon as the list is updated.
+- After a period offline, the course list no longer stays on “Couldn't refresh courses” once you are back online: with the window open, BeepBar tries again by itself when the connection returns, and the message goes away as soon as the list is updated.
 
 - Watching a lecture in BeepBar keeps the display and Mac awake during video playback.
 

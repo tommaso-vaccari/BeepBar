@@ -6,6 +6,37 @@ import Testing
 @testable import BeepbarCore
 
 struct NetworkPathReaderTests {
+    /// The course list's network watch (#168) must not outlive its consumer: cancelling the task
+    /// that iterates the stream stops the monitor. Fails if `onTermination` no longer stops it,
+    /// which would leave a path monitor running at rest after the window closes.
+    @Test func cancellingTheWatchStopsTheMonitor() async throws {
+        let stops = OSAllocatedUnfairLock(initialState: 0)
+        let (started, markStarted) = AsyncStream<Void>.makeStream()
+        let stream = NetworkPathReader.reachabilityChanges { yield in
+            yield(true)
+            markStarted.yield()
+            return { stops.withLock { $0 += 1 } }
+        }
+        let task = Task { var values: [Bool] = []; for await value in stream { values.append(value) }; return values }
+        for await _ in started { break }
+        #expect(stops.withLock { $0 } == 0)
+        task.cancel()
+        #expect(await task.value == [true])
+        let deadline = ContinuousClock.now.advanced(by: .seconds(30))
+        while stops.withLock({ $0 }) == 0, ContinuousClock.now < deadline { await Task.yield() }
+        #expect(stops.withLock { $0 } == 1)
+    }
+
+    /// The same when the stream is dropped without ever being iterated to the end.
+    @Test func droppingTheStreamStopsTheMonitor() async {
+        let stops = OSAllocatedUnfairLock(initialState: 0)
+        do {
+            let stream = NetworkPathReader.reachabilityChanges { _ in { stops.withLock { $0 += 1 } } }
+            _ = stream
+        }
+        #expect(stops.withLock { $0 } == 1)
+    }
+
     @Test func cancellationBeforeInstallationStartsNothing() async {
         let provider = PathProvider()
         let gate = AsyncStream<Void>.makeStream()

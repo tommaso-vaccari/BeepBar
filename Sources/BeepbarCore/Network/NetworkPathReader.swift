@@ -46,13 +46,23 @@ public enum NetworkPathReader {
 #if !canImport(Network)
         return AsyncStream { $0.finish() }
 #else
-        return AsyncStream(bufferingPolicy: .bufferingNewest(1)) { continuation in
+        return reachabilityChanges { yield in
             let monitor = NWPathMonitor()
-            monitor.pathUpdateHandler = { continuation.yield($0.status == .satisfied) }
-            continuation.onTermination = { _ in monitor.cancel() }
+            monitor.pathUpdateHandler = { yield($0.status == .satisfied) }
             monitor.start(queue: DispatchQueue(label: "io.github.tvaccari.beepbar.network-return"))
+            return { monitor.cancel() }
         }
 #endif
+    }
+
+    /// The stream around any monitor: `start` begins delivering values and returns what stops
+    /// it, which runs once the stream ends (consumer cancelled or stream dropped). Lets Core tests
+    /// prove the stop without a real `NWPathMonitor`.
+    internal static func reachabilityChanges(start: (@escaping @Sendable (Bool) -> Void) -> @Sendable () -> Void) -> AsyncStream<Bool> {
+        AsyncStream(bufferingPolicy: .bufferingNewest(1)) { continuation in
+            let stop = start { continuation.yield($0) }
+            continuation.onTermination = { _ in stop() }
+        }
     }
 
     internal static func current(start: @Sendable (

@@ -171,7 +171,9 @@ jobs:
             build/00-Beepbar.dmg
             appcast.xml
       # The `latest` tag and its "Legacy update feed" release are frozen at v2.2.35 and must stay
-      # published. Installs from before 2026-09-16 still look for
-      # `releases/download/latest/appcast.xml`. They update to v2.2.35, whose SUFeedURL points
-      # to `releases/latest/download/appcast.xml`, and from there they follow the versioned
-      # releases above. Deleting that release would leave them without updates.
+      # published, together with the `v2.2.35` release and its `00-Beepbar.dmg`: the frozen
+      # appcast's enclosure points to that DMG. Builds 2.0.31–2.0.42 (before v2.0.44) still look
+      # for `T-vaccari/Beepbar/releases/download/latest/appcast.xml`, which GitHub redirects
+      # here. They update to v2.2.35, whose SUFeedURL points to
+      # `releases/latest/download/appcast.xml`, and from there they follow the versioned
+      # releases above. Deleting either release would leave them without updates.

@@ -2,26 +2,23 @@
 
 ## Unreleased
 
-- Retry an expired Polimi sign-in with a fresh session. A service-unavailable page ends the attempt instead of leaving Recordings waiting.
-- Keep playback positions when Recordings is turned off and back on.
-
 ### New
 
 - Mark every lecture in a course completed with one command, or mark them all unseen again when all are completed. Playback progress and resume positions are kept.
-- Watch lecture recordings right inside BeepBar instead of in the browser, with the usual video controls in a slim bar along the bottom edge that covers little of the lecture, speeds from 0.5x to 4x, 10 and 30 second skips and keyboard shortcuts. A lecture picks up where you stopped, and if the connection drops it resumes on its own. If a recording can't be played inside BeepBar, it still opens in your browser, and "Open in browser" in a recording's menu always opens it there.
+- Watch lecture recordings right inside BeepBar instead of in the browser, with the usual video controls in a slim bar along the bottom edge that covers little of the lecture, speeds from 0.5x to 4x, 10 and 30 second skips and keyboard shortcuts. A lecture picks up where you stopped, and if the connection drops it resumes on its own. While a lecture plays, the display and your Mac stay awake. If a recording can't be played inside BeepBar, it still opens in your browser, and "Open in browser" in a recording's menu always opens it there.
 - To sign in to Webex for you, BeepBar uses the Polimi email from your WeBeep profile, with nothing to confirm. You can see, change or remove it in Settings › Recordings, and it stays on your Mac.
 - Save lessons from different courses in a single Watchlist inside Recordings. Add or remove bookmarks and find your saved list again after restarting.
 - Follow your progress in Recordings: every lecture shows how much you have watched, and a “Done” checkbox lets you mark lectures you watched elsewhere or attended in person. A lecture counts as done when you close it after watching at least 90%. Each course shows how many lectures are done and roughly how much time is left.
 - In the BeepBar menu, “Open BeepBar” now sits right under “Sync now”.
 - BeepBar now keeps your recordings up to date: after every sync it checks your selected courses for new recordings (it never downloads video) and, if notifications are on, tells you once with “N new recordings”; a click opens Recordings. It never opens a window or asks you to sign in on its own: if your Polimi sign-in has expired, Recordings shows the prompt next time you open it.
 - Zoom into the lecture video in the player with a pinch or with ⌘+, ⌘− and ⌘0, and drag to move around while zoomed.
-- Telemetry is enabled by default to count how many people use BeepBar and how, with one daily ping: the app and macOS versions, the language and which settings are on, under a random identifier that changes every month. Turn it off in Settings, which also deletes the identifier; the info button explains what is sent. No account, course or file information is included.
+- Telemetry is enabled by default to count how many people use BeepBar and how, with one daily ping to TelemetryDeck: the app and macOS versions, the language and which settings are on, under a random identifier that changes every month. Turn it off in Settings, which also deletes the identifier; the info button explains what is sent. No account, course or file information is included.
 
-**After updating:** the first time you press Play or open Settings › Recordings, BeepBar may read your email from WeBeep and sign in to Webex on its own; if no Polimi email is available, recordings that need that sign-in don't open until you enter one in Settings. Turning Recordings off deletes the Webex sign-in and the email but preserves where you stopped. Disconnecting also removes playback positions. Every lecture starts at 0% progress after updating: tick “Done” for the ones you have already watched. The first load of a course never triggers a “new recordings” notification, and turning Recordings off removes your progress.
+**After updating:** telemetry is on from the first launch: BeepBar sends one daily ping to TelemetryDeck, and you can turn it off in Settings, which also deletes its identifier. With Recordings on, every sync also checks your selected courses for new recordings; the first check of a course never sends a notification. The first time you press Play or open Settings › Recordings, BeepBar may read your email from WeBeep and sign in to Webex on its own; if no Polimi email is available, recordings that need that sign-in don't open until you enter one in Settings. Every lecture starts at 0% progress: tick “Done” for the ones you have already watched. Turning Recordings off removes the Webex sign-in, the email and your progress, but keeps where you stopped in each lecture; disconnecting also removes those positions.
 
 ### Improved
 
-- In Recordings, a course whose folder you renamed shows the folder name followed by the teacher in parentheses (for example “GAL (Claude Sonnet)”), and an orange dot marks the courses that still have lectures to watch, even right after opening BeepBar. The menu shows the same folder name, without the teacher.
+- In Recordings, a course whose folder you renamed shows the folder name followed by the teacher in parentheses (for example “GAL (Rossi)”), and an orange dot marks the courses that still have lectures to watch, even right after opening BeepBar.
 - Opening BeepBar shows your courses straight away, as they were at the last successful refresh, while the current list loads in the background; offline, the saved list stays visible and says it is not yet confirmed. Every sync still asks your university for the current list first. The very first opening after updating still waits for the list once.
 - Cancelling sync stops large local file checks promptly while file changes already underway still finish safely.
 - While a lecture plays in BeepBar, the Mac's Now Playing (in Control Center and the menu bar) shows the lecture's title, its course and the course's picture from WeBeep, instead of just "BeepBar". The keyboard's media keys and Control Center's play, pause, skip and scrub controls drive BeepBar's player.
@@ -31,23 +28,19 @@
 - Opening BeepBar restores the previous sync result with less work, keeping the interface available while a large Activity summary is read.
 - Repeated synchronization uses less memory and does less work when many materials are already saved.
 - During a large sync the menu bar and the window have less work to do: progress is handled off the interface and only the updates that are shown reach it.
-- Expanding a course in Activity with more than 200 new, moved or failed files now shows the first 200, with a link below them (“Mostra altri…”) that reveals more, down to the last one, so opening a large course stays quick.
+- Expanding a course in Activity with more than 200 new, moved or failed files now shows the first 200, with a link below them (“Mostra altri N” / “Show N more”) that reveals more, down to the last one, so opening a large course stays quick.
 
 ### Fixed
 
-- Zooming while a lecture loads keeps the intended part of the picture in view, including after playback recovers.
+- If your Polimi sign-in has expired, Recordings now starts a fresh sign-in instead of reusing the one that failed, and Polimi’s “Il servizio richiesto non è presente” page ends the attempt instead of leaving Recordings waiting.
 
 - Moving a local file to Trash and recovering a course-folder rename now preserve your files when the materials folder changes or a filesystem operation fails.
 
-- Closing a lecture or starting another one now cancels any late playback recovery for the previous lecture.
-
-- Turning Recordings off keeps the discarded Webex sign-in and email from returning, even if their saved file could not be deleted.
+- Turning Recordings off no longer lets your Polimi sign-in come back, even if its saved file could not be deleted.
 
 - After a period offline, the course list no longer stays on “Couldn't refresh courses” once you are back online: with the window open, BeepBar tries again by itself when the connection returns, and the message goes away as soon as the list is updated.
 
 - Choosing another materials folder while a sync is starting or finishing no longer shows the previous folder's last sync for the new one; the current folder stays: choose the new one again once the sync has ended.
-
-- Watching a lecture in BeepBar keeps the display and Mac awake during video playback.
 
 - Renaming a course folder works after restoring or copying your files to another Mac, without extra prompts and while keeping your files tracked.
 
@@ -57,7 +50,7 @@
 
 - Changing selected courses keeps the next automatic sync on schedule; automatic checks stop while local recovery needs attention and resume once it is resolved.
 
-- Cancelling a network check for Data Saver stops promptly and prevents an automatic sync from starting afterward.
+- With Data Saver on, cancelling while BeepBar checks which network you're on now stops right away, and no automatic sync starts afterwards.
 
 - Removing a course from your selection now drops its waiting recordings request without interrupting playback actions.
 

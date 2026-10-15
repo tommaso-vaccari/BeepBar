@@ -313,6 +313,20 @@ import Testing
         gate.release()
     }
 
+    /// Proves that a run ending after the app started quitting starts no recordings listing. A quit
+    /// from outside waits for `syncTask`, which can still finish successfully; a follow-up started
+    /// then would create WebKit work on the way out. Fails if `startRecordingsFollowUp` loses its
+    /// `isTerminating` guard (release review I-C1).
+    @Test func aRunEndingWhileQuittingStartsNoFollowUp() async throws {
+        let harness = try await Harness()
+        defer { harness.remove() }
+        #expect(harness.controller.prepareForTermination() == nil)
+        harness.controller.synchronizeNow()
+        await harness.settle()
+        #expect(harness.controller.recordingsFollowUpForTesting == nil)
+        #expect(harness.seam.calls.isEmpty)
+    }
+
     /// Proves that a sign-out (the list is forgotten) while the follow-up runs cancels it and its
     /// result is never published. Guards against a finished refresh of the previous account
     /// reporting itself.

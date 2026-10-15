@@ -2308,6 +2308,8 @@ enum MaterialsRunEnd: Equatable, Sendable {
                 self?.endOperation(operationID)
             } catch is RootOperationGateError {
                 self?.busySync(operationID)
+            } catch let error as RemoteMoveRecoveryError {
+                await self?.failedSync(operationID, error: nil, automatic: false, unreadableMove: error.path)
             } catch {
                 await self?.failedSync(operationID, error: nil, automatic: false)
             }
@@ -3403,6 +3405,8 @@ enum MaterialsRunEnd: Equatable, Sendable {
                 self?.endOperation(operationID)
             } catch is RootOperationGateError {
                 self?.deferredAutomaticSync(operationID)
+            } catch let error as RemoteMoveRecoveryError {
+                await self?.failedSync(operationID, error: nil, automatic: true, unreadableMove: error.path)
             } catch {
                 await self?.failedSync(operationID, error: nil, automatic: true)
             }
@@ -3504,6 +3508,9 @@ enum MaterialsRunEnd: Equatable, Sendable {
     /// `force`; the next manual sync will).
     @discardableResult
     private func startRecordingsFollowUp(after end: MaterialsRunEnd, trigger: RecordingsSyncTrigger) -> Task<Void, Never>? {
+        // A run that ends while the app quits (a quit from outside waits for `syncTask`, which can
+        // still finish successfully) must not start WebKit listings on the way out.
+        guard !isTerminating else { return nil }
         guard let materials = Self.recordingsOutcome(for: end) else { return nil }
         guard case .refresh = recordingsSyncDecision(after: materials, trigger: trigger, network: nil).0 else { return nil }
         if let recordingsFollowUp { return recordingsFollowUp }
@@ -3704,6 +3711,15 @@ enum MaterialsRunEnd: Equatable, Sendable {
         return stateBeforeRun
     }
 
+    /// What the window says when an interrupted Moodle move cannot be read at `path` (relative to
+    /// the sync folder). It says which path and what usually causes it (an alias or a folder where
+    /// the file should be, or missing permissions), since the folder stays blocked until it is fixed.
+    nonisolated static func unreadableMoveMessage(_ path: RelativePath) -> BilingualText {
+        BilingualText(
+            "BeepBar non riesce a leggere «\(path.value)», che fa parte di uno spostamento rimasto a metà, fatto per seguire Moodle. Controlla che al suo posto non ci sia un alias o una cartella e che il file sia accessibile, poi premi «Sincronizza ora».",
+            "BeepBar can't read “\(path.value)”, part of an unfinished move to follow Moodle. Check that there's no alias or folder in its place and that the file is accessible, then choose “Sync now”.")
+    }
+
     private func deferredAutomaticSync(_ operationID: UUID) {
         guard activeOperationID == operationID else { return }
         recordRunEnd(operationID, .deferredWhileBusy)
@@ -3712,15 +3728,21 @@ enum MaterialsRunEnd: Equatable, Sendable {
         endOperation(operationID)
     }
 
-    private func failedSync(_ operationID: UUID, error: WeBeepAPIError?, automatic: Bool) async {
+    /// `unreadableMove`: the run stopped because an interrupted Moodle move left a path recovery
+    /// cannot read (`RemoteMoveRecoveryError`). The window names it instead of the generic
+    /// "Sincronizzazione incompleta", since nothing syncs in that folder until the user fixes that
+    /// path (release review I-A4). The notification stays the generic one: it has no room for a
+    /// path, and opening BeepBar shows it.
+    private func failedSync(_ operationID: UUID, error: WeBeepAPIError?, automatic: Bool, unreadableMove: RelativePath? = nil) async {
         guard activeOperationID == operationID else { return }
         recordRunEnd(operationID, error.map(MaterialsRunEnd.serviceFailure) ?? .localFailure)
-        BeepbarLog.sync.error("Synchronization failed automatic=\(automatic, privacy: .public) errorType=\(error.map { String(reflecting: type(of: $0)) } ?? "unknown", privacy: .public)")
+        BeepbarLog.sync.error("Synchronization failed automatic=\(automatic, privacy: .public) errorType=\(error.map { String(reflecting: type(of: $0)) } ?? (unreadableMove == nil ? "unknown" : "unreadableMove"), privacy: .public)")
+        if let unreadableMove { BeepbarLog.sync.error("Interrupted move blocked by an unreadable path=\(unreadableMove.value, privacy: .private)") }
         let issue: AutomaticNotificationIssue?
         if let error {
             issue = await handleServiceFailure(error, automatic: automatic)
         } else {
-            setSyncState(.failed(.partialSync))
+            setSyncState(.failed(unreadableMove.map { .local(Self.unreadableMoveMessage($0)) } ?? .partialSync))
             issue = automatic ? .partialSync : nil
         }
         let isCurrent = currentNotificationCheck()

@@ -35,8 +35,10 @@ import Testing
         #expect(try await fixture.database.baseline(rootID: fixture.rootID, remoteID: one)?.relativePath == new)
     }
 
-    @Test(arguments: [false, true])
-    func ambiguousRemoteMoveRecoveryRetainsTheJournalAndBlocksPlanning(_ unreadable: Bool) async throws {
+    /// A path recovery cannot read (here a symlinked destination folder) keeps the move's row and
+    /// stops the sync before it plans or downloads: a transient read error must not lose a move
+    /// that completed (R-004). The user can clear it by fixing the path.
+    @Test func unreadableRemoteMoveRecoveryRetainsTheJournalAndBlocksPlanning() async throws {
         let fixture = try await Fixture()
         defer { fixture.remove() }
         let target = fixture.targets[0]
@@ -46,17 +48,83 @@ import Testing
         let destination = try RelativePath("Course 1/Moved/0.txt")
         let move = PendingRemoteMove(batchID: UUID(), remoteID: id, from: baseline.relativePath, to: destination, sha256: baseline.sha256, placement: nil)
         try await fixture.database.beginRemoteMoves(rootID: fixture.rootID, [move])
-        if unreadable {
-            try FileManager.default.createSymbolicLink(at: fixture.root.appending(path: "Course 1/Moved"), withDestinationURL: fixture.root)
-        } else {
-            try FileManager.default.moveItem(at: fixture.root.appending(path: baseline.relativePath.value), to: fixture.root.appending(path: "outside-journal.txt"))
-            try fixture.write("changed after move", to: destination.value)
-        }
+        try FileManager.default.createSymbolicLink(at: fixture.root.appending(path: "Course 1/Moved"), withDestinationURL: fixture.root)
         fixture.upstream.resetDownloadCount()
-        await #expect(throws: (any Error).self) { _ = try await fixture.synchronize(targets: [target]) }
+        // The error names the path to fix, so the app can show it (release review I-A4).
+        await #expect(throws: RemoteMoveRecoveryError(path: destination)) { _ = try await fixture.synchronize(targets: [target]) }
         #expect(try await fixture.database.pendingRemoteMoves(rootID: fixture.rootID) == [move])
         #expect(try await fixture.database.baseline(rootID: fixture.rootID, remoteID: id) == baseline)
         #expect(fixture.upstream.downloadCount == 0)
+    }
+
+    /// The readable states a crash and a later user action can leave behind never block the
+    /// folder. Before this, each kept the row forever, so every sync, conflict choice and folder
+    /// tidy-up of that folder failed with nothing the user could do (release review I-A1).
+    /// - `movedThenEdited`: the file moved, then the user edited it. The baseline follows it and
+    ///   the edit stays as a local change: no download over it.
+    /// - `bothMissing`: the file moved, then the user deleted it. Nothing is left to protect; the
+    ///   row is dropped and the tracked file is downloaded again, as for any deleted file.
+    /// - `sourceEdited`: the move never happened and the user edited the file where it was. The row
+    ///   is dropped and the edit is kept.
+    @Test(arguments: ["movedThenEdited", "bothMissing", "sourceEdited"])
+    func readableRemoteMoveRecoveryNeverBlocksTheFolder(_ state: String) async throws {
+        let fixture = try await Fixture()
+        defer { fixture.remove() }
+        let target = fixture.targets[0]
+        _ = try await fixture.synchronize(targets: [target])
+        let id = fixture.remoteID(course: 1, file: 0)
+        let baseline = try #require(try await fixture.database.baseline(rootID: fixture.rootID, remoteID: id))
+        let destination = try RelativePath("Course 1/Moved/0.txt")
+        let move = PendingRemoteMove(batchID: UUID(), remoteID: id, from: baseline.relativePath, to: destination, sha256: baseline.sha256, placement: nil)
+        try await fixture.database.beginRemoteMoves(rootID: fixture.rootID, [move])
+        let source = fixture.root.appending(path: baseline.relativePath.value)
+        switch state {
+        case "movedThenEdited":
+            try FileManager.default.removeItem(at: source)
+            try fixture.write("changed after move", to: destination.value)
+        case "bothMissing":
+            try FileManager.default.removeItem(at: source)
+        default:
+            try fixture.write("edited before the move", to: baseline.relativePath.value)
+        }
+        fixture.upstream.resetDownloadCount()
+        _ = try await fixture.synchronize(targets: [target])
+        #expect(try await fixture.database.pendingRemoteMoves(rootID: fixture.rootID).isEmpty)
+        switch state {
+        case "movedThenEdited":
+            #expect(try await fixture.database.baseline(rootID: fixture.rootID, remoteID: id)?.relativePath == destination)
+            #expect(fixture.contents(destination.value) == "changed after move")
+        case "bothMissing":
+            #expect(fixture.upstream.downloadCount == 1)
+            #expect(fixture.contents(baseline.relativePath.value) != nil)
+        default:
+            #expect(fixture.upstream.downloadCount == 0)
+            #expect(fixture.contents(baseline.relativePath.value) == "edited before the move")
+        }
+    }
+
+    /// One unreadable batch neither stops the others from being settled nor loses its own row.
+    /// Batches are visited in no fixed order, so throwing at the first unreadable one could leave
+    /// a settleable batch pending behind it.
+    @Test func anUnreadableBatchDoesNotHoldBackTheOthers() async throws {
+        let fixture = try await Fixture()
+        defer { fixture.remove() }
+        let target = fixture.targets[0]
+        _ = try await fixture.synchronize(targets: [target])
+        var moves: [PendingRemoteMove] = []
+        for file in 0..<4 {
+            let id = fixture.remoteID(course: 1, file: file)
+            let baseline = try #require(try await fixture.database.baseline(rootID: fixture.rootID, remoteID: id))
+            let folder = file == 0 ? "Moved" : "Elsewhere"
+            let move = PendingRemoteMove(batchID: UUID(), remoteID: id, from: baseline.relativePath, to: try RelativePath("Course 1/\(folder)/\(file).txt"), sha256: baseline.sha256, placement: nil)
+            try await fixture.database.beginRemoteMoves(rootID: fixture.rootID, [move])
+            moves.append(move)
+        }
+        try FileManager.default.createSymbolicLink(at: fixture.root.appending(path: "Course 1/Moved"), withDestinationURL: fixture.root)
+        await #expect(throws: RemoteMoveRecoveryError(path: moves[0].to)) {
+            try await RemoteMoveJournal.recover(rootID: fixture.rootID, database: fixture.database, fileStore: fixture.fileStore)
+        }
+        #expect(try await fixture.database.pendingRemoteMoves(rootID: fixture.rootID) == [moves[0]])
     }
 
     @Test func pendingScopeRenameBlocksSyncBeforeCreatingFoldersOrDownloading() async throws {
@@ -1834,6 +1902,71 @@ import Testing
         #expect(try await fixture.database.baseline(rootID: fixture.rootID, remoteID: one)?.relativePath == lab2)
         #expect(try await fixture.database.baseline(rootID: fixture.rootID, remoteID: two)?.relativePath == lab1)
         #expect(try await fixture.changes().isEmpty)
+    }
+
+    /// A swap is one atomic exchange, so either file shows which side of it the disk is on, even
+    /// when the user then edited or deleted the other one. Before release review I-A3 any such
+    /// edit dropped the row: both baselines kept the old paths and Conflicts described each file
+    /// with the other's contents.
+    /// - `oneEdited`, `twoEdited`, `oneDeleted`: the swap happened. The baselines follow it, the
+    ///   edit stays a local change and nothing is downloaded over it; a deleted file comes back.
+    /// - `beforeSwapOneEdited`: the journal was written but the swap never ran (or a power loss
+    ///   reverted it). The other file still holds its own contents, so the row is dropped and the
+    ///   baselines stay; a rule that commits whenever both files exist fails here.
+    @Test(arguments: ["oneEdited", "twoEdited", "oneDeleted", "beforeSwapOneEdited"])
+    func anInterruptedSwapFollowsTheContentsLeftOnDisk(_ state: String) async throws {
+        let fixture = try await Fixture()
+        defer { fixture.remove() }
+        let target = fixture.targets[0]
+        fixture.upstream.addModule(course: 1, id: 150, section: "Lab 1", name: "Esercizi")
+        fixture.upstream.addModule(course: 1, id: 160, section: "Lab 2", name: "Esercizi")
+        fixture.upstream.addFile(course: 1, file: 600, filename: "testo.txt", value: "one", revision: "1", module: 150, contentHash: String(repeating: "d", count: 40))
+        fixture.upstream.addFile(course: 1, file: 601, filename: "testo.txt", value: "two", revision: "1", module: 160, contentHash: String(repeating: "e", count: 40))
+        _ = try await fixture.synchronize(targets: [target])
+        let one = fixture.remoteID(course: 1, file: 600, module: 150, filename: "testo.txt")
+        let two = fixture.remoteID(course: 1, file: 601, module: 160, filename: "testo.txt")
+        let lab1 = try RelativePath("Course 1/Lab 1/Esercizi/testo.txt")
+        let lab2 = try RelativePath("Course 1/Lab 2/Esercizi/testo.txt")
+        let oneSHA = try #require(try await fixture.database.baseline(rootID: fixture.rootID, remoteID: one)).sha256
+        let twoSHA = try #require(try await fixture.database.baseline(rootID: fixture.rootID, remoteID: two)).sha256
+        let batch = UUID()
+        try await fixture.database.beginRemoteMoves(rootID: fixture.rootID, [
+            PendingRemoteMove(batchID: batch, remoteID: one, from: lab1, to: lab2, sha256: oneSHA, placement: RemotePlacement(sectionName: "Lab 2", moduleName: "Esercizi", isSingleFileResource: false)),
+            PendingRemoteMove(batchID: batch, remoteID: two, from: lab2, to: lab1, sha256: twoSHA, placement: RemotePlacement(sectionName: "Lab 1", moduleName: "Esercizi", isSingleFileResource: false)),
+        ])
+        switch state {
+        case "oneEdited":
+            try fixture.write("two", to: lab1.value)
+            try fixture.write("one, edited", to: lab2.value)
+        case "twoEdited":
+            try fixture.write("two, edited", to: lab1.value)
+            try fixture.write("one", to: lab2.value)
+        case "oneDeleted":
+            try fixture.write("two", to: lab1.value)
+            try FileManager.default.removeItem(at: fixture.root.appending(path: lab2.value))
+        default:
+            try fixture.write("one, edited", to: lab1.value)
+        }
+
+        try await RemoteMoveJournal.recover(rootID: fixture.rootID, database: fixture.database, fileStore: fixture.fileStore)
+        #expect(try await fixture.database.pendingRemoteMoves(rootID: fixture.rootID).isEmpty)
+        let swapped = state != "beforeSwapOneEdited"
+        #expect(try await fixture.database.baseline(rootID: fixture.rootID, remoteID: one)?.relativePath == (swapped ? lab2 : lab1))
+        #expect(try await fixture.database.baseline(rootID: fixture.rootID, remoteID: two)?.relativePath == (swapped ? lab1 : lab2))
+        guard swapped else {
+            #expect(fixture.contents(lab1.value) == "one, edited")
+            return
+        }
+
+        fixture.upstream.setModuleSection(course: 1, id: 150, section: "Lab 2")
+        fixture.upstream.setModuleSection(course: 1, id: 160, section: "Lab 1")
+        fixture.upstream.resetDownloadCount()
+        let result = try await fixture.synchronize(targets: [target])
+        #expect(result.conflicts == 0)
+        #expect(try await fixture.changes().isEmpty)
+        #expect(fixture.upstream.downloadCount == (state == "oneDeleted" ? 1 : 0))
+        #expect(fixture.contents(lab1.value) == (state == "twoEdited" ? "two, edited" : "two"))
+        #expect(fixture.contents(lab2.value) == (state == "oneEdited" ? "one, edited" : "one"))
     }
 
     @Test func aNumberedMoveInterruptedAfterTheRenameIsCompleted() async throws {

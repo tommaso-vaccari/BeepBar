@@ -5,8 +5,8 @@ import BeepbarCore
 
 /// The Recordings sidebar's renamed-folder titles and its orange "lectures to watch" marker.
 struct RecordingsSidebarNamesTests {
-    private static let raw = "058167 - GEOMETRIA ALGEBRA LINEARE (Claude Sonnet) [2026-27]"
-    private static let cleaned = "GEOMETRIA ALGEBRA LINEARE (Claude Sonnet)"
+    private static let raw = "058167 - GEOMETRIA ALGEBRA LINEARE (Rossi) [2026-27]"
+    private static let cleaned = "GEOMETRIA ALGEBRA LINEARE (Rossi)"
 
     private func name(_ folder: String?, cleaned: String = cleaned, raw: String = raw, id: Int64 = 7) -> String {
         RecordingsPresentation.sidebarName(courseName: cleaned, courseDisplayName: raw, courseID: id, localFolderName: folder)
@@ -30,13 +30,13 @@ struct RecordingsSidebarNamesTests {
         #expect(name("geometria-algebra-lineare") == Self.cleaned)
         #expect(name("Geometria-Algebra-Lineare") == Self.cleaned)
         #expect(name("geometria-algebra-lineare-7") == Self.cleaned)
-        #expect(name("058167-geometria-algebra-lineare-claude-sonnet-2026-27") == Self.cleaned)
+        #expect(name("058167-geometria-algebra-lineare-rossi-2026-27") == Self.cleaned)
     }
 
     /// The example of the feature: the folder replaces the base, the teacher stays.
     @Test func aRenamedFolderReplacesTheBaseAndKeepsTheTeacher() {
-        #expect(name("GAL") == "GAL (Claude Sonnet)")
-        #expect(name("  GAL \n") == "GAL (Claude Sonnet)")
+        #expect(name("GAL") == "GAL (Rossi)")
+        #expect(name("  GAL \n") == "GAL (Rossi)")
     }
 
     /// Without a trailing group there is no teacher to keep: just the folder.
@@ -62,11 +62,11 @@ struct RecordingsSidebarNamesTests {
 
     /// Odd folders must not crash, duplicate the teacher or lose their characters.
     @Test func oddFoldersAreHandled() {
-        #expect(name("Algebra (Claude Sonnet)") == "Algebra (Claude Sonnet)")
-        #expect(name("algebra (claude sonnet)") == "algebra (claude sonnet)")
-        #expect(name("Analisi 🧮 ✨") == "Analisi 🧮 ✨ (Claude Sonnet)")
-        #expect(name("Fisica (") == "Fisica ( (Claude Sonnet)")
-        #expect(name("Caf\u{65}\u{301}") == "Caf\u{65}\u{301} (Claude Sonnet)")
+        #expect(name("Algebra (Rossi)") == "Algebra (Rossi)")
+        #expect(name("algebra (rossi)") == "algebra (rossi)")
+        #expect(name("Analisi 🧮 ✨") == "Analisi 🧮 ✨ (Rossi)")
+        #expect(name("Fisica (") == "Fisica ( (Rossi)")
+        #expect(name("Caf\u{65}\u{301}") == "Caf\u{65}\u{301} (Rossi)")
         #expect(name("GAL", cleaned: "", raw: "") == "GAL")
     }
 
@@ -75,7 +75,7 @@ struct RecordingsSidebarNamesTests {
     @Test func theSidebarFollowsTheFolderMap() {
         let courses = [course(1, Self.raw), course(2, "058168 - FISICA [2026-27]"), course(3, "Seminar (Rossi)")]
         let sidebar = RecmanCourseSidebar(.init(courses: courses, enabledIDs: [1, 2, 3], folders: [1: "gal", 3: "Sem"]))
-        #expect(sidebar.searchable.map(\.sidebarName) == ["gal (Claude Sonnet)", "FISICA"])
+        #expect(sidebar.searchable.map(\.sidebarName) == ["gal (Rossi)", "FISICA"])
         #expect(sidebar.searchable.map(\.name) == [Self.cleaned, "FISICA"])
         #expect(sidebar.unsearchable.map(\.sidebarName) == ["Sem (Rossi)"])
         #expect(sidebar.searchable.map(\.key) == RecmanCourseSidebar(.init(courses: courses, enabledIDs: [1, 2, 3])).searchable.map(\.key))
@@ -98,16 +98,16 @@ struct RecordingsSidebarNamesTests {
 
     /// Custom folder names are honoured regardless of their capitalization or slug shape.
     @Test func customNamesAreHonouredRegardlessOfCase() {
-        #expect(name("GAL") == "GAL (Claude Sonnet)")
-        #expect(name("Gal") == "Gal (Claude Sonnet)")
-        #expect(name("Geometria 2") == "Geometria 2 (Claude Sonnet)")
-        #expect(name("gal") == "gal (Claude Sonnet)")
-        #expect(name("algebra-lineare") == "algebra-lineare (Claude Sonnet)")
+        #expect(name("GAL") == "GAL (Rossi)")
+        #expect(name("Gal") == "Gal (Rossi)")
+        #expect(name("Geometria 2") == "Geometria 2 (Rossi)")
+        #expect(name("gal") == "gal (Rossi)")
+        #expect(name("algebra-lineare") == "algebra-lineare (Rossi)")
         // An arbitrary name with an ID suffix remains a rename.
-        #expect(name("GAL (2026)") == "GAL (2026) (Claude Sonnet)")
-        #expect(name("Fisica (2)") == "Fisica (2) (Claude Sonnet)")
-        #expect(name("Geometria (7)") == "Geometria (7) (Claude Sonnet)", "not an actual legacy course name")
-        #expect(name("GAL(7)") == "GAL(7) (Claude Sonnet)", "the legacy form has a space before the id")
+        #expect(name("GAL (2026)") == "GAL (2026) (Rossi)")
+        #expect(name("Fisica (2)") == "Fisica (2) (Rossi)")
+        #expect(name("Geometria (7)") == "Geometria (7) (Rossi)", "not an actual legacy course name")
+        #expect(name("GAL(7)") == "GAL(7) (Rossi)", "the legacy form has a space before the id")
     }
 
     /// The trailing part in parentheses is not always a teacher (a section here): it is kept

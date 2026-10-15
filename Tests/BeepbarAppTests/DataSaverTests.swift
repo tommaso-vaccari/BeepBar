@@ -611,6 +611,37 @@ private final class NetworkSequence: Sendable {
     }
 }
 
+/// Uses the signed-in harness below, which runs real syncs against a local Moodle.
+@MainActor struct UnreadableMoveRecoveryTests {
+    /// An interrupted Moodle move whose destination became a symbolic link blocks the folder until
+    /// the user fixes it. Both a manual and an automatic run say which path, rather than the
+    /// generic "Sincronizzazione incompleta" that gave the user nothing to act on (release review
+    /// I-A4). Fails if the app stops catching `RemoteMoveRecoveryError` or drops the path.
+    @Test(arguments: [false, true])
+    func aBlockedMoveNamesThePathToFix(automatic: Bool) async throws {
+        let harness = try await Harness(networks: [.unrestricted, .unrestricted])
+        defer { harness.remove() }
+        await harness.controller.runAutomaticSyncForTesting()
+        #expect(harness.downloaded("a.txt"))
+        let destination = try RelativePath("Course/Moved/a.txt")
+        try await harness.database.beginRemoteMoves(rootID: harness.rootID, [
+            PendingRemoteMove(batchID: UUID(), remoteID: "interrupted", from: try RelativePath("Course/Lezioni/a.txt"), to: destination, sha256: String(repeating: "0", count: 64), placement: nil),
+        ])
+        try FileManager.default.createSymbolicLink(at: harness.root.appending(path: "Course/Moved"), withDestinationURL: harness.root)
+
+        if automatic {
+            await harness.controller.runAutomaticSyncForTesting()
+        } else {
+            harness.controller.synchronizeNow()
+            await harness.controller.waitForSyncForTesting()
+        }
+
+        #expect(harness.controller.syncState == .failed(.local(WeBeepAuthenticationController.unreadableMoveMessage(destination))))
+        #expect(WeBeepAuthenticationController.unreadableMoveMessage(destination).italian.contains("«Course/Moved/a.txt»"))
+        #expect(WeBeepAuthenticationController.unreadableMoveMessage(destination).english.contains("“Course/Moved/a.txt”"))
+    }
+}
+
 /// A controller signed in to a local Moodle where course 1 is selected and lists `a.txt`, with a
 /// folder of its own, a scripted network, and automatic sync on, as users have it.
 @MainActor private struct Harness {

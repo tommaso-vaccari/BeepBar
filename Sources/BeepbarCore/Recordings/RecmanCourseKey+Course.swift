@@ -120,7 +120,7 @@ public struct RecmanCourseSidebar: Equatable, Sendable {
     ///
     /// The student may rename that folder to something short ("GAL"); the row then follows it, but
     /// keeps the teacher, who tells apart two courses with the same name: "Geometria algebra
-    /// lineare (Claude Sonnet)" with the folder "GAL" reads "GAL (Claude Sonnet)".
+    /// lineare (Rossi)" with the folder "GAL" reads "GAL (Rossi)".
     ///
     /// The cleaned name is returned unchanged when there is no folder (nil, empty, blank) or when
     /// the folder matches a generated name (`renamedFolder`). Anything else is the student's

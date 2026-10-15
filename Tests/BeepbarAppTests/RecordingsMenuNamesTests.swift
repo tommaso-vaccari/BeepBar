@@ -5,22 +5,22 @@ import BeepbarCore
 
 /// The name a menu bar line gives a course: the renamed folder alone, never the teacher.
 struct RecordingsMenuNamesTests {
-    private static let raw = "058167 - GEOMETRIA ALGEBRA LINEARE (Claude Sonnet) [2026-27]"
-    private static let cleaned = "GEOMETRIA ALGEBRA LINEARE (Claude Sonnet)"
+    private static let raw = "058167 - GEOMETRIA ALGEBRA LINEARE (Rossi) [2026-27]"
+    private static let cleaned = "GEOMETRIA ALGEBRA LINEARE (Rossi)"
 
     private func menu(_ folder: String?, cleaned: String = cleaned, raw: String = raw) -> String {
         RecmanCourseSidebar.menuName(courseName: cleaned, courseDisplayName: raw, courseID: 7, localFolderName: folder)
     }
 
     /// A renamed folder is the whole name: no teacher. Guards against reusing the sidebar name,
-    /// which would print "GAL (Claude Sonnet)" in the menu. Fails if the teacher is appended.
+    /// which would print "GAL (Rossi)" in the menu. Fails if the teacher is appended.
     @Test func aRenamedFolderIsShownAlone() {
         #expect(menu("GAL") == "GAL")
         #expect(menu("gal") == "gal")
         #expect(menu("Gal") == "Gal")
         #expect(menu("algebra-lineare") == "algebra-lineare")
         #expect(menu("  GAL \n") == "GAL")
-        #expect(menu("Algebra (Claude Sonnet)") == "Algebra (Claude Sonnet)", "the student's own text is never edited")
+        #expect(menu("Algebra (Rossi)") == "Algebra (Rossi)", "the student's own text is never edited")
     }
 
     /// Not renamed (missing, blank, or a folder BeepBar generated): the base name without teacher.

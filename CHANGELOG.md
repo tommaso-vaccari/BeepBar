@@ -32,7 +32,7 @@
 
 ### Fixed
 
-- If your Polimi sign-in has expired, Recordings now starts a fresh sign-in instead of reusing the one that failed, and a “service not available” page from Polimi ends the attempt instead of leaving Recordings waiting.
+- If your Polimi sign-in has expired, Recordings now starts a fresh sign-in instead of reusing the one that failed, and Polimi’s “Il servizio richiesto non è presente” page ends the attempt instead of leaving Recordings waiting.
 
 - Moving a local file to Trash and recovering a course-folder rename now preserve your files when the materials folder changes or a filesystem operation fails.
 

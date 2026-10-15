@@ -72,7 +72,8 @@ struct RecmanWebSessionTests {
     /// A web view that has no page yet (right after `open(cookies:)`) or is still loading skips
     /// the archive probe; any page with an address is probed. Guards #174: probing the URL-less
     /// web view ran a script whose answer could not matter, and a cold web process missing the
-    /// script deadline ended the first Recordings operation as `unavailable`. The session wiring
+    /// script deadline (as CI saw for that same fresh session) could end the first Recordings
+    /// operation as `unavailable` before it tried to enter. The session wiring
     /// is not exercised here: once the probe is skipped the session enters Polimi for real.
     @Test func theArchiveProbeRunsOnlyOnALoadedPage() throws {
         let archive = try #require(URL(string: "https://\(RecmanURLPolicy.archiveHost)\(RecmanURLPolicy.archivePath)"))

@@ -84,6 +84,8 @@ struct RecordingPlayerPolicyTests {
         #expect(Policy.steppedSpeed(from: 2, faster: true, available: Policy.availableSpeeds(.unknown)) == nil)
         #expect(Policy.steppedSpeed(from: 3, faster: true, available: all) == 3.5)
         #expect(Policy.steppedSpeed(from: 4, faster: true, available: all) == nil)
+        #expect(Policy.steppedSpeed(from: 4, faster: false, available: all) == 3.5)
+        #expect(Policy.steppedSpeed(from: 3.5, faster: false, available: all) == 3)
     }
 
     /// Skips land inside the lecture: never before 0, never past the duration, unclamped above

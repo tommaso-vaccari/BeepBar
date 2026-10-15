@@ -490,11 +490,12 @@ struct RecordingPlayerMVPTests {
         let generation = controller.generation
         controller.rateSupportChanged(generation: generation, to: .unknown)
         #expect(player.defaultRate == 2)
-        let threeItem = controller.speedPopUp?.menu?.items.first { ($0.representedObject as? NSNumber)?.floatValue == 3 }
-        #expect(threeItem?.isEnabled == false)
+        let fastItems = controller.speedPopUp?.menu?.items.filter { (($0.representedObject as? NSNumber)?.floatValue ?? 0) > 2 } ?? []
+        #expect(fastItems.compactMap { ($0.representedObject as? NSNumber)?.floatValue } == [2.5, 3, 3.5, 4])
+        #expect(fastItems.allSatisfy { !$0.isEnabled })
         controller.rateSupportChanged(generation: generation, to: .all)
         #expect(player.defaultRate == 3)
-        #expect(threeItem?.isEnabled == true)
+        #expect(fastItems.allSatisfy { $0.isEnabled })
         controller.rateSupportChanged(generation: generation - 1, to: .unknown)
         #expect(player.defaultRate == 3)
         #expect(defaults.writes.count == written)

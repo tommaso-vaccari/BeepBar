@@ -674,6 +674,167 @@ struct SyncFinalizationTests {
         releaseNotification.continuation.yield()
         await completion.value
     }
+
+    // MARK: A result belongs to the folder it synced (#167)
+
+    /// The folder picker checked for a running sync before its awaits, and a sync of folder A
+    /// started during them. The picker must leave A in place, and A's result must be saved
+    /// under A only. Guards the re-check in `useRoot`: without it the folder becomes B mid-sync
+    /// and A's result reaches B's keys or screen.
+    @Test @MainActor func folderPickedWhileASyncStartsLeavesTheSyncedFolderInPlace() async throws {
+        let fixture = try await TwoFolders()
+        defer { fixture.remove() }
+        let controller = fixture.controller()
+        #expect(!controller.isSyncActive)
+        // As `chooseRoot` does after its check: `useRoot` then waits (here, on the bootstrap).
+        let (released, release) = AsyncStream<Void>.makeStream()
+        controller.holdBootstrapForTesting(Task { for await _ in released {} })
+        let pick = Task { await controller.useRootForTesting(fixture.folderB) }
+        await Task.yield()
+
+        let operation = UUID()
+        controller.setOperationForTesting(operation)
+        controller.setSyncStateForTesting(.syncing)
+        release.finish()
+        await pick.value
+
+        #expect(controller.rootURL == fixture.folderA, "the folder changed under a running sync")
+        #expect(controller.syncState == .syncing, "the picker replaced the running sync's state")
+        #expect(controller.isSyncActive)
+
+        await controller.completeSyncForTesting(operation, summary: TwoFolders.progressA)
+        #expect(controller.lastSyncSummary?.added == TwoFolders.progressA.added)
+        #expect(fixture.savedSummary(for: fixture.idA)?.added == TwoFolders.progressA.added)
+        let idB = try await fixture.database.rootID(canonicalPath: fixture.folderB.resolvingSymlinksInPath().path)
+        #expect(fixture.savedSummary(for: try #require(idB)) == nil, "folder B received folder A's result")
+    }
+
+    /// The same pick when the sync took the folder lease before the picker's recovery asked for
+    /// it: the recovery fails as busy, and that failure must not replace the running sync's
+    /// state with "Non è stato possibile usare questa cartella". Fails if `useRoot`'s catch
+    /// reports failures of a folder it never adopted while a sync runs.
+    @Test @MainActor func folderPickBlockedByTheSyncLeaseShowsNoErrorOverTheSync() async throws {
+        let fixture = try await TwoFolders()
+        defer { fixture.remove() }
+        let controller = fixture.controller()
+        let (released, release) = AsyncStream<Void>.makeStream()
+        controller.holdBootstrapForTesting(Task { for await _ in released {} })
+        let pick = Task { await controller.useRootForTesting(fixture.folderB) }
+        await Task.yield()
+
+        let operation = UUID()
+        controller.setOperationForTesting(operation)
+        controller.setSyncStateForTesting(.syncing)
+        let lease = try await controller.acquireOperationGateForTesting(.syncing(operation))
+        release.finish()
+        await pick.value
+        await lease.release()
+
+        #expect(controller.syncState == .syncing, "the picker's failure replaced the running sync's state")
+        #expect(controller.rootURL == fixture.folderA)
+        #expect(controller.isSyncActive)
+    }
+
+    /// Defence in depth behind the picker: a run whose folder was replaced anyway, while it
+    /// synced, while its pending choices were read, or while its result was encoded, ends as
+    /// superseded. Nothing is published or saved, no recordings follow-up is recorded, the
+    /// operation ends, and the new folder's own saved result is shown again. Fails if
+    /// `completeSync`/`finishReconciliation` stop comparing the synced folder with the current
+    /// one: A's result would then be shown over B (and saved under B before #167's save fix),
+    /// and the run end recorded for a follow-up of the old folder.
+    @Test(arguments: ["during-sync", "during-pending-choices", "during-encode"]) @MainActor
+    func syncWhoseFolderChangedEndsWithoutReportingOverTheNewFolder(_ moment: String) async throws {
+        let fixture = try await TwoFolders()
+        defer { fixture.remove() }
+        let controller = fixture.controller()
+        let idB = UUID()
+        try await fixture.database.registerRoot(id: idB, canonicalPath: fixture.folderB.path)
+        let previousB = SyncCompletionSummary(completedAt: Date(timeIntervalSince1970: 456), added: 2, updated: 0, unchanged: 0, preservedLocal: 0, conflicts: 0, failures: 0)
+        let previousBData = try JSONEncoder().encode(previousB)
+        fixture.defaults.set(previousBData, forKey: TwoFolders.summaryKey + idB.uuidString)
+        var notificationSent = false
+        controller.setBeforeNotificationForTesting { notificationSent = true }
+
+        let operation = UUID()
+        controller.setOperationForTesting(operation)
+        controller.setSyncStateForTesting(.checking)
+        switch moment {
+        case "during-sync": controller.setRootIDForTesting(idB)
+        case "during-pending-choices": controller.setBeforePendingChoicesForTesting { controller.setRootIDForTesting(idB) }
+        default: controller.setBeforeReconciliationStateForTesting { controller.setRootIDForTesting(idB) }
+        }
+        await controller.completeSyncForTesting(operation, summary: TwoFolders.progressA, syncedRootID: fixture.idA)
+
+        #expect(!controller.isSyncActive)
+        #expect(controller.lastSyncSummary == previousB, "B shows \(String(describing: controller.syncState)) instead of its own result")
+        #expect(fixture.defaults.data(forKey: TwoFolders.summaryKey + idB.uuidString) == previousBData, "folder B received folder A's result")
+        #expect(fixture.savedSummary(for: fixture.idA) == nil, "a result read against B's pending choices was saved")
+        #expect(controller.takeRunEndForTesting(operation) == nil, "a superseded run recorded an end")
+        #expect(!notificationSent)
+    }
+
+    /// The same superseded run when the pending choices read fails: the failure belongs to no
+    /// run, so nothing is recorded for a recordings follow-up. Fails if the catch path of
+    /// `completeSync` stops checking the folder (it would record `.pendingChoicesUnreadable`).
+    @Test @MainActor func syncWhoseFolderChangedRecordsNoRunEndWhenTheReadFails() async throws {
+        let fixture = try await TwoFolders()
+        defer { fixture.remove() }
+        let controller = fixture.controller()
+        controller.setRootIDForTesting(UUID())
+        var connection: OpaquePointer?
+        #expect(sqlite3_open(fixture.databaseURL.path, &connection) == SQLITE_OK)
+        defer { sqlite3_close(connection) }
+        #expect(sqlite3_exec(connection, "DROP TABLE remote_changes", nil, nil, nil) == SQLITE_OK)
+
+        let operation = UUID()
+        controller.setOperationForTesting(operation)
+        await controller.completeSyncForTesting(operation, summary: TwoFolders.progressA, syncedRootID: fixture.idA)
+
+        #expect(!controller.isSyncActive)
+        #expect(controller.takeRunEndForTesting(operation) == nil, "a superseded run recorded an end")
+        #expect(fixture.savedSummary(for: fixture.idA) == nil)
+    }
+}
+
+/// Folder A registered and current, folder B on disk and not yet registered, with throwaway
+/// preferences: what #167's tests switch between.
+private struct TwoFolders {
+    static let summaryKey = "io.github.tvaccari.beepbar.last-successful-summary.v1."
+    static let progressA = SyncProgress(completed: 7, total: 7, added: 7, updated: 0, preservedLocal: 0, unchanged: 0, conflicts: 0, failures: 0)
+    let base: URL
+    let folderA: URL
+    let folderB: URL
+    let databaseURL: URL
+    let database: SyncDatabase
+    let idA = UUID()
+    let suite: String
+    let defaults: UserDefaults
+
+    init() async throws {
+        base = FileManager.default.temporaryDirectory.appending(path: "two-folders-\(UUID().uuidString)", directoryHint: .isDirectory).resolvingSymlinksInPath()
+        folderA = base.appending(path: "A", directoryHint: .isDirectory)
+        folderB = base.appending(path: "B", directoryHint: .isDirectory)
+        try FileManager.default.createDirectory(at: folderA, withIntermediateDirectories: true)
+        try FileManager.default.createDirectory(at: folderB, withIntermediateDirectories: true)
+        databaseURL = base.appending(path: "state.sqlite")
+        database = try SyncDatabase(url: databaseURL)
+        try await database.registerRoot(id: idA, canonicalPath: folderA.path)
+        suite = WeBeepAuthenticationController.throwawayDefaultsSuite()
+        defaults = UserDefaults(suiteName: suite)!
+    }
+
+    @MainActor func controller() -> WeBeepAuthenticationController {
+        WeBeepAuthenticationController(testRootURL: folderA, database: database, rootID: idA, defaults: defaults)
+    }
+
+    func savedSummary(for rootID: UUID) -> SyncCompletionSummary? {
+        defaults.data(forKey: Self.summaryKey + rootID.uuidString).flatMap { try? JSONDecoder().decode(SyncCompletionSummary.self, from: $0) }
+    }
+
+    func remove() {
+        removeTestDefaults(suite)
+        try? FileManager.default.removeItem(at: base)
+    }
 }
 
 /// Holds the first real permission read while the controller can accept account/folder/run changes.

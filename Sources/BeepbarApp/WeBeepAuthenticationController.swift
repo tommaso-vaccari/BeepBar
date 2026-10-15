@@ -1028,7 +1028,7 @@ enum MaterialsRunEnd: Equatable, Sendable {
     }
 
     func setSyncStateForTesting(synced result: EncodedSyncSummary) {
-        setSyncState(synced: result)
+        setSyncState(synced: result, rootID: rootID)
     }
 
     /// Stands for a list Moodle confirmed in this session, as every caller assumed before #98.
@@ -1106,8 +1106,10 @@ enum MaterialsRunEnd: Equatable, Sendable {
         progressSink(operationID, run: beginTransfer(operationID, automatic: automatic))
     }
 
-    func completeSyncForTesting(_ operationID: UUID, summary: SyncProgress, automatic: Bool = false) async {
-        await completeSync(operationID, summary: summary, automatic: automatic)
+    /// Completes `operationID` as a run that synced `syncedRootID`, by default the folder current at
+    /// this call, as the real runs capture it before syncing (#167).
+    func completeSyncForTesting(_ operationID: UUID, summary: SyncProgress, automatic: Bool = false, syncedRootID: UUID? = nil) async {
+        await completeSync(operationID, rootID: syncedRootID ?? rootID, summary: summary, automatic: automatic)
     }
 
     func setBeforeReconciliationStateForTesting(_ action: @escaping @MainActor () async -> Void) {
@@ -1744,21 +1746,24 @@ enum MaterialsRunEnd: Equatable, Sendable {
 #if DEBUG
             summaryEncodedOnMainThreadForTesting = true
 #endif
-            saveSuccessfulResult(summary, data: try? JSONEncoder().encode(summary))
+            saveSuccessfulResult(summary, data: try? JSONEncoder().encode(summary), rootID: rootID)
         }
     }
 
     /// Publishes a sync's new successful result and saves it in the same main-actor turn, with the
     /// bytes encoded off the main actor (R01, #109). Keep both in this one synchronous function:
     /// saving later, from a task, would let a quit or a newer result find the shown result unsaved,
-    /// or let an older write land last.
-    private func setSyncState(synced result: EncodedSyncSummary) {
+    /// or let an older write land last. `rootID` is the folder the sync ran on, never read from
+    /// `self` here: saved under the folder current at completion, a result could land under a
+    /// folder picked mid-sync, which would then show the old folder's result (#167).
+    private func setSyncState(synced result: EncodedSyncSummary, rootID: UUID?) {
         publishSyncState(.synced(result.summary))
-        saveSuccessfulResult(result.summary, data: result.data)
+        saveSuccessfulResult(result.summary, data: result.data, rootID: rootID)
     }
 
-    /// Both keys of a successful result, the time first, as releases before R01 wrote them.
-    private func saveSuccessfulResult(_ summary: SyncCompletionSummary, data: Data?) {
+    /// Both keys of a successful result, the time first, as releases before R01 wrote them, under
+    /// the folder the caller names (#167).
+    private func saveSuccessfulResult(_ summary: SyncCompletionSummary, data: Data?, rootID: UUID?) {
         guard let rootID else { return }
         operationDefaults.set(summary.completedAt.timeIntervalSince1970, forKey: Self.lastSuccessfulReconciliationKey + rootID.uuidString)
         if let data {
@@ -1940,6 +1945,12 @@ enum MaterialsRunEnd: Equatable, Sendable {
             let report = try await operationGate.withLease(.recovering) {
                 try await RecoveryCoordinator(rootID: selectedID, database: database, fileStore: try FileStore(root: selectedURL)).recover()
             }
+            // `chooseRoot` checked for a running sync only before the awaits above, and a sync can
+            // start during them. Switching under it would hand its result to the new folder
+            // (#167), so the folder stays as it was, quietly as in `chooseRoot`: throwing would
+            // show a failure over the running sync. Keep no `await` between this check and the
+            // assignment below, or the window reopens.
+            guard !isSyncActive else { return }
             guard report.unresolved.isEmpty else { throw SyncDatabaseError.execution }
             rootURL = selectedURL; rootID = selectedID; recoveryBlocked = false; hasPendingModuleMoves = false
             // Started for the previous folder's run: the new folder's next sync decides again.
@@ -2240,7 +2251,7 @@ enum MaterialsRunEnd: Equatable, Sendable {
                 let coordinator = try SyncCoordinator(rootID: rootID, rootURL: rootURL, database: database, gate: self.operationGate, apiClient: self.apiClient, downloader: self.downloader, platformName: self.selectedSite.platformName)
                 let run = self.beginTransfer(operationID, automatic: false)
                 let summary = try await coordinator.synchronize(targets: targets, token: token, mode: .manual, networkAccess: .unrestricted, progress: self.progressSink(operationID, run: run))
-                await self.completeSync(operationID, summary: summary, automatic: false)
+                await self.completeSync(operationID, rootID: rootID, summary: summary, automatic: false)
             } catch is CancellationError {
                 self?.cancelledSync(operationID)
             } catch let error as WeBeepAPIError {
@@ -3080,13 +3091,18 @@ enum MaterialsRunEnd: Equatable, Sendable {
         }
     }
 
-    private func finishReconciliation(progress: SyncProgress, operationID: UUID) async throws {
+    /// Publishes the end of `operationID`, which synced the folder `rootID`. Both guards also
+    /// require that folder to be still the current one: the pending choices just read and the
+    /// state published belong to the current folder, so a run whose folder was replaced
+    /// meanwhile has nothing it may publish or save; `completeSync` then ends it as superseded
+    /// (#167).
+    private func finishReconciliation(progress: SyncProgress, operationID: UUID, rootID: UUID?) async throws {
         let pending = try await loadPendingChoices()
         let open = pending.conflicts
         let changes = pending.changes
         // The same check as the guard below, before paying for the encode: a sync cancelled or
         // replaced while its pending choices were read has nothing left to encode (R01, #109).
-        guard activeOperationID == operationID, !Task.isCancelled else { return }
+        guard activeOperationID == operationID, self.rootID == rootID, !Task.isCancelled else { return }
         let summary = SyncCompletionSummary(progress: progress)
         // Only a successful result is saved. Its encode runs off the main actor here, while this
         // operation is still the active one, and before the guard below, which then also drops a
@@ -3099,13 +3115,13 @@ enum MaterialsRunEnd: Equatable, Sendable {
 #endif
         // Cancellation keeps the operation ID until its task unwinds. Checking the ID alone
         // would publish a completed result over the user's pending cancellation.
-        guard activeOperationID == operationID, !Task.isCancelled else { return }
+        guard activeOperationID == operationID, self.rootID == rootID, !Task.isCancelled else { return }
         conflicts = open
         remoteChanges = changes
         let ordered = Self.orderedForDisplay(courses, enabledCourseIDs: enabledCourseIDs)
         if courses != ordered { courses = ordered }
         if let encoded {
-            setSyncState(synced: encoded)
+            setSyncState(synced: encoded, rootID: rootID)
         } else if progress.failures > 0 {
             setSyncState(.partial(summary))
         } else {
@@ -3275,7 +3291,7 @@ enum MaterialsRunEnd: Equatable, Sendable {
                 let coordinator = try SyncCoordinator(rootID: rootID, rootURL: rootURL, database: database, gate: gate, apiClient: apiClient, downloader: downloader, platformName: platformName)
                 let run = self.beginTransfer(operationID, automatic: true)
                 let summary = try await coordinator.synchronize(targets: targets, token: token, mode: .automatic, networkAccess: networkAccess, progress: self.progressSink(operationID, run: run))
-                await self.completeSync(operationID, summary: summary, automatic: true)
+                await self.completeSync(operationID, rootID: rootID, summary: summary, automatic: true)
             } catch is CancellationError {
                 self?.cancelledSync(operationID)
             } catch let error as WeBeepAPIError {
@@ -3316,8 +3332,8 @@ enum MaterialsRunEnd: Equatable, Sendable {
     }
 
     /// Records how `operationID`'s materials run ended. Only the active operation records: a
-    /// superseded one (sign-out, site or folder change mid-run) leaves nothing, and so starts no
-    /// follow-up.
+    /// superseded one (sign-out or site change mid-run, or a folder change, which ends it through
+    /// `supersededByFolderChange`) leaves nothing, and so starts no follow-up.
     private func recordRunEnd(_ operationID: UUID, _ end: MaterialsRunEnd) {
         guard activeOperationID == operationID else { return }
         materialsRunEnds[operationID] = (recordingsFollowUpGeneration, end)
@@ -3469,12 +3485,16 @@ enum MaterialsRunEnd: Equatable, Sendable {
         refreshMenuBarSnapshot()
     }
 
-    private func completeSync(_ operationID: UUID, summary: SyncProgress, automatic: Bool) async {
+    /// Ends `operationID`, a run that synced the folder `rootID` (captured when it started). The
+    /// folder is checked again after every suspension: if it was replaced meanwhile, the run ends
+    /// as superseded instead of reporting over the new folder (#167).
+    private func completeSync(_ operationID: UUID, rootID: UUID?, summary: SyncProgress, automatic: Bool) async {
         guard activeOperationID == operationID else { return }
         do {
-            try await finishReconciliation(progress: summary, operationID: operationID)
+            try await finishReconciliation(progress: summary, operationID: operationID, rootID: rootID)
         } catch {
             guard activeOperationID == operationID else { return }
+            guard self.rootID == rootID else { await supersededByFolderChange(operationID); return }
             if Task.isCancelled { cancelledSync(operationID); return }
             recordRunEnd(operationID, .pendingChoicesUnreadable)
             reportPendingChoicesReadFailure()
@@ -3482,6 +3502,7 @@ enum MaterialsRunEnd: Equatable, Sendable {
             return
         }
         guard activeOperationID == operationID else { return }
+        guard self.rootID == rootID else { await supersededByFolderChange(operationID); return }
         guard !Task.isCancelled else { cancelledSync(operationID); return }
         recordRunEnd(operationID, .completed(conflicts: summary.conflicts, failures: summary.failures))
         if summary.failures == 0 { notificationCoordinator.clearFailure() }
@@ -3515,6 +3536,17 @@ enum MaterialsRunEnd: Equatable, Sendable {
     func finishOperationBeforeNotification(_ operationID: UUID, notify: () async -> Void) async {
         endOperation(operationID)
         await notify()
+    }
+
+    /// Ends a run whose folder was replaced while it ran (#167). It records no run end, so no
+    /// recordings follow-up starts for the old folder, sends no notification, and saves nothing.
+    /// The new folder's own saved state is then restored: `useRoot` skipped that restore because
+    /// this run was still active, and without it the window would stay on "checking".
+    private func supersededByFolderChange(_ operationID: UUID) async {
+        guard activeOperationID == operationID else { return }
+        BeepbarLog.sync.notice("Synchronization superseded by a folder change")
+        endOperation(operationID)
+        await restorePersistedSyncState()
     }
 
     private func cancelledSync(_ operationID: UUID) {

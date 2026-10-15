@@ -817,6 +817,14 @@ struct RecmanStreamFailure: Error {
     /// Whether a script call is waiting for WebKit; for `RecmanWebSessionTests`.
     var hasPendingScript: Bool { !pendingScripts.isEmpty }
 
+    /// Runs the archive check that opens `recordings(for:)` and `playbackURL(for:)`, as an
+    /// operation of its own, without going on to enter. For `RecmanWebSessionTests`, which prove
+    /// the #174 skip is wired into the real check without reaching polimi.it.
+    func probeArchive() async throws -> Bool {
+        let operation = beginOperation()
+        return try await isOnArchive(operation: operation)
+    }
+
     /// The string `script` answers in `webView`, or nil if it threw or answered something else.
     /// Shared with `RecmanScriptsTests` and the probe, so the fixtures run the scripts exactly as
     /// the session does. Unbounded on purpose: it waits for WebKit's callback, which the fixtures

@@ -73,8 +73,8 @@ struct RecmanWebSessionTests {
     /// the archive probe; any page with an address is probed. Guards #174: probing the URL-less
     /// web view ran a script whose answer could not matter, and a cold web process missing the
     /// script deadline (as CI saw for that same fresh session) could end the first Recordings
-    /// operation as `unavailable` before it tried to enter. The session wiring
-    /// is not exercised here: once the probe is skipped the session enters Polimi for real.
+    /// operation as `unavailable` before it tried to enter. The session's own check is covered
+    /// by `aFreshSessionSkipsTheArchiveProbe` and `aLoadedPageIsStillProbedForTheArchive`.
     @Test func theArchiveProbeRunsOnlyOnALoadedPage() throws {
         let archive = try #require(URL(string: "https://\(RecmanURLPolicy.archiveHost)\(RecmanURLPolicy.archivePath)"))
         #expect(!RecmanWebSession.archiveProbeCanAnswer(url: nil, isLoading: false))
@@ -87,6 +87,19 @@ struct RecmanWebSessionTests {
         // The skip changes no outcome: a missing address is never the archive.
         #expect(PolimiPage.classify(archive, facts: PolimiPageFacts(hasArchiveForm: true)) == .archive)
         #expect(PolimiPage.classify(nil, facts: PolimiPageFacts(hasArchiveForm: true)) != .archive)
+    }
+
+    /// The session's real archive check, right after `open(cookies:)`, answers "not the archive"
+    /// without running a script. Fails if `isOnArchive` stops using `archiveProbeCanAnswer`
+    /// (#174): the first Recordings operation would again start with a bounded script on an
+    /// empty web view. Nothing loads, so nothing reaches polimi.it.
+    @Test func aFreshSessionSkipsTheArchiveProbe() async throws {
+        let session = RecmanWebSession()
+        await session.open(cookies: [])
+        defer { session.close() }
+        #expect(session.webView?.url == nil)
+        #expect(try await session.probeArchive() == false)
+        #expect(session.lastScriptCall == nil)
     }
 
     /// Only host and path reach the trace: Polimi's query strings carry sign-on tickets.
@@ -237,6 +250,17 @@ struct RecmanWebSessionScriptTests {
         #expect(session.lastScriptCall == nil)
         #expect(session.webView?.navigationDelegate === session)
         #expect(try await session.runScript("document.readyState + ':' + document.body.id") == "complete:script-fixture")
+    }
+
+    /// A page with an address (the local fixture, `about:blank`) is still probed: the check runs
+    /// the page-facts script and answers "not the archive". Fails if the #174 skip widens to pages
+    /// that have loaded, which would change how a stalled page inside a search ends.
+    @Test func aLoadedPageIsStillProbedForTheArchive() async throws {
+        let session = try await openSession(scriptTimeout: .seconds(10))
+        defer { session.close() }
+        #expect(session.webView?.url != nil)
+        #expect(try await session.probeArchive() == false)
+        #expect(session.lastScriptCall != nil)
     }
 
     private func start(_ script: String, in session: RecmanWebSession) -> Task<String, Error> {

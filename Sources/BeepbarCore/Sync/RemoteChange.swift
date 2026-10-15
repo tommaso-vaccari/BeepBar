@@ -92,34 +92,49 @@ public struct PendingRemoteMove: Sendable, Equatable {
 /// Completes or drops the moves a crash interrupted (see `PendingRemoteMove`).
 enum RemoteMoveJournal {
     /// A move counts as done when its destination holds the moved contents and, for a single move,
-    /// its origin no longer does; the two halves of a swap are done together or not at all. A move
-    /// that did not happen is dropped, and the file is looked at afresh by the caller.
+    /// its origin no longer does; the two halves of a swap are done together or not at all. A single
+    /// move whose origin is gone and whose destination holds something else also happened: the file
+    /// was edited after it moved, so the baseline follows it and the edit is then a local change. Any
+    /// other readable state is dropped and the files are looked at afresh by the caller, whose
+    /// three-way comparison keeps every edited file (as before #171).
+    ///
+    /// Only a path that cannot be read (a symlink, a folder, a permission error) keeps its row and
+    /// fails recovery, so a transient read error never loses a completed move (R-004). Readable
+    /// states never block: an edited or deleted file used to keep the row forever, and with it every
+    /// sync, conflict choice and folder tidy-up of that folder, with nothing the user could do.
+    /// Every batch is settled before the first read error is reported, so one unreadable batch does
+    /// not hold back the others.
     static func recover(rootID: UUID, database: SyncDatabase, fileStore: FileStore) async throws {
         let pending = try await database.pendingRemoteMoves(rootID: rootID)
         guard !pending.isEmpty else { return }
+        var unreadable: Error?
         for batch in Dictionary(grouping: pending, by: \.batchID).values {
             var arrived = true
-            var unchanged = true
-            for move in batch {
-                let destination = try await fileStore.snapshotRegularFile(move.to, checksCancellation: false)
-                let source = try await fileStore.snapshotRegularFile(move.from, checksCancellation: false)
-                let destinationMatches: Bool
-                if case .present(let there) = destination { destinationMatches = there.sha256 == move.sha256 }
-                else { destinationMatches = false }
-                let sourceMatches: Bool
-                if case .present(let left) = source { sourceMatches = left.sha256 == move.sha256 }
-                else { sourceMatches = false }
-                arrived = arrived && destinationMatches && (batch.count > 1 || !sourceMatches)
-                unchanged = unchanged && sourceMatches
+            var movedThenEdited = batch.count == 1
+            do {
+                for move in batch {
+                    let destination = try await fileStore.snapshotRegularFile(move.to, checksCancellation: false)
+                    let source = try await fileStore.snapshotRegularFile(move.from, checksCancellation: false)
+                    let destinationMatches: Bool
+                    if case .present(let there) = destination { destinationMatches = there.sha256 == move.sha256 }
+                    else { destinationMatches = false }
+                    let sourceMatches: Bool
+                    if case .present(let left) = source { sourceMatches = left.sha256 == move.sha256 }
+                    else { sourceMatches = false }
+                    arrived = arrived && destinationMatches && (batch.count > 1 || !sourceMatches)
+                    movedThenEdited = movedThenEdited && destination != .missing && source == .missing
+                }
+            } catch {
+                unreadable = unreadable ?? error
+                continue
             }
-            if arrived {
+            if arrived || movedThenEdited {
                 try await database.commitRemoteMoves(rootID: rootID, batch)
                 if let move = batch.first, batch.count == 1 { try? await fileStore.removeEmptyParentDirectories(of: move.from) }
-            } else if unchanged {
-                try await database.discardRemoteMoves(rootID: rootID, remoteIDs: batch.map(\.remoteID))
             } else {
-                throw SyncDatabaseError.execution
+                try await database.discardRemoteMoves(rootID: rootID, remoteIDs: batch.map(\.remoteID))
             }
         }
+        if let unreadable { throw unreadable }
     }
 }

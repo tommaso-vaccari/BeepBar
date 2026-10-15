@@ -35,8 +35,10 @@ import Testing
         #expect(try await fixture.database.baseline(rootID: fixture.rootID, remoteID: one)?.relativePath == new)
     }
 
-    @Test(arguments: [false, true])
-    func ambiguousRemoteMoveRecoveryRetainsTheJournalAndBlocksPlanning(_ unreadable: Bool) async throws {
+    /// A path recovery cannot read (here a symlinked destination folder) keeps the move's row and
+    /// stops the sync before it plans or downloads: a transient read error must not lose a move
+    /// that completed (R-004). The user can clear it by fixing the path.
+    @Test func unreadableRemoteMoveRecoveryRetainsTheJournalAndBlocksPlanning() async throws {
         let fixture = try await Fixture()
         defer { fixture.remove() }
         let target = fixture.targets[0]
@@ -46,17 +48,82 @@ import Testing
         let destination = try RelativePath("Course 1/Moved/0.txt")
         let move = PendingRemoteMove(batchID: UUID(), remoteID: id, from: baseline.relativePath, to: destination, sha256: baseline.sha256, placement: nil)
         try await fixture.database.beginRemoteMoves(rootID: fixture.rootID, [move])
-        if unreadable {
-            try FileManager.default.createSymbolicLink(at: fixture.root.appending(path: "Course 1/Moved"), withDestinationURL: fixture.root)
-        } else {
-            try FileManager.default.moveItem(at: fixture.root.appending(path: baseline.relativePath.value), to: fixture.root.appending(path: "outside-journal.txt"))
-            try fixture.write("changed after move", to: destination.value)
-        }
+        try FileManager.default.createSymbolicLink(at: fixture.root.appending(path: "Course 1/Moved"), withDestinationURL: fixture.root)
         fixture.upstream.resetDownloadCount()
         await #expect(throws: (any Error).self) { _ = try await fixture.synchronize(targets: [target]) }
         #expect(try await fixture.database.pendingRemoteMoves(rootID: fixture.rootID) == [move])
         #expect(try await fixture.database.baseline(rootID: fixture.rootID, remoteID: id) == baseline)
         #expect(fixture.upstream.downloadCount == 0)
+    }
+
+    /// The readable states a crash and a later user action can leave behind never block the
+    /// folder. Before this, each kept the row forever, so every sync, conflict choice and folder
+    /// tidy-up of that folder failed with nothing the user could do (release review I-A1).
+    /// - `movedThenEdited`: the file moved, then the user edited it. The baseline follows it and
+    ///   the edit stays as a local change: no download over it.
+    /// - `bothMissing`: the file moved, then the user deleted it. Nothing is left to protect; the
+    ///   row is dropped and the tracked file is downloaded again, as for any deleted file.
+    /// - `sourceEdited`: the move never happened and the user edited the file where it was. The row
+    ///   is dropped and the edit is kept.
+    @Test(arguments: ["movedThenEdited", "bothMissing", "sourceEdited"])
+    func readableRemoteMoveRecoveryNeverBlocksTheFolder(_ state: String) async throws {
+        let fixture = try await Fixture()
+        defer { fixture.remove() }
+        let target = fixture.targets[0]
+        _ = try await fixture.synchronize(targets: [target])
+        let id = fixture.remoteID(course: 1, file: 0)
+        let baseline = try #require(try await fixture.database.baseline(rootID: fixture.rootID, remoteID: id))
+        let destination = try RelativePath("Course 1/Moved/0.txt")
+        let move = PendingRemoteMove(batchID: UUID(), remoteID: id, from: baseline.relativePath, to: destination, sha256: baseline.sha256, placement: nil)
+        try await fixture.database.beginRemoteMoves(rootID: fixture.rootID, [move])
+        let source = fixture.root.appending(path: baseline.relativePath.value)
+        switch state {
+        case "movedThenEdited":
+            try FileManager.default.removeItem(at: source)
+            try fixture.write("changed after move", to: destination.value)
+        case "bothMissing":
+            try FileManager.default.removeItem(at: source)
+        default:
+            try fixture.write("edited before the move", to: baseline.relativePath.value)
+        }
+        fixture.upstream.resetDownloadCount()
+        _ = try await fixture.synchronize(targets: [target])
+        #expect(try await fixture.database.pendingRemoteMoves(rootID: fixture.rootID).isEmpty)
+        switch state {
+        case "movedThenEdited":
+            #expect(try await fixture.database.baseline(rootID: fixture.rootID, remoteID: id)?.relativePath == destination)
+            #expect(fixture.contents(destination.value) == "changed after move")
+        case "bothMissing":
+            #expect(fixture.upstream.downloadCount == 1)
+            #expect(fixture.contents(baseline.relativePath.value) != nil)
+        default:
+            #expect(fixture.upstream.downloadCount == 0)
+            #expect(fixture.contents(baseline.relativePath.value) == "edited before the move")
+        }
+    }
+
+    /// One unreadable batch neither stops the others from being settled nor loses its own row.
+    /// Batches are visited in no fixed order, so throwing at the first unreadable one could leave
+    /// a settleable batch pending behind it.
+    @Test func anUnreadableBatchDoesNotHoldBackTheOthers() async throws {
+        let fixture = try await Fixture()
+        defer { fixture.remove() }
+        let target = fixture.targets[0]
+        _ = try await fixture.synchronize(targets: [target])
+        var moves: [PendingRemoteMove] = []
+        for file in 0..<4 {
+            let id = fixture.remoteID(course: 1, file: file)
+            let baseline = try #require(try await fixture.database.baseline(rootID: fixture.rootID, remoteID: id))
+            let folder = file == 0 ? "Moved" : "Elsewhere"
+            let move = PendingRemoteMove(batchID: UUID(), remoteID: id, from: baseline.relativePath, to: try RelativePath("Course 1/\(folder)/\(file).txt"), sha256: baseline.sha256, placement: nil)
+            try await fixture.database.beginRemoteMoves(rootID: fixture.rootID, [move])
+            moves.append(move)
+        }
+        try FileManager.default.createSymbolicLink(at: fixture.root.appending(path: "Course 1/Moved"), withDestinationURL: fixture.root)
+        await #expect(throws: (any Error).self) {
+            try await RemoteMoveJournal.recover(rootID: fixture.rootID, database: fixture.database, fileStore: fixture.fileStore)
+        }
+        #expect(try await fixture.database.pendingRemoteMoves(rootID: fixture.rootID) == [moves[0]])
     }
 
     @Test func pendingScopeRenameBlocksSyncBeforeCreatingFoldersOrDownloading() async throws {

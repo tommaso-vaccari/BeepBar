@@ -35,6 +35,8 @@
 
 ### Fixed
 
+- Choosing another materials folder while a sync is starting or finishing no longer shows the previous folder's last sync for the new one; the current folder stays: choose the new one again once the sync has ended.
+
 - Watching a lecture in BeepBar keeps the display and Mac awake during video playback.
 
 - Renaming a course folder works after restoring or copying your files to another Mac, without extra prompts and while keeping your files tracked.

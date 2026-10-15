@@ -343,12 +343,13 @@ struct RecordingPlayerMVPTests {
         controller.close()
     }
 
-    /// 2.5x and 3x wait for the item to say it can fast-forward: until it is ready the player
-    /// runs at most at 2x, then at the remembered 3x (the local fixture can fast-forward).
+    /// 2.5x to 4x wait for the item to say it can fast-forward: until it is ready the player
+    /// runs at most at 2x, then at the remembered 4x, the top of the list, on a real AVPlayer
+    /// (the local fixture can fast-forward).
     @Test func fastSpeedsWaitForFastForwardSupport() async throws {
         let defaults = PlayerTestDefaults.throwaway()
         defer { defaults.discard() }
-        defaults.set(3.0, forKey: RecordingPlayerPolicy.speedDefaultsKey)
+        defaults.set(4.0, forKey: RecordingPlayerPolicy.speedDefaultsKey)
         let controller = makeController(defaults: defaults)
         let media = try await TestMedia.shared.url()
         controller.play(media, title: "Lezione", cookies: [], startAt: nil)
@@ -356,8 +357,8 @@ struct RecordingPlayerMVPTests {
         #expect(controller.rateSupport == .unknown)
         try await Self.waitUntil { controller.isStartSettled }
         #expect(controller.player?.currentItem?.canPlayFastForward == true)
-        #expect(controller.player?.defaultRate == 3)
-        #expect(controller.preferredSpeed == 3)
+        #expect(controller.player?.defaultRate == 4)
+        #expect(controller.preferredSpeed == 4)
         controller.close()
     }
 
@@ -475,7 +476,7 @@ struct RecordingPlayerMVPTests {
         controller.close()
     }
 
-    /// Rate support can change after the item is ready: 2.5x/3x and 0.5x/0.75x follow it, both
+    /// Rate support can change after the item is ready: 2.5x–4x and 0.5x/0.75x follow it, both
     /// ways, and the remembered speed is never rewritten by a cap. A report from a replaced item
     /// is ignored.
     @Test func speedsFollowRateSupportChanges() async throws {

@@ -59,9 +59,9 @@ enum PlayerShortcut: Equatable, Sendable {
 /// AVFoundation.
 enum RecordingPlayerPolicy {
     /// The speeds offered to the student, slowest first. Lectures are mostly speech, which stays
-    /// intelligible well past 2x with pitch correction; 0.75x helps with a fast speaker or a
-    /// foreign language.
-    static let speeds: [Float] = [0.5, 0.75, 1, 1.25, 1.5, 1.75, 2, 2.5, 3]
+    /// intelligible well past 2x with pitch correction, up to 4x for reviewing a lecture already
+    /// followed; 0.75x helps with a fast speaker or a foreign language.
+    static let speeds: [Float] = [0.5, 0.75, 1, 1.25, 1.5, 1.75, 2, 2.5, 3, 3.5, 4]
 
     /// AVFoundation guarantees rates from 1.0 to 2.0 for every ready item (AVPlayerItem.h);
     /// above 2.0 only when `canPlayFastForward` is true, below 1.0 only when

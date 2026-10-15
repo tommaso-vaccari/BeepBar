@@ -447,7 +447,7 @@ enum RecordingPlayerError: Error {
             Task { @MainActor [weak self] in self?.timeControlStatusChanged(generation: observedGeneration) }
         }
         // Which speeds the stream allows can change while it loads (an HLS stream may learn about
-        // an I-frame playlist late): follow it, so 2.5x/3x or 0.5x/0.75x open up when allowed.
+        // an I-frame playlist late): follow it, so 2.5x–4x or 0.5x/0.75x open up when allowed.
         // Nothing is read on AVFoundation's thread: two reports can hop in either order, and a
         // value carried by an older hop would overwrite a newer one. The hop reads the item's
         // current values itself (`rateSupportObserved`).

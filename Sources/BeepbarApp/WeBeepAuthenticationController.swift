@@ -1145,6 +1145,11 @@ enum MaterialsRunEnd: Equatable, Sendable {
 
     func setRootIDForTesting(_ id: UUID) { rootID = id }
 
+    /// Takes the folder lease as `operation`, as a running sync holds it.
+    func acquireOperationGateForTesting(_ operation: RootOperation) async throws -> Lease {
+        try await operationGate.acquire(operation)
+    }
+
     /// Runs inside `openActivityItem` after it captured the folder and before it looks the file
     /// up: lets a test change the folder mid-lookup.
     var beforeActivityLookupForTesting: (@MainActor () async -> Void)?
@@ -1932,6 +1937,9 @@ enum MaterialsRunEnd: Equatable, Sendable {
     /// Makes the folder chosen in the open panel the sync root: registers it, recovers anything
     /// left pending in it, and reads its records for the course list on screen.
     private func useRoot(picked pickedURL: URL, resolved selectedURL: URL) async {
+        // Whether the new folder replaced the old one: failures before that leave the old folder
+        // in place, and must not be shown over a sync running on it (#167).
+        var adopted = false
         do {
             await bootstrapTask?.value
             guard let database else { throw SyncDatabaseError.open }
@@ -1947,12 +1955,13 @@ enum MaterialsRunEnd: Equatable, Sendable {
             }
             // `chooseRoot` checked for a running sync only before the awaits above, and a sync can
             // start during them. Switching under it would hand its result to the new folder
-            // (#167), so the folder stays as it was, quietly as in `chooseRoot`: throwing would
-            // show a failure over the running sync. Keep no `await` between this check and the
-            // assignment below, or the window reopens.
+            // (#167), so the folder stays as it was, quietly as in `chooseRoot` (and as the catch
+            // below does when the sync's lease made the recovery fail). Keep no `await` between
+            // this check and the assignment below, or the window reopens.
             guard !isSyncActive else { return }
             guard report.unresolved.isEmpty else { throw SyncDatabaseError.execution }
             rootURL = selectedURL; rootID = selectedID; recoveryBlocked = false; hasPendingModuleMoves = false
+            adopted = true
             // Started for the previous folder's run: the new folder's next sync decides again.
             cancelRecordingsFollowUp()
             activityItemProblems = [:]
@@ -1986,6 +1995,10 @@ enum MaterialsRunEnd: Equatable, Sendable {
                 }
             }
         } catch {
+            // Not adopted while a sync runs: the old folder is still current and the screen shows
+            // its sync, which this failure must not replace. Typically the sync took the folder
+            // lease first and the recovery above failed as busy (#167).
+            guard adopted || !isSyncActive else { return }
             setSyncState(.failed(.local(BilingualText("Non è stato possibile usare questa cartella. Scegline un'altra.", "This folder couldn't be used. Choose another one."))))
         }
     }
@@ -3539,7 +3552,9 @@ enum MaterialsRunEnd: Equatable, Sendable {
     }
 
     /// Ends a run whose folder was replaced while it ran (#167). It records no run end, so no
-    /// recordings follow-up starts for the old folder, sends no notification, and saves nothing.
+    /// recordings follow-up starts for the old folder, sends no notification, and saves nothing,
+    /// not even under the old folder: its pending choices were read for the new one, so whether
+    /// the run counts as a success is unknown. The old folder keeps its previous result.
     /// The new folder's own saved state is then restored: `useRoot` skipped that restore because
     /// this run was still active, and without it the window would stay on "checking".
     private func supersededByFolderChange(_ operationID: UUID) async {

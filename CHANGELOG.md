@@ -35,7 +35,7 @@
 
 ### Fixed
 
-- Choosing another materials folder while a sync is starting or finishing no longer shows the previous folder's last sync for the new one; the folder stays as it was until the sync ends.
+- Choosing another materials folder while a sync is starting or finishing no longer shows the previous folder's last sync for the new one; the current folder stays: choose the new one again once the sync has ended.
 
 - Watching a lecture in BeepBar keeps the display and Mac awake during video playback.
 

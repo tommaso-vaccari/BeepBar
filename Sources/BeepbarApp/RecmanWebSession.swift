@@ -674,8 +674,19 @@ struct RecmanStreamFailure: Error {
     }
 
     private func isOnArchive(operation: Int) async throws -> Bool {
-        guard let webView, !webView.isLoading else { return false }
+        guard let webView, Self.archiveProbeCanAnswer(url: webView.url, isLoading: webView.isLoading) else { return false }
         return PolimiPage.classify(webView.url, facts: try await pageFacts(operation: operation)) == .archive
+    }
+
+    /// Whether probing the page could find the archive. Not while a load is under way, and not
+    /// on a web view with no page yet, as right after `open(cookies:)`: `PolimiPage.classify`
+    /// never calls a missing URL the archive, so the script could not change the answer, yet as
+    /// the first script of a fresh web process it could miss `scriptTimeout` under load and end
+    /// the first `recordings(for:)` or `playbackURL(for:)` as `unavailable` before it even
+    /// tried to enter (#174; seen on CI with the same fresh session). Any page with an address
+    /// is still probed: a stalled one there is `unavailable` on purpose (see `evaluate`).
+    nonisolated static func archiveProbeCanAnswer(url: URL?, isLoading: Bool) -> Bool {
+        url != nil && !isLoading
     }
 
     /// What a finished load tells the entry's navigator, given how its page probe ended.

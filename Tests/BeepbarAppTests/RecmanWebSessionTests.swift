@@ -69,6 +69,25 @@ struct RecmanWebSessionTests {
         session.close()
     }
 
+    /// A web view that has no page yet (right after `open(cookies:)`) or is still loading skips
+    /// the archive probe; any page with an address is probed. Guards #174: probing the URL-less
+    /// web view ran a script whose answer could not matter, and a cold web process missing the
+    /// script deadline ended the first Recordings operation as `unavailable`. The session wiring
+    /// is not exercised here: once the probe is skipped the session enters Polimi for real.
+    @Test func theArchiveProbeRunsOnlyOnALoadedPage() throws {
+        let archive = try #require(URL(string: "https://\(RecmanURLPolicy.archiveHost)\(RecmanURLPolicy.archivePath)"))
+        #expect(!RecmanWebSession.archiveProbeCanAnswer(url: nil, isLoading: false))
+        #expect(!RecmanWebSession.archiveProbeCanAnswer(url: nil, isLoading: true))
+        #expect(!RecmanWebSession.archiveProbeCanAnswer(url: archive, isLoading: true))
+        #expect(RecmanWebSession.archiveProbeCanAnswer(url: archive, isLoading: false))
+        // Pages that are not the archive are still probed, so a stalled one keeps ending as
+        // `unavailable` inside a search.
+        #expect(RecmanWebSession.archiveProbeCanAnswer(url: RecmanWebSession.blankPage, isLoading: false))
+        // The skip changes no outcome: a missing address is never the archive.
+        #expect(PolimiPage.classify(archive, facts: PolimiPageFacts(hasArchiveForm: true)) == .archive)
+        #expect(PolimiPage.classify(nil, facts: PolimiPageFacts(hasArchiveForm: true)) != .archive)
+    }
+
     /// Only host and path reach the trace: Polimi's query strings carry sign-on tickets.
     @Test func tracesNeverCarryTheQuery() {
         let url = URL(string: "https://onlineservices.polimi.it/recman_frontend/?ticket=ST-secret#frag")!

@@ -709,6 +709,32 @@ struct SyncFinalizationTests {
         #expect(fixture.savedSummary(for: try #require(idB)) == nil, "folder B received folder A's result")
     }
 
+    /// The same pick when the sync took the folder lease before the picker's recovery asked for
+    /// it: the recovery fails as busy, and that failure must not replace the running sync's
+    /// state with "Non è stato possibile usare questa cartella". Fails if `useRoot`'s catch
+    /// reports failures of a folder it never adopted while a sync runs.
+    @Test @MainActor func folderPickBlockedByTheSyncLeaseShowsNoErrorOverTheSync() async throws {
+        let fixture = try await TwoFolders()
+        defer { fixture.remove() }
+        let controller = fixture.controller()
+        let (released, release) = AsyncStream<Void>.makeStream()
+        controller.holdBootstrapForTesting(Task { for await _ in released {} })
+        let pick = Task { await controller.useRootForTesting(fixture.folderB) }
+        await Task.yield()
+
+        let operation = UUID()
+        controller.setOperationForTesting(operation)
+        controller.setSyncStateForTesting(.syncing)
+        let lease = try await controller.acquireOperationGateForTesting(.syncing(operation))
+        release.finish()
+        await pick.value
+        await lease.release()
+
+        #expect(controller.syncState == .syncing, "the picker's failure replaced the running sync's state")
+        #expect(controller.rootURL == fixture.folderA)
+        #expect(controller.isSyncActive)
+    }
+
     /// Defence in depth behind the picker: a run whose folder was replaced anyway, while it
     /// synced, while its pending choices were read, or while its result was encoded, ends as
     /// superseded. Nothing is published or saved, no recordings follow-up is recorded, the

@@ -722,8 +722,7 @@ enum RecordingPlayerError: Error {
     /// Makes `state` the zoom and shows it: the magnification through AVKit's public
     /// `setMagnification:centeredAtPoint:`, then the visible part by placing the clip origin of
     /// AVKit's video scroll view, both within this main-actor turn so no frame shows the halfway
-    /// state. Nothing touches the view when what is shown does not change, so a play at fit
-    /// costs nothing. Also pushes `isVideoZoomed` to the window.
+    /// state. A play at fit costs nothing. Also pushes `isVideoZoomed` to the window.
     ///
     /// The fixed point handed to AVKit (`PlayerZoomModel.fixedPoint`) already makes its result
     /// match the model; the clip origin is set as well, because a pan has no scale change to
@@ -732,7 +731,7 @@ enum RecordingPlayerError: Error {
         let previous = zoom
         zoom = state
         (window as? RecordingPlayerWindow)?.isVideoZoomed = state.isZoomed
-        guard let playerView, !state.showsSameView(as: previous) else { return }
+        guard let playerView else { return }
         if state.scale != previous.scale {
             let viewport = playerView.bounds.size
             let from = PlayerZoomModel.adapted(previous, to: viewport, video: CGRect(origin: .zero, size: viewport))
@@ -740,6 +739,9 @@ enum RecordingPlayerError: Error {
             AVKitLoader.setMagnification(state.scale, centeredAt: fixed, of: playerView)
         }
         guard state.isZoomed else { return }
+        // AVKit may defer magnification layout or rebuild its clip for a new item. Place the
+        // origin after layout, even if readiness re-applies an unchanged model.
+        playerView.layoutSubtreeIfNeeded()
         if videoHost.map({ !$0.isDescendant(of: playerView) }) ?? true {
             videoHost = PlayerVideoViews.videoHost(in: playerView)
         }

@@ -15,6 +15,8 @@ final class FakeZoomingPlayerView: NSView {
     let videoView = NSView()
     let control = NSButton(title: "Play", target: nil, action: nil)
     private(set) var magnifications: [(scale: CGFloat, point: CGPoint)] = []
+    var defersMagnificationUntilLayout = false
+    private var pendingMagnification: (scale: CGFloat, point: CGPoint)?
 
     override init(frame: NSRect) {
         super.init(frame: frame)
@@ -46,7 +48,19 @@ final class FakeZoomingPlayerView: NSView {
 
     @objc(setMagnification:centeredAtPoint:) func setMagnification(_ magnification: CGFloat, centeredAt point: CGPoint) {
         magnifications.append((magnification, point))
-        scrollView.setMagnification(magnification, centeredAt: point)
+        if defersMagnificationUntilLayout {
+            pendingMagnification = (magnification, point)
+            needsLayout = true
+        } else {
+            scrollView.setMagnification(magnification, centeredAt: point)
+        }
+    }
+    override func layout() {
+        super.layout()
+        if let pending = pendingMagnification {
+            pendingMagnification = nil
+            scrollView.setMagnification(pending.scale, centeredAt: pending.point)
+        }
     }
 }
 
@@ -303,6 +317,42 @@ struct PlayerZoomControllerTests {
         controller.close()
     }
 
+    /// A magnification can leave layout pending. The clip must be laid out before its origin
+    /// is placed, otherwise the later layout overwrites the requested pan.
+    @Test func aDeferredMagnificationIsLaidOutBeforePanning() async throws {
+        let view = FakeZoomingPlayerView()
+        view.defersMagnificationUntilLayout = true
+        let controller = makeController(makePlayerView: { view })
+        defer { controller.close() }
+        try await playReady(controller)
+        controller.performShortcut(.zoomIn)
+        controller.performShortcut(.zoomIn)
+        controller.handleZoomInput(.pan(CGVector(dx: 5000, dy: -40)))
+        let intended = controller.zoom
+        view.layoutSubtreeIfNeeded()
+        #expect(controller.zoom == intended)
+        expectShown(controller, in: view)
+        #expect(abs(view.scrollView.contentView.bounds.width - view.bounds.width / intended.scale) < 0.5)
+    }
+
+    /// AVKit may reset the clip while replacing an item. Readiness must restore the retained
+    /// zoom even when its model needs no re-clamping; no new user input repairs it here.
+    @Test func recoveryReappliesAnUnchangedZoomAfterTheClipResets() async throws {
+        let controller = makeController()
+        defer { controller.close() }
+        try await playReady(controller)
+        let (_, view) = try parts(controller)
+        controller.performShortcut(.zoomIn)
+        controller.handleZoomInput(.pan(CGVector(dx: -30, dy: 40)))
+        let intended = controller.zoom
+        let media = try await TestMedia.shared.url()
+        controller.play(media, title: "Lezione", cookies: [], startAt: 20, recordingID: "Lezione", metadata: nil)
+        view.scrollView.contentView.scroll(to: .zero)
+        try await Self.waitUntil { controller.isStartSettled }
+        #expect(controller.zoom == intended)
+        expectShown(controller, in: view)
+    }
+
     /// Closing forgets the zoom: the next lecture, even the same one, opens a new window at fit,
     /// and the released window stops handling zoom events. Guards against a zoom surviving the
     /// window it was shown in.
@@ -409,16 +459,28 @@ struct PlayerZoomControllerTests {
     /// over the video at fit and zoomed, the magnification survives the item being replaced for
     /// the same lecture (a recovery), and fitting again restores 1x. Guards every assumption
     /// made about AVKit (verified on macOS 27) against a change in a future macOS.
-    @Test func theRealPlayerViewZooms() async throws {
+    @Test(arguments: [false, true]) func theRealPlayerViewZooms(beforeReady: Bool) async throws {
         let controller = makeController(makePlayerView: AVKitLoader.makePlayerView)
-        try await playReady(controller)
+        defer { controller.close() }
+        let media = try await TestMedia.shared.url()
+        controller.play(media, title: "Lezione", cookies: [], startAt: nil, recordingID: "Lezione", metadata: nil)
         let view = try #require(controller.playerView)
+        // Item readiness is not first-frame readiness. This invisible fixture has no display cycle.
+        func waitForDisplay() async throws {
+            try await Self.waitUntil {
+                view.layoutSubtreeIfNeeded()
+                return (view.value(forKey: "readyForDisplay") as? Bool) == true
+            }
+        }
+        if !beforeReady { try await waitForDisplay() }
         let window = try #require(controller.window as? RecordingPlayerWindow)
         #expect((view.value(forKey: "allowsMagnification") as? Bool) == false)
         #expect(window.isOverVideo(CGPoint(x: 480, y: 500)), "at fit, before AVKit built its scroll view")
         controller.performShortcut(.zoomIn)
         controller.performShortcut(.zoomIn)
         #expect((view.value(forKey: "magnification") as? CGFloat) == 2)
+        try await Self.waitUntil { controller.isStartSettled }
+        try await waitForDisplay()
         let host = try #require(PlayerVideoViews.videoHost(in: view))
         let clip = try #require(PlayerVideoViews.videoClipView(in: view, videoHost: host))
         func expectClip(sourceLocation: SourceLocation = #_sourceLocation) {
@@ -433,6 +495,7 @@ struct PlayerZoomControllerTests {
         #expect(window.isOverVideo(CGPoint(x: 480, y: 500)))
         let kept = controller.zoom
         try await playReady(controller, id: "Lezione", startAt: 20)
+        try await waitForDisplay()
         #expect(controller.zoom == kept)
         #expect((view.value(forKey: "magnification") as? CGFloat) == 2, "AVKit keeps it across the new item")
         expectClip()

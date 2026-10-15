@@ -170,23 +170,8 @@ jobs:
           files: |
             build/00-Beepbar.dmg
             appcast.xml
-      - name: Move legacy latest tag to this commit
-        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
-        run: |
-          git tag -f latest "$GITHUB_SHA"
-          git push -f origin latest
-      - name: Publish legacy latest feed (backward compatibility for installs predating versioned releases)
-        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
-        uses: softprops/action-gh-release@v2
-        with:
-          tag_name: latest
-          name: Legacy update feed
-          body: >-
-            Kept only so installs from before versioned releases (SUFeedURL baked into their
-            Info.plist as `releases/download/latest/appcast.xml`) can still discover and install
-            an update. Not meant for direct download — use the link in the README instead.
-          prerelease: true
-          make_latest: false
-          files: |
-            build/00-Beepbar.dmg
-            appcast.xml
+      # The `latest` tag and its "Legacy update feed" release are frozen at v2.2.35 and must stay
+      # published. Installs from before 2026-09-16 still look for
+      # `releases/download/latest/appcast.xml`. They update to v2.2.35, whose SUFeedURL points
+      # to `releases/latest/download/appcast.xml`, and from there they follow the versioned
+      # releases above. Deleting that release would leave them without updates.

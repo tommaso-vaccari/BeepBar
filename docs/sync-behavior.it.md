@@ -72,6 +72,8 @@ Se nella nuova posizione c'è già un file con lo stesso nome, niente viene sovr
 - Se quel file si sta spostando anche lui nello stesso sync (per esempio il professore ha scambiato i nomi di due sezioni), BeepBar sposta i file nell'ordine giusto e scambia in un solo passaggio i file che si sono scambiati di posto, senza nomi temporanei. Alla fine ogni file è al suo posto con il suo nome. Solo su un disco che non sa scambiare due file in un passaggio (alcuni dischi di rete o esterni) uno dei due arriva con un numero.
 - Se è un file diverso (un altro materiale con lo stesso nome, o un tuo file), vale la stessa regola dei download: il file spostato arriva con un numero, per esempio `testo (1).pdf`. Vale anche per "Sposta la mia versione nella nuova cartella".
 
+**[PR #PRNUM]** Se BeepBar si interrompe a metà di uno spostamento (per esempio il Mac si spegne), al sync successivo guarda i file: se lo spostamento è avvenuto, continua a seguirli nella nuova posizione anche se nel frattempo ne hai modificato o cancellato uno; altrimenti li segue dove sono. Le tue modifiche restano in ogni caso. Se uno dei due percorsi non si può leggere (per esempio c'è un alias o una cartella al posto del file), il sync di quella cartella si ferma finché non lo sistemi, e la finestra indica quale percorso.
+
 ### 4.2 Il file viene cancellato e ricaricato altrove con lo stesso contenuto
 
 Per Moodle è un file nuovo; BeepBar lo riconosce perché il contenuto è identico.

@@ -312,7 +312,9 @@ enum RecordingPlayerError: Error {
     /// "let the system decide"), AVPlayer may buffer minutes of high-bitrate video ahead, which
     /// costs memory and university network for footage the student may skip. Thirty seconds
     /// still absorbs ordinary network hiccups and seeking within the buffer, while keeping memory
-    /// and download proportional to what is actually watched.
+    /// and download proportional to what is actually watched. The duration is media time: at 4x
+    /// it lasts 7.5 s of wall time and must refill four times as fast, so a weak connection
+    /// stalls sooner at the fastest speeds than at 1x.
     static let forwardBufferDuration: TimeInterval = 30
     static let defaultFrameAutosaveName = "BeepbarRecordingPlayerWindow"
     /// How far a seek may land from its target. An exact seek (zero tolerance) decodes from the
@@ -447,7 +449,7 @@ enum RecordingPlayerError: Error {
             Task { @MainActor [weak self] in self?.timeControlStatusChanged(generation: observedGeneration) }
         }
         // Which speeds the stream allows can change while it loads (an HLS stream may learn about
-        // an I-frame playlist late): follow it, so 2.5x/3x or 0.5x/0.75x open up when allowed.
+        // an I-frame playlist late): follow it, so 2.5x–4x or 0.5x/0.75x open up when allowed.
         // Nothing is read on AVFoundation's thread: two reports can hop in either order, and a
         // value carried by an older hop would overwrite a newer one. The hop reads the item's
         // current values itself (`rateSupportObserved`).

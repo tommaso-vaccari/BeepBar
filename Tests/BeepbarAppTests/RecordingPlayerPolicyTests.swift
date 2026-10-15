@@ -12,7 +12,7 @@ struct RecordingPlayerPolicyTests {
     /// The offered speeds are exactly the product owner's list, slowest first. Guards against a
     /// speed silently dropped or reordered (stepping relies on the order).
     @Test func theSpeedListIsTheAgreedOne() {
-        #expect(Policy.speeds == [0.5, 0.75, 1, 1.25, 1.5, 1.75, 2, 2.5, 3])
+        #expect(Policy.speeds == [0.5, 0.75, 1, 1.25, 1.5, 1.75, 2, 2.5, 3, 3.5, 4])
         #expect(Policy.speeds == Policy.speeds.sorted())
     }
 
@@ -24,11 +24,13 @@ struct RecordingPlayerPolicyTests {
         let slowOnly = RateSupport(fastForward: false, slowForward: true)
         #expect(Policy.availableSpeeds(.all) == Policy.speeds)
         #expect(Policy.availableSpeeds(.unknown) == [1, 1.25, 1.5, 1.75, 2])
-        #expect(Policy.availableSpeeds(fastOnly) == [1, 1.25, 1.5, 1.75, 2, 2.5, 3])
+        #expect(Policy.availableSpeeds(fastOnly) == [1, 1.25, 1.5, 1.75, 2, 2.5, 3, 3.5, 4])
         #expect(Policy.availableSpeeds(slowOnly) == [0.5, 0.75, 1, 1.25, 1.5, 1.75, 2])
         #expect(Policy.effectiveSpeed(preferred: 3, support: slowOnly) == 2)
         #expect(Policy.effectiveSpeed(preferred: 2.5, support: .unknown) == 2)
         #expect(Policy.effectiveSpeed(preferred: 3, support: fastOnly) == 3)
+        #expect(Policy.effectiveSpeed(preferred: 4, support: fastOnly) == 4)
+        #expect(Policy.effectiveSpeed(preferred: 4, support: .unknown) == 2)
         #expect(Policy.effectiveSpeed(preferred: 2, support: .unknown) == 2)
         #expect(Policy.effectiveSpeed(preferred: 0.5, support: fastOnly) == 1)
         #expect(Policy.effectiveSpeed(preferred: 0.75, support: .unknown) == 1)
@@ -41,7 +43,9 @@ struct RecordingPlayerPolicyTests {
         #expect(Policy.speed(matching: 0.75) == 0.75)
         #expect(Policy.speed(matching: 0.7505) == 0.75)
         #expect(Policy.speed(matching: 1.1) == nil)
-        #expect(Policy.speed(matching: 3.5) == nil)
+        #expect(Policy.speed(matching: 3.5) == 3.5)
+        #expect(Policy.speed(matching: 4) == 4)
+        #expect(Policy.speed(matching: 4.5) == nil)
         #expect(Policy.speed(matching: .nan) == nil)
         #expect(Policy.speed(matching: .infinity) == nil)
     }
@@ -52,6 +56,9 @@ struct RecordingPlayerPolicyTests {
         #expect(Policy.storedSpeed(nil) == 1)
         #expect(Policy.storedSpeed(NSNumber(value: 1.5)) == 1.5)
         #expect(Policy.storedSpeed(NSNumber(value: 3.0)) == 3)
+        #expect(Policy.storedSpeed(NSNumber(value: 4.0)) == 4)
+        #expect(Policy.storedSpeed(NSNumber(value: 4.5)) == 1)
+        #expect(Policy.storedSpeed(NSNumber(value: 8.0)) == 1)
         #expect(Policy.storedSpeed(NSNumber(value: 1.6)) == 1)
         #expect(Policy.storedSpeed(NSNumber(value: 0)) == 1)
         #expect(Policy.storedSpeed(NSNumber(value: -2)) == 1)
@@ -75,6 +82,10 @@ struct RecordingPlayerPolicyTests {
         #expect(Policy.steppedSpeed(from: 1.1, faster: true, available: all) == 1.25)
         #expect(Policy.steppedSpeed(from: 1.1, faster: false, available: all) == 1)
         #expect(Policy.steppedSpeed(from: 2, faster: true, available: Policy.availableSpeeds(.unknown)) == nil)
+        #expect(Policy.steppedSpeed(from: 3, faster: true, available: all) == 3.5)
+        #expect(Policy.steppedSpeed(from: 4, faster: true, available: all) == nil)
+        #expect(Policy.steppedSpeed(from: 4, faster: false, available: all) == 3.5)
+        #expect(Policy.steppedSpeed(from: 3.5, faster: false, available: all) == 3)
     }
 
     /// Skips land inside the lecture: never before 0, never past the duration, unclamped above
@@ -223,6 +234,8 @@ struct RecordingPlayerPolicyTests {
         #expect(Policy.speedLabel(1.5) == "1,5×")
         #expect(Policy.speedLabel(2.5) == "2,5×")
         #expect(Policy.speedLabel(3) == "3×")
+        #expect(Policy.speedLabel(3.5) == "3,5×")
+        #expect(Policy.speedLabel(4) == "4×")
         let help = Policy.shortcutHelp()
         #expect(help.count == 12)
         #expect(help.allSatisfy { !$0.keys.isEmpty && !$0.action.isEmpty })

@@ -3504,6 +3504,9 @@ enum MaterialsRunEnd: Equatable, Sendable {
     /// `force`; the next manual sync will).
     @discardableResult
     private func startRecordingsFollowUp(after end: MaterialsRunEnd, trigger: RecordingsSyncTrigger) -> Task<Void, Never>? {
+        // A run that ends while the app quits (a quit from outside waits for `syncTask`, which can
+        // still finish successfully) must not start WebKit listings on the way out.
+        guard !isTerminating else { return nil }
         guard let materials = Self.recordingsOutcome(for: end) else { return nil }
         guard case .refresh = recordingsSyncDecision(after: materials, trigger: trigger, network: nil).0 else { return nil }
         if let recordingsFollowUp { return recordingsFollowUp }

@@ -35,6 +35,8 @@
 
 ### Fixed
 
+- After a period offline, the course list no longer stays on “Couldn't refresh courses” once you are back online: BeepBar tries again by itself when the connection returns, and the message goes away as soon as the list is updated.
+
 - Watching a lecture in BeepBar keeps the display and Mac awake during video playback.
 
 - Renaming a course folder works after restoring or copying your files to another Mac, without extra prompts and while keeping your files tracked.

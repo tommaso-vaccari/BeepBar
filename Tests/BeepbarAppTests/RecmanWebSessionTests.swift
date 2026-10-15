@@ -143,7 +143,7 @@ struct RecmanWebSessionTests {
 /// playback request suspended, and `close()`, a newer operation or the controller cancelling its
 /// worker could not end it.
 ///
-/// Each test opens an isolated session on its blank page (a non-persistent store, no network, no
+/// Each test loads a local document in an isolated session (a non-persistent store, no network, no
 /// Polimi session) and runs scripts through `runScript`, which starts an operation exactly as the
 /// archive operations do. `callAsyncJavaScript` (the form with arguments) waits for a returned
 /// Promise, which is how a script is made to never answer.
@@ -160,11 +160,63 @@ struct RecmanWebSessionScriptTests {
     /// these tests use: `call.outcome == .interrupted` is what proves the timeout didn't end it.
     private static let interruptBound: Duration = .seconds(15)
 
-    private func openSession(scriptTimeout: Duration) async -> RecmanWebSession {
+    private func openSession(scriptTimeout: Duration) async throws -> RecmanWebSession {
         let session = RecmanWebSession()
         session.scriptTimeout = scriptTimeout
         await session.open(cookies: [])
-        return session
+        do {
+            let webView = try #require(session.webView)
+            let loaded = ScriptPageLoad()
+            let delegate = webView.navigationDelegate
+            webView.navigationDelegate = loaded
+            defer { webView.navigationDelegate = delegate }
+            // Process/document startup is fixture setup, not part of the script's deadline.
+            webView.loadHTMLString("<html><body id='script-fixture'></body></html>", baseURL: nil)
+            try await loaded.wait()
+            return session
+        } catch {
+            session.close()
+            throw error
+        }
+    }
+
+    /// Temporary navigation delegate used only while `openSession` loads the fixture document.
+    /// It reports the first finished or failed load, so a missing or broken document fails setup
+    /// within 30 s instead of letting a script start on a web view that has none.
+    @MainActor private final class ScriptPageLoad: NSObject, WKNavigationDelegate {
+        private var result: Result<Void, Error>?
+
+        func wait() async throws {
+            let deadline = ContinuousClock.now.advanced(by: .seconds(30))
+            while result == nil && ContinuousClock.now < deadline {
+                try await Task.sleep(for: .milliseconds(10))
+            }
+            try #require(result, "local script fixture did not finish loading").get()
+        }
+
+        func webView(_ webView: WKWebView, didFinish navigation: WKNavigation!) {
+            result = .success(())
+        }
+
+        func webView(_ webView: WKWebView, didFail navigation: WKNavigation!, withError error: Error) {
+            result = .failure(error)
+        }
+
+        func webView(_ webView: WKWebView, didFailProvisionalNavigation navigation: WKNavigation!, withError error: Error) {
+            result = .failure(error)
+        }
+    }
+
+    /// Cold WebContent startup belongs to setup, not to a script's deadline: a CI run once had
+    /// `scriptsThatAnswerStillAnswer` end as `unavailable` because the first script also paid for
+    /// starting WebKit. Fails if the fixture stops loading its document, runs a session script
+    /// during setup, or leaves its own navigation delegate in place of the session's.
+    @Test func theLocalDocumentIsReadyBeforeTheScriptDeadlineStarts() async throws {
+        let session = try await openSession(scriptTimeout: .seconds(10))
+        defer { session.close() }
+        #expect(session.lastScriptCall == nil)
+        #expect(session.webView?.navigationDelegate === session)
+        #expect(try await session.runScript("document.readyState + ':' + document.body.id") == "complete:script-fixture")
     }
 
     private func start(_ script: String, in session: RecmanWebSession) -> Task<String, Error> {
@@ -197,7 +249,7 @@ struct RecmanWebSessionScriptTests {
     /// The bounded wait changes nothing for scripts that answer: a string comes back from both
     /// WebKit forms, and anything else is still `unrecognized`.
     @Test func scriptsThatAnswerStillAnswer() async throws {
-        let session = await openSession(scriptTimeout: .seconds(10))
+        let session = try await openSession(scriptTimeout: .seconds(10))
         defer { session.close() }
         #expect(try await session.runScript("return 'ok'", arguments: [:]) == "ok")
         #expect(try await session.runScript("'plain'") == "plain")
@@ -209,7 +261,7 @@ struct RecmanWebSessionScriptTests {
     /// A script that never answers ends at `scriptTimeout` as `unavailable`, the error a page load
     /// that never finishes gives, so the controller stops instead of waiting forever.
     @Test(.timeLimit(.minutes(1))) func aScriptThatNeverAnswersEndsAtTheTimeout() async throws {
-        let session = await openSession(scriptTimeout: .milliseconds(300))
+        let session = try await openSession(scriptTimeout: .milliseconds(300))
         defer { session.close() }
         let clock = ContinuousClock()
         let started = clock.now
@@ -225,7 +277,7 @@ struct RecmanWebSessionScriptTests {
     /// `close()` (Recordings turned off, sign-out, another account) ends a script in flight at
     /// once, well before the timeout.
     @Test(.timeLimit(.minutes(1))) func closingEndsAScriptInFlight() async throws {
-        let session = await openSession(scriptTimeout: .seconds(20))
+        let session = try await openSession(scriptTimeout: .seconds(20))
         let task = start(Self.stalled, in: session)
         let call = try await pendingCall(session)
         let clock = ContinuousClock()
@@ -240,7 +292,7 @@ struct RecmanWebSessionScriptTests {
     /// A newer operation (another course, a playback request) ends the previous operation's script
     /// and gets its own answer, not the old one.
     @Test(.timeLimit(.minutes(1))) func aNewOperationEndsThePreviousScript() async throws {
-        let session = await openSession(scriptTimeout: .seconds(20))
+        let session = try await openSession(scriptTimeout: .seconds(20))
         defer { session.close() }
         let first = start(Self.stalled, in: session)
         let call = try await pendingCall(session)
@@ -257,7 +309,7 @@ struct RecmanWebSessionScriptTests {
     /// Cancelling the task that awaits the script (the controller's `worker?.cancel()`) ends it
     /// at once, and the session keeps working for the next operation.
     @Test(.timeLimit(.minutes(1))) func cancellingTheAwaitingTaskEndsTheScript() async throws {
-        let session = await openSession(scriptTimeout: .seconds(20))
+        let session = try await openSession(scriptTimeout: .seconds(20))
         defer { session.close() }
         let task = start(Self.stalled, in: session)
         let call = try await pendingCall(session)
@@ -275,7 +327,7 @@ struct RecmanWebSessionScriptTests {
     /// ended call keeps its timeout and records the answer as late, and the next operation gets
     /// its own answer.
     @Test(.timeLimit(.minutes(1))) func anAnswerAfterTheCallEndedIsDropped() async throws {
-        let session = await openSession(scriptTimeout: .milliseconds(100))
+        let session = try await openSession(scriptTimeout: .milliseconds(100))
         defer { session.close() }
         let late = "return new Promise(resolve => setTimeout(() => resolve('late'), 400))"
         await #expect(throws: RecmanBrowserError.unavailable) { try await session.runScript(late, arguments: [:]) }
@@ -293,7 +345,7 @@ struct RecmanWebSessionScriptTests {
     /// `close()` lets the web view go even while WebKit still holds the callback of a Promise that
     /// never settles: the callback captures the pending call, not the session or its web view.
     @Test(.timeLimit(.minutes(1))) func closingReleasesTheWebViewDespiteAStalledScript() async throws {
-        let session = await openSession(scriptTimeout: .seconds(20))
+        let session = try await openSession(scriptTimeout: .seconds(20))
         weak var webView = session.webView
         #expect(webView != nil)
         let task = start(Self.stalled, in: session)

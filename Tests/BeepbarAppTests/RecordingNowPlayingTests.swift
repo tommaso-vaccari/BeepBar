@@ -2,6 +2,8 @@ import AppKit
 @preconcurrency import AVFoundation
 import BeepbarCore
 import Foundation
+// Tests only: the enum values to check the policy against. The app itself never links it.
+import MediaPlayer
 import os
 import Testing
 @testable import BeepbarApp
@@ -523,8 +525,21 @@ struct RecordingNowPlayingTests {
         controller.close()
     }
 
-    /// The real publisher works in this process: MediaPlayer loads on demand, takes over and
-    /// gives everything back. Guards against the runtime calls (class names, selectors, the
+    /// The numbers spelled out in `RecordingNowPlayingPolicy` are MediaPlayer's own enum values,
+    /// read from the SDK through `import MediaPlayer` (tests only; the app never links it, see
+    /// `theAppDoesNotLinkMediaPlayer`). Guards against an off-by-one like issue #192, where
+    /// closing wrote 4 (Interrupted) for Stopped and the round-trip test read back the same 4.
+    @Test func theNumbersAreMediaPlayersOwn() {
+        #expect(RecordingNowPlayingPolicy.playingState == Int(MPNowPlayingPlaybackState.playing.rawValue))
+        #expect(RecordingNowPlayingPolicy.pausedState == Int(MPNowPlayingPlaybackState.paused.rawValue))
+        #expect(RecordingNowPlayingPolicy.stoppedState == Int(MPNowPlayingPlaybackState.stopped.rawValue))
+        #expect(RecordingNowPlayingPolicy.videoMediaType == Int(MPNowPlayingInfoMediaType.video.rawValue))
+        #expect(RecordingNowPlayingPolicy.commandSucceeded == MPRemoteCommandHandlerStatus.success.rawValue)
+    }
+
+    /// The real publisher works in this process: MediaPlayer loads (already mapped here, since
+    /// this test file imports it), takes over and gives everything back, writing the states
+    /// MediaPlayer's enum names (closing: Stopped, issue #192). Guards against the runtime calls (class names, selectors, the
     /// artwork initializer) silently failing, which would leave AVKit's "BeepBar" in place.
     @Test func theSystemPublisherLoadsAndClears() throws {
         let system = SystemNowPlaying()
@@ -545,26 +560,37 @@ struct RecordingNowPlayingTests {
         #expect(NSStringFromClass(type(of: artwork)).contains("MPMediaItemArtwork"))
         // The numbers MediaPlayer reads: video, playing; then paused.
         let mediaType = info[RecordingNowPlayingPolicy.Key.mediaType] as? Int
-        #expect(mediaType == 2)
+        #expect(mediaType == Int(MPNowPlayingInfoMediaType.video.rawValue))
         let playing = center.value(forKey: "playbackState") as? Int
-        #expect(playing == 1)
+        #expect(playing == Int(MPNowPlayingPlaybackState.playing.rawValue))
         system.publish(NowPlayingState(title: "Lezione", artist: "Corso", duration: 60, elapsed: 1, rate: 0, defaultRate: 1, isPlaying: false, artwork: picture))
         let paused = center.value(forKey: "playbackState") as? Int
-        #expect(paused == 2)
+        #expect(paused == Int(MPNowPlayingPlaybackState.paused.rawValue))
         system.deactivate()
         #expect(center.value(forKey: "nowPlayingInfo") == nil)
         let stopped = center.value(forKey: "playbackState") as? Int
-        #expect(stopped == 4)
+        #expect(stopped == Int(MPNowPlayingPlaybackState.stopped.rawValue))
         for name in Self.commandNames { #expect(try Self.targetCount(name) == 0, "\(name) still has a target") }
+        // Closing also disables every command (issue #199): an enabled command with no target
+        // can keep BeepBar the media keys' target after the lecture closed.
+        for name in Self.commandNames { #expect(try Self.isEnabled(name) == false, "\(name) still enabled") }
         system.deactivate()
-        // Activated again (the next lecture window): one target each, not two.
+        // Activated again (the next lecture window): one target each, not two, enabled again.
         let reactivated = system.activate(onCommand: { _ in })
         #expect(reactivated)
         for name in Self.commandNames { #expect(try Self.targetCount(name) == 1, "\(name)") }
+        for name in Self.commandNames { #expect(try Self.isEnabled(name), "\(name) not enabled") }
         system.deactivate()
     }
 
     private static let commandNames = ["playCommand", "pauseCommand", "togglePlayPauseCommand", "skipForwardCommand", "skipBackwardCommand", "changePlaybackPositionCommand"]
+
+    /// Whether the real shared `MPRemoteCommand` named `name` is enabled.
+    private static func isEnabled(_ name: String) throws -> Bool {
+        let center = try #require((NSClassFromString("MPRemoteCommandCenter") as? NSObject.Type)?.perform(NSSelectorFromString("sharedCommandCenter"))?.takeUnretainedValue() as? NSObject)
+        let command = try #require(center.value(forKey: name) as? MPRemoteCommand)
+        return command.isEnabled
+    }
 
     /// How many targets a real `MPRemoteCommand` holds: its `_handlers` dictionary when the
     /// class has one (read through the runtime, never key-value coding on a missing key), else

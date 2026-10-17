@@ -131,6 +131,7 @@ Keep `automaticRun` in step with the app when that sequence changes.
 - *What it reports:* average CPU, interrupt wakeups per second (with how many brought the CPU out of idle), disk writes and footprint growth.
 - *Network:* `nettop` samples the process's open connections every second for the whole window, and each connection counts the most bytes it was seen with, minus what it had moved before the window. `nettop` forgets a connection once it closes, so two snapshots would read 0 after a check that came and went. A connection opened and closed between two samples is still missed, so the number is a lower bound, printed with the count of connections seen.
 - *Before measuring:* close BeepBar's window and leave the Mac alone. An automatic check that falls inside the window is expected and shows up as one burst.
+- *Expected exception:* with telemetry on (the Release default), at most one HTTPS request to TelemetryDeck and one preferences write per UTC day, right after launch, wake, activation or UTC midnight. It is a documented exception to the idle budget, see the [performance plan](performance-plan.md#budget-e-significato-delle-misure) and [telemetry.md](telemetry.md).
 
 ## Profiling
 

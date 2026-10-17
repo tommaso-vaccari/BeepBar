@@ -159,6 +159,9 @@ struct RecordingsListing: Equatable {
 ///   first). A failure of this refresh is never shown as a sync failure.
 @MainActor final class RecordingsController: ObservableObject {
     nonisolated static let enabledKey = "io.github.tvaccari.beepbar.recordings-enabled.v1"
+    /// The session file is obsolete (turn-off, logout, account change, damage): never read it.
+    /// Cleared when its deletion is confirmed (`trackSessionDeletion`) or a new session is saved.
+    /// While set, every new controller and every session read retries the deletion (#200).
     private static let sessionDiscardedKey = "io.github.tvaccari.beepbar.recordings-session-discarded.v1"
 
     /// The switch as saved: on by default, and off wherever the feature isn't available. Shared by
@@ -365,6 +368,11 @@ struct RecordingsListing: Equatable {
     /// `sessionOwner` is nil, and without this an account change would keep the previous
     /// account's address and send it to Webex for the new one (PR #152 review, P0).
     private var emailAccount: Int?
+    /// The session-file deletion in flight (a discard or its retry), so a read while it runs
+    /// doesn't enqueue another one. Its id tells a finished deletion whether it is still the
+    /// tracked one.
+    private var sessionDeletion: Int?
+    private var sessionDeletions = 0
 
     private let makeBrowser: @MainActor () -> RecmanBrowsing
     private let store: RecordingsSessionStore
@@ -511,6 +519,10 @@ struct RecordingsListing: Equatable {
         isEnabled = enabled
         access = enabled ? .ready : .off
         legacySeen = .init(ids: enabled ? defaults.stringArray(forKey: Self.acknowledgedKey) ?? [] : [], baselines: enabled ? defaults.stringArray(forKey: Self.baselinedKey) ?? [] : [])
+        // A deletion that failed, or never ran because the app quit first, would otherwise leave
+        // the old account's Polimi and Webex cookies and email on disk for good (#200). Off the
+        // main actor, and only while the flag says there is something to delete.
+        retryObsoleteSessionDeletion()
     }
 
     /// The saved switch, on unless turned off; Polimi still decides (`isAvailable`). Shared with
@@ -676,6 +688,16 @@ struct RecordingsListing: Equatable {
 
     /// Called when the WeBeep account becomes known or changes. A session made for another
     /// account is dropped together with what that account had seen.
+    ///
+    /// With no session owner (a Polimi sign-in completed while the WeBeep account was unknown,
+    /// so nothing was saved), the live browser and whatever the controller holds in memory
+    /// (listings, playback links, watch progress) can't be attributed to anyone: they are
+    /// dropped as well, or the new account would use the previous student's Polimi login and
+    /// see their lectures (#191). Only memory goes in that case: the seen history, the resume
+    /// points and the session file are scoped by owner (and checked when read), and wiping
+    /// them could erase the same student's progress when the account merely became known. The
+    /// cost is one more "Accedi con Polimi" in that rare case. Nothing in memory, nothing done:
+    /// the account becoming known at a normal launch stays free.
     func webBeepAccountChanged(to userID: Int) {
         loadStudy()
         // Before the session check: an address learned with no Polimi session yet belongs to the
@@ -686,18 +708,25 @@ struct RecordingsListing: Equatable {
         }
         resumePoints = nil
         Self.forgetResumePoints(in: defaults, notOwnedBy: userID)
-        guard let sessionOwner, sessionOwner != userID else { return }
-        log.notice("Polimi session belongs to another WeBeep account: dropped")
+        let foreignSession = sessionOwner.map { $0 != userID } ?? false
+        let unattributedMemory = sessionOwner == nil && (browser != nil || !playbackURLs.isEmpty
+            || !watchProgress.known.isEmpty || listings.values.contains { $0.recordings != nil })
+        guard foreignSession || unattributedMemory else { return }
+        log.notice("Polimi session belongs to another or an unknown WeBeep account: dropped foreign=\(foreignSession, privacy: .public)")
         supersedeInitialSessionCheck()
         closePlayerForIdentityChange()
         invalidate()
         closeBrowser()
         listings.removeAll()
         playbackURLs.removeAll()
-        forgetSeen()
-        forgetResumePoints()
-        forgetEmailOptOut()
-        discardSessionFile()
+        if foreignSession {
+            forgetSeen()
+            forgetResumePoints()
+            forgetEmailOptOut()
+            discardSessionFile()
+        } else {
+            watchProgress.reset()
+        }
         if isEnabled { access = .needsSignIn(nil) }
     }
 
@@ -2099,10 +2128,13 @@ struct RecordingsListing: Equatable {
 
     /// Saves a course's summary under `owner`, only when it differs from the saved one: a listing
     /// or a write that changes nothing in it writes nothing. The comparison is of the whole value,
-    /// `next` included, so only a change of the counts or of the next lecture writes.
+    /// `next` included, so only a change of the counts or of the next lecture writes. Both sides
+    /// go through the saved projection (`StoredCourseWatchSummary.persisted`): after a relaunch
+    /// the in-memory copy is the decoded one, whose `next` lacks the date, kind and size, and a
+    /// raw comparison rewrote and republished every course after each launch (#189).
     private func storeWatchSummary(_ summary: CourseWatchSummary, for key: RecmanCourseKey, owner: Int) {
         loadWatchSummaries(owner: owner)
-        guard watchSummaries[key] != summary else { return }
+        guard watchSummaries[key].map({ StoredCourseWatchSummary($0).persisted }) != StoredCourseWatchSummary(summary).persisted else { return }
         var updated = watchSummaries
         updated[key] = summary
         let stored = StoredWatchSummaries(owner: owner, courses: Dictionary(uniqueKeysWithValues: updated.map { (Self.baselineID(courseCode: $0.key.courseCode, academicYear: $0.key.academicYear), $0.value) }))
@@ -2608,6 +2640,7 @@ struct RecordingsListing: Equatable {
     /// opening cycle: later callers in the same cycle share the first read.
     private func savedCookies() async -> [HTTPCookie] {
         if defaults.bool(forKey: Self.sessionDiscardedKey) {
+            retryObsoleteSessionDeletion()
             emailLoaded = true
             return []
         }
@@ -2733,9 +2766,33 @@ struct RecordingsListing: Equatable {
         // The email lives in the file and goes with it, in memory too.
         resetEmail()
         let delete = vault.discard()
-        Task { [log] in
-            if case .failed(let errorType) = await delete.value {
+        trackSessionDeletion(delete, epoch: vault.epoch)
+    }
+
+    /// Deletes again a session file discarded earlier (`sessionDiscardedKey`) whose deletion
+    /// failed or never ran (#200). `RecmanSessionVault.retryDiscard` keeps a file a new session
+    /// was saved to since, and bumps no epoch, so a sign-in in progress is not disturbed.
+    private func retryObsoleteSessionDeletion() {
+        guard sessionDeletion == nil, defaults.bool(forKey: Self.sessionDiscardedKey) else { return }
+        trackSessionDeletion(vault.retryDiscard(), epoch: vault.epoch)
+    }
+
+    /// Clears the discard flag once the deletion is confirmed, unless a newer discard happened
+    /// meanwhile (`epoch`): that one's own deletion decides. A failure keeps the flag, so the
+    /// next controller or session read retries; it is only logged.
+    private func trackSessionDeletion(_ delete: Task<RecmanSessionVault.DeleteOutcome, Never>, epoch: Int) {
+        sessionDeletions += 1
+        let id = sessionDeletions
+        sessionDeletion = id
+        Task { [weak self, log] in
+            let outcome = await delete.value
+            if case .failed(let errorType) = outcome {
                 log.error("Couldn't delete the saved Polimi session errorType=\(errorType, privacy: .public)")
+            }
+            guard let self else { return }
+            if self.sessionDeletion == id { self.sessionDeletion = nil }
+            if outcome == .deleted, self.vault.epoch == epoch {
+                self.defaults.removeObject(forKey: Self.sessionDiscardedKey)
             }
         }
     }

@@ -73,6 +73,27 @@ enum RecordingsPresentation {
         return BilingualText("\(left) da guardare", "\(left) left")
     }
 
+    /// "1 registrazione" / "3 registrazioni": the course's recording count, in the sidebar
+    /// subtitle and the course header. Both languages agree in number (#195).
+    static func recordingCount(_ count: Int) -> BilingualText {
+        BilingualText(italianCount(count, "registrazione", "registrazioni"), englishCount(count, "recording", "recordings"))
+    }
+
+    /// VoiceOver's label of the sidebar badge counting new lectures: "1 nuova" / "3 nuove" (#195).
+    static func newCountLabel(_ count: Int) -> BilingualText {
+        BilingualText(italianCount(count, "nuova", "nuove"), "\(count) new")
+    }
+
+    /// The sidebar course row's third line: the recording count, or what the listing is doing.
+    static func courseSubtitle(for listing: RecordingsListing?) -> String {
+        if let count = listing?.recordings?.count {
+            return count == 0 ? tr("Nessuna registrazione", "No recordings") : recordingCount(count).text
+        }
+        if listing?.isLoading == true { return tr("Caricamento…", "Loading…") }
+        if listing?.problem != nil { return tr("Non disponibile", "Unavailable") }
+        return " "
+    }
+
     // MARK: Watch progress
 
     /// What one row shows of its watch progress, as plain values: the row compares it with `==`,
@@ -163,6 +184,8 @@ enum RecordingsPresentation {
         /// `RecordingsController.canEditProgress` when the reader was built (see
         /// `WatchProgressReader.init` on why a stale value is harmless).
         let canEdit: Bool
+        /// `RecordingsWatchProgressModel.stateRevision` when the copy was taken.
+        let stateRevision: Int
 
         @MainActor init(_ model: RecordingsWatchProgressModel, canEdit: Bool) {
             entries = model.entries
@@ -171,6 +194,7 @@ enum RecordingsPresentation {
             pendingCourses = model.pendingCourses
             known = model.known
             summaries = model.summaries
+            stateRevision = model.stateRevision
             self.canEdit = canEdit
         }
 
@@ -189,6 +213,8 @@ enum RecordingsPresentation {
         /// cannot authorize a bulk change. The label follows committed entries only. A course
         /// with a bulk save in flight is covered through `row(for:)`, which counts every row of a
         /// `pendingCourses` course as pending, also rows a refresh added meanwhile.
+        /// One `row(for:)` per recording: the page asks through `BulkActionCache`, never on each
+        /// publication (#209).
         func bulkAction(for key: RecmanCourseKey, recordings: [RecmanRecording]?) -> BulkAction {
             guard let recordings, !recordings.isEmpty else { return BulkAction(allDone: false, enabled: false) }
             var allDone = true
@@ -206,6 +232,47 @@ enum RecordingsPresentation {
         func headerLine(_ base: String, for key: RecmanCourseKey) -> String {
             guard let watched = RecordingsPresentation.watchSummaryText(summaries[key]) else { return base }
             return "\(base) · \(watched.text)"
+        }
+    }
+
+    /// The course toolbar's bulk button, scanned again only when something it reads changed.
+    ///
+    /// Why: the button sits in a `WatchProgressReader`, whose closure runs on every publication
+    /// of the progress model, a playing lecture's ~30 s tick included, and `bulkAction` visits
+    /// every recording of the listing. Scanning on each run made the tick's cost proportional to
+    /// the listing (and a bulk save of N lectures cost N scans of N rows), against principle 6
+    /// and `WatchProgressReader`'s flat-cost design (#209). The scan's inputs are the model's
+    /// committed state (tracked by `stateRevision`, which a tick doesn't change), `canEdit` and
+    /// the listing.
+    ///
+    /// While the course's own bulk save runs (`pendingCourses`), every commit of it changes the
+    /// entries, but the button stays disabled whatever they say (every row is pending): the
+    /// label of the last scan is kept, without a scan, until the save ends; the save's end
+    /// changes `pendingCourses` and so rescans, and the label follows the saved state again.
+    ///
+    /// A class, held in the page's `@State` and filled during `body` like `DerivedValueCache`:
+    /// a cache, not state SwiftUI observes. One per course page, on the main actor.
+    @MainActor final class BulkActionCache {
+        /// How many times the listing was scanned, so tests can prove that a tick costs none.
+        private(set) var scans = 0
+        private var stored: (key: RecmanCourseKey, revision: Int, canEdit: Bool, recordings: [RecmanRecording], action: BulkAction)?
+
+        func action(for key: RecmanCourseKey, recordings: [RecmanRecording]?, values: WatchValues) -> BulkAction {
+            guard let recordings, !recordings.isEmpty else { return BulkAction(allDone: false, enabled: false) }
+            if let stored, stored.key == key, stored.recordings == recordings {
+                // Keep the caller's array, so the next comparison hits the shared-storage fast
+                // path instead of comparing a refetched listing element by element each time.
+                self.stored?.recordings = recordings
+                if values.pendingCourses.contains(key) { return BulkAction(allDone: stored.action.allDone, enabled: false) }
+                if stored.revision == values.stateRevision, stored.canEdit == values.canEdit { return stored.action }
+            }
+            scans += 1
+            #if DEBUG
+            RecordingsPageProbes.bulkScan?(recordings.count)
+            #endif
+            let action = values.bulkAction(for: key, recordings: recordings)
+            stored = (key, values.stateRevision, values.canEdit, recordings, action)
+            return action
         }
     }
 
@@ -398,7 +465,7 @@ struct RecordingsPage: View {
                 // header keeps the WeBeep name on purpose: owner decision, sidebar and menu only.
                 ForEach(model.searchable) { entry in
                     let summary = authentication.watchSummaries[entry.key]
-                    CourseRow(name: entry.sidebarName, key: entry.key, subtitle: CourseRow.subtitle(for: recordings.listing(for: entry.key)), newCount: recordings.newCount(for: entry.key),
+                    CourseRow(name: entry.sidebarName, key: entry.key, subtitle: RecordingsPresentation.courseSubtitle(for: recordings.listing(for: entry.key)), newCount: recordings.newCount(for: entry.key),
                               toWatch: RecordingsPresentation.hasLecturesToWatch(summary: summary) ? summary.map(RecordingsPresentation.lecturesToWatchValue) : nil)
                         .equatable()
                         .tag(RecordingsDestination.course(entry.course.id))
@@ -492,19 +559,10 @@ private struct CourseRow: View, Equatable {
                     .padding(.horizontal, 6)
                     .frame(minHeight: 17)
                     .background(Color.accentColor, in: Capsule())
-                    .accessibilityLabel(tr("\(newCount) nuove", "\(newCount) new"))
+                    .accessibilityLabel(RecordingsPresentation.newCountLabel(newCount).text)
             }
         }
         .padding(.vertical, 2)
-    }
-
-    static func subtitle(for listing: RecordingsListing?) -> String {
-        if let count = listing?.recordings?.count {
-            return count == 0 ? tr("Nessuna registrazione", "No recordings") : tr("\(count) registrazioni", englishCount(count, "recording", "recordings"))
-        }
-        if listing?.isLoading == true { return tr("Caricamento…", "Loading…") }
-        if listing?.problem != nil { return tr("Non disponibile", "Unavailable") }
-        return " "
     }
 }
 
@@ -526,6 +584,8 @@ private struct CourseRecordings: View {
     /// Lesson numbers and total minutes, which depend on the listing alone: typing in the search
     /// doesn't sort the whole list again.
     @State private var summaryCache = DerivedValueCache<[RecmanRecording], RecmanCourseListSummary>()
+    /// The bulk button's last scan, so a progress tick doesn't scan the listing (#209).
+    @State private var bulkCache = RecordingsPresentation.BulkActionCache()
 
     private var listing: RecordingsListing? { recordings.listing(for: key) }
 
@@ -591,7 +651,7 @@ private struct CourseRecordings: View {
             searchField
             Spacer(minLength: 0)
             WatchProgressReader(recordings: recordings) { progress in
-                let action = progress.bulkAction(for: key, recordings: listing?.recordings)
+                let action = bulkCache.action(for: key, recordings: listing?.recordings, values: progress)
                 Button(action.label.text) { recordings.toggleAllDone(key) }
                     .buttonStyle(.borderless)
                     .font(.callout)
@@ -626,7 +686,7 @@ private struct CourseRecordings: View {
             return listing?.isLoading == true ? "\(year) · \(tr("caricamento…", "loading…"))" : year
         }
         let minutes = summary(list).totalMinutes
-        var parts = [year, tr("\(list.count) registrazioni", englishCount(list.count, "recording", "recordings"))]
+        var parts = [year, RecordingsPresentation.recordingCount(list.count).text]
         if minutes > 0 { parts.append(RecordingsPresentation.durationText(minutes: minutes)) }
         return parts.joined(separator: " · ")
     }
@@ -717,7 +777,9 @@ private struct CourseRecordings: View {
         }
         .listStyle(.inset)
         .scrollContentBackground(.hidden)
-        // Double click and Return open the player, the way Finder opens a file.
+        // Double click and Return open the player, the way Finder opens a file. The modifier
+        // sits on the reader, not on the `List` inside it; SwiftUI still hands it to the list
+        // (`courseListMenuAndPrimaryActionReachTheList` drives the real AppKit list, #198).
         .contextMenu(forSelectionType: String.self) { ids in
             if let recording = ids.first.flatMap({ byID[$0] }) {
                 // Really the browser: Play (double click, Return, the row's button) is BeepBar's
@@ -826,6 +888,8 @@ private struct WatchlistRecordings: View {
                     }
                 }
                 .listStyle(.inset).scrollContentBackground(.hidden)
+                // On the reader like the course list's; pinned by
+                // `watchlistMenuAndPrimaryActionReachTheList` (#198).
                 .contextMenu(forSelectionType: String.self) { ids in
                     if let bookmark = shown.first(where: { ids.contains($0.id) }) {
                         Button(tr("Rimuovi dalla watchlist", "Remove from watchlist")) { recordings.toggleWatchlist(bookmark.recording, courseName: bookmark.courseName) }
@@ -872,7 +936,10 @@ private struct WatchlistRecordings: View {
 /// `WatchValues.row`, `aTickReRendersOnlyThePlayingRow`, 1000×700 window): 302 `row` calls with
 /// 1,000 recordings and 326 with 5,000 (the rows `List` keeps built around the visible ones,
 /// nearly flat in the listing's size), and one row body in both. Package G records these numbers
-/// with the rest of the delivery evidence.
+/// with the rest of the delivery evidence. Every reader closure must keep that property: the
+/// course toolbar's bulk button, added later, scanned the whole listing on each tick until it
+/// went through `RecordingsPresentation.BulkActionCache` (#209; `aTickDoesNotScanTheListing`
+/// pins zero scans per tick). Nothing in a reader may visit every recording on a publication.
 struct WatchProgressReader<Content: View>: View {
     @ObservedObject var progress: RecordingsWatchProgressModel
     /// `RecordingsController.canEditProgress` when the page built this reader. It can go stale
@@ -901,6 +968,8 @@ struct WatchProgressReader<Content: View>: View {
 @MainActor enum RecordingsPageProbes {
     static var row: ((RecordingRow) -> Void)?
     static var header: ((String) -> Void)?
+    /// A scan of the listing by the course toolbar's bulk button, with the listing's size.
+    static var bulkScan: ((Int) -> Void)?
     /// A sidebar course row's body: its title and whether the orange marker shows.
     static var sidebarRow: ((_ name: String, _ marker: Bool) -> Void)?
 }
@@ -951,15 +1020,26 @@ struct RecordingRow: View, Equatable {
         Binding(get: { watch.isOn }, set: { setDone($0) })
     }
 
+    /// VoiceOver's label of the bookmark button. It names the lecture, like Play's label, so a
+    /// VoiceOver user moving between rows knows which lecture the button adds or removes (#196);
+    /// the tooltip stays short because the row is next to it on screen.
+    static func watchlistAccessibilityLabel(isWatchlisted: Bool, title: String) -> BilingualText {
+        isWatchlisted ? BilingualText("Rimuovi \(title) dalla watchlist", "Remove \(title) from watchlist")
+            : BilingualText("Aggiungi \(title) alla watchlist", "Add \(title) to watchlist")
+    }
+
     var body: some View {
         #if DEBUG
         let _ = RecordingsPageProbes.row?(self)
         #endif
         HStack(spacing: 10) {
+            // Hidden from VoiceOver when clear: an empty label still made the dot an unnamed
+            // element at the start of every row that isn't new (#196).
             Circle()
                 .fill(isNew ? Color.accentColor : .clear)
                 .frame(width: 7, height: 7)
-                .accessibilityLabel(isNew ? tr("Nuova", "New") : "")
+                .accessibilityLabel(tr("Nuova", "New"))
+                .accessibilityHidden(!isNew)
             if let number {
                 Text("#\(number)")
                     .font(.callout).monospacedDigit().foregroundStyle(.tertiary)
@@ -999,7 +1079,7 @@ struct RecordingRow: View, Equatable {
             }
             .buttonStyle(.plain).disabled(!canEdit)
             .help(isWatchlisted ? tr("Rimuovi dalla watchlist", "Remove from watchlist") : tr("Aggiungi alla watchlist", "Add to watchlist"))
-            .accessibilityLabel(isWatchlisted ? tr("Rimuovi dalla watchlist", "Remove from watchlist") : tr("Aggiungi alla watchlist", "Add to watchlist"))
+            .accessibilityLabel(Self.watchlistAccessibilityLabel(isWatchlisted: isWatchlisted, title: RecordingsPresentation.title(recording)).text)
             Button(action: actions.play) {
                 ZStack {
                     ProgressView().controlSize(.small).opacity(isOpening ? 1 : 0)

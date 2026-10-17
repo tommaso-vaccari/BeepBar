@@ -123,11 +123,19 @@ enum RemoteMoveJournal {
     /// with it every sync, conflict choice and folder tidy-up of that folder, with nothing the user
     /// could do (release review I-A1). Every batch is settled before the first read error is
     /// reported, so one unreadable batch does not hold back the others.
+    ///
+    /// Batches are visited in the database's order (by batch id), not a dictionary's: the order
+    /// changes nothing for the user, but a fixed one lets a test put the unreadable batch first and
+    /// prove the others are still settled behind it (#224).
     static func recover(rootID: UUID, database: SyncDatabase, fileStore: FileStore) async throws {
         let pending = try await database.pendingRemoteMoves(rootID: rootID)
         guard !pending.isEmpty else { return }
+        let grouped = Dictionary(grouping: pending, by: \.batchID)
+        var seen = Set<UUID>()
+        let batchIDs = pending.map(\.batchID).filter { seen.insert($0).inserted }
         var unreadable: Error?
-        for batch in Dictionary(grouping: pending, by: \.batchID).values {
+        for batchID in batchIDs {
+            guard let batch = grouped[batchID] else { continue }
             var states: [(move: PendingRemoteMove, destination: FileSnapshotState, source: FileSnapshotState)] = []
             do {
                 for move in batch {

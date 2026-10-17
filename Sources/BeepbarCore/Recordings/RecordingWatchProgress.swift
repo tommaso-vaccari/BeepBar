@@ -212,6 +212,17 @@ public struct StoredCourseWatchSummary: Codable {
 
     public init(_ summary: CourseWatchSummary) { self.summary = summary }
 
+    /// `summary` as it reads back after a save and a relaunch: `next` keeps only what `Target`
+    /// stores (id, course, year, title, duration; the date, kind and size are rebuilt as
+    /// placeholders, and an invalid target is dropped). Compare through this, never the raw
+    /// value, to tell whether a summary changed: a freshly computed `next` never equals a
+    /// decoded one, so a raw comparison rewrote every course's summary after each relaunch (#189).
+    public var persisted: CourseWatchSummary {
+        CourseWatchSummary(done: summary.done, total: summary.total, remainingMinutes: summary.remainingMinutes,
+                           unknownDurationCount: summary.unknownDurationCount,
+                           next: summary.next.flatMap(Target.init)?.recording, newCount: summary.newCount)
+    }
+
     private struct Target: Codable {
         let id: String
         let courseCode: String

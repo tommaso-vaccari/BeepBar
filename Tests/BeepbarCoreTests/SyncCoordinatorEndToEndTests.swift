@@ -104,19 +104,24 @@ import Testing
     }
 
     /// One unreadable batch neither stops the others from being settled nor loses its own row.
-    /// Batches are visited in no fixed order, so throwing at the first unreadable one could leave
-    /// a settleable batch pending behind it.
-    @Test func anUnreadableBatchDoesNotHoldBackTheOthers() async throws {
+    /// Recovery visits batches by batch id, so the unreadable batch is put first, in the middle and
+    /// last: throwing at the first unreadable batch leaves the batches behind it pending and fails
+    /// the first two orders on every run. With a dictionary's order the same mutant passed about a
+    /// quarter of the runs (#224).
+    @Test(arguments: ["00000000-0000-0000-0000-000000000000", "6FFFFFFF-FFFF-FFFF-FFFF-FFFFFFFFFFFF", "FFFFFFFF-FFFF-FFFF-FFFF-FFFFFFFFFFFF"])
+    func anUnreadableBatchDoesNotHoldBackTheOthers(_ unreadableBatch: String) async throws {
         let fixture = try await Fixture()
         defer { fixture.remove() }
         let target = fixture.targets[0]
         _ = try await fixture.synchronize(targets: [target])
+        let readableBatches = ["40000000-0000-0000-0000-000000000000", "80000000-0000-0000-0000-000000000000", "C0000000-0000-0000-0000-000000000000"]
         var moves: [PendingRemoteMove] = []
         for file in 0..<4 {
             let id = fixture.remoteID(course: 1, file: file)
             let baseline = try #require(try await fixture.database.baseline(rootID: fixture.rootID, remoteID: id))
             let folder = file == 0 ? "Moved" : "Elsewhere"
-            let move = PendingRemoteMove(batchID: UUID(), remoteID: id, from: baseline.relativePath, to: try RelativePath("Course 1/\(folder)/\(file).txt"), sha256: baseline.sha256, placement: nil)
+            let batch = try #require(UUID(uuidString: file == 0 ? unreadableBatch : readableBatches[file - 1]))
+            let move = PendingRemoteMove(batchID: batch, remoteID: id, from: baseline.relativePath, to: try RelativePath("Course 1/\(folder)/\(file).txt"), sha256: baseline.sha256, placement: nil)
             try await fixture.database.beginRemoteMoves(rootID: fixture.rootID, [move])
             moves.append(move)
         }

@@ -100,3 +100,39 @@ Additional public sources checked:
 - [Garante cookie FAQ, questions 4–5](https://www.garanteprivacy.it/faq/Cookie) explicitly allows qualifying minimized analytics without consent, including third-party analytics subject to limits on combination and onward disclosure. This is a conditional exemption, not a blanket requirement that all analytics be opt-in, nor proof that this particular native integration qualifies.
 
 Assessment outcome: a concrete maintenance interest and a technically valid monthly deduplication rationale are documented. A positive finding on the whole default-on implementation is still unsupported because purpose-limited retention, necessity of recurring events and the conditions for third-party terminal-access exemption remain unresolved. Client-side hashing and the provider's claim of anonymous processing cannot substitute for that assessment. Further rewording of this record alone cannot resolve missing service/configuration evidence. Default-on remains in the draft, with C08 open; this is not approval for release.
+
+
+## TelemetryDeck-only remediation package — 2026-10-17
+
+Owner constraint: retain TelemetryDeck, default-on and opt-out. A replacement service or self-hosted collector is not the selected solution. No change to daily/monthly metrics is assumed. Application code remains unchanged from the validated code commit; this section is a concrete evidence/contract proposal, not a positive legal opinion.
+
+The direct client uses the documented v2 ingest endpoint. That supports technical compatibility; it does not prove the supplemental agreement's SDK-specific warranties apply to it. Neither changing to the SDK nor accepting provider anonymity language automatically resolves terminal-access lawfulness. A full independent server audit is not assumed mandatory: applicable contractual assurances and sufficiently specific technical documentation can be evidence. The unanswered question is their scope for this client, not a demand to prove every server operation independently.
+
+### Conditions to resolve with the existing provider
+
+1. Preserve a record of the applicable account terms. Establish whether the binding [German supplemental agreement](https://telemetrydeck.com/avv/) and its Sections 3 and 5 cover this direct API client, including server hashing, hourly timestamps, IP handling and infrastructure access. Its Section 2 denies an Article 28 processor role; do not call this an Article 28 DPA merely because of its page title. If identifiable data are actually processed, assess the factual role and obtain the corresponding agreement instead of relying on labels.
+2. Obtain applicable restrictions against identifying users, combining these events with other customers or external datasets, independent secondary use, and onward disclosure beyond service infrastructure under appropriate guarantees. Namespace isolation alone is not equivalent to all these restrictions. Assess the answer against the Italian exemption rather than treating a generic GDPR assurance as an exemption decision.
+3. Request a concrete retention arrangement: proposed maximum 90 days for linkable events, including archives, with a documented backup expiry or irreversible anonymization deadline. The proposed term is not active or owner-approved. It covers up to three calendar-month maintenance comparisons; a longer horizon should use genuinely non-identifying aggregates with small-cohort safeguards. No absolute numerical threshold guarantees anonymity. Provider feasibility, scope, cost and the purpose justification must be recorded before selecting a term.
+4. Complete a single processing-specific legitimate-interest assessment for collection/transmission and a separate terminal-access exemption analysis using that evidence. Explicitly assess the monthly deduplication rationale, alternatives, daily frequency, retained versions, small cohorts, objections and prior notice. Provider agreement alone cannot make this legal assessment positive. Request qualified privacy review of the exact configuration and evidence if the native exemption remains uncertain; no paid engagement is authorized here.
+
+### Ready-to-send provider request — NOT SENT
+
+Subject: BeepBar — direct Ingest v2 privacy guarantees and bounded retention
+
+We use TelemetryDeck for maintenance and compatibility statistics in a native macOS app, with default-on reporting and an opt-out. Before relying on this configuration, we need confirmation specific to the following direct API client, rather than a general compliance statement.
+
+Our app sends at most one best-effort request per UTC day to your documented v2 namespace endpoint. Each event contains appID, type BeepBar.dailyActive, clientUser = SHA256(appID + ':' + a randomly generated installation UUID that is independently replaced each UTC calendar month), and only app version, platform macOS, operating system macOS and major macOS version in payload. No account ID, email, device identifier, course, file, language, settings, session ID or custom timestamp is sent. Disabling stops future sends and removes the local UUID. Requests use an ephemeral HTTP session without cookies, credentials, cache or redirects. The server necessarily receives a connection IP.
+
+Please confirm or correct each point and identify the applicable contractual clause or technical documentation:
+
+- Do your current supplemental agreement and anonymization/security warranties cover this direct v2 client? Which terms apply to our account, and how can we retain evidence of their applicability?
+- Does this endpoint apply server-side salted hashing, timestamp rounding, and the published no-IP-storage policy across ingestion, logs and infrastructure? What additional fields, location information or identifiers are derived or retained for this path?
+- What binding restrictions cover identification, combination with external/customer datasets, independent secondary use, and disclosure to additional recipients? Please distinguish service infrastructure from other recipients and explain the applicable role for any personal data before anonymization.
+- Can we configure or agree to deletion or irreversible anonymization of linkable events after at most 90 days, covering cold storage and a stated backup expiry? Please state any exceptions, available aggregate-only retention, activation evidence and cost. This is a proposed arrangement, not a request to delete existing production data or enable a paid feature.
+- Please supply the relevant technical and organizational measures and describe the treatment of previously collected events separately from future configuration.
+
+We are assessing Italian analytics-exemption conditions as well as GDPR legitimate interest. We are not asking you to certify our app's overall compliance; we need facts and enforceable guarantees applicable to this configuration.
+
+### Stop condition for this iteration
+
+The public-document-only scope has been exhausted for the questions above. This request is prepared but not sent because the owner previously prohibited provider outreach. No account settings, contractual acceptance, deletion policy, budget or legal-review engagement has been changed. A later authorization to use TelemetryDeck does not by itself revoke that outreach restriction. C08 stays open until the missing evidence and the application-specific legal assessment support closure; a negative or incomplete answer must remain visible.

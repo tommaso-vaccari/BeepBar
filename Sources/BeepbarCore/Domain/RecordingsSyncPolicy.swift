@@ -32,6 +32,7 @@ import Foundation
 /// | `failedSync(error: nil)` (a non-WeBeep error, e.g. `SyncDatabaseError.open`) | `.localFailure` |
 /// | `runAutomaticSync`, `pausedMidRun` returned true | `.pausedByDataSaver(pause)` |
 /// | `runAutomaticSync`, `AutomaticSyncPolicy.decision` not `.run` | `.notRun(thatDecision)` |
+/// | `runAutomaticSync`, the scheduler task cancelled (its schedule dropped) or the scheduler asking to defer (`shouldDefer`) when the materials end (#188) | `.cancelled` |
 /// | `runAutomaticSync`, schedule changed while reading the network (`schedulerGeneration` moved, returns `.finished` without running) | `.cancelled` (the run belongs to a schedule that no longer exists) |
 /// | `runAutomaticSync`, no root/database (`guard let rootURL…` returns `.finished`) | `.notRun(.skipUnconfigured)` |
 /// | `runAutomaticSync`, reading the enabled scopes failed (`.failed(.local)`) | `.localFailure` |

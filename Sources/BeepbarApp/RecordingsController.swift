@@ -1074,7 +1074,7 @@ struct RecordingsListing: Equatable {
         "\(courseCode)-\(academicYear)"
     }
 
-    private func scheduleAcknowledge(_ ids: [String], for key: RecmanCourseKey, opening: Int? = nil, preserveHistoryProblem: Bool = false) {
+    private func scheduleAcknowledge(_ ids: [String], for key: RecmanCourseKey, opening: Int? = nil) {
         guard let owner = sessionOwner ?? ownerUserID(), !ids.isEmpty else { return }
         let pending = pendingAcknowledgementIDs[key] ?? []
         let added = ids.filter { !(listings[key]?.seenIDs?.contains($0) ?? false) && !pending.contains($0) }
@@ -1112,7 +1112,7 @@ struct RecordingsListing: Equatable {
                 if self.listings[key]?.seenIDs != nil { self.listings[key]?.seenIDs?.formUnion(added) }
                 // The unseen count of the saved summary (menu line) changes with the dots.
                 if self.listings[key]?.seenIDs != nil { self.refreshWatchSummary(for: key, persist: true) }
-                if !preserveHistoryProblem, self.listings[key]?.historyReadFailed != true, self.listings[key]?.problem == .historyUnavailable { self.listings[key]?.problem = nil }
+                if self.listings[key]?.historyReadFailed != true, self.listings[key]?.problem == .historyUnavailable { self.listings[key]?.problem = nil }
             } catch {
                 guard self.isCurrentHistory(history, owner: owner, generation: generation) else { return }
                 self.listings[key]?.problem = .historyUnavailable
@@ -1959,9 +1959,18 @@ struct RecordingsListing: Equatable {
         enqueueProgress(.manual(done: done), for: recording, owner: owner, serial: nil, untickEpoch: untickCounts[identity, default: 0])
     }
 
-    /// One serial operation for the full course listing. Entries publish only after their
-    /// commits; summary and acknowledgement are batched once, avoiding a full-list scan per row.
+    /// One serial operation for the full course listing: one store transaction for every lecture
+    /// (`RecordingsSeenHistory.applyProgress(owner:key:ids:event:)`, issue #208), then one
+    /// publication of the committed entries, one summary and one acknowledgement. Before #208 it
+    /// was a connection, a durable commit and a publication per lecture, and the whole loop held
+    /// the progress chain, so a pause of the lecture playing waited behind N commits.
     /// Capture the history and owner before queueing so a reset cannot redirect these writes.
+    ///
+    /// All or nothing: a failed save leaves every lecture as it was (the store rolls back) and
+    /// shows the history banner; the label still reads what was saved, so clicking again retries
+    /// the whole set. Entries publish only after the commit, through `setEntries`, which writes
+    /// `entries` and `known` once each (each bumps `stateRevision`, which the toolbar's
+    /// `BulkActionCache` relies on, #209).
     func toggleAllDone(_ key: RecmanCourseKey) {
         let recordings = listings[key]?.recordings
         let action = RecordingsPresentation.WatchValues(watchProgress, canEdit: canEditProgress)
@@ -1992,18 +2001,30 @@ struct RecordingsListing: Equatable {
                     self.watchProgress.setPending(false, for: identities, course: key)
                 }
             }
-            var completed: [String] = []
-            var failed = false
-            for recording in recordings {
-                guard self.isCurrentIdentity(history, owner: owner) else { return }
-                let changedDone = await self.commitProgress(.manual(done: done), for: recording, key: key,
-                    owner: owner, history: history, serial: nil,
-                    untickEpoch: self.untickCounts[RecordingsStudyState.identity(recording), default: 0],
-                    deferCourseUpdate: true)
-                guard let changedDone else { failed = true; break }
-                if changedDone { completed.append(recording.id) }
-            }
             guard self.isCurrentIdentity(history, owner: owner) else { return }
+            let results: [RecordingProgressResult]
+            do {
+                results = try await history.applyProgress(owner: owner, key: key, ids: recordings.map(\.id), event: .manual(done: done))
+            } catch is CancellationError {
+                return
+            } catch {
+                guard self.isCurrentIdentity(history, owner: owner) else { return }
+                self.listings[key]?.problem = .historyUnavailable
+                self.log.error("Couldn't save the course's done marks")
+                return
+            }
+            // Same second check as `commitProgress`: the WeBeep account can change without a
+            // reset, and then only this keeps the old account's entries off the screen.
+            guard self.isCurrentIdentity(history, owner: owner), results.count == recordings.count else { return }
+            var committed: [String: RecordingWatchEntry] = [:]
+            var completed: [String] = []
+            for (recording, result) in zip(recordings, results) {
+                let identity = RecordingsStudyState.identity(recording)
+                if let entry = result.entry { committed[identity] = entry }
+                if result.changed, result.entry?.isCompleted == true { completed.append(recording.id) }
+            }
+            self.watchProgress.setEntries(committed, for: recordings.map(RecordingsStudyState.identity))
+            if results.contains(where: \.changed) { self.historyRevision[key, default: 0] += 1 }
             self.refreshWatchSummary(for: key, persist: true)
             // A refresh may have evicted the listing meanwhile, and then the summary above can't
             // be recomputed: drop a saved `next` that was just completed, as the per-row path does.
@@ -2011,7 +2032,7 @@ struct RecordingsListing: Equatable {
             for recording in recordings where completedIDs.contains(recording.id) {
                 self.clearSavedNextIfCompleted(recording, in: key)
             }
-            self.scheduleAcknowledge(completed, for: key, preserveHistoryProblem: failed)
+            self.scheduleAcknowledge(completed, for: key)
         }
     }
 
@@ -2044,7 +2065,7 @@ struct RecordingsListing: Equatable {
     /// - Other errors: a checkpoint is kept for the next one, logged, no banner; a tick shows the
     ///   history banner and the row keeps its saved value.
     @discardableResult
-    private func commitProgress(_ event: RecordingProgressEvent, for recording: RecmanRecording, key: RecmanCourseKey, owner: Int, history: RecordingsSeenHistory, serial: Int?, untickEpoch: Int, deferCourseUpdate: Bool = false) async -> Bool? {
+    private func commitProgress(_ event: RecordingProgressEvent, for recording: RecmanRecording, key: RecmanCourseKey, owner: Int, history: RecordingsSeenHistory, serial: Int?, untickEpoch: Int) async -> Bool? {
         let identity = RecordingsStudyState.identity(recording)
         let isManual = if case .manual = event { true } else { false }
         guard isCurrentIdentity(history, owner: owner) else { return nil }
@@ -2052,12 +2073,12 @@ struct RecordingsListing: Equatable {
         do {
             result = try await history.applyProgress(owner: owner, key: key, id: recording.id, event: event)
         } catch is CancellationError {
-            if isManual, !deferCourseUpdate, isCurrentIdentity(history, owner: owner) { watchProgress.setPending(false, for: identity) }
+            if isManual, isCurrentIdentity(history, owner: owner) { watchProgress.setPending(false, for: identity) }
             return nil
         } catch {
             guard isCurrentIdentity(history, owner: owner) else { return nil }
             if isManual {
-                if !deferCourseUpdate { watchProgress.setPending(false, for: identity) }
+                watchProgress.setPending(false, for: identity)
                 listings[key]?.problem = .historyUnavailable
                 log.error("Couldn't save a lecture's done mark")
             } else if let serial {
@@ -2080,14 +2101,14 @@ struct RecordingsListing: Equatable {
         // no Polimi session was saved, and then only this check keeps the old account's entry off
         // the screen.
         guard isCurrentIdentity(history, owner: owner) else { return nil }
-        if isManual && !deferCourseUpdate { watchProgress.setPending(false, for: identity) }
+        if isManual { watchProgress.setPending(false, for: identity) }
         // An ended session's position now lives in the entry (or never will, if the save failed
         // and is waiting for a retry): the live value goes unless the lecture is playing again.
         if case .checkpoint(_, true) = event, sessions[recording.id] == nil { watchProgress.setLive(nil, for: identity) }
         let published = watchProgress.setEntry(result.entry, for: identity)
         if result.changed { historyRevision[key, default: 0] += 1 }
-        if !deferCourseUpdate && (result.changed || published) { refreshWatchSummary(for: key, persist: true) }
-        if !deferCourseUpdate, result.changed, result.entry?.isCompleted == true {
+        if result.changed || published { refreshWatchSummary(for: key, persist: true) }
+        if result.changed, result.entry?.isCompleted == true {
             clearSavedNextIfCompleted(recording, in: key)
             scheduleAcknowledge([recording.id], for: key)
         }

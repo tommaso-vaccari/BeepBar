@@ -1,4 +1,6 @@
 import AppKit
+import Combine
+import CSQLite
 import Foundation
 import Testing
 import BeepbarCore
@@ -149,6 +151,18 @@ struct RecordingsWatchProgressTests {
         return try store.seenAndProgress(owner: owner, key: course, ids: [id], establishBaseline: false, legacy: .init(ids: [], baselines: [])).progress[id]
     }
 
+    /// Runs raw SQL on the controller's current history file through a separate connection: a
+    /// trigger there makes the real database refuse one row, as a damaged file would.
+    private func executeSQL(_ sql: String) throws {
+        let namespace = defaults.string(forKey: RecordingsController.historyNamespaceKey).flatMap(UUID.init(uuidString:))
+        let name = namespace.map { "recordings-seen-v2-\($0.uuidString).sqlite" } ?? RecordingsSeenStore.fileName
+        var db: OpaquePointer?
+        defer { sqlite3_close(db) }
+        guard sqlite3_open(folder.appendingPathComponent(name).path, &db) == SQLITE_OK, sqlite3_exec(db, sql, nil, nil, nil) == SQLITE_OK else {
+            throw CocoaError(.fileWriteUnknown)
+        }
+    }
+
     private var summaryWrites: Int { defaults.writes.filter { $0 == RecordingsController.watchSummaryKey }.count }
 
     private func cleanUp() {
@@ -204,17 +218,17 @@ struct RecordingsWatchProgressTests {
 
     /// Until commit, every checkbox keeps its old value and stays locked for the whole batch.
     /// Repeated bulk clicks and individual edits cannot enqueue extra writes. Page closing
-    /// preserves this explicit action. Mutations: optimistic entries or clearing pending early.
+    /// preserves this explicit action. The batch is one store call (#208), held here before it
+    /// commits. Mutations: optimistic entries or clearing pending early.
     @Test func bulkPendingValuesStayCommittedAcrossPageClose() async throws {
         defer { cleanUp() }
         let controller = await listedController()
         let gate = FakeRecmanBrowser.Gate()
         gates.before = gate
-        gates.holdCall = 2
         controller.toggleAllDone(course)
-        await settle("second bulk write held") { gate.isWaiting }
-        #expect(gates.calls == 2)
-        #expect(controller.watchProgress.entries.values.filter(\.isCompleted).count == 1)
+        await settle("bulk write held") { gate.isWaiting }
+        #expect(gates.calls == 1)
+        #expect(controller.watchProgress.entries.values.filter(\.isCompleted).isEmpty, "nothing shown before the commit")
         #expect(controller.watchProgress.pending == Set([identity("a"), identity("b")]))
         #expect(!bulkAction(controller).enabled)
         controller.toggleAllDone(course)
@@ -222,7 +236,7 @@ struct RecordingsWatchProgressTests {
         controller.pageDisappeared()
         gate.release()
         await controller.settleWatchProgress()
-        #expect(gates.calls == 2, "one chain, no duplicate bulk or per-row write")
+        #expect(gates.calls == 1, "one chain, no duplicate bulk or per-row write")
         #expect(controller.watchProgress.pending.isEmpty)
         #expect(controller.watchProgress.pendingCourses.isEmpty)
         #expect(controller.watchProgress.isCompleted(recording("a")))
@@ -271,63 +285,96 @@ struct RecordingsWatchProgressTests {
         controller.turnOff()
     }
 
-    /// Partial commits remain real, and their acknowledgement succeeding afterwards cannot erase
-    /// the banner of the save that failed later in the same batch. Two new rows guarantee that a
-    /// new row is among the committed ones whatever the listing order, so an acknowledgement
-    /// really runs; its gate makes it run with storage healthy again, after the failure.
-    /// Mutation: drop `preserveHistoryProblem` (the acknowledgement clears the banner).
-    @Test func bulkPartialFailureKeepsCommittedRowsAndError() async throws {
+    /// A save that fails on one lecture midway saves none (#208: one transaction for the whole
+    /// course): no row is done, no "new" dot clears, the history banner shows, the controls are
+    /// released and the label still offers completion, so clicking again redoes the whole set.
+    /// The failure comes from the real database (a trigger refusing the last row's insert),
+    /// after the first rows were written inside the transaction.
+    /// Mutations: commit per lecture (the rows before the failure stay done); publish the
+    /// requested values (rows shown done); acknowledge before the commit (dots cleared).
+    @Test func bulkFailureMidwaySavesNothing() async throws {
         defer { cleanUp() }
         let controller = await listedController(["a"])
         browser.listResults[course.courseCode] = .success([recording("a"), recording("b", daysAgo: 0), recording("c", daysAgo: 0)])
         controller.refresh([course], selected: course, force: true)
         await settle("new rows listed") { controller.newCount(for: course) == 2 }
-        let gate = FakeRecmanBrowser.Gate()
-        gates.before = gate
-        gates.holdCall = 3
-        let acknowledge = FakeRecmanBrowser.Gate()
-        gates.acknowledge = acknowledge
+        let ids = try #require(controller.listing(for: course)?.recordings?.map(\.id))
+        let last = try #require(ids.last)
+        try executeSQL("CREATE TRIGGER refuse BEFORE INSERT ON progress WHEN NEW.id = '\(last)' BEGIN SELECT RAISE(ABORT, 'refused'); END")
+        let before = probe.current.writeTransactions
         controller.toggleAllDone(course)
-        await settle("third bulk save held") { gate.isWaiting }
-        fault.isFailing = true
-        gate.release()
         await controller.settleWatchProgress()
-        await settle("acknowledgement queued") { acknowledge.isWaiting }
-        fault.isFailing = false
-        acknowledge.release()
-        await settle("committed new row acknowledged") { controller.newCount(for: course) == 1 }
         await drainTasks()
-        #expect(controller.watchProgress.entries.values.filter(\.isCompleted).count == 2)
-        #expect(controller.watchSummaries[course]?.done == 2)
+        #expect(probe.current.writeTransactions == before + 1, "the failed batch was one transaction")
+        for id in ids { #expect(try storedEntry(id) == nil, "\(id) rolled back") }
+        #expect(controller.watchProgress.entries.values.filter(\.isCompleted).isEmpty)
+        #expect(controller.newCount(for: course) == 2)
         #expect(controller.listing(for: course)?.problem == .historyUnavailable)
         #expect(controller.watchProgress.pending.isEmpty)
+        #expect(controller.watchProgress.pendingCourses.isEmpty)
+        let action = bulkAction(controller)
+        #expect(action.enabled)
+        #expect(action.label.english == "Mark all as completed")
+
+        try executeSQL("DROP TRIGGER refuse")
+        controller.toggleAllDone(course)
+        await controller.settleWatchProgress()
+        await settle("retry acknowledged") { controller.newCount(for: course) == 0 }
+        #expect(controller.watchSummaries[course]?.done == 3)
         controller.turnOff()
     }
 
-    /// A bulk untick that fails midway leaves the first row unticked and the second still done,
-    /// so the label follows the saved state back to "Mark all as completed", as the spec says.
-    /// Guards a label stuck on "unseen" (or computed from what was requested) after a failure.
+    /// A bulk untick that fails midway unticks nothing (#208), so the label follows the saved
+    /// state and still reads "Mark all as unseen", and clicking again retries.
+    /// Guards a label computed from what was requested, or rows left half unticked.
+    /// Mutation: commit per lecture (the first row stays unticked, the label flips).
     @Test func bulkUntickFailureLabelFollowsSavedState() async throws {
         defer { cleanUp() }
         let controller = await listedController()
         controller.toggleAllDone(course)
         await controller.settleWatchProgress()
         #expect(bulkAction(controller).allDone)
-        let gate = FakeRecmanBrowser.Gate()
-        gates.before = gate
-        gates.holdCall = gates.calls + 2
+        let ids = try #require(controller.listing(for: course)?.recordings?.map(\.id))
+        let last = try #require(ids.last)
+        try executeSQL("CREATE TRIGGER refuse BEFORE UPDATE ON progress WHEN NEW.id = '\(last)' BEGIN SELECT RAISE(ABORT, 'refused'); END")
         controller.toggleAllDone(course)
-        await settle("second untick held") { gate.isWaiting }
-        fault.isFailing = true
-        gate.release()
         await controller.settleWatchProgress()
-        fault.isFailing = false
-        #expect(controller.watchProgress.entries.values.filter(\.isCompleted).count == 1)
+        for id in ids { #expect(try storedEntry(id)?.completed == .manual, "\(id) still done") }
+        #expect(controller.watchProgress.entries.values.filter(\.isCompleted).count == 2)
         #expect(controller.listing(for: course)?.problem == .historyUnavailable)
         let action = bulkAction(controller)
-        #expect(!action.allDone)
+        #expect(action.allDone)
         #expect(action.enabled)
-        #expect(action.label.english == "Mark all as completed")
+        #expect(action.label.english == "Mark all as unseen")
+        try executeSQL("DROP TRIGGER refuse")
+        controller.toggleAllDone(course)
+        await controller.settleWatchProgress()
+        #expect(!bulkAction(controller).allDone)
+        controller.turnOff()
+    }
+
+    /// "Mark all as completed" on a long course is one store transaction and a bounded number of
+    /// publications, not one of each per lecture (#208, PERF-005), and still bumps the model's
+    /// `stateRevision` the toolbar cache relies on (#209).
+    /// Mutations: call the single-recording `applyProgress` per lecture (transactions == N);
+    /// `setEntry` per lecture (publications grow with N).
+    @Test func bulkCompletionOfALongCourseIsOneTransaction() async throws {
+        defer { cleanUp() }
+        let ids = (1...60).map { "r\($0)" }
+        let controller = await listedController(ids)
+        let transactions = probe.current.writeTransactions
+        let revision = controller.watchProgress.stateRevision
+        var publications = 0
+        let subscription = controller.watchProgress.objectWillChange.sink { publications += 1 }
+        defer { subscription.cancel() }
+        controller.toggleAllDone(course)
+        publications = 0
+        await controller.settleWatchProgress()
+        #expect(probe.current.writeTransactions == transactions + 1)
+        #expect(publications <= 6, "publications: \(publications)")
+        #expect(controller.watchProgress.stateRevision != revision)
+        #expect(controller.watchSummaries[course]?.done == ids.count)
+        for id in [ids[0], ids[29], ids[59]] { #expect(try storedEntry(id)?.completed == .manual) }
         controller.turnOff()
     }
 

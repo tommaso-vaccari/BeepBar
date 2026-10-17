@@ -303,6 +303,29 @@ import BeepbarCore
             try await settle { bodies[newest.id] != nil }
             return (key, newest)
         }
+
+        /// The detail pane's list as AppKit sees it (SwiftUI's outline view), not the sidebar's:
+        /// the one right of the 230-point sidebar, once it has at least `rows` rows.
+        @MainActor func detailTable(rows: Int) async throws -> NSTableView {
+            func tables(_ view: NSView) -> [NSTableView] { ((view as? NSTableView).map { [$0] } ?? []) + view.subviews.flatMap(tables) }
+            func detail() -> NSTableView? { tables(host).first { $0.convert($0.bounds, to: nil).minX > 200 && $0.numberOfRows >= rows } }
+            try await settle { detail() != nil }
+            return try #require(detail())
+        }
+
+        /// A right click on `row` of `table`: the menu SwiftUI builds from `contextMenu`.
+        @MainActor func contextMenu(_ table: NSTableView, row: Int) throws -> NSMenu {
+            let rect = table.rect(ofRow: row)
+            let point = table.convert(NSPoint(x: rect.midX, y: rect.midY), to: nil)
+            let event = try #require(NSEvent.mouseEvent(with: .rightMouseDown, location: point, modifierFlags: [], timestamp: 0, windowNumber: window.windowNumber, context: nil, eventNumber: 0, clickCount: 1, pressure: 1))
+            return try #require(table.menu(for: event), "no row menu reached the list")
+        }
+
+        /// Waits (at most 10 s) until the controller has finished the last opening: the fixture's
+        /// browser refuses every link, so it ends with a problem and never reaches a real browser.
+        @MainActor func untilOpeningEnds() async throws {
+            try await settle { recordings.openingRecordingID == nil }
+        }
     }
 
     /// The performance property of principle 6, on the real Recordings page: a tick of the
@@ -329,6 +352,66 @@ import BeepbarCore
         page.recordings.watchProgress.setLive(0.5, for: "2026:000000:not-listed")
         try await page.settle()
         #expect(page.bodies.isEmpty, "a tick of a lecture not in the list re-rendered \(page.bodies.count) row(s)")
+    }
+
+    /// The row menu and the primary action (double click, Return) of the course list reach the
+    /// `List` through `WatchProgressReader`, which wraps it since the progress work (#198): the
+    /// modifier sits on the reader, and SwiftUI must still hand it to the list inside. Driven
+    /// through the real AppKit list: a right click builds the menu with the course list's items,
+    /// its "Apri nel browser" opens the clicked lecture, and the double action and Return on the
+    /// selected row play it (both start an opening of that lecture: `openingRecordingID`).
+    /// Mutation: drop `primaryAction` (or the whole `contextMenu`) and the opening never starts
+    /// or no menu is built; key `byID` wrongly and another lecture opens.
+    @Test(.timeLimit(.minutes(1))) func courseListMenuAndPrimaryActionReachTheList() async throws {
+        let page = try await HostedPage()
+        defer { page.close() }
+        let (key, _) = try await page.loadedCourse()
+        let recordings = page.recordings
+        // Row 0 is the newest week's header; row 2 is the week's second-newest lecture.
+        let ordered = try #require(recordings.listings[key]?.recordings).sorted { $0.recordedAt > $1.recordedAt }
+        let expected = ordered[1].id
+        let table = try await page.detailTable(rows: 3)
+
+        let menu = try page.contextMenu(table, row: 2)
+        #expect(menu.items.map(\.title) == ["Apri nel browser", "Copia link", "Aggiungi alla watchlist"])
+        menu.performActionForItem(at: 0)
+        #expect(recordings.openingRecordingID == expected, "\"Apri nel browser\" opened \(recordings.openingRecordingID ?? "nothing")")
+        try await page.untilOpeningEnds()
+
+        table.selectRowIndexes([2], byExtendingSelection: false)
+        try await page.settle()
+        #expect(table.sendAction(table.doubleAction, to: table.target))
+        #expect(recordings.openingRecordingID == expected, "a double click played \(recordings.openingRecordingID ?? "nothing")")
+        try await page.untilOpeningEnds()
+
+        page.window.makeFirstResponder(table)
+        let returnKey = try #require(NSEvent.keyEvent(with: .keyDown, location: .zero, modifierFlags: [], timestamp: 0, windowNumber: page.window.windowNumber, context: nil, characters: "\r", charactersIgnoringModifiers: "\r", isARepeat: false, keyCode: 36))
+        table.keyDown(with: returnKey)
+        #expect(recordings.openingRecordingID == expected, "Return played \(recordings.openingRecordingID ?? "nothing")")
+        try await page.untilOpeningEnds()
+    }
+
+    /// The same for the Watchlist, whose list is wrapped the same way: the menu has the
+    /// Watchlist's items and the double action plays the bookmark. Mutation: drop the
+    /// Watchlist's `primaryAction` or `contextMenu` and this fails.
+    @Test(.timeLimit(.minutes(1))) func watchlistMenuAndPrimaryActionReachTheList() async throws {
+        let page = try await HostedPage()
+        defer { page.close() }
+        let (_, newest) = try await page.loadedCourse()
+        let recordings = page.recordings
+        recordings.toggleWatchlist(newest, courseName: "Synthetic")
+        recordings.selectDestination(.watchlist)
+        try await page.settle { page.rows.contains { $0.courseName == "Synthetic" } }
+        let table = try await page.detailTable(rows: 1)
+
+        let menu = try page.contextMenu(table, row: 0)
+        #expect(menu.items.map(\.title) == ["Rimuovi dalla watchlist", "Apri nel browser"])
+
+        table.selectRowIndexes([0], byExtendingSelection: false)
+        try await page.settle()
+        #expect(table.sendAction(table.doubleAction, to: table.target))
+        #expect(recordings.openingRecordingID == newest.id, "a double click played \(recordings.openingRecordingID ?? "nothing")")
+        try await page.untilOpeningEnds()
     }
 
     /// The course header shows the model's live summary after the archive line, and nothing

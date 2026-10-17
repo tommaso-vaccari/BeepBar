@@ -729,7 +729,9 @@ private struct CourseRecordings: View {
         }
         .listStyle(.inset)
         .scrollContentBackground(.hidden)
-        // Double click and Return open the player, the way Finder opens a file.
+        // Double click and Return open the player, the way Finder opens a file. The modifier
+        // sits on the reader, not on the `List` inside it; SwiftUI still hands it to the list
+        // (`courseListMenuAndPrimaryActionReachTheList` drives the real AppKit list, #198).
         .contextMenu(forSelectionType: String.self) { ids in
             if let recording = ids.first.flatMap({ byID[$0] }) {
                 // Really the browser: Play (double click, Return, the row's button) is BeepBar's
@@ -838,6 +840,8 @@ private struct WatchlistRecordings: View {
                     }
                 }
                 .listStyle(.inset).scrollContentBackground(.hidden)
+                // On the reader like the course list's; pinned by
+                // `watchlistMenuAndPrimaryActionReachTheList` (#198).
                 .contextMenu(forSelectionType: String.self) { ids in
                     if let bookmark = shown.first(where: { ids.contains($0.id) }) {
                         Button(tr("Rimuovi dalla watchlist", "Remove from watchlist")) { recordings.toggleWatchlist(bookmark.recording, courseName: bookmark.courseName) }

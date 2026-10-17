@@ -95,7 +95,7 @@ xcodebuild -project Beepbar.xcodeproj -target Beepbar -configuration Release bui
 scripts/create-dmg.sh build/Release/Beepbar.app build/Beepbar.dmg
 ```
 
-CI runs the tests and builds an ad-hoc-signed arm64 DMG.
+CI runs the tests and the Release build on every PR and push; a push to `main` that changes the app also builds the ad-hoc-signed arm64 DMG and publishes it as a release.
 
 ## Contributing
 

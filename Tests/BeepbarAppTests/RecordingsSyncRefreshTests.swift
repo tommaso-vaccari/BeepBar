@@ -463,6 +463,32 @@ struct RecordingsSyncRefreshTests {
         #expect(sessionFileNumber() == file)
     }
 
+    /// After a relaunch, an unchanged listing writes no summary and publishes no changed one
+    /// (#189). The saved `next` reads back without its date, kind and size, so a raw comparison
+    /// with the fresh summary rewrote and republished every course with an unfinished lecture on
+    /// each launch. The only push allowed is the lazy read of the saved summaries, identical to
+    /// what the menu seeded itself with. Unlike `aSecondIdenticalRefreshWritesNothing`, the
+    /// second refresh runs in a new controller that only has the decoded copy.
+    /// Mutation: compare raw values in `storeWatchSummary` (one write, a second push).
+    @Test func anUnchangedListingAfterARelaunchWritesAndPublishesNothing() async throws {
+        defer { cleanUp() }
+        let first = try launched()
+        list(["a", "b"])
+        _ = await first.refreshForSync([course], force: true)
+        await first.settleSessionFile()
+        let saved = try #require(RecordingsController.storedWatchSummaries(in: defaults, owner: 42))
+        #expect(saved[course]?.next?.id == "a", "the fixture needs a saved next lecture")
+
+        let relaunched = makeController()
+        var pushes: [[RecmanCourseKey: CourseWatchSummary]] = []
+        relaunched.onWatchSummaryChange = { pushes.append($0) }
+        defaults.resetWrites()
+        #expect(await relaunched.refreshForSync([course], force: true) == .refreshed(newlyPublished: 0, failedKeys: 0))
+        await relaunched.settleSessionFile()
+        #expect(summaryWrites == 0, "wrote \(defaults.writes)")
+        #expect(pushes == [saved], "pushed \(pushes.count) summaries")
+    }
+
     /// Non-force respects the 300 s freshness (zero browser calls); force and an expired
     /// window list again. Guards "Sincronizza ora" being ignored, or automatic runs relisting
     /// every time. Mutations: `force` ignored in `refreshForSync`'s `needsLoad`; `true` for it.

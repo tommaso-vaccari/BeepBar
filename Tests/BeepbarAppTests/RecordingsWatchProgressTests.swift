@@ -770,7 +770,9 @@ struct RecordingsWatchProgressTests {
         relaunched.refresh([course], selected: course)
         await settle("listed after relaunch") { relaunched.listing(for: course)?.recordings != nil }
         #expect(relaunched.watchProgress.fraction(for: recording("a")) == 0.5)
-        #expect(relaunched.watchSummaries[course] == summary)
+        // The saved form: an unchanged listing keeps the decoded copy instead of rewriting it
+        // (#189), so the relaunched `next` lacks the date, kind and size.
+        #expect(relaunched.watchSummaries[course].map { StoredCourseWatchSummary($0).persisted } == summary.map { StoredCourseWatchSummary($0).persisted })
         let saved = try #require(RecordingsController.storedWatchSummaries(in: defaults, owner: 42)?[course])
         #expect(saved.done == summary?.done && saved.total == summary?.total)
         #expect(saved.remainingMinutes == summary?.remainingMinutes && saved.unknownDurationCount == summary?.unknownDurationCount)

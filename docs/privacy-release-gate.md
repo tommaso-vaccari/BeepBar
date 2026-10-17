@@ -29,7 +29,7 @@ Status: **OPEN; draft remediation, not a GDPR compliance declaration.** Baseline
 | C04 updates | Correct README opt-in contradiction; disclose default-on eight-hour checks | Verify runtime request/redirect recipients, Sparkle system-profile settings and distribution-provider retention |
 | C05 recordings/email | Explain automatic email use and university/Webex connections | Full identity-provider chain, necessary cookie scope/lifetime, provider roles |
 | C06 study data | Explicit preservation disclosure and cleanup guidance | Per-account erasure decision; complete current/legacy persistence inventory |
-| C07 diagnostics | Existing log redaction retained | Complete public-field/error/URL audit and synthetic packet capture; no absence-of-leak claim |
+| C07 diagnostics | Static log audit; browser traces omit paths/query/userinfo/fragments, login-item errors omit free text | Synthetic runtime packet capture and OS/provider diagnostics verification; no absence-of-leak claim |
 | C08 telemetry | Language/settings omitted; opt-out effects accurately described | Default-on basis/ePrivacy, provider evidence and historical signals |
 | C09 operations | Rights/incident runbook and contact | Owner approval, mailbox/security arrangements, dry run, proportional ROPA/DPIA/DPO assessment |
 
@@ -37,7 +37,7 @@ Status: **OPEN; draft remediation, not a GDPR compliance declaration.** Baseline
 
 - Focused regressions, full `swift test`, Release Xcode build, independent review, green PR CI on the final SHA.
 - Synthetic runtime network trace: first launch before any choice; disabled telemetry; updates; login, profile lookup and Webex; opt-out in flight; logout/relaunch and deletion errors. Do not use real accounts or transmit production telemetry.
-- Inventory current and legacy preferences, SQLite/WAL/SHM, course-list snapshot, session/temp files, logs, WebKit/URLSession storage, notifications, Now Playing, clipboard and crash diagnostics. Record retention and erasure for each.
+- Verify the static [persistence inventory](privacy-operations.md#persistence-inventory) against the final packaged app, including OS/provider-managed retention.
 - Attach provider evidence, lawful-basis/ePrivacy conclusions, owner decisions and approved notice. Publish the website notice only as part of the authorized release, in its separate repository.
 - Reconcile wiki snapshots with final source/binary. No merge, release, installed-app change, production signal, provider message or real-data inspection was performed by this task.
 

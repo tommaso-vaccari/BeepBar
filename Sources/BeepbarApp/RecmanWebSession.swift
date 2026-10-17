@@ -1125,17 +1125,9 @@ struct RecmanStreamFailure: Error {
         traceHandler?(line)
     }
 
-    /// Host and path only: Polimi's query strings carry single sign-on tickets, and Java and
-    /// Shibboleth pages can put the session id in the path itself (`;jsessionid=…`), so each
-    /// path segment is cut at its first `;` too. Webex puts the recording's uuid in the path of
-    /// its playback page (#148): 32-hex runs are masked, so a trace never says what was watched.
     static func redacted(_ url: URL?) -> String {
         guard let url, let components = URLComponents(url: url, resolvingAgainstBaseURL: false) else { return "(none)" }
-        let path = components.path.split(separator: "/", omittingEmptySubsequences: false)
-            .map { $0.split(separator: ";", maxSplits: 1, omittingEmptySubsequences: false).first.map(String.init) ?? "" }
-            .joined(separator: "/")
-            .replacingOccurrences(of: "[0-9A-Fa-f]{32}", with: "<id>", options: .regularExpression)
-        return "\(components.scheme ?? "?")://\(components.host ?? "?")\(path)"
+        return "\(components.scheme ?? "?")://\(components.host ?? "?")"
     }
 }
 

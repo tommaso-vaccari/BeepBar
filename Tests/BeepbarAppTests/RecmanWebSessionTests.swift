@@ -103,16 +103,16 @@ struct RecmanWebSessionTests {
         #expect(session.lastScriptCall == nil)
     }
 
-    /// Only host and path reach the trace: Polimi's query strings carry sign-on tickets.
     @Test func tracesNeverCarryTheQuery() {
-        let url = URL(string: "https://onlineservices.polimi.it/recman_frontend/?ticket=ST-secret#frag")!
-        #expect(RecmanWebSession.redacted(url) == "https://onlineservices.polimi.it/recman_frontend/")
+        for address in [
+            "https://user:password@onlineservices.polimi.it/recman_frontend/?ticket=ST-secret#frag",
+            "https://onlineservices.polimi.it/aunicalogin.jsp;jsessionid=SECRET",
+            "https://onlineservices.polimi.it/mario.rossi@polimi.it/12345678-1234-1234-1234-123456789abc",
+            "https://onlineservices.polimi.it/arbitrary-private-course-title/0123456789abcdef0123456789abcdef",
+        ] {
+            #expect(RecmanWebSession.redacted(URL(string: address)) == "https://onlineservices.polimi.it")
+        }
         #expect(RecmanWebSession.redacted(nil) == "(none)")
-        // Java and Shibboleth pages put the session id in the path.
-        let pathSession = URL(string: "https://aunicalogin.polimi.it/aunicalogin/aunicalogin.jsp;jsessionid=SECRET?x=1")!
-        #expect(RecmanWebSession.redacted(pathSession) == "https://aunicalogin.polimi.it/aunicalogin/aunicalogin.jsp")
-        let middle = URL(string: "https://shibidp.polimi.it/idp/profile;jsessionid=SECRET/SAML2/Redirect/SSO")!
-        #expect(RecmanWebSession.redacted(middle) == "https://shibidp.polimi.it/idp/profile/SAML2/Redirect/SSO")
     }
 
     /// ⌘A, ⌘C, ⌘V, ⌘X and undo/redo work in the sign-in page with no Edit menu around: the web

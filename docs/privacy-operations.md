@@ -25,3 +25,26 @@ Assess GDPR Articles 33–34: notify the competent authority within 72 hours of 
 ## Owner sign-off
 
 Record treatment purposes/roles/bases, retention and recipients, provider terms/security/transfer evidence, access to the mailbox, deletion/export test results and incident contacts. Assess proportional Article 30 records, DPIA under Article 35 and DPO under Article 37 against the actual operations; a small user count is not a blanket exemption. Do not mark the release gate closed from passing unit tests alone.
+
+## Persistence inventory
+
+Static source inspection on the remediation branch; runtime and OS-managed retention still require verification.
+
+| Store | Contents and lifetime | Erasure |
+| --- | --- | --- |
+| `credential.token`, `.credential-*.tmp` | University token; 0600 files in restricted directory; no independent TTL | Disconnect attempts primary and all crash temporaries; failure keeps account connected |
+| `recordings-session.plist`, `.recordings-session-*.tmp` | Eligible Polimi/Webex cookies and optional email; no independent inactivity TTL | Disable/disconnect attempts all files; persistent failure warning/retry; replacement removes old temporaries |
+| `course-list.json` | Course list, up to 30 days | Startup expiry pruning and disconnect |
+| `sync.sqlite`, WAL/SHM | Root, courses/modules/files, hashes, revisions, journal and conflicts; no TTL | Remains after disconnect; whole-app reset after preserving materials |
+| `recordings-seen-v2*.sqlite`, WAL/SHM | Account/course/recording IDs and viewing state | Namespace invalidated then removed on reset; failed removal retried on next use |
+| Legacy seen defaults | Acknowledged/baselined entries pending migration | Removed after successful migration or reset |
+| Resume/summary/email opt-out defaults | Resume positions (cap 200), playback summary, per-session email choice | Identity/session reset |
+| `recordings-study.v1.<owner>` defaults | Per-account watchlist/queue; no TTL | Intentionally survives logout/disable; whole-app reset currently required |
+| Preferences/bookmarks/last-sync defaults | Settings, selected root/account state and sync summaries | Some cleared on disconnect; whole-app reset removes remaining preferences |
+| Monthly telemetry identity/defaults | Random UUID/month, daily attempt and choice | Rotation; opt-out removes UUID; server history unaffected |
+| Downloaded materials, backups and conflict copies | User-controlled files under selected root; no automatic retention limit | User-managed; preserve before app reset |
+| WebKit and URLSession | Browser cookies use nonpersistent stores; API/download/resolver use ephemeral sessions | Browser/session close; explicit saved session above remains separate |
+| Logs, notifications, Now Playing, clipboard, OS crash diagnostics | Operational errors, displayed titles/links and system-managed diagnostics | OS/user-controlled; clipboard may be retained by other apps; no guaranteed OS purge by logout |
+| Sparkle/provider storage and support email | Update metadata, provider analytics and voluntary support messages | Provider evidence and approved support policy still required |
+
+Browser log formatting now omits all path segments, query, userinfo and fragment, including email, UUID and arbitrary course-title paths. Login-item failure logs contain numeric error codes instead of arbitrary error descriptions. Static inspection cannot prove the absence of OS-level diagnostic data or substitute for the required synthetic runtime trace.

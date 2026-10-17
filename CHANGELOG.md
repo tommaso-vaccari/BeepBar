@@ -4,6 +4,7 @@
 
 ### Privacy
 
+- Browser diagnostic logs omit URL paths and login-item failures omit free-text errors.
 - Telemetry no longer sends language or settings. Settings explains stored data and external connections, with a privacy contact and a retry for failed recording-session deletion.
 
 ### New

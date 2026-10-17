@@ -5,6 +5,14 @@ import FoundationNetworking
 import Testing
 @testable import BeepbarCore
 
+/// Whether the volume holding the fixtures' temporary folders ignores case, the only place where
+/// renaming "Course 1" to "course 1" leaves "Course 1" reachable. The case-rename tests need it and
+/// are reported as skipped elsewhere instead of passing with no assertion (#220).
+private let temporaryVolumeIgnoresCase: Bool = {
+    let values = try? FileManager.default.temporaryDirectory.resourceValues(forKeys: [.volumeSupportsCaseSensitiveNamesKey])
+    return values?.volumeSupportsCaseSensitiveNames == false
+}()
+
 @Suite(.serialized) struct SyncCoordinatorEndToEndTests {
     @Test(arguments: [false, true])
     func directorySyncFailureRetainsRemoteMoveJournalAndStopsPlanning(_ swap: Bool) async throws {
@@ -1522,7 +1530,7 @@ import Testing
         if !symlink { #expect(fixture.contents("Course 1/Lezioni") == "user file") }
     }
 
-    @Test(arguments: ["automatic", "manual", "reupload", "missing"])
+    @Test(.enabled(if: temporaryVolumeIgnoresCase), arguments: ["automatic", "manual", "reupload", "missing"])
     func aCaseRenamedParentStillAllowsRemoteFileMoves(_ mode: String) async throws {
         let fixture = try await Fixture()
         defer { fixture.remove() }
@@ -1533,7 +1541,7 @@ import Testing
         if mode == "manual" { try fixture.write("my notes", to: "Course 1/Lezioni/0.txt") }
         if mode == "missing" { try FileManager.default.removeItem(at: fixture.root.appending(path: "Course 1/Lezioni/0.txt")) }
         try FileManager.default.moveItem(at: fixture.root.appending(path: "Course 1"), to: fixture.root.appending(path: "course 1"))
-        guard FileManager.default.fileExists(atPath: fixture.root.appending(path: "Course 1").path) else { return }
+        try #require(FileManager.default.fileExists(atPath: fixture.root.appending(path: "Course 1").path))
         fixture.upstream.resetDownloadCount()
         if mode == "reupload" {
             fixture.upstream.removeFile(course: 1, file: 500)
@@ -1557,12 +1565,12 @@ import Testing
         #expect(try await fixture.changes().isEmpty)
     }
 
-    @Test func aCaseRenamedParentStillAcceptsNewDownloads() async throws {
+    @Test(.enabled(if: temporaryVolumeIgnoresCase)) func aCaseRenamedParentStillAcceptsNewDownloads() async throws {
         let fixture = try await Fixture()
         defer { fixture.remove() }
         _ = try await fixture.synchronize(targets: [fixture.targets[0]])
         try FileManager.default.moveItem(at: fixture.root.appending(path: "Course 1"), to: fixture.root.appending(path: "course 1"))
-        guard FileManager.default.fileExists(atPath: fixture.root.appending(path: "Course 1").path) else { return }
+        try #require(FileManager.default.fileExists(atPath: fixture.root.appending(path: "Course 1").path))
         fixture.upstream.addFile(course: 1, file: 501, filename: "new.txt", value: "new", revision: "1")
         let result = try await fixture.synchronize(targets: [fixture.targets[0]])
         #expect(result.added == 1 && result.failures == 0)

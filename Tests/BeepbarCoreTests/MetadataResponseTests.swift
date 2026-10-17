@@ -97,9 +97,13 @@ import Testing
     }
 
     /// Opt-in probe runs in a fresh Release test process for each advertised body size/ref.
+    /// Without `BEEPBAR_METADATA_PROBE_MIB` it is reported as skipped, and a value that is not a
+    /// size above 1 MiB fails instead of passing with no assertion (#220).
     #if canImport(Darwin)
-    @Test func memoryProbe() async throws {
-        guard let raw = ProcessInfo.processInfo.environment["BEEPBAR_METADATA_PROBE_MIB"], let mib = Int(raw), mib > 1 else { return }
+    @Test(.enabled(if: ProcessInfo.processInfo.environment["BEEPBAR_METADATA_PROBE_MIB"] != nil))
+    func memoryProbe() async throws {
+        let mib = try #require(Int(ProcessInfo.processInfo.environment["BEEPBAR_METADATA_PROBE_MIB"] ?? ""))
+        try #require(mib > 1)
         let fixture = MetadataFixture(total: mib * 1_048_576, cancellationBoundary: 1_048_576 + MetadataFixture.chunkSize)
         let session = fixture.session()
         defer { session.invalidateAndCancel() }

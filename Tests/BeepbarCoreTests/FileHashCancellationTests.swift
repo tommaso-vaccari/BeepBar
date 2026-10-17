@@ -131,8 +131,10 @@ struct FileHashCancellationTests {
         #expect(try await fixture.store.conflictArtifact(at: conflict.incomingPath)?.sha256 == artifact.sha256)
     }
 
-    @Test func releaseCancellationLatency() async throws {
-        guard ProcessInfo.processInfo.environment["BEEPBAR_HASH_CANCEL_REPORT"] != nil else { return }
+    /// On demand only (`BEEPBAR_HASH_CANCEL_REPORT=1`); otherwise reported as skipped rather than
+    /// as a pass with no assertion (#220).
+    @Test(.enabled(if: ProcessInfo.processInfo.environment["BEEPBAR_HASH_CANCEL_REPORT"] != nil))
+    func releaseCancellationLatency() async throws {
         let clock = ContinuousClock()
         for read in Read.allCases {
             let fixture = try await Fixture(read: read)

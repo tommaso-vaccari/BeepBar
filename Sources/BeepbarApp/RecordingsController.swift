@@ -259,6 +259,13 @@ struct RecordingsListing: Equatable {
     /// worker must neither keep the browser alive nor clear a newer worker's running state.
     private var runningRecoveryGeneration: Int?
     private var runningPlayGeneration: Int?
+    /// The Play lookup the worker is running now (`drain`), as its own task, so a newer Play can
+    /// stop it instead of queueing behind it (issue #194): the lookup may sit in the interactive
+    /// Webex sign-in, which waits for the student with no deadline, and a superseded result is
+    /// thrown away anyway (`request == openingRequest`). Cancelling it ends the browser operation
+    /// (`RecmanWebSession.stream`, its sign-in window included) with `CancellationError`, which
+    /// `drain` skips like any superseded request.
+    private var runningPlay: (request: Int, recordingID: String, task: Task<Void, Error>)?
 
     // MARK: Menu bar Play state
 
@@ -985,10 +992,21 @@ struct RecordingsListing: Equatable {
 
     private func open(_ recording: RecmanRecording, _ action: OpenAction) {
         guard isEnabled, access == .ready else { return }
+        // The same lecture's Play is already being looked up and is still the latest click (a
+        // double click on the row's Play): it serves this one too. Re-queueing would restart the
+        // whole lookup after the first one finished, only to throw the first result away (#194).
+        if action == .play, let runningPlay, runningPlay.request == openingRequest, runningPlay.recordingID == recording.id,
+           !queue.contains(where: { if case .recover = $0 { true } else { false } }) {
+            return
+        }
         // A newer click replaces a menu Play: its failure is no longer the menu's.
         menuPlay = nil
         openingRequest += 1
-        if action == .play { playbackIntent += 1 }
+        if action == .play {
+            playbackIntent += 1
+            // A newer Play stops the one being looked up rather than waiting for it (#194).
+            runningPlay?.task.cancel()
+        }
         openingProblem = nil
         openingRecordingID = recording.id
         // The cached path must replace pending openings too, or a slow lookup can later
@@ -1393,7 +1411,23 @@ struct RecordingsListing: Equatable {
                 case .open(let recording, .play, let request):
                     runningPlayGeneration = generation
                     defer { if runningPlayGeneration == generation { runningPlayGeneration = nil } }
-                    try await playNatively(recording, request: request, browser: browser, generation: generation)
+                    // Its own task, so `open` can cancel just this lookup (#194); the worker's
+                    // own cancellation (`invalidate`) still reaches it through the handler.
+                    let lookup = Task { [weak self] in
+                        guard let self else { return }
+                        // Cleared in the same main-actor turn as the player starts (or the
+                        // browser opens), not when `drain` resumes: a Play again clicked in
+                        // between must restart the lecture, not join a lookup that is over.
+                        defer { if self.runningPlay?.request == request { self.runningPlay = nil } }
+                        try await self.playNatively(recording, request: request, browser: browser, generation: generation)
+                    }
+                    runningPlay = (request, recording.id, lookup)
+                    defer { if runningPlay?.request == request { runningPlay = nil } }
+                    try await withTaskCancellationHandler {
+                        try await lookup.value
+                    } onCancel: {
+                        lookup.cancel()
+                    }
                     guard generation == self.generation else { return }
                     // Reached the player or the browser fallback: no longer the menu's to report.
                     if menuPlay?.request == request { menuPlay = nil }
@@ -1561,6 +1595,9 @@ struct RecordingsListing: Equatable {
         // Where the address came from, never the address: with none, a Play that needs a Webex
         // sign-in can only show the message.
         let emailState = Self.emailDiagnosis(confirmedEmail, fromProfile: emailFromProfile)
+        // A newer Play cancelled this one while the address was looked up (#194): no browser
+        // operation for a lecture the student no longer wants.
+        try Task.checkCancellation()
         PlaybackDiagnostics.log.notice("play: start email=\(emailState, privacy: .public)")
         let stream: RecordingStream
         do {

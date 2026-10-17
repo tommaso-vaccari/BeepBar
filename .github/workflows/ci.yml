@@ -59,8 +59,14 @@ jobs:
             .build/repositories
             build/SourcePackages
           key: packages-v1-${{ runner.os }}-${{ runner.arch }}-${{ steps.toolchain.outputs.fingerprint }}-${{ hashFiles('Package.swift', 'Package.resolved', 'Beepbar.xcodeproj/project.pbxproj', 'Beepbar.xcodeproj/project.xcworkspace/xcshareddata/swiftpm/Package.resolved') }}
+      # Tooling tests that need no Swift build (#215, #222): cheap, so they run before `swift test`.
+      # `scripts/recordings-seen-isolated-tests.py` is not here: it builds a temporary Swift package.
       - name: Benchmark comparison tests
         run: python3 scripts/test_benchmark_compare.py
+      - name: UI benchmark driver tests
+        run: python3 scripts/test_ui_benchmark.py
+      - name: Linux test wrapper tests
+        run: bash scripts/test-linux-core-tests.sh
       - name: Swift tests
         run: swift test
       - name: Verify readable release notes

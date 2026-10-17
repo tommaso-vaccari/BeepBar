@@ -2968,6 +2968,44 @@ struct RecordingsControllerTests {
         await reopened.settleSessionFile()
     }
 
+    /// A discarded session whose deletion failed is deleted later: by the next controller (a
+    /// relaunch, with nothing opened) or by the next session read of the same controller, and
+    /// the discard flag is cleared only once the file is gone (#200). Guards the previous
+    /// account's Polimi and Webex cookies and email staying on disk for good after turn-off.
+    /// Mutations: drop `retryObsoleteSessionDeletion()` from `init` (relaunch keeps the file) or
+    /// from `savedCookies` (same controller keeps it); clear the flag on any outcome (the flag
+    /// is gone while the file is still there after the first failure).
+    @Test(arguments: [false, true])
+    func aFailedSessionDeletionIsRetriedLater(relaunch: Bool) async throws {
+        defer { try? FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: folder.path); cleanUp() }
+        let discardedKey = "io.github.tvaccari.beepbar.recordings-session-discarded.v1"
+        try store.save(RecmanSessionCodec.encode([FakeRecmanBrowser.cookie("SSO_LOGIN", value: "obsolete")], ownerUserID: 42, email: "obsolete@mail.polimi.it", now: world.now))
+        defaults.set(true, forKey: RecordingsController.enabledKey)
+        let controller = makeController()
+        try FileManager.default.setAttributes([.posixPermissions: 0o500], ofItemAtPath: folder.path)
+        controller.setEnabled(false)
+        await controller.settleSessionFile()
+        await drainTasks()
+        #expect(try store.load() != nil, "fixture: the first unlink failed")
+        #expect(defaults.bool(forKey: discardedKey), "a failed deletion keeps the flag")
+        try FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: folder.path)
+
+        let next: RecordingsController
+        if relaunch {
+            next = makeController()
+        } else {
+            // The sign-in fails, so no new session replaces the file: only the retry removes it.
+            browser.signInError = RecmanBrowserError.unrecognized
+            next = controller
+            next.setEnabled(true)
+        }
+        await settle("the obsolete file is deleted") { (try? store.load()) == nil }
+        await next.settleSessionFile()
+        await drainTasks()
+        #expect(!defaults.bool(forKey: discardedKey), "a confirmed deletion clears the flag")
+        if !relaunch { next.turnOff() }
+    }
+
     // MARK: Review follow-ups (#148)
 
     /// Closing the Settings window (or leaving the page) while a lecture recovery is running or

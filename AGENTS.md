@@ -154,7 +154,7 @@ Being fast, reactive and nearly free in the background is a product feature. Per
 
   | Moment | Budget |
   |---|---|
-  | Idle, 30 min, window closed | ≈0% CPU, no wakeups attributable to Beepbar, 0 bytes network, 0 disk writes |
+  | Idle, 30 min, window closed | ≈0% CPU, no wakeups attributable to Beepbar, 0 bytes network, 0 disk writes (documented exception: the daily telemetry check-in, at most one request and one preferences write per UTC day; see `docs/performance-plan.md`) |
   | After 10 consecutive syncs, or after closing the window | memory back to its previous level (±2 MB), no leftover tasks or timers |
   | Launch | icon in ≤ 200 ms; main thread never blocked > 16 ms in any flow |
   | Menu | `menuNeedsUpdate` ≤ 1 ms; icon updates in the same main-actor turn as the state |

@@ -63,7 +63,7 @@ I budget sono obiettivi provvisori, non risultati già raggiunti. Una baseline n
 
 | Momento | Criterio |
 |---|---|
-| Riposo per 30 minuti | CPU prossima a zero, nessun risveglio/lavoro attribuibile senza scopo, zero rete e scritture fuori dai controlli/operazioni dovuti |
+| Riposo per 30 minuti | CPU prossima a zero, nessun risveglio/lavoro attribuibile senza scopo, zero rete e scritture fuori dai controlli/operazioni dovuti e dall’invio giornaliero della telemetria (eccezione sotto) |
 | Dopo 10 sync o chiusura finestra | Memoria vicina al livello stabilizzato precedente (obiettivo ±2 MB), nessun task o timer residuo non necessario |
 | Avvio e menu | Icona entro 200 ms; `menuNeedsUpdate` entro 1 ms; icona coerente nello stesso turno main-actor dello stato |
 | UI | Nessun blocco del main thread oltre 16 ms; misurare anche scorrimento e azioni durante la sync |
@@ -71,6 +71,8 @@ I budget sono obiettivi provvisori, non risultati già raggiunti. Una baseline n
 | Sync invariata | ≤50 ms di lavoro locale/1.000 file; zero hash, modifiche DB e scritture non necessarie; minimo numero di richieste compatibile con la correttezza |
 | File nuovi/aggiornati | Memoria indipendente dalla dimensione del file; misurare throughput, CPU e letture prima di attribuire il limite alla rete |
 | Annullamento | p95 <1 s nelle fasi interrompibili, compresi file grandi; sicurezza del completamento/recupero nelle fasi atomiche |
+
+**Eccezione documentata: telemetria giornaliera ([#128](https://github.com/tommaso-vaccari/BeepBar/issues/128), [#207](https://github.com/tommaso-vaccari/BeepBar/issues/207)).** Nelle build Release la telemetria è attiva di default (`BeepBarTelemetryDefaultEnabled`) e si disattiva in Impostazioni; Debug, test e anteprime non inviano. Con l’app in esecuzione e la telemetria attiva, `DailyTelemetryController` tenta al massimo un invio per giorno UTC: all’avvio, poi con un `NSBackgroundActivityScheduler` non ripetuto (QoS background) poco dopo la mezzanotte UTC successiva, e all’attivazione dell’app o al risveglio del Mac se il giorno è cambiato. Ogni tentativo è una sola POST HTTPS a `nom.telemetrydeck.com` con un segnale JSON (versione, macOS maggiore, lingua e alcune impostazioni; campi e privacy in [telemetry.md](telemetry.md), aspetti privacy in [#180](https://github.com/tommaso-vaccari/BeepBar/issues/180)), sessione effimera senza cookie né cache, timeout 10 s (risorsa 15 s), nessun ritentativo, coda o recupero dei giorni persi; non sveglia un Mac addormentato e non aggiunge attese all’uscita. La sessione rifiuta le reti costose (hotspot) e a dati limitati (Modalità dati ridotti): lì non parte traffico, ma il tentativo consuma comunque la giornata. Non consulta l’impostazione Risparmio dati di BeepBar: l’esclusione dipende dalla rete, non dall’interruttore. Prima di inviare scrive in UserDefaults la data del tentativo (una scrittura al giorno), più l’identificatore mensile quando cambia il mese UTC. Gli osservatori di attivazione/risveglio, a giorno già coperto, fanno solo una lettura di UserDefaults e un calcolo di calendario. In un’osservazione idle di 30 minuti sulla copia installata sono quindi attesi al più una connessione e una scrittura di preferenze, subito dopo l’avvio, il risveglio, l’attivazione o la mezzanotte UTC: non sono una regressione del principio 3. Nessun test o misura verifica oggi che sia l’unico traffico a riposo; il comportamento non cambia con questa annotazione.
 
 ## Risultati obbligatori nelle PR: incremento e confronto con main
 

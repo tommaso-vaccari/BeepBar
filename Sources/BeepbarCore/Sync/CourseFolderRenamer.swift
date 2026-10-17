@@ -32,7 +32,8 @@ public actor CourseFolderRenamer {
               !ReservedNamespace.isReservedTopLevelName(newFolder) else { throw FileStoreError.invalidStage }
         try await gate.withLease(.renaming(courseID)) { [database, fileStore, interruption] in
             guard try await database.hasPendingModuleMoves(rootID: rootID) == false else { throw SyncDatabaseError.execution }
-            guard try await database.pendingScopeMoves().contains(where: { $0.rootID == rootID }) == false else { throw SyncDatabaseError.execution }
+            // A rename that did not become durable earlier in this session is settled first (#183).
+            try await ScopeMoveRecovery.settlePending(rootID: rootID, database: database, fileStore: fileStore)
             guard !(try await database.hasOpenConflicts(rootID: rootID, prefix: oldFolder)),
                   !(try await database.hasPendingOperations(rootID: rootID, prefix: oldFolder)),
                   let scope = try await database.scope(rootID: rootID, courseID: courseID), scope.localFolder == oldFolder else { throw SyncDatabaseError.execution }

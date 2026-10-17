@@ -131,8 +131,54 @@ struct FileHashCancellationTests {
         #expect(try await fixture.store.conflictArtifact(at: conflict.incomingPath)?.sha256 == artifact.sha256)
     }
 
-    @Test func releaseCancellationLatency() async throws {
-        guard ProcessInfo.processInfo.environment["BEEPBAR_HASH_CANCEL_REPORT"] != nil else { return }
+    /// Moving a file to the Trash reads it twice before anything changes on disk: the file, then
+    /// the hard link that pins it (#185). Cancelling during either read (`skipReads` picks which)
+    /// stops at the next chunk with the file unchanged at its path, nothing handed to the Trash
+    /// and the staging link gone. Fails when either read ignores cancellation: the probe only
+    /// cancels cooperative reads, so the action then runs to the end and trashes the file.
+    @Test(arguments: [0, 1])
+    func cancellingATrashBeforeItActsLeavesTheFileInPlace(skipReads: Int) async throws {
+        let trashed = OSAllocatedUnfairLock(initialState: [URL]())
+        let fixture = try await Fixture(read: .inspect, trash: { url in trashed.withLock { $0.append(url) } })
+        defer { fixture.remove() }
+        guard case .present(let snapshot) = try await fixture.store.snapshotRegularFile(fixture.path) else { Issue.record("fixture file missing"); return }
+        let before = await fixture.store.counters()
+        fixture.probe.arm(skipReads: skipReads)
+        let result = await Task { try await fixture.store.trashRegularFile(fixture.path, expected: snapshot) }.result
+        #expect(result.isCancellation)
+        #expect(fixture.probe.chunksAfterCancellation == 0)
+        // Stopped 8 MiB into the read that was meant to be cancelled, not in a later one.
+        #expect(await fixture.store.counters().since(before).bytesHashed == Int64(skipReads) * Fixture.size + 8 << 20)
+        #expect(trashed.withLock { $0 }.isEmpty)
+        #expect(try await fixture.store.inspect(fixture.path) == fixture.original)
+        let links = try FileManager.default.attributesOfItem(atPath: fixture.root.appending(path: fixture.path.value).path)[.referenceCount] as? Int
+        #expect(links == 1)
+    }
+
+    /// Once the Trash holds the file, a cancellation no longer stops the action halfway (#185):
+    /// the last check still runs and the user's path is unlinked, so the file is in the Trash
+    /// only, as the choice promised. Fails if that check becomes cancellable, which would leave
+    /// the file both in the Trash and at its path with the choice reported as failed.
+    @Test func aCancellationAfterTheTrashCallStillFinishesTheAction() async throws {
+        let trashFolder = FileManager.default.temporaryDirectory.appending(path: "Beepbar-trash-\(UUID())")
+        try FileManager.default.createDirectory(at: trashFolder, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: trashFolder) }
+        let fixture = try await Fixture(read: .inspect, trash: { url in
+            try FileManager.default.moveItem(at: url, to: trashFolder.appending(path: url.lastPathComponent))
+            withUnsafeCurrentTask { $0?.cancel() }
+        })
+        defer { fixture.remove() }
+        guard case .present(let snapshot) = try await fixture.store.snapshotRegularFile(fixture.path) else { Issue.record("fixture file missing"); return }
+        let result = await Task { try await fixture.store.trashRegularFile(fixture.path, expected: snapshot) }.result
+        guard case .success = result else { Issue.record("Expected the trash to finish, got \(result)"); return }
+        #expect(!FileManager.default.fileExists(atPath: fixture.root.appending(path: fixture.path.value).path))
+        #expect(FileManager.default.fileExists(atPath: trashFolder.appending(path: "local.bin").path))
+    }
+
+    /// On demand only (`BEEPBAR_HASH_CANCEL_REPORT=1`); otherwise reported as skipped rather than
+    /// as a pass with no assertion (#220).
+    @Test(.enabled(if: ProcessInfo.processInfo.environment["BEEPBAR_HASH_CANCEL_REPORT"] != nil))
+    func releaseCancellationLatency() async throws {
         let clock = ContinuousClock()
         for read in Read.allCases {
             let fixture = try await Fixture(read: read)
@@ -165,7 +211,7 @@ struct FileHashCancellationTests {
         let hash: String
         let probe: CancelProbe
 
-        init(read: Read) async throws {
+        init(read: Read, trash: @escaping @Sendable (URL) throws -> Void = { _ in }) async throws {
             readKind = read
             root = FileManager.default.temporaryDirectory.appending(path: "Beepbar-hash-cancel-\(UUID())")
             try FileManager.default.createDirectory(at: root.appending(path: "Course"), withIntermediateDirectories: true)
@@ -180,7 +226,7 @@ struct FileHashCancellationTests {
             hash = digest.finalize().map { String(format: "%02x", $0) }.joined()
             original = .present(sha256: hash)
             probe = CancelProbe()
-            store = try FileStore(root: root, beforeMove: nil, trash: { _ in }, beforeReadChunk: { [probe] cooperative, offset in probe.chunk(cooperative: cooperative, offset: offset) })
+            store = try FileStore(root: root, beforeMove: nil, trash: trash, beforeReadChunk: { [probe] cooperative, offset in probe.chunk(cooperative: cooperative, offset: offset) })
             stage = try await store.createStage()
             if read == .stage || read == .conflict || read == .conflictCopy {
                 for _ in 0..<64 { try await store.write(chunk, to: stage) }

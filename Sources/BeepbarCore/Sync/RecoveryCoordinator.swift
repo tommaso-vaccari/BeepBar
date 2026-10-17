@@ -83,25 +83,7 @@ public actor RecoveryCoordinator {
     }
 
     private func recover(_ move: PendingScopeMove) async throws -> Outcome {
-        guard let scope = try await database.scope(rootID: move.rootID, courseID: move.courseID),
-              scope.localFolder == move.oldFolder,
-              let managedDirectory = scope.managedDirectory else { return .unresolved }
-        let old = try await fileStore.topLevelDirectoryState(move.oldFolder)
-        let new = try await fileStore.topLevelDirectoryState(move.newFolder)
-        switch (old, new) {
-        case (.directory, .missing):
-            guard try await fileStore.topLevelDirectoryIdentity(move.oldFolder) == managedDirectory else { return .unresolved }
-            try await fileStore.renameTopLevelDirectory(from: move.oldFolder, to: move.newFolder, expectedIdentity: managedDirectory)
-            guard try await fileStore.topLevelDirectoryIdentity(move.newFolder) == managedDirectory else { return .unresolved }
-            try await database.commitScopeMove(move)
-            return .recovered
-        case (.missing, .directory):
-            guard try await fileStore.topLevelDirectoryIdentity(move.newFolder) == managedDirectory else { return .unresolved }
-            try await database.commitScopeMove(move)
-            return .recovered
-        default:
-            return .unresolved
-        }
+        try await ScopeMoveRecovery.recover(move, database: database, fileStore: fileStore) ? .recovered : .unresolved
     }
 
     private func recoverPrepared(_ operation: PendingOperation, stage: StagedArtifact?, destination: LocalState, baseline: Baseline) async throws -> Outcome {
@@ -197,5 +179,52 @@ private extension LocalState {
     var sha256: String? {
         if case .present(let sha256) = self { return sha256 }
         return nil
+    }
+}
+
+/// Completes or confirms an interrupted course-folder rename (`PendingScopeMove`) from what is on
+/// disk: at launch through `RecoveryCoordinator`, and in a running app before a sync or another
+/// rename through `settlePending` (#183).
+enum ScopeMoveRecovery {
+    /// Whether the move is now complete (row committed). `false` leaves the row pending: the
+    /// scope no longer matches the row, or neither folder (or both) is the managed directory.
+    static func recover(_ move: PendingScopeMove, database: SyncDatabase, fileStore: FileStore) async throws -> Bool {
+        guard let scope = try await database.scope(rootID: move.rootID, courseID: move.courseID),
+              scope.localFolder == move.oldFolder,
+              let managedDirectory = scope.managedDirectory else { return false }
+        let old = try await fileStore.topLevelDirectoryState(move.oldFolder)
+        let new = try await fileStore.topLevelDirectoryState(move.newFolder)
+        switch (old, new) {
+        case (.directory, .missing):
+            guard try await fileStore.topLevelDirectoryIdentity(move.oldFolder) == managedDirectory else { return false }
+            try await fileStore.renameTopLevelDirectory(from: move.oldFolder, to: move.newFolder, expectedIdentity: managedDirectory)
+            guard try await fileStore.topLevelDirectoryIdentity(move.newFolder) == managedDirectory else { return false }
+            try await database.commitScopeMove(move)
+            return true
+        case (.missing, .directory):
+            guard try await fileStore.topLevelDirectoryIdentity(move.newFolder) == managedDirectory else { return false }
+            try await database.commitScopeMove(move)
+            return true
+        default:
+            return false
+        }
+    }
+
+    /// Settles this root's pending course-folder renames, or throws `SyncDatabaseError.execution`
+    /// (as the guard it replaces did) while any stays pending. Call it inside the root's lease.
+    ///
+    /// Why it exists (#183): when `renameatx_np` succeeds but the `fsync` of the sync folder
+    /// fails, `CourseFolderRenamer` keeps the row (`mutationNotDurable`), and every later sync and
+    /// rename refused to run until a relaunch, with only a generic error, because nothing but
+    /// launch recovery settled it. The root is flushed again first, so the database records the
+    /// rename only once the disk has it durably; while the flush keeps failing the row stays and
+    /// the next attempt retries.
+    static func settlePending(rootID: UUID, database: SyncDatabase, fileStore: FileStore) async throws {
+        let moves = try await database.pendingScopeMoves(rootID: rootID)
+        guard !moves.isEmpty else { return }
+        do { try await fileStore.syncRootDirectory() } catch { throw SyncDatabaseError.execution }
+        for move in moves {
+            guard (try? await recover(move, database: database, fileStore: fileStore)) == true else { throw SyncDatabaseError.execution }
+        }
     }
 }

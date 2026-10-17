@@ -165,6 +165,10 @@ import BeepbarCore
     /// How many times the controller brought the open window forward (`bringToFront`).
     private(set) var broughtToFront = 0
     func bringToFront() { if isOpen { broughtToFront += 1 } }
+    /// What the controller told the open window about a lecture that can't continue
+    /// (`showProblem`), in order.
+    private(set) var problems: [String] = []
+    func showProblem(_ message: String) { if isOpen { problems.append(message) } }
 
     /// Reports the lecture on screen, if any, with `reason`: what the real player's checkpoint
     /// carries.
@@ -2593,6 +2597,62 @@ struct RecordingsControllerTests {
         await settle("browser opened") { world.opened == [playerLink("a")] }
         #expect(browser.streamCalls.count == (name == "never started" ? 1 : 2))
         #expect(world.player.plays.count == 1)
+        controller.turnOff()
+    }
+
+    /// A mid-lecture failure whose recovery ends with neither a new stream nor the browser tells
+    /// the paused player window why, not only the Recordings page (issue #197: a lecture started
+    /// from the menu bar has no page, and its window just froze). Covers each way a recovery can
+    /// end like that: Webex needs a confirmed email, the second failure's browser link can't be
+    /// found (Polimi offline), and the Polimi session lapsing during the lookup.
+    /// Mutations: drop the `reportStoppedLecture` call of the scenario (no problem shown);
+    /// drop the `stillShowing` guard in it (not caught here: the window is open throughout).
+    @Test(arguments: ["needs email", "browser link unavailable", "session lapsed"])
+    func aRecoveryThatEndsWithNothingTellsThePlayerWindow(scenario name: String) async throws {
+        defer { cleanUp() }
+        switch name {
+        case "needs email":
+            browser.streamResults["a"] = [.success(stream("a")), .failure(RecmanBrowserError.needsEmail)]
+        case "browser link unavailable":
+            browser.streamResults["a"] = [.success(stream("a")), .success(stream("a"))]
+            browser.playbackResults["a"] = .failure(RecmanBrowserError.unavailable)
+        default:
+            browser.streamResults["a"] = [.success(stream("a")), .failure(RecmanBrowserError.needsSignIn)]
+        }
+        let controller = await readyController()
+        controller.play(recording("a"))
+        await settle("a playing") { world.player.plays.count == 1 }
+        world.player.failDuringPlayback(at: 300)
+        if name == "browser link unavailable" {
+            await settle("resumed once") { world.player.plays.count == 2 }
+            world.player.failDuringPlayback(at: 400)
+        }
+        await settle("the window was told") { !world.player.problems.isEmpty }
+        let expected: String = switch name {
+        case "needs email": RecordingsProblem.playbackUnavailable.message
+        case "browser link unavailable": RecordingsProblem.unavailable.message
+        default: RecordingsController.signInToContinueMessage
+        }
+        #expect(world.player.problems == [expected])
+        #expect(world.player.isOpen, "the paused window stays, with the reason")
+        #expect(world.opened.isEmpty)
+        controller.turnOff()
+    }
+
+    /// A lecture that stops while the Polimi session is gone can't be recovered: its paused
+    /// window says to sign in again (issue #197) instead of sitting frozen.
+    /// Mutation: drop the `.duringPlayback` report in `playerFailed`'s access guard.
+    @Test func aFailureWhileSignedOutTellsThePlayerWindow() async throws {
+        defer { cleanUp() }
+        browser.streamResults["a"] = [.success(stream("a"))]
+        let controller = await readyController()
+        controller.play(recording("a"))
+        await settle("a playing") { world.player.plays.count == 1 }
+        browser.listResults[course.courseCode] = .failure(RecmanBrowserError.needsSignIn)
+        controller.refresh([course], selected: course)
+        await settle("signed out") { controller.access == .needsSignIn(nil) }
+        world.player.failDuringPlayback(at: 300)
+        #expect(world.player.problems == [RecordingsController.signInToContinueMessage])
         controller.turnOff()
     }
 

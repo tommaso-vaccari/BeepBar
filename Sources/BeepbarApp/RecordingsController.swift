@@ -2209,7 +2209,11 @@ struct RecordingsListing: Equatable {
         PlaybackDiagnostics.log.notice("\(diagnosis, privacy: .public)")
         guard access == .ready else {
             // No Polimi session to look anything up with: the student has to sign in again.
-            if case .beforeReady = failure { openingProblem = .playbackUnavailable }
+            switch failure {
+            case .beforeReady: openingProblem = .playbackUnavailable
+            // The window stays open, paused where the stream stopped: it says why (#197).
+            case .duringPlayback: reportStoppedLecture(recording, message: Self.signInToContinueMessage)
+            }
             return
         }
         if visiblePages == 0 { closesBrowserWhenIdle = true }
@@ -2245,11 +2249,16 @@ struct RecordingsListing: Equatable {
                 found = player
                 let diagnosis = "play: recovery stream failed reason=\(Self.playFailureReason(cause).rawValue) error=\(PlaybackDiagnostics.errorName(cause))"
                 PlaybackDiagnostics.log.notice("\(diagnosis, privacy: .public)")
-                if cause is CancellationError || (cause as? RecmanBrowserError) == .needsSignIn { throw cause }
+                if (cause as? RecmanBrowserError) == .needsSignIn {
+                    reportStoppedLecture(recording, message: Self.signInToContinueMessage)
+                    throw cause
+                }
+                if cause is CancellationError { throw cause }
                 if (cause as? RecmanBrowserError) == .needsEmail {
                     // Same decision as for Play: no Webex page for the student, only the sentence.
-                    // The window stays, paused at the place it stopped.
+                    // The window stays, paused at the place it stopped, and says it too (#197).
                     openingProblem = RecordingsProblem(cause)
+                    reportStoppedLecture(recording, message: RecordingsProblem(cause).message)
                     log.notice("Fresh stream needs a confirmed email")
                     return
                 }
@@ -2266,10 +2275,32 @@ struct RecordingsListing: Equatable {
             openURL(url)
         } catch {
             guard isCurrent() else { return }
-            if error is CancellationError || (error as? RecmanBrowserError) == .needsSignIn { throw error }
+            if (error as? RecmanBrowserError) == .needsSignIn {
+                reportStoppedLecture(recording, message: Self.signInToContinueMessage)
+                throw error
+            }
+            if error is CancellationError { throw error }
             openingProblem = RecordingsProblem(error)
+            // A second mid-lecture failure leaves its window open: it says why too (#197).
+            reportStoppedLecture(recording, message: RecordingsProblem(error).message)
             log.error("Couldn't open a failed lecture in the browser")
         }
+    }
+
+    /// A mid-lecture failure whose recovery ended with neither a new stream nor the browser
+    /// (issue #197): `openingProblem` reaches only a Recordings page, and a lecture started from
+    /// the menu bar may have none, so the player window, still paused where the stream stopped,
+    /// shows the reason too. Only while that lecture is still the one on screen.
+    private func reportStoppedLecture(_ recording: RecmanRecording, message: String) {
+        guard stillShowing(recording) else { return }
+        player?.showProblem(message)
+    }
+
+    /// What the paused player window says when the lecture can't continue because the Polimi
+    /// session lapsed: the page shows "Accedi con Polimi", the window points there. Resolved when
+    /// shown (`tr`), never cached.
+    static var signInToContinueMessage: String {
+        tr("Accedi di nuovo con Polimi nella pagina Registrazioni per continuare.", "Sign in with Polimi again on the Recordings page to continue.")
     }
 
     /// Whether `recording` is still the lecture in the player's window: the student may have
@@ -2400,7 +2431,8 @@ struct RecordingsListing: Equatable {
             // `openingProblem` is shown by the page; with none on screen a menu Play asks for it.
             needsPage = takeMenuPlayNeedingPage(failing: job, queued: false)
         case .recover:
-            // Not a click: the lecture's window already says what happened to it.
+            // Not a click: `recoverPlayback` already told the lecture's window (#197) and only
+            // rethrows a cancellation or a lapsed session.
             break
         }
         // Offline or Polimi down: every other request would wait for the same timeout.

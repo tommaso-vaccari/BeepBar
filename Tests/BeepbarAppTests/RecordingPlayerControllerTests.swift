@@ -415,6 +415,38 @@ struct RecordingPlayerControllerTests {
         controller.close()
     }
 
+    /// After a mid-lecture failure the window can show why the lecture stopped (`showProblem`, in
+    /// place of the course name), and when the student starts the paused item again the course
+    /// name comes back and a later failure of that same item is reported again (issue #197: the
+    /// once-per-item flag stayed set, so a second stall left a frozen window nobody explained).
+    /// Mutations: drop the `failureReported = false` reset in `timeControlStatusChanged` (one
+    /// failure only); drop the subtitle restore there (the problem stays); make `showProblem` a
+    /// no-op (subtitle never changes).
+    @Test(.timeLimit(.minutes(1))) func resumingAfterAFailureReportsTheNextOneAgain() async throws {
+        let media = try await TestMedia.shared.url()
+        let controller = makeController()
+        var failures = 0
+        controller.onFailure = { _, _ in failures += 1 }
+        controller.play(media, title: "Lezione", cookies: [], startAt: nil, recordingID: "a",
+                        metadata: RecordingPlaybackMetadata(title: "Lezione", courseName: "Analisi", artworkURL: nil))
+        try await Self.waitUntil { controller.isCurrentItemReady }
+        let window = try #require(controller.window)
+        #expect(window.subtitle == "Analisi")
+        controller.fail(generation: controller.generation, error: nil)
+        #expect(failures == 1)
+        controller.showProblem("Il Politecnico non risponde.")
+        #expect(window.subtitle == "Il Politecnico non risponde.")
+
+        let player = try #require(controller.player)
+        player.play()
+        try await Self.waitUntil { window.subtitle == "Analisi" }
+        controller.fail(generation: controller.generation, error: nil)
+        #expect(failures == 2, "a stall after the student resumed is reported again")
+        controller.close()
+        controller.showProblem("dopo la chiusura")
+        #expect(controller.window == nil)
+    }
+
     /// The failed-to-play-to-end notification of an item a newer Play replaced, or of the item
     /// playing when the player was closed, is ignored: the observer belongs to the current item.
     @Test(.timeLimit(.minutes(1))) func notificationsForOldItemsAreIgnored() async throws {

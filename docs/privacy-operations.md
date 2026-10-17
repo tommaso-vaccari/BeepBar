@@ -38,8 +38,8 @@ Static source inspection on the remediation branch; runtime and OS-managed reten
 | `sync.sqlite`, WAL/SHM | Root, courses/modules/files, hashes, revisions, journal and conflicts; no TTL | Remains after disconnect; whole-app reset after preserving materials |
 | `recordings-seen-v2*.sqlite`, WAL/SHM | Account/course/recording IDs and viewing state | Namespace invalidated then removed on reset; failed removal retried on next use |
 | Legacy seen defaults | Acknowledged/baselined entries pending migration | Removed after successful migration or reset |
-| Resume/summary/email opt-out defaults | Resume positions (cap 200), playback summary, per-session email choice | Identity/session reset |
-| `recordings-study.v1.<owner>` defaults | Per-account watchlist/queue; no TTL | Intentionally survives logout/disable; whole-app reset currently required |
+| Resume/summary/email opt-out defaults | Resume positions (cap 200), playback summary, per-session email choice | Resume: logout/university/account change, preserved by normal disable; summary/email opt-out also removed by disable |
+| `recordings-study.v1.<owner>` defaults | Per-account watchlist/queue; no TTL | Intentionally survives logout/disable; individual bookmarks can be removed in the UI; whole-app reset removes all account records |
 | Preferences/bookmarks/last-sync defaults | Settings, selected root/account state and sync summaries | Some cleared on disconnect; whole-app reset removes remaining preferences |
 | Monthly telemetry identity/defaults | Random UUID/month, daily attempt and choice | Rotation; opt-out removes UUID; server history unaffected |
 | Downloaded materials, backups and conflict copies | User-controlled files under selected root; no automatic retention limit | User-managed; preserve before app reset |

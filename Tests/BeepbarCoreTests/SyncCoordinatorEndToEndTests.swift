@@ -153,6 +153,34 @@ private let temporaryVolumeIgnoresCase: Bool = {
         #expect(!FileManager.default.fileExists(atPath: fixture.root.appending(path: target.localFolder).path))
     }
 
+    /// A course-folder rename whose flush failed once no longer fails every sync until a relaunch
+    /// (#183): the next sync settles it from the disk and runs, and the files stay tracked in the
+    /// renamed folder. While the flush still fails, the sync refuses and records nothing.
+    @Test func aSyncSettlesACourseRenameThatWasNotDurable() async throws {
+        let flush = FlushFailures()
+        let fixture = try await Fixture(syncDirectory: { try flush.sync($0) })
+        defer { fixture.remove() }
+        _ = try await fixture.synchronize(targets: [fixture.targets[0]])
+        let renamer = CourseFolderRenamer(database: fixture.database, fileStore: fixture.fileStore, gate: fixture.gate)
+        flush.failNext(1)
+        await #expect(throws: FileStoreError.mutationNotDurable) { try await renamer.rename(rootID: fixture.rootID, courseID: 1, from: "Course 1", to: "Renamed") }
+        let renamed = SyncTarget(courseID: 1, localFolder: "Renamed")
+
+        flush.failNext(1)
+        await #expect(throws: SyncDatabaseError.execution) { _ = try await fixture.synchronize(targets: [renamed]) }
+        #expect(try await fixture.database.pendingScopeMoves().count == 1)
+        #expect(try await fixture.database.scope(rootID: fixture.rootID, courseID: 1)?.localFolder == "Course 1")
+
+        fixture.upstream.resetDownloadCount()
+        let result = try await fixture.synchronize(targets: [renamed])
+        #expect(result.failures == 0 && result.conflicts == 0)
+        #expect(fixture.upstream.downloadCount == 0)
+        #expect(try await fixture.database.pendingScopeMoves().isEmpty)
+        #expect(try await fixture.database.scope(rootID: fixture.rootID, courseID: 1)?.localFolder == "Renamed")
+        #expect(try await fixture.database.baseline(rootID: fixture.rootID, remoteID: fixture.remoteID(course: 1, file: 0))?.relativePath == RelativePath("Renamed/Lezioni/0.txt"))
+        #expect(!FileManager.default.fileExists(atPath: fixture.root.appending(path: "Course 1").path))
+    }
+
     @Test(arguments: ["manual", "reupload"])
     func directorySyncFailureRetainsManualAndReuploadJournals(_ mode: String) async throws {
         let failure = DirectorySyncFailure()

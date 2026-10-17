@@ -57,7 +57,8 @@ public actor SyncCoordinator {
     private func synchronizeWithinLease(targets: [SyncTarget], token: String, mode: SyncCoordinatorMode, networkAccess: NetworkAccess, progress: @escaping @Sendable (SyncProgress) async -> Void) async throws -> SyncProgress {
         try Task.checkCancellation()
         guard try await database.hasPendingModuleMoves(rootID: rootID) == false else { throw SyncDatabaseError.execution }
-        guard try await database.pendingScopeMoves().contains(where: { $0.rootID == rootID }) == false else { throw SyncDatabaseError.execution }
+        // A course-folder rename left pending in this session is settled here, not only at launch (#183).
+        try await ScopeMoveRecovery.settlePending(rootID: rootID, database: database, fileStore: fileStore)
         guard !targets.isEmpty else { return SyncProgress(completed: 0, total: 0, installed: 0, preservedLocal: 0, unchanged: 0, conflicts: 0, failures: 0) }
         // Before any baseline is read: a move interrupted by a crash is completed or dropped first.
         try await RemoteMoveJournal.recover(rootID: rootID, database: database, fileStore: fileStore)

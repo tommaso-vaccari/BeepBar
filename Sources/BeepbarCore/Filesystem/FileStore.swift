@@ -628,6 +628,13 @@ public actor FileStore {
         catch { throw FileStoreError.mutationNotDurable }
     }
 
+    /// Flushes the sync folder's own entries, making a top-level rename durable after its first
+    /// flush failed (see `ScopeMoveRecovery.settlePending`, #183).
+    func syncRootDirectory() throws {
+        do { try syncDirectory(rootFD) }
+        catch { throw FileStoreError.mutationNotDurable }
+    }
+
     public func topLevelDirectoryIdentity(_ name: String) throws -> DirectoryIdentity? {
         guard isSafeTopLevelName(name) else { throw FileStoreError.invalidStage }
         let fd = openat(rootFD, name, O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW)

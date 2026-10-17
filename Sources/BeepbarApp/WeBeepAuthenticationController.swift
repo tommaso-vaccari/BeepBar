@@ -751,6 +751,13 @@ enum MaterialsRunEnd: Equatable, Sendable {
     private let credentialVault: CredentialVault
     private let notificationCoordinator: SyncNotificationCoordinator
     private var backgroundScheduler: BackgroundActivityRegistration?
+    /// How long a scheduler callback keeps the system activity open for the recordings follow-up
+    /// before calling `completion` anyway (#187). The follow-up's listings queue behind a Play in
+    /// the Recordings worker, and a Play can wait for an interactive Webex sign-in with no
+    /// deadline: awaiting it unbounded kept `completion` from ever being called, so no further
+    /// automatic sync was scheduled. Past the hold the follow-up goes on by itself and still
+    /// publishes its result; a later automatic run merges into it rather than starting another.
+    private var followUpActivityHold: Duration = .seconds(120)
     /// Owns the real registration; tests replace it with a clock-backed registration, never macOS activity.
     private var scheduleBackgroundActivity: (TimeInterval, @escaping @Sendable (@escaping NSBackgroundActivityScheduler.CompletionHandler) -> Void) -> BackgroundActivityRegistration = { interval, callback in
         let scheduler = NSBackgroundActivityScheduler(identifier: "io.github.tvaccari.beepbar.auto-sync")
@@ -1092,6 +1099,8 @@ enum MaterialsRunEnd: Equatable, Sendable {
 
     /// The account going away as `forgetCourseList()` sees it, at a moment a test chooses.
     func forgetCourseListForTesting() { forgetCourseList() }
+
+    func setFollowUpActivityHoldForTesting(_ hold: Duration) { followUpActivityHold = hold }
 
     func setBackgroundSchedulerForTesting(_ register: @escaping (TimeInterval, @escaping @Sendable (@escaping NSBackgroundActivityScheduler.CompletionHandler) -> Void) -> BackgroundActivityRegistration) {
         scheduleBackgroundActivity = register
@@ -2436,6 +2445,20 @@ enum MaterialsRunEnd: Equatable, Sendable {
         }
     }
 
+    /// `wait(for:atMost:)` that also cancels its timer when `task` finishes first, so a follow-up
+    /// that ends in seconds leaves no sleeping task behind for the rest of the hold (#187). Kept
+    /// apart from `wait(for:atMost:)`, which the quit path uses and `scripts/quit-probe.sh` covers.
+    nonisolated static func waitReleasingTimer(for task: Task<Void, Never>, atMost timeout: Duration) async {
+        let gate = FirstResume()
+        var timer: Task<Void, Never>?
+        await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
+            gate.arm(continuation)
+            Task { await task.value; gate.resume() }
+            timer = Task { try? await Task.sleep(for: timeout); gate.resume() }
+        }
+        timer?.cancel()
+    }
+
     func refreshConflicts() {
         guard !isSyncActive else { return }
         guard database != nil, rootID != nil else { return }
@@ -3424,10 +3447,14 @@ enum MaterialsRunEnd: Equatable, Sendable {
         // Captured before the follow-up, which never changes the materials outcome.
         let outcome = Task.isCancelled ? AutomaticSyncOutcome.cancelled : automaticOutcome
         // After the run and before the scheduler's `completion`: the system activity that ran the
-        // materials covers the recordings listings too, with no timer of our own. Never inside
-        // `task` (`syncTask`), which a quit waits for.
+        // materials covers the recordings listings too. Never inside `task` (`syncTask`), which a
+        // quit waits for. Held at most `followUpActivityHold`, so `completion` is always called and
+        // the next automatic run always scheduled (#187).
         if let followUp = followUpAfterRun(operationID, trigger: .automatic, schedulerCancelled: Task.isCancelled) {
-            await withTaskCancellationHandler { await followUp.value } onCancel: { followUp.cancel() }
+            let hold = followUpActivityHold
+            await withTaskCancellationHandler {
+                await Self.waitReleasingTimer(for: followUp, atMost: hold)
+            } onCancel: { followUp.cancel() }
         }
         return outcome
     }

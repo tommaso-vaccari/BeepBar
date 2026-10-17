@@ -34,7 +34,7 @@ import Testing
 
     /// Proves the order of an automatic run: the materials state is already `.synced` while the
     /// refresh is gated, and the scheduler's completion is delivered only after the refresh ends
-    /// (the system activity covers it, no timer of our own); the refresh respects the freshness
+    /// (the system activity covers it, within the default hold); the refresh respects the freshness
     /// window (`force: false`) and gets the course's key. Guards against starting it after
     /// `completion` (the activity would end under it), awaiting it before the materials result, or
     /// forcing automatic runs.
@@ -66,6 +66,46 @@ import Testing
         #expect(await fired.value == .finished)
         #expect(log.withLock { $0 } == ["released", "completion"])
         #expect(harness.controller.lastRecordingsOutcome == .refreshed(newlyPublished: 0, failedKeys: 0))
+    }
+
+    /// Proves that the scheduler's completion is delivered once the hold runs out even though the
+    /// follow-up is still blocked (as behind a Play waiting for a Webex sign-in), that the
+    /// follow-up keeps going and still publishes its result afterwards, and that an automatic run
+    /// fired meanwhile starts no second refresh. Guards against awaiting the follow-up without a
+    /// bound (#187): `completion` never called, so no automatic sync was ever scheduled again.
+    @Test func theSchedulerCompletesWhileTheFollowUpIsStillBlocked() async throws {
+        let schedule = TestSchedule()
+        let harness = try await Harness(schedule: schedule)
+        defer { harness.remove() }
+        harness.controller.setFollowUpActivityHoldForTesting(.milliseconds(200))
+        let gate = FakeRecmanBrowser.Gate()
+        harness.seam.gate = gate
+        let completed = OSAllocatedUnfairLock(initialState: false)
+        let fired = Task { @MainActor in
+            let result = await schedule.fire(0)
+            completed.withLock { $0 = true }
+            return result
+        }
+        while !gate.isWaiting { await Task.yield() }
+        let deadline = ContinuousClock.now + .seconds(5)
+        while !completed.withLock({ $0 }), ContinuousClock.now < deadline { try? await Task.sleep(for: .milliseconds(5)) }
+        guard completed.withLock({ $0 }) else {
+            Issue.record("The scheduler's completion waited for the blocked follow-up")
+            gate.release(); _ = await fired.value
+            return
+        }
+        #expect(await fired.value == .finished)
+        let followUp = try #require(harness.controller.recordingsFollowUpForTesting, "the follow-up was dropped at the hold")
+        #expect(harness.controller.lastRecordingsOutcome == nil)
+
+        // The next automatic run, while the first follow-up is still blocked.
+        #expect(await schedule.fire(0) == .finished)
+        #expect(harness.seam.calls.count == 1)
+
+        gate.release()
+        await followUp.value
+        #expect(harness.controller.lastRecordingsOutcome == .refreshed(newlyPublished: 0, failedKeys: 0))
+        #expect(harness.seam.calls.count == 1)
     }
 
     /// Proves that a manual sync starts its follow-up with `force: true` after the list is loaded

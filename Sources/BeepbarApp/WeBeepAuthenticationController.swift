@@ -949,6 +949,7 @@ enum MaterialsRunEnd: Equatable, Sendable {
             return
         }
 #endif
+        _ = recordings
         accountState = hasStoredCredential ? .connected : .notConnected
         setSyncState(.starting)
         let bootstrap = BootstrapService()
@@ -1303,7 +1304,7 @@ enum MaterialsRunEnd: Equatable, Sendable {
         }
     }
 
-    /// The Recordings feature (Polimi lecture recordings), created on first use.
+    /// The Recordings feature; startup creates it to enforce saved-session expiry.
     var recordings: RecordingsController {
         if let recordingsStorage { return recordingsStorage }
         let controller = makeRecordings()
@@ -1314,6 +1315,11 @@ enum MaterialsRunEnd: Equatable, Sendable {
     /// The Recordings controller only if something already created it, for paths that must not
     /// create it just to tell it nothing is happening (the window closing).
     var recordingsIfCreated: RecordingsController? { recordingsStorage }
+
+    var recordingsForPrivacy: RecordingsController? {
+        if let recordingsStorage { return recordingsStorage }
+        return (operationDefaults.bool(forKey: RecordingsController.sessionDeletionPendingKey) || operationDefaults.bool(forKey: RecordingsController.studyDeletionPendingKey)) ? recordings : nil
+    }
 
     /// Whether Recordings is on, read without creating its controller (daily telemetry asks once a
     /// day and must not build the feature just to report it is off).

@@ -32,12 +32,6 @@ struct DailyTelemetryTests {
             "TelemetryDeck.Device.platform": "macOS",
             "TelemetryDeck.Device.operatingSystem": "macOS",
             "TelemetryDeck.Device.systemMajorVersion": "macOS 15",
-            "TelemetryDeck.RunContext.language": "en",
-            "BeepBar.automaticSync": "true",
-            "BeepBar.automaticSyncInterval": "28800",
-            "BeepBar.dataSaver": "false",
-            "BeepBar.recordings": "true",
-            "BeepBar.launchAtLogin": "true",
         ])
         #expect(!String(decoding: body, as: UTF8.self).contains("installation-a"))
         #expect((signal["clientUser"] as? String)?.count == 64)
@@ -48,27 +42,26 @@ struct DailyTelemetryTests {
         #expect(first.timeoutInterval == 10)
     }
 
-    /// A login-item state macOS hasn't reported yet is left out instead of being reported as off.
+    /// Settings and language never enter the payload, even when their values are known.
     @Test func unknownLoginItemIsOmitted() {
         var unknown = context
         unknown.launchAtLogin = nil
         unknown.language = .italian
         let payload = configuration.payload(unknown)
         #expect(payload["BeepBar.launchAtLogin"] == nil)
-        #expect(payload["TelemetryDeck.RunContext.language"] == "it")
-        #expect(payload.count == 9)
+        #expect(payload["TelemetryDeck.RunContext.language"] == nil)
+        #expect(payload == configuration.payload(context))
     }
 
-    /// Without the app's settings reader only system values are sent: unknown settings are left
-    /// out, never reported as "false" (telemetry switched on in Settings during launch).
+    /// Fallback context follows the same minimal wire contract.
     @Test func fallbackContextOmitsSettings() {
         #expect(Set(configuration.payload(.system(language: .italian)).keys) == [
             "TelemetryDeck.AppInfo.version", "TelemetryDeck.Device.platform", "TelemetryDeck.Device.operatingSystem",
-            "TelemetryDeck.Device.systemMajorVersion", "TelemetryDeck.RunContext.language",
+            "TelemetryDeck.Device.systemMajorVersion",
         ])
     }
 
-    /// Telemetry off at launch, then switched on in Settings: the signal still reads the settings
+    /// Telemetry off at launch, then switched on in Settings: the signal still reads the context
     /// through the provider the launch installed, not the fallback.
     @Test func launchProviderSurvivesEnablingLater() async throws {
         let harness = Harness()
@@ -85,7 +78,7 @@ struct DailyTelemetryTests {
             await Task.yield()
         }
         let payloads = try await recorder.requests.map(payload)
-        #expect(payloads.first?["BeepBar.automaticSyncInterval"] == "28800")
+        #expect(payloads.first == configuration.payload(context))
         controller.stop()
     }
 
@@ -390,14 +383,14 @@ struct DailyTelemetryTests {
         let base = context
         await controller.start(context: {
             var current = base
-            current.dataSaverEnabled = state.date.timeIntervalSince1970 > 0
+            current.systemMajorVersion = state.date.timeIntervalSince1970 > 0 ? 16 : 15
             return current
         })
         state.date = Date(timeIntervalSince1970: 1)
         clock.date += 86_400
         await controller.checkIn()
         let payloads = try await recorder.requests.map(payload)
-        #expect(payloads.map { $0["BeepBar.dataSaver"] } == ["false", "true"])
+        #expect(payloads.map { $0["TelemetryDeck.Device.systemMajorVersion"] } == ["macOS 15", "macOS 16"])
         controller.stop()
     }
 

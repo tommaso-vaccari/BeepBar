@@ -73,7 +73,7 @@ struct RecordingsListing: Equatable {
 ///   its notification settings and history (an opaque reset namespace remains). Personal study choices
 ///   remain account-scoped. Another WeBeep account never inherits a Polimi session:
 ///   the saved one names its owner and is dropped when the known account differs.
-/// - **Quiet at rest.** Nothing runs on its own: no timer, no observer. Work starts only when the
+/// - **Quiet at rest.** A metadata check and timer expire saved sessions after ten days. Other work starts when the
 ///   Recordings page is shown, a sign-in starts, a lecture is played, or a sync run asks for its
 ///   listings follow-up (`refreshForSync`, see below). The browser is closed as soon as none of
 ///   these needs it any more, unless a sign-in is on screen. Nothing here takes part in quitting
@@ -159,6 +159,7 @@ struct RecordingsListing: Equatable {
 ///   first). A failure of this refresh is never shown as a sync failure.
 @MainActor final class RecordingsController: ObservableObject {
     nonisolated static let enabledKey = "io.github.tvaccari.beepbar.recordings-enabled.v1"
+    nonisolated static let sessionDeletionPendingKey = "io.github.tvaccari.beepbar.recordings-session-deletion-pending.v1"
     private static let sessionDiscardedKey = "io.github.tvaccari.beepbar.recordings-session-discarded.v1"
 
     /// The switch as saved: on by default, and off wherever the feature isn't available. Shared by
@@ -190,6 +191,12 @@ struct RecordingsListing: Equatable {
     /// player in the default browser, on purpose (the rows' "Apri nel browser" menu item, which
     /// before the package F fix ran a native Play despite its name). `copyLink`: the clipboard.
     enum OpenAction: Equatable { case play, browser, copyLink }
+
+    @Published private(set) var studyDeletionFailed = false
+    nonisolated static let studyDeletionPendingKey = "io.github.tvaccari.beepbar.study-deletion-pending.v1"
+    @Published private(set) var sessionDeletionFailed = false
+    private var sessionDeletionGeneration = 0
+    private var sessionExpirationTask: Task<Void, Never>?
 
     @Published private(set) var isEnabled: Bool
     @Published private(set) var access: RecordingsAccess
@@ -484,7 +491,7 @@ struct RecordingsListing: Equatable {
         playbackURLs = BoundedCache(capacity: playbackURLCapacity)
         self.makeBrowser = makeBrowser
         self.store = store
-        self.vault = RecmanSessionVault(storage: .init(load: { try store.load() }, save: { try store.save($0) }, delete: { try store.delete() }))
+        self.vault = RecmanSessionVault(storage: .init(load: { try store.load() }, save: { try store.save($0) }, delete: { try store.delete() }, expirationDate: { try store.expirationDate() }))
         let historyFactory = makeSeenHistory ?? { namespace in
             RecordingsSeenHistory(store: RecordingsSeenStore(directory: store.directory, namespace: namespace))
         }
@@ -511,6 +518,13 @@ struct RecordingsListing: Equatable {
         isEnabled = enabled
         access = enabled ? .ready : .off
         legacySeen = .init(ids: enabled ? defaults.stringArray(forKey: Self.acknowledgedKey) ?? [] : [], baselines: enabled ? defaults.stringArray(forKey: Self.baselinedKey) ?? [] : [])
+        if defaults.bool(forKey: Self.sessionDeletionPendingKey) {
+            sessionDeletionFailed = true
+            discardSessionFile()
+        }
+        studyDeletionFailed = defaults.bool(forKey: Self.studyDeletionPendingKey)
+        if studyDeletionFailed { retryStudyDeletion() }
+        scheduleSessionExpiration()
     }
 
     /// The saved switch, on unless turned off; Polimi still decides (`isAvailable`). Shared with
@@ -559,6 +573,25 @@ struct RecordingsListing: Equatable {
         } catch {
             studyProblem = BilingualText("Non è stato possibile salvare la watchlist. Riprova.", "Couldn't save the watchlist. Try again.")
         }
+    }
+
+    var canForgetStudyData: Bool { ownerUserID() != nil }
+
+    func forgetStudyData() {
+        guard let owner = ownerUserID() else { return }
+        supersedeInitialSessionCheck()
+        closePlayerForIdentityChange()
+        invalidate()
+        closeBrowser()
+        forgetSeen()
+        forgetResumePoints()
+        defaults.removeObject(forKey: Self.studyKey(owner: owner))
+        studyLoaded = false
+        loadStudy()
+        listings.removeAll()
+        playbackURLs.removeAll()
+        if !isEnabled { access = .off }
+        else if access == .signingIn { access = .needsSignIn(nil) }
     }
 
     var canEditStudy: Bool { isEnabled && studyOwner != nil && !studyUnreadable }
@@ -1135,10 +1168,32 @@ struct RecordingsListing: Equatable {
         previous.invalidate()
         let reset = historyResetTask
         seenHistory = makeSeenHistory(namespace)
-        historyResetTask = Task { [log] in
+        defaults.set(true, forKey: Self.studyDeletionPendingKey)
+        let current = seenHistory
+        historyResetTask = Task { [weak self, log] in
             await reset?.value
-            do { try await previous.invalidateAndDelete() }
-            catch { log.error("Couldn't delete obsolete recording history; next use retries cleanup") }
+            var failed = false
+            do { try await previous.invalidateAndDelete() } catch { failed = true }
+            do { try await current.removeObsoleteFiles(); failed = false } catch { failed = true }
+            guard let self, self.defaults.string(forKey: Self.historyNamespaceKey) == namespace.uuidString else { return }
+            self.studyDeletionFailed = failed
+            if !failed { self.defaults.removeObject(forKey: Self.studyDeletionPendingKey) }
+            else { log.error("Couldn't delete obsolete recording history") }
+        }
+    }
+
+    func retryStudyDeletion() {
+        let history = seenHistory
+        let reset = historyResetTask
+        let namespace = defaults.string(forKey: Self.historyNamespaceKey)
+        historyResetTask = Task { [weak self] in
+            await reset?.value
+            do {
+                try await history.removeObsoleteFiles()
+                guard let self, self.defaults.string(forKey: Self.historyNamespaceKey) == namespace else { return }
+                self.studyDeletionFailed = false
+                self.defaults.removeObject(forKey: Self.studyDeletionPendingKey)
+            } catch { self?.studyDeletionFailed = true }
         }
     }
 
@@ -2708,14 +2763,21 @@ struct RecordingsListing: Equatable {
         let keepFileEmail = !emailLoaded && !emailEditedByUser
         switch await vault.save(cookies, ownerUserID: owner, email: confirmedEmail?.value, keepingFileEmail: keepFileEmail, epoch: epoch, now: now()).value {
         case .saved:
+            scheduleSessionExpiration()
             if generation == self.generation, vault.epoch == epoch, defaults.bool(forKey: Self.sessionDiscardedKey) {
                 defaults.removeObject(forKey: Self.sessionDiscardedKey)
+                defaults.removeObject(forKey: Self.sessionDeletionPendingKey)
+                sessionDeletionFailed = false
+                sessionDeletionGeneration += 1
             }
             // The cycle's cached read now describes an older file.
             sessionLoad = nil
         case .unchanged:
             if generation == self.generation, vault.epoch == epoch, defaults.bool(forKey: Self.sessionDiscardedKey) {
                 defaults.removeObject(forKey: Self.sessionDiscardedKey)
+                defaults.removeObject(forKey: Self.sessionDeletionPendingKey)
+                sessionDeletionFailed = false
+                sessionDeletionGeneration += 1
             }
         case .stale:
             log.notice("Polimi session not saved: discarded while saving")
@@ -2724,18 +2786,50 @@ struct RecordingsListing: Equatable {
         }
     }
 
-    /// Bumps the vault epoch now, so every save already under way is refused, and deletes the
-    /// file in turn, off the main actor.
+    private func scheduleSessionExpiration() {
+        sessionExpirationTask?.cancel()
+        let expiryRead = vault.expirationDate()
+        let epoch = vault.epoch
+        sessionExpirationTask = Task { [weak self] in
+            let expiry = await expiryRead.value
+            guard let expiry, !Task.isCancelled else { return }
+            do { try await Task.sleep(for: .seconds(max(0, expiry.timeIntervalSinceNow))) }
+            catch { return }
+            guard let self, self.vault.epoch == epoch else { return }
+            self.supersedeInitialSessionCheck()
+            self.closePlayerForIdentityChange()
+            self.invalidate()
+            self.closeBrowser()
+            self.discardSessionFile()
+            self.access = self.isEnabled ? .needsSignIn(nil) : .off
+        }
+    }
+
+    func retrySessionDeletion() {
+        guard sessionDeletionFailed, !isEnabled else { return }
+        discardSessionFile()
+    }
+
     private func discardSessionFile() {
+        sessionExpirationTask?.cancel()
+        defaults.set(true, forKey: Self.sessionDeletionPendingKey)
+        sessionDeletionGeneration += 1
+        let deletionGeneration = sessionDeletionGeneration
         defaults.set(true, forKey: Self.sessionDiscardedKey)
         sessionOwner = nil
         sessionLoad = nil
         // The email lives in the file and goes with it, in memory too.
         resetEmail()
         let delete = vault.discard()
-        Task { [log] in
-            if case .failed(let errorType) = await delete.value {
+        Task { [weak self, log] in
+            let outcome = await delete.value
+            guard let self, self.sessionDeletionGeneration == deletionGeneration else { return }
+            if case .failed(let errorType) = outcome {
+                self.sessionDeletionFailed = true
                 log.error("Couldn't delete the saved Polimi session errorType=\(errorType, privacy: .public)")
+            } else {
+                self.sessionDeletionFailed = false
+                self.defaults.removeObject(forKey: Self.sessionDeletionPendingKey)
             }
         }
     }

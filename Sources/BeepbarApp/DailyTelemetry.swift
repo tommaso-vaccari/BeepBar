@@ -5,11 +5,9 @@ import CryptoKit
 import Foundation
 import os
 
-/// The settings a daily signal reports (#128). Each field has few possible values, but with a
-/// small user base their combination, plus the source IP, can still be distinctive: the monthly
-/// identifier limits linking on the client, it does not make the data anonymous.
-/// Built on the main actor at send time, so a change made during the day shows up the next day.
-/// A `nil` setting is unknown and left out of the payload rather than reported wrong.
+/// Internal launch context, read on the main actor at send time. Only app and major OS
+/// versions enter the payload; settings and language remain local. The monthly identifier
+/// and source IP mean the transmitted signal is not proven anonymous.
 struct DailyTelemetryContext: Equatable, Sendable {
     var language: AppLanguage
     /// Major macOS version only (e.g. 15): the full build would narrow installations down.
@@ -23,8 +21,7 @@ struct DailyTelemetryContext: Equatable, Sendable {
     /// `nil` while macOS hasn't answered yet.
     var launchAtLogin: Bool?
 
-    /// Values that need no app state, for a signal sent before the app installed its provider
-    /// (telemetry switched on in Settings during launch): the settings are then omitted.
+    /// Values that need no app state, before the app installs its provider.
     static func system(language: AppLanguage = .current) -> Self {
         Self(language: language, systemMajorVersion: ProcessInfo.processInfo.operatingSystemVersion.majorVersion)
     }
@@ -56,28 +53,14 @@ struct DailyTelemetryConfiguration: Sendable {
 #endif
     }
 
-    /// The whole payload. App version, platform, macOS major version and language use the keys and
-    /// value formats of TelemetryDeck's Swift SDK, so the dashboard's built-in version, OS and
-    /// language insights read them without custom queries; nothing else from the SDK's default set
-    /// (device model, screen, time zone, region, locale) is sent. BeepBar's own settings stay in the
-    /// `BeepBar.` scope, as TelemetryDeck asks for custom keys. Values are strings, as the SDK sends.
+    /// Only app and major OS versions are reported; settings and language stay on the Mac.
     func payload(_ context: DailyTelemetryContext) -> [String: String] {
-        var payload = [
+        [
             "TelemetryDeck.AppInfo.version": version,
             "TelemetryDeck.Device.platform": "macOS",
             "TelemetryDeck.Device.operatingSystem": "macOS",
             "TelemetryDeck.Device.systemMajorVersion": "macOS \(context.systemMajorVersion)",
-            "TelemetryDeck.RunContext.language": context.language.rawValue,
         ]
-        let flags: [(String, Bool?)] = [
-            ("BeepBar.automaticSync", context.automaticSyncEnabled),
-            ("BeepBar.dataSaver", context.dataSaverEnabled),
-            ("BeepBar.recordings", context.recordingsEnabled),
-            ("BeepBar.launchAtLogin", context.launchAtLogin),
-        ]
-        for case let (key, value?) in flags { payload[key] = value ? "true" : "false" }
-        if let interval = context.automaticSyncInterval { payload["BeepBar.automaticSyncInterval"] = String(interval) }
-        return payload
     }
 
     /// `clientID` is this month's random identifier; only its hash with the App ID leaves the Mac.

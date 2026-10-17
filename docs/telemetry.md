@@ -13,7 +13,7 @@ Debug builds, tests and UI previews do not use production configuration. Release
 One JSON array containing one signal is POSTed to `https://nom.telemetrydeck.com/v2/namespace/com.beepbar/`:
 
 - `appID`: the public app identifier.
-- `clientUser`: SHA-256 of the App ID and a random UUID that lives for one UTC calendar month. The UUID is never transmitted. When the UTC month changes it is replaced by a fresh random UUID, not derived from the previous one, so the client keeps no link between months (a clock moved back sends nothing until the UTC day after the last attempt; the next allowed signal reuses the UUID if its month still matches, otherwise it creates a fresh one). The receiver may still re-link months from the payload and the source IP, see below. Turning telemetry off deletes it; turning it on again starts a new one. The permanent installation UUID of the first `dev` build (`dailyTelemetryInstallationID`, never released) is deleted on launch. TelemetryDeck's Swift SDK states in a code comment that the server hashes and salts `clientUser` again; its public ingest documentation does not say so, so this document does not rely on it.
+- `clientUser`: SHA-256 of the App ID and a random UUID that lives for one UTC calendar month. The UUID is never transmitted. When the UTC month changes it is replaced by a fresh random UUID, not derived from the previous one, so the client keeps no link between months (a clock moved back sends nothing until the UTC day after the last attempt; the next allowed signal reuses the UUID if its month still matches, otherwise it creates a fresh one). The receiver may still re-link months from the payload and the source IP, see below. Turning telemetry off deletes it; turning it on again starts a new one. The permanent installation UUID of the first `dev` build (`dailyTelemetryInstallationID`, never released) is deleted on launch. The provider describes server-side salting and hashing, but applicability and guarantees for this direct API integration remain to be confirmed.
 - `type`: `BeepBar.dailyActive`.
 - `payload`, all values as strings:
 
@@ -22,18 +22,10 @@ One JSON array containing one signal is POSTed to `https://nom.telemetrydeck.com
 | `TelemetryDeck.AppInfo.version` | `CFBundleShortVersionString` | SDK key: the dashboard's version insights read it |
 | `TelemetryDeck.Device.platform` / `TelemetryDeck.Device.operatingSystem` | `macOS` | SDK keys, constant |
 | `TelemetryDeck.Device.systemMajorVersion` | `macOS 15` (major version only, SDK format) | SDK key |
-| `TelemetryDeck.RunContext.language` | `it` or `en`, BeepBar's language at send time | SDK key |
-| `BeepBar.automaticSync` | `true` / `false` | custom |
-| `BeepBar.automaticSyncInterval` | seconds, one of the Settings options | custom |
-| `BeepBar.dataSaver` | `true` / `false` | custom |
-| `BeepBar.recordings` | `true` / `false` (read without creating the Recordings controller); `true` means Polimi is selected (the default), the only university with Recordings; it does not prove an authenticated account | custom |
-| `BeepBar.launchAtLogin` | `true` / `false`; omitted while macOS has not reported the login item | custom |
 
-`BeepBar.*` settings that are unknown when a signal is sent (the login item before macOS answers, or every setting when telemetry is switched on during launch, before the app installed its settings reader) are omitted, never reported as `false`.
+Language and all `BeepBar.*` settings are omitted, including sync interval, Data Saver, Recordings and login-item state. The context reader remains internal; those values never enter the request.
 
-The SDK keys reuse TelemetryDeck's standard names and formats so the built-in insights work; TelemetryDeck's advice to avoid the `TelemetryDeck.` scope concerns inventing new keys there. No other SDK default is sent: no device model, screen, architecture, time zone, region, locale, full OS build or retention counters. Settings are read when the signal is sent, so a change made during a day appears in the next day's signal.
-
-There is no account, course, file, device model, location or session metadata in the payload, and no university field (but see `BeepBar.recordings`). Each field has few possible values; with a small user base their combination can still be distinctive and stable across months, so together with the source IP the receiver could re-link an installation's months. The monthly identifier limits linking on the client; it does not make the data anonymous. Like any HTTPS receiver, the service necessarily receives network connection information, including the source IP. Use TelemetryDeck's [privacy information](https://telemetrydeck.com/privacy/) for its handling; hashing is not a guarantee that network traffic contains no identifying information.
+The monthly identifier still links events within a month. The receiver necessarily receives the connection IP. Hashing and this smaller payload do not demonstrate anonymity or a lawful default-on implementation. See [release privacy gate](privacy-release-gate.md).
 
 ## Scheduling and limits
 
@@ -52,13 +44,12 @@ Filter all production queries to `type = BeepBar.dailyActive` and exclude Test M
 | Daily active installations | Number of signals per UTC day: each installation sends at most one. |
 | Monthly active installations | Distinct users per **calendar month**. Never count distinct users across a month boundary: the identifier changes there, so a rolling 7 / 30 day window that spans two months counts each installation twice. Turning telemetry off and on within a month also starts a new identifier, so that installation counts twice that month. |
 | Weekly activity | Average daily signals over the week, not distinct users. |
-| App version / macOS / language adoption | Built-in insights, or signals grouped by `TelemetryDeck.AppInfo.version`, `TelemetryDeck.Device.systemMajorVersion`, `TelemetryDeck.RunContext.language`, per day. |
-| Settings in use | Signals per day grouped by a `BeepBar.*` key; divide by that day's signals for a share. |
+| App version / macOS adoption | Built-in insights, or signals grouped by `TelemetryDeck.AppInfo.version`, `TelemetryDeck.Device.systemMajorVersion`, per day. |
 
-Recent Events shows a fixed set of columns: `TelemetryDeck.Device.modelName` stays empty because it is never sent, and other payload keys appear after adding them as columns or opening an event. Signals sent before this change carry `BeepBar.appVersion` instead of `TelemetryDeck.AppInfo.version`. The free plan currently offers 50,000 signals/month and three months of queryable history; longer historical trends require exporting aggregates or a different plan. Verify current limits in the dashboard's billing page before a release; the free tier is not realtime.
+Recent Events shows a fixed set of columns: `TelemetryDeck.Device.modelName` stays empty because it is never sent, and other payload keys appear after adding them as columns or opening an event. Signals sent before this change carry `BeepBar.appVersion` instead of `TelemetryDeck.AppInfo.version`. The free plan currently offers 50,000 signals/month and three months of queryable history; this is not a deletion deadline. The provider’s current FAQ gives no guaranteed cold-storage deletion schedule. Verify current limits in the dashboard's billing page before a release; the free tier is not realtime.
 
 ## Verification
 
 On 2026-10-10 the owner confirmed two manually authorized synthetic signals in Explore → Recent Events with Test Mode enabled: `BeepBar.integrationCheck` (namespaced endpoint, boolean `isTestMode = true`) and `BeepBar.sdkFormatTest` (generic endpoint, string `isTestMode = "true"`). Both used the configured App ID. This verifies ingestion, processing and dashboard visibility without an SDK; the earlier empty results did not establish a payload-format failure. No production signal was submitted during development.
 
-The free namespace status warns that processing occurs between once an hour and once a day. HTTP 200 / `OK` means the ingest endpoint accepted the request; dashboard visibility can lag. The device-model column remains empty because that field is omitted. Signals from the earlier payload use the custom `BeepBar.appVersion` key; signals from this change use the SDK keys listed above for built-in version, system and language insights.
+The free namespace status warns that processing occurs between once an hour and once a day. HTTP 200 / `OK` means the ingest endpoint accepted the request; dashboard visibility can lag. The device-model column remains empty because that field is omitted. Signals from the earlier payload use the custom `BeepBar.appVersion` key; signals from this change use the SDK keys listed above for built-in version and system insights.

@@ -80,5 +80,60 @@
     "sha256": "8f392f9d2a173c5e5f9b582e66639b160c9432b523fd7aca75a0700b54ec0963",
     "bytes": 19651,
     "raw": "S-0007-telemetry-50177f3.md"
+  },
+  {
+    "id": "S-0008",
+    "title": "TelemetryDeck agreement",
+    "url": "https://telemetrydeck.com/dpa/",
+    "resolved_url": "https://telemetrydeck.com/dpa/",
+    "retrieved_date": "2026-10-17",
+    "sha256": "f580452bbfe25f37b68a796087e04bfbe09c69c9748623b20a55f090bc01060e",
+    "bytes": 106675,
+    "content_type": "text/html",
+    "raw": "S-0008-2026-10-17.html"
+  },
+  {
+    "id": "S-0009",
+    "title": "TelemetryDeck Privacy FAQ",
+    "url": "https://telemetrydeck.com/docs/guides/privacy-faq/",
+    "resolved_url": "https://telemetrydeck.com/docs/guides/privacy-faq/",
+    "retrieved_date": "2026-10-17",
+    "sha256": "dad2da67f4fbf8d1c1a8bbc6e95d43d86b9181e22296a4bf5d15f507f8434b81",
+    "bytes": 140350,
+    "content_type": "text/html",
+    "raw": "S-0009-2026-10-17.html"
+  },
+  {
+    "id": "S-0010",
+    "title": "EDPB lawful processing",
+    "url": "https://www.edpb.europa.eu/sme/be-compliant/process-personal-data-lawfully_en",
+    "resolved_url": "https://www.edpb.europa.eu/sme/be-compliant/process-personal-data-lawfully_en",
+    "retrieved_date": "2026-10-17",
+    "sha256": "550b89a6388552ab1ea3a34f697352f3eaa0e97c1b725901d88153eed53ea92a",
+    "bytes": 65101,
+    "content_type": "text/html; charset=utf-8",
+    "raw": "S-0010-2026-10-17.html"
+  },
+  {
+    "id": "S-0011",
+    "title": "EDPB technical scope Article 5(3) final 2.0",
+    "url": "https://www.edpb.europa.eu/system/files/documents/2024-10/edpb_guidelines_202302_technical_scope_art_53_eprivacydirective_v2_en_0.pdf",
+    "resolved_url": "https://www.edpb.europa.eu/system/files/documents/2024-10/edpb_guidelines_202302_technical_scope_art_53_eprivacydirective_v2_en_0.pdf",
+    "retrieved_date": "2026-10-17",
+    "sha256": "dbc1d37783e35ae8668925f92a590ae282eec24c98381a5a8f91b5c2048b5b03",
+    "bytes": 409348,
+    "content_type": "application/pdf",
+    "raw": "S-0011-2026-10-17.pdf"
+  },
+  {
+    "id": "S-0012",
+    "title": "Garante cookie guidance 10 June 2021",
+    "url": "https://www.garanteprivacy.it/home/docweb/-/docweb-display/docweb/9677876",
+    "resolved_url": "https://www.garanteprivacy.it/home/docweb/-/docweb-display/docweb/9677876",
+    "retrieved_date": "2026-10-17",
+    "sha256": "447d87fd23135545c8886ce5d70fb45f0374653ee21ad52446ca8ee6e8cea25a",
+    "bytes": 243070,
+    "content_type": "text/html;charset=UTF-8",
+    "raw": "S-0012-2026-10-17.html"
   }
 ]

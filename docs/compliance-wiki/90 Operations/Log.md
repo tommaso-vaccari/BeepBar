@@ -44,3 +44,9 @@ Aggiornata la mappa dei dati sul branch `feature/recordings-progress-and-player`
 ### 2026-10-14 — Minimizzazione riepilogo PR #154
 
 Analisi statica del completamento della PR: `StoredCourseWatchSummary` scrive solo ID, codice/anno, titolo e durata della prossima lezione. URL originale, query, data, tipo e dimensione esclusi; URL ricostruito da ID validato. Le righe legacy restano sul disco fino alla successiva riscrittura o rimozione. Aggiornata la mappa, nessuna nuova fonte esterna né conclusione giuridica; verifica pre-release ancora aperta.
+
+## 2026-10-17 — issue #180
+
+Ingestione S-0008–S-0012: accordo/FAQ fornitore, basi GDPR, ePrivacy finale e Garante. La finestra dashboard non dimostra cancellazione; contratto fornitore non equivale automaticamente a nomina art. 28. Branch di rimedio riduce payload ed espone errori di cancellazione. Gate legale, runtime e approvazione informativa aperti. Nessun dato reale o invio al fornitore.
+
+Decisioni utente del 2026-10-17: sessioni massimo dieci giorni dal primo salvataggio, esclusione token/sessioni dai futuri backup e comando di cancellazione dati di studio per account conservando i materiali. Implementazione nel branch #181, verifiche automatiche e revisione indipendente; nessuna conclusione di conformità giuridica.

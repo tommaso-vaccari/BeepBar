@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+### Fixed
+
+- In Recordings, a course with a single recording now reads “1 registrazione” instead of “1 registrazioni”, and VoiceOver announces one new lecture as “1 nuova”.
+
 ## 2026-10-17
 
 ### Release highlights

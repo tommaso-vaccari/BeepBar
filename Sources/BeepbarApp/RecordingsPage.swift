@@ -73,6 +73,27 @@ enum RecordingsPresentation {
         return BilingualText("\(left) da guardare", "\(left) left")
     }
 
+    /// "1 registrazione" / "3 registrazioni": the course's recording count, in the sidebar
+    /// subtitle and the course header. Both languages agree in number (#195).
+    static func recordingCount(_ count: Int) -> BilingualText {
+        BilingualText(italianCount(count, "registrazione", "registrazioni"), englishCount(count, "recording", "recordings"))
+    }
+
+    /// VoiceOver's label of the sidebar badge counting new lectures: "1 nuova" / "3 nuove" (#195).
+    static func newCountLabel(_ count: Int) -> BilingualText {
+        BilingualText(italianCount(count, "nuova", "nuove"), "\(count) new")
+    }
+
+    /// The sidebar course row's third line: the recording count, or what the listing is doing.
+    static func courseSubtitle(for listing: RecordingsListing?) -> String {
+        if let count = listing?.recordings?.count {
+            return count == 0 ? tr("Nessuna registrazione", "No recordings") : recordingCount(count).text
+        }
+        if listing?.isLoading == true { return tr("Caricamento…", "Loading…") }
+        if listing?.problem != nil { return tr("Non disponibile", "Unavailable") }
+        return " "
+    }
+
     // MARK: Watch progress
 
     /// What one row shows of its watch progress, as plain values: the row compares it with `==`,
@@ -398,7 +419,7 @@ struct RecordingsPage: View {
                 // header keeps the WeBeep name on purpose: owner decision, sidebar and menu only.
                 ForEach(model.searchable) { entry in
                     let summary = authentication.watchSummaries[entry.key]
-                    CourseRow(name: entry.sidebarName, key: entry.key, subtitle: CourseRow.subtitle(for: recordings.listing(for: entry.key)), newCount: recordings.newCount(for: entry.key),
+                    CourseRow(name: entry.sidebarName, key: entry.key, subtitle: RecordingsPresentation.courseSubtitle(for: recordings.listing(for: entry.key)), newCount: recordings.newCount(for: entry.key),
                               toWatch: RecordingsPresentation.hasLecturesToWatch(summary: summary) ? summary.map(RecordingsPresentation.lecturesToWatchValue) : nil)
                         .equatable()
                         .tag(RecordingsDestination.course(entry.course.id))
@@ -492,19 +513,10 @@ private struct CourseRow: View, Equatable {
                     .padding(.horizontal, 6)
                     .frame(minHeight: 17)
                     .background(Color.accentColor, in: Capsule())
-                    .accessibilityLabel(tr("\(newCount) nuove", "\(newCount) new"))
+                    .accessibilityLabel(RecordingsPresentation.newCountLabel(newCount).text)
             }
         }
         .padding(.vertical, 2)
-    }
-
-    static func subtitle(for listing: RecordingsListing?) -> String {
-        if let count = listing?.recordings?.count {
-            return count == 0 ? tr("Nessuna registrazione", "No recordings") : tr("\(count) registrazioni", englishCount(count, "recording", "recordings"))
-        }
-        if listing?.isLoading == true { return tr("Caricamento…", "Loading…") }
-        if listing?.problem != nil { return tr("Non disponibile", "Unavailable") }
-        return " "
     }
 }
 
@@ -626,7 +638,7 @@ private struct CourseRecordings: View {
             return listing?.isLoading == true ? "\(year) · \(tr("caricamento…", "loading…"))" : year
         }
         let minutes = summary(list).totalMinutes
-        var parts = [year, tr("\(list.count) registrazioni", englishCount(list.count, "recording", "recordings"))]
+        var parts = [year, RecordingsPresentation.recordingCount(list.count).text]
         if minutes > 0 { parts.append(RecordingsPresentation.durationText(minutes: minutes)) }
         return parts.joined(separator: " · ")
     }

@@ -16,6 +16,31 @@ struct RecordingsPresentationTests {
                         duration: "97 min", size: nil, previewURL: URL(string: "https://onlineservices.polimi.it/")!)
     }
 
+    /// Italian counts agree in number with their noun, like English ones (#195): a course with
+    /// one recording reads "1 registrazione" (sidebar subtitle and course header) and one new
+    /// lecture is announced as "1 nuova", never "1 registrazioni" / "1 nuove". Checked through
+    /// `BilingualText` for both languages; the subtitle in the tests' Italian default proves the
+    /// sidebar uses the helper. Mutation: always pass the plural to `italianCount`, or put the
+    /// old `tr("\(count) registrazioni", …)` back in `courseSubtitle`, and the 1 cases fail.
+    @Test func countsUseTheItalianSingularForOne() {
+        #expect(italianCount(0, "registrazione", "registrazioni") == "0 registrazioni")
+        #expect(italianCount(1, "registrazione", "registrazioni") == "1 registrazione")
+        #expect(italianCount(2, "registrazione", "registrazioni") == "2 registrazioni")
+
+        #expect(RecordingsPresentation.recordingCount(0) == BilingualText("0 registrazioni", "0 recordings"))
+        #expect(RecordingsPresentation.recordingCount(1) == BilingualText("1 registrazione", "1 recording"))
+        #expect(RecordingsPresentation.recordingCount(2) == BilingualText("2 registrazioni", "2 recordings"))
+
+        #expect(RecordingsPresentation.newCountLabel(0) == BilingualText("0 nuove", "0 new"))
+        #expect(RecordingsPresentation.newCountLabel(1) == BilingualText("1 nuova", "1 new"))
+        #expect(RecordingsPresentation.newCountLabel(2) == BilingualText("2 nuove", "2 new"))
+
+        let one = recording("a", "2026-10-01T10:00:00Z")
+        #expect(RecordingsPresentation.courseSubtitle(for: RecordingsListing(recordings: [one])) == "1 registrazione")
+        #expect(RecordingsPresentation.courseSubtitle(for: RecordingsListing(recordings: [one, recording("b", "2026-10-02T10:00:00Z")])) == "2 registrazioni")
+        #expect(RecordingsPresentation.courseSubtitle(for: RecordingsListing(recordings: [])) == "Nessuna registrazione")
+    }
+
     @Test func sidebarExcludesDisabledCoursesInBothSections() {
         let courses = [course(1, "058167 - Course [2026/27]"), course(2, "058168 - Course [2026/27]"), course(3, "No code"), course(4, "Another unknown")]
         let shown = RecordingsPresentation.syncedCourses(courses, enabledIDs: [1, 3])

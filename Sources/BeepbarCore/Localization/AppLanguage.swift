@@ -50,6 +50,13 @@ public func englishCount(_ count: Int, _ one: String, _ many: String) -> String 
     "\(count) \(count == 1 ? one : many)"
 }
 
+/// "1 registrazione" / "3 registrazioni": the Italian counterpart of `englishCount`, for the
+/// nouns and adjectives that do change in the plural ("nuova"/"nuove"). Without it a count of one
+/// read "1 registrazioni" in the Recordings page (#195). Same rule as English: only 1 is singular.
+public func italianCount(_ count: Int, _ one: String, _ many: String) -> String {
+    "\(count) \(count == 1 ? one : many)"
+}
+
 /// Text that has to outlive the moment it was produced (stored errors, failure states): both
 /// variants are kept so it still follows a later language switch instead of freezing in the
 /// language that was active when it was stored.

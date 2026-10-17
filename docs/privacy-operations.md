@@ -1,6 +1,6 @@
 # Privacy operations — proposed procedure
 
-Owner approval and a synthetic dry run are still required; see [release gate](privacy-release-gate.md). Public contact: [draft notice](privacy-notice.md). Never place actual requests, account details, incidents or secrets in GitHub issues or this repository.
+Owner/request handler: Tommaso Vaccari, confirmed 2026-10-17. Correspondence retention approved: delete within 90 days of closure except documented legal obligations or disputes. Approval of the remaining procedure is pending; the owner waived the synthetic dry run for this PR, which remains unperformed; see [release gate](privacy-release-gate.md). Public contact: [draft notice](privacy-notice.md). Never place actual requests, account details, incidents or secrets in GitHub issues or this repository.
 
 ## Requests
 
@@ -8,7 +8,7 @@ Owner approval and a synthetic dry run are still required; see [release gate](pr
 2. Check identity proportionately only when needed. Distinguish locally controlled app data, information held for support, telemetry, and university/Webex data. Route third-party service requests appropriately; do not promise authority over their records.
 3. Respond without undue delay and within one month under GDPR Article 12(3). A justified extension of up to two further months must be explained within the original month. Document refusals, applicable exceptions and complaint routes.
 4. For local erasure, guide the user; do not access their device without separate authorization. For telemetry establish whether records can actually be linked and the provider's assistance; GDPR Article 11 does not require collecting extra identifiers solely for identification. Opt-out only stops future sends.
-5. Send exports privately, verify recipient and exclude other people's data. Retain only evidence necessary to handle/account for the request; proposed support retention is 90 days after closure, pending owner approval.
+5. Send exports privately, verify recipient and exclude other people's data. Retain only evidence necessary to handle/account for the request; delete support/privacy correspondence within 90 days after closure, except documented legal obligations or disputes.
 
 ## Local cleanup guidance
 
@@ -47,6 +47,6 @@ Static source inspection on the remediation branch; runtime and OS-managed reten
 | Downloaded materials, backups and conflict copies | User-controlled files under selected root; no automatic retention limit | User-managed; preserve before app reset |
 | WebKit and URLSession | Browser cookies use nonpersistent stores; API/download/resolver use ephemeral sessions | Browser/session close; explicit saved session above remains separate |
 | Logs, notifications, Now Playing, clipboard, OS crash diagnostics | Operational errors, displayed titles/links and system-managed diagnostics | OS/user-controlled; clipboard may be retained by other apps; no guaranteed OS purge by logout |
-| Sparkle/provider storage and support email | Update metadata, provider analytics and voluntary support messages | Provider evidence and approved support policy still required |
+| Sparkle/provider storage and support email | Update metadata, provider analytics and voluntary support messages | Provider documentation limitations remain; support/privacy correspondence: approved 90-day deletion after closure, subject to documented legal exceptions |
 
-Browser log formatting now omits all path segments, query, userinfo and fragment, including email, UUID and arbitrary course-title paths. Login-item failure logs contain numeric error codes instead of arbitrary error descriptions. Static inspection cannot prove the absence of OS-level diagnostic data or substitute for the required synthetic runtime trace.
+Browser log formatting now omits all path segments, query, userinfo and fragment, including email, UUID and arbitrary course-title paths. Login-item failure logs contain numeric error codes instead of arbitrary error descriptions. Static inspection cannot prove the absence of OS-level diagnostic data or substitute for a synthetic runtime trace, which the owner waived for this PR.

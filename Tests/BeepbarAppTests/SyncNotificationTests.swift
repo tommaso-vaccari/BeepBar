@@ -97,7 +97,7 @@ private final class FakeNotificationCenter: NotificationCenterClient, @unchecked
     @Test func everyOtherEndingSendsNothing() async {
         let center = FakeNotificationCenter()
         let coordinator = SyncNotificationCoordinator(defaults: defaults, center: center)
-        for outcome: RecordingsSyncOutcome in [.refreshed(newlyPublished: 0, failedKeys: 0), .skipped(.switchedOff), .needsSignIn, .unavailable, .cancelled] {
+        for outcome: RecordingsSyncOutcome in [.refreshed(newlyPublished: 0, failedKeys: 0), .skipped(.switchedOff), .needsSignIn(newlyPublished: 0), .unavailable(newlyPublished: 0), .cancelled] {
             await coordinator.announceRecordingsRefresh(outcome)
         }
         await coordinator.postRecordingsSummary(newCount: 0)

@@ -19,12 +19,11 @@ struct RecordingsMenuPlayTests {
     private let course = RecmanCourseKey(courseCode: "058167", academicYear: 2026)!
     private let other = RecmanCourseKey(courseCode: "052499", academicYear: 2026)!
     private let third = RecmanCourseKey(courseCode: "099999", academicYear: 2026)!
-    /// What the controller asked the page for (`onMenuPlayNeedsPage`) and how often it brought the
-    /// player forward; a class so the controller's closures and the test see the same values.
+    /// What the controller asked the page for (`onMenuPlayNeedsPage`); a class so the controller's
+    /// closures and the test see the same values.
     @MainActor final class Calls {
         var needsPage: [RecmanCourseKey] = []
         var accessWhenAsked: [RecordingsAccess] = []
-        var broughtForward = 0
     }
     private let calls = Calls()
 
@@ -52,8 +51,7 @@ struct RecordingsMenuPlayTests {
             copy: { world.copied.append($0) },
             now: { MainActor.assumeIsolated { world.now } },
             makePlayer: { world.playersMade += 1; return world.player },
-            courses: { world.courses },
-            bringPlayerForward: { calls.broughtForward += 1 }
+            courses: { world.courses }
         )
         controller.onMenuPlayNeedsPage = { [weak controller] key in
             calls.needsPage.append(key)
@@ -330,8 +328,10 @@ struct RecordingsMenuPlayTests {
     }
 
     /// The lecture already in the player is brought forward, not played again (which would
-    /// restart it at its stored point and ask Webex for a new stream). Mutation: drop the
-    /// `stillShowing` branch in `playFromMenu` (a second play and stream call).
+    /// restart it at its stored point and ask Webex for a new stream), through the player's own
+    /// `bringToFront` so a minimized window comes back (issue #193). Mutations: drop the
+    /// `stillShowing` branch in `playFromMenu` (a second play and stream call); drop the
+    /// `bringToFront` call (nothing brought forward).
     @Test func theLectureAlreadyOpenIsBroughtForwardNotReplayed() async throws {
         defer { cleanUp() }
         let controller = await signedInController()
@@ -343,7 +343,7 @@ struct RecordingsMenuPlayTests {
         await drainTasks()
         #expect(world.player.plays.count == 1)
         #expect(browser.streamCalls == ["stream a"])
-        #expect(calls.broughtForward == 1)
+        #expect(world.player.broughtToFront == 1)
         controller.turnOff()
     }
 

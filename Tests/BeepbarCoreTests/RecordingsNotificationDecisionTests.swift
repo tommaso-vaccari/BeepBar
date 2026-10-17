@@ -18,11 +18,13 @@ struct RecordingsNotificationDecisionTests {
         #expect(RecordingsNotificationDecision.count(for: .refreshed(newlyPublished: 0, failedKeys: 4), notificationsEnabled: true) == nil)
     }
 
-    /// Every ending that is not a refresh is silent, an expired session and failures included:
-    /// guards against notifying a sign-in prompt or an outage.
+    /// Every ending with nothing newly published is silent, an expired session and an outage
+    /// included, and so is every skip and cancellation: guards against notifying a sign-in prompt
+    /// or an outage itself.
     @Test func everyOtherEndingIsSilent() {
         let outcomes: [RecordingsSyncOutcome] = [.skipped(.switchedOff), .skipped(.notPolimi), .skipped(.ownerUnknown), .skipped(.noCourses),
-                                                 .skipped(.materialsCancelled), .skipped(.materialsDeferred), .needsSignIn, .unavailable, .cancelled]
+                                                 .skipped(.materialsCancelled), .skipped(.materialsDeferred), .needsSignIn(newlyPublished: 0),
+                                                 .unavailable(newlyPublished: 0), .cancelled]
         for outcome in outcomes {
             #expect(RecordingsNotificationDecision.count(for: outcome, notificationsEnabled: true) == nil)
         }
@@ -31,5 +33,14 @@ struct RecordingsNotificationDecisionTests {
     /// Some courses failing does not hide the lectures the others published; the failure itself is not notified.
     @Test func partialFailureStillAnnouncesTheRealNewLectures() {
         #expect(RecordingsNotificationDecision.count(for: .refreshed(newlyPublished: 2, failedKeys: 1), notificationsEnabled: true) == 2)
+    }
+
+    /// A batch cut short by Polimi not answering or the session lapsing still announces what its
+    /// earlier courses published (issue #190), with the switch on only. Mutation: make those
+    /// endings return nil in `count(for:)` (the lectures are never announced).
+    @Test func aBatchCutShortStillAnnouncesWhatItPublished() {
+        #expect(RecordingsNotificationDecision.count(for: .unavailable(newlyPublished: 2), notificationsEnabled: true) == 2)
+        #expect(RecordingsNotificationDecision.count(for: .needsSignIn(newlyPublished: 1), notificationsEnabled: true) == 1)
+        #expect(RecordingsNotificationDecision.count(for: .unavailable(newlyPublished: 2), notificationsEnabled: false) == nil)
     }
 }

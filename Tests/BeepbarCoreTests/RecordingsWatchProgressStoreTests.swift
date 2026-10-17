@@ -79,6 +79,59 @@ struct RecordingsWatchProgressStoreTests {
         #expect(try progress(store, ids: []).isEmpty)
     }
 
+    /// Proves: one event over many recordings of a course (`applyProgress(owner:key:ids:event:)`,
+    /// #208) opens one write transaction for all of them, returns one result per ID in order
+    /// (already-done rows reported unchanged, with their entry), writes only the rows that change,
+    /// and a batch that changes nothing opens no transaction at all.
+    /// Guards against "Mark all as completed" paying a connection and a durable commit per
+    /// lecture (mutations: open the transaction per row → `writeTransactions` == N; drop the
+    /// unlocked first pass's early return → the unchanged batch opens one).
+    @Test func aBatchIsOneTransaction() throws {
+        defer { cleanUp() }
+        let probe = RecordingsSeenStore.Probe()
+        let store = store(probe: probe)
+        _ = try store.applyProgress(owner: 42, key: key, id: "r3", event: .manual(done: true))
+        let ids = (1...50).map { "r\($0)" }
+        let start = probe.current
+        let results = try store.applyProgress(owner: 42, key: key, ids: ids, event: .manual(done: true))
+        #expect(probe.current.writeTransactions == start.writeTransactions + 1)
+        #expect(probe.current.rowChanges == start.rowChanges + 49)
+        #expect(results.count == ids.count)
+        #expect(results.allSatisfy { $0.entry == RecordingWatchEntry(completed: .manual) })
+        #expect(results.enumerated().allSatisfy { $0.element.changed == ($0.offset != 2) }, "r3 was already done")
+        #expect(try progress(store, ids: ids).count == ids.count)
+
+        let unchanged = probe.current
+        let again = try store.applyProgress(owner: 42, key: key, ids: ids, event: .manual(done: true))
+        #expect(again.allSatisfy { !$0.changed })
+        #expect(probe.current.writeTransactions == unchanged.writeTransactions)
+        #expect(probe.current.rowChanges == unchanged.rowChanges)
+        #expect(try store.applyProgress(owner: 42, key: key, ids: [], event: .manual(done: false)).isEmpty)
+        #expect(probe.current.writeTransactions == unchanged.writeTransactions)
+    }
+
+    /// Proves: a batch is all or nothing. When the database refuses one row midway (a trigger
+    /// aborting its insert, after earlier rows were written in the same transaction), the call
+    /// throws and none of the batch's rows exist; an un-tick refused midway leaves every lecture
+    /// done. Rows are decided per entry, so a repeated ID reports no change the second time.
+    /// Guards against a failed "Mark all" leaving the course half saved (mutation: commit each
+    /// row in its own transaction → the rows before the refused one survive).
+    @Test func aBatchRefusedMidwaySavesNothing() throws {
+        defer { cleanUp() }
+        let store = store()
+        _ = try progress(store, ids: [])
+        try execute("CREATE TRIGGER refuse BEFORE INSERT ON progress WHEN NEW.id = 'c' BEGIN SELECT RAISE(ABORT, 'refused'); END")
+        #expect(throws: (any Error).self) { try store.applyProgress(owner: 42, key: key, ids: ["a", "b", "c", "d"], event: .manual(done: true)) }
+        #expect(try progress(store, ids: ["a", "b", "c", "d"]).isEmpty)
+        try execute("DROP TRIGGER refuse")
+
+        let repeated = try store.applyProgress(owner: 42, key: key, ids: ["a", "b", "a"], event: .manual(done: true))
+        #expect(repeated.map(\.changed) == [true, true, false])
+        try execute("CREATE TRIGGER refuse BEFORE UPDATE ON progress WHEN NEW.id = 'b' BEGIN SELECT RAISE(ABORT, 'refused'); END")
+        #expect(throws: (any Error).self) { try store.applyProgress(owner: 42, key: key, ids: ["a", "b"], event: .manual(done: false)) }
+        #expect(try progress(store, ids: ["a", "b"]).values.allSatisfy(\.isCompleted))
+    }
+
     /// Proves: an event that changes nothing (pause at the same place, a lower position, a tick on
     /// a done lecture, an un-tick on one not done) writes no row and opens no write transaction,
     /// while a real change writes exactly one row.

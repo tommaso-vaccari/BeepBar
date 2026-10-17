@@ -3590,8 +3590,9 @@ enum MaterialsRunEnd: Equatable, Sendable {
             // An account, site or folder change meanwhile: the result belongs to a world that is gone.
             guard self.recordingsFollowUpGeneration == generation else { return }
             self.lastRecordingsOutcome = result
-            // One aggregated notification for the lectures first seen by this refresh (nothing for a
-            // baseline, a failure or an expired session; the coordinator applies the Notifiche switch).
+            // One aggregated notification for the lectures first seen by this refresh, including those
+            // published before an outage or an expired session cut it short (#190); nothing for a
+            // baseline or a cancellation. The coordinator applies the Notifiche switch.
             await self.notificationCoordinator.announceRecordingsRefresh(result, isCurrent: { [weak self] in self?.recordingsFollowUpGeneration == generation })
         }
         recordingsFollowUp = task

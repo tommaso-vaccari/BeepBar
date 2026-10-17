@@ -414,6 +414,86 @@ import BeepbarCore
         try await page.untilOpeningEnds()
     }
 
+    /// The bulk button's cache scans the listing only when something the button reads changed
+    /// (#209): never for a playback tick (`live`, `summaries`) or the same listing in new
+    /// storage; once for a commit, a change of `canEdit` or another listing; and not for each
+    /// commit of the course's own bulk save, during which the button stays disabled with the
+    /// label of the last scan, then follows the saved state when the save ends.
+    /// Mutations: scan on every call (or bump `stateRevision` from `live`) and the tick checks
+    /// fail; drop the bump from `entries` and the commit leaves a stale label; drop the
+    /// `pendingCourses` branch and the bulk save scans once per commit; drop `canEdit` from the
+    /// comparison and the button stays enabled after editing becomes impossible.
+    @Test func bulkButtonScansOnlyWhenItsInputsChange() throws {
+        typealias BulkAction = RecordingsPresentation.BulkAction
+        let model = RecordingsWatchProgressModel()
+        let key = try #require(RecmanCourseKey(courseCode: "058167", academicYear: 2026))
+        let list = (0..<3).map { recording("bulk\($0)") }
+        let ids = list.map(RecordingsStudyState.identity)
+        model.setEntries([:], for: ids)
+        let cache = RecordingsPresentation.BulkActionCache()
+        func action(_ recordings: [RecmanRecording]? = nil, canEdit: Bool = true) -> BulkAction {
+            cache.action(for: key, recordings: recordings ?? list, values: RecordingsPresentation.WatchValues(model, canEdit: canEdit))
+        }
+        #expect(action() == BulkAction(allDone: false, enabled: true))
+        #expect(cache.scans == 1)
+
+        model.setLive(0.4, for: ids[0])
+        model.setSummary(CourseWatchSummary(done: 0, total: 3, remainingMinutes: 200, unknownDurationCount: 0), for: key)
+        #expect(action() == BulkAction(allDone: false, enabled: true))
+        #expect(action(list.map { $0 }) == BulkAction(allDone: false, enabled: true), "same listing, new storage")
+        #expect(cache.scans == 1, "a tick or an equal listing scanned the listing")
+
+        for id in ids { model.setEntry(RecordingWatchEntry(furthest: 1, completed: .manual), for: id) }
+        #expect(action() == BulkAction(allDone: true, enabled: true), "a commit is shown")
+        #expect(cache.scans == 2)
+        #expect(action(canEdit: false) == BulkAction(allDone: true, enabled: false))
+        #expect(cache.scans == 3)
+        #expect(action(Array(list.prefix(2))) == BulkAction(allDone: true, enabled: true))
+        #expect(cache.scans == 4, "another listing is scanned")
+        _ = action()
+        #expect(cache.scans == 5)
+
+        // The bulk un-tick of the whole course: one commit per lecture, no scan for any of them.
+        model.setPending(true, for: Set(ids), course: key)
+        #expect(action() == BulkAction(allDone: true, enabled: false))
+        for id in ids {
+            model.setEntry(RecordingWatchEntry(furthest: 1), for: id)
+            #expect(action() == BulkAction(allDone: true, enabled: false), "disabled, last label kept while saving")
+        }
+        #expect(cache.scans == 5, "the bulk save scanned \(cache.scans - 5) time(s)")
+        model.setPending(false, for: Set(ids), course: key)
+        #expect(action() == BulkAction(allDone: false, enabled: true), "the label follows the saved state after the save")
+        #expect(cache.scans == 6)
+    }
+
+    /// On the real page, a playback tick runs the toolbar's reader without scanning the listing,
+    /// and a commit scans it once, with the whole listing (#209). Counted through the
+    /// `bulkScan` probe, so the test fails if the page asks `bulkAction` directly again (its cost
+    /// would be the listing's size on every tick). Mutation: call `progress.bulkAction` in the
+    /// toolbar instead of the cache and the probe never fires (commit check fails); make the
+    /// cache always scan and the tick check fails.
+    @Test(.timeLimit(.minutes(1))) func aTickDoesNotScanTheListing() async throws {
+        let page = try await HostedPage()
+        var scans: [Int] = []
+        RecordingsPageProbes.bulkScan = { scans.append($0) }
+        defer { RecordingsPageProbes.bulkScan = nil; page.close() }
+        let (key, playing) = try await page.loadedCourse()
+        let identity = RecordingsStudyState.identity(playing)
+        let total = try #require(page.recordings.listings[key]?.recordings?.count)
+
+        scans = []
+        for fraction in [0.11, 0.22, 0.33] {
+            page.recordings.watchProgress.setLive(fraction, for: identity)
+            try await page.settle { page.rows.last { $0.recording.id == playing.id }?.watch.barValue == fraction }
+        }
+        #expect(page.rows.last { $0.recording.id == playing.id }?.watch.barValue == 0.33, "the ticks reached the page")
+        #expect(scans.isEmpty, "\(scans.count) tick(s) scanned the listing")
+
+        page.recordings.watchProgress.setEntry(RecordingWatchEntry(furthest: 0.5), for: identity)
+        try await page.settle { !scans.isEmpty }
+        #expect(scans == [total], "a commit scans the listing once, was \(scans)")
+    }
+
     /// The course header shows the model's live summary after the archive line, and nothing
     /// when the summary is unknown. Mutation: build the header line without the summary (or
     /// read it outside the reader) and the progress text never appears.

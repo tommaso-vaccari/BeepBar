@@ -33,20 +33,28 @@ import BeepbarCore
 ///   change (`reset()`), before the next account's data can arrive.
 @MainActor final class RecordingsWatchProgressModel: ObservableObject {
     /// Stored progress by identity. Absent: untouched.
-    @Published private(set) var entries: [String: RecordingWatchEntry] = [:]
+    @Published private(set) var entries: [String: RecordingWatchEntry] = [:] { didSet { stateRevision &+= 1 } }
     /// The furthest fraction seen by the playing session, in memory only, by identity. May be
     /// ahead of `entries` until the next checkpoint saves it.
     @Published private(set) var live: [String: Double] = [:]
     /// Identities whose tick or un-tick is being saved: the checkbox is disabled until then.
-    @Published private(set) var pending: Set<String> = []
+    @Published private(set) var pending: Set<String> = [] { didSet { stateRevision &+= 1 } }
     /// Courses with a bulk save in flight, including across a listing refresh.
-    @Published private(set) var pendingCourses: Set<RecmanCourseKey> = []
+    @Published private(set) var pendingCourses: Set<RecmanCourseKey> = [] { didSet { stateRevision &+= 1 } }
     /// Each loaded course's summary including `live`, for the window. The menu bar and the
     /// persisted copy use `RecordingsController.watchSummaries`, which ignores ticks.
     @Published private(set) var summaries: [RecmanCourseKey: CourseWatchSummary] = [:]
     /// Identities whose stored state this model has read or committed, so a missing entry for
     /// them really means untouched. Grows with loaded listings; emptied by `reset()`.
-    @Published private(set) var known: Set<String> = []
+    @Published private(set) var known: Set<String> = [] { didSet { stateRevision &+= 1 } }
+
+    /// Changes with every write of `entries`, `pending`, `pendingCourses` or `known`, and never
+    /// with `live` or `summaries`, the two a playback tick writes. Lets the course toolbar's bulk
+    /// button skip its scan of the whole listing on a tick (`RecordingsPresentation.BulkActionCache`,
+    /// #209): comparing the four collections themselves would cost as much as the scan. Not
+    /// published, since each of those writes publishes already. Invariant: a new stored property
+    /// that `WatchValues.row(for:)` reads, other than `live`, must bump it too.
+    private(set) var stateRevision = 0
 
     /// Whether the stored state of `recording` is known (see `known`). When false, `entry(for:)`
     /// and `fraction(for:)` say nothing about the store: hide or disable the bar and checkbox.

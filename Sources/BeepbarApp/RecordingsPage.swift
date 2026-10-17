@@ -184,6 +184,8 @@ enum RecordingsPresentation {
         /// `RecordingsController.canEditProgress` when the reader was built (see
         /// `WatchProgressReader.init` on why a stale value is harmless).
         let canEdit: Bool
+        /// `RecordingsWatchProgressModel.stateRevision` when the copy was taken.
+        let stateRevision: Int
 
         @MainActor init(_ model: RecordingsWatchProgressModel, canEdit: Bool) {
             entries = model.entries
@@ -192,6 +194,7 @@ enum RecordingsPresentation {
             pendingCourses = model.pendingCourses
             known = model.known
             summaries = model.summaries
+            stateRevision = model.stateRevision
             self.canEdit = canEdit
         }
 
@@ -210,6 +213,8 @@ enum RecordingsPresentation {
         /// cannot authorize a bulk change. The label follows committed entries only. A course
         /// with a bulk save in flight is covered through `row(for:)`, which counts every row of a
         /// `pendingCourses` course as pending, also rows a refresh added meanwhile.
+        /// One `row(for:)` per recording: the page asks through `BulkActionCache`, never on each
+        /// publication (#209).
         func bulkAction(for key: RecmanCourseKey, recordings: [RecmanRecording]?) -> BulkAction {
             guard let recordings, !recordings.isEmpty else { return BulkAction(allDone: false, enabled: false) }
             var allDone = true
@@ -227,6 +232,47 @@ enum RecordingsPresentation {
         func headerLine(_ base: String, for key: RecmanCourseKey) -> String {
             guard let watched = RecordingsPresentation.watchSummaryText(summaries[key]) else { return base }
             return "\(base) · \(watched.text)"
+        }
+    }
+
+    /// The course toolbar's bulk button, scanned again only when something it reads changed.
+    ///
+    /// Why: the button sits in a `WatchProgressReader`, whose closure runs on every publication
+    /// of the progress model, a playing lecture's ~30 s tick included, and `bulkAction` visits
+    /// every recording of the listing. Scanning on each run made the tick's cost proportional to
+    /// the listing (and a bulk save of N lectures cost N scans of N rows), against principle 6
+    /// and `WatchProgressReader`'s flat-cost design (#209). The scan's inputs are the model's
+    /// committed state (tracked by `stateRevision`, which a tick doesn't change), `canEdit` and
+    /// the listing.
+    ///
+    /// While the course's own bulk save runs (`pendingCourses`), every commit of it changes the
+    /// entries, but the button stays disabled whatever they say (every row is pending): the
+    /// label of the last scan is kept, without a scan, until the save ends; the save's end
+    /// changes `pendingCourses` and so rescans, and the label follows the saved state again.
+    ///
+    /// A class, held in the page's `@State` and filled during `body` like `DerivedValueCache`:
+    /// a cache, not state SwiftUI observes. One per course page, on the main actor.
+    @MainActor final class BulkActionCache {
+        /// How many times the listing was scanned, so tests can prove that a tick costs none.
+        private(set) var scans = 0
+        private var stored: (key: RecmanCourseKey, revision: Int, canEdit: Bool, recordings: [RecmanRecording], action: BulkAction)?
+
+        func action(for key: RecmanCourseKey, recordings: [RecmanRecording]?, values: WatchValues) -> BulkAction {
+            guard let recordings, !recordings.isEmpty else { return BulkAction(allDone: false, enabled: false) }
+            if let stored, stored.key == key, stored.recordings == recordings {
+                // Keep the caller's array, so the next comparison hits the shared-storage fast
+                // path instead of comparing a refetched listing element by element each time.
+                self.stored?.recordings = recordings
+                if values.pendingCourses.contains(key) { return BulkAction(allDone: stored.action.allDone, enabled: false) }
+                if stored.revision == values.stateRevision, stored.canEdit == values.canEdit { return stored.action }
+            }
+            scans += 1
+            #if DEBUG
+            RecordingsPageProbes.bulkScan?(recordings.count)
+            #endif
+            let action = values.bulkAction(for: key, recordings: recordings)
+            stored = (key, values.stateRevision, values.canEdit, recordings, action)
+            return action
         }
     }
 
@@ -538,6 +584,8 @@ private struct CourseRecordings: View {
     /// Lesson numbers and total minutes, which depend on the listing alone: typing in the search
     /// doesn't sort the whole list again.
     @State private var summaryCache = DerivedValueCache<[RecmanRecording], RecmanCourseListSummary>()
+    /// The bulk button's last scan, so a progress tick doesn't scan the listing (#209).
+    @State private var bulkCache = RecordingsPresentation.BulkActionCache()
 
     private var listing: RecordingsListing? { recordings.listing(for: key) }
 
@@ -603,7 +651,7 @@ private struct CourseRecordings: View {
             searchField
             Spacer(minLength: 0)
             WatchProgressReader(recordings: recordings) { progress in
-                let action = progress.bulkAction(for: key, recordings: listing?.recordings)
+                let action = bulkCache.action(for: key, recordings: listing?.recordings, values: progress)
                 Button(action.label.text) { recordings.toggleAllDone(key) }
                     .buttonStyle(.borderless)
                     .font(.callout)
@@ -888,7 +936,10 @@ private struct WatchlistRecordings: View {
 /// `WatchValues.row`, `aTickReRendersOnlyThePlayingRow`, 1000×700 window): 302 `row` calls with
 /// 1,000 recordings and 326 with 5,000 (the rows `List` keeps built around the visible ones,
 /// nearly flat in the listing's size), and one row body in both. Package G records these numbers
-/// with the rest of the delivery evidence.
+/// with the rest of the delivery evidence. Every reader closure must keep that property: the
+/// course toolbar's bulk button, added later, scanned the whole listing on each tick until it
+/// went through `RecordingsPresentation.BulkActionCache` (#209; `aTickDoesNotScanTheListing`
+/// pins zero scans per tick). Nothing in a reader may visit every recording on a publication.
 struct WatchProgressReader<Content: View>: View {
     @ObservedObject var progress: RecordingsWatchProgressModel
     /// `RecordingsController.canEditProgress` when the page built this reader. It can go stale
@@ -917,6 +968,8 @@ struct WatchProgressReader<Content: View>: View {
 @MainActor enum RecordingsPageProbes {
     static var row: ((RecordingRow) -> Void)?
     static var header: ((String) -> Void)?
+    /// A scan of the listing by the course toolbar's bulk button, with the listing's size.
+    static var bulkScan: ((Int) -> Void)?
     /// A sidebar course row's body: its title and whether the orange marker shows.
     static var sidebarRow: ((_ name: String, _ marker: Bool) -> Void)?
 }

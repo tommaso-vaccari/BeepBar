@@ -96,7 +96,8 @@ enum NowPlayingCommand: Equatable {
     func activate(onCommand: @escaping @MainActor (NowPlayingCommand) -> Void) -> Bool
     /// Replaces the record. Only called between `activate` and `deactivate`.
     func publish(_ state: NowPlayingState)
-    /// Clears the record and removes the commands. Idempotent; safe without `activate`.
+    /// Clears the record (state Stopped) and removes and disables the commands. Idempotent; safe
+    /// without `activate`.
     func deactivate()
 }
 
@@ -117,10 +118,13 @@ enum RecordingNowPlayingPolicy {
     }
     /// `MPNowPlayingInfoMediaTypeVideo`.
     static let videoMediaType = 2
-    /// `MPNowPlayingPlaybackState`: playing, paused, stopped.
+    /// `MPNowPlayingPlaybackState`: playing, paused, stopped. The header's order is Unknown 0,
+    /// Playing 1, Paused 2, Stopped 3, Interrupted 4; a test checks each against the real enum.
+    /// Closing the player must say Stopped: Interrupted (4, the value written before issue #192)
+    /// tells the system playback will resume, so it may keep BeepBar as a paused Now Playing app.
     static let playingState = 1
     static let pausedState = 2
-    static let stoppedState = 4
+    static let stoppedState = 3
     /// `MPRemoteCommandHandlerStatus.success`, the only status returned: the handler answers at
     /// once and hands the command to the main actor, where one that cannot apply (a seek before
     /// the lecture has a timeline) simply does nothing.
@@ -349,9 +353,16 @@ enum RecordingArtwork {
         }
     }
 
+    /// Gives Now Playing back when the player window closes. The commands are app-wide
+    /// singletons that `activate` enabled, so each is also disabled (issue #199): removing the
+    /// target alone left them enabled with nothing behind them, which can keep BeepBar a
+    /// candidate for the media keys after the lecture closed. Safe because nothing else in the
+    /// app uses them once the window is gone (AVKit's publication was off for that window, and
+    /// the next `activate` enables them again).
     func deactivate() {
         for (command, target) in targets {
             _ = command.perform(NSSelectorFromString("removeTarget:"), with: target)
+            if command.responds(to: NSSelectorFromString("setEnabled:")) { command.setValue(false, forKey: "enabled") }
         }
         targets = []
         artworkObject = nil

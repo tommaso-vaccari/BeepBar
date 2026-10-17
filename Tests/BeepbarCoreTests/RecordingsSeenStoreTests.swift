@@ -63,6 +63,39 @@ struct RecordingsSeenStoreTests {
         #expect(try Data(contentsOf: sentinel) == Data("preserve".utf8))
     }
 
+    /// SQLite companions (`-journal`, `-wal`, `-shm`) are part of a history database: a stale
+    /// hot journal left by a crash would be rolled back into a later database created under the
+    /// same name (#221). `delete()` must remove every companion of its own namespace, and
+    /// `removeObsoleteFiles()` every companion of tombstoned namespaces, while keeping the
+    /// active namespace and unrelated files. Guards the suffix list and the companion regex.
+    @Test func cleanupRemovesSQLiteCompanionFiles() throws {
+        defer { cleanUp() }
+        let suffixes = ["", "-journal", "-wal", "-shm"]
+        func seed(_ base: String) throws {
+            for suffix in suffixes { try Data("x".utf8).write(to: folder.appendingPathComponent(base + suffix)) }
+        }
+        func present(_ name: String) -> Bool { FileManager.default.fileExists(atPath: folder.appendingPathComponent(name).path) }
+        try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+
+        try seed(RecordingsSeenStore.fileName)
+        try store.delete()
+        for suffix in suffixes { #expect(!present(RecordingsSeenStore.fileName + suffix), "delete() left \(suffix)") }
+
+        let active = RecordingsSeenStore(directory: { [folder] in folder }, namespace: UUID())
+        let obsolete = "recordings-seen-v2-\(UUID().uuidString).sqlite"
+        try seed(RecordingsSeenStore.fileName)
+        try seed(obsolete)
+        try seed(active.databaseFileName)
+        try Data("keep".utf8).write(to: folder.appendingPathComponent("unrelated.sqlite-journal"))
+        try active.removeObsoleteFiles()
+        for suffix in suffixes {
+            #expect(!present(RecordingsSeenStore.fileName + suffix), "legacy \(suffix) survived")
+            #expect(!present(obsolete + suffix), "obsolete \(suffix) survived")
+            #expect(present(active.databaseFileName + suffix), "active \(suffix) was removed")
+        }
+        #expect(present("unrelated.sqlite-journal"))
+    }
+
     /// An acknowledgement before the first listing must not turn that scope into a baseline.
     /// Legacy survivor matching is limited to migrated courses, not fresh course baselines.
     @Test func openingBeforeListingAndMigrationAreDistinct() throws {

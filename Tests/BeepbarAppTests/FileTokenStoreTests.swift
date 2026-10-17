@@ -51,6 +51,19 @@ final class FileTokenStoreTests: XCTestCase {
         XCTAssertEqual(try FileTokenStore.load(.nonInteractive), "a-token")
     }
 
+    func testTokenAndExistingTokenAreExcludedFromBackups() throws {
+        try FileTokenStore.save("synthetic-token")
+        let directory = try FileManager.default.url(for: .applicationSupportDirectory, in: .userDomainMask, appropriateFor: nil, create: false)
+            .appendingPathComponent(testDirectoryName, isDirectory: true)
+        var url = directory.appendingPathComponent("credential.token")
+        XCTAssertEqual(try url.resourceValues(forKeys: [.isExcludedFromBackupKey]).isExcludedFromBackup, true)
+        var values = URLResourceValues()
+        values.isExcludedFromBackup = false
+        try url.setResourceValues(values)
+        XCTAssertTrue(try FileTokenStore.containsCredential())
+        XCTAssertEqual(try url.resourceValues(forKeys: [.isExcludedFromBackupKey]).isExcludedFromBackup, true)
+    }
+
     func testSaveOverwritesPreviousToken() throws {
         try FileTokenStore.save("first")
         try FileTokenStore.save("second")

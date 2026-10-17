@@ -67,6 +67,28 @@ struct RecordingsSessionStoreTests {
         #expect(FileManager.default.fileExists(atPath: orphan.path) != primaryFails)
     }
 
+    @Test func sessionLifetimeIsNotExtendedByReplacement() throws {
+        defer { try? FileManager.default.removeItem(at: folder) }
+        let start = Date().addingTimeInterval(-9 * 86_400)
+        try store.save(Data("first".utf8), now: start)
+        try store.save(Data("replacement".utf8))
+        #expect(try store.load(now: start.addingTimeInterval(10 * 86_400 - 1)) == Data("replacement".utf8))
+        #expect(try store.load(now: start.addingTimeInterval(10 * 86_400)) == nil)
+        #expect(!FileManager.default.fileExists(atPath: file.path))
+    }
+
+    @Test func sessionAndMigratedFileAreExcludedFromBackups() throws {
+        defer { try? FileManager.default.removeItem(at: folder) }
+        try store.save(Data("session".utf8))
+        #expect(try file.resourceValues(forKeys: [.isExcludedFromBackupKey]).isExcludedFromBackup == true)
+        var url = file
+        var values = URLResourceValues()
+        values.isExcludedFromBackup = false
+        try url.setResourceValues(values)
+        _ = try store.load()
+        #expect(try file.resourceValues(forKeys: [.isExcludedFromBackupKey]).isExcludedFromBackup == true)
+    }
+
     /// Delete removes the session and the temporary files a crash mid-save can leave, but
     /// nothing else in BeepBar's folder (the token and the sync database live there too).
     @Test func deleteRemovesTheSessionAndCrashLeftoversOnly() throws {

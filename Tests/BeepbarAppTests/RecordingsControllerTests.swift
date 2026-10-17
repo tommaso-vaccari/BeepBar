@@ -516,7 +516,7 @@ struct RecordingsControllerTests {
         await drainTasks()
         #expect(!controller.isEnabled)
         #expect(controller.access == .off)
-        #expect(world.storeAccesses == 0)
+        #expect(world.storeAccesses == 1)
         #expect(world.browsersMade == 0)
         #expect(defaults.writes.isEmpty)
     }
@@ -526,7 +526,7 @@ struct RecordingsControllerTests {
         let controller = makeController(useDefault: true)
         #expect(controller.isEnabled)
         await drainTasks()
-        #expect(world.storeAccesses == 0)
+        #expect(world.storeAccesses == 1)
         #expect(world.browsersMade == 0)
         #expect(defaults.writes.isEmpty)
         controller.setEnabled(false)
@@ -640,11 +640,11 @@ struct RecordingsControllerTests {
     @Test func firstVisitWithoutASessionShowsSignInWithoutOpeningABrowser() async {
         defer { cleanUp() }
         let controller = makeController(useDefault: true)
-        #expect(world.storeAccesses == 0)
+        #expect(world.storeAccesses <= 1)
         controller.pageAppeared()
         controller.refresh([course], selected: course)
         await settle("the missing session asks for a sign-in") { controller.access == .needsSignIn(nil) }
-        #expect(world.storeAccesses == 1)
+        #expect(world.storeAccesses == 2)
         #expect(controller.listings.isEmpty)
         controller.pageDisappeared()
         controller.pageAppeared()
@@ -653,7 +653,7 @@ struct RecordingsControllerTests {
         await drainTasks()
         #expect(controller.access == .needsSignIn(nil))
         #expect(controller.listings.isEmpty)
-        #expect(world.storeAccesses == 1)
+        #expect(world.storeAccesses == 2)
         #expect(world.browsersMade == 0)
         #expect(browser.calls.isEmpty)
         #expect(defaults.writes.isEmpty)
@@ -666,7 +666,7 @@ struct RecordingsControllerTests {
         world.storeAccesses = 0
         browser.listResults[course.courseCode] = .success([recording("a")])
         let controller = makeController(useDefault: true)
-        #expect(world.storeAccesses == 0)
+        #expect(world.storeAccesses <= 1)
         controller.pageAppeared()
         #expect(controller.access == .ready)
         #expect(world.browsersMade == 0)
@@ -676,7 +676,7 @@ struct RecordingsControllerTests {
         #expect(!browser.calls.contains("signIn"))
         // The first visit's check and the worker opening the browser share one read (#97); the
         // unchanged session is not written back.
-        #expect(world.storeAccesses == 1)
+        #expect(world.storeAccesses == 2)
         let accesses = world.storeAccesses
         controller.pageDisappeared()
         controller.pageAppeared()
@@ -725,9 +725,9 @@ struct RecordingsControllerTests {
         if hasSession { try saveSession(owner: 42) }
         browser.listResults[course.courseCode] = .success([recording("a")])
         browser.playbackResults["a"] = .success(URL(string: "https://politecnicomilano.webex.com/politecnicomilano/ldr.php?RCID=a")!)
+        world.sessionFiles.hold(access: 1)
         let controller = makeController(useDefault: true)
         controller.toggleWatchlist(recording("a"), courseName: "NLA")
-        world.sessionFiles.hold(access: 1)
         controller.pageAppeared()
         controller.refresh([course], selected: course)
         controller.play(recording("a"))
@@ -742,7 +742,7 @@ struct RecordingsControllerTests {
             await settle("listed with the saved session") { controller.listing(for: course)?.recordings != nil }
             await settle("the queued Play ran") { world.opened.count == 1 }
             #expect(browser.openedWith == [["SSO_LOGIN"]])
-            #expect(world.storeAccesses == 1)
+            #expect(world.storeAccesses == 2)
         } else {
             await settle("asks for a sign-in") { controller.access == .needsSignIn(nil) }
             await drainTasks()
@@ -1809,6 +1809,81 @@ struct RecordingsControllerTests {
         #expect(restored.listings.isEmpty)
         #expect(browser.calls == calls)
         restored.turnOff()
+    }
+
+    @Test(arguments: [false, true])
+    func forgettingStudyDataOnlyErasesTheCurrentAccount(disabled: Bool) async throws {
+        defer { cleanUp() }
+        browser.streamResults["lesson"] = [.success(stream("lesson"))]
+        let controller = await readyController()
+        controller.toggleWatchlist(recording("lesson"), courseName: "NLA")
+        controller.play(recording("lesson"))
+        await settle("lecture playing") { world.player.plays.count == 1 }
+        world.player.pause(at: 1_234)
+        #expect(try storedResumePoints()?.position(for: RecordingsStudyState.identity(recording("lesson"))) == 1_234)
+        let material = folder.appendingPathComponent("downloaded-material.pdf")
+        let materialData = Data("synthetic material".utf8)
+        try materialData.write(to: material)
+        let otherKey = RecordingsController.studyKey(owner: 99)
+        let otherData = Data("other-account-synthetic-data".utf8)
+        defaults.set(otherData, forKey: otherKey)
+        if disabled { controller.setEnabled(false) }
+        controller.forgetStudyData()
+        await controller.settleSessionFile()
+        #expect(controller.study.bookmarks.isEmpty)
+        #expect(defaults.data(forKey: RecordingsController.studyKey(owner: 42)) == nil)
+        #expect(defaults.data(forKey: otherKey) == otherData)
+        #expect(try storedResumePoints() == nil)
+        #expect(controller.isEnabled == !disabled)
+        #expect(try Data(contentsOf: material) == materialData)
+        world.player.pause(at: 2_000)
+        #expect(try storedResumePoints() == nil)
+        let reopened = makeController(useDefault: true)
+        reopened.pageAppeared()
+        #expect(reopened.study.bookmarks.isEmpty)
+        reopened.turnOff()
+    }
+
+    @Test func forgettingStudyDataDoesNotGrantAccess() async {
+        defer { cleanUp() }
+        let controller = makeController(useDefault: true)
+        controller.pageAppeared()
+        await settle("sign in required") { controller.access == .needsSignIn(nil) }
+        controller.forgetStudyData()
+        #expect(controller.access == .needsSignIn(nil))
+        #expect(world.browsersMade == 0)
+    }
+
+    @Test func expiredSessionIsDeletedAtStartupWithoutOpeningABrowser() async throws {
+        defer { cleanUp() }
+        try store.save(Data("expired synthetic session".utf8), now: Date().addingTimeInterval(-RecordingsSessionStore.maximumAge))
+        let controller = makeController(useDefault: true)
+        await settle("expired file removed") { !FileManager.default.fileExists(atPath: sessionFile.path) }
+        await controller.settleSessionFile()
+        #expect(controller.access == .needsSignIn(nil))
+        #expect(world.browsersMade == 0)
+        #expect(!controller.sessionDeletionFailed)
+    }
+
+    @Test func studyErasureFailureIsVisibleAcrossRelaunchAndRetryable() async {
+        defer { world.historyFiles.setRemovalFailure(false); cleanUp() }
+        browser.listResults[course.courseCode] = .success([recording("old")])
+        let controller = await readyController()
+        controller.refresh([course], selected: course)
+        await settle("old baseline") { controller.listing(for: course)?.recordings != nil }
+        let oldDatabase = folder.appendingPathComponent(RecordingsSeenStore.fileName)
+        world.historyFiles.setRemovalFailure(true)
+        controller.forgetStudyData()
+        await settle("erasure failure reported") { controller.studyDeletionFailed }
+        #expect(FileManager.default.fileExists(atPath: oldDatabase.path))
+        let reopened = makeController(useDefault: true)
+        await drainTasks()
+        #expect(reopened.studyDeletionFailed)
+        world.historyFiles.setRemovalFailure(false)
+        reopened.retryStudyDeletion()
+        await settle("erasure retry completed") { !reopened.studyDeletionFailed }
+        #expect(!FileManager.default.fileExists(atPath: oldDatabase.path))
+        reopened.turnOff()
     }
 
     /// Reused recording IDs in another course or year never share bookmarked state.
@@ -3350,6 +3425,17 @@ struct RecordingsAccountTests {
 
     private func session(owner: Int) throws -> Data {
         try RecmanSessionCodec.encode([FakeRecmanBrowser.cookie("SSO_LOGIN")], ownerUserID: owner)
+    }
+
+    @Test func privacySettingsFindPendingStudyDeletionOutsidePolimi() async {
+        defer { try? FileManager.default.removeItem(at: root) }
+        let defaults = WeBeepAuthenticationController.throwawayDefaults()
+        defaults.set(true, forKey: RecordingsController.studyDeletionPendingKey)
+        let controller = WeBeepAuthenticationController(testRootURL: root.appendingPathComponent("sync"), defaults: defaults, recordingsStore: store, site: MoodleSite.unipd[0])
+        #expect(controller.recordingsIfCreated == nil)
+        #expect(controller.recordingsForPrivacy != nil)
+        #expect(controller.recordingsIfCreated != nil)
+        await controller.recordings.settleSessionFile()
     }
 
     @Test func disconnectingOrSwitchingUniversityDeletesThePolimiSession() async throws {

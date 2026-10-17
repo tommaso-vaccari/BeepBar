@@ -14,7 +14,9 @@ Owner approval and a synthetic dry run are still required; see [release gate](pr
 
 Disconnect the university account and disable Recordings. Resolve any deletion error in Settings → Data and privacy before assuming session deletion succeeded. Revoke the university mobile token through the university's supported mechanism if revocation is needed; deleting a local token does not revoke it remotely.
 
-Quit BeepBar. Preserve the materials folder and local edits first. App state is in `~/Library/Application Support/Beepbar` and preferences for bundle `io.github.tvaccari.beepbar`; removing all of these resets app state, including sync history and per-account study choices. This is a whole-app reset, not a per-account erasure operation. Check the selected materials folder separately; do not delete it unintentionally. Uninstalling the app alone is not data erasure. Backups, macOS notifications, clipboard/Now Playing and system-managed diagnostics need separate consideration; do not promise remote or backup erasure from an app reset. Relaunch only after intentionally completing the reset because enabled features can create new data.
+For a single account, use Settings → Recordings → “Forget this account’s study data”. This removes its watchlist, viewing state and resume points, closes playback, and preserves downloaded materials. A persistent warning and retry report physical history deletion failures. This is separate from signing out.
+
+For a whole-app reset, quit BeepBar. Preserve the materials folder and local edits first. App state is in `~/Library/Application Support/Beepbar` and preferences for bundle `io.github.tvaccari.beepbar`; removing all of these resets app state, including sync history and per-account study choices. This is a whole-app reset, not a per-account erasure operation. Check the selected materials folder separately; do not delete it unintentionally. Uninstalling the app alone is not data erasure. Backups, macOS notifications, clipboard/Now Playing and system-managed diagnostics need separate consideration; do not promise remote or backup erasure from an app reset. Relaunch only after intentionally completing the reset because enabled features can create new data.
 
 ## Suspected breach
 
@@ -32,14 +34,14 @@ Static source inspection on the remediation branch; runtime and OS-managed reten
 
 | Store | Contents and lifetime | Erasure |
 | --- | --- | --- |
-| `credential.token`, `.credential-*.tmp` | University token; 0600 files in restricted directory; no independent TTL | Disconnect attempts primary and all crash temporaries; failure keeps account connected |
-| `recordings-session.plist`, `.recordings-session-*.tmp` | Eligible Polimi/Webex cookies and optional email; no independent inactivity TTL | Disable/disconnect attempts all files; persistent failure warning/retry; replacement removes old temporaries |
+| `credential.token`, `.credential-*.tmp` | University token; 0600 files in restricted directory; excluded from future macOS backups; no independent TTL | Disconnect attempts primary and all crash temporaries; failure keeps account connected |
+| `recordings-session.plist`, `.recordings-session-*.tmp` | Eligible Polimi/Webex cookies and optional email; ten days from initial file creation, unchanged by replacement; expiry timer or next launch; excluded from future macOS backups | Disable/disconnect attempts all files; persistent failure warning/retry; replacement removes old temporaries |
 | `course-list.json` | Course list, up to 30 days | Startup expiry pruning and disconnect |
 | `sync.sqlite`, WAL/SHM | Root, courses/modules/files, hashes, revisions, journal and conflicts; no TTL | Remains after disconnect; whole-app reset after preserving materials |
-| `recordings-seen-v2*.sqlite`, WAL/SHM | Account/course/recording IDs and viewing state | Namespace invalidated then removed on reset; failed removal retried on next use |
+| `recordings-seen-v2*.sqlite`, WAL/SHM | Account/course/recording IDs and viewing state | Namespace invalidated then removed on reset; persistent failure warning and explicit retry, also retried on next history use |
 | Legacy seen defaults | Acknowledged/baselined entries pending migration | Removed after successful migration or reset |
-| Resume/summary/email opt-out defaults | Resume positions (cap 200), playback summary, per-session email choice | Resume: logout/university/account change, preserved by normal disable; summary/email opt-out also removed by disable |
-| `recordings-study.v1.<owner>` defaults | Per-account watchlist/queue; no TTL | Intentionally survives logout/disable; individual bookmarks can be removed in the UI; whole-app reset removes all account records |
+| Resume/summary/email opt-out defaults | Resume positions (cap 200), playback summary, per-session email choice | Resume: study-erasure command or logout/university/account change, preserved by normal disable; summary/email opt-out also removed by disable |
+| `recordings-study.v1.<owner>` defaults | Per-account watchlist/queue; no TTL | Intentionally survives logout/disable; individual bookmarks or this account’s entire study data can be erased in Settings; whole-app reset removes all account records |
 | Preferences/bookmarks/last-sync defaults | Settings, selected root/account state and sync summaries | Some cleared on disconnect; whole-app reset removes remaining preferences |
 | Monthly telemetry identity/defaults | Random UUID/month, daily attempt and choice | Rotation; opt-out removes UUID; server history unaffected |
 | Downloaded materials, backups and conflict copies | User-controlled files under selected root; no automatic retention limit | User-managed; preserve before app reset |

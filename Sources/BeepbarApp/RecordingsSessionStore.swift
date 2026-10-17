@@ -11,6 +11,7 @@ import Foundation
 /// Nothing touches the disk until a method is called: the controller reads the file only when
 /// the Recordings page needs the session, never at launch.
 struct RecordingsSessionStore: Sendable {
+    static let maximumAge: TimeInterval = 10 * 24 * 60 * 60
     static let fileName = "recordings-session.plist"
     private static let tempPrefix = ".recordings-session-"
     private static let tempSuffix = ".tmp"
@@ -30,13 +31,41 @@ struct RecordingsSessionStore: Sendable {
     }
 
     /// The saved session, or nil when there is none.
-    func load() throws -> Data? {
+    func load(now: Date = Date()) throws -> Data? {
         let url = try directory().appendingPathComponent(Self.fileName)
         guard FileManager.default.fileExists(atPath: url.path) else { return nil }
+        if try expirationDate(at: url, now: now) <= now {
+            try delete()
+            return nil
+        }
         return try Data(contentsOf: url)
     }
 
-    func save(_ data: Data) throws {
+    func expirationDate(now: Date = Date()) throws -> Date? {
+        let folder = try directory()
+        guard FileManager.default.fileExists(atPath: folder.path) else { return nil }
+        for name in try FileManager.default.contentsOfDirectory(atPath: folder.path) where name.hasPrefix(Self.tempPrefix) && name.hasSuffix(Self.tempSuffix) {
+            var temporary = folder.appendingPathComponent(name)
+            var values = URLResourceValues()
+            values.isExcludedFromBackup = true
+            try temporary.setResourceValues(values)
+        }
+        let url = folder.appendingPathComponent(Self.fileName)
+        guard FileManager.default.fileExists(atPath: url.path) else { return nil }
+        return try expirationDate(at: url, now: now)
+    }
+
+    private func expirationDate(at file: URL, now: Date) throws -> Date {
+        var url = file
+        var values = URLResourceValues()
+        values.isExcludedFromBackup = true
+        try url.setResourceValues(values)
+        let attributes = try FileManager.default.attributesOfItem(atPath: url.path)
+        guard attributes[.type] as? FileAttributeType == .typeRegular, let created = attributes[.creationDate] as? Date else { throw CocoaError(.fileReadUnknown) }
+        return created > now ? now : created.addingTimeInterval(Self.maximumAge)
+    }
+
+    func save(_ data: Data, now: Date = Date()) throws {
         let folder = try directory()
         try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true, attributes: [.posixPermissions: 0o700])
         let permissions = try FileManager.default.attributesOfItem(atPath: folder.path)[.posixPermissions] as? Int ?? 0o700
@@ -44,13 +73,25 @@ struct RecordingsSessionStore: Sendable {
         for name in try FileManager.default.contentsOfDirectory(atPath: folder.path) where name.hasPrefix(Self.tempPrefix) && name.hasSuffix(Self.tempSuffix) {
             try FileManager.default.removeItem(at: folder.appendingPathComponent(name))
         }
+        let destination = folder.appendingPathComponent(Self.fileName)
+        let created = (try? FileManager.default.attributesOfItem(atPath: destination.path)[.creationDate] as? Date) ?? now
         // Created with 0600 rather than chmod'ed afterwards, then moved into place in one step:
         // the cookies are never on disk under the default permissions, nor half written.
-        let temporary = folder.appendingPathComponent("\(Self.tempPrefix)\(UUID().uuidString)\(Self.tempSuffix)")
-        guard FileManager.default.createFile(atPath: temporary.path, contents: data, attributes: [.posixPermissions: 0o600]) else {
+        var temporary = folder.appendingPathComponent("\(Self.tempPrefix)\(UUID().uuidString)\(Self.tempSuffix)")
+        guard FileManager.default.createFile(atPath: temporary.path, contents: nil, attributes: [.posixPermissions: 0o600]) else {
             throw CocoaError(.fileWriteUnknown)
         }
-        if rename(temporary.path, folder.appendingPathComponent(Self.fileName).path) != 0 {
+        do {
+            var values = URLResourceValues()
+            values.isExcludedFromBackup = true
+            try temporary.setResourceValues(values)
+            try FileManager.default.setAttributes([.creationDate: created], ofItemAtPath: temporary.path)
+            try data.write(to: temporary)
+        } catch {
+            try? FileManager.default.removeItem(at: temporary)
+            throw error
+        }
+        if rename(temporary.path, destination.path) != 0 {
             let error = POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO)
             try? FileManager.default.removeItem(at: temporary)
             throw error

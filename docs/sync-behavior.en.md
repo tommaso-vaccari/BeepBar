@@ -200,3 +200,5 @@ Watchlist is saved locally per account and survives session expiry and disabling
 ## Privacy and deletion
 
 Telemetry sends only a hashed monthly identifier, app version and major macOS version; language and settings are excluded. It remains enabled by default with opt-out, pending closure of the privacy release gate. Settings → Data and privacy describes flows and contact details. Failed session deletion stays pending across launches, is retried when the controller is created and can be retried in Settings with Recordings off. The tombstone blocks reuse of the discarded session. Logout preserves materials, database and watchlist.
+
+Saved Polimi sessions expire ten days after initial save; updates do not renew this deadline. Removal happens at expiry while running or at next launch. Tokens and sessions are excluded from future macOS backups; earlier copies remain. Settings → Recordings → “Forget this account’s study data” erases watchlist, viewing state and resume points, closes playback and preserves materials. History deletion failures remain visible across relaunch and can be retried.

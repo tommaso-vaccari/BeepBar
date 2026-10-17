@@ -522,6 +522,10 @@ public actor RecordingsSeenHistory {
 
     public nonisolated func invalidate() { validity.invalidate() }
 
+    public func removeObsoleteFiles() throws {
+        try store.removeObsoleteFiles()
+    }
+
     public func invalidateAndDelete() throws {
         invalidate()
         try store.delete()

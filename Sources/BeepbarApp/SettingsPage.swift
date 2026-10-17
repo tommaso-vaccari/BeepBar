@@ -76,7 +76,7 @@ struct SettingsPage: View {
             ScrollView {
                 VStack(alignment: .leading, spacing: 12) {
                     Text(tr("Il token dell’ateneo e le sessioni Polimi/Webex sono salvati in locale con permessi ristretti. Per usare le funzioni richieste, BeepBar si collega all’ateneo e a Webex. Alla prima riproduzione o aprendo le impostazioni Registrazioni, può leggere automaticamente l’email dal profilo WeBeep e usarla per l’accesso Webex. Puoi modificarla o rimuoverla nelle impostazioni Registrazioni.", "The university token and Polimi/Webex sessions are saved locally with restricted permissions. BeepBar connects to your university and Webex to provide the requested features. On first playback or when opening Recordings settings, it may automatically read your WeBeep profile email and use it to sign in to Webex. You can edit or remove it in Recordings settings."))
-                    Text(tr("Disconnettersi elimina il token e richiede la cancellazione della sessione Registrazioni; non elimina i materiali, il database di sincronizzazione o la watchlist salvata per account. Le copie nei backup non vengono cancellate. Prima di eliminare manualmente i dati dell’app, chiudi BeepBar e conserva i materiali e le modifiche che vuoi tenere.", "Disconnecting deletes the token and requests deletion of the Recordings session; materials, the sync database and per-account watchlist remain. Backup copies are not deleted. Before manually deleting app data, quit BeepBar and preserve any materials and edits you want to keep."))
+                    Text(tr("Disconnettersi elimina il token e richiede la cancellazione della sessione Registrazioni; non elimina i materiali, il database di sincronizzazione o la watchlist salvata per account. Token e sessioni sono esclusi dai futuri backup; le copie già presenti non vengono cancellate. La sessione salvata scade dopo 10 giorni e richiede un nuovo accesso; se BeepBar è chiuso, viene rimossa al successivo avvio. Puoi cancellare watchlist e stato delle lezioni con “Dimentica i dati di studio di questo account”. Prima di eliminare manualmente i dati dell’app, chiudi BeepBar e conserva i materiali e le modifiche che vuoi tenere.", "Disconnecting deletes the token and requests deletion of the Recordings session; materials, the sync database and per-account watchlist remain. Tokens and sessions are excluded from future backups; existing copies remain. Saved sessions expire after 10 days and require signing in again; if BeepBar is closed, removal happens at next launch. Use “Forget this account’s study data” to erase the watchlist and viewing state. Before manually deleting app data, quit BeepBar and preserve any materials and edits you want to keep."))
                     Text(tr("I controlli degli aggiornamenti sono attivi di default ogni otto ore e contattano il servizio di distribuzione degli aggiornamenti. Puoi disattivarli in Impostazioni. Anche la telemetria è attiva di default: puoi spegnerla nella sezione Telemetria e leggere lì i dati inviati.", "Update checks are enabled by default every eight hours and contact the update distribution service. You can turn them off in Settings. Telemetry is also enabled by default: turn it off in the Telemetry section, where the transmitted data is described."))
                     Text(tr("Richieste privacy: tommaso.vaccari@mail.polimi.it. Non inviare password, token, cookie o registrazioni delle lezioni. Questa schermata descrive i flussi dell’app; l’informativa completa e la verifica della telemetria restano un requisito prima del rilascio.", "Privacy requests: tommaso.vaccari@mail.polimi.it. Do not send passwords, tokens, cookies or lecture recordings. This screen describes the app’s data flows; the complete privacy notice and telemetry assessment remain requirements before release."))
                 }
@@ -342,6 +342,13 @@ private struct SessionDeletionWarning: View {
     @ObservedObject var recordings: RecordingsController
 
     var body: some View {
+        if recordings.studyDeletionFailed {
+            VStack(alignment: .leading, spacing: 6) {
+                Text(tr("La cronologia precedente non è più usata, ma alcuni file non sono stati eliminati dal Mac.", "Previous history is no longer used, but some files could not be deleted from your Mac."))
+                    .foregroundStyle(.orange)
+                Button(tr("Riprova a eliminare la cronologia", "Retry deleting history")) { recordings.retryStudyDeletion() }
+            }
+        }
         if recordings.sessionDeletionFailed {
             VStack(alignment: .leading, spacing: 6) {
                 Text(tr("Cancellazione della sessione non riuscita: cookie ed email potrebbero essere ancora sul disco. Disattiva Registrazioni e riprova.", "Session deletion failed: cookies and email may still be on disk. Turn Recordings off and retry."))
@@ -355,6 +362,7 @@ private struct SessionDeletionWarning: View {
 
 private struct RecordingsSettingsSection: View {
     @ObservedObject var recordings: RecordingsController
+    @State private var showForgetConfirmation = false
 
     var body: some View {
         Section {
@@ -385,6 +393,14 @@ private struct RecordingsSettingsSection: View {
             if recordings.isEnabled {
                 RecordingsEmailField(recordings: recordings)
             }
+            Button(tr("Dimentica i dati di studio di questo account…", "Forget this account’s study data…"), role: .destructive) { showForgetConfirmation = true }
+                .disabled(!recordings.canForgetStudyData)
+                .confirmationDialog(tr("Dimenticare i dati di studio?", "Forget study data?"), isPresented: $showForgetConfirmation, titleVisibility: .visible) {
+                    Button(tr("Dimentica i dati di studio", "Forget study data"), role: .destructive) { recordings.forgetStudyData() }
+                    Button(tr("Annulla", "Cancel"), role: .cancel) {}
+                } message: {
+                    Text(tr("Elimina watchlist, stato di visione e posizioni di ripresa di questo account e chiude la lezione in riproduzione. I materiali scaricati restano sul Mac.", "Deletes this account’s watchlist, viewing state and resume positions, and closes the playing lecture. Downloaded materials stay on your Mac."))
+                }
         } header: {
             Text(tr("Registrazioni", "Recordings"))
         } footer: {

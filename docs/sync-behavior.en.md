@@ -196,3 +196,7 @@ Recordings is enabled by default for Polimi accounts. Turning it off in Settings
 Watchlist, above the courses on the same page, collects only lessons manually added with the bookmark. It shows saved course, title, date and duration before courses are reloaded. Lessons remain in the list until their bookmark is removed, even after opening them. “Mark new recordings as read” only affects novelty indicators. Navigation is remembered.
 
 Watchlist is saved locally per account and survives session expiry and disabling the feature. It is hidden after disconnecting; another account never inherits it. A successful refresh retains lessons missing from the archive and marks them unavailable; a failure or cancellation never removes them. Watchlist can contain lessons from courses no longer selected for synchronization.
+
+## Privacy and deletion
+
+Telemetry sends only a hashed monthly identifier, app version and major macOS version; language and settings are excluded. It remains enabled by default with opt-out, pending closure of the privacy release gate. Settings → Data and privacy describes flows and contact details. Failed session deletion stays pending across launches, is retried when the controller is created and can be retried in Settings with Recordings off. The tombstone blocks reuse of the discarded session. Logout preserves materials, database and watchlist.

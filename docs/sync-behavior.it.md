@@ -196,3 +196,7 @@ Registrazioni è attiva di default per gli account Polimi. Disattivandola in Imp
 La Watchlist, sopra i corsi nella stessa pagina, raccoglie solo le lezioni aggiunte manualmente con il segnalibro. Mostra corso, titolo, data e durata salvati, anche prima di ricaricare i corsi. Le lezioni restano in elenco finché rimuovi il segnalibro, anche dopo averle aperte. «Segna novità come lette» riguarda solo gli indicatori di novità. La scelta della vista resta salvata.
 
 La watchlist è salvata localmente per account e sopravvive alla scadenza della sessione e alla disattivazione della funzione. Alla disconnessione non è più visibile; un altro account non la eredita. Un aggiornamento riuscito conserva le lezioni non più presenti, segnalandole come non disponibili; un errore o una cancellazione non le rimuove. La watchlist può contenere lezioni di corsi non più selezionati per la sincronizzazione.
+
+## Privacy e cancellazione
+
+La telemetria invia solo identificativo mensile sotto forma di hash, versione dell’app e versione principale di macOS; lingua e impostazioni sono escluse. È attiva di default con opt-out, in attesa della chiusura del gate privacy prima del rilascio. Impostazioni → Dati e privacy descrive i flussi e mostra il contatto. Un errore di cancellazione della sessione resta pendente tra avvii, viene ritentato alla creazione del controller e può essere ritentato dalle Impostazioni con Registrazioni spenta. Il marcatore impedisce il riutilizzo della sessione scartata. Il logout mantiene materiali, database e watchlist.

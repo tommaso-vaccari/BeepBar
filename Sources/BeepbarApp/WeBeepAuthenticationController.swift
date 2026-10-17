@@ -1315,6 +1315,11 @@ enum MaterialsRunEnd: Equatable, Sendable {
     /// create it just to tell it nothing is happening (the window closing).
     var recordingsIfCreated: RecordingsController? { recordingsStorage }
 
+    var recordingsForPrivacy: RecordingsController? {
+        if let recordingsStorage { return recordingsStorage }
+        return operationDefaults.bool(forKey: RecordingsController.sessionDeletionPendingKey) ? recordings : nil
+    }
+
     /// Whether Recordings is on, read without creating its controller (daily telemetry asks once a
     /// day and must not build the feature just to report it is off).
     var recordingsEnabledWithoutCreating: Bool {

@@ -2884,12 +2884,17 @@ struct RecordingsControllerTests {
         defer { try? FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: folder.path); cleanUp() }
         let data = try RecmanSessionCodec.encode([FakeRecmanBrowser.cookie("SSO_LOGIN", value: "obsolete")], ownerUserID: 42, email: "obsolete@mail.polimi.it", now: world.now)
         try store.save(data)
+        let orphan = folder.appendingPathComponent(".recordings-session-obsolete.tmp")
+        try data.write(to: orphan)
         let controller = makeController()
         try FileManager.default.setAttributes([.posixPermissions: 0o500], ofItemAtPath: folder.path)
         controller.setEnabled(false)
         await controller.settleSessionFile()
         #expect(try store.load() == data, "failed unlink leaves a readable obsolete session")
+        await settle("deletion failure shown") { controller.sessionDeletionFailed }
         let next = relaunch ? makeController() : controller
+        await next.settleSessionFile()
+        await settle("deletion failure survives relaunch") { next.sessionDeletionFailed }
         next.setEnabled(true)
         await settle("fresh sign-in finishes") { next.access == .ready && !browser.isOpen }
         #expect(browser.openedWith == [[]])
@@ -2898,6 +2903,9 @@ struct RecordingsControllerTests {
         next.signIn()
         await settle("replacement session saved") { next.access == .ready && !browser.isOpen }
         await next.settleSessionFile()
+        #expect(!FileManager.default.fileExists(atPath: orphan.path))
+        #expect(!defaults.bool(forKey: RecordingsController.sessionDeletionPendingKey))
+        #expect(!next.sessionDeletionFailed)
         #expect(try savedEmail() == nil)
         #expect(try savedSession()?.cookies.first?.value == "fresh")
         let reopened = makeController(useDefault: true)
@@ -2906,6 +2914,21 @@ struct RecordingsControllerTests {
         #expect(reopened.access == .ready, "a successfully saved replacement can be adopted again")
         reopened.turnOff()
         await reopened.settleSessionFile()
+    }
+
+    @Test func retryingFailedSessionDeletionRemovesTheResidue() async throws {
+        defer { try? FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: folder.path); cleanUp() }
+        try store.save(Data("synthetic-session".utf8))
+        let controller = makeController()
+        try FileManager.default.setAttributes([.posixPermissions: 0o500], ofItemAtPath: folder.path)
+        controller.setEnabled(false)
+        await settle("deletion failure shown") { controller.sessionDeletionFailed }
+        try FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: folder.path)
+        controller.retrySessionDeletion()
+        await settle("deletion retried") { !controller.sessionDeletionFailed }
+        #expect(try store.load() == nil)
+        let relaunched = makeController()
+        #expect(!relaunched.sessionDeletionFailed)
     }
 
     // MARK: Review follow-ups (#148)

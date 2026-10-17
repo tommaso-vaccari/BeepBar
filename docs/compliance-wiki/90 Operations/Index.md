@@ -28,3 +28,13 @@
 - [Manifest e hash](source-manifest.json).
 
 - [[20 Sources/S-0007 BeepBar telemetria]] — aggiornamento dev 50177f3; verifica pre-release aperta.
+
+## Verifica privacy 2026-10-17
+
+- [[20 Sources/S-0008 TelemetryDeck accordo]]
+- [[20 Sources/S-0009 TelemetryDeck FAQ]]
+- [[20 Sources/S-0010 EDPB basi giuridiche]]
+- [[20 Sources/S-0011 EDPB ePrivacy]]
+- [[20 Sources/S-0012 Garante tracciamento]]
+
+- [Gate di rilascio](../../privacy-release-gate.md) — issue #180, ancora aperto.

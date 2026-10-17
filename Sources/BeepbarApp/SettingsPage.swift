@@ -6,6 +6,7 @@ struct SettingsPage: View {
     // Sparkle's setting isn't observable; mirror it so the toggle reflects changes immediately.
     @State private var checksForUpdates = UpdaterController.shared.automaticallyChecksForUpdates
     @State private var showSignOutConfirmation = false
+    @State private var showPrivacy = false
     @ObservedObject private var launchAtLogin = LaunchAtLoginController.shared
 
     @ObservedObject private var telemetry = DailyTelemetryController.shared
@@ -23,8 +24,10 @@ struct SettingsPage: View {
             notificationsSection
             updatesSection
             telemetrySection
+            privacySection
         }
         .formStyle(.grouped)
+        .sheet(isPresented: $showPrivacy) { privacyDetails }
         // On the Form, not on the startup Section: modifiers on a Section inside a Form can be
         // applied to each of its rows, which would start one refresh per row.
         .task {
@@ -41,7 +44,7 @@ struct SettingsPage: View {
             Button(tr("Disconnetti", "Disconnect"), role: .destructive) { authentication.signOut() }
             Button(tr("Annulla", "Cancel"), role: .cancel) {}
         } message: {
-            Text(tr("Il token salvato viene eliminato da questo Mac. La cartella dei materiali e i file restano dove sono.", "The saved token is removed from this Mac. The materials folder and files stay where they are."))
+            Text(tr("Il token salvato viene eliminato da questo Mac. La cartella dei materiali, il database di sincronizzazione e le scelte di studio salvate restano sul Mac.", "The saved token is removed from this Mac. The materials folder, sync database and saved study choices remain on this Mac."))
         }
     }
 
@@ -51,10 +54,37 @@ struct SettingsPage: View {
                 get: { telemetry.isEnabled },
                 set: { telemetry.setEnabled($0) }
             )) {
-                SettingLabel(tr("Telemetria", "Telemetry"), explanation: tr("Serve solo a contare quanti usano BeepBar e come. Invia a TelemetryDeck un ping al giorno con un identificativo casuale che cambia ogni mese, la versione dell’app e di macOS, la lingua e quali impostazioni sono attive (sincronizzazione automatica e frequenza, Risparmio dati, Registrazioni, apertura al login). Nessun dato dell’account, corso o file. Se lo spegni, l’identificativo viene cancellato.", "Used only to count how many people use BeepBar and how. Sends TelemetryDeck one daily ping with a random identifier that changes every month, the app and macOS versions, the language and which settings are on (automatic sync and its frequency, Data Saver, Recordings, open at login). No account, course or file data. Turning it off deletes the identifier."))
+                SettingLabel(tr("Telemetria", "Telemetry"), explanation: tr("Attiva di default. Invia a TelemetryDeck al massimo un segnale al giorno: identificativo casuale mensile sotto forma di hash, versione dell’app e versione principale di macOS. Non invia lingua, impostazioni, account, corsi o file. Il server riceve anche l’indirizzo IP della connessione. Spegnendola si interrompono gli invii futuri e si cancella l’identificativo locale; i segnali già inviati non vengono cancellati.", "Enabled by default. Sends TelemetryDeck at most one signal a day: a hashed monthly random identifier, app version and major macOS version. Language, settings, accounts, courses and files are not sent. The server also receives the connection IP address. Turning it off stops future sends and deletes the local identifier; previously sent signals are not deleted."))
             }
             .disabled(!telemetry.isConfigured)
         }
+    }
+
+    private var privacySection: some View {
+        Section(tr("Dati e privacy", "Data and privacy")) {
+            Button(tr("Dati salvati e collegamenti esterni…", "Saved data and external connections…")) { showPrivacy = true }
+            Link(tr("Contatta per la privacy", "Privacy contact"), destination: URL(string: "mailto:tommaso.vaccari@mail.polimi.it")!)
+            if let recordings = authentication.recordingsForPrivacy {
+                SessionDeletionWarning(recordings: recordings)
+            }
+        }
+    }
+
+    private var privacyDetails: some View {
+        VStack(alignment: .leading, spacing: 16) {
+            Text(tr("Dati e privacy", "Data and privacy")).font(.title2)
+            ScrollView {
+                VStack(alignment: .leading, spacing: 12) {
+                    Text(tr("Il token dell’ateneo e le sessioni Polimi/Webex sono salvati in locale con permessi ristretti. Per usare le funzioni richieste, BeepBar si collega all’ateneo e a Webex. Alla prima riproduzione o aprendo le impostazioni Registrazioni, può leggere automaticamente l’email dal profilo WeBeep e usarla per l’accesso Webex. Puoi modificarla o rimuoverla nelle impostazioni Registrazioni.", "The university token and Polimi/Webex sessions are saved locally with restricted permissions. BeepBar connects to your university and Webex to provide the requested features. On first playback or when opening Recordings settings, it may automatically read your WeBeep profile email and use it to sign in to Webex. You can edit or remove it in Recordings settings."))
+                    Text(tr("Disconnettersi elimina il token e richiede la cancellazione della sessione Registrazioni; non elimina i materiali, il database di sincronizzazione o la watchlist salvata per account. Le copie nei backup non vengono cancellate. Prima di eliminare manualmente i dati dell’app, chiudi BeepBar e conserva i materiali e le modifiche che vuoi tenere.", "Disconnecting deletes the token and requests deletion of the Recordings session; materials, the sync database and per-account watchlist remain. Backup copies are not deleted. Before manually deleting app data, quit BeepBar and preserve any materials and edits you want to keep."))
+                    Text(tr("I controlli degli aggiornamenti sono attivi di default ogni otto ore e contattano il servizio di distribuzione degli aggiornamenti. Puoi disattivarli in Impostazioni. Anche la telemetria è attiva di default: puoi spegnerla nella sezione Telemetria e leggere lì i dati inviati.", "Update checks are enabled by default every eight hours and contact the update distribution service. You can turn them off in Settings. Telemetry is also enabled by default: turn it off in the Telemetry section, where the transmitted data is described."))
+                    Text(tr("Richieste privacy: tommaso.vaccari@mail.polimi.it. Non inviare password, token, cookie o registrazioni delle lezioni. Questa schermata descrive i flussi dell’app; l’informativa completa e la verifica della telemetria restano un requisito prima del rilascio.", "Privacy requests: tommaso.vaccari@mail.polimi.it. Do not send passwords, tokens, cookies or lecture recordings. This screen describes the app’s data flows; the complete privacy notice and telemetry assessment remain requirements before release."))
+                }
+            }
+            Button(tr("Chiudi", "Close")) { showPrivacy = false }.keyboardShortcut(.cancelAction)
+        }
+        .padding(24)
+        .frame(width: 560, height: 460)
     }
 
     // MARK: Language
@@ -308,8 +338,21 @@ struct SettingsPage: View {
     }
 }
 
-/// "Registrazioni" (Polimi only): the switch of the Recordings feature, and the Polimi sign-in
-/// when it has lapsed. Off by default; turning it on starts the sign-in at once.
+private struct SessionDeletionWarning: View {
+    @ObservedObject var recordings: RecordingsController
+
+    var body: some View {
+        if recordings.sessionDeletionFailed {
+            VStack(alignment: .leading, spacing: 6) {
+                Text(tr("Cancellazione della sessione non riuscita: cookie ed email potrebbero essere ancora sul disco. Disattiva Registrazioni e riprova.", "Session deletion failed: cookies and email may still be on disk. Turn Recordings off and retry."))
+                    .foregroundStyle(.orange)
+                Button(tr("Riprova la cancellazione", "Retry deletion")) { recordings.retrySessionDeletion() }
+                    .disabled(recordings.isEnabled)
+            }
+        }
+    }
+}
+
 private struct RecordingsSettingsSection: View {
     @ObservedObject var recordings: RecordingsController
 

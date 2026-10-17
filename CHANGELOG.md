@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+### Privacy
+
+- Telemetry no longer sends language or settings. Settings explains stored data and external connections, with a privacy contact and a retry for failed recording-session deletion.
+
 ### New
 
 - Mark every lecture in a course completed with one command, or mark them all unseen again when all are completed. Playback progress and resume positions are kept.

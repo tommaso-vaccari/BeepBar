@@ -58,7 +58,7 @@ In a preliminary local measurement of the Release build, with automatic sync dis
 - Controlled parallel downloads, byte-level progress, and real cancellation
 - Selectable sync root and editable course-folder names
 - [Three-way sync](#how-the-three-way-sync-works) backed by SQLite, atomic staging, and explicit conflict resolution
-- [Opt-in auto-updates](#auto-updates) via Sparkle, checked against a signed appcast
+- [Automatic updates (opt-out)](#auto-updates) via Sparkle, checked against a signed appcast
 
 ## How the three-way sync works
 

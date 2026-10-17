@@ -63,8 +63,17 @@ enum FileTokenStore {
 
     static func delete(removeFile: (URL) throws -> Void = { try FileManager.default.removeItem(at: $0) }) throws {
         let url = try fileURL()
-        try cleanUpOrphanedTempFiles(in: url.deletingLastPathComponent())
-        if FileManager.default.fileExists(atPath: url.path) { try removeFile(url) }
+        var failure: (any Error)?
+        if FileManager.default.fileExists(atPath: url.path) {
+            do { try removeFile(url) } catch { failure = error }
+        }
+        do {
+            let contents = try FileManager.default.contentsOfDirectory(at: url.deletingLastPathComponent(), includingPropertiesForKeys: nil)
+            for item in contents where item.lastPathComponent.hasPrefix(tempFilePrefix) && item.lastPathComponent.hasSuffix(tempFileSuffix) {
+                do { try removeFile(item) } catch { failure = failure ?? error }
+            }
+        } catch { failure = failure ?? error }
+        if let failure { throw failure }
     }
 
     private static func fileURL() throws -> URL {
@@ -77,7 +86,7 @@ enum FileTokenStore {
             // by `WeBeepAuthenticationController.databaseDirectory()` with default permissions
             // when it runs first — re-assert 0700 here so the credential file's directory is
             // never left group/world-readable regardless of creation order.
-            try? FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: directory.path)
+            try FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: directory.path)
             return directory.appendingPathComponent(fileName)
         } catch {
             throw CredentialStorageError.write

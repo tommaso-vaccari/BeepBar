@@ -159,6 +159,7 @@ struct RecordingsListing: Equatable {
 ///   first). A failure of this refresh is never shown as a sync failure.
 @MainActor final class RecordingsController: ObservableObject {
     nonisolated static let enabledKey = "io.github.tvaccari.beepbar.recordings-enabled.v1"
+    nonisolated static let sessionDeletionPendingKey = "io.github.tvaccari.beepbar.recordings-session-deletion-pending.v1"
     private static let sessionDiscardedKey = "io.github.tvaccari.beepbar.recordings-session-discarded.v1"
 
     /// The switch as saved: on by default, and off wherever the feature isn't available. Shared by
@@ -190,6 +191,9 @@ struct RecordingsListing: Equatable {
     /// player in the default browser, on purpose (the rows' "Apri nel browser" menu item, which
     /// before the package F fix ran a native Play despite its name). `copyLink`: the clipboard.
     enum OpenAction: Equatable { case play, browser, copyLink }
+
+    @Published private(set) var sessionDeletionFailed = false
+    private var sessionDeletionGeneration = 0
 
     @Published private(set) var isEnabled: Bool
     @Published private(set) var access: RecordingsAccess
@@ -511,6 +515,10 @@ struct RecordingsListing: Equatable {
         isEnabled = enabled
         access = enabled ? .ready : .off
         legacySeen = .init(ids: enabled ? defaults.stringArray(forKey: Self.acknowledgedKey) ?? [] : [], baselines: enabled ? defaults.stringArray(forKey: Self.baselinedKey) ?? [] : [])
+        if defaults.bool(forKey: Self.sessionDeletionPendingKey) {
+            sessionDeletionFailed = true
+            discardSessionFile()
+        }
     }
 
     /// The saved switch, on unless turned off; Polimi still decides (`isAvailable`). Shared with
@@ -2710,12 +2718,18 @@ struct RecordingsListing: Equatable {
         case .saved:
             if generation == self.generation, vault.epoch == epoch, defaults.bool(forKey: Self.sessionDiscardedKey) {
                 defaults.removeObject(forKey: Self.sessionDiscardedKey)
+                defaults.removeObject(forKey: Self.sessionDeletionPendingKey)
+                sessionDeletionFailed = false
+                sessionDeletionGeneration += 1
             }
             // The cycle's cached read now describes an older file.
             sessionLoad = nil
         case .unchanged:
             if generation == self.generation, vault.epoch == epoch, defaults.bool(forKey: Self.sessionDiscardedKey) {
                 defaults.removeObject(forKey: Self.sessionDiscardedKey)
+                defaults.removeObject(forKey: Self.sessionDeletionPendingKey)
+                sessionDeletionFailed = false
+                sessionDeletionGeneration += 1
             }
         case .stale:
             log.notice("Polimi session not saved: discarded while saving")
@@ -2726,16 +2740,30 @@ struct RecordingsListing: Equatable {
 
     /// Bumps the vault epoch now, so every save already under way is refused, and deletes the
     /// file in turn, off the main actor.
+    func retrySessionDeletion() {
+        guard sessionDeletionFailed, !isEnabled else { return }
+        discardSessionFile()
+    }
+
     private func discardSessionFile() {
+        defaults.set(true, forKey: Self.sessionDeletionPendingKey)
+        sessionDeletionGeneration += 1
+        let deletionGeneration = sessionDeletionGeneration
         defaults.set(true, forKey: Self.sessionDiscardedKey)
         sessionOwner = nil
         sessionLoad = nil
         // The email lives in the file and goes with it, in memory too.
         resetEmail()
         let delete = vault.discard()
-        Task { [log] in
-            if case .failed(let errorType) = await delete.value {
+        Task { [weak self, log] in
+            let outcome = await delete.value
+            guard let self, self.sessionDeletionGeneration == deletionGeneration else { return }
+            if case .failed(let errorType) = outcome {
+                self.sessionDeletionFailed = true
                 log.error("Couldn't delete the saved Polimi session errorType=\(errorType, privacy: .public)")
+            } else {
+                self.sessionDeletionFailed = false
+                self.defaults.removeObject(forKey: Self.sessionDeletionPendingKey)
             }
         }
     }

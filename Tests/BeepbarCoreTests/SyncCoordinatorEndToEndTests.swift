@@ -1243,6 +1243,26 @@ import Testing
         #expect(try await fixture.changes().isEmpty)
     }
 
+    /// #182: on a volume without hard links (exFAT/FAT, some network or FileProvider folders)
+    /// "Sposta nel Cestino" failed on every attempt. Proves the choice now completes there, with
+    /// the file in the Trash and the entry closed. Fails if the fallback is removed (the resolver
+    /// throws) or if it trashes something other than the user's file.
+    @Test func aRemovedFileCanGoToTheTrashOnAVolumeWithoutHardLinks() async throws {
+        let fixture = try await Fixture(hardLink: { _, _, _, _ in ENOTSUP })
+        defer { fixture.remove() }
+        let target = fixture.targets[0]
+        let id = fixture.remoteID(course: 1, file: 0)
+        _ = try await fixture.synchronize(targets: [target])
+        fixture.upstream.removeFile(course: 1, file: 0)
+        _ = try await fixture.synchronize(targets: [target])
+        let change = try #require(try await fixture.change(for: id))
+
+        #expect(try await fixture.resolve(change, .trash) == .done(nil))
+        #expect(fixture.contents("Course 1/Lezioni/0.txt") == nil)
+        #expect(fixture.trashedFiles() == ["0.txt"])
+        #expect(try await fixture.changes().isEmpty)
+    }
+
     @Test func aKeptFileIsTrackedAgainIfItReturnsUnchangedAndConflictsOtherwise() async throws {
         let fixture = try await Fixture()
         defer { fixture.remove() }
@@ -1602,6 +1622,31 @@ import Testing
         let updated = try await fixture.synchronize(targets: [target])
         #expect(updated.conflicts == 1)
         #expect(fixture.contents("Course 1/Lab 0/Esercizi/es.txt") == "my solution")
+    }
+
+    /// #182: "Sostituisci la copia nuova con la mia versione" trashes the new copy first, so on a
+    /// volume without hard links (here `EPERM`, as some network and FileProvider folders answer)
+    /// it failed on every attempt. Proves it completes there: the new copy is in the Trash and the
+    /// user's version takes its place.
+    @Test func anEditedFileCanReplaceTheNewCopyOnAVolumeWithoutHardLinks() async throws {
+        let fixture = try await Fixture(hardLink: { _, _, _, _ in EPERM })
+        defer { fixture.remove() }
+        let target = fixture.targets[0]
+        let hash = String(repeating: "c", count: 40)
+        fixture.upstream.addModule(course: 1, id: 150, section: "Lab 0", name: "Esercizi")
+        fixture.upstream.addFile(course: 1, file: 500, filename: "es.txt", value: "exercise", revision: "1", contentHash: hash)
+        _ = try await fixture.synchronize(targets: [target])
+        try fixture.write("my solution", to: "Course 1/Lezioni/es.txt")
+        fixture.upstream.removeFile(course: 1, file: 500)
+        fixture.upstream.addFile(course: 1, file: 501, filename: "es.txt", value: "exercise", revision: "1", module: 150, contentHash: hash)
+        _ = try await fixture.synchronize(targets: [target])
+        let change = try #require(try await fixture.change(for: fixture.remoteID(course: 1, file: 500, filename: "es.txt")))
+
+        #expect(try await fixture.resolve(change, .replaceNewCopy) == .done(try RelativePath("Course 1/Lab 0/Esercizi/es.txt")))
+        #expect(fixture.contents("Course 1/Lab 0/Esercizi/es.txt") == "my solution")
+        #expect(fixture.contents("Course 1/Lezioni/es.txt") == nil)
+        #expect(fixture.trashedFiles() == ["es.txt"])
+        #expect(try await fixture.changes().isEmpty)
     }
 
     @Test func anEditedNewCopyCannotBeReplacedOrTrashed() async throws {
@@ -2032,7 +2077,7 @@ private final class Fixture: @unchecked Sendable {
         let coordinator: SyncCoordinator
         let fileStore: FileStore
 
-        init(beforeMove: (@Sendable (URL, RelativePath, RelativePath) throws -> Void)? = nil, syncDirectory: (@Sendable (Int32) throws -> Void)? = nil) async throws {
+        init(beforeMove: (@Sendable (URL, RelativePath, RelativePath) throws -> Void)? = nil, syncDirectory: (@Sendable (Int32) throws -> Void)? = nil, hardLink: (@Sendable (Int32, String, Int32, String) -> Int32)? = nil) async throws {
             let container = FileManager.default.temporaryDirectory.appending(path: UUID().uuidString, directoryHint: .isDirectory)
             root = container.appending(path: "Sync", directoryHint: .isDirectory)
             supportDirectory = container.appending(path: "Support", directoryHint: .isDirectory)
@@ -2056,6 +2101,9 @@ private final class Fixture: @unchecked Sendable {
             }, syncDirectory: { descriptor in
                 if let syncDirectory { try syncDirectory(descriptor) }
                 else if fsync(descriptor) != 0 { throw FileStoreError.ioFailure }
+            }, hardLink: { from, name, to, linkName in
+                if let hardLink { return hardLink(from, name, to, linkName) }
+                return linkat(from, name, to, linkName, 0) == 0 ? 0 : errno
             })
             coordinator = try SyncCoordinator(rootID: rootID, rootURL: root, database: database, gate: gate, apiClient: client, downloader: downloader, fileStore: fileStore)
             try await database.registerRoot(id: rootID, canonicalPath: root.path)

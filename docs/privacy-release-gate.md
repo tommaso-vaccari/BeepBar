@@ -1,6 +1,35 @@
 # Privacy release gate — issue #180
 
-Status: **OPEN; draft remediation, not a GDPR compliance declaration.** Baseline: dev `039dc4092d29c23682ee3a8e802f40923af6ffce`, reviewed 2026-10-17. This PR targets dev. Do not release through #150 until the blockers below are resolved and the final binary is verified.
+Status: **Technical remediation delivered; legal/release gate OPEN. Not a GDPR compliance declaration.** Baseline: dev `039dc4092d29c23682ee3a8e802f40923af6ffce`, reviewed 2026-10-17. This PR targets dev. Do not release through #150 until the blockers below are resolved and the final binary is verified.
+
+## Delivery scope and acceptance — 2026-10-17
+
+The owner selected completion of the technical remediation and evidence record, with TelemetryDeck, minimal collection and default-on/opt-out retained. This is separate from approval to publish the app with that configuration. Default-on is a product constraint, not evidence of lawfulness. No opt-in migration, provider replacement, production signal, provider outreach or release is authorized by this scope.
+
+| Delivery criterion | Evidence and disposition |
+| --- | --- |
+| Implement and independently review agreed protections | Code `5812b9ae59acc8516200bdeec7142ef5802d2ff5`; independent review reported no remaining P1/P2 after corrections; automated expiry, backup, deletion, account-erasure and minimized-telemetry regressions passed. |
+| Full tests, Release build and CI | Local full suite and Release passed on `5812b9a`. CI on documentation HEAD `7459d443fd6855b2a4ff8f004fb890e502a7bf70` passed tests and Release: [run 39023033345](https://github.com/tommaso-vaccari/BeepBar/actions/runs/39023033345). Later documentation-only commits require their own CI status; these runs are not evidence for an untested later SHA. |
+| Accurate notice and retention description | IT/EN draft notice records actual client behavior, approved contact and correspondence retention, opt-out limits and attributed provider statements. Unresolved legal bases/recipient roles remain explicit; it is not a publishable complete Article 13 notice. |
+| Document purpose, alternatives and verified safeguards | Assessment and source links below, including SDK review; distinguish implemented safeguards, provider statements and unverified account guarantees. |
+| Record excluded manual checks honestly | Packaged/network/backup/expiry/erasure checks and procedure dry run were waived, not performed. They are not outstanding implementation tasks within this delivery; their evidential limits remain for release. |
+| Preserve requested telemetry and separate unresolved lawfulness | Minimized direct client retained; issue #180 remains open for legal/operational release evidence. Do not use an automatic issue-closing keyword in this PR. |
+
+Technical delivery does not close C01–C09 as a compliance assessment. No further runtime change is justified solely to make this table green. The remaining legal objective cannot be completed by declaring an unsupported positive result.
+
+### Lawful default-on route: evidence boundaries
+
+The candidate route is Article 6(1)(f) for any personal-data collection/transmission, together with a separately established Italian analytics/terminal-access exemption. If retained server data are genuinely anonymous, that conclusion needs an evidence-backed assessment; it cannot be inferred from hashing alone. A requirement that analytics be indispensable to course synchronization would apply the wrong test: the relevant interest here is compatibility maintenance. Equally effective, reasonably available, less intrusive means must still be assessed for that interest; see [CJEU C-621/22, paragraph 42](https://infocuria.curia.europa.eu/tabs/redirect/juris/documents.jsf?language=en&num=C-621%252F22&page=1).
+
+| Condition | What supports it | What the current record does not establish |
+| --- | --- | --- |
+| Specific legitimate interest | Actual maintenance/adoption purpose and installation-weighted compatibility rationale below. | No invented support thresholds, maintenance decisions or production measurements. |
+| Necessity and balancing | Small allowlisted payload, independently rotated monthly random identity, bounded attempts, opt-out/cancellation and alternatives analysis. | Why recurring daily linkage is necessary compared with one monthly report for the monthly metric; acceptable impact of retained linkable events and small cohorts. |
+| Qualifying analytics exemption | [Garante FAQ 4–5](https://www.garanteprivacy.it/faq/Cookie) permits qualifying aggregate analytics without consent, with minimization and restrictions on third-party combination/disclosure. | The exact native/direct-API configuration meets all conditions. The exemption is not ruled out merely because the app is native or the identifier rotates monthly. |
+| Provider assurances | Published no-IP-storage/EU-hosting statements and supplemental security/anonymity warranties. | Account-specific applicable terms and whether SDK-described warranties cover this direct client; no claim that every server operation needs an independent audit. |
+| Purpose-limited retention | Local monthly rotation and opt-out identity deletion are implemented. | Server-event deletion or sufficiently demonstrated irreversible anonymization. The proposed 90 days is a design option, not a GDPR-prescribed deadline. |
+
+A provider reply, a lawyer's signature and a 90-day term are not universal statutory prerequisites. Sufficient applicable public/contractual evidence could support an assessment without outreach. However, the public materials reviewed here do not resolve the particular gaps above; no server policy or account acceptance can be implemented in this repository. The positive default-on conclusion is therefore **not established**, rather than a finding that all default-on analytics are unlawful. The notice must remain a draft until those gaps and the other processing-specific notice requirements are resolved. Repeating the technical purpose does not supply that evidence.
 
 ## Decisions already recorded
 

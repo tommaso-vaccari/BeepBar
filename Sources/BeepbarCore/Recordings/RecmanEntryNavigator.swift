@@ -88,6 +88,8 @@ public struct RecmanEntryNavigator: Sendable {
             switch PolimiPage.classify(url, facts: facts) {
             case .archive:
                 return finish(.archive)
+            case .serviceUnavailable:
+                return finish(.failed)
             case .needsUser:
                 return reachedDeadEnd(.needsUser)
             case .unrecognized:

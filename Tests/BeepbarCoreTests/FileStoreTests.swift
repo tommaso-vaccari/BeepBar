@@ -1,10 +1,91 @@
+#if canImport(CryptoKit)
 import CryptoKit
+#else
+import Crypto
+#endif
+#if canImport(Darwin)
 import Darwin
+#else
+import Glibc
+#endif
 import Foundation
 import Testing
 @testable import BeepbarCore
 
 struct FileStoreTests {
+    @Test func trashRefusesAReplacedRootWithoutTouchingEitherFile() async throws {
+        let container = try temporaryRoot()
+        defer { try? FileManager.default.removeItem(at: container) }
+        let root = container.appending(path: "Sync")
+        let moved = container.appending(path: "Moved")
+        let destination = container.appending(path: "SyntheticTrash.txt")
+        try FileManager.default.createDirectory(at: root.appending(path: "Course"), withIntermediateDirectories: true)
+        try Data("original".utf8).write(to: root.appending(path: "Course/file.txt"))
+        let store = try FileStore(root: root) { try FileManager.default.moveItem(at: $0, to: destination) }
+        let path = try RelativePath("Course/file.txt")
+        guard case .present(let snapshot) = try await store.snapshotRegularFile(path) else { Issue.record("missing fixture"); return }
+        try FileManager.default.moveItem(at: root, to: moved)
+        try FileManager.default.createDirectory(at: root.appending(path: "Course"), withIntermediateDirectories: true)
+        try Data("unrelated".utf8).write(to: root.appending(path: path.value))
+        await #expect(throws: FileStoreError.self) { try await store.trashRegularFile(path, expected: snapshot) }
+        #expect(!FileManager.default.fileExists(atPath: destination.path))
+        #expect(try Data(contentsOf: moved.appending(path: path.value)) == Data("original".utf8))
+        #expect(try Data(contentsOf: root.appending(path: path.value)) == Data("unrelated".utf8))
+    }
+
+    @Test(arguments: ["success", "failure", "edit", "replace-parent", "replace-root"])
+    func trashStagesOnlyThePinnedFileAndPreservesConcurrentChanges(_ mode: String) async throws {
+        let container = try temporaryRoot()
+        defer { try? FileManager.default.removeItem(at: container) }
+        let root = container.appending(path: "Sync")
+        let source = root.appending(path: "Course/file.txt")
+        let destination = container.appending(path: "SyntheticTrash.txt")
+        let stageRecord = container.appending(path: "stage-path")
+        let replacement = container.appending(path: "Replacement")
+        let moved = container.appending(path: "Moved")
+        try FileManager.default.createDirectory(at: source.deletingLastPathComponent(), withIntermediateDirectories: true)
+        try FileManager.default.createDirectory(at: replacement, withIntermediateDirectories: true)
+        try Data("original".utf8).write(to: source)
+        try Data("unrelated".utf8).write(to: replacement.appending(path: "file.txt"))
+        let store = try FileStore(root: root) { staged in
+            try Data(staged.deletingLastPathComponent().path.utf8).write(to: stageRecord)
+            if mode == "failure" { throw FileStoreError.ioFailure }
+            if mode == "edit" { try Data("local edit".utf8).write(to: source) }
+            if mode == "replace-parent" {
+                try FileManager.default.moveItem(at: source.deletingLastPathComponent(), to: moved)
+                try FileManager.default.createSymbolicLink(at: source.deletingLastPathComponent(), withDestinationURL: replacement)
+            }
+            if mode == "replace-root" {
+                try FileManager.default.moveItem(at: root, to: moved)
+                try FileManager.default.createDirectory(at: root.appending(path: "Course"), withIntermediateDirectories: true)
+                try Data("unrelated".utf8).write(to: source)
+            }
+            try FileManager.default.moveItem(at: staged, to: destination)
+        }
+        let path = try RelativePath("Course/file.txt")
+        guard case .present(let snapshot) = try await store.snapshotRegularFile(path) else { Issue.record("missing fixture"); return }
+        if mode == "failure" || mode == "edit" {
+            await #expect(throws: FileStoreError.self) { try await store.trashRegularFile(path, expected: snapshot) }
+            #expect(try Data(contentsOf: source) == Data((mode == "edit" ? "local edit" : "original").utf8))
+        } else {
+            try await store.trashRegularFile(path, expected: snapshot)
+            #expect(try Data(contentsOf: destination) == Data("original".utf8))
+            if mode == "replace-parent" {
+                #expect(!FileManager.default.fileExists(atPath: moved.appending(path: "file.txt").path))
+            } else if mode == "replace-root" {
+                #expect(!FileManager.default.fileExists(atPath: moved.appending(path: path.value).path))
+                #expect(try Data(contentsOf: source) == Data("unrelated".utf8))
+            } else {
+                #expect(!FileManager.default.fileExists(atPath: source.path))
+            }
+        }
+        #expect(try Data(contentsOf: replacement.appending(path: "file.txt")) == Data("unrelated".utf8))
+        let stagedDirectory = try String(contentsOf: stageRecord, encoding: .utf8)
+        #expect(!FileManager.default.fileExists(atPath: stagedDirectory))
+    }
+
+    /// macOS only: the hidden flag is Finder metadata; the Linux shim sets nothing (see LinuxCompat.swift).
+    #if canImport(Darwin)
     @Test func hidesInternalBookkeepingDirectoryFromFinder() async throws {
         let root = try temporaryRoot()
         defer { try? FileManager.default.removeItem(at: root) }
@@ -16,6 +97,7 @@ struct FileStoreTests {
         #expect(stat(path, &info) == 0)
         #expect(info.st_flags & UInt32(UF_HIDDEN) != 0)
     }
+    #endif
 
     @Test func installsOnlyWhenDestinationIsStillMissing() async throws {
         let root = try temporaryRoot()

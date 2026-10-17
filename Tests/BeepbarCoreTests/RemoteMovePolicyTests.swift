@@ -11,6 +11,17 @@ struct RemoteMovePolicyTests {
         RemotePlacement(sectionName: section, moduleName: module, isSingleFileResource: single)
     }
 
+    /// Contradictory or missing names never replace a saved override, in either response order.
+    @Test func ambiguousOverrideMetadataKeepsSavedName() {
+        let saved = ModulePathOverride(rootID: UUID(), courseID: 1, moduleID: 4, localFolder: "Custom", lastKnownName: "Saved")
+        for names in [["First", "Second"], ["Second", "First"], ["", "First"], ["First", ""], [""]] {
+            let files = names.map { file(module: $0) }
+            #expect(SyncCoordinator.moduleOverrideRenames(files: files, overrides: [1: [4: saved]]).isEmpty)
+        }
+        #expect(SyncCoordinator.moduleOverrideRenames(files: [file(module: "First"), file(module: "First")], overrides: [1: [4: saved]]) == [1: [4: "First"]])
+        #expect(SyncCoordinator.moduleOverrideRenames(files: [file(module: "Saved")], overrides: [1: [4: saved]]).isEmpty)
+    }
+
     @Test func aBaselineWithNoRecordedPlacementIsOnlyRecorded() throws {
         let decision = try RemoteMovePolicy.decide(baselinePath: RelativePath("Corso/Lab 1/Esercizi/es1.pdf"), recorded: nil, file: file(), courseFolder: "Corso", moduleFolderOverride: nil)
         #expect(decision == .record)

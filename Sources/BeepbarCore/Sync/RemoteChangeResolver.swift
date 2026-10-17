@@ -108,6 +108,8 @@ public actor RemoteChangeResolver {
                 try await database.beginRemoteMoves(rootID: rootID, [step])
                 do {
                     try await fileStore.moveRegularFile(from: change.relativePath, to: destination, expected: snapshot)
+                } catch FileStoreError.mutationNotDurable {
+                    throw FileStoreError.mutationNotDurable
                 } catch {
                     try await database.discardRemoteMoves(rootID: rootID, remoteIDs: [change.remoteID])
                     if case FileStoreError.destinationExists = error { continue }

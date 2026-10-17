@@ -4,6 +4,8 @@ import Testing
 
 /// What a click on a file in Attività does (#69). Downloaded course files carry no quarantine
 /// flag, so these decisions are the only thing between a teacher's upload and running it.
+/// Needs UniformTypeIdentifiers: on Linux `opensDirectly` always reveals (see ActivityFilePolicy.swift).
+#if canImport(UniformTypeIdentifiers)
 struct ActivityFilePolicyTests {
     private let root = URL(fileURLWithPath: "/Users/someone/WeBeep", isDirectory: true)
 
@@ -85,3 +87,4 @@ struct ActivityFilePolicyTests {
         #expect(ActivityFilePolicy.action(trackedPath: script, root: root, fileState: .regular(executable: false)) == .reveal(root.appending(path: "Analisi/setup.term", directoryHint: .notDirectory)))
     }
 }
+#endif

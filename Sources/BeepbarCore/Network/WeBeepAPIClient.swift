@@ -1,4 +1,7 @@
 import Foundation
+#if canImport(FoundationNetworking)
+import FoundationNetworking
+#endif
 
 public struct WeBeepSiteInfo: Sendable, Equatable {
     public let userID: Int
@@ -13,14 +16,74 @@ public struct RemoteCourseSummary: Sendable, Equatable, Identifiable {
     public let isVisible: Bool?
     public let startDate: Date?
     public let endDate: Date?
+    /// The course's image on WeBeep (the picture Moodle shows on the course card), as a
+    /// `/webservice/pluginfile.php/` address on the site's own host, without any credential:
+    /// fetching it takes the token (`WeBeepAPIClient.fetchCourseImage`). Nil when the course has
+    /// none, or Moodle only offers its generated pattern. Shown as the artwork of the lecture
+    /// playing in macOS's Now Playing (issue #148 follow-up). Chosen by `WeBeepCourseImage.select`.
+    public let imageURL: URL?
 
-    public init(id: Int64, shortName: String, displayName: String, isVisible: Bool?, startDate: Date?, endDate: Date?) {
+    public init(id: Int64, shortName: String, displayName: String, isVisible: Bool?, startDate: Date?, endDate: Date?, imageURL: URL? = nil) {
         self.id = id
         self.shortName = shortName
         self.displayName = displayName
         self.isVisible = isVisible
         self.startDate = startDate
         self.endDate = endDate
+        self.imageURL = imageURL
+    }
+}
+
+/// Which of the images `core_enrol_get_users_courses` lists for a course BeepBar uses, and in
+/// which form (issue #148 follow-up, "Now Playing artwork"). Pure, so every rule is tested.
+///
+/// Moodle offers two: `overviewfiles`, the files a teacher uploaded as the course image, already
+/// as web-service addresses (`/webservice/pluginfile.php/…`), and, on newer versions,
+/// `courseimage`, the same picture as a browser address (`/pluginfile.php/…`) or, when there is
+/// none, a generated SVG pattern as a `data:` URI. Only a real picture is kept: a `data:` URI, an
+/// SVG (ImageIO cannot draw it), another host, plain HTTP, an address already carrying a token,
+/// or anything outside `pluginfile.php` is dropped, and the course simply has no image.
+///
+/// A `/pluginfile.php/` address is rewritten to `/webservice/pluginfile.php/`, as the Moodle app
+/// does: only the web-service path accepts the token BeepBar has, the browser path wants a
+/// session cookie. The address kept never contains a credential, so it can be stored with the
+/// course list (`CourseListSnapshot`) and compared freely.
+public enum WeBeepCourseImage {
+    /// One entry of `overviewfiles`, as far as this choice needs it.
+    public struct OverviewFile: Sendable, Equatable {
+        public let fileURL: String?
+        public let mimeType: String?
+        public init(fileURL: String?, mimeType: String?) {
+            self.fileURL = fileURL
+            self.mimeType = mimeType
+        }
+    }
+
+    /// The image to keep for a course, or nil. The first acceptable overview file wins (a teacher
+    /// can upload several; Moodle shows the first), then `courseimage`.
+    public static func select(overviewFiles: [OverviewFile], courseImage: String?, policy: WeBeepServerPolicy) -> URL? {
+        for file in overviewFiles {
+            if let mime = file.mimeType?.lowercased(), !mime.hasPrefix("image/") || mime.contains("svg") { continue }
+            if let url = acceptable(file.fileURL, policy: policy) { return url }
+        }
+        return acceptable(courseImage, policy: policy)
+    }
+
+    /// `text` as a credential-free web-service address on the site's host, or nil.
+    public static func acceptable(_ text: String?, policy: WeBeepServerPolicy) -> URL? {
+        guard let text, text.utf8.count <= 2_048, let url = URL(string: text),
+              url.scheme?.lowercased() == "https", policy.acceptsPluginURL(url),
+              var components = URLComponents(url: url, resolvingAgainstBaseURL: false) else { return nil }
+        if (components.queryItems ?? []).contains(where: { ["token", "wstoken"].contains($0.name.lowercased()) }) { return nil }
+        if components.percentEncodedPath.lowercased().hasSuffix(".svg") { return nil }
+        // No `.` or `..` segment, spelled out or percent-encoded (`%2e%2e`): the prefix check
+        // must not be escaped into another script of the site once the server normalizes it.
+        if components.path.split(separator: "/", omittingEmptySubsequences: false).contains(where: { $0 == "." || $0 == ".." }) { return nil }
+        if components.percentEncodedPath.hasPrefix("/pluginfile.php/") {
+            components.percentEncodedPath = "/webservice" + components.percentEncodedPath
+        }
+        guard let rewritten = components.url, policy.acceptsPluginURL(rewritten) else { return nil }
+        return rewritten
     }
 }
 
@@ -236,8 +299,43 @@ public final class WeBeepAPIClient: @unchecked Sendable {
                   let shortName = MoodleText.normalized(course.shortname), !shortName.isEmpty, shortName.utf8.count <= 512 else {
                 throw WeBeepAPIError.malformedPayload
             }
-            return RemoteCourseSummary(id: course.id, shortName: shortName, displayName: name, isVisible: course.visible.map { $0 != 0 }, startDate: course.startdate.map(Date.init(timeIntervalSince1970:)), endDate: course.enddate.map(Date.init(timeIntervalSince1970:)))
+            let image = WeBeepCourseImage.select(overviewFiles: course.overviewfiles, courseImage: course.courseimage, policy: policy)
+            return RemoteCourseSummary(id: course.id, shortName: shortName, displayName: name, isVisible: course.visible.map { $0 != 0 }, startDate: course.startdate.map(Date.init(timeIntervalSince1970:)), endDate: course.enddate.map(Date.init(timeIntervalSince1970:)), imageURL: image)
         }
+    }
+
+    /// Largest course image BeepBar accepts. A course card picture is a few hundred kilobytes;
+    /// anything bigger is cut off during reception, never buffered whole.
+    public static let courseImageByteLimit = 2_097_152
+    /// The longest a course image may take to start answering or between two chunks. The
+    /// artwork is a nicety: a slow WeBeep must never keep a request open for long.
+    public static let courseImageTimeout: TimeInterval = 10
+
+    /// The bytes of a course image (`RemoteCourseSummary.imageURL`), for the artwork of the
+    /// lecture playing (issue #148 follow-up).
+    ///
+    /// Same guarantees as every WeBeep request: this client's ephemeral session (no cache, no
+    /// cookies kept), redirects refused (a redirect fails the request rather than taking the token
+    /// to another address), reception capped at `courseImageByteLimit`, and an `image/*` answer
+    /// required. The address must be a web-service `pluginfile.php` address on the site's own
+    /// host over HTTPS, without a credential of its own; the token is appended here, and neither
+    /// it nor the address is ever logged. Cancellation cancels the request.
+    public func fetchCourseImage(_ url: URL, token: String) async throws -> Data {
+        guard url.scheme?.lowercased() == "https", WeBeepCourseImage.acceptable(url.absoluteString, policy: policy) == url else {
+            throw WeBeepAPIError.unexpectedSite
+        }
+        var request: URLRequest
+        do { request = try RemoteDownloader.request(url: url, token: token, policy: policy) }
+        catch { throw WeBeepAPIError.unexpectedSite }
+        request.setValue("image/*", forHTTPHeaderField: "Accept")
+        request.timeoutInterval = Self.courseImageTimeout
+        let receiver = BoundedMetadataResponse(limit: Self.courseImageByteLimit, acceptsContentType: { $0?.lowercased().hasPrefix("image/") == true })
+        do { return try await receiver.run(request, in: session) }
+        catch let error as WeBeepAPIError { throw error }
+        catch is CancellationError { throw CancellationError() }
+        catch let error as URLError where error.code == .cancelled { throw CancellationError() }
+        catch let error as URLError { throw WeBeepAPIError.network(NetworkFailure(error.code)) }
+        catch { throw WeBeepAPIError.invalidResponse }
     }
 
     public func fetchContents(courseID: Int64, token: String) async throws -> RemoteCourseContents {
@@ -326,18 +424,54 @@ public final class WeBeepAPIClient: @unchecked Sendable {
         return RemoteCourseContents(sections: resolved, issueCount: issueCount, modulesWithDroppedEntries: modulesWithDroppedEntries, isComplete: isComplete)
     }
 
+    /// Moodle web service that `fetchOwnEmail` calls. Callers check
+    /// `WeBeepSiteInfo.availableFunctions.contains(ownEmailFunction)` first: a WeBeep token may not
+    /// be allowed to call it, and its absence must not be treated as a failed sign-in.
+    public static let ownEmailFunction = AllowedFunction.userByField.rawValue
+
+    /// Response cap for `fetchOwnEmail`: one user record (profile fields and preferences) is a few
+    /// kilobytes, so 1 MiB, as for site info, leaves headroom without unbounded reception (#102).
+    static let ownEmailResponseLimit = 1_048_576
+
+    /// The e-mail address on the signed-in user's WeBeep profile, used to pre-fill the Polimi
+    /// address Webex asks for in native recordings playback (#148).
+    ///
+    /// Returns the raw string, untouched, for the user whose `id` equals `userID`; nil when Moodle
+    /// returns no user, only other users, or a user without a non-blank `email`. It does not
+    /// validate the address: `PolimiEmail` does that at the caller, so the network client stays
+    /// independent of the playback policy. Moodle errors map as for `fetchCourses`
+    /// (`invalidtoken` → `.invalidToken`, any other exception → `.malformedPayload`).
+    /// The address is personal data and the token a credential: neither is ever logged.
+    public func fetchOwnEmail(userID: Int, token: String) async throws -> String? {
+        guard userID > 0 else { throw WeBeepAPIError.malformedPayload }
+        let data = try await request(.userByField, token: token, fields: Self.ownEmailFields(userID: userID), limit: Self.ownEmailResponseLimit)
+        if let error = try? JSONDecoder().decode(MoodleErrorResponse.self, from: data), error.exception != nil || error.errorcode != nil {
+            throw error.errorcode == "invalidtoken" ? WeBeepAPIError.invalidToken : WeBeepAPIError.malformedPayload
+        }
+        let users: [UserResponse]
+        do { users = try JSONDecoder().decode([UserResponse].self, from: data) }
+        catch { throw WeBeepAPIError.malformedPayload }
+        // Match the id rather than taking the first element: an address that belongs to someone
+        // else must never be offered as the user's own, whatever order Moodle returns.
+        guard let email = users.first(where: { $0.id == Int64(userID) })?.email,
+              !email.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return nil }
+        return email
+    }
+
+    /// `core_user_get_users_by_field` takes a field name and an array of values; PHP reads the
+    /// form key `values[0]` as the array's first element.
+    private static func ownEmailFields(userID: Int) -> [String: String] {
+        ["field": "id", "values[0]": String(userID)]
+    }
+
     private func request(_ function: AllowedFunction, token: String, fields: [String: String], limit: Int) async throws -> Data {
         let request = Self.request(function: function, token: token, fields: fields, endpoint: policy.endpoint)
-        let (data, response): (Data, URLResponse)
-        do { (data, response) = try await session.data(for: request) }
+        do { return try await BoundedMetadataResponse(limit: limit).run(request, in: session) }
+        catch let error as WeBeepAPIError { throw error }
+        catch is CancellationError { throw CancellationError() }
         catch let error as URLError where error.code == .cancelled { throw CancellationError() }
         catch let error as URLError { throw WeBeepAPIError.network(NetworkFailure(error.code)) }
         catch { throw WeBeepAPIError.invalidResponse }
-        guard let http = response as? HTTPURLResponse else { throw WeBeepAPIError.invalidResponse }
-        guard (200...299).contains(http.statusCode) else { throw WeBeepAPIError.transport(http.statusCode) }
-        guard http.value(forHTTPHeaderField: "Content-Type")?.lowercased().contains("application/json") == true else { throw WeBeepAPIError.invalidResponse }
-        guard data.count <= limit else { throw WeBeepAPIError.responseTooLarge }
-        return data
     }
 
     static func validationRequest(token: String) -> URLRequest {
@@ -350,6 +484,10 @@ public final class WeBeepAPIClient: @unchecked Sendable {
 
     static func contentsRequest(courseID: Int64, token: String) -> URLRequest {
         request(function: .contents, token: token, fields: ["courseid": String(courseID)], endpoint: endpoint)
+    }
+
+    static func ownEmailRequest(userID: Int, token: String) -> URLRequest {
+        request(function: .userByField, token: token, fields: ownEmailFields(userID: userID), endpoint: endpoint)
     }
 
     private static func request(function: AllowedFunction, token: String, fields: [String: String], endpoint: URL) -> URLRequest {
@@ -380,6 +518,114 @@ public final class WeBeepAPIClient: @unchecked Sendable {
         configuration.urlCache = nil
         configuration.timeoutIntervalForRequest = 15
         return URLSession(configuration: configuration, delegate: RejectRedirects(), delegateQueue: nil)
+    }
+}
+
+/// Accumulates metadata only up to the caller's cap, cancelling reception at the first overrun (#102).
+/// The task uses the original session, including injected URLProtocols and credentials. Redirect and
+/// authentication methods remain on its session delegate, as with the bounded file downloader.
+final class BoundedMetadataResponse: NSObject, URLSessionDataDelegate, @unchecked Sendable {
+    private let limit: Int
+    private let lock = NSLock()
+    private var body = Data()
+    private var receivedResponse = false
+    private var rejection: Error?
+    private var continuation: CheckedContinuation<Data, Error>?
+    private var completed = false
+    private var consumerInstalled = false
+    private var earlyResult: Result<Data, Error>?
+
+    /// Which `Content-Type` an answer must have to be read: JSON for every web-service call, an
+    /// image for `fetchCourseImage`. Anything else is refused before a byte is buffered.
+    private let acceptsContentType: @Sendable (String?) -> Bool
+
+    init(limit: Int, acceptsContentType: @escaping @Sendable (String?) -> Bool = { $0?.lowercased().contains("application/json") == true }) {
+        self.limit = limit
+        self.acceptsContentType = acceptsContentType
+    }
+
+    /// No async byte sequence or main-actor hop: URLSession supplies background chunk callbacks.
+    func run(_ request: URLRequest, in session: URLSession) async throws -> Data {
+        try Task.checkCancellation()
+        let task = session.dataTask(with: request)
+        task.delegate = self
+        return try await withTaskCancellationHandler {
+            try await receive { task.resume() }
+        } onCancel: {
+            task.cancel()
+        }
+    }
+
+    /// Install the consumer or deliver a terminal result received before installation (#127).
+    /// Callback completion and installation share one lock; resume/start happen outside it.
+    func receive(start: @Sendable () -> Void) async throws -> Data {
+        try await withCheckedThrowingContinuation { continuation in
+            let result = lock.withLock { () -> Result<Data, Error>? in
+                precondition(!consumerInstalled, "Metadata reception has one consumer")
+                consumerInstalled = true
+                if completed {
+                    let result = earlyResult
+                    earlyResult = nil
+                    return result
+                }
+                self.continuation = continuation
+                return nil
+            }
+            if let result { continuation.resume(with: result) }
+            else { start() }
+        }
+    }
+
+    func urlSession(_ session: URLSession, dataTask: URLSessionDataTask, didReceive response: URLResponse, completionHandler: @escaping @Sendable (URLSession.ResponseDisposition) -> Void) {
+        let failure: WeBeepAPIError?
+        if let http = response as? HTTPURLResponse {
+            if !(200...299).contains(http.statusCode) { failure = .transport(http.statusCode) }
+            else if !acceptsContentType(http.value(forHTTPHeaderField: "Content-Type")) { failure = .invalidResponse }
+            else if http.expectedContentLength > Int64(limit) { failure = .responseTooLarge }
+            else { failure = nil }
+        } else { failure = .invalidResponse }
+        let allow = lock.withLock { () -> Bool in
+            guard !completed else { return false }
+            receivedResponse = true
+            if let failure { rejection = failure }
+            return failure == nil
+        }
+        completionHandler(allow ? .allow : .cancel)
+    }
+
+    func urlSession(_ session: URLSession, dataTask: URLSessionDataTask, didReceive data: Data) {
+        let stop = lock.withLock { () -> Bool in
+            guard !completed, rejection == nil else { return true }
+            // Count the bytes URLSession delivers after decompression. Header lengths can be absent,
+            // false, or compressed; they never replace this check or permit an oversized allocation.
+            guard data.count <= limit - body.count else {
+                rejection = WeBeepAPIError.responseTooLarge
+                body = Data()
+                return true
+            }
+            body.append(data)
+            return false
+        }
+        if stop { dataTask.cancel() }
+    }
+
+    func urlSession(_ session: URLSession, task: URLSessionTask, didCompleteWithError error: Error?) {
+        let completion = lock.withLock { () -> (CheckedContinuation<Data, Error>, Result<Data, Error>)? in
+            guard !completed else { return nil }
+            completed = true
+            // Retain a terminal result even when cancellation of a suspended task completes
+            // before receive installs its continuation. No callback may complete twice.
+            let failure = rejection ?? error ?? (receivedResponse ? nil : WeBeepAPIError.invalidResponse)
+            let result: Result<Data, Error> = failure.map { .failure($0) } ?? .success(body)
+            body = Data()
+            guard let pending = continuation else {
+                earlyResult = result
+                return nil
+            }
+            continuation = nil
+            return (pending, result)
+        }
+        if let (pending, result) = completion { pending.resume(with: result) }
     }
 }
 
@@ -485,7 +731,14 @@ private func validContentHash(_ value: String?) -> String? {
     return value.lowercased()
 }
 
-private enum AllowedFunction: String { case siteInfo = "core_webservice_get_site_info", courses = "core_enrol_get_users_courses", contents = "core_course_get_contents" }
+/// The only Moodle web services BeepBar calls. A new call is added here deliberately, never built
+/// from a free-form string.
+private enum AllowedFunction: String {
+    case siteInfo = "core_webservice_get_site_info"
+    case courses = "core_enrol_get_users_courses"
+    case contents = "core_course_get_contents"
+    case userByField = "core_user_get_users_by_field"
+}
 
 private final class RejectRedirects: NSObject, URLSessionTaskDelegate {
     func urlSession(_ session: URLSession, task: URLSessionTask, willPerformHTTPRedirection response: HTTPURLResponse, newRequest request: URLRequest, completionHandler: @escaping (URLRequest?) -> Void) {
@@ -504,6 +757,10 @@ private struct SiteInfoResponse: Decodable {
     struct Function: Decodable { let name: String }
 }
 
+/// One element of `core_user_get_users_by_field`. Only what `fetchOwnEmail` needs is decoded;
+/// `email` is optional because Moodle omits it when the field is hidden or unset.
+private struct UserResponse: Decodable { let id: Int64; let email: String? }
+
 private struct CourseResponse: Decodable {
     let id: Int64
     let shortname: String?
@@ -512,6 +769,33 @@ private struct CourseResponse: Decodable {
     let visible: Int?
     let startdate: TimeInterval?
     let enddate: TimeInterval?
+    /// The course image fields (`WeBeepCourseImage`). Decoded leniently: they are a nicety, and
+    /// an unexpected shape must cost the course its picture, never the whole course list.
+    let overviewfiles: [WeBeepCourseImage.OverviewFile]
+    let courseimage: String?
+
+    private enum CodingKeys: String, CodingKey {
+        case id, shortname, fullname, displayname, visible, startdate, enddate, overviewfiles, courseimage
+    }
+
+    private struct OverviewFileResponse: Decodable {
+        let fileurl: String?
+        let mimetype: String?
+    }
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        id = try container.decode(Int64.self, forKey: .id)
+        shortname = try container.decodeIfPresent(String.self, forKey: .shortname)
+        fullname = try container.decodeIfPresent(String.self, forKey: .fullname)
+        displayname = try container.decodeIfPresent(String.self, forKey: .displayname)
+        visible = try container.decodeIfPresent(Int.self, forKey: .visible)
+        startdate = try container.decodeIfPresent(TimeInterval.self, forKey: .startdate)
+        enddate = try container.decodeIfPresent(TimeInterval.self, forKey: .enddate)
+        let files = (try? container.decodeIfPresent(LossyArray<OverviewFileResponse>.self, forKey: .overviewfiles))??.elements ?? []
+        overviewfiles = files.prefix(20).map { WeBeepCourseImage.OverviewFile(fileURL: $0.fileurl, mimeType: $0.mimetype) }
+        courseimage = (try? container.decodeIfPresent(String.self, forKey: .courseimage)) ?? nil
+    }
 }
 
 private struct LossyArray<Element: Decodable>: Decodable {

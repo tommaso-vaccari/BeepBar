@@ -8,6 +8,8 @@ struct SettingsPage: View {
     @State private var showSignOutConfirmation = false
     @ObservedObject private var launchAtLogin = LaunchAtLoginController.shared
 
+    @ObservedObject private var telemetry = DailyTelemetryController.shared
+
     var body: some View {
         Form {
             languageSection
@@ -20,6 +22,7 @@ struct SettingsPage: View {
             automaticSection
             notificationsSection
             updatesSection
+            telemetrySection
         }
         .formStyle(.grouped)
         // On the Form, not on the startup Section: modifiers on a Section inside a Form can be
@@ -39,6 +42,18 @@ struct SettingsPage: View {
             Button(tr("Annulla", "Cancel"), role: .cancel) {}
         } message: {
             Text(tr("Il token salvato viene eliminato da questo Mac. La cartella dei materiali e i file restano dove sono.", "The saved token is removed from this Mac. The materials folder and files stay where they are."))
+        }
+    }
+
+    private var telemetrySection: some View {
+        Section(tr("Telemetria", "Telemetry")) {
+            Toggle(isOn: Binding(
+                get: { telemetry.isEnabled },
+                set: { telemetry.setEnabled($0) }
+            )) {
+                SettingLabel(tr("Telemetria", "Telemetry"), explanation: tr("Serve solo a contare quanti usano BeepBar e come. Invia a TelemetryDeck un ping al giorno con un identificativo casuale che cambia ogni mese, la versione dell’app e di macOS, la lingua e quali impostazioni sono attive (sincronizzazione automatica e frequenza, Risparmio dati, Registrazioni, apertura al login). Nessun dato dell’account, corso o file. Se lo spegni, l’identificativo viene cancellato.", "Used only to count how many people use BeepBar and how. Sends TelemetryDeck one daily ping with a random identifier that changes every month, the app and macOS versions, the language and which settings are on (automatic sync and its frequency, Data Saver, Recordings, open at login). No account, course or file data. Turning it off deletes the identifier."))
+            }
+            .disabled(!telemetry.isConfigured)
         }
     }
 
@@ -324,6 +339,9 @@ private struct RecordingsSettingsSection: View {
             case .ready, .off:
                 EmptyView()
             }
+            if recordings.isEnabled {
+                RecordingsEmailField(recordings: recordings)
+            }
         } header: {
             Text(tr("Registrazioni", "Recordings"))
         } footer: {
@@ -337,6 +355,95 @@ private struct RecordingsSettingsSection: View {
         if !recordings.isEnabled && !recordings.canTurnOn {
             return tr("Collega prima il tuo account WeBeep.", "Connect your WeBeep account first.")
         }
-        return tr("L'accesso al Politecnico resta solo su questo Mac, leggibile solo dal tuo utente. Spegnendo l'interruttore o disconnettendo l'account viene cancellato.", "The Polimi sign-in stays on this Mac only, readable only by your user. Turning the switch off or disconnecting the account deletes it.")
+        return tr("L'accesso al Politecnico e a Webex e l'email restano solo su questo Mac, leggibili solo dal tuo utente. Spegnendo l'interruttore o disconnettendo l'account vengono cancellati.", "The Polimi and Webex sign-ins and the email stay on this Mac only, readable only by your user. Turning the switch off or disconnecting the account deletes them.")
+    }
+}
+
+/// The Polimi email Webex asks for when a recording is played inside BeepBar (#148). By product
+/// decision (2026-10-11) the WeBeep profile's address, when the account allows reading it, is in
+/// use without a confirmation step (`RecordingsController.learnEmail`, also run by the first
+/// Play); this row shows the address in use, says where it came from, and lets the student change
+/// or remove it, which wins over the profile (rules in `RecordingsController.emailFieldState` and
+/// `confirmEmail`).
+private struct RecordingsEmailField: View {
+    @ObservedObject var recordings: RecordingsController
+    @State private var draft = ""
+    /// What `draft` was last filled with, so a late suggestion never overwrites what the student typed.
+    @State private var source = ""
+
+    private var state: RecordingsController.EmailFieldState {
+        RecordingsController.emailFieldState(draft: draft, confirmed: recordings.confirmedEmail)
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 4) {
+            LabeledContent {
+                HStack(spacing: 8) {
+                    TextField("", text: $draft, prompt: Text("nome.cognome@mail.polimi.it"))
+                        .labelsHidden()
+                        .textFieldStyle(.roundedBorder)
+                        .frame(width: 230)
+                        .accessibilityLabel(tr("Email del Politecnico", "Polimi email"))
+                        .disabled(!recordings.canConfirmEmail)
+                        .onSubmit(confirm)
+                    Button(state == .removable ? tr("Rimuovi", "Remove") : tr("Conferma", "Confirm"), action: confirm)
+                        .disabled(!canConfirm)
+                }
+            } label: {
+                SettingLabel(tr("Email del Politecnico", "Polimi email"), explanation: tr("BeepBar prende l'indirizzo dal tuo profilo WeBeep e lo usa solo per accedere a Webex in automatico quando guardi una registrazione dentro l'app: lo manda a Webex per l'accesso e a nessun altro. Puoi cambiarlo o rimuoverlo qui. Resta su questo Mac, nello stesso file dell'accesso al Politecnico, e viene cancellato con lui.", "BeepBar takes the address from your WeBeep profile and uses it only to sign in to Webex automatically when you watch a recording inside the app: it sends it to Webex for that sign-in and to no one else. You can change or remove it here. It stays on this Mac, in the same file as your Polimi sign-in, and is deleted with it."))
+            }
+            if let note {
+                Text(note)
+                    .font(.caption)
+                    .foregroundStyle(state == .invalid ? Color.red : Color.secondary)
+            }
+        }
+        .task {
+            await recordings.prepareEmailField()
+            fill()
+        }
+        .onChange(of: recordings.confirmedEmail) { _, _ in fill() }
+    }
+
+    private var canConfirm: Bool {
+        guard recordings.canConfirmEmail else { return false }
+        switch state {
+        case .ready, .removable: return true
+        case .empty, .confirmed, .invalid: return false
+        }
+    }
+
+    private var note: String? {
+        // No WeBeep account known (expired sign-in at launch): an address typed now would belong
+        // to no account, so the field takes none until the student signs in again.
+        if !recordings.canConfirmEmail {
+            return tr("Accedi di nuovo a WeBeep per inserire l'indirizzo.", "Sign in to WeBeep again to enter the address.")
+        }
+        switch state {
+        case .invalid:
+            return tr("Serve un indirizzo del Politecnico (…@mail.polimi.it o …@polimi.it).", "A Polimi address is needed (…@mail.polimi.it or …@polimi.it).")
+        case .confirmed where recordings.emailFromProfile:
+            return tr("In uso, preso dal tuo profilo WeBeep. Puoi cambiarlo o rimuoverlo.", "In use, taken from your WeBeep profile. You can change or remove it.")
+        case .confirmed:
+            return tr("Indirizzo in uso.", "Address in use.")
+        case .empty:
+            return tr("Serve per guardare le registrazioni dentro BeepBar: senza, quelle che richiedono l'accesso a Webex non si aprono.", "Needed to watch recordings inside BeepBar: without it, those that need a Webex sign-in won't open.")
+        case .ready, .removable:
+            return nil
+        }
+    }
+
+    private func confirm() {
+        guard canConfirm else { return }
+        recordings.confirmEmail(draft)
+        draft = ""
+        source = ""
+        fill()
+    }
+
+    private func fill() {
+        let latest = recordings.confirmedEmail?.value ?? ""
+        if draft == source { draft = latest }
+        source = latest
     }
 }

@@ -1,0 +1,25 @@
+# Valutazione BeepBar
+
+2026-10-10. Base della prima indagine: `c9a04dc2f510fb02d0662f1c66ce0c53f54e5296`. Main locale: `3ce0ba02c10dcf51836057f7119ba0e78da3c6e4`. Remoti live/binario distribuito non verificati. Solo documentazione, nessun fix. Allineamento successivo a dev `d3a42dc775ef461f5406c85818a1e1e0f57ad6dc`: aggiunta telemetria, evidenza [[20 Sources/S-0007 BeepBar telemetria]].
+
+**Conformità non dimostrata; nessuna conclusione di violazione dalla sola analisi statica.** [[20 Sources/S-0001 GDPR]], [[20 Sources/S-0002 EDPB ruoli]], [[20 Sources/S-0005 BeepBar codice]].
+
+| ID | Evidenza | Valutazione e chiusura richiesta |
+|---|---|---|
+| C01 | Informativa dedicata non trovata nel repository | `code-backed` assenza delimitata; definire ruoli e applicabilità art. 13 |
+| C02 | Token/sessioni locali, 0600/0700 | `code-backed` misura positiva; valutare rischi, log, backup, errori |
+| C03 | signOut rimuove token, invoca turnOff, conserva sync.sqlite e materiali | `code-backed`; documentare residui e rimozione preservando lavoro locale |
+| C04 | Aggiornamenti automatici ogni otto ore, README anche “Opt-in” | `code-backed` incoerenza; allineare descrizione, verificare payload e base |
+| C05 | Cookie Polimi senza expiry persistiti; con la riproduzione nativa (#148, PR #152, non rilasciata) lo stesso file conserva anche cookie di sessione Webex e l'email Polimi (dato personale), tutti cancellati con il file. Dal 2026-10-11 l'email è presa dal profilo WeBeep e usata senza un passo di conferma esplicito (decisione del responsabile): l'utente la vede, la cambia o la rimuove in Impostazioni, ma non c'è più un'azione che ne autorizzi l'uso prima del primo Play | `code-backed`; motivare durata, minimizzazione (solo domini polimi.it/webex.com, cookie Webex con scadenza entro 12 ore esclusi, email validata e mai nei log, nessun nome) e finalità (accesso automatico a Webex); valutare se l'uso dell'email del profilo senza conferma è coperto da informazione adeguata (testo in Impostazioni, CHANGELOG) e dalla base giuridica scelta, e se Webex riceve l'indirizzo anche da utenti che non hanno mai aperto Impostazioni; provare cancellazione/failure path su turn-off, logout, cambio sito e account; verificare ruolo di Webex come destinatario dell'email e se la catena idbroker → IdP Polimi la inoltra; minimizzazione della lettura del profilo (`core_user_get_users_by_field` restituisce l'intero record, BeepBar decodifica solo `id` ed `email`); un'email appresa prima di una sessione Polimi resta legata al suo account WeBeep e viene scartata al cambio account (test di regressione in PR #152) |
+| C06 | Preferiti per account restano dopo logout | `code-backed`; conservazione distinta dalla sessione, documentare e verificare rimozione |
+| C07 | Log con campi pubblici; URL Recman ridotti a host/path | `code-backed` parziale; audit di campi/errori e diagnostica |
+| C08 | TelemetryDeck diretto, default attivo in Release; da dev `50177f3` (PR #158) l'identità persistente è sostituita da un UUID casuale per mese UTC (cancellato all'opt-out) e il payload aggiunge solo campi a bassa cardinalità (versione principale macOS, lingua, impostazioni attive) | `code-backed` su dev 50177f3, fonte S-0007; la rotazione mensile riduce il collegamento nel tempo ma non risolve la base giuridica del default attivo né rende anonimo il dato (IP, identità entro il mese); il risalting lato server è dichiarato solo in un commento del codice SDK, non nella documentazione; verificare informativa, ruoli/contratti, conservazione, trasferimenti e base GDPR/ePrivacy prima della release; hash non prova anonimato |
+| C09 | Processi assistenza/incidenti/diritti non censiti | `open-question`; documentare obblighi proporzionati ai ruoli |
+
+## Limiti e correzioni
+
+Non trovare l'informativa nel repo non dimostra assenza ovunque; sito pubblico non validato. Default automatico degli update non prova obbligo di consenso. File non cifrato non è automaticamente illecito. Logout non deve cancellare materiali/preferiti implicitamente. Produttore locale non è automaticamente titolare di tutti i dati universitari.
+
+Eseguiti: lettura statica, ricerca connessioni/privacy, confronto nomi dei file main→dev, acquisizione fonti pubbliche con hash. Non eseguiti: test app, build, account reali, rete live, accesso a DB utente o assistenza.
+
+Su dev differiscono da main RecordingsController, RecordingsStudyState, WeBeepAuthenticationController: non attribuire i finding alla release senza confronto mirato. API issue GitHub non raggiungibile durante l'indagine; nessuna assegnazione o aggiornamento remoto. [[30 Wiki/Piano di verifica]]

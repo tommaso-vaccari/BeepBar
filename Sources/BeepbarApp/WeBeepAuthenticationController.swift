@@ -154,7 +154,7 @@ enum AppSyncState: Equatable {
     }
 }
 
-struct SyncCompletionSummary: Codable, Equatable {
+struct SyncCompletionSummary: Codable, Equatable, Sendable {
     let completedAt: Date
     let added: Int
     let updated: Int
@@ -231,6 +231,47 @@ struct SyncCompletionSummary: Codable, Equatable {
     private var preservedSuffix: String {
         guard preservedLocal > 0 else { return "" }
         return preservedLocal == 1 ? tr(" 1 modifica locale conservata.", " 1 local change kept.") : tr(" \(preservedLocal) modifiche locali conservate.", " \(preservedLocal) local changes kept.")
+    }
+}
+
+/// A sync's new successful result with its JSON, encoded off the main actor before it is published
+/// (R01, #109). Encoding 15,000 file details takes about 19 ms on an M5, more than a frame, and
+/// used to run on the main actor at the end of the sync. Publishing and saving still happen
+/// together, in one main-actor turn (`setSyncState(synced:)`), so no published result ever waits
+/// to be saved and no write can land after a newer one. Only `encode(_:)` builds it, so the bytes
+/// always belong to `summary`.
+struct EncodedSyncSummary: Sendable {
+    let summary: SyncCompletionSummary
+    /// nil when encoding failed. As before R01, the time of the sync is still saved and the
+    /// previous summary is left in place; nothing is encoded again on the main actor.
+    let data: Data?
+#if DEBUG
+    /// Where the encode ran; `SyncFinalizationTests` proves it is never the main thread.
+    let encodedOnMainThread: Bool
+#endif
+
+    private init(summary: SyncCompletionSummary, data: Data?, encodedOnMainThread: Bool) {
+        self.summary = summary
+        self.data = data
+#if DEBUG
+        self.encodedOnMainThread = encodedOnMainThread
+#endif
+    }
+
+    /// Encodes on a detached task, never on the caller's actor. Today a nonisolated async function
+    /// already leaves the main actor, but under `nonisolated(nonsending)`, the default that
+    /// Swift's approachable-concurrency setting turns on, it would run on its caller's: the
+    /// detached task keeps the encode off the main actor either way. It keeps the sync's own
+    /// priority, so an automatic sync in the background does not encode at user-initiated
+    /// priority. Not interruptible: a sync cancelled meanwhile waits for it, about 20 ms at 15,000
+    /// details, and then drops the result at its own guard.
+    static func encode(_ summary: SyncCompletionSummary) async -> EncodedSyncSummary {
+        await Task.detached(priority: Task.currentPriority) { encodeNow(summary) }.value
+    }
+
+    /// Synchronous, so it can tell which thread it runs on.
+    private static func encodeNow(_ summary: SyncCompletionSummary) -> EncodedSyncSummary {
+        EncodedSyncSummary(summary: summary, data: try? JSONEncoder().encode(summary), encodedOnMainThread: Thread.isMainThread)
     }
 }
 
@@ -317,6 +358,80 @@ struct MenuBarSnapshot: Sendable {
     let actionTitle: String
     let openTitle: String
     let quitTitle: String
+    /// Header of the recordings section ("Registrazioni"); unused while `recordingLines` is empty.
+    let recordingsTitle: String
+    /// One line per synced course with a known watch summary ("Analisi 2 — 12/30 · ~14 h"), at
+    /// most `WeBeepAuthenticationController.maxRecordingMenuLines`, already in the current
+    /// language. Empty means the menu has no recordings section at all.
+    let recordingLines: [RecordingMenuLine]
+}
+
+/// What a click on a course's recordings line in the menu bar carries to the main actor: who,
+/// which course, which archive key, and nothing else. The lecture itself is deliberately not in
+/// it: the main actor re-resolves the course's *current* next lecture when the click arrives
+/// (`WeBeepAuthenticationController.playNextRecording`), so a click on a menu drawn before a
+/// checkpoint plays what the student is missing now. A plain `Sendable` value, because it is the
+/// item's `representedObject` and is read by the `nonisolated` menu action, which must touch no
+/// main-actor state (issue #30).
+struct RecordingMenuTarget: Sendable, Equatable {
+    /// The WeBeep account (`recordingsOwnerUserID`) the line was drawn for: a click on a menu
+    /// drawn for another account is ignored.
+    let owner: Int
+    /// The WeBeep course the line stands for, which must still be synced when the click arrives.
+    let courseID: Int64
+    /// The archive key whose summary's `next` is played.
+    let key: RecmanCourseKey
+}
+
+/// One recordings line as the menu draws it, in one language (`recordingMenuSection`).
+/// `target` is nil for a line with nothing to play (every lecture done, or no known next
+/// lecture): such a line stays grey and has no action.
+struct RecordingMenuLine: Sendable, Equatable {
+    let title: String
+    /// "Riproduci: «Lezione 3»", only on a line with a target.
+    let toolTip: String?
+    let target: RecordingMenuTarget?
+}
+
+/// One recordings line in both languages, as `WeBeepAuthenticationController` keeps it between
+/// rebuilds (a language switch needs no rebuild). `hint` and `target` are both set or both nil.
+struct RecordingMenuEntry: Equatable {
+    let text: BilingualText
+    let hint: BilingualText?
+    let target: RecordingMenuTarget?
+}
+
+/// How one materials run ended, named after the app's own code paths, so each path records what
+/// happened and the mapping to `RecordingsMaterialsOutcome` stays one pure, table-tested function
+/// (`WeBeepAuthenticationController.recordingsOutcome(for:)`). A run that never ended for its own
+/// operation (superseded, never started) records nothing at all: there is deliberately no case
+/// that a forgotten path could fall into by default.
+enum MaterialsRunEnd: Equatable, Sendable {
+    /// `completeSync` finished and published its result.
+    case completed(conflicts: Int, failures: Int)
+    /// `completeSync`: `finishReconciliation` threw (the pending choices couldn't be read).
+    case pendingChoicesUnreadable
+    /// `cancelledSync`, from any path ("Annulla", a cancelled task, quit).
+    case cancelled
+    /// `failedSync` with a WeBeep error.
+    case serviceFailure(WeBeepAPIError)
+    /// A local failure: `failedSync(error: nil)`, `busySync`, the enabled scopes unreadable.
+    case localFailure
+    /// `pausedMidRun`: Data Saver stopped an automatic run midway.
+    case pausedMidRun(DataSaverPause)
+    /// `runAutomaticSync`: `AutomaticSyncPolicy.decision` held the run back.
+    case notRun(AutomaticSyncDecision)
+    /// `runAutomaticSync`: the schedule was rebuilt while the network was read.
+    case scheduleChanged
+    /// Nothing to sync with: no root or database, no enabled course, nothing selected, no folder.
+    case unconfigured
+    /// `deferredAutomaticSync`: the folder was busy (`RootOperationGateError`) for an automatic run.
+    case deferredWhileBusy
+    /// `handleCredentialStorageError`, from a manual or an automatic run.
+    case credentialUnavailable
+    /// Superseded (sign-out, site or folder change mid-run) or never started (another operation
+    /// was active): nothing ended for this operation.
+    case superseded
 }
 
 @MainActor final class WeBeepAuthenticationController: NSObject, ObservableObject {
@@ -336,11 +451,17 @@ struct MenuBarSnapshot: Sendable {
     // `menuBarAction`/`menuBarTitle`/`menuBarActionTitle`/`menuBarDetail`/`menuBarSymbol` (currently: syncState,
     // accountState, hasStoredCredential, recoveryBlocked, conflicts, rootURL, activeOperationID,
     // dataSaverPause), and
-    // `setLanguage(_:)` calls it since every label depends on `AppLanguage.current`. If you make
+    // `setLanguage(_:)` calls it since every label depends on `AppLanguage.current`. The
+    // recordings lines (`recordingMenuLines`) are fed by courses, lastRunCourses (stands in for
+    // `courses` while it is empty), enabledCourseIDs,
+    // courseFolders, watchSummaries and siteInfo (the account is the `owner` of each line's click
+    // target, so a menu drawn for one account never plays for another), whose `didSet` calls
+    // `recordingMenuInputsChanged()`, which rebuilds the lines (text, tooltip and click target)
+    // and then calls `refreshMenuBarSnapshot()`. If you make
     // those computed properties depend on anything else, add a matching
     // `didSet { refreshMenuBarSnapshot() }` to that property too, or the menu bar will silently
     // go stale instead of crashing loudly.
-    private(set) nonisolated(unsafe) var menuBarSnapshot = MenuBarSnapshot(title: "", detail: "", actionTitle: "", openTitle: "", quitTitle: "")
+    private(set) nonisolated(unsafe) var menuBarSnapshot = MenuBarSnapshot(title: "", detail: "", actionTitle: "", openTitle: "", quitTitle: "", recordingsTitle: "", recordingLines: [])
     /// Pushes the status item's icon from the main actor whenever `menuBarSymbol` changes, so
     /// StatusItemController never has to read it from an AppKit callback (same reason as
     /// `menuBarSnapshot`). Set once by StatusItemController's `@MainActor` init.
@@ -359,7 +480,75 @@ struct MenuBarSnapshot: Sendable {
     @Published private(set) var isLoadingCourses = false
     @Published private(set) var courseLoadError: BilingualText?
     @Published private(set) var courses: [RemoteCourseSummary] = [] {
-        didSet { defaultCourseFolders = Self.defaultFolders(for: courses, saved: courseFolders) }
+        didSet {
+            defaultCourseFolders = Self.defaultFolders(for: courses, saved: courseFolders)
+            recordingMenuInputsChanged()
+        }
+    }
+    /// Where `courses` comes from (#98): `.saved` while the window shows the list saved at an
+    /// earlier launch and Moodle has not confirmed it in this one, `.current` once it has. Every
+    /// assignment of `courses` that changes its origin sets this in the same main-actor turn, so
+    /// the label under "Corsi" never describes another list. A sync asks Moodle for the list
+    /// first unless this is `.current`: saved enrollments never decide what is synced.
+    @Published private(set) var courseListFreshness: CourseListFreshness = .unknown
+    /// The course list saved for the next launch (`course-list.json` next to `sync.sqlite`). Tests
+    /// and previews point it at a throwaway folder, never at the installed app's.
+    private let courseListStore: CourseListSnapshotStore
+    /// Bumped whenever the account the course list belongs to may change: sign-out, another
+    /// university, a new sign-in, the stored credential gone. A network refresh, a restore or a
+    /// save that began under an earlier value belongs to someone else and is dropped, and the
+    /// store refuses saves from retired epochs (#98).
+    private var courseListEpoch = 0
+    /// The epoch whose saved list was already read, so reopening the window doesn't read the
+    /// file again when the first read found nothing to show.
+    private var courseListRestoreEpoch: Int?
+    /// A course list load the window wants that has not started yet (#98): from the moment the
+    /// window opens until the load starts (`isLoadingCourses` takes over in the same turn), and
+    /// while a running sync holds it back (`endOperation` starts it). The window shows the
+    /// loading state meanwhile instead of "no courses", or "refreshing" over a saved list.
+    /// Cleared when nothing will be loaded (signed out), when the list arrives, and when the
+    /// window closes, so a closed window never causes a request (`windowClosed()`).
+    @Published private(set) var isPreparingCourseList = false
+    /// Bumped when the configuration window closes, so a window-open refresh still waiting for
+    /// the bootstrap or the saved list knows its window is gone and loads nothing (#98).
+    private var windowGeneration = 0
+    /// Whether the configuration window is open: from `refreshOnWindowOpen()` to `windowClosed()`,
+    /// minimized included. A failed course refresh is retried by itself only while the window
+    /// that shows it exists (#168).
+    private var isWindowOpen = false
+    /// `courseLoadError` comes from a connection failure (offline, lost connection, no answer):
+    /// the only kind a returning network or a finished sync can end. A server error or a
+    /// malformed answer waits for the refresh button, as the specification says (#168).
+    private var courseLoadFailedForConnection = false
+    /// Watches the network while the window shows a course refresh that failed for lack of a
+    /// connection, and retries when the network comes back (#168). Without it, a window opened
+    /// right after waking, before Wi-Fi was up, kept "Impossibile aggiornare i corsi" until the
+    /// refresh button was pressed. Started by that failure, stopped when the list is confirmed,
+    /// when the account goes (sign-out, expiry, credential gone) and when the window closes:
+    /// never running at rest.
+    private var networkReturnWatch: Task<Void, Never>?
+    /// Identifies the current `networkReturnWatch`, so a watch whose stream ended clears itself
+    /// without clearing a newer one.
+    private var networkReturnWatchID = 0
+    /// Set when the app starts quitting: a sync wound down by the quit must not start a course
+    /// refresh on its way out (`endOperation`).
+    private var isTerminating = false
+    /// The network-path changes `networkReturnWatch` follows; tests drive it by hand, and no test
+    /// reaches the real `NWPathMonitor`.
+    private let reachabilityChanges: @Sendable () -> AsyncStream<Bool>
+    /// True once the launch bootstrap has finished (always, in a test controller): until then the
+    /// account isn't known, so an opening window shows the loading state, not a sign-in prompt.
+    private var hasBootstrapped = false
+    /// The saved list's reads, writes and deletions, chained so each starts after the previous one
+    /// ended (#98). Actor calls made from separate tasks carry no ordering promise: without the
+    /// chain the save of a new sign-in could reach the store before the deletion that sign-in
+    /// asked for, and be wiped by it, or a restore's read could run after a later save.
+    private var courseListIO: Task<Void, Never>?
+    /// Whether the window shows the list saved at an earlier launch: its switches and renames are
+    /// off until Moodle confirms it, so a saved list never records anything (#98).
+    var isShowingSavedCourseList: Bool {
+        if case .saved = courseListFreshness { return true }
+        return false
     }
     @Published private(set) var hasStoredCredential: Bool {
         didSet {
@@ -388,7 +577,17 @@ struct MenuBarSnapshot: Sendable {
     @Published private(set) var needsOnboarding: Bool
     /// Mirrors `AppLanguage.current`; published so the window rebuilds in the new language.
     @Published private(set) var language: AppLanguage
-    @Published private(set) var enabledCourseIDs: Set<Int64>
+    @Published private(set) var enabledCourseIDs: Set<Int64> {
+        didSet {
+            guard enabledCourseIDs != oldValue else { return }
+            schedulerGeneration += 1
+            dataSaverPause = nil
+            configureBackgroundScheduler()
+            // A deselected course leaves the menu; its summary stays in `watchSummaries`, so
+            // selecting it again brings the line back without a request.
+            recordingMenuInputsChanged()
+        }
+    }
     @Published private(set) var automaticSyncEnabled: Bool
     /// The "Notifiche" switch (#64). On unless the user turned it off; see `NotificationPolicy`.
     @Published private(set) var notificationsEnabled: Bool
@@ -406,15 +605,21 @@ struct MenuBarSnapshot: Sendable {
     /// So it is cleared when a sync starts, when the switch is turned off, when the folder changes,
     /// when an automatic run is skipped because nothing can be synced, and whenever
     /// `configureBackgroundScheduler()` rebuilds the scheduler (automatic sync turned off,
-    /// Frequenza or the selected courses changed, signed out, sign-in expired or renewed…), since
-    /// each of these drops the retry.
+    /// Frequenza changed, signed out, sign-in expired or renewed…), since each drops the retry.
+    /// Selection changes also clear it and invalidate pending network checks without moving
+    /// an eligible scheduler's deadline.
     @Published private(set) var dataSaverPause: DataSaverPause? {
         didSet { refreshMenuBarSnapshot() }
     }
     @Published private(set) var recoveryBlocked = false {
-        didSet { refreshMenuBarSnapshot() }
+        didSet {
+            refreshMenuBarSnapshot()
+            if recoveryBlocked != oldValue { configureBackgroundScheduler() }
+        }
     }
-    @Published private(set) var courseFolders: [Int64: String] = [:]
+    @Published private(set) var courseFolders: [Int64: String] = [:] {
+        didSet { if courseFolders != oldValue { recordingMenuInputsChanged() } }
+    }
     @Published private(set) var courseRenameErrors: [Int64: String] = [:]
     @Published private(set) var renamingCourseID: Int64?
     let progressStore = SyncProgressStore()
@@ -437,9 +642,97 @@ struct MenuBarSnapshot: Sendable {
         didSet {
             // Only a controller that already exists can hold another account's session; one
             // created later checks the saved session's owner when it reads it.
-            if let userID = siteInfo?.userID, userID != oldValue?.userID { recordingsStorage?.webBeepAccountChanged(to: userID) }
+            guard siteInfo?.userID != oldValue?.userID else { return }
+            // A recordings follow-up belongs to the account it started for (its owner namespace
+            // and keys): another account, or none, stops it and publishes nothing.
+            cancelRecordingsFollowUp()
+            // The previous account's enrolled courses must not name the new account's menu lines.
+            if oldValue != nil { lastRunCourses = [] }
+            // The account is each recordings line's click owner (`RecordingMenuTarget.owner`):
+            // rebuild the lines on every path below, even when `watchSummaries` ends up equal and
+            // its own `didSet` stays silent, or the menu would keep the previous account as owner
+            // and every click would be ignored (or, worse, the lines would outlive the account).
+            defer { recordingMenuInputsChanged() }
+            guard let userID = siteInfo?.userID else {
+                // Signed out or another university: no account, so no account's numbers.
+                watchSummaries = [:]
+                return
+            }
+            // The previous account's places in lectures, watch summaries and email opt-out go with the account
+            // (#148). Always, not only without a controller: one that exists but has no Polimi
+            // session yet (`sessionOwner` nil) forgets nothing in `webBeepAccountChanged`, and
+            // an earlier launch's copy for another account must not stay on disk. All the forgets
+            // are cheap and idempotent (one settings read, a removal only for another owner).
+            RecordingsController.forgetResumePoints(in: operationDefaults, notOwnedBy: userID)
+            RecordingsController.forgetWatchSummary(in: operationDefaults, notOwnedBy: userID)
+            RecordingsController.forgetEmailOptOut(in: operationDefaults, notOwnedBy: userID)
+            recordingsStorage?.webBeepAccountChanged(to: userID)
+            // After the forgets above, so a previous account's numbers can't be read back. Read
+            // here, once per account, and never by creating the controller: the menu shows the
+            // last known numbers without a request (lazy guarantee of `recordingsStorage`).
+            let recordingsOn = (recordingsStorage?.isEnabled ?? RecordingsController.isSwitchedOn(in: operationDefaults))
+                && selectedSite.university == .polimi
+            watchSummaries = recordingsOn ? RecordingsController.storedWatchSummaries(in: operationDefaults, owner: userID) ?? [:] : [:]
         }
     }
+    /// The last known watch summary of each Recordings course, for the menu bar. Seeded from the
+    /// saved copy when the account becomes known (`siteInfo`), then replaced by each push of the
+    /// controller (`onWatchSummaryChange`, wired in `makeRecordings`), whose pushes are always the
+    /// whole picture: before its first push the controller holds `[:]` without that meaning
+    /// "none", so this is never overwritten from the controller's state, only from its pushes.
+    /// Cleared when the account goes; a push of `[:]` is a reset (turn-off, account change).
+    /// A deselected course keeps its entry here and is only hidden by `recordingMenuLines`.
+    ///
+    /// `@Published` so the Recordings sidebar's orange marker (which reads it, not the Recordings
+    /// controller's copy, empty until a listing loads) redraws on a commit and only then: it never
+    /// changes on a playback tick. Assigned only when the value changes, except by the account
+    /// handlers above. Everything observing `authentication` (every page, not only this sidebar)
+    /// redraws when a saved summary changes: at a checkpoint, a completion or a listing change,
+    /// never on ticks.
+    @Published private(set) var watchSummaries: [RecmanCourseKey: CourseWatchSummary] = [:] {
+        didSet { if watchSummaries != oldValue { recordingMenuInputsChanged() } }
+    }
+
+    /// Reads the saved summaries when the Recordings page opens with none in memory: the seed
+    /// in `siteInfo.didSet` is empty when Recordings was switched on after the account became
+    /// known. Cheap (one settings read, once per appearance), never creates the Recordings
+    /// controller, and does nothing without an account or with Recordings off.
+    func seedWatchSummariesIfNeeded() {
+        guard watchSummaries.isEmpty, let userID = siteInfo?.userID, selectedSite.university == .polimi,
+              recordingsStorage?.isEnabled ?? RecordingsController.isSwitchedOn(in: operationDefaults),
+              let stored = RecordingsController.storedWatchSummaries(in: operationDefaults, owner: userID) else { return }
+        watchSummaries = stored
+    }
+
+#if DEBUG
+    /// Test seams for the sidebar tests: set what the page reads, as a commit or a rename would.
+    func setWatchSummariesForTesting(_ summaries: [RecmanCourseKey: CourseWatchSummary]) { watchSummaries = summaries }
+    func setCourseFoldersForTesting(_ folders: [Int64: String]) { courseFolders = folders }
+#endif
+    /// The enrolled courses the last automatic run fetched from WeBeep (`fetchEnrolledCourses`),
+    /// memory only. An automatic run never sets `courses` (only the window and "Sincronizza ora"
+    /// do), so in a launch where the window was never opened the menu's recordings lines and the
+    /// recordings follow-up's keys come from here instead; while `courses` is loaded it wins and
+    /// this changes nothing. Cleared with the account (`forgetCourseList`). Feeds the menu: its
+    /// `didSet` calls `recordingMenuInputsChanged()` (invariant on `menuBarSnapshot`).
+    private(set) var lastRunCourses: [RemoteCourseSummary] = [] {
+        didSet { if lastRunCourses != oldValue { recordingMenuInputsChanged() } }
+    }
+    /// The menu's recordings lines in both languages, with their click targets, rebuilt only when
+    /// `courses` (or `lastRunCourses`), `enabledCourseIDs`, `courseFolders`, `watchSummaries` or the
+    /// account (`siteInfo`) change, so the frequent snapshot refreshes during a sync don't rerun the course-name
+    /// regexes. Resolved to one language in `refreshMenuBarSnapshot()`, which is why a language
+    /// switch needs no rebuild here.
+    private(set) var recordingMenuLines: [RecordingMenuEntry] = []
+    /// While above zero (`restoreScopes`) a change of the menu's inputs only marks the lines stale;
+    /// the holder rebuilds once at the end.
+    private var menuRebuildHolds = 0
+    private var menuRebuildPending = false
+#if DEBUG
+    /// How many times the lines were actually recomputed (not held back): lets a test prove the
+    /// rebuild is coalesced during `restoreScopes`.
+    private(set) var menuRebuildCountForTesting = 0
+#endif
     private var database: SyncDatabase?
     /// Created on first use (the window, a sign-out), so a launch with the window closed doesn't
     /// read anything for a feature that may be off.
@@ -457,9 +750,47 @@ struct MenuBarSnapshot: Sendable {
     private var downloader: RemoteDownloader
     private let credentialVault: CredentialVault
     private let notificationCoordinator: SyncNotificationCoordinator
-    private var backgroundScheduler: NSBackgroundActivityScheduler?
+    private var backgroundScheduler: BackgroundActivityRegistration?
+    /// Owns the real registration; tests replace it with a clock-backed registration, never macOS activity.
+    private var scheduleBackgroundActivity: (TimeInterval, @escaping @Sendable (@escaping NSBackgroundActivityScheduler.CompletionHandler) -> Void) -> BackgroundActivityRegistration = { interval, callback in
+        let scheduler = NSBackgroundActivityScheduler(identifier: "io.github.tvaccari.beepbar.auto-sync")
+        scheduler.repeats = true
+        scheduler.interval = interval
+        scheduler.tolerance = interval * 0.5
+        scheduler.qualityOfService = .utility
+        scheduler.schedule(callback)
+        return BackgroundActivityRegistration(invalidate: { scheduler.invalidate() })
+    }
     private var bootstrapTask: Task<Void, Never>?
     private var syncTask: Task<Void, Never>?
+    /// The Recordings listings refresh that follows a sync run (owner decision 2026-10-12, see
+    /// `RecordingsSyncPolicy`). Deliberately OUTSIDE `syncTask`: "Esci" and a quit from outside
+    /// wait for `syncTask` (`prepareForTermination`), and a WebKit listing must never hold a quit
+    /// (AGENTS.md, quit path). For the same reason `prepareForTermination` neither returns nor
+    /// touches it: the process simply exits under it. It never calls `setSyncState`, never touches
+    /// `activeOperationID` and never notifies a failure, so the menu and Home keep showing the
+    /// materials result only. At most one runs: a sync ending while it runs merges into it.
+    /// Cancelled with the identity it was started for (`cancelRecordingsFollowUp`).
+    private var recordingsFollowUp: Task<Void, Never>?
+    /// Identifies `recordingsFollowUp`, so a finishing task clears only itself.
+    private var recordingsFollowUpID: UUID?
+    /// Bumped by `cancelRecordingsFollowUp`: a follow-up that resumes under an older value belongs
+    /// to an account, site or folder that is gone and publishes nothing.
+    private var recordingsFollowUpGeneration = 0
+    /// How each operation's materials run ended, recorded by its ending path while it is still
+    /// the active operation and taken once by the tail that starts the follow-up. An operation
+    /// with no entry was superseded: no follow-up (`MaterialsRunEnd.superseded`).
+    /// Notification delivery can suspend after the active operation ends, allowing another run.
+    private var materialsRunEnds: [UUID: (generation: Int, end: MaterialsRunEnd)] = [:]
+    /// How the last recordings follow-up ended, memory only (for the "N nuove registrazioni"
+    /// notification and the menu, package D). Nil until one ends, and again with the account.
+    private(set) var lastRecordingsOutcome: RecordingsSyncOutcome?
+    /// Refreshes the Recordings listings of `keys` for a sync follow-up; the Bool is `force`
+    /// (ignore the 300 s freshness window: manual sync only). A seam so the integration is tested
+    /// with a fake, without WebKit.
+    /// Nil in production: the follow-up then calls `recordings.refreshForSync(keys, force:)`.
+    /// Tests set it to a fake so no WebKit or Polimi request is involved.
+    var recordingsRefresh: (@MainActor (Set<RecmanCourseKey>, Bool) async -> RecordingsSyncOutcome)?
     private var scopeWriteTask: Task<Void, Never>?
     // Published because views read it through `isSyncActive` / `canSynchronize` (Annulla vs
     // Sincronizza ora). An operation often ends after a suspension (the new-materials notification,
@@ -478,17 +809,30 @@ struct MenuBarSnapshot: Sendable {
     private var automaticOutcome: AutomaticSyncOutcome = .finished
     private let automaticSyncEnvironment: AutomaticSyncEnvironment
     private var rootID: UUID? {
-        didSet { if rootID != oldValue { conflictChoiceFeedback = nil } }
+        didSet { if rootID != oldValue { notificationGeneration += 1; conflictChoiceFeedback = nil } }
     }
     private var scheduledConfiguration: BackgroundScheduleConfiguration?
     /// Bumped on every real rebuild of the scheduler. Tells an automatic run whether the schedule
     /// that started it still exists: comparing configurations can't, since turning automatic sync
     /// off and on again rebuilds twice and ends on an equal configuration.
     private var schedulerGeneration = 0
+    private var schedulerRegistrationGeneration = 0
 #if DEBUG
     private var recordingsStoreForTesting: RecordingsSessionStore?
     private var recordingsBrowserForTesting: (@MainActor () -> RecmanBrowsing)?
+    /// Set by a test before the first use of `recordings`; the real player is never built in tests.
+    var recordingsPlayerForTesting: (@MainActor () -> RecordingPlaying)?
+    /// Replaces opening the window on the Recordings page (`showRecordingsCourse`), so a test can
+    /// see that it was asked for, and for which course (nil: the page as it was), without a
+    /// window.
+    var showRecordingsPageForTesting: (@MainActor (Int64?) -> Void)?
     private var beforeReconciliationStateForTesting: (@MainActor () async -> Void)?
+    /// Whether the last sync result to be encoded was encoded on the main thread; nil until one
+    /// is (R01, #109). Set by the pre-encode in `finishReconciliation` and by the inline
+    /// `setSyncState(_:)` save, which always encodes on the main actor, so a completion path that
+    /// goes back to the inline save shows up as `true`.
+    private(set) var summaryEncodedOnMainThreadForTesting: Bool?
+    private var beforeRestoredSummaryPublicationForTesting: (@MainActor () async -> Void)?
     private var beforePendingChoicesForTesting: (@MainActor () async -> Void)?
     private var courseLoadTaskForTesting: Task<Void, Never>?
     private var deleteCredentialForTesting: (() throws -> Void)?
@@ -544,7 +888,15 @@ struct MenuBarSnapshot: Sendable {
         Self.defaults.set(storedAutomaticSyncInterval, forKey: Self.autoSyncIntervalKey)
         dataSaverEnabled = Self.storedDataSaverEnabled(in: Self.defaults)
         automaticSyncEnvironment = .system
+        reachabilityChanges = { NetworkPathReader.reachabilityChanges() }
         rootID = Self.storedRootID()
+        // Resolved once here (a path lookup, no file is touched): the store calls it off the main
+        // actor, where the preview flags can't be read.
+        let courseListFolder = Self.courseListDirectory()
+        courseListStore = CourseListSnapshotStore {
+            guard let courseListFolder else { throw CocoaError(.fileNoSuchFile) }
+            return courseListFolder
+        }
         apiClient = WeBeepAPIClient(policy: selectedSite.serverPolicy)
         downloader = RemoteDownloader(policy: apiClient.policy)
         database = nil
@@ -566,7 +918,8 @@ struct MenuBarSnapshot: Sendable {
             // Real Polimi course names ("058167 - NAME [2026-27]", one per line) can be passed in
             // BEEPBAR_PREVIEW_COURSES to try Recordings against the real archive: the mock names
             // carry no code or year, so they have no recordings.
-            let recordingsCourses = (ProcessInfo.processInfo.environment["BEEPBAR_PREVIEW_COURSES"] ?? "")
+            let previewNames = ProcessInfo.processInfo.arguments.contains("--watchlist-preview") ? WatchlistPreviewBrowser.courseNames.joined(separator: "\n") : (ProcessInfo.processInfo.environment["BEEPBAR_PREVIEW_COURSES"] ?? "")
+            let recordingsCourses = previewNames
                 .split(separator: "\n").map { $0.trimmingCharacters(in: .whitespaces) }.filter { !$0.isEmpty }.enumerated()
                 .map { RemoteCourseSummary(id: Int64(1_000 + $0.offset), shortName: $0.element, displayName: $0.element, isVisible: true, startDate: nil, endDate: nil) }
             let mockCourses = recordingsCourses + (1...100).map { index in
@@ -606,6 +959,7 @@ struct MenuBarSnapshot: Sendable {
         bootstrapTask = Task { [weak self] in
             let trace = PerformanceTrace.shared.begin("bootstrap.total", category: .bootstrap)
             defer { PerformanceTrace.shared.end("bootstrap.total", category: .bootstrap, state: trace) }
+            defer { self?.hasBootstrapped = true }
             do {
                 let result = try await bootstrap.prepare(databaseDirectory: Self.databaseDirectory(), rootURL: rootURL, rootID: rootID, gate: operationGate, credentialVault: credentialVault)
                 guard let self else { return }
@@ -625,15 +979,21 @@ struct MenuBarSnapshot: Sendable {
     /// defaults to mains power and an ordinary network, so no test depends on the Mac running it.
     ///
     /// The Recordings session goes to `recordingsStore`, or to a throwaway folder: never to the
-    /// real one, which a sign-out in any test would otherwise delete.
-    init(testRootURL: URL, database: SyncDatabase? = nil, rootID: UUID? = nil, notificationCenter: NotificationCenterClient = InertNotificationCenter(), fileOpener: ActivityFileOpening = InertFileOpener(), apiClient: WeBeepAPIClient? = nil, downloader: RemoteDownloader? = nil, credentialVault: CredentialVault? = nil, deleteCredential: (() throws -> Void)? = nil, defaults: UserDefaults? = nil, automaticSyncEnvironment: AutomaticSyncEnvironment = .fixed(), recordingsStore: RecordingsSessionStore? = nil, recordingsBrowser: (@MainActor () -> RecmanBrowsing)? = nil) {
+    /// real one, which a sign-out in any test would otherwise delete. The saved course list goes
+    /// to `courseListStore`, or nowhere; a test that relaunches gives each controller a store of
+    /// its own over the same folder, as two launches would have. `site` is Polimi unless a test
+    /// needs another university from the first moment (Recordings exist only for Polimi).
+    /// `language` sets the controller's own `language` only (see the init body).
+    init(testRootURL: URL, database: SyncDatabase? = nil, rootID: UUID? = nil, notificationCenter: NotificationCenterClient = InertNotificationCenter(), fileOpener: ActivityFileOpening = InertFileOpener(), apiClient: WeBeepAPIClient? = nil, downloader: RemoteDownloader? = nil, credentialVault: CredentialVault? = nil, deleteCredential: (() throws -> Void)? = nil, defaults: UserDefaults? = nil, automaticSyncEnvironment: AutomaticSyncEnvironment = .fixed(), reachabilityChanges: @escaping @Sendable () -> AsyncStream<Bool> = { AsyncStream { $0.finish() } }, recordingsStore: RecordingsSessionStore? = nil, recordingsBrowser: (@MainActor () -> RecmanBrowsing)? = nil, courseListStore: CourseListSnapshotStore? = nil, site: MoodleSite = .site(id: nil), language: AppLanguage = .italian) {
         deleteCredentialForTesting = deleteCredential
         let throwawayRecordingsFolder = FileManager.default.temporaryDirectory.appendingPathComponent("beepbar-recordings-test-\(UUID().uuidString)", isDirectory: true)
         recordingsStoreForTesting = recordingsStore ?? RecordingsSessionStore { throwawayRecordingsFolder }
+        // Without a store of its own a test controller saves nothing anywhere: no folder is left
+        // behind, and nothing reaches the installed app's file.
+        self.courseListStore = courseListStore ?? CourseListSnapshotStore { throw CocoaError(.fileNoSuchFile) }
         recordingsBrowserForTesting = recordingsBrowser
         self.credentialVault = credentialVault ?? CredentialVault(read: FileTokenStore.load, write: FileTokenStore.save)
         self.fileOpener = fileOpener
-        let site = MoodleSite.site(id: nil)
         selectedSite = site
         hasStoredCredential = true
         let isolatedDefaults = defaults ?? Self.throwawayDefaults()
@@ -642,17 +1002,21 @@ struct MenuBarSnapshot: Sendable {
         notificationsEnabled = Self.storedNotificationsEnabled(in: isolatedDefaults)
         rootURL = testRootURL
         needsOnboarding = false
-        language = .italian
+        // Only this controller's `language`, never `AppLanguage.current` (process-global, shared
+        // by tests running in parallel); the menu bar's recordings section reads this one.
+        self.language = language
         enabledCourseIDs = [1]
         automaticSyncEnabled = false
         automaticSyncInterval = 28_800
         registersBackgroundActivity = false
         dataSaverEnabled = Self.storedDataSaverEnabled(in: isolatedDefaults)
         self.automaticSyncEnvironment = automaticSyncEnvironment
+        self.reachabilityChanges = reachabilityChanges
         self.apiClient = apiClient ?? WeBeepAPIClient(policy: site.serverPolicy)
         self.downloader = downloader ?? RemoteDownloader(policy: self.apiClient.policy)
         self.database = database
         self.rootID = rootID
+        hasBootstrapped = true
         super.init()
         accountState = .connected
         refreshMenuBarSnapshot()
@@ -689,9 +1053,52 @@ struct MenuBarSnapshot: Sendable {
         setSyncState(state)
     }
 
+    func setSyncStateForTesting(synced result: EncodedSyncSummary) {
+        setSyncState(synced: result, rootID: rootID)
+    }
+
+    /// Stands for a list Moodle confirmed in this session, as every caller assumed before #98.
     func setCoursesForTesting(_ courses: [RemoteCourseSummary]) {
         self.courses = courses
+        courseListFreshness = courses.isEmpty ? .unknown : .current
     }
+
+    /// Waits for every read, save or deletion of the saved course list issued so far.
+    func waitForCourseListWriteForTesting() async { await courseListIO?.value }
+
+    /// The restore a window opening does before the network refresh, without that refresh.
+    func restoreSavedCourseListForTesting() async { await restoreSavedCourseList() }
+
+    /// The launch bootstrap finding no stored credential, for a test controller (which has none).
+    func applyBootstrapWithoutCredentialForTesting(recoveryBlocked: Bool = false, corrupt: Bool = false) async {
+        guard let database else { return }
+        await applyBootstrap(BootstrapService.Result(database: database, recoveryBlocked: recoveryBlocked, credential: corrupt ? .unavailable(.corrupt) : .absent))
+    }
+
+    /// The launch bootstrap finding the stored credential, for a test controller.
+    func applyBootstrapWithCredentialForTesting(recoveryBlocked: Bool = false) async {
+        guard let database else { return }
+        await applyBootstrap(BootstrapService.Result(database: database, recoveryBlocked: recoveryBlocked, credential: .present))
+    }
+
+    /// Makes everything that waits for the launch bootstrap wait for `task` instead.
+    func holdBootstrapForTesting(_ task: Task<Void, Never>) { bootstrapTask = task }
+
+    /// The folder handling after the open panel, with `url` as if picked there.
+    func useRootForTesting(_ url: URL) async {
+        let picked = url.standardizedFileURL
+        await useRoot(picked: picked, resolved: picked.resolvingSymlinksInPath())
+    }
+
+    /// The account going away as `forgetCourseList()` sees it, at a moment a test chooses.
+    func forgetCourseListForTesting() { forgetCourseList() }
+
+    func setBackgroundSchedulerForTesting(_ register: @escaping (TimeInterval, @escaping @Sendable (@escaping NSBackgroundActivityScheduler.CompletionHandler) -> Void) -> BackgroundActivityRegistration) {
+        scheduleBackgroundActivity = register
+        registersBackgroundActivity = true
+    }
+
+    func setRecoveryBlockedForTesting(_ blocked: Bool) { recoveryBlocked = blocked }
 
     func setLoadingCoursesForTesting(_ loading: Bool) {
         isLoadingCourses = loading
@@ -719,8 +1126,16 @@ struct MenuBarSnapshot: Sendable {
         notificationCoordinator.beforeNotificationForTesting = action
     }
 
-    func completeSyncForTesting(_ operationID: UUID, summary: SyncProgress, automatic: Bool = false) async {
-        await completeSync(operationID, summary: summary, automatic: automatic)
+    /// Starts `operationID`'s progress stream exactly as a sync does and returns the callback the
+    /// coordinator would receive, so a test can drive it from off the main actor.
+    func beginTransferForTesting(_ operationID: UUID, automatic: Bool) -> @Sendable (SyncProgress) async -> Void {
+        progressSink(operationID, run: beginTransfer(operationID, automatic: automatic))
+    }
+
+    /// Completes `operationID` as a run that synced `syncedRootID`, by default the folder current at
+    /// this call, as the real runs capture it before syncing (#167).
+    func completeSyncForTesting(_ operationID: UUID, summary: SyncProgress, automatic: Bool = false, syncedRootID: UUID? = nil) async {
+        await completeSync(operationID, rootID: syncedRootID ?? rootID, summary: summary, automatic: automatic)
     }
 
     func setBeforeReconciliationStateForTesting(_ action: @escaping @MainActor () async -> Void) {
@@ -732,12 +1147,37 @@ struct MenuBarSnapshot: Sendable {
     /// Waits for the sync `synchronizeNow()` started, which it does not return.
     func waitForSyncForTesting() async { await syncTask?.value }
 
+    /// The running recordings follow-up, nil when none runs.
+    var recordingsFollowUpForTesting: Task<Void, Never>? { recordingsFollowUp }
+
+    /// Ends `operationID` through `failedSync`, as a run that failed with `error` would.
+    func failSyncForTesting(_ operationID: UUID, error: WeBeepAPIError?, automatic: Bool) async {
+        await failedSync(operationID, error: error, automatic: automatic)
+    }
+
+    /// Starts the follow-up of `operationID` the way the manual tail does, and returns its task.
+    @discardableResult
+    func startFollowUpForTesting(_ operationID: UUID, trigger: RecordingsSyncTrigger) -> Task<Void, Never>? {
+        followUpAfterRun(operationID, trigger: trigger)
+    }
+
+    /// Takes what `operationID`'s ending path recorded, as the follow-up's tail does.
+    func takeRunEndForTesting(_ operationID: UUID) -> MaterialsRunEnd? { takeRunEnd(operationID) }
+
     var isMenuQuitInProgressForTesting: Bool { menuQuitInProgress }
+
+    /// Whether a network watch for a failed course refresh is recorded as running (#168).
+    var isWatchingForNetworkReturnForTesting: Bool { networkReturnWatch != nil }
 
     /// Waits for the course refresh `loadCourses()` started, which it does not return.
     func waitForCourseLoadForTesting() async { await courseLoadTaskForTesting?.value }
 
     func setRootIDForTesting(_ id: UUID) { rootID = id }
+
+    /// Takes the folder lease as `operation`, as a running sync holds it.
+    func acquireOperationGateForTesting(_ operation: RootOperation) async throws -> Lease {
+        try await operationGate.acquire(operation)
+    }
 
     /// Runs inside `openActivityItem` after it captured the folder and before it looks the file
     /// up: lets a test change the folder mid-lookup.
@@ -750,6 +1190,8 @@ struct MenuBarSnapshot: Sendable {
     }
 
     func setBeforePendingChoicesForTesting(_ action: @escaping @MainActor () async -> Void) { beforePendingChoicesForTesting = action }
+
+    func setBeforeRestoredSummaryPublicationForTesting(_ action: @escaping @MainActor () async -> Void) { beforeRestoredSummaryPublicationForTesting = action }
 
     func reloadPendingChoicesForTesting() async { await reloadPendingChoices() }
     func restorePersistedSyncStateForTesting() async { await restorePersistedSyncState() }
@@ -767,6 +1209,12 @@ struct MenuBarSnapshot: Sendable {
     /// every root operation gated; otherwise the account and the persisted sync state are restored.
     private func applyBootstrap(_ result: BootstrapService.Result) async {
         await refreshPendingModuleMoves()
+        // Before the blocked-recovery return: a launch without a credential deletes the saved
+        // course list whether or not a pending operation blocks recovery, as documented (#98).
+        // The rest of the credential handling waits for recovery, as before.
+        // An expired list is pruned at every launch with a credential, blocked recovery included:
+        // no sync runs then, so nothing else would enforce the age limit.
+        if Self.credentialIsGone(result.credential) { forgetCourseList() } else { pruneExpiredCourseList() }
         if result.recoveryBlocked {
             recoveryBlocked = true
             setSyncState(.recoveryBlocked)
@@ -787,10 +1235,22 @@ struct MenuBarSnapshot: Sendable {
         case .absent:
             hasStoredCredential = false
             accountState = .notConnected
+            // No credential, so no account the saved list could belong to: an older BeepBar that
+            // signed out, or a sign-out whose deletion never ran, must not leave it on disk (#98).
+            // Deleted above, before the blocked-recovery return.
             await restorePersistedSyncState()
             configureBackgroundScheduler()
         case .unavailable(let error):
             await handleCredentialStorageError(error)
+        }
+    }
+
+    /// Whether the launch found no usable credential: absent, or unreadable as absent or corrupt
+    /// (what `handleCredentialStorageError` treats as signed out). A write error is not one.
+    private nonisolated static func credentialIsGone(_ status: BootstrapService.CredentialStatus) -> Bool {
+        switch status {
+        case .present, .unavailable(.write): false
+        case .absent, .unavailable(.absent), .unavailable(.corrupt): true
         }
     }
 
@@ -855,6 +1315,13 @@ struct MenuBarSnapshot: Sendable {
     /// create it just to tell it nothing is happening (the window closing).
     var recordingsIfCreated: RecordingsController? { recordingsStorage }
 
+    /// Whether Recordings is on, read without creating its controller (daily telemetry asks once a
+    /// day and must not build the feature just to report it is off).
+    var recordingsEnabledWithoutCreating: Bool {
+        if let recordingsStorage { return recordingsStorage.isEnabled }
+        return RecordingsController.storedEnabled(in: operationDefaults, isAvailable: selectedSite.university == .polimi)
+    }
+
     /// The WeBeep account the saved Polimi session is bound to; nil until the account is
     /// validated in this launch (`siteInfo`).
     var recordingsOwnerUserID: Int? {
@@ -868,22 +1335,109 @@ struct MenuBarSnapshot: Sendable {
     private func makeRecordings() -> RecordingsController {
         var store = RecordingsSessionStore.standard
         var makeBrowser: @MainActor () -> RecmanBrowsing = { RecmanWebSession() }
+        // The player fetches the course picture for Now Playing through `courseImage`, which
+        // holds the token; the player never sees it.
+        var makePlayer: @MainActor () -> RecordingPlaying = { [weak self] in
+            RecordingPlayerController(artworkLoader: { [weak self] url in
+                guard let self else { throw CancellationError() }
+                return try await self.courseImage(url)
+            })
+        }
 #if DEBUG
+        if let recordingsPlayerForTesting { makePlayer = recordingsPlayerForTesting }
         if let recordingsStoreForTesting { store = recordingsStoreForTesting }
         if let recordingsBrowserForTesting { makeBrowser = recordingsBrowserForTesting }
 #endif
-        return RecordingsController(
+#if DEBUG
+        if Self.isUIPreview && ProcessInfo.processInfo.arguments.contains("--watchlist-preview") {
+            makeBrowser = { WatchlistPreviewBrowser() }
+            store = RecordingsSessionStore { FileManager.default.temporaryDirectory.appendingPathComponent("Beepbar-watchlist-preview-session", isDirectory: true) }
+        }
+#endif
+        let controller = RecordingsController(
             makeBrowser: makeBrowser,
             store: store,
             defaults: operationDefaults,
             ownerUserID: { [weak self] in self?.recordingsOwnerUserID },
-            isAvailable: { [weak self] in self?.selectedSite.university == .polimi }
+            isAvailable: { [weak self] in self?.selectedSite.university == .polimi },
+            makePlayer: makePlayer,
+            courses: { [weak self] in self?.courses ?? [] },
+            fetchProfileEmail: { [weak self] in await self?.profileEmail() }
         )
+        // Pushed from the main actor (never read from the menu's AppKit callback). Each push is
+        // the controller's whole picture, `[:]` included: that one is a reset.
+        controller.onWatchSummaryChange = { [weak self] summaries in self?.watchSummaries = summaries }
+        // A menu Play that failed with no Recordings page on screen (session lapsed, lecture
+        // can't be opened): show that course's page, where the message or "Accedi con Polimi"
+        // explains it. Called on the main actor, never for a window Play.
+        controller.onMenuPlayNeedsPage = { [weak self] key in self?.showRecordingsCourse(for: key) }
+#if DEBUG
+        if Self.isUIPreview && ProcessInfo.processInfo.arguments.contains("--watchlist-preview") {
+            if controllerDefaultsHaveNoWatchlist {
+                for course in courses.prefix(2) {
+                    if let key = RecmanCourseKey(course: course), let lesson = WatchlistPreviewBrowser.lessons(for: key).first {
+                        controller.toggleWatchlist(lesson, courseName: RecordingsPresentation.courseName(course))
+                    }
+                }
+                controller.selectDestination(.watchlist)
+            }
+            controller.signIn()
+        }
+#endif
+        return controller
     }
+
+    /// The address on the WeBeep profile, used for the Webex sign-in without a confirmation step
+    /// (#148, product decision 2026-10-11; `RecordingsController.learnEmail`, from the Settings
+    /// row or the first Play). Asked only when the site lists the function for this token. Every
+    /// failure (no function, no token, offline, an odd answer) is nil: the student then types the address, and
+    /// nothing reaches the sync status or the log. The address is personal data and is never
+    /// logged here.
+    /// The bytes of a WeBeep course picture (`RemoteCourseSummary.imageURL`) for the artwork of
+    /// the lecture playing in Now Playing (issue #148 follow-up). Runs on the main actor only to
+    /// read the client, the account and the token; the request itself is `fetchCourseImage`'s
+    /// (bounded, no redirects, image only, token never logged). A picture that arrives after the
+    /// account or the site changed is refused: it belongs to the previous identity.
+    private func courseImage(_ url: URL) async throws -> Data {
+        let client = apiClient
+        let userID = siteInfo?.userID
+        let token = try await credentialVault.load(.nonInteractive)
+        let data = try await client.fetchCourseImage(url, token: token)
+        // The account clause is what `aCoursePictureArrivingAfterAnAccountChangeIsDropped` pins.
+        // `apiClient === client` is a defensive duplicate for a site change: `selectSite` swaps
+        // the client but also clears `siteInfo`, so `userID` already differs; it is kept for the
+        // case where a future site switch keeps `siteInfo` (same user id on two sites).
+        guard apiClient === client, siteInfo?.userID == userID else { throw CancellationError() }
+        return data
+    }
+
+    private func profileEmail() async -> String? {
+        guard let info = siteInfo, info.availableFunctions.contains(WeBeepAPIClient.ownEmailFunction) else { return nil }
+        do {
+            let token = try await credentialVault.load(.nonInteractive)
+            let address = try await apiClient.fetchOwnEmail(userID: info.userID, token: token)
+            // Another account may have signed in while WeBeep answered: its address is not ours to offer.
+            return siteInfo?.userID == info.userID ? address : nil
+        } catch {
+            return nil
+        }
+    }
+
+#if DEBUG
+    /// The profile lookup Recordings uses, called directly so tests can check its own guards
+    /// (the listed function, the account after the answer) apart from Recordings' epochs.
+    func profileEmailForTesting() async -> String? { await profileEmail() }
+    /// The course-picture fetch the player is given, called directly to test its identity guard.
+    func courseImageForTesting(_ url: URL) async throws -> Data { try await courseImage(url) }
+
+    private var controllerDefaultsHaveNoWatchlist: Bool {
+        operationDefaults.data(forKey: RecordingsController.studyKey(owner: 1)) == nil
+    }
+#endif
 
     /// Forgets the stored token so another account, or another university, can be connected.
     /// The sync folder, its files and the course selection stay as they are; the Recordings
-    /// feature is turned off and its Polimi session deleted.
+    /// feature is turned off and its Polimi session deleted, and so is the saved course list.
     func signOut(removeFile: (URL) throws -> Void = { try FileManager.default.removeItem(at: $0) }) {
         guard hasStoredCredential, !isSyncActive, !isAuthenticating, !isVerifying, !isLoadingCourses else { return }
         do {
@@ -904,8 +1458,9 @@ struct MenuBarSnapshot: Sendable {
         Self.defaults.removeObject(forKey: Self.credentialExpiredKey)
         notificationCoordinator.clearFailure()
         siteInfo = nil
-        courses = []
+        forgetCourseList()
         courseLoadError = nil
+        courseLoadFailedForConnection = false
         hasStoredCredential = false
         accountState = .notConnected
         setSyncState(recoveryBlocked ? .recoveryBlocked : .loginRequired)
@@ -985,18 +1540,181 @@ struct MenuBarSnapshot: Sendable {
     }
 
     private func refreshMenuBarSnapshot() {
+        // `language` mirrors `AppLanguage.current` (both set in `init` and `setLanguage`); reading
+        // the property lets a test check an English menu without switching the process-global
+        // language.
+        let recordings = Self.recordingMenuSection(recordingMenuLines, language: language)
         menuBarSnapshot = MenuBarSnapshot(
             title: menuBarTitle,
             detail: menuBarDetail,
             actionTitle: menuBarActionTitle,
-            openTitle: tr("Apri BeepBar…", "Open BeepBar…"),
-            quitTitle: tr("Esci da BeepBar", "Quit BeepBar")
+            openTitle: tr("Apri BeepBar", "Open BeepBar"),
+            quitTitle: tr("Esci da BeepBar", "Quit BeepBar"),
+            recordingsTitle: recordings.title,
+            recordingLines: recordings.lines
         )
         let symbol = menuBarSymbol
         if symbol != lastMenuBarSymbol {
             lastMenuBarSymbol = symbol
             onMenuBarSymbolChange?(symbol)
         }
+    }
+
+    /// The most recordings lines the menu shows: past ten courses the menu would outgrow its
+    /// purpose (a glance), and the window has them all.
+    nonisolated static let maxRecordingMenuLines = 10
+
+    /// Rebuilds `recordingMenuLines` from its inputs and refreshes the snapshot when they
+    /// changed. Called from the `didSet` of `courses`, `lastRunCourses`, `enabledCourseIDs`, `courseFolders`,
+    /// `watchSummaries` and `siteInfo` (see the invariant comment on `menuBarSnapshot`). Costs
+    /// nothing when no summary is known (every launch without Recordings), since the pure builder
+    /// returns before any course.
+    private func recordingMenuInputsChanged() {
+        if menuRebuildHolds > 0 { menuRebuildPending = true; return }
+#if DEBUG
+        menuRebuildCountForTesting += 1
+#endif
+        // `lastRunCourses` only while `courses` is empty: a window-less launch still gets its
+        // lines from what the last automatic run fetched, and a loaded list changes nothing.
+        let lines = Self.recordingMenuLines(courses: courses.isEmpty ? lastRunCourses : courses, enabledIDs: enabledCourseIDs, summaries: watchSummaries, owner: recordingsOwnerUserID, folders: courseFolders)
+        guard lines != recordingMenuLines else { return }
+        recordingMenuLines = lines
+        refreshMenuBarSnapshot()
+    }
+
+    /// The menu's recordings lines: the synced courses (`enabledIDs`) in sidebar order (`courses`,
+    /// as the Recordings page lists them) that have an archive key and a known summary, named as
+    /// the Recordings page names them, at most `maxRecordingMenuLines`.
+    /// - A course with no known summary is left out, never shown as "0/0" (nothing before a page
+    ///   has loaded it once); so is one with `total == 0` (see `RecordingWatchProgress.menuLine`).
+    /// - Two WeBeep courses with the same archive key (two sections of one course) show the same
+    ///   recordings and the same summary: one line, the first course's. The Recordings page
+    ///   (`RecordingsPresentation.syncedCourses`) still lists both rows, so either can be opened;
+    ///   the menu is a glance, where the same numbers twice would read as two courses. The
+    ///   difference between page and menu is intentional.
+    /// - A line is clickable (has a `target` and a "Riproduci: «…»" hint) only when its summary
+    ///   has a `next` lecture that `RecordingsController.validatedNext` accepts and the account
+    ///   (`owner`) is known; otherwise it stays grey (every lecture done, nothing known to play,
+    ///   or a stored `next` that couldn't be played anyway). The click re-checks all of it
+    ///   (`menuPlayRecording`): the line only tells the student what a click would do.
+    /// - The line's name is the course's renamed local folder (`folders`), else its name without
+    ///   the part in parentheses at the end (`RecmanCourseSidebar.menuName`).
+    nonisolated static func recordingMenuLines(courses: [RemoteCourseSummary], enabledIDs: Set<Int64>, summaries: [RecmanCourseKey: CourseWatchSummary], owner: Int?, folders: [Int64: String] = [:]) -> [RecordingMenuEntry] {
+        guard !summaries.isEmpty, !enabledIDs.isEmpty else { return [] }
+        var lines: [RecordingMenuEntry] = []
+        var shown: Set<RecmanCourseKey> = []
+        for course in courses where enabledIDs.contains(course.id) {
+            guard let key = RecmanCourseKey(course: course), let summary = summaries[key], summary.total > 0,
+                  shown.insert(key).inserted else { continue }
+            let name = RecmanCourseSidebar.menuName(courseName: RecordingsPresentation.courseName(course), courseDisplayName: course.displayName, courseID: course.id, localFolderName: folders[course.id])
+            let text = RecordingWatchProgress.menuLine(courseName: name, summary)
+            if let owner, let next = summary.next, RecordingsController.validatedNext(next, for: key) {
+                lines.append(RecordingMenuEntry(
+                    text: text,
+                    hint: recordingMenuHint(title: RecordingsPresentation.title(next)),
+                    target: RecordingMenuTarget(owner: owner, courseID: course.id, key: key)
+                ))
+            } else {
+                lines.append(RecordingMenuEntry(text: text, hint: nil, target: nil))
+            }
+            if lines.count == maxRecordingMenuLines { break }
+        }
+        return lines
+    }
+
+    /// The tooltip of a clickable recordings line: "Riproduci: «title»" / "Play: “title”". The
+    /// archive's title can carry line breaks and runs of spaces, which a one-line tooltip would
+    /// show as gaps or extra lines, so every run of whitespace becomes one space; an empty title
+    /// (nothing left after that) gives just "Riproduci" / "Play" rather than empty quotes.
+    nonisolated static func recordingMenuHint(title: String) -> BilingualText {
+        let clean = title.split(whereSeparator: { $0.isWhitespace || $0.isNewline }).joined(separator: " ")
+        guard !clean.isEmpty else { return BilingualText("Riproduci", "Play") }
+        return BilingualText("Riproduci: «\(clean)»", "Play: “\(clean)”")
+    }
+
+    /// The recordings section's header and lines in `language`. Takes the language explicitly
+    /// (the app passes `AppLanguage.current`) so tests can check both without switching the
+    /// process-global language; resolved at every snapshot refresh, never cached, so
+    /// `setLanguage(_:)` rebuilds it (title and tooltip alike; the target has no text).
+    nonisolated static func recordingMenuSection(_ lines: [RecordingMenuEntry], language: AppLanguage) -> (title: String, lines: [RecordingMenuLine]) {
+        let pick = { (text: BilingualText) in language == .italian ? text.italian : text.english }
+        return (pick(BilingualText("Registrazioni", "Recordings")), lines.map {
+            RecordingMenuLine(title: pick($0.text), toolTip: $0.hint.map(pick), target: $0.target)
+        })
+    }
+
+    // MARK: Menu bar Play
+
+    /// A click on a course's recordings line, delivered on the main actor by
+    /// `StatusItemController.dispatchRecordingClick` (after its `Task { @MainActor in … }` hop).
+    /// Plays the course's current next lecture through the Play button's path, without opening
+    /// the window. The click is a stale snapshot (the menu may have been drawn before a sign-out,
+    /// an account change, a turn-off, a deselection or a checkpoint), so everything is re-checked
+    /// here (`menuPlayRecording`); a click that no longer applies does nothing and, in particular,
+    /// never creates the Recordings controller. Only an accepted click uses `recordings` (lazy:
+    /// an explicit user action). When the controller can't play without the window (Recordings
+    /// off for it, the Polimi session needs a sign-in), the course's Recordings page opens,
+    /// where the usual message or "Accedi con Polimi" shows.
+    func playNextRecording(_ target: RecordingMenuTarget) {
+        let switchOn = recordingsStorage?.isEnabled ?? RecordingsController.isSwitchedOn(in: operationDefaults)
+        guard let recording = Self.menuPlayRecording(target: target, owner: recordingsOwnerUserID, isPolimi: selectedSite.university == .polimi,
+                                                     switchOn: switchOn, enabledIDs: enabledCourseIDs, summaries: watchSummaries) else {
+            BeepbarLog.lifecycle.notice("Menu recording click ignored: no longer applies")
+            return
+        }
+        BeepbarLog.lifecycle.notice("Menu recording click: playing the course's next lecture")
+        if !startMenuPlay(recording, owner: target.owner, courseID: target.courseID) {
+            showRecordingsCourse(target.courseID)
+        }
+    }
+
+    /// The lecture a menu click on `target` may play, or nil when the click no longer applies:
+    /// - another account than the one the line was drawn for (`owner`), or none;
+    /// - not Polimi, or Recordings switched off;
+    /// - the course no longer synced;
+    /// - no known next lecture for the key (all done since, or a reset);
+    /// - a stored next that fails `RecordingsController.validatedNext`: it was read back from
+    ///   UserDefaults and is untrusted (another course or year, a foreign link).
+    /// Pure, so each rejection is tested without a controller or a window.
+    nonisolated static func menuPlayRecording(target: RecordingMenuTarget, owner: Int?, isPolimi: Bool, switchOn: Bool,
+                                              enabledIDs: Set<Int64>, summaries: [RecmanCourseKey: CourseWatchSummary]) -> RecmanRecording? {
+        guard let owner, owner == target.owner, isPolimi, switchOn, enabledIDs.contains(target.courseID),
+              let next = summaries[target.key]?.next, RecordingsController.validatedNext(next, for: target.key) else { return nil }
+        return next
+    }
+
+    /// The single call into the Recordings controller's menu Play, so the controller's signature
+    /// can change in one place. `owner` is the account the click was made for; the controller
+    /// ignores (true, nothing happens) a click whose owner isn't its own resume owner, and
+    /// answers false when it can't play without the window (off, sign-in needed or running, an
+    /// invalid stored next): the caller then shows the course's page.
+    private func startMenuPlay(_ recording: RecmanRecording, owner: Int, courseID: Int64) -> Bool {
+        recordings.playFromMenu(recording, owner: owner, courseID: courseID)
+    }
+
+    /// Opens BeepBar on the Recordings page of WeBeep course `courseID`: the page a menu Play
+    /// needs when it can't go on without the window (sign-in, a lecture that can't be opened).
+    private func showRecordingsCourse(_ courseID: Int64) {
+        recordings.selectDestination(.course(courseID))
+#if DEBUG
+        if let showRecordingsPageForTesting { showRecordingsPageForTesting(courseID); return }
+#endif
+        ConfigurationWindowController.shared.show(self, page: .recordings)
+    }
+
+    /// `onMenuPlayNeedsPage` hands over an archive key: the synced course with that key that the
+    /// menu showed (the first in sidebar order, as `recordingMenuLines` picks it), else any course
+    /// with it; with none (the course left the list meanwhile) the Recordings page opens as it was.
+    private func showRecordingsCourse(for key: RecmanCourseKey) {
+        let matching = courses.filter { RecmanCourseKey(course: $0) == key }
+        if let course = matching.first(where: { enabledCourseIDs.contains($0.id) }) ?? matching.first {
+            showRecordingsCourse(course.id)
+            return
+        }
+#if DEBUG
+        if let showRecordingsPageForTesting { showRecordingsPageForTesting(nil); return }
+#endif
+        ConfigurationWindowController.shared.show(self, page: .recordings)
     }
 
     /// One short line for the status menu; the full sentences live in the window.
@@ -1046,16 +1764,45 @@ struct MenuBarSnapshot: Sendable {
         activeOperationID != nil
     }
 
-    private func setSyncState(_ newState: AppSyncState) {
+    /// Publishing restored state must not encode and persist a result that is already saved.
+    private func publishSyncState(_ newState: AppSyncState) {
         let previousSummary = lastSyncSummary
         syncState = newState
         if lastSyncSummary != previousSummary { activityItemProblems = [:] }
         status = newState.detail
-        if case .synced(let summary) = newState, let rootID {
-            operationDefaults.set(summary.completedAt.timeIntervalSince1970, forKey: Self.lastSuccessfulReconciliationKey + rootID.uuidString)
-            if let data = try? JSONEncoder().encode(summary) {
-                operationDefaults.set(data, forKey: Self.lastSuccessfulSummaryKey + rootID.uuidString)
-            }
+    }
+
+    /// New successful results and explicit legacy migration retain their durable timestamp and detail.
+    /// Encodes on the main actor, which only small summaries may do (legacy migration, previews):
+    /// a sync's new result goes through `setSyncState(synced:)`, already encoded (R01, #109).
+    private func setSyncState(_ newState: AppSyncState) {
+        publishSyncState(newState)
+        if case .synced(let summary) = newState, rootID != nil {
+#if DEBUG
+            summaryEncodedOnMainThreadForTesting = true
+#endif
+            saveSuccessfulResult(summary, data: try? JSONEncoder().encode(summary), rootID: rootID)
+        }
+    }
+
+    /// Publishes a sync's new successful result and saves it in the same main-actor turn, with the
+    /// bytes encoded off the main actor (R01, #109). Keep both in this one synchronous function:
+    /// saving later, from a task, would let a quit or a newer result find the shown result unsaved,
+    /// or let an older write land last. `rootID` is the folder the sync ran on, never read from
+    /// `self` here: saved under the folder current at completion, a result could land under a
+    /// folder picked mid-sync, which would then show the old folder's result (#167).
+    private func setSyncState(synced result: EncodedSyncSummary, rootID: UUID?) {
+        publishSyncState(.synced(result.summary))
+        saveSuccessfulResult(result.summary, data: result.data, rootID: rootID)
+    }
+
+    /// Both keys of a successful result, the time first, as releases before R01 wrote them, under
+    /// the folder the caller names (#167).
+    private func saveSuccessfulResult(_ summary: SyncCompletionSummary, data: Data?, rootID: UUID?) {
+        guard let rootID else { return }
+        operationDefaults.set(summary.completedAt.timeIntervalSince1970, forKey: Self.lastSuccessfulReconciliationKey + rootID.uuidString)
+        if let data {
+            operationDefaults.set(data, forKey: Self.lastSuccessfulSummaryKey + rootID.uuidString)
         }
     }
 
@@ -1065,26 +1812,42 @@ struct MenuBarSnapshot: Sendable {
         guard accountState != .expired else { setSyncState(.failed(.authenticationExpired)); return }
         guard hasStoredCredential else { setSyncState(.loginRequired); return }
         guard rootURL != nil, let rootID else { setSyncState(.needsFolder); return }
+        let generation = notificationGeneration
+        let expectedSite = selectedSite
+        let expectedURL = rootURL
         let open: [ConflictRecord]
         do {
             let pending = try await loadPendingChoices()
-            guard self.rootID == rootID, hasStoredCredential, accountState != .expired, !isSyncActive else { return }
+            guard self.rootID == rootID, selectedSite == expectedSite, rootURL == expectedURL, notificationGeneration == generation, hasStoredCredential, accountState != .expired, !recoveryBlocked, !isSyncActive, !Task.isCancelled else { return }
             open = pending.conflicts
             conflicts = open
             remoteChanges = pending.changes
         } catch {
-            guard self.rootID == rootID, hasStoredCredential, accountState != .expired, !isSyncActive else { return }
+            guard self.rootID == rootID, selectedSite == expectedSite, rootURL == expectedURL, notificationGeneration == generation, hasStoredCredential, accountState != .expired, !recoveryBlocked, !isSyncActive, !Task.isCancelled else { return }
             reportPendingChoicesReadFailure()
             return
         }
         if !open.isEmpty { setSyncState(.conflicts(open.count, nil)); return }
-        if let data = operationDefaults.data(forKey: Self.lastSuccessfulSummaryKey + rootID.uuidString),
-           let summary = try? JSONDecoder().decode(SyncCompletionSummary.self, from: data) {
-            setSyncState(.synced(summary))
-            return
+        if let data = operationDefaults.data(forKey: Self.lastSuccessfulSummaryKey + rootID.uuidString) {
+            // A large Activity summary can take more than a frame to decode. A detached task
+            // keeps that CPU work off the UI; its result remains subject to the captured identity.
+            let summary = await Task.detached(priority: .userInitiated) {
+                try? JSONDecoder().decode(SyncCompletionSummary.self, from: data)
+            }.value
+#if DEBUG
+            await beforeRestoredSummaryPublicationForTesting?()
+#endif
+            guard self.rootID == rootID, selectedSite == expectedSite, rootURL == expectedURL,
+                  notificationGeneration == generation, hasStoredCredential,
+                  accountState != .expired, !recoveryBlocked, !isSyncActive, !Task.isCancelled else { return }
+            if let summary {
+                publishSyncState(.synced(summary))
+                return
+            }
         }
         let timestamp = operationDefaults.double(forKey: Self.lastSuccessfulReconciliationKey + rootID.uuidString)
         let legacy = SyncCompletionSummary(completedAt: Date(timeIntervalSince1970: timestamp), added: 0, updated: 0, unchanged: 0, preservedLocal: 0, conflicts: 0, failures: 0)
+        // Timestamp-only installs migrate once; later restores take the read-only summary path.
         setSyncState(timestamp > 0 ? .synced(legacy) : .readyUnchecked)
     }
 
@@ -1112,13 +1875,55 @@ struct MenuBarSnapshot: Sendable {
         }
     }
 
-    func refreshOnWindowOpen() {
-        Task { [weak self] in
+    /// Fills the Corsi page when the window opens: the course list saved at an earlier launch
+    /// first, read from disk without waiting for the network, then Moodle's list (#98).
+    @discardableResult func refreshOnWindowOpen() -> Task<Void, Never> {
+        // A list on its way (signed in, or the launch bootstrap still deciding) and none confirmed
+        // on screen: the loading state shows from the first frame, not once the bootstrap and the
+        // saved list are done. Signed out or expired, nothing loads, so nothing flashes.
+        if !Self.isUIPreview, courseListFreshness != .current, hasBootstrapped ? (hasStoredCredential && accountState == .connected) : true {
+            isPreparingCourseList = true
+        }
+        isWindowOpen = true
+        let generation = windowGeneration
+        let refresh = Task { [weak self] in
             guard let self else { return }
             await self.bootstrapTask?.value
+            await self.restoreSavedCourseList()
+            // Closed while the bootstrap or the restore ran: no request for a window nobody sees
+            // (quiet at rest). The loading state was cleared by `windowClosed()`, and a reopened
+            // window's own refresh owns it now, so it is left alone.
+            guard self.windowGeneration == generation else { return }
+            // Starts the load in this turn (`isLoadingCourses` takes over), holds it until a
+            // running sync ends, or ends the loading state when nothing will be loaded.
             self.loadCourses()
+#if DEBUG
+            // The isolated UI harness awaits the real refresh completion instead of sleeping.
+            await self.courseLoadTaskForTesting?.value
+#endif
         }
         refreshConflicts()
+        return refresh
+    }
+
+    /// What `chooseRoot` does with the activation policy once its folder panel is closed.
+    enum PanelPolicyOutcome: Equatable {
+        /// Put `previous` back: the panel raised BeepBar and nothing else has since.
+        case restore
+        /// A lecture window is open: leave BeepBar regular and let the player restore `previous`
+        /// when it closes.
+        case handToPlayer
+        /// Not ours to change: the panel didn't raise BeepBar, or someone else changed the policy
+        /// since.
+        case leave
+    }
+
+    /// Pure, so it is tested without a panel. Restores only if BeepBar is still `.regular` (the
+    /// state `chooseRoot` itself set), never over a policy someone else chose meanwhile, and never
+    /// under an open lecture window (#148).
+    nonisolated static func panelPolicyOutcome(previous: NSApplication.ActivationPolicy, current: NSApplication.ActivationPolicy, playerOpen: Bool) -> PanelPolicyOutcome {
+        guard previous != .regular, current == .regular else { return .leave }
+        return playerOpen ? .handToPlayer : .restore
     }
 
     func chooseRoot() {
@@ -1137,9 +1942,19 @@ struct MenuBarSnapshot: Sendable {
         if previousPolicy != .regular { NSApp.setActivationPolicy(.regular) }
         NSApp.activate(ignoringOtherApps: true)
         let response = panel.runModal()
-        if previousPolicy != .regular {
+        // `runModal` keeps servicing main-actor jobs, so a Lecture Play can open the native
+        // player meanwhile. Putting `.accessory` back unconditionally would then drop the Dock
+        // icon from under the lecture window (#148).
+        let lectureOpen = recordingsIfCreated?.isPlayerOpen ?? false
+        switch Self.panelPolicyOutcome(previous: previousPolicy, current: NSApp.activationPolicy(), playerOpen: lectureOpen) {
+        case .restore:
             NSApp.setActivationPolicy(previousPolicy)
             NSApp.activate(ignoringOtherApps: true)
+        case .handToPlayer:
+            // The player restores it when the lecture closes.
+            recordingsIfCreated?.keepPolicyAfterLecture(previousPolicy)
+        case .leave:
+            break
         }
         guard response == .OK, let url = panel.url else { return }
         // Registered by its resolved path, so the same folder reached through a symlink (the folder
@@ -1147,35 +1962,85 @@ struct MenuBarSnapshot: Sendable {
         let pickedURL = url.standardizedFileURL
         let selectedURL = pickedURL.resolvingSymlinksInPath()
         guard !isSyncActive else { return }
-        Task { [weak self] in
-            do {
-                guard let self else { return }
-                await self.bootstrapTask?.value
-                guard let database = self.database else { throw SyncDatabaseError.open }
-                _ = try FileStore(root: selectedURL)
-                // A root registered before paths were resolved is still found by the path it was
-                // picked with, and moves to the resolved one.
-                let existingID = try await database.rootID(canonicalPath: selectedURL.path)
-                let legacyID = pickedURL.path == selectedURL.path ? nil : try await database.rootID(canonicalPath: pickedURL.path)
-                let selectedID = existingID ?? legacyID ?? UUID()
-                try await database.registerRoot(id: selectedID, canonicalPath: selectedURL.path)
-                let report = try await operationGate.withLease(.recovering) {
-                    try await RecoveryCoordinator(rootID: selectedID, database: database, fileStore: try FileStore(root: selectedURL)).recover()
-                }
-                guard report.unresolved.isEmpty else { throw SyncDatabaseError.execution }
-                rootURL = selectedURL; rootID = selectedID; recoveryBlocked = false; hasPendingModuleMoves = false
-                activityItemProblems = [:]
-                dataSaverPause = nil
-                courseFolders = [:]; conflicts = []; remoteChanges = []
-                try await restoreScopes(for: courses)
-                Self.defaults.set(selectedURL.path, forKey: Self.rootKey)
-                Self.defaults.set(selectedID.uuidString, forKey: Self.rootIDKey)
-                await self.restorePersistedSyncState()
-                self.configureBackgroundScheduler()
-            } catch {
-                self?.setSyncState(.failed(.local(BilingualText("Non è stato possibile usare questa cartella. Scegline un'altra.", "This folder couldn't be used. Choose another one."))))
+        Task { [weak self] in await self?.useRoot(picked: pickedURL, resolved: selectedURL) }
+    }
+
+    /// Makes the folder chosen in the open panel the sync root: registers it, recovers anything
+    /// left pending in it, and reads its records for the course list on screen.
+    private func useRoot(picked pickedURL: URL, resolved selectedURL: URL) async {
+        // Whether the new folder replaced the old one: failures before that leave the old folder
+        // in place, and must not be shown over a sync running on it (#167).
+        var adopted = false
+        do {
+            await bootstrapTask?.value
+            guard let database else { throw SyncDatabaseError.open }
+            _ = try FileStore(root: selectedURL)
+            // A root registered before paths were resolved is still found by the path it was
+            // picked with, and moves to the resolved one.
+            let existingID = try await database.rootID(canonicalPath: selectedURL.path)
+            let legacyID = pickedURL.path == selectedURL.path ? nil : try await database.rootID(canonicalPath: pickedURL.path)
+            let selectedID = existingID ?? legacyID ?? UUID()
+            try await database.registerRoot(id: selectedID, canonicalPath: selectedURL.path)
+            let report = try await operationGate.withLease(.recovering) {
+                try await RecoveryCoordinator(rootID: selectedID, database: database, fileStore: try FileStore(root: selectedURL)).recover()
             }
+            // `chooseRoot` checked for a running sync only before the awaits above, and a sync can
+            // start during them. Switching under it would hand its result to the new folder
+            // (#167), so the folder stays as it was, quietly as in `chooseRoot` (and as the catch
+            // below does when the sync's lease made the recovery fail). Keep no `await` between
+            // this check and the assignment below, or the window reopens.
+            guard !isSyncActive else { return }
+            guard report.unresolved.isEmpty else { throw SyncDatabaseError.execution }
+            rootURL = selectedURL; rootID = selectedID; recoveryBlocked = false; hasPendingModuleMoves = false
+            adopted = true
+            // Started for the previous folder's run: the new folder's next sync decides again.
+            cancelRecordingsFollowUp()
+            activityItemProblems = [:]
+            dataSaverPause = nil
+            courseFolders = [:]; conflicts = []; remoteChanges = []
+            // Only a list Moodle confirmed may create the new folder's records: a saved one is set
+            // aside and Moodle's list loaded instead, as when the window opens (#98).
+            let setAside = isShowingSavedCourseList
+            if setAside {
+                courses = []
+                courseListFreshness = .unknown
+            } else {
+                try await restoreScopes(for: courses)
+            }
+            // Through `operationDefaults`, like every other setting: a test controller's folder
+            // must not reach the test runner's own preferences.
+            operationDefaults.set(selectedURL.path, forKey: Self.rootKey)
+            operationDefaults.set(selectedID.uuidString, forKey: Self.rootIDKey)
+            await restorePersistedSyncState()
+            configureBackgroundScheduler()
+            if setAside {
+                loadCourses()
+            } else if courseListFreshness == .current, !courses.isEmpty {
+                // The saved list names its folder: saved again for this one, so the next launch
+                // can show it. Captured before the token read, and dropped if the account or the
+                // folder changed meanwhile.
+                let confirmed = courses
+                let epoch = courseListEpoch
+                if let token = try? await credentialVault.load(), courseListEpoch == epoch, rootID == selectedID, courseListFreshness == .current {
+                    saveConfirmedCourseList(confirmed, token: token)
+                }
+            }
+        } catch {
+            // Not adopted while a sync runs: the old folder is still current and the screen shows
+            // its sync, which this failure must not replace. Typically the sync took the folder
+            // lease first and the recovery above failed as busy (#167).
+            guard adopted || !isSyncActive else { return }
+            setSyncState(.failed(.local(BilingualText("Non è stato possibile usare questa cartella. Scegline un'altra.", "This folder couldn't be used. Choose another one."))))
         }
+    }
+
+    /// The configuration window closed: a course list load still waiting for a sync to end is no
+    /// longer wanted, so the end of that sync sends no request (quiet at rest, #98).
+    func windowClosed() {
+        windowGeneration += 1
+        isWindowOpen = false
+        isPreparingCourseList = false
+        stopWatchingForNetworkReturn()
     }
 
     func setLanguage(_ newLanguage: AppLanguage) {
@@ -1200,7 +2065,8 @@ struct MenuBarSnapshot: Sendable {
     }
 
     func setCourse(_ course: RemoteCourseSummary, enabled: Bool) {
-        guard !isSyncActive, !isLoadingCourses else { return }
+        // A saved list is not Moodle's: its courses get no records until it is confirmed (#98).
+        guard !isSyncActive, !isLoadingCourses, !isShowingSavedCourseList else { return }
         if enabled { enabledCourseIDs.insert(course.id) }
         else { enabledCourseIDs.remove(course.id) }
         operationDefaults.set(enabledCourseIDs.map(String.init).sorted(), forKey: Self.enabledCoursesKey)
@@ -1344,7 +2210,7 @@ struct MenuBarSnapshot: Sendable {
     func setAutomaticSyncInterval(_ seconds: Int) { guard !isSyncActive else { return }; automaticSyncInterval = Self.validatedAutomaticInterval(seconds); operationDefaults.set(automaticSyncInterval, forKey: Self.autoSyncIntervalKey); configureBackgroundScheduler() }
 
     func renameFolder(for course: RemoteCourseSummary, to newFolder: String) {
-        guard let rootURL, let rootID, let database, !recoveryBlocked, !isSyncActive else { return }
+        guard let rootURL, let rootID, let database, !recoveryBlocked, !isSyncActive, !isShowingSavedCourseList else { return }
         let oldFolder = folder(for: course)
         let trimmedFolder = newFolder.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmedFolder.isEmpty, !ReservedNamespace.isReservedTopLevelName(trimmedFolder) else {
@@ -1383,33 +2249,45 @@ struct MenuBarSnapshot: Sendable {
         guard activeOperationID == nil, !isLoadingCourses else { return }
         let operationID = UUID()
         activeOperationID = operationID
+        pruneExpiredCourseList()
         // «Sincronizza ora» always downloads, on any network: nothing is paused any more.
         dataSaverPause = nil
         setSyncState(.checking)
         // Through the helper, not the coordinator directly: it also refreshes the Settings footer.
         Task { await requestNotificationPermissionIfNeeded() }
         syncTask = Task { [weak self] in
+            // On every exit, once the run has ended (its operation, `syncTask` included, is over
+            // by then): the recordings follow-up starts as a task of its own, never awaited here,
+            // so "Esci" never waits for it. A superseded run recorded nothing and starts nothing.
+            defer { self?.followUpAfterRun(operationID, trigger: .manual) }
             do {
                 guard let self else { return }
                 await self.bootstrapTask?.value
                 try Task.checkCancellation()
                 guard self.activeOperationID == operationID else { return }
                 // The course list is only loaded when the window opens, so a sync started from the
-                // menu right after launch would otherwise find nothing selected and do nothing.
-                if self.courses.isEmpty, self.hasStoredCredential, self.accountState == .connected {
+                // menu right after launch would otherwise find nothing selected and do nothing. A
+                // list restored from disk is not enough either: saved enrollments never decide
+                // what is synced, so until Moodle confirmed the list in this session it is asked
+                // first (#98).
+                if self.courseListFreshness != .current, self.hasStoredCredential, self.accountState == .connected {
                     let token = try await self.credentialVault.load()
                     try await self.refreshCourseList(token: token)
                     try Task.checkCancellation()
                     guard self.activeOperationID == operationID else { return }
                 }
-                let selected = self.courses.filter { self.enabledCourseIDs.contains($0.id) }
+                // Only a list Moodle confirmed selects anything: if the refresh above could not run
+                // (not connected), a saved list on screen still selects nothing (#98).
+                let selected = self.courseListFreshness == .current ? self.courses.filter { self.enabledCourseIDs.contains($0.id) } : []
                 guard !selected.isEmpty else {
+                    self.recordRunEnd(operationID, .unconfigured)
                     self.setSyncState(.readyUnchecked)
                     self.endOperation(operationID)
                     return
                 }
                 guard let database = self.database else { throw SyncDatabaseError.open }
                 guard let rootURL = self.rootURL, let rootID = self.rootID else {
+                    self.recordRunEnd(operationID, .unconfigured)
                     self.setSyncState(.needsFolder)
                     self.endOperation(operationID)
                     return
@@ -1417,20 +2295,21 @@ struct MenuBarSnapshot: Sendable {
                 let targets = selected.map { SyncTarget(courseID: $0.id, localFolder: self.folder(for: $0)) }
                 let token = try await self.credentialVault.load()
                 let coordinator = try SyncCoordinator(rootID: rootID, rootURL: rootURL, database: database, gate: self.operationGate, apiClient: self.apiClient, downloader: self.downloader, platformName: self.selectedSite.platformName)
-                await self.beginTransfer(operationID, automatic: false)
-                let summary = try await coordinator.synchronize(targets: targets, token: token, mode: .manual, networkAccess: .unrestricted) { [weak self] progress in
-                    await self?.publishProgress(progress)
-                }
-                await self.completeSync(operationID, summary: summary, automatic: false)
+                let run = self.beginTransfer(operationID, automatic: false)
+                let summary = try await coordinator.synchronize(targets: targets, token: token, mode: .manual, networkAccess: .unrestricted, progress: self.progressSink(operationID, run: run))
+                await self.completeSync(operationID, rootID: rootID, summary: summary, automatic: false)
             } catch is CancellationError {
                 self?.cancelledSync(operationID)
             } catch let error as WeBeepAPIError {
                 await self?.failedSync(operationID, error: error, automatic: false)
             } catch let error as CredentialStorageError {
+                self?.recordRunEnd(operationID, .credentialUnavailable)
                 await self?.handleCredentialStorageError(error)
                 self?.endOperation(operationID)
             } catch is RootOperationGateError {
                 self?.busySync(operationID)
+            } catch let error as RemoteMoveRecoveryError {
+                await self?.failedSync(operationID, error: nil, automatic: false, unreadableMove: error.path)
             } catch {
                 await self?.failedSync(operationID, error: nil, automatic: false)
             }
@@ -1443,16 +2322,17 @@ struct MenuBarSnapshot: Sendable {
     private func simulatePreviewSync() {
         guard activeOperationID == nil else { return }
         let previous = lastSyncSummary
-        activeOperationID = UUID()
+        let operationID = UUID()
+        activeOperationID = operationID
         setSyncState(.syncing)
         syncTask = Task { [weak self] in
             guard let self else { return }
-            await self.progressStore.reset(automatic: false)
+            let sink = self.progressSink(operationID, run: self.progressStore.reset(automatic: false))
             let total = 40
             for completed in 1...total {
                 try? await Task.sleep(for: .milliseconds(90))
                 if Task.isCancelled { break }
-                await self.publishProgress(SyncProgress(completed: completed, total: total, added: completed / 8, updated: completed / 20, preservedLocal: 0, unchanged: completed, conflicts: 0, failures: 0))
+                await sink(SyncProgress(completed: completed, total: total, added: completed / 8, updated: completed / 20, preservedLocal: 0, unchanged: completed, conflicts: 0, failures: 0))
             }
             let cancelled = Task.isCancelled
             self.syncTask = nil
@@ -1462,6 +2342,7 @@ struct MenuBarSnapshot: Sendable {
                 self.setSyncState(.synced(SyncCompletionSummary(completedAt: Date(), added: 5, updated: 2, unchanged: 93, preservedLocal: 0, conflicts: 0, failures: 0, perCourse: previous?.perCourse ?? [])))
             }
             await Task.yield()
+            self.progressStore.closeCurrentRun()
             self.activeOperationID = nil
         }
     }
@@ -1487,6 +2368,8 @@ struct MenuBarSnapshot: Sendable {
     /// its cookies here and made every quit wait (see `prepareForMenuQuit()` for why waiting is
     /// dangerous on the menu path).
     func prepareForTermination() -> Task<Void, Never>? {
+        isTerminating = true
+        stopWatchingForNetworkReturn()
         backgroundScheduler?.invalidate()
         backgroundScheduler = nil
         scheduledConfiguration = nil
@@ -1668,7 +2551,7 @@ struct MenuBarSnapshot: Sendable {
         apiClient = WeBeepAPIClient(policy: site.serverPolicy)
         downloader = RemoteDownloader(policy: site.serverPolicy)
         siteInfo = nil
-        courses = []
+        forgetCourseList()
         // Recordings exist only for Polimi, and a Polimi session must not wait for the next
         // Polimi account.
         recordings.turnOff()
@@ -1710,30 +2593,67 @@ struct MenuBarSnapshot: Sendable {
 
     func loadCourses() {
         guard !Self.isUIPreview else { return }
-        guard accountState == .connected, hasStoredCredential, !isLoadingCourses, !isSyncActive else { return }
+        guard accountState == .connected, hasStoredCredential else { isPreparingCourseList = false; return }
+        // A load already running answers this request too.
+        guard !isLoadingCourses else { isPreparingCourseList = false; return }
+        guard !isSyncActive else {
+            // Started when the sync ends (`endOperation`), so a window opened during a sync does
+            // not stay on an empty or unconfirmed list (#98).
+            if courseListFreshness != .current { isPreparingCourseList = true }
+            return
+        }
+        isPreparingCourseList = false
+        // Hidden while the new attempt runs (the page shows it loading); it comes back if the
+        // attempt fails, and goes for good once the list is confirmed.
         courseLoadError = nil
+        courseLoadFailedForConnection = false
         isLoadingCourses = true
+        let epoch = courseListEpoch
         let task = Task { [weak self] in
-            defer { self?.isLoadingCourses = false }
+            defer {
+                if let self {
+                    self.isLoadingCourses = false
+                    // A new sign-in replaced the account while this load ran: its result was
+                    // dropped, and the sign-in's own `loadCourses` found this one running and did
+                    // nothing, so the new account's list is loaded now (#98).
+                    if self.courseListEpoch != epoch { self.loadCourses() }
+                }
+            }
             do {
                 guard let self else { return }
                 await self.bootstrapTask?.value
                 try Task.checkCancellation()
                 let token = try await self.credentialVault.load()
                 try await self.refreshCourseList(token: token)
-            } catch let error as WeBeepAPIError {
-                guard let self else { return }
-                if error == .invalidToken {
-                    await self.expireCredential()
-                } else if error == .network(.timedOut) {
-                    self.courseLoadError = BilingualText("\(self.selectedSite.platformName) non risponde. Riprova.", "\(self.selectedSite.platformName) isn't responding. Try again.")
-                } else {
-                    self.courseLoadError = BilingualText("Impossibile aggiornare i corsi da \(self.selectedSite.platformName). Riprova.", "Couldn't refresh courses from \(self.selectedSite.platformName). Try again.")
-                }
-            } catch let error as CredentialStorageError {
-                await self?.handleCredentialStorageError(error)
+            } catch is CancellationError {
+                // Superseded (a new sign-in) or cancelled: nothing failed that the user must see.
             } catch {
-                self?.courseLoadError = BilingualText("Impossibile aggiornare i corsi. Riprova.", "Couldn't refresh courses. Try again.")
+                // A failure of the previous account's token says nothing about the account
+                // signed in now: expiring or reporting it would blame the new sign-in (#98).
+                guard let self, self.courseListEpoch == epoch else { return }
+                switch error {
+                case let error as WeBeepAPIError where error == .invalidToken:
+                    await self.expireCredential()
+                case let error as WeBeepAPIError where error == .network(.timedOut):
+                    self.courseLoadError = BilingualText("\(self.selectedSite.platformName) non risponde. Riprova.", "\(self.selectedSite.platformName) isn't responding. Try again.")
+                    self.courseLoadFailedForConnection = true
+                    self.watchForNetworkReturn()
+                case let error as WeBeepAPIError:
+                    self.courseLoadError = BilingualText("Impossibile aggiornare i corsi da \(self.selectedSite.platformName). Riprova.", "Couldn't refresh courses from \(self.selectedSite.platformName). Try again.")
+                    // Only a connection failure can end when the network comes back; a server
+                    // error or a malformed answer waits for the refresh button.
+                    if case .network = error {
+                        self.courseLoadFailedForConnection = true
+                        self.watchForNetworkReturn()
+                    } else {
+                        self.stopWatchingForNetworkReturn()
+                    }
+                case let error as CredentialStorageError:
+                    await self.handleCredentialStorageError(error)
+                default:
+                    self.courseLoadError = BilingualText("Impossibile aggiornare i corsi. Riprova.", "Couldn't refresh courses. Try again.")
+                    self.stopWatchingForNetworkReturn()
+                }
             }
         }
 #if DEBUG
@@ -1744,19 +2664,64 @@ struct MenuBarSnapshot: Sendable {
     }
 
     /// Fetches the enrolled courses and makes them the current list. Shared by the course list
-    /// refresh and by a sync started before the list was ever loaded (from the menu right after
-    /// launch), which cannot go through `loadCourses` because that refuses to run during a sync.
+    /// refresh and by a sync started before the list was confirmed (from the menu right after
+    /// launch, or over a saved list), which cannot go through `loadCourses` because that refuses
+    /// to run during a sync. The confirmed list replaces a saved one and is saved for the next
+    /// launch (#98).
     private func refreshCourseList(token: String) async throws {
+        let epoch = courseListEpoch
         let courses = try await fetchEnrolledCourses(token: token)
-        // The account may have been disconnected while the list was loading.
-        guard hasStoredCredential else { return }
+        // The account may have been disconnected or replaced while the list was loading.
+        guard hasStoredCredential, courseListEpoch == epoch else { return }
         try await restoreScopes(for: courses)
-        self.courses = Self.orderedForDisplay(courses, enabledCourseIDs: enabledCourseIDs)
+        guard hasStoredCredential, courseListEpoch == epoch else { return }
+        let ordered = Self.orderedForDisplay(courses, enabledCourseIDs: enabledCourseIDs)
+        // #94: equal @Published assignments still invalidate every course subscriber.
+        if self.courses != ordered { self.courses = ordered }
+        if courseListFreshness != .current { courseListFreshness = .current }
+        if isPreparingCourseList { isPreparingCourseList = false }
+        // Every path that confirms the list ends its error, the sync's own refresh included:
+        // before #168 only a new `loadCourses()` cleared it, so a banner outlived the failure.
+        if courseLoadError != nil { courseLoadError = nil }
+        courseLoadFailedForConnection = false
+        stopWatchingForNetworkReturn()
         accountState = .connected
         operationDefaults.removeObject(forKey: Self.credentialExpiredKey)
+        saveConfirmedCourseList(courses, token: token)
+    }
+
+    /// Starts `networkReturnWatch` if the window is open and none is running. The first value is
+    /// the network as it is now: if it already has a route (Wi-Fi came up between the failure
+    /// and this call) the list is retried at once, and after that at every change that brings a
+    /// route back. One watch per failure episode, so a retry that fails again never restarts it:
+    /// at most one immediate retry, then only real network changes (#168).
+    private func watchForNetworkReturn() {
+        guard isWindowOpen, !isTerminating, networkReturnWatch == nil else { return }
+        networkReturnWatchID += 1
+        let watchID = networkReturnWatchID
+        let changes = reachabilityChanges()
+        networkReturnWatch = Task { [weak self] in
+            for await reachable in changes {
+                guard reachable else { continue }
+                guard let self, !Task.isCancelled else { return }
+                // A retry already in flight clears the error until it ends: not a reason to stop.
+                // A failure that is not a connection one stops the watch (`loadCourses`).
+                guard self.courseLoadError != nil, !self.isLoadingCourses else { continue }
+                self.loadCourses()
+            }
+            // The stream ended by itself (no path monitor here): a later failure may watch again.
+            guard let self, !Task.isCancelled, self.networkReturnWatchID == watchID else { return }
+            self.networkReturnWatch = nil
+        }
+    }
+
+    private func stopWatchingForNetworkReturn() {
+        networkReturnWatch?.cancel()
+        networkReturnWatch = nil
     }
 
     private func fetchEnrolledCourses(token: String) async throws -> [RemoteCourseSummary] {
+        let epoch = courseListEpoch
         let siteInfo: WeBeepSiteInfo
         if let existing = self.siteInfo {
             siteInfo = existing
@@ -1764,8 +2729,114 @@ struct MenuBarSnapshot: Sendable {
             siteInfo = try await apiClient.validateToken(token)
         }
         let courses = try await apiClient.fetchCourses(userID: siteInfo.userID, token: token)
+        // A sign-in that replaced this account meanwhile owns `siteInfo` now: writing the old
+        // account's back would hand its id to Recordings (#98).
+        guard courseListEpoch == epoch else { throw CancellationError() }
         self.siteInfo = siteInfo
         return courses
+    }
+
+    /// Shows the course list saved at an earlier launch while nothing is on screen (#98). The
+    /// file is read and decoded off the main actor by `courseListStore`, and only a list saved
+    /// for this site, this sync folder and this very sign-in is accepted. Folders come from the
+    /// sync database, read only: a saved list never renames, enables or records anything; that
+    /// is `restoreScopes`, once Moodle has answered. Whatever changes meanwhile (sign-out, a new
+    /// sign-in, another folder, Moodle's list arriving first) makes the result stale, and it is
+    /// dropped.
+    private func restoreSavedCourseList() async {
+        guard !Self.isUIPreview, courses.isEmpty, courseListFreshness == .unknown, courseListRestoreEpoch != courseListEpoch,
+              hasStoredCredential, let rootID, let database else { return }
+        let epoch = courseListEpoch
+        courseListRestoreEpoch = epoch
+        let site = selectedSite
+        // A token that can't be read shows nothing here; the refresh that follows reports it.
+        guard let token = try? await credentialVault.load() else { return }
+        // Checked again before the read: a read for an identity that is no longer current would
+        // delete the file of the current one as foreign.
+        guard courseListEpoch == epoch, self.rootID == rootID, selectedSite == site else { return }
+        let identity = CourseListSnapshot.Identity(siteID: site.id, rootID: rootID, token: token)
+        let outcome = await enqueueCourseListIO(priority: .userInitiated) { await $0.load(expecting: identity) }.value
+        guard case .restored(let snapshot) = outcome else {
+            if case .discarded(let reason) = outcome {
+                BeepbarLog.lifecycle.notice("Saved course list discarded reason=\(String(describing: reason), privacy: .public)")
+            }
+            return
+        }
+        // Without the database's folders the list would show names it doesn't have: nothing then.
+        guard let scopes = try? await database.scopes(rootID: rootID) else { return }
+        guard courseListEpoch == epoch, courses.isEmpty, courseListFreshness == .unknown, self.rootID == rootID, selectedSite == site, hasStoredCredential else { return }
+        // The folders `restoreScopes` would show, without its renames and records: a course's
+        // saved folder, else the default it would get next to every folder already taken.
+        let savedFolders = Dictionary(scopes.compactMap { $0.localFolder.isEmpty ? nil : ($0.courseID, $0.localFolder) }, uniquingKeysWith: { first, _ in first })
+        let defaults = Self.defaultFolders(for: snapshot.summaries, saved: savedFolders)
+        // Before `courses`, whose didSet derives the default folders from these.
+        for course in snapshot.summaries {
+            let folder = savedFolders[course.id] ?? defaults[course.id] ?? LocalPathPolicy.defaultCourseFolder(course.displayName)
+            if courseFolders[course.id] != folder { courseFolders[course.id] = folder }
+        }
+        courses = Self.orderedForDisplay(snapshot.summaries, enabledCourseIDs: enabledCourseIDs)
+        courseListFreshness = .saved(snapshot.savedAt)
+    }
+
+    /// Runs `work` on the saved list's store after every read, save and deletion issued before
+    /// it (`courseListIO`), off the main actor.
+    private func enqueueCourseListIO<Value: Sendable>(priority: TaskPriority, _ work: @escaping @Sendable (CourseListSnapshotStore) async -> Value) -> Task<Value, Never> {
+        let previous = courseListIO
+        let store = courseListStore
+        let task = Task.detached(priority: priority) { () async -> Value in
+            await previous?.value
+            return await work(store)
+        }
+        courseListIO = Task.detached(priority: priority) { _ = await task.value }
+        return task
+    }
+
+    /// Saves a list Moodle just confirmed for the next launch, without waiting: the store writes
+    /// only when the list changed or a day has passed, and refuses the write if the account was
+    /// forgotten meanwhile (`courseListEpoch`).
+    private func saveConfirmedCourseList(_ courses: [RemoteCourseSummary], token: String) {
+        guard !Self.isUIPreview, let rootID else { return }
+        let identity = CourseListSnapshot.Identity(siteID: selectedSite.id, rootID: rootID, token: token)
+        let epoch = courseListEpoch
+        _ = enqueueCourseListIO(priority: .utility) { (store: CourseListSnapshotStore) async -> Void in
+            do { try await store.save(courses, identity: identity, epoch: epoch) }
+            catch { BeepbarLog.lifecycle.error("Saved course list not written errorType=\(String(reflecting: type(of: error)), privacy: .public)") }
+        }
+    }
+
+    /// Deletes the saved course list once it is older than 30 days, without retiring the account
+    /// (#98, PR #138). Called at launch and when a sync runs, so the age limit holds for a user who
+    /// never opens the window, where `restoreSavedCourseList` would otherwise be the only check.
+    /// Costs a `stat` when there is no file and nothing once the store knows the file's date.
+    private func pruneExpiredCourseList() {
+        guard !Self.isUIPreview else { return }
+        _ = enqueueCourseListIO(priority: .utility) { (store: CourseListSnapshotStore) async -> Void in
+            if await store.removeIfExpired() {
+                BeepbarLog.lifecycle.notice("Saved course list removed reason=expired")
+            }
+        }
+    }
+
+    /// Clears the course list of an account that is going away (sign-out, another university, a
+    /// new sign-in, the stored credential gone) and deletes its saved copy. Bumps the epoch first,
+    /// so a refresh, a restore or a save still running for that account is dropped (#98).
+    private func forgetCourseList() {
+        courseListEpoch += 1
+        // The account goes: its recordings follow-up, its last fetched enrollments and the last
+        // follow-up's result go with it (memory only).
+        cancelRecordingsFollowUp()
+        // Nothing left to retry for an account that is going (#168).
+        stopWatchingForNetworkReturn()
+        lastRunCourses = []
+        lastRecordingsOutcome = nil
+        courses = []
+        courseListFreshness = .unknown
+        isPreparingCourseList = false
+        let epoch = courseListEpoch
+        _ = enqueueCourseListIO(priority: .utility) { (store: CourseListSnapshotStore) async -> Void in
+            do { try await store.delete(retiringEpochsBelow: epoch) }
+            catch { BeepbarLog.lifecycle.error("Saved course list not deleted errorType=\(String(reflecting: type(of: error)), privacy: .public)") }
+        }
     }
 
     private static let onboardingCompletedKey = "io.github.tvaccari.beepbar.onboarding-completed.v1"
@@ -1801,12 +2872,14 @@ struct MenuBarSnapshot: Sendable {
     /// identifier (they're unsigned executables built from the same target), so writing straight
     /// to `.standard` during manual preview testing would silently overwrite the real installed
     /// app's settings (sync root, credentials-expired flag, etc). Preview runs get their own
-    /// throwaway suite, wiped at launch so every preview run starts from a clean slate.
+    /// separate suite, wiped at launch except for the watchlist demo, which keeps choices
+    /// so manual testing can verify restoration after relaunch.
     private static let defaults: UserDefaults = {
         guard isUIPreview || isUIPreviewOnboarding else { return .standard }
-        let suiteName = "io.github.tvaccari.beepbar.preview"
+        let watchlistPreview = isUIPreview && ProcessInfo.processInfo.arguments.contains("--watchlist-preview")
+        let suiteName = watchlistPreview ? "io.github.tvaccari.beepbar.preview.watchlist" : "io.github.tvaccari.beepbar.preview"
         let store = UserDefaults(suiteName: suiteName) ?? .standard
-        if let domain = store.persistentDomain(forName: suiteName) {
+        if !watchlistPreview, let domain = store.persistentDomain(forName: suiteName) {
             for key in domain.keys { store.removeObject(forKey: key) }
         }
         return store
@@ -1849,8 +2922,10 @@ struct MenuBarSnapshot: Sendable {
                 guard let self else { return }
                 let siteInfo = try await self.apiClient.validateToken(token)
                 try await self.credentialVault.save(token)
-                // Only a token that was accepted and stored replaces the previous account's state.
-                self.courses = []
+                // Only a token that was accepted and stored replaces the previous account's state,
+                // including the course list saved for the previous sign-in, even if it is the same
+                // account: the new token has its own fingerprint (#98).
+                self.forgetCourseList()
                 self.siteInfo = siteInfo
                 self.hasStoredCredential = true
                 self.accountState = .connected
@@ -1899,6 +2974,17 @@ struct MenuBarSnapshot: Sendable {
         return installedDatabaseDirectory(applicationSupport: try FileManager.default.url(for: .applicationSupportDirectory, in: .userDomainMask, appropriateFor: nil, create: false))
     }
 
+    /// Where the saved course list lives (#98): next to `sync.sqlite` for the installed app, and in
+    /// a throwaway folder for the `--ui-preview` builds, which share the installed app's identity
+    /// and must never read or replace its file. `nil` when Application Support can't be found:
+    /// then nothing is saved or restored and the window simply waits for the network, as before.
+    private static func courseListDirectory() -> URL? {
+        guard !isUIPreview, !isUIPreviewOnboarding else {
+            return FileManager.default.temporaryDirectory.appendingPathComponent("Beepbar-preview-course-list", isDirectory: true)
+        }
+        return try? databaseDirectory()
+    }
+
     /// Where an installed BeepBar keeps `sync.sqlite`: the same Application Support folder as the
     /// token, under a name that must never change with the product's spelling (see
     /// `FileTokenStore.applicationSupportDirectoryName`).
@@ -1919,6 +3005,14 @@ struct MenuBarSnapshot: Sendable {
         let restoredSelection = Self.restoredEnabledCourseIDs(scopes: scopes, current: enabledCourseIDs, remoteIDs: remoteIDs)
         // @Published sends even for equal values; unchanged refreshes must leave the UI quiet.
         if enabledCourseIDs != restoredSelection { enabledCourseIDs = restoredSelection }
+        // `courseFolders` is assigned one course at a time below and each assignment would rebuild
+        // the menu lines (a name regex pass over every course: quadratic at launch). The rebuild
+        // is held back and runs once when the loop is done, whichever way it ends.
+        menuRebuildHolds += 1
+        defer {
+            menuRebuildHolds -= 1
+            if menuRebuildHolds == 0, menuRebuildPending { menuRebuildPending = false; recordingMenuInputsChanged() }
+        }
         for course in courses {
             if let scope = scopesByCourse[course.id], !scope.localFolder.isEmpty {
                 let replacement = LocalPathPolicy.generatedCourseFolderReplacement(
@@ -1938,8 +3032,7 @@ struct MenuBarSnapshot: Sendable {
                             courseID: course.id,
                             displayName: course.displayName,
                             localFolder: replacement,
-                            enabled: scope.enabled,
-                            managedDirectory: scope.managedDirectory
+                            enabled: scope.enabled
                         ))
                     } catch {
                         if courseFolders[course.id] != scope.localFolder { courseFolders[course.id] = scope.localFolder }
@@ -1969,7 +3062,11 @@ struct MenuBarSnapshot: Sendable {
                 }
             }
         }
-        operationDefaults.set(enabledCourseIDs.map(String.init).sorted(), forKey: Self.enabledCoursesKey)
+        let selection = enabledCourseIDs.map(String.init).sorted()
+        // Compare persisted data, not just the in-memory set: missing/legacy values still need repair.
+        if operationDefaults.stringArray(forKey: Self.enabledCoursesKey) != selection {
+            operationDefaults.set(selection, forKey: Self.enabledCoursesKey)
+        }
     }
 
     func folder(for course: RemoteCourseSummary) -> String {
@@ -2095,27 +3192,41 @@ struct MenuBarSnapshot: Sendable {
         }
     }
 
-    private func finishReconciliation(progress: SyncProgress, operationID: UUID) async throws {
+    /// Publishes the end of `operationID`, which synced the folder `rootID`. Both guards also
+    /// require that folder to be still the current one: the pending choices just read and the
+    /// state published belong to the current folder, so a run whose folder was replaced
+    /// meanwhile has nothing it may publish or save; `completeSync` then ends it as superseded
+    /// (#167).
+    private func finishReconciliation(progress: SyncProgress, operationID: UUID, rootID: UUID?) async throws {
         let pending = try await loadPendingChoices()
         let open = pending.conflicts
         let changes = pending.changes
+        // The same check as the guard below, before paying for the encode: a sync cancelled or
+        // replaced while its pending choices were read has nothing left to encode (R01, #109).
+        guard activeOperationID == operationID, self.rootID == rootID, !Task.isCancelled else { return }
+        let summary = SyncCompletionSummary(progress: progress)
+        // Only a successful result is saved. Its encode runs off the main actor here, while this
+        // operation is still the active one, and before the guard below, which then also drops a
+        // result superseded or cancelled during the encode (R01, #109). Encoding after the guard
+        // would publish across a suspension the guard no longer covers.
+        let encoded = progress.failures == 0 && open.isEmpty ? await EncodedSyncSummary.encode(summary) : nil
 #if DEBUG
+        if let encoded { summaryEncodedOnMainThreadForTesting = encoded.encodedOnMainThread }
         await beforeReconciliationStateForTesting?()
 #endif
         // Cancellation keeps the operation ID until its task unwinds. Checking the ID alone
         // would publish a completed result over the user's pending cancellation.
-        guard activeOperationID == operationID, !Task.isCancelled else { return }
+        guard activeOperationID == operationID, self.rootID == rootID, !Task.isCancelled else { return }
         conflicts = open
         remoteChanges = changes
         let ordered = Self.orderedForDisplay(courses, enabledCourseIDs: enabledCourseIDs)
         if courses != ordered { courses = ordered }
-        let summary = SyncCompletionSummary(progress: progress)
-        if progress.failures > 0 {
+        if let encoded {
+            setSyncState(synced: encoded, rootID: rootID)
+        } else if progress.failures > 0 {
             setSyncState(.partial(summary))
-        } else if !open.isEmpty {
-            setSyncState(.conflicts(open.count, summary))
         } else {
-            setSyncState(.synced(summary))
+            setSyncState(.conflicts(open.count, summary))
         }
     }
 
@@ -2125,7 +3236,7 @@ struct MenuBarSnapshot: Sendable {
             interval: automaticSyncInterval,
             connected: accountState == .connected,
             rootConfigured: rootURL != nil,
-            enabledCourseCount: enabledCourseIDs.count,
+            hasEnabledCourses: !enabledCourseIDs.isEmpty,
             recoveryBlocked: recoveryBlocked
         )
         guard configuration != scheduledConfiguration else { return }
@@ -2133,6 +3244,7 @@ struct MenuBarSnapshot: Sendable {
         backgroundScheduler = nil
         scheduledConfiguration = configuration
         schedulerGeneration += 1
+        schedulerRegistrationGeneration += 1
         // The pause promised a retry soon; that retry belonged to the scheduler just dropped, and
         // the new one first runs a whole interval later. Left on screen, "In attesa del Wi-Fi"
         // could stay for hours, through a renewed sign-in, after the Mac is back on Wi-Fi.
@@ -2141,28 +3253,29 @@ struct MenuBarSnapshot: Sendable {
             automaticSyncEnabled: configuration.enabled,
             hasCredential: configuration.connected,
             hasRoot: configuration.rootConfigured,
-            enabledCourseCount: configuration.enabledCourseCount,
+            enabledCourseCount: configuration.hasEnabledCourses ? 1 : 0,
             recoveryBlocked: recoveryBlocked
         )
         guard BackgroundSchedulePolicy.shouldSchedule(policy) else {
-            BeepbarLog.scheduler.notice("Scheduler disabled enabled=\(configuration.enabled, privacy: .public) connected=\(configuration.connected, privacy: .public) root=\(configuration.rootConfigured, privacy: .public) courses=\(configuration.enabledCourseCount, privacy: .public) recoveryBlocked=\(configuration.recoveryBlocked, privacy: .public)")
+            BeepbarLog.scheduler.notice("Scheduler disabled enabled=\(configuration.enabled, privacy: .public) connected=\(configuration.connected, privacy: .public) root=\(configuration.rootConfigured, privacy: .public) courses=\(self.enabledCourseIDs.count, privacy: .public) recoveryBlocked=\(configuration.recoveryBlocked, privacy: .public)")
             return
         }
 #if DEBUG
         guard registersBackgroundActivity else { return }
 #endif
-        let scheduler = NSBackgroundActivityScheduler(identifier: "io.github.tvaccari.beepbar.auto-sync")
-        scheduler.repeats = true
-        scheduler.interval = TimeInterval(automaticSyncInterval)
-        scheduler.tolerance = TimeInterval(automaticSyncInterval) * 0.5
-        scheduler.qualityOfService = .utility
-        BeepbarLog.scheduler.notice("Scheduler configured intervalSeconds=\(self.automaticSyncInterval, privacy: .public) toleranceSeconds=\(Int(scheduler.tolerance), privacy: .public)")
-        scheduler.schedule { [weak self] completion in
+        BeepbarLog.scheduler.notice("Scheduler configured intervalSeconds=\(self.automaticSyncInterval, privacy: .public)")
+        let registrationGeneration = schedulerRegistrationGeneration
+        let scheduler = scheduleBackgroundActivity(TimeInterval(automaticSyncInterval)) { [weak self] completion in
             Task { @MainActor [weak self] in
+                guard let self, self.schedulerRegistrationGeneration == registrationGeneration,
+                      self.backgroundScheduler != nil else {
+                    completion(.finished)
+                    return
+                }
                 BeepbarLog.scheduler.notice("Scheduler callback started")
                 let trace = PerformanceTrace.shared.begin("scheduler.callback", category: .scheduler)
                 defer { PerformanceTrace.shared.end("scheduler.callback", category: .scheduler, state: trace) }
-                let outcome = await self?.runAutomaticSync() ?? .finished
+                let outcome = await self.runAutomaticSync()
                 BeepbarLog.scheduler.notice("Scheduler callback completed outcome=\(outcome.diagnosticName, privacy: .public)")
                 completion(outcome.schedulerResult)
             }
@@ -2189,26 +3302,27 @@ struct MenuBarSnapshot: Sendable {
             // exists, and the new one takes over. Going on would sync after the user turned
             // automatic sync off, or show a pause nothing would clear, since the rebuild that
             // clears it has already happened.
-            guard schedulerGeneration == generation else {
+            guard !Task.isCancelled, schedulerGeneration == generation else {
                 BeepbarLog.sync.notice("Automatic synchronization skipped reason=schedule-changed")
+                startRecordingsFollowUp(after: .scheduleChanged, trigger: .automatic)
                 return .finished
             }
         }
-        switch AutomaticSyncPolicy.decision(lowPowerMode: lowPowerMode, busy: activeOperationID != nil || isLoadingCourses, configured: isAutomaticSyncConfigured, dataSaverEnabled: dataSaverEnabled, network: network) {
+        let decision = AutomaticSyncPolicy.decision(lowPowerMode: lowPowerMode, busy: activeOperationID != nil || isLoadingCourses, configured: isAutomaticSyncConfigured, dataSaverEnabled: dataSaverEnabled, network: network)
+        switch decision {
         case .deferForLowPowerMode:
             BeepbarLog.sync.notice("Automatic synchronization deferred reason=low-power")
+            startRecordingsFollowUp(after: .notRun(decision), trigger: .automatic)
             return .deferred
         case .deferWhileBusy:
             BeepbarLog.sync.notice("Automatic synchronization deferred reason=operation-active")
+            startRecordingsFollowUp(after: .notRun(decision), trigger: .automatic)
             return .deferred
         case .skipUnconfigured:
             BeepbarLog.sync.notice("Automatic synchronization skipped reason=configuration-unavailable")
             // Finishing leaves no retry behind, so a pause from an earlier attempt must go too.
-            // A blocked local recovery gets here without a rebuild (`recoveryBlocked` doesn't
-            // reconfigure the scheduler), and resolving it restores an equal schedule: left in
-            // place, "In attesa del Wi-Fi" would come back over the last result, even on Wi-Fi,
-            // until the next run a whole interval later.
             dataSaverPause = nil
+            startRecordingsFollowUp(after: .notRun(decision), trigger: .automatic)
             return .finished
         case .pause(let pause):
             // Nothing is sent and the state on screen is left alone (the last result, "sincronizzato
@@ -2216,12 +3330,17 @@ struct MenuBarSnapshot: Sendable {
             // instead of waiting a whole interval.
             BeepbarLog.sync.notice("Automatic synchronization deferred reason=data-saver")
             dataSaverPause = pause
+            startRecordingsFollowUp(after: .notRun(decision), trigger: .automatic)
             return .deferred
         case .run:
             break
         }
-        guard let rootURL, let rootID, let database else { return .finished }
+        guard let rootURL, let rootID, let database else {
+            startRecordingsFollowUp(after: .unconfigured, trigger: .automatic)
+            return .finished
+        }
         dataSaverPause = nil
+        pruneExpiredCourseList()
         // Captured once: switching "Risparmio dati" during the run changes the next run, not this one.
         let networkAccess: NetworkAccess = dataSaverEnabled ? .dataSaver : .unrestricted
         let operationID = UUID()
@@ -2235,14 +3354,18 @@ struct MenuBarSnapshot: Sendable {
         catch {
             guard activeOperationID == operationID else { return .cancelled }
             guard !Task.isCancelled else { cancelledSync(operationID); return .cancelled }
+            recordRunEnd(operationID, .localFailure)
             setSyncState(.failed(.local(BilingualText("Impossibile leggere i corsi selezionati. Riprova.", "Couldn't read selected courses. Try again."))))
             endOperation(operationID)
+            followUpAfterRun(operationID, trigger: .automatic)
             return .finished
         }
         guard !automaticScopes.isEmpty else {
             guard activeOperationID == operationID else { return .cancelled }
             BeepbarLog.sync.notice("Automatic synchronization skipped reason=no-enabled-courses")
+            recordRunEnd(operationID, .unconfigured)
             endOperation(operationID)
+            followUpAfterRun(operationID, trigger: .automatic)
             return .finished
         }
         guard activeOperationID == operationID else { return .cancelled }
@@ -2260,14 +3383,16 @@ struct MenuBarSnapshot: Sendable {
                 let token = try await self.credentialVault.load(.nonInteractive)
                 // A course stays enabled in the database after the user leaves it; only the courses
                 // the account is still enrolled in are checked.
-                let enrolled = Set(try await self.fetchEnrolledCourses(token: token).map(\.id))
+                let enrolledCourses = try await self.fetchEnrolledCourses(token: token)
+                // Kept for the menu's recordings lines and the recordings follow-up's keys in a
+                // launch where the window never loaded `courses`: no extra WeBeep request.
+                if self.lastRunCourses != enrolledCourses { self.lastRunCourses = enrolledCourses }
+                let enrolled = Set(enrolledCourses.map(\.id))
                 let targets = Self.automaticTargets(scopes: automaticScopes, enrolledCourseIDs: enrolled)
                 let coordinator = try SyncCoordinator(rootID: rootID, rootURL: rootURL, database: database, gate: gate, apiClient: apiClient, downloader: downloader, platformName: platformName)
-                await self.beginTransfer(operationID, automatic: true)
-                let summary = try await coordinator.synchronize(targets: targets, token: token, mode: .automatic, networkAccess: networkAccess) { [weak self] progress in
-                    await self?.publishProgress(progress)
-                }
-                await self.completeSync(operationID, summary: summary, automatic: true)
+                let run = self.beginTransfer(operationID, automatic: true)
+                let summary = try await coordinator.synchronize(targets: targets, token: token, mode: .automatic, networkAccess: networkAccess, progress: self.progressSink(operationID, run: run))
+                await self.completeSync(operationID, rootID: rootID, summary: summary, automatic: true)
             } catch is CancellationError {
                 self?.cancelledSync(operationID)
             } catch let error as WeBeepAPIError {
@@ -2275,17 +3400,157 @@ struct MenuBarSnapshot: Sendable {
                 if networkAccess == .dataSaver, await self.pausedMidRun(operationID, error: error, restoring: stateBeforeRun) { return }
                 await self.failedSync(operationID, error: error, automatic: true)
             } catch let error as CredentialStorageError {
+                self?.recordRunEnd(operationID, .credentialUnavailable)
                 await self?.handleCredentialStorageError(error)
                 self?.endOperation(operationID)
             } catch is RootOperationGateError {
                 self?.deferredAutomaticSync(operationID)
+            } catch let error as RemoteMoveRecoveryError {
+                await self?.failedSync(operationID, error: nil, automatic: true, unreadableMove: error.path)
             } catch {
                 await self?.failedSync(operationID, error: nil, automatic: true)
             }
         }
         syncTask = task
         await task.value
-        return Task.isCancelled ? .cancelled : automaticOutcome
+        // Captured before the follow-up, which never changes the materials outcome.
+        let outcome = Task.isCancelled ? AutomaticSyncOutcome.cancelled : automaticOutcome
+        // After the run and before the scheduler's `completion`: the system activity that ran the
+        // materials covers the recordings listings too, with no timer of our own. Never inside
+        // `task` (`syncTask`), which a quit waits for.
+        if let followUp = followUpAfterRun(operationID, trigger: .automatic, schedulerCancelled: Task.isCancelled) {
+            await withTaskCancellationHandler { await followUp.value } onCancel: { followUp.cancel() }
+        }
+        return outcome
+    }
+
+    /// Starts the recordings follow-up of `operationID` from what its ending path recorded, or
+    /// nothing when it recorded nothing (superseded). An automatic run whose scheduler task was
+    /// cancelled ends as `.cancelled` (mapping table: `runAutomaticSync` returning `.cancelled`).
+    /// Returns the task that runs (new or merged into), nil when skipped.
+    @discardableResult
+    private func followUpAfterRun(_ operationID: UUID, trigger: RecordingsSyncTrigger, schedulerCancelled: Bool = false) -> Task<Void, Never>? {
+        guard let end = takeRunEnd(operationID) else { return nil }
+        return startRecordingsFollowUp(after: schedulerCancelled ? .cancelled : end, trigger: trigger)
+    }
+
+    /// Records how `operationID`'s materials run ended. Only the active operation records: a
+    /// superseded one (sign-out or site change mid-run, or a folder change, which ends it through
+    /// `supersededByFolderChange`) leaves nothing, and so starts no follow-up.
+    private func recordRunEnd(_ operationID: UUID, _ end: MaterialsRunEnd) {
+        guard activeOperationID == operationID else { return }
+        materialsRunEnds[operationID] = (recordingsFollowUpGeneration, end)
+    }
+
+    /// Takes (and forgets) what `operationID` recorded; nil for a superseded or never-started run.
+    private func takeRunEnd(_ operationID: UUID) -> MaterialsRunEnd? {
+        guard let recorded = materialsRunEnds.removeValue(forKey: operationID),
+              recorded.generation == recordingsFollowUpGeneration else { return nil }
+        return recorded.end
+    }
+
+    /// The mapping table of `RecordingsMaterialsOutcome`, as one pure function. nil means nothing
+    /// ended for the operation: no follow-up, not even a skipping one.
+    nonisolated static func recordingsOutcome(for end: MaterialsRunEnd) -> RecordingsMaterialsOutcome? {
+        switch end {
+        case .completed(let conflicts, let failures):
+            if conflicts > 0 { return .conflicts }
+            return failures > 0 ? .partial : .synced
+        case .pendingChoicesUnreadable, .localFailure: return .localFailure
+        case .cancelled, .scheduleChanged: return .cancelled
+        case .serviceFailure(let error): return .failed(SyncServiceFailure(error))
+        case .pausedMidRun(let pause): return .pausedByDataSaver(pause)
+        case .notRun(let decision): return .notRun(decision)
+        case .unconfigured: return .notRun(.skipUnconfigured)
+        case .deferredWhileBusy: return .notRun(.deferWhileBusy)
+        case .credentialUnavailable: return .accountUnavailable
+        case .superseded: return nil
+        }
+    }
+
+    /// The Recman keys the follow-up refreshes: the selected courses, deduplicated. A manual sync
+    /// has loaded `courses` by now; an automatic one uses what `fetchEnrolledCourses` returned
+    /// (`lastRunCourses`), so no extra WeBeep request is made.
+    private func recordingsSyncKeys(trigger: RecordingsSyncTrigger) -> Set<RecmanCourseKey> {
+        let source = trigger == .manual ? courses : lastRunCourses
+        return Set(RecordingsPresentation.syncedCourses(source, enabledIDs: enabledCourseIDs).compactMap { RecmanCourseKey(course: $0) })
+    }
+
+    /// The gate's inputs, read without creating `RecordingsController`: with no controller the
+    /// switch is read from defaults and access can only be `.ready` (a missing session is found
+    /// by the refresh itself, never here).
+    private func recordingsSyncDecision(after outcome: RecordingsMaterialsOutcome, trigger: RecordingsSyncTrigger, network: NetworkPathConditions?) -> (RecordingsSyncDecision, Set<RecmanCourseKey>) {
+        let switchedOn = recordingsStorage?.isEnabled ?? RecordingsController.isSwitchedOn(in: operationDefaults)
+        let access: RecordingsSyncAccess
+        switch recordingsStorage?.access {
+        case nil, .ready?: access = switchedOn ? .ready : .off
+        case .off?: access = .off
+        case .signingIn?: access = .signingIn
+        case .needsSignIn?: access = .needsSignIn
+        }
+        // The keys are only computed when the cheap standing reasons don't already skip.
+        let keys = switchedOn && selectedSite.university == .polimi ? recordingsSyncKeys(trigger: trigger) : []
+        let decision = RecordingsSyncPolicy.decision(switchedOn: switchedOn, university: selectedSite.university, ownerKnown: recordingsOwnerUserID != nil, courseKeys: keys, outcome: outcome, trigger: trigger, dataSaverEnabled: dataSaverEnabled, currentNetwork: network, access: access)
+        return (decision, keys)
+    }
+
+    /// Starts the Recordings listings refresh that follows a materials run, or nothing when the
+    /// gate skips it (silently: a skip is never a failure). Returns the running task (new, or the
+    /// one it merges into), nil when skipped.
+    ///
+    /// Never calls `setSyncState`, never touches `activeOperationID`, never notifies a failure and
+    /// is not returned by `prepareForTermination`: the materials result stays what the menu and
+    /// Home show, and a quit never waits for WebKit (AGENTS.md, quit path). The decision is taken
+    /// twice: now without the network (cheap skips, and the merge), and again inside the task right
+    /// before the refresh, for an automatic run with Data Saver on with the network read then,
+    /// since the Mac may have moved to a hotspot during the run. Merge: a refresh already running
+    /// serves this request too (a manual request does not upgrade a running automatic one to
+    /// `force`; the next manual sync will).
+    @discardableResult
+    private func startRecordingsFollowUp(after end: MaterialsRunEnd, trigger: RecordingsSyncTrigger) -> Task<Void, Never>? {
+        // A run that ends while the app quits (a quit from outside waits for `syncTask`, which can
+        // still finish successfully) must not start WebKit listings on the way out.
+        guard !isTerminating else { return nil }
+        guard let materials = Self.recordingsOutcome(for: end) else { return nil }
+        guard case .refresh = recordingsSyncDecision(after: materials, trigger: trigger, network: nil).0 else { return nil }
+        if let recordingsFollowUp { return recordingsFollowUp }
+        let generation = recordingsFollowUpGeneration
+        let id = UUID()
+        recordingsFollowUpID = id
+        let task = Task { @MainActor [weak self] in
+            guard let self else { return }
+            defer { if self.recordingsFollowUpID == id { self.recordingsFollowUp = nil; self.recordingsFollowUpID = nil } }
+            // Only an automatic run with Data Saver on cares about the network now; a nil network
+            // (unknown) never pauses.
+            let network: NetworkPathConditions? = trigger == .automatic && self.dataSaverEnabled ? await self.automaticSyncEnvironment.currentNetwork() : nil
+            guard !Task.isCancelled, self.recordingsFollowUpGeneration == generation else { return }
+            let (decision, keys) = self.recordingsSyncDecision(after: materials, trigger: trigger, network: network)
+            guard case .refresh(let force) = decision else { return }
+            let result: RecordingsSyncOutcome
+            if let refresh = self.recordingsRefresh {
+                result = await refresh(keys, force)
+            } else {
+                result = await self.recordings.refreshForSync(keys, force: force)
+            }
+            // An account, site or folder change meanwhile: the result belongs to a world that is gone.
+            guard self.recordingsFollowUpGeneration == generation else { return }
+            self.lastRecordingsOutcome = result
+            // One aggregated notification for the lectures first seen by this refresh (nothing for a
+            // baseline, a failure or an expired session; the coordinator applies the Notifiche switch).
+            await self.notificationCoordinator.announceRecordingsRefresh(result, isCurrent: { [weak self] in self?.recordingsFollowUpGeneration == generation })
+        }
+        recordingsFollowUp = task
+        return task
+    }
+
+    /// Stops the follow-up of a context that no longer exists (sign-out, site, account, folder
+    /// change): it publishes nothing and the seam is told through task cancellation.
+    private func cancelRecordingsFollowUp() {
+        recordingsFollowUpGeneration += 1
+        materialsRunEnds.removeAll()
+        recordingsFollowUp?.cancel()
+        recordingsFollowUp = nil
+        recordingsFollowUpID = nil
     }
 
     nonisolated static func automaticTargets(scopes: [SyncScope], enrolledCourseIDs: Set<Int64>) -> [SyncTarget] {
@@ -2293,31 +3558,59 @@ struct MenuBarSnapshot: Sendable {
             .map { SyncTarget(courseID: $0.courseID, localFolder: $0.localFolder) }
     }
 
-    private func beginTransfer(_ operationID: UUID, automatic: Bool) async {
-        guard activeOperationID == operationID else { return }
-        await progressStore.reset(automatic: automatic)
-        guard activeOperationID == operationID, !Task.isCancelled else { return }
+    /// Opens the progress stream of `operationID` and shows the sync as running. Returns the run
+    /// token its events carry; `.superseded` when the operation is no longer the active one, so
+    /// nothing it reports is ever shown.
+    private func beginTransfer(_ operationID: UUID, automatic: Bool) -> SyncProgressRun {
+        guard activeOperationID == operationID, !Task.isCancelled else { return .superseded }
+        let run = progressStore.reset(automatic: automatic)
         setSyncState(.syncing)
+        return run
     }
 
-    private func publishProgress(_ progress: SyncProgress) async {
-        guard await progressStore.publish(progress) else { return }
+    /// The progress callback handed to `SyncCoordinator`. It runs on the sync's own tasks: the
+    /// throttle decides there, and the main actor is entered only for the updates it keeps and
+    /// for the final totals (D08, #96). Moving the hop before `accept` brings back one main-queue
+    /// turn per file; `SyncProgressStoreTests` counts them.
+    nonisolated private func progressSink(_ operationID: UUID, run: SyncProgressRun) -> @Sendable (SyncProgress) async -> Void {
+        let store = progressStore
+        return { [weak self] progress in
+            guard let update = store.accept(progress, run: run) else { return }
+            await self?.progressAccepted(update, run: run, operationID: operationID)
+        }
+    }
+
+    /// Main actor: applies an accepted update when the operation is still the active one, and
+    /// keeps the menu bar detail in the same turn as the state (AGENTS.md hard rules).
+    private func progressAccepted(_ update: SyncProgress, run: SyncProgressRun, operationID: UUID) {
+        // Counted before any guard: this measures main-actor entries, not accepted updates.
+        // Moving it behind a guard, or into `receive`, blinds the D08 regression test to a hop
+        // placed before `accept` (the test would then count the throttle instead of the actor).
+        progressStore.recordMainActorEntry()
+        guard activeOperationID == operationID, progressStore.receive(update, run: run) else { return }
         refreshMenuBarSnapshot()
     }
 
-    private func completeSync(_ operationID: UUID, summary: SyncProgress, automatic: Bool) async {
+    /// Ends `operationID`, a run that synced the folder `rootID` (captured when it started). The
+    /// folder is checked again after every suspension: if it was replaced meanwhile, the run ends
+    /// as superseded instead of reporting over the new folder (#167).
+    private func completeSync(_ operationID: UUID, rootID: UUID?, summary: SyncProgress, automatic: Bool) async {
         guard activeOperationID == operationID else { return }
         do {
-            try await finishReconciliation(progress: summary, operationID: operationID)
+            try await finishReconciliation(progress: summary, operationID: operationID, rootID: rootID)
         } catch {
             guard activeOperationID == operationID else { return }
+            guard self.rootID == rootID else { await supersededByFolderChange(operationID); return }
             if Task.isCancelled { cancelledSync(operationID); return }
+            recordRunEnd(operationID, .pendingChoicesUnreadable)
             reportPendingChoicesReadFailure()
             endOperation(operationID)
             return
         }
         guard activeOperationID == operationID else { return }
+        guard self.rootID == rootID else { await supersededByFolderChange(operationID); return }
         guard !Task.isCancelled else { cancelledSync(operationID); return }
+        recordRunEnd(operationID, .completed(conflicts: summary.conflicts, failures: summary.failures))
         if summary.failures == 0 { notificationCoordinator.clearFailure() }
         BeepbarLog.sync.notice("Synchronization completed automatic=\(automatic, privacy: .public) total=\(summary.total, privacy: .public) installed=\(summary.installed, privacy: .public) conflicts=\(summary.conflicts, privacy: .public) failures=\(summary.failures, privacy: .public)")
         configureBackgroundScheduler()
@@ -2351,9 +3644,23 @@ struct MenuBarSnapshot: Sendable {
         await notify()
     }
 
+    /// Ends a run whose folder was replaced while it ran (#167). It records no run end, so no
+    /// recordings follow-up starts for the old folder, sends no notification, and saves nothing,
+    /// not even under the old folder: its pending choices were read for the new one, so whether
+    /// the run counts as a success is unknown. The old folder keeps its previous result.
+    /// The new folder's own saved state is then restored: `useRoot` skipped that restore because
+    /// this run was still active, and without it the window would stay on "checking".
+    private func supersededByFolderChange(_ operationID: UUID) async {
+        guard activeOperationID == operationID else { return }
+        BeepbarLog.sync.notice("Synchronization superseded by a folder change")
+        endOperation(operationID)
+        await restorePersistedSyncState()
+    }
+
     private func cancelledSync(_ operationID: UUID) {
         guard activeOperationID == operationID else { return }
         BeepbarLog.sync.notice("Synchronization cancelled")
+        recordRunEnd(operationID, .cancelled)
         setSyncState(.readyUnchecked)
         endOperation(operationID)
     }
@@ -2361,6 +3668,7 @@ struct MenuBarSnapshot: Sendable {
     /// A manual sync found the folder busy with a rename, a module move or a conflict being resolved.
     private func busySync(_ operationID: UUID) {
         guard activeOperationID == operationID else { return }
+        recordRunEnd(operationID, .localFailure)
         setSyncState(.failed(.local(BilingualText("Un'altra operazione è in corso sulla cartella. Riprova tra poco.", "Another operation is running on the folder. Try again shortly."))))
         endOperation(operationID)
     }
@@ -2381,6 +3689,7 @@ struct MenuBarSnapshot: Sendable {
         // An ordinary network now: the refusal was a real outage, reported as one.
         guard let pause = AutomaticSyncPolicy.dataSaverPause(for: network) else { return false }
         BeepbarLog.sync.notice("Automatic synchronization deferred midway reason=data-saver")
+        recordRunEnd(operationID, .pausedMidRun(pause))
         automaticOutcome = .deferred
         setSyncState(Self.stateAfterPauseMidway(stateBeforeRun))
         // Turned off while the run was going: nothing to show, and the retry runs without limits.
@@ -2402,21 +3711,38 @@ struct MenuBarSnapshot: Sendable {
         return stateBeforeRun
     }
 
+    /// What the window says when an interrupted Moodle move cannot be read at `path` (relative to
+    /// the sync folder). It says which path and what usually causes it (an alias or a folder where
+    /// the file should be, or missing permissions), since the folder stays blocked until it is fixed.
+    nonisolated static func unreadableMoveMessage(_ path: RelativePath) -> BilingualText {
+        BilingualText(
+            "BeepBar non riesce a leggere «\(path.value)», che fa parte di uno spostamento rimasto a metà, fatto per seguire Moodle. Controlla che al suo posto non ci sia un alias o una cartella e che il file sia accessibile, poi premi «Sincronizza ora».",
+            "BeepBar can't read “\(path.value)”, part of an unfinished move to follow Moodle. Check that there's no alias or folder in its place and that the file is accessible, then choose “Sync now”.")
+    }
+
     private func deferredAutomaticSync(_ operationID: UUID) {
         guard activeOperationID == operationID else { return }
+        recordRunEnd(operationID, .deferredWhileBusy)
         automaticOutcome = .deferred
         setSyncState(.readyUnchecked)
         endOperation(operationID)
     }
 
-    private func failedSync(_ operationID: UUID, error: WeBeepAPIError?, automatic: Bool) async {
+    /// `unreadableMove`: the run stopped because an interrupted Moodle move left a path recovery
+    /// cannot read (`RemoteMoveRecoveryError`). The window names it instead of the generic
+    /// "Sincronizzazione incompleta", since nothing syncs in that folder until the user fixes that
+    /// path (release review I-A4). The notification stays the generic one: it has no room for a
+    /// path, and opening BeepBar shows it.
+    private func failedSync(_ operationID: UUID, error: WeBeepAPIError?, automatic: Bool, unreadableMove: RelativePath? = nil) async {
         guard activeOperationID == operationID else { return }
-        BeepbarLog.sync.error("Synchronization failed automatic=\(automatic, privacy: .public) errorType=\(error.map { String(reflecting: type(of: $0)) } ?? "unknown", privacy: .public)")
+        recordRunEnd(operationID, error.map(MaterialsRunEnd.serviceFailure) ?? .localFailure)
+        BeepbarLog.sync.error("Synchronization failed automatic=\(automatic, privacy: .public) errorType=\(error.map { String(reflecting: type(of: $0)) } ?? (unreadableMove == nil ? "unknown" : "unreadableMove"), privacy: .public)")
+        if let unreadableMove { BeepbarLog.sync.error("Interrupted move blocked by an unreadable path=\(unreadableMove.value, privacy: .private)") }
         let issue: AutomaticNotificationIssue?
         if let error {
             issue = await handleServiceFailure(error, automatic: automatic)
         } else {
-            setSyncState(.failed(.partialSync))
+            setSyncState(.failed(unreadableMove.map { .local(Self.unreadableMoveMessage($0)) } ?? .partialSync))
             issue = automatic ? .partialSync : nil
         }
         let isCurrent = currentNotificationCheck()
@@ -2446,6 +3772,8 @@ struct MenuBarSnapshot: Sendable {
         await credentialVault.invalidate()
         operationDefaults.set(true, forKey: Self.credentialExpiredKey)
         accountState = .expired
+        // An expired sign-in is not fixed by the network coming back (#168).
+        stopWatchingForNetworkReturn()
         setSyncState(.failed(.authenticationExpired))
         configureBackgroundScheduler()
     }
@@ -2456,6 +3784,8 @@ struct MenuBarSnapshot: Sendable {
         case .absent, .corrupt:
             hasStoredCredential = false
             accountState = .notConnected
+            // Signed out in all but name: the list of an account with no credential goes too (#98).
+            forgetCourseList()
             setSyncState(.loginRequired)
         case .write:
             setSyncState(.failed(.credentialUnavailable))
@@ -2465,10 +3795,24 @@ struct MenuBarSnapshot: Sendable {
 
     private func endOperation(_ operationID: UUID) {
         guard activeOperationID == operationID else { return }
+        progressStore.closeCurrentRun()
         activeOperationID = nil
         syncTask = nil
+        // Quitting: nothing new starts on the way out (no Keychain or network work, #168).
+        guard !isTerminating else { return }
+        // The course list the window asked for while this sync ran (#98). An open window still
+        // showing a connection failure is retried too: `loadCourses` returns during a sync before
+        // it clears the error, and a sync over a confirmed list doesn't refresh it, so the banner
+        // of a failure before the sync would otherwise stay up for good (#168). A server error
+        // is not retried, and without an error nothing is asked: syncs never reload the list.
+        if isPreparingCourseList || (isWindowOpen && courseLoadError != nil && courseLoadFailedForConnection) { loadCourses() }
     }
 
+}
+
+/// A registration can be invalidated without coupling schedule identity to an enabled-course count.
+struct BackgroundActivityRegistration {
+    let invalidate: () -> Void
 }
 
 private struct BackgroundScheduleConfiguration: Equatable {
@@ -2476,39 +3820,110 @@ private struct BackgroundScheduleConfiguration: Equatable {
     let interval: Int
     let connected: Bool
     let rootConfigured: Bool
-    let enabledCourseCount: Int
+    let hasEnabledCourses: Bool
     let recoveryBlocked: Bool
 }
 
+/// Shows the running sync's progress. Only `SyncProgressLine` observes it, so a tick re-renders
+/// that line and nothing else.
+///
+/// Progress arrives from the sync's own tasks, thousands of times per run. The decision whether
+/// an event is worth showing is taken where it arrives, in `accept`, behind a lock and off the
+/// main actor; the main actor is entered in `receive` only for the events that survived the
+/// throttle (D08, #96). Before that change every event hopped to the main actor first and most
+/// were then thrown away there, so a big run cost the UI one main-queue turn per file.
+///
+/// Each run gets a `SyncProgressRun` token from `reset`; `close` retires it when the run reaches
+/// its terminal state. An event carrying another run's token is dropped at both steps, so a late
+/// callback from a cancelled or finished run can never overwrite the completed state, nor the
+/// next run's first ticks.
 @MainActor final class SyncProgressStore: ObservableObject {
     @Published private(set) var progress = SyncProgress(completed: 0, total: 0, installed: 0, preservedLocal: 0, unchanged: 0, conflicts: 0, failures: 0)
+    /// Main-actor entries on the progress path since the last `reset`, recorded by the controller
+    /// at the top of `progressAccepted` before any guard. What D08's regression test measures;
+    /// not shown anywhere.
+    private(set) var mainActorEntries = 0
     private let relay = SyncProgressRelay()
 
-    func reset(automatic: Bool) async {
-        await relay.reset(interval: automatic ? .seconds(1) : .milliseconds(200))
+    /// Starts a run with the cadence its kind deserves (200 ms manual, 1 s automatic) and returns
+    /// the token its events must carry. Any earlier run is retired.
+    func reset(automatic: Bool) -> SyncProgressRun {
         progress = SyncProgress(completed: 0, total: 0, installed: 0, preservedLocal: 0, unchanged: 0, conflicts: 0, failures: 0)
-    }
-    nonisolated func publish(_ value: SyncProgress) async -> Bool {
-        guard let update = await relay.next(value) else { return false }
-        await receive(update)
-        return true
+        mainActorEntries = 0
+        return relay.reset(interval: automatic ? .seconds(1) : .milliseconds(200))
     }
 
-    private func receive(_ update: SyncProgress) {
+    /// Retires whatever run is open. `endOperation` calls it for every way an operation ends,
+    /// including cancellation, so a token kept by a still-running sync task goes dead.
+    func closeCurrentRun() {
+        relay.closeCurrent()
+    }
+
+    /// Called by the controller the moment the progress path enters the main actor, before it
+    /// decides whether the update is still wanted. See `progressAccepted`.
+    func recordMainActorEntry() {
+        mainActorEntries += 1
+    }
+
+    /// Off the main actor: the throttle's verdict for one event. `nil` means nothing to show.
+    nonisolated func accept(_ value: SyncProgress, run: SyncProgressRun) -> SyncProgress? {
+        relay.next(value, run: run)
+    }
+
+    /// On the main actor, for accepted updates only. Returns `false` when `run` was retired
+    /// between `accept` and this call, which leaves the shown progress untouched.
+    func receive(_ update: SyncProgress, run: SyncProgressRun) -> Bool {
+        guard relay.isCurrent(run) else { return false }
         progress = update
+        return true
     }
 }
 
-private actor SyncProgressRelay {
-    private let clock = ContinuousClock()
-    private var throttle = SyncProgressThrottle(minimumInterval: .milliseconds(200))
+/// Identifies one sync run's progress stream; see `SyncProgressStore`.
+struct SyncProgressRun: Sendable, Equatable {
+    fileprivate let generation: Int
+    /// A token no event is ever accepted for: handed out when a run was superseded before it
+    /// could start.
+    static let superseded = SyncProgressRun(generation: -1)
+}
 
-    func reset(interval: Duration) {
-        throttle = SyncProgressThrottle(minimumInterval: interval)
+/// The throttle and the current run token, behind a lock so sync tasks can consult them without
+/// entering any actor. Not an actor on purpose: an actor hop would be the very cost D08 removes.
+private final class SyncProgressRelay: Sendable {
+    private struct State {
+        var throttle = SyncProgressThrottle(minimumInterval: .milliseconds(200))
+        var current = SyncProgressRun.superseded
+        var generation = 0
+    }
+    private let clock = ContinuousClock()
+    private let state = OSAllocatedUnfairLock(initialState: State())
+
+    func reset(interval: Duration) -> SyncProgressRun {
+        state.withLock { state in
+            state.generation += 1
+            state.current = SyncProgressRun(generation: state.generation)
+            state.throttle = SyncProgressThrottle(minimumInterval: interval)
+            return state.current
+        }
     }
 
-    func next(_ progress: SyncProgress) -> SyncProgress? {
-        throttle.accept(progress, now: clock.now)
+    /// Closing sets `current` to `.superseded`. That is why `isCurrent` and `next` also refuse
+    /// `run == .superseded` explicitly: otherwise a sink handed the superseded token (a run refused
+    /// by `beginTransfer`) would match the closed state and pass the relay after any run ended.
+    func closeCurrent() {
+        state.withLock { $0.current = .superseded }
+    }
+
+    func isCurrent(_ run: SyncProgressRun) -> Bool {
+        state.withLock { $0.current == run && run != .superseded }
+    }
+
+    func next(_ progress: SyncProgress, run: SyncProgressRun) -> SyncProgress? {
+        let now = clock.now
+        return state.withLock { state in
+            guard state.current == run, run != .superseded else { return nil }
+            return state.throttle.accept(progress, now: now)
+        }
     }
 }
 

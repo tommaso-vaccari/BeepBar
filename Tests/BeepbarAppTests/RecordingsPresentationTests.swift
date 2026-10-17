@@ -1,4 +1,6 @@
 import Foundation
+import AppKit
+import SwiftUI
 import Testing
 import BeepbarCore
 @testable import BeepbarApp
@@ -95,5 +97,81 @@ struct RecordingsPresentationTests {
 #if DEBUG
         #expect(!UpdaterController.startsAutomatically)
 #endif
+    }
+    /// Global search finds courses and titles without removing bookmarks.
+    @Test func globalWatchlistSearchFindsCoursesAndTitles() {
+        let a = recording("a", "2026-10-05T10:00:00Z", title: "Eigenvalues")
+        let b = recording("b", "2026-10-06T10:00:00Z", title: "GPU")
+        var study = RecordingsStudyState()
+        study.bookmarks = [.init(recording: a, courseName: "NLA"), .init(recording: b, courseName: "HPC")]
+        #expect(study.visibleBookmarks(query: " nla ").map(\.recording.id) == ["a"])
+        #expect(study.visibleBookmarks(query: "eigen").map(\.recording.id) == ["a"])
+        #expect(study.visibleBookmarks(query: "").map(\.recording.id) == ["b", "a"])
+        #expect(study.bookmarks.count == 2)
+    }
+
+    /// Bookmarks from the first demo survive removal of its completion flags and all become visible.
+    @Test func earlierPreviewCompletionFlagsDoNotHideSavedBookmarks() throws {
+        let lesson = recording("legacy", "2026-10-05T10:00:00Z")
+        var state = RecordingsStudyState()
+        state.bookmarks = [.init(recording: lesson, courseName: "NLA")]
+        state.destination = .watchlist
+        let data = try PropertyListEncoder().encode(state)
+        var legacy = try #require(PropertyListSerialization.propertyList(from: data, format: nil) as? [String: Any])
+        legacy["watched"] = [RecordingsStudyState.identity(lesson)]
+        legacy["showWatchedInWatchlist"] = false
+        legacy["hideWatchedInCourses"] = true
+        let oldData = try PropertyListSerialization.data(fromPropertyList: legacy, format: .binary, options: 0)
+        let restored = try PropertyListDecoder().decode(RecordingsStudyState.self, from: oldData)
+        #expect(restored == state)
+        #expect(restored.visibleBookmarks(query: "").map(\.recording.id) == ["legacy"])
+    }
+
+}
+
+
+extension RecordingsPresentationTests {
+    /// Removing the last bookmark must not move the search field or header down the page.
+    @MainActor @Test func watchlistHeaderStaysAtTopWhenLastLessonIsRemoved() async throws {
+        _ = NSApplication.shared
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent("watchlist-layout-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        let suite = "watchlist-layout-\(UUID().uuidString)"
+        let defaults = try #require(UserDefaults(suiteName: suite))
+        defer {
+            defaults.removePersistentDomain(forName: suite)
+            try? FileManager.default.removeItem(at: root)
+        }
+        let authentication = WeBeepAuthenticationController(testRootURL: root, defaults: defaults)
+        let controller = RecordingsController(makeBrowser: { WatchlistPreviewBrowser() },
+            store: RecordingsSessionStore { root }, defaults: defaults, ownerUserID: { 42 }, isAvailable: { true })
+        let key = try #require(RecmanCourseKey(courseCode: "058167", academicYear: 2026))
+        let lesson = WatchlistPreviewBrowser.lessons(for: key)[0]
+        controller.toggleWatchlist(lesson, courseName: "NLA")
+        controller.selectDestination(.watchlist)
+        controller.signIn()
+        for _ in 0..<100 where controller.access != .ready { await Task.yield() }
+        #expect(controller.access == .ready)
+        let host = NSHostingView(rootView: RecordingsPage(authentication: authentication, recordings: controller))
+        let window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 780, height: 580),
+            styleMask: [.titled], backing: .buffered, defer: false)
+        window.isReleasedWhenClosed = false
+        window.contentView = host
+        window.alphaValue = 0
+        window.orderFront(nil)
+        defer { window.close(); controller.turnOff() }
+        func searchField(in view: NSView) -> NSTextField? {
+            if let field = view as? NSTextField, field.isEditable { return field }
+            return view.subviews.lazy.compactMap { searchField(in: $0) }.first
+        }
+        try await Task.sleep(for: .milliseconds(150))
+        host.layoutSubtreeIfNeeded()
+        let field = try #require(searchField(in: host))
+        let initial = field.convert(field.bounds, to: host).minY
+        controller.toggleWatchlist(lesson, courseName: "NLA")
+        try await Task.sleep(for: .milliseconds(150))
+        host.layoutSubtreeIfNeeded()
+        let empty = try #require(searchField(in: host))
+        #expect(abs(empty.convert(empty.bounds, to: host).minY - initial) < 1)
     }
 }

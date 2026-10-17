@@ -1,5 +1,7 @@
 import Foundation
+#if canImport(os)
 import os
+#endif
 
 /// The language Beepbar's own text is shown in, chosen in onboarding and in Settings.
 ///

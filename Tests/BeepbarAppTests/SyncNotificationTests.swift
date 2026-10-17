@@ -13,6 +13,8 @@ private final class FakeNotificationCenter: NotificationCenterClient, @unchecked
         var authorization: NotificationAuthorization
         var authorizationAfterRequest: NotificationAuthorization
         var sent: [Sent] = []
+        /// The body of each entry in `sent`, kept apart so `Sent` stays as the older tests build it.
+        var bodies: [String] = []
         var requests = 0
         var authorizationReads = 0
     }
@@ -30,6 +32,7 @@ private final class FakeNotificationCenter: NotificationCenterClient, @unchecked
     }
 
     var sent: [Sent] { state.withLock { $0.sent } }
+    var bodies: [String] { state.withLock { $0.bodies } }
     var requests: Int { state.withLock { $0.requests } }
     /// Every contact with macOS: permission reads, requests and sends.
     var contacts: Int { state.withLock { $0.authorizationReads + $0.requests + $0.sent.count } }
@@ -41,7 +44,7 @@ private final class FakeNotificationCenter: NotificationCenterClient, @unchecked
     }
     func requestAuthorization() async { state.withLock { $0.requests += 1; $0.authorization = $0.authorizationAfterRequest } }
     func send(identifier: String, title: String, body: String, destination: NotificationDestination) async {
-        state.withLock { $0.sent.append(Sent(identifier: identifier, title: title, destination: destination)) }
+        state.withLock { $0.sent.append(Sent(identifier: identifier, title: title, destination: destination)); $0.bodies.append(body) }
         onSend?()
     }
 }
@@ -74,6 +77,62 @@ private final class FakeNotificationCenter: NotificationCenterClient, @unchecked
         #expect(center.sent.map(\.destination) == [.conflicts, .activity, .activity, .home])
         #expect(center.sent.first?.identifier == "beepbar-conflicts")
         #expect(center.sent.last?.identifier == "beepbar-authenticationExpired")
+    }
+
+    /// A refresh that newly published lectures sends ONE notification with the count, the Recordings
+    /// destination and the fixed identifier (a second post replaces, not stacks). Guards against one
+    /// notification per course, a wrong page, or stacking.
+    @Test func newRecordingsSendOneNotificationWithAStableIdentifier() async {
+        let center = FakeNotificationCenter()
+        let coordinator = SyncNotificationCoordinator(defaults: defaults, center: center)
+        await coordinator.announceRecordingsRefresh(.refreshed(newlyPublished: 3, failedKeys: 0))
+        await coordinator.announceRecordingsRefresh(.refreshed(newlyPublished: 1, failedKeys: 0))
+        #expect(center.sent.map(\.identifier) == ["beepbar-new-recordings", "beepbar-new-recordings"])
+        #expect(center.sent.map(\.destination) == [.recordings, .recordings])
+        #expect(center.sent.map(\.title) == ["3 nuove registrazioni", "1 nuova registrazione"])
+    }
+
+    /// Nothing is sent for zero, a baseline, a skip, an expired session, an outage or a cancel, nor
+    /// with the switch off or macOS denying. Guards against any failure or silent ending notifying.
+    @Test func everyOtherEndingSendsNothing() async {
+        let center = FakeNotificationCenter()
+        let coordinator = SyncNotificationCoordinator(defaults: defaults, center: center)
+        for outcome: RecordingsSyncOutcome in [.refreshed(newlyPublished: 0, failedKeys: 0), .skipped(.switchedOff), .needsSignIn, .unavailable, .cancelled] {
+            await coordinator.announceRecordingsRefresh(outcome)
+        }
+        await coordinator.postRecordingsSummary(newCount: 0)
+        await coordinator.postRecordingsSummary(newCount: -1)
+        #expect(center.sent.isEmpty)
+        turnOff()
+        await coordinator.announceRecordingsRefresh(.refreshed(newlyPublished: 2, failedKeys: 0))
+        #expect(center.contacts == 0)
+        turnOn()
+        let denied = FakeNotificationCenter(authorization: .denied)
+        await SyncNotificationCoordinator(defaults: defaults, center: denied).announceRecordingsRefresh(.refreshed(newlyPublished: 2, failedKeys: 0))
+        #expect(denied.sent.isEmpty)
+    }
+
+    /// A result no longer current (sign-out, account change) is not posted, whether it turned stale
+    /// before or during the permission read. Guards against the old account's lectures being announced.
+    @Test func aStaleResultIsNotPosted() async {
+        let center = FakeNotificationCenter()
+        let coordinator = SyncNotificationCoordinator(defaults: defaults, center: center)
+        await coordinator.announceRecordingsRefresh(.refreshed(newlyPublished: 2, failedKeys: 0), isCurrent: { false })
+        let flag = OSAllocatedUnfairLock(initialState: true)
+        let late = FakeNotificationCenter(onAuthorizationRead: { flag.withLock { $0 = false } })
+        await SyncNotificationCoordinator(defaults: defaults, center: late).postRecordingsSummary(newCount: 2, isCurrent: { flag.withLock { $0 } })
+        #expect(center.contacts == 0)
+        #expect(late.sent.isEmpty)
+    }
+
+    /// Singular and plural in both languages, through BilingualText, and no course or lecture name:
+    /// the text depends on the count alone. Guards against a wrong plural or leaking names (privacy).
+    @Test func theTextIsCountOnlyInBothLanguages() throws {
+        let one = try #require(NotificationPolicy.recordingsNotification(newCount: 1))
+        let many = try #require(NotificationPolicy.recordingsNotification(newCount: 5))
+        #expect(one.title == BilingualText("1 nuova registrazione", "1 new recording"))
+        #expect(many.title == BilingualText("5 nuove registrazioni", "5 new recordings"))
+        #expect(many.body.english == "They're available in Recordings.")
     }
 
     /// The core promise of the switch: with it off, no path reaches macOS at all, not even a
@@ -317,6 +376,20 @@ struct NotificationMappingTests {
         #expect(ShellPage(NotificationDestination.conflicts) == .conflicts)
         #expect(ShellPage(NotificationDestination.activity) == .activity)
         #expect(ShellPage(NotificationDestination.home) == .home)
+        #expect(ShellPage(NotificationDestination.recordings) == .recordings)
+    }
+
+    /// A click on a notification whose userInfo says "recordings" opens Recordings; an unknown value
+    /// opens Courses; a dismissal opens nothing. Guards against the wrong page or a crash on a
+    /// destination written by another build.
+    @Test @MainActor func clickRoutingOpensRecordingsAndFallsBackSafely() async {
+        let opened = OSAllocatedUnfairLock(initialState: [NotificationDestination]())
+        let responder = NotificationResponder(open: { destination in opened.withLock { $0.append(destination) } })
+        responder.route(isDefaultAction: true, userInfo: SystemNotificationCenter.userInfo(for: .recordings))
+        responder.route(isDefaultAction: true, userInfo: [NotificationPolicy.destinationKey: "from-a-newer-build"])
+        responder.route(isDefaultAction: false, userInfo: SystemNotificationCenter.userInfo(for: .recordings))
+        for _ in 0..<20 { await Task.yield() }
+        #expect(opened.withLock { $0 } == [.recordings, .home])
     }
 
     /// The switch shows the stored choice at launch; never set means on.

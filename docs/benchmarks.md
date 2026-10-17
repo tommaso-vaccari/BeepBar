@@ -28,6 +28,7 @@ scripts/benchmark.sh                       # every scenario → PerformanceRepor
 scripts/benchmark.sh unchanged --files 15000
 scripts/benchmark.sh large-update --size-mb 512 --runs 5
 scripts/benchmark.sh cancel --fraction 0.5 --rate-mbps 100
+scripts/benchmark.sh startup --files 15000 --phase first   # or --phase later, --files 0 for an empty database
 scripts/measure-idle.sh                    # 30 min, the installed Beepbar, passive
 ```
 
@@ -40,6 +41,8 @@ scripts/measure-idle.sh                    # 30 min, the installed Beepbar, pass
 - one JSON file per scenario;
 - a merged `baseline.json`;
 - `baseline.txt`, the table also printed on screen.
+
+Options are validated before any benchmark work: unknown or wrong-command options, duplicates, missing values and invalid numeric values exit with status 64 and usage. Use `baseline --out DIR` for baseline output; `--json PATH` belongs to individual scenarios and `idle`. `--runs` and `--warmup` apply to scenarios and baseline. The wrapper supplies `--commit` and `--dirty`; do not repeat them.
 
 `PerformanceReports/` is git-ignored.
 
@@ -74,6 +77,15 @@ Every report records the commit, the machine model, the CPU, the memory, the mac
 - *Checks:* every run ended cancelled, before the whole file was sent when `--fraction` is below 1, and the previously installed file still has its exact bytes (SHA-256 compared after every run).
 - *Note:* `--fraction 1` cancels as the last chunk leaves the mock, which is the closest the harness gets to "after the download".
 
+**`startup`: one launch's database work on a degraded database (R02, issue #110).**
+- *What it measures:* what `BootstrapService.prepare` does at every app start: open `sync.sqlite` (which reruns the whole schema migration in one transaction), `registerRoot`, recovery. In the app this runs on `BootstrapService`'s own actor while the menu shows the starting state, not on the main actor.
+- *Setup:* `LegacyDatabaseFixture` builds `--files` tracked files (default 15,000; 0 allowed with `--phase later` only) through today's schema, then degrades it: half the rows without an owning module, 40 rows with a course but no module, no recorded migration versions, the later releases' tables and index dropped.
+- *`--phase first`:* the first launch after updating. Every run, warm-up included, gets a fresh degraded fixture, so every sample is a real repair; it needs `--files 6` or more, since a smaller corpus has no half-attributed row and its checks would pass with the repair removed. *Checks:* the half-attributed rows are repaired, the dropped tables and index and the deleted versions are back (both counted on the fixture, not assumed, so an older or newer ref is checked against its own schema), only those rows and versions changed, every tracked file is kept, recovery finds nothing.
+- *`--phase later`* (default): every launch after that. The repair runs once in setup, unmeasured; each run reopens the file on a new SQLite connection (the OS page cache stays warm). *Checks:* no row or page written, the same work every run, no ownership backfill or module-override work, every tracked file kept, recovery finds nothing.
+- *`--files`* is at most 1,000,000 here. The fixture models a half-attributed `items` table (an upgraded table has no `CHECK` against it); the upgrade from a release without module ownership (v2.0.106) is covered by `StartupMigrationTests` in Core instead.
+- *What it reports:* `wall` is the whole launch and `db.*` the launch's own connection; `notes` split open+migrate from the whole launch. `cpu` includes the 1 ms peak-memory sampler thread, so it can exceed `wall` on sub-millisecond launches. The samples use the common metric set on purpose, so `compare` can validate them like every other scenario.
+- *In `baseline` and `compare`:* `startup-first-15k` and `startup-later-15k`; the smoke comparison runs `startup-smoke` (100 files, first launch). A harness selected with `--harness-ref` that predates this scenario (it has no `StartupScenario.swift`) leaves them out and records them as not measured in the report's limitations, instead of failing every build of the series.
+
 ## Counters
 
 Every counter is the change during one run.
@@ -84,10 +96,11 @@ Every counter is the change during one run.
 | `disk.written`, `disk.logicalWritten` | `proc_pid_rusage` | Bytes written to storage, and including those still in the page cache |
 | `memory.peak`, `memory.peakGrowth` | `PeakFootprintSampler` (1 ms) | Highest `phys_footprint` of the process during the run, and that minus the value just before. Compare `memory.peak` across file sizes. `memory.peakGrowth` reads near zero after a warm-up even when a run needs hundreds of MiB, because the allocator keeps what the previous run freed |
 | `db.commits` | SQLite commit hook | Write transactions committed. An empty transaction, or a write matching no row, still counts. Only commits that wrote pages (`db.pagesWritten`) append to the WAL and wait for an `fsync` |
+| `db.ownershipBackfill.transactions`, `db.ownershipBackfill.updates` | Connection-local attempt counters | Ownership migration write transactions and per-row UPDATEs attempted, including failed attempts; separate from rows actually changed |
 | `db.rowChanges` | `sqlite3_total_changes64` | Rows inserted, updated or deleted, identical rewrites included |
 | `db.pagesWritten` | `SQLITE_DBSTATUS_CACHE_WRITE` | WAL frames. An `UPDATE` that leaves a page byte-identical writes none |
 | `fs.filesHashed`, `fs.bytesHashed` | `FileStore.counters()` | Full-content SHA-256 reads, and the bytes they read |
-| `fs.pathLookups` | `FileStore.counters()` | Paths resolved from the sync root before touching a file |
+| `fs.pathLookups` | `FileStore.counters()` | Directory resolutions from the sync root before touching the files in them. Per-file calls resolve once per path; the bulk existence check of a run with nothing new resolves each distinct parent folder once per call, and a run makes a few such calls (R03, #111), so `unchanged` counts module folders, not tracked files. Reports from before R03 count one per tracked file |
 | `net.*` | mock counters | Requests by kind, metadata bytes, downloaded bytes |
 
 The database and filesystem counters are `package`-level API in `BeepbarCore`. Tests use them to prove properties like "a run with nothing new writes nothing" (`WorkCountersTests` shows what each one counts).
@@ -103,7 +116,9 @@ The database and filesystem counters are `package`-level API in `BeepbarCore`. T
 
 **Not covered**, because it lives in the app:
 - the keychain read;
-- the UserDefaults writes of the sync state (the last summary and the reconciliation time);
+- the UserDefaults writes of the sync state (the last summary and the reconciliation time): the
+  controller benchmark in [Persisted Activity summary save](#persisted-activity-summary-save)
+  measures them;
 - the "Risparmio dati" setting: runs always use `.unrestricted`;
 - notifications;
 - UI updates.
@@ -134,3 +149,151 @@ Add a scenario to `Scenarios` with its own checks, register it in `Sources/Beepb
 - New counters belong in Core, with a test in `WorkCountersTests` proving what they count.
 
 Extend the harness rather than writing one-off scripts.
+
+## Persisted Activity summary restore
+
+Run the on-demand controller benchmark without launching the app:
+
+```sh
+BEEPBAR_RESTORE_BENCHMARK=1 swift test -c release --arch arm64 -Xswiftc -DDEBUG --filter SyncFinalizationTests/benchmarkSummaryRestore
+```
+
+Release optimization remains enabled; `DEBUG` enables the existing isolated controller constructor and test hooks. All data, defaults and SQLite are temporary; no account, real preferences or network is used. The test is disabled in regular CI. It restores synthetic summaries containing 1,000 and 15,000 file details, warms up once and prints seven samples, JSON size, write attempts, end-to-end restore latency and separate synchronous codec timings. Compare the same configuration on the same machine and power source, without concurrent builds/tests. End-to-end async latency is not main-thread occupancy: use the codec timings to justify moving decode work and Instruments to validate UI latency. New-result encoding is measured by the save benchmark below.
+
+## Persisted Activity summary save
+
+Run the on-demand controller benchmark of a sync's new result (R01, #109) without launching the app:
+
+```sh
+BEEPBAR_PERSIST_BENCHMARK=1 swift test -c release --arch arm64 -Xswiftc -DDEBUG --filter SyncFinalizationTests/benchmarkSummaryPersist
+```
+
+The same conditions as the restore benchmark apply: Release optimization with `DEBUG` for the
+isolated controller and its hooks, a throwaway defaults suite in a temporary folder, temporary
+SQLite, no account, real preferences or network, and disabled in regular CI. It saves synthetic
+results with 0 (no course entries, as a sync with nothing new), 1,000, 5,000 and 15,000 file
+details over ten courses, warms up once and prints five samples per size (`PERSIST_BENCH`) and
+their median and nearest-rank p95 (`PERSIST_SUMMARY`) for:
+
+- `inline_turn`: `setSyncState(.synced)`, the main-actor turn that encodes and writes. It was the
+  completion path before R01 and is still the legacy-migration path;
+- `encode` and `writes`: its two parts alone;
+- `off_main_encode`: `EncodedSyncSummary.encode`, awaited from the main actor; it lengthens the end
+  of the sync but does not occupy the main actor;
+- `turn`: `setSyncState(synced:)`, the main-actor turn of the completion path since R01, which
+  publishes and writes bytes already encoded.
+
+Each sample checks, outside the timed windows, that exactly the two keys were written and that the
+saved bytes decode to the published result. The turn excludes SwiftUI rendering, which needs the
+isolated UI harness. Refs without `EncodedSyncSummary` (before R01) can be measured for
+`inline_turn`, `encode` and `writes` with a measurement-only copy of the benchmark limited to those
+three timings; record such a copy as a measurement-only adjustment.
+
+## Directory traversal profile
+
+The opt-in `DirectoryTraversalProfileTests` measures only `FileStore.existingRegularFiles`, the per-file part of a run with nothing new, over three synthetic layouts of 15,000 empty files: 50 folders two levels deep (like `unchanged`), 500 folders four levels deep, and one file per folder three levels deep (the worst case for grouping by folder). It prints the median and maximum of five runs after one warm-up, and the `FileStore` counters.
+
+```sh
+BEEPBAR_TRAVERSAL_PROFILE=1 swift test -c release --arch arm64 -Xswiftc -DDEBUG --filter DirectoryTraversalProfileTests
+```
+
+`-DDEBUG` only lets the app test target compile in release, as for the restore benchmark above; `BEEPBAR_TRAVERSAL_FILES` changes the file count. The test uses only API that predates R03, so to measure an older commit, check it out in a disposable detached worktree, copy the test file there and run the same command. Files live in a temporary folder that is deleted afterwards. It is a Core micro-measurement: use `unchanged` for the numbers a PR compares.
+
+## Reproducible ref comparisons (single agent command)
+
+Use the existing harness through `scripts/benchmark.sh compare`. It never checks out a ref in
+this checkout, launches/installs the app, or measures real accounts/network. It archives each
+full source SHA into its own temporary directory and builds `beepbar-bench` Release arm64.
+
+Prerequisites: macOS on Apple Silicon, Xcode/Swift matching CI, Git, Python 3.9+ (standard library
+only), AC power, Low Power Mode off, nominal thermal state, enough temporary disk space and
+resolved Swift package dependencies. The command copies only dependency artifacts/checkouts/
+repositories from `.build` (or `--dependency-cache DIR`); it never reuses compiled app/Core objects.
+Dependency resolution is disabled: missing dependencies fail with retained build logs. Build
+sandbox disabling is limited to SwiftPM in isolated source directories. Do not run builds/tests
+concurrently with measurements. Default sampling is five measured runs after one warm-up.
+
+Agent steps:
+
+1. Read the project instructions and measurement requirements; inspect `git status` and preserve
+   user changes. Fetch remote refs explicitly before measuring: `git fetch origin`.
+2. Commit the candidate on its feature branch. Choose the PR's actual base-dev SHA and freeze main
+   for this series; a later release requires a separately named output series.
+3. Run the single command from a checkout containing this tooling (the measured candidate can be
+   another ref). Each ref is resolved to a full SHA exactly once before any build. `--out` must not
+   exist; existing evidence is never overwritten.
+
+```sh
+scripts/benchmark.sh compare --main origin/main --base-dev origin/dev \
+  --candidate HEAD --out PerformanceReports/my-change --runs 5 --warmup 1
+```
+
+4. If native measurement source trees differ, the command refuses the comparison. Inspect the
+   differences first. Explicitly choose one committed harness for all three production revisions
+   with `--harness-ref REF`. Only `Sources/BeepbarBenchmarkKit` and `Sources/BeepbarBenchmarks` are
+   overlaid; production sources, package manifest and dependencies remain from each source SHA.
+   Build/API incompatibility fails instead of patching production. Selecting an older harness
+   means its newer counters are unmeasured. Every overlay is retained as a per-ref patch and
+   native/effective file SHA-256 identities; adjusted raw reports carry `dirty: true`.
+
+The released fixture historically omitted saved folder overrides. To reproduce the explicitly
+matched fixture documented in the existing `2026-10-09-main-vs-dev/conditions.log`, choose an old
+harness and request this specific fixture-only adjustment:
+
+```sh
+scripts/benchmark.sh compare --main origin/main --base-dev origin/dev \
+  --candidate HEAD --harness-ref origin/main --saved-folder-overrides \
+  --out PerformanceReports/my-change-matched --runs 5 --warmup 1
+```
+
+`--saved-folder-overrides` persists normal module destinations before the setup sync on all
+three revisions. It requires `--harness-ref`, refuses an already adjusted or unrecognized fixture,
+and records the option, effective hashes and actual source patches. It changes no application code.
+A harness selection is an explicit measurement policy; inspect its checks/workload against the
+budget being evaluated. Unknown metrics or raw-report schemas are refused. If an API, manifest,
+fixture or instrumentation cannot be made equivalent using these measurement-only options,
+report **not measured** and extend the existing harness with a reviewed adjustment first.
+
+5. Check exit status, `comparison.json` validity and every scenario's checks. Reports must agree
+   on scenario name/parameters, check names, warm-up, sample counts, machine, OS, power and build.
+   Metric distributions are recalculated from raw samples and checked against the harness JSON.
+   Failed subprocesses, missing/invalid samples or incompatible reports never produce valid rows.
+   Costs increasing at either median or p95 are marked regressions; delta is candidate minus base,
+   percentage is cost reduction `(base - candidate) / base * 100`. A zero baseline has no percentage.
+6. Paste `comparison.md` into the PR and retain the output directory. Separate tooling validation
+   from measured app gains. Include regressions, spread and limitations; Core timings establish
+   no UI, idle or real-network improvement. With five runs p95 is the maximum, not a stable tail estimate.
+
+Exit codes: **0** all comparisons valid (regressions still appear), **1** invalid comparison/build/
+subprocess/report or output error, **64** invalid arguments, **130** interruption (SIGINT/SIGTERM).
+Failure results and diagnostics remain; incomplete runs have `valid: false`. An output directory
+creation failure leaves the existing directory untouched. Temporary source/build/fixture/dependency
+and module-cache files owned by this command are removed on success, failure and handled interruption;
+logs/results stay. SIGKILL or power loss cannot run cleanup; `temporaryRoot` identifies the owned
+leftover directory. Never delete unrelated paths or existing reports.
+
+Output layout:
+
+```text
+comparison.json                 SHAs, refs, driver hash, effective/native harness hashes,
+                                commands/exits, toolchain/environments, comparisons, limitations
+comparison.md                   PR table: units, median/p95, absolute/% deltas, regressions
+{main,base-dev,candidate}-*.log  export/build/toolchain diagnostics
+*-measurement.patch            explicit per-source measurement adjustments
+{main,base-dev,candidate}/       each scenario's raw JSON (samples/checks/notes/environment) + log
+```
+
+The standard plan is unchanged 1k/15k, updates 64/256 MiB and mid-download cancellation.
+For a real end-to-end tooling smoke test, append `--smoke`; it uses 10 files, a 1 MiB update and
+4 MiB throttled cancellation with identical sampling on all three refs. Smoke reports explicitly
+state that the reduced corpus does not establish the standard baseline.
+
+Run safeguards locally with `python3 scripts/test_benchmark_compare.py`; CI runs these alongside
+`swift test`. Mutation checks must use a disposable copy, especially for cleanup changes.
+
+## Isolated UI and launch measurements
+
+D07's opt-in fixture and single-command scenario runner are documented in
+[UI benchmarks](ui-benchmarks.md). It hosts the actual pages with synthetic dependencies and
+reports window key separately from populated-content readiness. Its timings and traces must
+not be confused with the Core comparison harness or production launch/scheduler evidence.

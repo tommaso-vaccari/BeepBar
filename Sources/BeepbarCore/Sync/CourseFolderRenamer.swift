@@ -32,6 +32,7 @@ public actor CourseFolderRenamer {
               !ReservedNamespace.isReservedTopLevelName(newFolder) else { throw FileStoreError.invalidStage }
         try await gate.withLease(.renaming(courseID)) { [database, fileStore, interruption] in
             guard try await database.hasPendingModuleMoves(rootID: rootID) == false else { throw SyncDatabaseError.execution }
+            guard try await database.pendingScopeMoves().contains(where: { $0.rootID == rootID }) == false else { throw SyncDatabaseError.execution }
             guard !(try await database.hasOpenConflicts(rootID: rootID, prefix: oldFolder)),
                   !(try await database.hasPendingOperations(rootID: rootID, prefix: oldFolder)),
                   let scope = try await database.scope(rootID: rootID, courseID: courseID), scope.localFolder == oldFolder else { throw SyncDatabaseError.execution }
@@ -39,16 +40,21 @@ public actor CourseFolderRenamer {
                 try await database.renameScopeMetadata(rootID: rootID, courseID: courseID, from: oldFolder, to: newFolder)
                 return
             }
-            guard let managedIdentity = scope.managedDirectory, currentIdentity == managedIdentity else { throw SyncDatabaseError.execution }
+            guard scope.managedDirectory != nil else { throw SyncDatabaseError.execution }
             // `renameTopLevelDirectory` uses RENAME_EXCL, so an occupied target fails. Catch it here,
             // before the pending row exists, and report it as its own error the UI can explain.
             guard try await fileStore.topLevelDirectoryState(newFolder) == .missing else { throw CourseRenameError.folderAlreadyExists }
+            if currentIdentity != scope.managedDirectory {
+                try await database.upsertScope(SyncScope(rootID: rootID, courseID: courseID, displayName: scope.displayName, localFolder: oldFolder, enabled: scope.enabled, managedDirectory: currentIdentity))
+            }
             let move = PendingScopeMove(id: UUID(), rootID: rootID, courseID: courseID, oldFolder: oldFolder, newFolder: newFolder)
             try await database.beginScopeMove(move)
             // Outside the `do` below: a crash here leaves the row behind, unlike a failed rename.
             try interruption?(.journaled)
             do {
-                try await fileStore.renameTopLevelDirectory(from: oldFolder, to: newFolder)
+                try await fileStore.renameTopLevelDirectory(from: oldFolder, to: newFolder, expectedIdentity: currentIdentity)
+            } catch FileStoreError.mutationNotDurable {
+                throw FileStoreError.mutationNotDurable
             } catch {
                 // Nothing moved, so the prepared row describes a move that will never happen. Leaving
                 // it behind would trip the table's unique constraints on every later rename of this

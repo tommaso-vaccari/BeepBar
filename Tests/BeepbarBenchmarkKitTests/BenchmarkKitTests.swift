@@ -172,9 +172,10 @@ struct BenchmarkKitTests {
         #expect(result.samples.count == 2)
         #expect(result.samples.allSatisfy { $0.fileStore.filesHashed == 0 && $0.upstream.downloads == 0 })
         #expect(result.samples.allSatisfy { $0.upstream.contentsRequests == 3 && $0.upstream.courseListRequests == 1 })
-        // One lookup per tracked file is today's cost, not a requirement: a PR that makes the
-        // check cheaper updates this number.
-        #expect(result.summary["wall"] != nil && result.summary["fs.pathLookups"]?.median == 30)
+        // One lookup per module folder (3 courses × 5 modules), not per tracked file (30): since
+        // R03 (#111) the existence check resolves each distinct parent folder once per run. This
+        // is today's cost, not a requirement: a PR that makes the check cheaper updates it.
+        #expect(result.summary["wall"] != nil && result.summary["fs.pathLookups"]?.median == 15)
         #expect(result.notes.contains("budget, no file hashing: met"))
     }
 
@@ -199,5 +200,134 @@ struct BenchmarkKitTests {
             let latency = try #require(sample.cancelLatencyMilliseconds)
             #expect(latency >= 0 && latency < sample.wallMilliseconds)
         }
+    }
+
+    /// The first launch after updating repairs a small legacy database in every measured run:
+    /// each run gets a fresh degraded fixture, so the warm-up cannot absorb the repair. Guards the
+    /// scenario against measuring a launch with nothing to repair, and its checks against a
+    /// migration that stops repairing (the "repaired" check would turn false; see R02 in
+    /// docs/performance-plan.md for the mutation run).
+    @Test func startupFirstLaunchRepairsInEveryRun() async throws {
+        let result = try await Scenarios.startup(files: 200, phase: .first, runs: 2, warmup: 1)
+        #expect(result.passed, "\(result.checks)")
+        #expect(result.name == "startup-first" && result.samples.count == 2)
+        #expect(result.checks.count == 5)
+        #expect(result.samples.allSatisfy { $0.database.rowChanges > 7 && $0.database.pagesWritten > 0 })
+        #expect(result.samples.allSatisfy { $0.upstream == UpstreamCounters() && $0.installed == 0 })
+        // `compare` validates every scenario against the shared metric set; a missing metric
+        // would invalidate the whole comparison.
+        #expect(Set(result.summary.keys) == Set(Metric.all.map(\.name)).subtracting(["cancel.latency"]))
+    }
+
+    /// A corpus too small to hold a half-attributed row is refused, not reported as a repair: the
+    /// repair checks would otherwise pass with the repair removed. The options reject it first;
+    /// this guards direct callers.
+    @Test func startupFirstLaunchRefusesACorpusWithNothingToRepair() async {
+        await #expect(throws: BenchmarkError.self) {
+            try await Scenarios.startup(files: LegacyDatabaseFixture.smallestRepairableCorpus - 1, phase: .first, runs: 1, warmup: 0)
+        }
+        let smallest = try? await Scenarios.startup(files: LegacyDatabaseFixture.smallestRepairableCorpus, phase: .first, runs: 1, warmup: 0)
+        #expect(smallest?.passed == true)
+    }
+
+    /// Every later launch on the repaired database writes no row and no page, run after run: the
+    /// "nearly free at rest" property for app starts. Guards against a startup step that writes
+    /// on a current database (the "no rows or pages written" check would turn false).
+    @Test func startupLaterLaunchesWriteNothing() async throws {
+        let result = try await Scenarios.startup(files: 200, phase: .later, runs: 3, warmup: 1)
+        #expect(result.passed, "\(result.checks)")
+        #expect(result.name == "startup-later" && result.samples.count == 3)
+        #expect(result.samples.allSatisfy { $0.database.rowChanges == 0 && $0.database.pagesWritten == 0 })
+        #expect(result.notes.contains { $0.hasPrefix("open+migrate median") })
+        #expect(result.checks["no ownership backfill or module override work"] == true)
+        #expect(Set(result.summary.keys) == Set(Metric.all.map(\.name)).subtracting(["cancel.latency"]))
+    }
+}
+
+/// Invalid CLI input must fail before creating a corpus, report directory or idle observer.
+struct BenchmarkOptionsTests {
+    @Test(arguments: [
+        ("baseline", ["--output", "report"]),
+        ("unchanged", ["--out", "report"]),
+        ("baseline", ["--json", "report.json"]),
+        ("idle", ["--files", "1"]),
+        ("large-update", ["--fraction", "0.5"]),
+        ("cancel", ["--files", "1"]),
+        ("unknown", []),
+        ("baseline", ["--out"]),
+        ("baseline", ["--out", "--runs", "1"]),
+        ("baseline", ["--out", ""]),
+        ("baseline", ["--runs", "1", "--runs", "2"]),
+        ("baseline", ["--dirty", "--dirty"]),
+        ("baseline", ["--runs", "0"]),
+        ("unchanged", ["--files", "-1"]),
+        ("unchanged", ["--courses", "0"]),
+        ("cancel", ["--fraction", "1.1"]),
+        ("cancel", ["--fraction", "nan"]),
+        ("large-update", ["--size-mb", String(Int.max)]),
+        ("cancel", ["--rate-mbps", String(Int.max)]),
+        ("baseline", ["--runs", String(Int.max)]),
+        ("unchanged", ["--warmup", String(Int.max)]),
+        ("unchanged", ["--files", String(Int.max)]),
+        ("unchanged", ["--files", "1", "--courses", String(Int.max)]),
+        ("unchanged", ["--files", String(Int.max - 1000), "--courses", "2000"]),
+        ("idle", []),
+        ("idle", ["--pid", "2147483648"]),
+        ("idle", ["--pid", "1", "--minutes", "inf"]),
+    ])
+    func rejectsBeforeWork(command: String, arguments: [String]) {
+        #expect(throws: CLIError.self) {
+            try BenchmarkOptions(arguments[...], command: command)
+        }
+    }
+
+    /// `startup` takes only a known phase and a non-negative file count (zero is the empty
+    /// database R02 measures); `--phase` belongs to `startup` alone, and other scenarios still
+    /// reject zero files.
+    @Test(arguments: [
+        ("startup", ["--phase", "second"]),
+        ("startup", ["--phase"]),
+        ("startup", ["--size-mb", "1"]),
+        ("startup", ["--files", "-1"]),
+        // Too few files leave nothing to repair: the first launch's checks would prove nothing.
+        ("startup", ["--files", "0", "--phase", "first"]),
+        ("startup", ["--files", "5", "--phase", "first"]),
+        ("startup", ["--files", "1000001"]),
+        ("startup", ["--files", "9223372036854775807"]),
+        ("unchanged", ["--phase", "first"]),
+        ("unchanged", ["--files", "0"]),
+    ] as [(String, [String])])
+    func rejectsInvalidStartupOptions(command: String, arguments: [String]) {
+        #expect(throws: CLIError.self) {
+            try BenchmarkOptions(arguments[...], command: command)
+        }
+    }
+
+    /// Defaults, zero warmup, each command's options and literal paths remain usable.
+    @Test(arguments: ["unchanged", "large-update", "cancel", "startup", "baseline"])
+    func defaultsAndCommonMetadata(command: String) throws {
+        let defaults = try BenchmarkOptions([][...], command: command)
+        #expect(try defaults.int("runs", 5) == 5)
+        #expect(try defaults.int("warmup", 1, allowZero: true) == 1)
+        let options = try BenchmarkOptions(["--runs", "2", "--warmup", "0", "--commit", "sha", "--dirty"][...], command: command)
+        #expect(try options.int("runs", 5) == 2)
+        #expect(try options.int("warmup", 1, allowZero: true) == 0)
+        #expect(options.values["commit"] == "sha" && options.flags.contains("dirty"))
+    }
+
+    @Test(arguments: [
+        ("unchanged", ["--files", "1", "--courses", "1", "--json", "a b.json"]),
+        ("large-update", ["--size-mb", "1"]),
+        ("cancel", ["--size-mb", "1", "--fraction", "1", "--rate-mbps", "1"]),
+        ("startup", ["--files", "10", "--phase", "first", "--json", "s.json"]),
+        ("startup", ["--phase", "later"]),
+        ("startup", ["--files", "0", "--phase", "later"]),
+        ("baseline", ["--out", "a b"]),
+        ("baseline", ["--runs", String(Int.max), "--warmup", "0"]),
+        ("idle", ["--pid", "1", "--minutes", "0.01", "--interval-seconds", "0.1", "--json", "idle.json", "--commit", "sha", "--dirty"]),
+    ])
+    func acceptsCommandOptions(command: String, arguments: [String]) throws {
+        let options = try BenchmarkOptions(arguments[...], command: command)
+        #expect(!options.values.isEmpty)
     }
 }

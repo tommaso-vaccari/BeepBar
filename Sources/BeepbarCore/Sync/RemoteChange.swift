@@ -89,25 +89,86 @@ public struct PendingRemoteMove: Sendable, Equatable {
     }
 }
 
+/// A path of an interrupted Moodle move that recovery could not read: a symbolic link, a folder,
+/// or a permission error where the file should be. Recovery keeps the move's row and stops until
+/// the path is readable again, so the app names the path and the user knows what to fix (release
+/// review I-A4); before, the folder showed only "Sincronizzazione incompleta".
+public struct RemoteMoveRecoveryError: Error, Sendable, Equatable {
+    /// Relative to the sync folder, the path that could not be read.
+    public let path: RelativePath
+}
+
 /// Completes or drops the moves a crash interrupted (see `PendingRemoteMove`).
 enum RemoteMoveJournal {
-    /// A move counts as done when its destination holds the moved contents and, for a single move,
-    /// its origin no longer does; the two halves of a swap are done together or not at all. A move
-    /// that did not happen is dropped, and the file is looked at afresh by the caller.
+    /// Settles every interrupted move from what is on disk. Recovery writes no file: it only moves
+    /// a baseline (commit) or drops the row (discard), and the caller's three-way comparison then
+    /// keeps every edited file (as before #171).
+    ///
+    /// - A single move is done when its destination holds the moved contents and its origin no
+    ///   longer does. A single move whose origin is gone and whose destination holds something
+    ///   else also happened: the file was edited after it moved, so the baseline follows it and the
+    ///   edit is then a local change.
+    /// - The two halves of a swap (`swapRegularFiles`, one atomic `RENAME_SWAP`) are done together
+    ///   or not at all, so either file proves which side of the swap the disk is on. The swap is
+    ///   done when one path holds the other's contents and neither still holds its own: an edit or
+    ///   a deletion of one file after the swap no longer hides it (release review I-A3), and a
+    ///   journal written just before a crash, or a swap reverted by a power loss, still shows its
+    ///   own contents and is dropped. With both files edited or both gone nothing tells the two
+    ///   sides apart, and the row is dropped as before.
+    /// - Any other readable state is dropped.
+    ///
+    /// Only a path that cannot be read keeps its row and fails recovery with
+    /// `RemoteMoveRecoveryError`, so a transient read error never loses a completed move (R-004).
+    /// Readable states never block: an edited or deleted file used to keep the row forever, and
+    /// with it every sync, conflict choice and folder tidy-up of that folder, with nothing the user
+    /// could do (release review I-A1). Every batch is settled before the first read error is
+    /// reported, so one unreadable batch does not hold back the others.
     static func recover(rootID: UUID, database: SyncDatabase, fileStore: FileStore) async throws {
         let pending = try await database.pendingRemoteMoves(rootID: rootID)
         guard !pending.isEmpty else { return }
+        var unreadable: Error?
         for batch in Dictionary(grouping: pending, by: \.batchID).values {
-            var arrived = true
-            for move in batch {
-                guard case .present(let there)? = try? await fileStore.snapshotRegularFile(move.to), there.sha256 == move.sha256 else { arrived = false; break }
-                if batch.count == 1, case .present(let left)? = try? await fileStore.snapshotRegularFile(move.from), left.sha256 == move.sha256 { arrived = false; break }
-            }
-            if arrived, (try? await database.commitRemoteMoves(rootID: rootID, batch)) != nil {
-                if let move = batch.first, batch.count == 1 { try? await fileStore.removeEmptyParentDirectories(of: move.from) }
+            var states: [(move: PendingRemoteMove, destination: FileSnapshotState, source: FileSnapshotState)] = []
+            do {
+                for move in batch {
+                    states.append((move, try await read(move.to, fileStore: fileStore), try await read(move.from, fileStore: fileStore)))
+                }
+            } catch {
+                unreadable = unreadable ?? error
                 continue
             }
-            try await database.discardRemoteMoves(rootID: rootID, remoteIDs: batch.map(\.remoteID))
+            if happened(states) {
+                try await database.commitRemoteMoves(rootID: rootID, batch)
+                if let move = batch.first, batch.count == 1 { try? await fileStore.removeEmptyParentDirectories(of: move.from) }
+            } else {
+                try await database.discardRemoteMoves(rootID: rootID, remoteIDs: batch.map(\.remoteID))
+            }
         }
+        if let unreadable { throw unreadable }
+    }
+
+    private static func read(_ path: RelativePath, fileStore: FileStore) async throws -> FileSnapshotState {
+        do { return try await fileStore.snapshotRegularFile(path, checksCancellation: false) }
+        catch { throw RemoteMoveRecoveryError(path: path) }
+    }
+
+    /// Whether the disk shows the batch's moves as made (see `recover`).
+    static func happened(_ states: [(move: PendingRemoteMove, destination: FileSnapshotState, source: FileSnapshotState)]) -> Bool {
+        func holds(_ state: FileSnapshotState, _ sha256: String) -> Bool {
+            if case .present(let file) = state { return file.sha256 == sha256 }
+            return false
+        }
+        if states.count == 1, let only = states.first {
+            let arrived = holds(only.destination, only.move.sha256) && !holds(only.source, only.move.sha256)
+            let movedThenEdited = only.destination != .missing && only.source == .missing
+            return arrived || movedThenEdited
+        }
+        if states.count == 2, states[0].move.from == states[1].move.to, states[1].move.from == states[0].move.to {
+            let swapped = states.contains { holds($0.destination, $0.move.sha256) }
+            let unswapped = states.contains { holds($0.source, $0.move.sha256) }
+            return swapped && !unswapped
+        }
+        // Not a shape `SyncCoordinator` writes: done only if every file arrived.
+        return states.allSatisfy { holds($0.destination, $0.move.sha256) }
     }
 }

@@ -9,3 +9,7 @@ PerformanceReports/
 Config/LocalSigning.xcconfig
 xcuserdata/
 *.xcuserstate
+
+# Shared instructions and private local agent context
+!/AGENTS.md
+/AGENTS.override.md

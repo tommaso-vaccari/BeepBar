@@ -7,6 +7,7 @@
 	objects = {
 
 /* Begin PBXBuildFile section */
+		D781C25133AC471FAB128002 /* DailyTelemetry.swift in Sources */ = {isa = PBXBuildFile; fileRef = D781C25133AC471FAB128001 /* DailyTelemetry.swift */; };
 		A10000000000000000000001 /* BeepbarApp.swift in Sources */ = {isa = PBXBuildFile; fileRef = A10000000000000000000011 /* BeepbarApp.swift */; };
 		A10000000000000000000002 /* WeBeepAuthenticationController.swift in Sources */ = {isa = PBXBuildFile; fileRef = A10000000000000000000012 /* WeBeepAuthenticationController.swift */; };
 		A10000000000000000000006 /* BeepbarShellView.swift in Sources */ = {isa = PBXBuildFile; fileRef = A10000000000000000000014 /* BeepbarShellView.swift */; };
@@ -27,12 +28,22 @@
 		A10000000000000000000008 /* Sparkle in Frameworks */ = {isa = PBXBuildFile; productRef = A10000000000000000000041 /* Sparkle */; };
 		A100000000000000000000B0 /* RecmanScripts.swift in Sources */ = {isa = PBXBuildFile; fileRef = A100000000000000000000B1 /* RecmanScripts.swift */; };
 		A100000000000000000000B2 /* RecmanWebSession.swift in Sources */ = {isa = PBXBuildFile; fileRef = A100000000000000000000B3 /* RecmanWebSession.swift */; };
+		B148000000000000000E0001 /* WebexStreamResolver.swift in Sources */ = {isa = PBXBuildFile; fileRef = B148000000000000000E0002 /* WebexStreamResolver.swift */; };
 		A100000000000000000000B8 /* RecordingsPage.swift in Sources */ = {isa = PBXBuildFile; fileRef = A100000000000000000000B9 /* RecordingsPage.swift */; };
 		A100000000000000000000B6 /* RecordingsController.swift in Sources */ = {isa = PBXBuildFile; fileRef = A100000000000000000000B7 /* RecordingsController.swift */; };
 		A100000000000000000000B4 /* RecordingsSessionStore.swift in Sources */ = {isa = PBXBuildFile; fileRef = A100000000000000000000B5 /* RecordingsSessionStore.swift */; };
+		A100000000000000000000C0 /* UIContentReadiness.swift in Sources */ = {isa = PBXBuildFile; fileRef = A100000000000000000000C1 /* UIContentReadiness.swift */; };
+		A100000000000000000000C2 /* UIPerformanceHarness.swift in Sources */ = {isa = PBXBuildFile; fileRef = A100000000000000000000C3 /* UIPerformanceHarness.swift */; };
+		B12300000000000000000001 /* RecordingsStudyState.swift in Sources */ = {isa = PBXBuildFile; fileRef = B12300000000000000000002 /* RecordingsStudyState.swift */; };
+		C4A7E0000000000000000001 /* RecordingsWatchProgressModel.swift in Sources */ = {isa = PBXBuildFile; fileRef = C4A7E0000000000000000002 /* RecordingsWatchProgressModel.swift */; };
+		B14800000000000000000001 /* RecordingPlayerController.swift in Sources */ = {isa = PBXBuildFile; fileRef = B14800000000000000000002 /* RecordingPlayerController.swift */; };
+		B14800000000000000000003 /* RecordingPlayerControls.swift in Sources */ = {isa = PBXBuildFile; fileRef = B14800000000000000000004 /* RecordingPlayerControls.swift */; };
+		B148000000000000000000A1 /* RecordingNowPlaying.swift in Sources */ = {isa = PBXBuildFile; fileRef = B148000000000000000000A2 /* RecordingNowPlaying.swift */; };
+		B14800000000000000000A01 /* PlayerZoom.swift in Sources */ = {isa = PBXBuildFile; fileRef = B14800000000000000000A02 /* PlayerZoom.swift */; };
 /* End PBXBuildFile section */
 
 /* Begin PBXFileReference section */
+		D781C25133AC471FAB128001 /* DailyTelemetry.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DailyTelemetry.swift; sourceTree = "<group>"; };
 		A10000000000000000000010 /* Beepbar.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = Beepbar.app; sourceTree = BUILT_PRODUCTS_DIR; };
 		A10000000000000000000011 /* BeepbarApp.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = BeepbarApp.swift; sourceTree = "<group>"; };
 		A10000000000000000000012 /* WeBeepAuthenticationController.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = WeBeepAuthenticationController.swift; sourceTree = "<group>"; };
@@ -54,9 +65,18 @@
 		A10000000000000000000021 /* WebKit.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = WebKit.framework; path = System/Library/Frameworks/WebKit.framework; sourceTree = SDKROOT; };
 		A100000000000000000000B1 /* RecmanScripts.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = RecmanScripts.swift; sourceTree = "<group>"; };
 		A100000000000000000000B3 /* RecmanWebSession.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = RecmanWebSession.swift; sourceTree = "<group>"; };
+		B148000000000000000E0002 /* WebexStreamResolver.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = WebexStreamResolver.swift; sourceTree = "<group>"; };
 		A100000000000000000000B9 /* RecordingsPage.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = RecordingsPage.swift; sourceTree = "<group>"; };
 		A100000000000000000000B7 /* RecordingsController.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = RecordingsController.swift; sourceTree = "<group>"; };
 		A100000000000000000000B5 /* RecordingsSessionStore.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = RecordingsSessionStore.swift; sourceTree = "<group>"; };
+		A100000000000000000000C1 /* UIContentReadiness.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = UIContentReadiness.swift; sourceTree = "<group>"; };
+		A100000000000000000000C3 /* UIPerformanceHarness.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = UIPerformanceHarness.swift; sourceTree = "<group>"; };
+		B12300000000000000000002 /* RecordingsStudyState.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = RecordingsStudyState.swift; sourceTree = "<group>"; };
+		C4A7E0000000000000000002 /* RecordingsWatchProgressModel.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = RecordingsWatchProgressModel.swift; sourceTree = "<group>"; };
+		B14800000000000000000002 /* RecordingPlayerController.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = RecordingPlayerController.swift; sourceTree = "<group>"; };
+		B14800000000000000000004 /* RecordingPlayerControls.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = RecordingPlayerControls.swift; sourceTree = "<group>"; };
+		B148000000000000000000A2 /* RecordingNowPlaying.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = RecordingNowPlaying.swift; sourceTree = "<group>"; };
+		B14800000000000000000A02 /* PlayerZoom.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PlayerZoom.swift; sourceTree = "<group>"; };
 /* End PBXFileReference section */
 
 /* Begin PBXFrameworksBuildPhase section */
@@ -98,9 +118,12 @@
 			isa = PBXGroup;
 			children = (
 				A10000000000000000000011 /* BeepbarApp.swift */,
+				A100000000000000000000C3 /* UIPerformanceHarness.swift */,
+				A100000000000000000000C1 /* UIContentReadiness.swift */,
 				A10000000000000000000012 /* WeBeepAuthenticationController.swift */,
 				A10000000000000000000014 /* BeepbarShellView.swift */,
 				A10000000000000000000017 /* UpdaterController.swift */,
+				D781C25133AC471FAB128001 /* DailyTelemetry.swift */,
 				A100000000000000000000AD /* LaunchAtLogin.swift */,
 				A100000000000000000000AF /* SyncNotifications.swift */,
 				A10000000000000000000091 /* OnboardingView.swift */,
@@ -113,9 +136,16 @@
 				A100000000000000000000AB /* ModuleDestinationsSheet.swift */,
 				A100000000000000000000B1 /* RecmanScripts.swift */,
 				A100000000000000000000B3 /* RecmanWebSession.swift */,
+				B148000000000000000E0002 /* WebexStreamResolver.swift */,
 				A100000000000000000000B9 /* RecordingsPage.swift */,
 				A100000000000000000000B7 /* RecordingsController.swift */,
 				A100000000000000000000B5 /* RecordingsSessionStore.swift */,
+				B12300000000000000000002 /* RecordingsStudyState.swift */,
+				C4A7E0000000000000000002 /* RecordingsWatchProgressModel.swift */,
+				B14800000000000000000002 /* RecordingPlayerController.swift */,
+				B14800000000000000000004 /* RecordingPlayerControls.swift */,
+				B148000000000000000000A2 /* RecordingNowPlaying.swift */,
+				B14800000000000000000A02 /* PlayerZoom.swift */,
 			);
 			name = Sources;
 			path = Sources/BeepbarApp;
@@ -207,9 +237,12 @@
 			buildActionMask = 2147483647;
 			files = (
 				A10000000000000000000001 /* BeepbarApp.swift in Sources */,
+				A100000000000000000000C2 /* UIPerformanceHarness.swift in Sources */,
+				A100000000000000000000C0 /* UIContentReadiness.swift in Sources */,
 				A10000000000000000000002 /* WeBeepAuthenticationController.swift in Sources */,
 				A10000000000000000000006 /* BeepbarShellView.swift in Sources */,
 				A10000000000000000000009 /* UpdaterController.swift in Sources */,
+				D781C25133AC471FAB128002 /* DailyTelemetry.swift in Sources */,
 				A100000000000000000000AC /* LaunchAtLogin.swift in Sources */,
 				A100000000000000000000AE /* SyncNotifications.swift in Sources */,
 				A10000000000000000000090 /* OnboardingView.swift in Sources */,
@@ -222,9 +255,16 @@
 				A100000000000000000000AA /* ModuleDestinationsSheet.swift in Sources */,
 				A100000000000000000000B0 /* RecmanScripts.swift in Sources */,
 				A100000000000000000000B2 /* RecmanWebSession.swift in Sources */,
+				B148000000000000000E0001 /* WebexStreamResolver.swift in Sources */,
 				A100000000000000000000B8 /* RecordingsPage.swift in Sources */,
 				A100000000000000000000B6 /* RecordingsController.swift in Sources */,
 				A100000000000000000000B4 /* RecordingsSessionStore.swift in Sources */,
+				B12300000000000000000001 /* RecordingsStudyState.swift in Sources */,
+				C4A7E0000000000000000001 /* RecordingsWatchProgressModel.swift in Sources */,
+				B14800000000000000000001 /* RecordingPlayerController.swift in Sources */,
+				B14800000000000000000003 /* RecordingPlayerControls.swift in Sources */,
+				B148000000000000000000A1 /* RecordingNowPlaying.swift in Sources */,
+				B14800000000000000000A01 /* PlayerZoom.swift in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};

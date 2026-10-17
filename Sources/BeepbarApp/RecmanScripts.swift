@@ -19,7 +19,8 @@ enum RecmanScripts {
       return JSON.stringify({
         hasArchiveForm: !!document.querySelector('select[name="aa"]') && !!document.querySelector('input[name="contesto"]') && !!document.querySelector('[name="EVN_SEARCH"]'),
         hasAutomaticRedirectForm: !!document.querySelector('form#automaticaRedirectForm'),
-        asksForCredentials: Array.from(document.querySelectorAll('input')).some(i => visible(i) && (i.type === 'password' || i.autocomplete === 'one-time-code'))
+        asksForCredentials: Array.from(document.querySelectorAll('input')).some(i => visible(i) && (i.type === 'password' || i.autocomplete === 'one-time-code')),
+        hasServiceError: /il servizio richiesto non è presente/i.test(document.body?.innerText || '')
       });
     })()
     """#

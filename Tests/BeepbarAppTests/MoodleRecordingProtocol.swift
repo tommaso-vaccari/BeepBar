@@ -20,8 +20,24 @@ final class MoodleRecordingProtocol: URLProtocol, @unchecked Sendable {
     private struct Account {
         var courses: [(id: Int64, name: String)]
         var files: [Int64: [String]]
+        var userID: Int
         var requests: [RecordedRequest] = []
         var onHotspot = false
+        var offline = false
+        /// Moodle stopped accepting the token but the account's held answers stay deliverable.
+        var rejected = false
+        var holdsCourseLists = false
+        var malformedCourseLists = false
+        var timesOut = false
+        var heldCourseLists: [@Sendable () -> Void] = []
+        /// The profile address `core_user_get_users_by_field` answers; site info lists that
+        /// function only when `listsEmailFunction` is set.
+        var email: String?
+        var listsEmailFunction = false
+        var holdsEmails = false
+        var heldEmails: [@Sendable () -> Void] = []
+        var holdsCourseImages = false
+        var heldCourseImages: [@Sendable () -> Void] = []
     }
 
     /// What a download records as its `function`.
@@ -30,11 +46,68 @@ final class MoodleRecordingProtocol: URLProtocol, @unchecked Sendable {
     private static let accounts = OSAllocatedUnfairLock(initialState: [String: Account]())
 
     /// A fresh token whose account lists `courses`, in this order, as its enrolled courses, and
-    /// `files` (one-byte files, by course) in their contents.
-    static func register(courses: [(id: Int64, name: String)], files: [Int64: [String]] = [:]) -> String {
+    /// `files` (one-byte files, by course) in their contents. `userID` is the Moodle user id its
+    /// site info reports; tests that tell two accounts apart give them different ones.
+    static func register(courses: [(id: Int64, name: String)], files: [Int64: [String]] = [:], userID: Int = 7) -> String {
         let token = UUID().uuidString
-        accounts.withLock { $0[token] = Account(courses: courses, files: files) }
+        accounts.withLock { $0[token] = Account(courses: courses, files: files, userID: userID) }
         return token
+    }
+
+    /// Makes site info report `userID` for this token from now on: the stored token turning out
+    /// to belong to another account at the next connection check, with nothing else changing
+    /// (the controller caches its token, so a test can't swap the token itself).
+    static func setUserID(token: String, _ userID: Int) {
+        accounts.withLock { $0[token]?.userID = userID }
+    }
+
+    /// Gives this account a profile `email`; `listed` says whether site info lists the function
+    /// that reads it (a WeBeep token may not be allowed to call it).
+    static func setProfileEmail(token: String, _ email: String?, listed: Bool) {
+        accounts.withLock {
+            $0[token]?.email = email
+            $0[token]?.listsEmailFunction = listed
+        }
+    }
+
+    /// Holds every profile-address answer for this account until `releaseEmails(token:)`, like
+    /// `holdCourseLists(token:)`: lets a test switch accounts while the address is on its way.
+    static func holdEmails(token: String) {
+        accounts.withLock { $0[token]?.holdsEmails = true }
+    }
+
+    static func heldEmailCount(token: String) -> Int {
+        accounts.withLock { $0[token]?.heldEmails.count ?? 0 }
+    }
+
+    static func releaseEmails(token: String) {
+        let held = accounts.withLock { accounts -> [@Sendable () -> Void] in
+            let held = accounts[token]?.heldEmails ?? []
+            accounts[token]?.holdsEmails = false
+            accounts[token]?.heldEmails = []
+            return held
+        }
+        held.forEach { $0() }
+    }
+
+    /// Holds every course-picture download (`/course/overviewfiles/`) for this account until
+    /// `releaseCourseImages(token:)`: lets a test change the account while a picture is on its way.
+    static func holdCourseImages(token: String) {
+        accounts.withLock { $0[token]?.holdsCourseImages = true }
+    }
+
+    static func heldCourseImageCount(token: String) -> Int {
+        accounts.withLock { $0[token]?.heldCourseImages.count ?? 0 }
+    }
+
+    static func releaseCourseImages(token: String) {
+        let held = accounts.withLock { accounts -> [@Sendable () -> Void] in
+            let held = accounts[token]?.heldCourseImages ?? []
+            accounts[token]?.holdsCourseImages = false
+            accounts[token]?.heldCourseImages = []
+            return held
+        }
+        held.forEach { $0() }
     }
 
     /// Puts this account's Mac on a phone hotspot: a request that may not use an expensive network
@@ -50,6 +123,45 @@ final class MoodleRecordingProtocol: URLProtocol, @unchecked Sendable {
         accounts.withLock { $0[token] = nil }
     }
 
+    /// Takes this account's Mac offline: every request fails with
+    /// `URLError.notConnectedToInternet`, as macOS fails it without a network. Still recorded.
+    static func setOffline(token: String, _ offline: Bool) {
+        accounts.withLock { $0[token]?.offline = offline }
+    }
+
+    /// Moodle stops accepting `token` like `revoke(token:)`, but its held answers stay: once
+    /// released they answer `invalidtoken`, as a request that reached Moodle after the token
+    /// expired would.
+    static func reject(token: String) {
+        accounts.withLock { $0[token]?.rejected = true }
+    }
+
+    /// Holds every enrolled-courses answer for this account until
+    /// `releaseCourseLists(token:)`: lets a test change the app's state while a refresh waits for
+    /// Moodle and then deliver the answer late.
+    static func holdCourseLists(token: String) {
+        accounts.withLock { $0[token]?.holdsCourseLists = true }
+    }
+
+    static func heldCourseListCount(token: String) -> Int {
+        accounts.withLock { $0[token]?.heldCourseLists.count ?? 0 }
+    }
+
+    /// Delivers every held enrolled-courses answer, worked out now, and stops holding new ones.
+    static func releaseCourseLists(token: String) {
+        let held = accounts.withLock { accounts -> [@Sendable () -> Void] in
+            let held = accounts[token]?.heldCourseLists ?? []
+            accounts[token]?.holdsCourseLists = false
+            accounts[token]?.heldCourseLists = []
+            return held
+        }
+        held.forEach { $0() }
+    }
+
+    static func setCourses(token: String, courses: [(id: Int64, name: String)]) {
+        accounts.withLock { $0[token]?.courses = courses }
+    }
+
     static func requests(token: String) -> [RecordedRequest] {
         accounts.withLock { $0[token]?.requests ?? [] }
     }
@@ -61,6 +173,17 @@ final class MoodleRecordingProtocol: URLProtocol, @unchecked Sendable {
     /// A downloader whose requests stay in this protocol, for the files `register(files:)` lists.
     static func makeDownloader() -> RemoteDownloader {
         RemoteDownloader(session: makeSession())
+    }
+
+    /// Moodle answers the enrolled-courses call with something that isn't a course list: a server
+    /// failure that a network change cannot fix, unlike `setOffline(token:_:)`.
+    static func setMalformedCourseLists(token: String, _ malformed: Bool) {
+        accounts.withLock { $0[token]?.malformedCourseLists = malformed }
+    }
+
+    /// Every request fails with `URLError.timedOut`, as a server that never answers does.
+    static func setTimingOut(token: String, _ timesOut: Bool) {
+        accounts.withLock { $0[token]?.timesOut = timesOut }
     }
 
     private static func makeSession() -> URLSession {
@@ -87,6 +210,32 @@ final class MoodleRecordingProtocol: URLProtocol, @unchecked Sendable {
             client?.urlProtocol(self, didFailWithError: URLError(.notConnectedToInternet))
             return
         }
+        if let account, account.timesOut {
+            client?.urlProtocol(self, didFailWithError: URLError(.timedOut))
+            return
+        }
+        if let account, account.offline {
+            client?.urlProtocol(self, didFailWithError: URLError(.notConnectedToInternet))
+            return
+        }
+        if isDownload, url.path.contains("/course/overviewfiles/") {
+            // A course picture: three bytes are enough, the tests check what reaches the caller.
+            let this = self
+            let deliver: @Sendable () -> Void = {
+                let found = MoodleRecordingProtocol.accounts.withLock { $0[token] } != nil
+                let response = HTTPURLResponse(url: url, statusCode: found ? 200 : 404, httpVersion: "HTTP/1.1", headerFields: ["Content-Type": "image/png"])!
+                this.client?.urlProtocol(this, didReceive: response, cacheStoragePolicy: .notAllowed)
+                if found { this.client?.urlProtocol(this, didLoad: Data([1, 2, 3])) }
+                this.client?.urlProtocolDidFinishLoading(this)
+            }
+            let held = Self.accounts.withLock { accounts in
+                guard accounts[token]?.holdsCourseImages == true else { return false }
+                accounts[token]?.heldCourseImages.append(deliver)
+                return true
+            }
+            if !held { deliver() }
+            return
+        }
         if isDownload {
             let body = Data("x".utf8)
             let found = account != nil
@@ -96,23 +245,50 @@ final class MoodleRecordingProtocol: URLProtocol, @unchecked Sendable {
             client?.urlProtocolDidFinishLoading(self)
             return
         }
-        let json: String
+        let this = self
+        let deliver: @Sendable () -> Void = {
+            // Worked out when delivered, so a held answer reflects a token rejected meanwhile.
+            let json = MoodleRecordingProtocol.answer(function: function, fields: fields, account: MoodleRecordingProtocol.accounts.withLock { $0[token] })
+            let response = HTTPURLResponse(url: url, statusCode: 200, httpVersion: "HTTP/1.1", headerFields: ["Content-Type": "application/json"])!
+            this.client?.urlProtocol(this, didReceive: response, cacheStoragePolicy: .notAllowed)
+            this.client?.urlProtocol(this, didLoad: Data(json.utf8))
+            this.client?.urlProtocolDidFinishLoading(this)
+        }
+        let held = Self.accounts.withLock { accounts in
+            if function == "core_enrol_get_users_courses", accounts[token]?.holdsCourseLists == true {
+                accounts[token]?.heldCourseLists.append(deliver)
+                return true
+            }
+            if function == WeBeepAPIClient.ownEmailFunction, accounts[token]?.holdsEmails == true {
+                accounts[token]?.heldEmails.append(deliver)
+                return true
+            }
+            return false
+        }
+        if !held { deliver() }
+    }
+
+    private static func answer(function: String, fields: [String: String], account: Account?) -> String {
         switch (account, function) {
         case (nil, _):
-            json = #"{"exception":"invalidtoken","errorcode":"invalidtoken"}"#
-        case (_, "core_webservice_get_site_info"):
-            json = #"{"userid":7,"siteurl":"https://webeep.polimi.it","functions":[{"name":"core_enrol_get_users_courses"},{"name":"core_course_get_contents"}]}"#
+            return #"{"exception":"invalidtoken","errorcode":"invalidtoken"}"#
+        case (let account?, _) where account.rejected:
+            return #"{"exception":"invalidtoken","errorcode":"invalidtoken"}"#
+        case (let account?, "core_webservice_get_site_info"):
+            let email = account.listsEmailFunction ? #",{"name":"\#(WeBeepAPIClient.ownEmailFunction)"}"# : ""
+            return #"{"userid":\#(account.userID),"siteurl":"https://webeep.polimi.it","functions":[{"name":"core_enrol_get_users_courses"},{"name":"core_course_get_contents"}\#(email)]}"#
+        case (let account?, WeBeepAPIClient.ownEmailFunction):
+            guard let email = account.email else { return "[]" }
+            return #"[{"id":\#(account.userID),"email":"\#(email)"}]"#
+        case (let account?, "core_enrol_get_users_courses") where account.malformedCourseLists:
+            return "{"
         case (let account?, "core_enrol_get_users_courses"):
-            json = "[" + account.courses.map { #"{"id":\#($0.id),"shortname":"\#($0.name)","fullname":"\#($0.name)","visible":1}"# }.joined(separator: ",") + "]"
+            return "[" + account.courses.map { #"{"id":\#($0.id),"shortname":"\#($0.name)","fullname":"\#($0.name)","visible":1}"# }.joined(separator: ",") + "]"
         case (let account?, "core_course_get_contents"):
-            json = Self.contents(course: Int64(fields["courseid"] ?? "") ?? 0, files: account.files)
+            return contents(course: Int64(fields["courseid"] ?? "") ?? 0, files: account.files)
         default:
-            json = "[]"
+            return "[]"
         }
-        let response = HTTPURLResponse(url: url, statusCode: 200, httpVersion: "HTTP/1.1", headerFields: ["Content-Type": "application/json"])!
-        client?.urlProtocol(self, didReceive: response, cacheStoragePolicy: .notAllowed)
-        client?.urlProtocol(self, didLoad: Data(json.utf8))
-        client?.urlProtocolDidFinishLoading(self)
     }
 
     /// One section with one folder module listing the course's registered files; empty without any.

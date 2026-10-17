@@ -5,6 +5,7 @@
 ### Fixed
 
 - In Recordings, a course with a single recording now reads “1 registrazione” instead of “1 registrazioni”, and VoiceOver announces one new lecture as “1 nuova”.
+- In Recordings, VoiceOver no longer stops on an unnamed element at the start of lectures that aren't new, and the bookmark button now says which lecture it adds to or removes from the Watchlist.
 
 ## 2026-10-17
 

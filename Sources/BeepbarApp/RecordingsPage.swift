@@ -963,15 +963,26 @@ struct RecordingRow: View, Equatable {
         Binding(get: { watch.isOn }, set: { setDone($0) })
     }
 
+    /// VoiceOver's label of the bookmark button. It names the lecture, like Play's label, so a
+    /// VoiceOver user moving between rows knows which lecture the button adds or removes (#196);
+    /// the tooltip stays short because the row is next to it on screen.
+    static func watchlistAccessibilityLabel(isWatchlisted: Bool, title: String) -> BilingualText {
+        isWatchlisted ? BilingualText("Rimuovi \(title) dalla watchlist", "Remove \(title) from watchlist")
+            : BilingualText("Aggiungi \(title) alla watchlist", "Add \(title) to watchlist")
+    }
+
     var body: some View {
         #if DEBUG
         let _ = RecordingsPageProbes.row?(self)
         #endif
         HStack(spacing: 10) {
+            // Hidden from VoiceOver when clear: an empty label still made the dot an unnamed
+            // element at the start of every row that isn't new (#196).
             Circle()
                 .fill(isNew ? Color.accentColor : .clear)
                 .frame(width: 7, height: 7)
-                .accessibilityLabel(isNew ? tr("Nuova", "New") : "")
+                .accessibilityLabel(tr("Nuova", "New"))
+                .accessibilityHidden(!isNew)
             if let number {
                 Text("#\(number)")
                     .font(.callout).monospacedDigit().foregroundStyle(.tertiary)
@@ -1011,7 +1022,7 @@ struct RecordingRow: View, Equatable {
             }
             .buttonStyle(.plain).disabled(!canEdit)
             .help(isWatchlisted ? tr("Rimuovi dalla watchlist", "Remove from watchlist") : tr("Aggiungi alla watchlist", "Add to watchlist"))
-            .accessibilityLabel(isWatchlisted ? tr("Rimuovi dalla watchlist", "Remove from watchlist") : tr("Aggiungi alla watchlist", "Add to watchlist"))
+            .accessibilityLabel(Self.watchlistAccessibilityLabel(isWatchlisted: isWatchlisted, title: RecordingsPresentation.title(recording)).text)
             Button(action: actions.play) {
                 ZStack {
                     ProgressView().controlSize(.small).opacity(isOpening ? 1 : 0)

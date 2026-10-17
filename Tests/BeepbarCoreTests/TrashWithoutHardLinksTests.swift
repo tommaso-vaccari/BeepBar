@@ -111,9 +111,12 @@ struct TrashWithoutHardLinksTests {
     }
 
     /// The Trash API resolves a path, so the fallback checks that the path still leads to the
-    /// verified file: a course folder swapped for a symbolic link to another folder holding a file
-    /// of the same name must not send that other file to the Trash, nor the original.
-    @Test func refusesAParentFolderSwappedForASymbolicLink() async throws {
+    /// verified file: a course folder swapped for a symbolic link to another folder, or for a new
+    /// folder, holding a file of the same name must not send that other file to the Trash, nor the
+    /// original. The symbolic link is refused by the `O_NOFOLLOW` open of the named parent, the
+    /// new folder only by comparing its identity with the folder the file was verified in.
+    @Test(arguments: ["symlink", "directory"])
+    func refusesAParentFolderSwappedAfterVerification(_ swap: String) async throws {
         let setup = try Setup()
         defer { setup.remove() }
         let record = Record()
@@ -124,7 +127,12 @@ struct TrashWithoutHardLinksTests {
         try Data("unrelated".utf8).write(to: elsewhere.appending(path: "file.txt"))
         let store = try store(setup, record: record) { _, _, _, _ in
             try! FileManager.default.moveItem(at: course, to: moved)
-            try! FileManager.default.createSymbolicLink(at: course, withDestinationURL: elsewhere)
+            if swap == "symlink" {
+                try! FileManager.default.createSymbolicLink(at: course, withDestinationURL: elsewhere)
+            } else {
+                try! FileManager.default.createDirectory(at: course, withIntermediateDirectories: false)
+                try! Data("unrelated".utf8).write(to: course.appending(path: "file.txt"))
+            }
             return ENOTSUP
         }
         let expected = try await snapshot(store, setup.path)
@@ -134,6 +142,7 @@ struct TrashWithoutHardLinksTests {
         #expect(record.trashed.isEmpty)
         #expect(try Data(contentsOf: moved.appending(path: "file.txt")) == Data("original".utf8))
         #expect(try Data(contentsOf: elsewhere.appending(path: "file.txt")) == Data("unrelated".utf8))
+        if swap == "directory" { #expect(try Data(contentsOf: setup.source) == Data("unrelated".utf8)) }
     }
 
     /// The check after the Trash call: if the verified file is still at its path, the Trash took

@@ -313,24 +313,52 @@ import Testing
 
     // MARK: Cancellation and quit
 
-    /// Proves that cancelling the automatic run's task while the follow-up is running cancels the
-    /// refresh and finishes the run within a second. Guards against the follow-up outliving a
-    /// cancelled scheduler task.
+    /// Proves, through the real scheduler callback, that turning automatic sync off while the
+    /// follow-up of an automatic run is still inside the system activity cancels the refresh and
+    /// delivers `completion` promptly, well before the hold runs out. Guards against the callback
+    /// task having no handle (#188): before, nothing in the app could cancel it, and this test
+    /// cancelled a task of its own instead, proving a path the app never took.
     @Test func cancellingAnAutomaticRunStopsTheFollowUpPromptly() async throws {
-        let harness = try await Harness()
+        let schedule = TestSchedule()
+        let harness = try await Harness(schedule: schedule)
         defer { harness.remove() }
+        harness.controller.setFollowUpActivityHoldForTesting(.seconds(30))
         harness.seam.honorsCancellation = true
-        let run = Task { @MainActor in await harness.controller.runAutomaticSyncForTesting() }
+        let fired = Task { @MainActor in await schedule.fire(0) }
         await harness.waitForCalls(1)
 
         let started = ContinuousClock.now
-        run.cancel()
-        let outcome = await run.value
+        harness.controller.setAutomaticSync(enabled: false)
+        let result = await fired.value
 
         // The materials run had already finished: cancelling the follow-up doesn't rewrite that.
-        #expect(outcome == .finished)
+        #expect(result == .finished)
         #expect(ContinuousClock.now - started < .seconds(5))
         #expect(harness.seam.sawCancellation)
+        guard case .synced = harness.controller.syncState else {
+            Issue.record("Expected the materials result to stay, got \(harness.controller.syncState)")
+            return
+        }
+    }
+
+    /// Proves that when the system asks background work to defer (`shouldDefer`), an automatic
+    /// run still finishes its materials but starts no recordings refresh. Guards against ignoring
+    /// the scheduler's request (#188): the WebKit listings ran under thermal or battery pressure.
+    @Test func aSchedulerAskingToDeferSkipsTheFollowUp() async throws {
+        let schedule = TestSchedule()
+        schedule.defers.withLock { $0 = true }
+        let harness = try await Harness(schedule: schedule)
+        defer { harness.remove() }
+
+        #expect(await schedule.fire(0) == .finished)
+        await harness.settle()
+
+        guard case .synced = harness.controller.syncState else {
+            Issue.record("Expected the materials run to finish synced, got \(harness.controller.syncState)")
+            return
+        }
+        #expect(harness.seam.calls.isEmpty)
+        #expect(harness.controller.recordingsFollowUpForTesting == nil)
     }
 
     /// Proves that "Esci" with a follow-up running does not wait for it and does not get it from
@@ -568,9 +596,12 @@ private final class NetworkSequence: Sendable {
 /// Deterministic registration of the scheduler callback.
 @MainActor private final class TestSchedule {
     private var callbacks: [@Sendable (@escaping NSBackgroundActivityScheduler.CompletionHandler) -> Void] = []
+    /// What the registration answers for `shouldDefer`.
+    let defers = OSAllocatedUnfairLock(initialState: false)
     func register(_ interval: TimeInterval, _ callback: @escaping @Sendable (@escaping NSBackgroundActivityScheduler.CompletionHandler) -> Void) -> BackgroundActivityRegistration {
         callbacks.append(callback)
-        return BackgroundActivityRegistration { }
+        let defers = defers
+        return BackgroundActivityRegistration(invalidate: { }, shouldDefer: { defers.withLock { $0 } })
     }
     func fire(_ index: Int) async -> NSBackgroundActivityScheduler.Result {
         let callback = callbacks[index]

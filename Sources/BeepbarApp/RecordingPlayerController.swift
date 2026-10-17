@@ -33,6 +33,11 @@ import OSLog
     func pause()
     /// Stops playback and releases the player and its window. Safe to call at any time.
     func close()
+    /// Puts the open player window back in front of the student: restores it from the Dock if it
+    /// was minimized, then activates the app and makes it key. Does nothing when no lecture is
+    /// open. A menu Play of the lecture already open uses this (issue #193): activating the app
+    /// alone leaves a minimized window in the Dock, so the click looked dead.
+    func bringToFront()
     /// Makes the player restore `policy` when it closes, for code that raised BeepBar to a
     /// regular app and finds a lecture open when it is done; see
     /// `RecordingPlayerController.adoptPolicyToRestore`.
@@ -509,6 +514,14 @@ enum RecordingPlayerError: Error {
             speedPopUp = nil
         }
         window.close()
+    }
+
+    func bringToFront() {
+        guard isOpen, let window else { return }
+        // `NSApp.activate()` never restores a minimized window (probed in #193); the window
+        // itself must leave the Dock before it is ordered front.
+        if window.isMiniaturized { window.deminiaturize(nil) }
+        present(window)
     }
 
     func windowWillClose(_ notification: Notification) {

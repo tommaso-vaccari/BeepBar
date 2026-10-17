@@ -83,6 +83,38 @@ struct RecordingPlayerControllerTests {
         controller.close()
     }
 
+    /// `bringToFront` restores a minimized player window and orders it front through `present`,
+    /// on a real `NSWindow` (issue #193: `NSApp.activate()` alone left it in the Dock, so a menu
+    /// Play of the open lecture looked dead), and does nothing once the player is closed.
+    /// Mutations: drop the `deminiaturize` (stays minimized when `present` is a no-op, as here);
+    /// drop the `present` call (never presented).
+    @Test func bringToFrontRestoresAMinimizedWindow() async throws {
+        let media = try await TestMedia.shared.url()
+        var presented: [NSWindow] = []
+        let controller = RecordingPlayerController(present: { presented.append($0) }, makePlayerView: { FakePlayerView() },
+                                                   activationPolicy: FakePolicy(.accessory).control, frameAutosaveName: nil,
+                                                   defaults: PlayerTestDefaults.throwaway(), toggleFullScreen: { _ in }, nowPlaying: SilentNowPlaying())
+        defer { controller.close() }
+        controller.play(media, title: "Lezione", cookies: [])
+        let window = try #require(controller.window)
+        presented.removeAll()
+        // On screen without activating the test process, then into the Dock.
+        window.orderFront(nil)
+        window.miniaturize(nil)
+        for _ in 0..<500 where !window.isMiniaturized { try await Task.sleep(for: .milliseconds(5)) }
+        try #require(window.isMiniaturized, "the window server must minimize the window for this test to mean anything")
+
+        controller.bringToFront()
+        // AppKit restores the window asynchronously (the Dock animation).
+        for _ in 0..<500 where window.isMiniaturized { try await Task.sleep(for: .milliseconds(5)) }
+        #expect(window.isMiniaturized == false)
+        #expect(presented.count == 1 && presented.first === window)
+
+        controller.close()
+        controller.bringToFront()
+        #expect(presented.count == 1, "a closed player has nothing to bring forward")
+    }
+
     /// macOS defaults sleep prevention off: every newly created player must opt in, including
     /// one opened after closing the previous lecture. AVFoundation owns the playback assertion.
     @Test func videoPlaybackPreventsIdleSleepAcrossReplacementAndReopen() async throws {

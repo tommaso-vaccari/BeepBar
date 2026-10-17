@@ -240,10 +240,6 @@ struct RecordingsListing: Equatable {
     private var playbackMetadata: (recordingID: String, metadata: RecordingPlaybackMetadata)?
     /// The WeBeep profile's email address, or nil: any failure is "ask the user", never an error.
     private let fetchProfileEmail: @MainActor () async -> String?
-    /// Brings the lecture already playing forward for a menu Play of that same lecture
-    /// (`playFromMenu`). Activates the whole app until the player has its own front API
-    /// (package P4, `RecordingPlaying.bringToFront()`); injected so tests don't touch `NSApp`.
-    private let bringPlayerForward: @MainActor () -> Void
     /// Created by the first Play that has a stream, never earlier.
     private var player: RecordingPlaying?
     /// The lectures whose reports are still accepted, by recording id. Filled before a `play` (the
@@ -480,14 +476,12 @@ struct RecordingsListing: Equatable {
         makePlayer: @escaping @MainActor () -> RecordingPlaying = { RecordingPlayerController() },
         courses: @escaping @MainActor () -> [RemoteCourseSummary] = { [] },
         fetchProfileEmail: @escaping @MainActor () async -> String? = { nil },
-        bringPlayerForward: @escaping @MainActor () -> Void = { NSApplication.shared.activate() },
         listingCapacity: Int = RecordingsController.listingCapacity,
         playbackURLCapacity: Int = RecordingsController.playbackURLCapacity
     ) {
         self.makePlayer = makePlayer
         self.courses = courses
         self.fetchProfileEmail = fetchProfileEmail
-        self.bringPlayerForward = bringPlayerForward
         listings = BoundedCache(capacity: listingCapacity)
         playbackURLs = BoundedCache(capacity: playbackURLCapacity)
         self.makeBrowser = makeBrowser
@@ -945,7 +939,9 @@ struct RecordingsListing: Equatable {
         guard resumeOwner() == owner else { return true }
         guard let key = Self.courseKey(of: recording), Self.validatedNext(recording, for: key) else { return false }
         if stillShowing(recording) {
-            bringPlayerForward()
+            // The player's own front API, not `NSApp.activate()`: a minimized window has to be
+            // restored from the Dock, or the click does nothing visible (issue #193).
+            player?.bringToFront()
             return true
         }
         open(recording, .play)

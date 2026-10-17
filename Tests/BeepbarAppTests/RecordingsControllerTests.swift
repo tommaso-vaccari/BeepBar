@@ -162,6 +162,10 @@ import BeepbarCore
 
     func adoptPolicyToRestore(_ policy: NSApplication.ActivationPolicy) { adoptedPolicies.append(policy) }
 
+    /// How many times the controller brought the open window forward (`bringToFront`).
+    private(set) var broughtToFront = 0
+    func bringToFront() { if isOpen { broughtToFront += 1 } }
+
     /// Reports the lecture on screen, if any, with `reason`: what the real player's checkpoint
     /// carries.
     private func report(_ reason: RecordingCheckpoint.Reason) {

@@ -41,8 +41,7 @@ struct RecordingsSyncRefreshTests {
             copy: { world.copied.append($0) },
             now: { MainActor.assumeIsolated { world.now } },
             makePlayer: { world.playersMade += 1; return world.player },
-            courses: { world.courses },
-            bringPlayerForward: {}
+            courses: { world.courses }
         )
     }
 

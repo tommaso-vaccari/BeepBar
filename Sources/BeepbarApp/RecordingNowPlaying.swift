@@ -96,7 +96,8 @@ enum NowPlayingCommand: Equatable {
     func activate(onCommand: @escaping @MainActor (NowPlayingCommand) -> Void) -> Bool
     /// Replaces the record. Only called between `activate` and `deactivate`.
     func publish(_ state: NowPlayingState)
-    /// Clears the record and removes the commands. Idempotent; safe without `activate`.
+    /// Clears the record (state Stopped) and removes and disables the commands. Idempotent; safe
+    /// without `activate`.
     func deactivate()
 }
 
@@ -352,9 +353,16 @@ enum RecordingArtwork {
         }
     }
 
+    /// Gives Now Playing back when the player window closes. The commands are app-wide
+    /// singletons that `activate` enabled, so each is also disabled (issue #199): removing the
+    /// target alone left them enabled with nothing behind them, which can keep BeepBar a
+    /// candidate for the media keys after the lecture closed. Safe because nothing else in the
+    /// app uses them once the window is gone (AVKit's publication was off for that window, and
+    /// the next `activate` enables them again).
     func deactivate() {
         for (command, target) in targets {
             _ = command.perform(NSSelectorFromString("removeTarget:"), with: target)
+            if command.responds(to: NSSelectorFromString("setEnabled:")) { command.setValue(false, forKey: "enabled") }
         }
         targets = []
         artworkObject = nil

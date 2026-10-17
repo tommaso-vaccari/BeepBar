@@ -1483,6 +1483,9 @@ enum MaterialsRunEnd: Equatable, Sendable {
             case .incompatibleResponse: return AppFailure.incompatibleResponse.detail
             }
         case is CredentialStorageError: return AppFailure.credentialUnavailable.detail
+        // Preview and apply settle interrupted Moodle moves first; an unreadable one blocks
+        // "Organizza cartelle" until fixed, so the sheet names the path as a sync does (#184).
+        case let error as RemoteMoveRecoveryError: return unreadableMoveMessage(error.path).text
         case is FileStoreError: return tr("Impossibile accedere ai file del corso. Controlla la cartella e riprova.", "Couldn't access the course files. Check the folder and try again.")
         default: return tr("Operazione non riuscita. Riprova.", "Operation failed. Try again.")
         }
@@ -2516,6 +2519,11 @@ enum MaterialsRunEnd: Equatable, Sendable {
                 case .done, .gone: break
                 default: self.reportConflictChoiceFeedback(SyncCopy.remoteChangeFeedback(outcome, action: action), rootID: rootID)
                 }
+            } catch let error as RemoteMoveRecoveryError {
+                // `perform` settles interrupted Moodle moves first; an unreadable one blocks every
+                // choice here, even those that touch no file, until the user fixes that path. Name
+                // it, as a sync does, instead of the generic failure (#184).
+                self?.reportConflictChoiceFeedback(Self.unreadableMoveMessage(error.path), rootID: rootID)
             } catch {
                 self?.reportConflictChoiceFeedback(BilingualText("Impossibile completare la scelta. Nessun file è stato sovrascritto o cancellato definitivamente.", "Couldn't carry out the choice. No file was overwritten or permanently deleted."), rootID: rootID)
             }

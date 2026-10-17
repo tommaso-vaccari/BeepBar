@@ -211,10 +211,11 @@ import Testing
         #expect(harness.controller.lastRecordingsOutcome == nil)
     }
 
-    /// Proves that a refresh ending `.unavailable`, `.needsSignIn` or `.cancelled` leaves the
-    /// materials state and the notifications exactly as a refresh that skipped would. Guards
-    /// against the follow-up reporting its trouble through `setSyncState` or a failure notification.
-    @Test(arguments: [RecordingsSyncOutcome.unavailable, .needsSignIn, .cancelled])
+    /// Proves that a refresh ending `.unavailable`, `.needsSignIn` or `.cancelled` with nothing
+    /// newly published leaves the materials state and the notifications exactly as a refresh that
+    /// skipped would. Guards against the follow-up reporting its trouble through `setSyncState` or
+    /// a failure notification.
+    @Test(arguments: [RecordingsSyncOutcome.unavailable(newlyPublished: 0), .needsSignIn(newlyPublished: 0), .cancelled])
     func aRecordingsFailureLeavesTheSyncStateAndNotificationsAlone(_ outcome: RecordingsSyncOutcome) async throws {
         let baseline = try await Harness()
         defer { baseline.remove() }
@@ -236,6 +237,24 @@ import Testing
         #expect(harness.center.sent.map { $0.prefix(17) } == expectedSent.map { $0.prefix(17) })
         #expect(!harness.center.sent.isEmpty)
         #expect(harness.controller.lastRecordingsOutcome == outcome)
+    }
+
+    /// Proves that a refresh cut short after publishing new lectures still announces them through
+    /// the follow-up, and only them: one "new recordings" notification on top of what a skipped
+    /// refresh sends (issue #190). Mutation: make `count(for:)` return nil for the early endings.
+    @Test(arguments: [RecordingsSyncOutcome.unavailable(newlyPublished: 2), .needsSignIn(newlyPublished: 2)])
+    func aRefreshCutShortStillAnnouncesWhatItPublished(_ outcome: RecordingsSyncOutcome) async throws {
+        let baseline = try await Harness()
+        defer { baseline.remove() }
+        baseline.seam.result = .skipped(.noCourses)
+        await baseline.controller.runAutomaticSyncForTesting()
+
+        let harness = try await Harness()
+        defer { harness.remove() }
+        harness.seam.result = outcome
+        await harness.controller.runAutomaticSyncForTesting()
+        #expect(harness.center.sent.filter { $0 == "beepbar-new-recordings" }.count == 1)
+        #expect(harness.center.sent.count == baseline.center.sent.count + 1)
     }
 
     /// Proves the follow-up decision after a failed materials run: a WeBeep service failure still

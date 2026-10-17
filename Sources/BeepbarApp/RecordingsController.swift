@@ -2455,14 +2455,29 @@ struct RecordingsListing: Equatable {
     /// Empties the queue, and with it every sync refresh still waiting, answered `background`
     /// (what emptied it: the session lapsed, Polimi not answering, a cancellation). Required, so
     /// no new way of clearing the queue can leave a caller of `refreshForSync` waiting forever.
-    private func clearQueue(background outcome: RecordingsSyncOutcome) {
+    private func clearQueue(background end: BackgroundEnd) {
         queue.removeAll()
         runningKey = nil
         openingRecordingID = nil
         for key in listings.keys where listings[key]?.isLoading == true {
             listings[key]?.isLoading = false
         }
-        for id in Array(backgroundWaiters.keys) { resolveBackground(id, outcome) }
+        for id in Array(backgroundWaiters.keys) {
+            // Each waiter keeps the lectures its finished courses already published (#190).
+            let newlyPublished = backgroundWaiters[id]?.newlyPublished ?? 0
+            switch end {
+            case .needsSignIn: resolveBackground(id, .needsSignIn(newlyPublished: newlyPublished))
+            case .unavailable: resolveBackground(id, .unavailable(newlyPublished: newlyPublished))
+            case .cancelled: resolveBackground(id, .cancelled)
+            }
+        }
+    }
+
+    /// What emptied the queue (`clearQueue`), turned into each waiting sync refresh's outcome with
+    /// its own count: the early endings carry the lectures its finished courses already published
+    /// (issue #190), a cancellation carries nothing (`RecordingsSyncOutcome.cancelled`).
+    private enum BackgroundEnd {
+        case needsSignIn, unavailable, cancelled
     }
 
     /// Sign-in, turn-off and an account change decide access themselves: the first visit's check

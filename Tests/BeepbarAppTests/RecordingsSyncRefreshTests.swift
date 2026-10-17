@@ -150,7 +150,7 @@ struct RecordingsSyncRefreshTests {
     @Test func noSessionOpensNothing() async throws {
         defer { cleanUp() }
         let controller = try launched(withSession: false)
-        #expect(await controller.refreshForSync([course], force: false) == .needsSignIn)
+        #expect(await controller.refreshForSync([course], force: false) == .needsSignIn(newlyPublished: 0))
         #expect(world.browsersMade == 0)
         #expect(browser.calls.isEmpty)
         #expect(controller.access == .needsSignIn(nil))
@@ -170,7 +170,7 @@ struct RecordingsSyncRefreshTests {
         #expect(await controller.refreshForSync([course], force: false) == .refreshed(newlyPublished: 0, failedKeys: 0))
         browser.listResults[course.courseCode] = .failure(RecmanBrowserError.needsSignIn)
         var seen = browser.calls.count
-        #expect(await controller.refreshForSync([course], force: true) == .needsSignIn)
+        #expect(await controller.refreshForSync([course], force: true) == .needsSignIn(newlyPublished: 0))
         #expect(!browser.calls.dropFirst(seen).contains("signIn"), "no sign-in, so no window")
         #expect(!browser.isOpen)
         #expect(controller.access == .needsSignIn(nil))
@@ -216,8 +216,29 @@ struct RecordingsSyncRefreshTests {
         // Listed in key order: `other` (052499) first.
         browser.listResults[other.courseCode] = .failure(RecmanBrowserError.unavailable)
         list(["x"])
-        #expect(await controller.refreshForSync([course, other], force: true) == .unavailable)
+        #expect(await controller.refreshForSync([course, other], force: true) == .unavailable(newlyPublished: 0))
         #expect(browser.listCalls == ["052499"])
+    }
+
+    /// A batch cut short after an earlier course published new lectures keeps their count in its
+    /// outcome, so they are still announced (issue #190): they are on the page with their dots
+    /// and the next sync compares against them, so dropping the count lost the "N nuove
+    /// registrazioni" for good. Covers both early endings, Polimi not answering and the session
+    /// lapsing, on the second course in key order (`other`, 052499, lists first).
+    /// Mutation: resolve `.needsSignIn`/`.unavailable` with 0 in `clearQueue` (count lost).
+    @Test(arguments: [RecmanBrowserError.unavailable, .needsSignIn])
+    func aBatchCutShortKeepsWhatItAlreadyPublished(_ failure: RecmanBrowserError) async throws {
+        defer { cleanUp() }
+        let controller = try launched()
+        list(["x"], for: other)
+        list(["a"])
+        #expect(await controller.refreshForSync([course, other], force: true) == .refreshed(newlyPublished: 0, failedKeys: 0), "baseline")
+        list(["x", "y", "z"], for: other)
+        browser.listResults[course.courseCode] = .failure(failure)
+        let outcome = await controller.refreshForSync([course, other], force: true)
+        #expect(outcome == (failure == .unavailable ? .unavailable(newlyPublished: 2) : .needsSignIn(newlyPublished: 2)))
+        #expect(controller.listing(for: other)?.recordings?.map(\.id) == ["x", "y", "z"], "already published")
+        #expect(RecordingsNotificationDecision.count(for: outcome, notificationsEnabled: true) == 2)
     }
 
     // MARK: Identity changes while a listing is in flight

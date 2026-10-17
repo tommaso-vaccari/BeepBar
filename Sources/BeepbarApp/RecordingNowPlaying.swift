@@ -117,10 +117,13 @@ enum RecordingNowPlayingPolicy {
     }
     /// `MPNowPlayingInfoMediaTypeVideo`.
     static let videoMediaType = 2
-    /// `MPNowPlayingPlaybackState`: playing, paused, stopped.
+    /// `MPNowPlayingPlaybackState`: playing, paused, stopped. The header's order is Unknown 0,
+    /// Playing 1, Paused 2, Stopped 3, Interrupted 4; a test checks each against the real enum.
+    /// Closing the player must say Stopped: Interrupted (4, the value written before issue #192)
+    /// tells the system playback will resume, so it may keep BeepBar as a paused Now Playing app.
     static let playingState = 1
     static let pausedState = 2
-    static let stoppedState = 4
+    static let stoppedState = 3
     /// `MPRemoteCommandHandlerStatus.success`, the only status returned: the handler answers at
     /// once and hands the command to the main actor, where one that cannot apply (a seek before
     /// the lecture has a timeline) simply does nothing.

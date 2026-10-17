@@ -921,6 +921,66 @@ struct RecordingsControllerTests {
         #expect(defaults.object(forKey: RecordingsController.acknowledgedKey) == nil)
     }
 
+    /// A Polimi sign-in completed while the WeBeep account was unknown has no session owner, so
+    /// nothing was saved. When an account then appears with that browser still open, the live
+    /// session can't be attributed: it goes, and the page asks for a sign-in (#191). Only memory
+    /// goes: the seen history's namespace is not rotated (the history is scoped by owner and
+    /// would hold the same student's progress if the account merely became known).
+    /// Guards a second student using the first one's Polimi login.
+    /// Mutation: restore `guard let sessionOwner, sessionOwner != userID` (browser stays open).
+    @Test func anAccountAppearingDropsALiveSessionWithNoOwner() async throws {
+        defer { cleanUp() }
+        defaults.set(true, forKey: RecordingsController.enabledKey)
+        world.owner = nil
+        let controller = makeController()
+        let namespace = defaults.string(forKey: RecordingsController.historyNamespaceKey)
+        controller.pageAppeared()
+        controller.signIn()
+        await settle("signed in, page open") { controller.access == .ready && browser.isOpen }
+        await controller.settleSessionFile()
+        #expect(try store.load() == nil, "fixture: an unknown owner saves nothing")
+
+        world.owner = 8
+        controller.webBeepAccountChanged(to: 8)
+        #expect(!browser.isOpen)
+        #expect(controller.access == .needsSignIn(nil))
+        #expect(defaults.string(forKey: RecordingsController.historyNamespaceKey) == namespace, "the seen history is untouched")
+    }
+
+    /// With no session owner, listings recorded under the account WeBeep reported at the time
+    /// (`ownerUserID()` fallback) and their watch progress go when the account changes (#191);
+    /// with nothing in memory, the account becoming known changes nothing (a normal launch
+    /// stays free and a sign-in made meanwhile stays usable).
+    /// Mutations: restore `guard let sessionOwner, sessionOwner != userID` (the listing and its
+    /// progress stay for account 8); drop the `unattributedMemory` emptiness checks (the first
+    /// `webBeepAccountChanged(to: 7)` asks for a sign-in).
+    @Test func anAccountChangeWithNoSessionOwnerDropsListingsInMemory() async throws {
+        defer { cleanUp() }
+        defaults.set(true, forKey: RecordingsController.enabledKey)
+        world.owner = nil
+        let controller = makeController()
+        controller.signIn()
+        await settle("signed in and closed") { controller.access == .ready && !browser.isOpen }
+        world.owner = 7
+        controller.webBeepAccountChanged(to: 7)
+        #expect(controller.access == .ready, "nothing in memory: nothing dropped")
+
+        browser.listResults[course.courseCode] = .success([recording("a")])
+        controller.pageAppeared()
+        controller.refresh([course], selected: course)
+        await settle("listed under the reported account") { controller.listing(for: course)?.recordings?.count == 1 }
+        #expect(!controller.watchProgress.known.isEmpty, "fixture: the listing's progress is known")
+        await controller.settleSessionFile()
+        #expect(try store.load() == nil, "fixture: still no session owner")
+
+        world.owner = 8
+        controller.webBeepAccountChanged(to: 8)
+        #expect(controller.listings.isEmpty)
+        #expect(controller.watchProgress.known.isEmpty)
+        #expect(!browser.isOpen)
+        #expect(controller.access == .needsSignIn(nil))
+    }
+
     /// A file that can't be decoded (damage, a future version) is deleted and the user signs in
     /// again; one that can't be read right now (a disk error) is kept for the next try.
     @Test func anUndecodableSessionIsDeletedButAnUnreadableOneIsKept() async throws {

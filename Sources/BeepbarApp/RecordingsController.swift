@@ -676,6 +676,16 @@ struct RecordingsListing: Equatable {
 
     /// Called when the WeBeep account becomes known or changes. A session made for another
     /// account is dropped together with what that account had seen.
+    ///
+    /// With no session owner (a Polimi sign-in completed while the WeBeep account was unknown,
+    /// so nothing was saved), the live browser and whatever the controller holds in memory
+    /// (listings, playback links, watch progress) can't be attributed to anyone: they are
+    /// dropped as well, or the new account would use the previous student's Polimi login and
+    /// see their lectures (#191). Only memory goes in that case: the seen history, the resume
+    /// points and the session file are scoped by owner (and checked when read), and wiping
+    /// them could erase the same student's progress when the account merely became known. The
+    /// cost is one more "Accedi con Polimi" in that rare case. Nothing in memory, nothing done:
+    /// the account becoming known at a normal launch stays free.
     func webBeepAccountChanged(to userID: Int) {
         loadStudy()
         // Before the session check: an address learned with no Polimi session yet belongs to the
@@ -686,18 +696,25 @@ struct RecordingsListing: Equatable {
         }
         resumePoints = nil
         Self.forgetResumePoints(in: defaults, notOwnedBy: userID)
-        guard let sessionOwner, sessionOwner != userID else { return }
-        log.notice("Polimi session belongs to another WeBeep account: dropped")
+        let foreignSession = sessionOwner.map { $0 != userID } ?? false
+        let unattributedMemory = sessionOwner == nil && (browser != nil || !playbackURLs.isEmpty
+            || !watchProgress.known.isEmpty || listings.values.contains { $0.recordings != nil })
+        guard foreignSession || unattributedMemory else { return }
+        log.notice("Polimi session belongs to another or an unknown WeBeep account: dropped foreign=\(foreignSession, privacy: .public)")
         supersedeInitialSessionCheck()
         closePlayerForIdentityChange()
         invalidate()
         closeBrowser()
         listings.removeAll()
         playbackURLs.removeAll()
-        forgetSeen()
-        forgetResumePoints()
-        forgetEmailOptOut()
-        discardSessionFile()
+        if foreignSession {
+            forgetSeen()
+            forgetResumePoints()
+            forgetEmailOptOut()
+            discardSessionFile()
+        } else {
+            watchProgress.reset()
+        }
         if isEnabled { access = .needsSignIn(nil) }
     }
 

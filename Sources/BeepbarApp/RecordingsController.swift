@@ -2099,10 +2099,13 @@ struct RecordingsListing: Equatable {
 
     /// Saves a course's summary under `owner`, only when it differs from the saved one: a listing
     /// or a write that changes nothing in it writes nothing. The comparison is of the whole value,
-    /// `next` included, so only a change of the counts or of the next lecture writes.
+    /// `next` included, so only a change of the counts or of the next lecture writes. Both sides
+    /// go through the saved projection (`StoredCourseWatchSummary.persisted`): after a relaunch
+    /// the in-memory copy is the decoded one, whose `next` lacks the date, kind and size, and a
+    /// raw comparison rewrote and republished every course after each launch (#189).
     private func storeWatchSummary(_ summary: CourseWatchSummary, for key: RecmanCourseKey, owner: Int) {
         loadWatchSummaries(owner: owner)
-        guard watchSummaries[key] != summary else { return }
+        guard watchSummaries[key].map({ StoredCourseWatchSummary($0).persisted }) != StoredCourseWatchSummary(summary).persisted else { return }
         var updated = watchSummaries
         updated[key] = summary
         let stored = StoredWatchSummaries(owner: owner, courses: Dictionary(uniqueKeysWithValues: updated.map { (Self.baselineID(courseCode: $0.key.courseCode, academicYear: $0.key.academicYear), $0.value) }))

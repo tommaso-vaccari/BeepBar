@@ -189,13 +189,28 @@ extension RecordingsPresentationTests {
             if let field = view as? NSTextField, field.isEditable { return field }
             return view.subviews.lazy.compactMap { searchField(in: $0) }.first
         }
-        try await Task.sleep(for: .milliseconds(150))
-        host.layoutSubtreeIfNeeded()
+        /// The Watchlist's list, right of the sidebar (also a list); gone once the last
+        /// bookmark is removed and the empty state replaces it.
+        func detailTable(in view: NSView) -> NSTableView? {
+            if let table = view as? NSTableView, table.convert(table.bounds, to: nil).minX > 200 { return table }
+            return view.subviews.lazy.compactMap { detailTable(in: $0) }.first
+        }
+        /// Lays out until `condition` holds, at most 10 s: polling on an observable fact instead
+        /// of a fixed sleep a loaded runner can outlast (#223).
+        func settle(until condition: () -> Bool) async throws {
+            let deadline = Date().addingTimeInterval(10)
+            while !condition() && Date() < deadline {
+                host.layoutSubtreeIfNeeded()
+                try await Task.sleep(for: .milliseconds(10))
+            }
+            host.layoutSubtreeIfNeeded()
+        }
+        try await settle { searchField(in: host) != nil && detailTable(in: host) != nil }
         let field = try #require(searchField(in: host))
         let initial = field.convert(field.bounds, to: host).minY
         controller.toggleWatchlist(lesson, courseName: "NLA")
-        try await Task.sleep(for: .milliseconds(150))
-        host.layoutSubtreeIfNeeded()
+        try await settle { detailTable(in: host) == nil }
+        #expect(detailTable(in: host) == nil, "the empty Watchlist never replaced the list")
         let empty = try #require(searchField(in: host))
         #expect(abs(empty.convert(empty.bounds, to: host).minY - initial) < 1)
     }

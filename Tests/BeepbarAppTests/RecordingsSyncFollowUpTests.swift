@@ -417,6 +417,40 @@ import Testing
         await followUp.value
     }
 
+    /// A follow-up the dropped schedule already cancelled but that has not finished unwinding (its
+    /// refresh ignores cancellation for a while, as a WebKit listing can) must not take in a
+    /// "Sincronizza ora": the user's sync would end with no refresh at all. Proves the manual
+    /// sync starts a refresh of its own. Guards against the merge branch of
+    /// `startRecordingsFollowUp` returning a cancelled task (RB-104 of #225).
+    @Test func aManualSyncDoesNotMergeIntoAFollowUpTheDroppedScheduleCancelled() async throws {
+        let schedule = TestSchedule()
+        let harness = try await Harness(schedule: schedule)
+        defer { harness.remove() }
+        harness.controller.setFollowUpActivityHoldForTesting(.seconds(30))
+        let gate = FakeRecmanBrowser.Gate()
+        harness.seam.gate = gate
+        let fired = Task { @MainActor in await schedule.fire(0) }
+        await harness.waitForCalls(1)
+        let cancelled = try #require(harness.controller.recordingsFollowUpForTesting)
+
+        harness.controller.setAutomaticSync(enabled: false)
+        #expect(await fired.value == .finished)
+        #expect(cancelled.isCancelled, "no manual sync relied on it, so the schedule stopped it")
+        #expect(harness.controller.recordingsFollowUpForTesting == cancelled, "it is still unwinding")
+
+        harness.controller.synchronizeNow()
+        await harness.waitForCalls(2)
+        #expect(harness.seam.calls.count == 2, "the manual sync got no refresh of its own")
+        #expect(harness.seam.calls.last?.force == true)
+        let fresh = try #require(harness.controller.recordingsFollowUpForTesting)
+        #expect(fresh != cancelled)
+
+        gate.release()
+        await cancelled.value
+        await fresh.value
+        #expect(harness.controller.recordingsFollowUpForTesting == nil)
+    }
+
     /// Waits until the automatic run of `fired` has finished its materials and sits in the hold
     /// (its sync is over and `completion` has not come), so a cancellation lands on the hold.
     private static func waitUntilHeld(_ fired: Task<NSBackgroundActivityScheduler.Result, Never>, _ harness: Harness) async throws {

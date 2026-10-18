@@ -3610,7 +3610,11 @@ enum MaterialsRunEnd: Equatable, Sendable {
         guard !isTerminating else { return nil }
         guard let materials = Self.recordingsOutcome(for: end) else { return nil }
         guard case .refresh = recordingsSyncDecision(after: materials, trigger: trigger, network: nil).0 else { return nil }
-        if let recordingsFollowUp {
+        // A follow-up the dropped schedule already cancelled can still be unwinding (a refresh
+        // that ignores cancellation for a while): merging into it would leave this request with no
+        // refresh at all, so it counts as absent. The old task's `defer` compares ids, so it
+        // clears only itself (RB-104 of #225).
+        if let recordingsFollowUp, !recordingsFollowUp.isCancelled {
             if trigger == .manual { recordingsFollowUpReliance.markManual() }
             return recordingsFollowUp
         }

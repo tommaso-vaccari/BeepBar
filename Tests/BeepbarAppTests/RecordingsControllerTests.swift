@@ -3099,7 +3099,8 @@ struct RecordingsControllerTests {
     /// Mutations: drop the pending-recovery check in `playerFailed` and "browser" opens it twice;
     /// drop it together with the item check in `recoverPlayback` (`start == lectureStarts`) and
     /// "fresh" also closes the recovered player and opens the browser. The item check alone is
-    /// masked by the pending-recovery check, which stops the second recovery first.
+    /// masked here by the pending-recovery check, which stops the second recovery first; it has
+    /// its own test, `aStaleRecoveryNeverReplacesTheNewerItemOfTheSameLecture`.
     @Test(arguments: ["fresh", "browser"])
     func aSecondFailureDuringARecoveryQueuesNoSecondRecovery(outcome: String) async throws {
         defer { cleanUp() }
@@ -3128,6 +3129,95 @@ struct RecordingsControllerTests {
         } else {
             #expect(world.opened == [playerLink("a")], "the browser opened more than once")
         }
+        controller.turnOff()
+    }
+
+    /// RB-101 on #197: the student presses Play again on the lecture already open; the old item
+    /// fails during that lookup, so a recovery of the OLD item is queued and runs after the new
+    /// item starts. The new item then fails before it is ready (its window closes), either while
+    /// that stale recovery is still looking up a stream ("running") or in the very turn the new
+    /// item starts, the stale recovery still queued ("queued"). The new item's failure must get
+    /// its own recovery, here the browser: before the fix the pending-recovery check matched the
+    /// lecture id alone, ignored the report, and the stale recovery then gave up (its item was
+    /// replaced), leaving no window, no browser and no message.
+    /// Mutations: drop the item comparison (`start == lectureStarts`) from the running half of
+    /// the pending check in `playerFailed` and "running" never opens the browser; drop it from
+    /// the queued half and "queued" never does.
+    @Test(arguments: ["running", "queued"])
+    func aFailureOfANewerItemIsRecoveredWhileAStaleRecoveryIsPending(stage: String) async throws {
+        defer { cleanUp() }
+        browser.streamResults["a"] = [.success(stream("a")), .success(stream("a")), .success(stream("a"))]
+        browser.playbackResults["a"] = .success(playerLink("a"))
+        // A known address, as after a first Play: the recovery goes straight to the stream lookup.
+        world.profileEmail = "mario.rossi@mail.polimi.it"
+        let controller = await readyController()
+        controller.play(recording("a"))
+        await settle("a playing") { world.player.plays.count == 1 }
+        let lookup = FakeRecmanBrowser.Gate()
+        defer { lookup.release() }
+        browser.streamGates["a"] = lookup
+        // Play again on the open lecture; the old item dies while the new stream is looked up.
+        controller.play(recording("a"))
+        await settle("second Play looking up") { lookup.isWaiting }
+        world.player.failDuringPlayback(at: 700)
+        let staleRecovery = FakeRecmanBrowser.Gate()
+        defer { staleRecovery.release() }
+        // Swapped in the same turn: the released lookup already holds its own gate.
+        if stage == "queued" {
+            // Inside the turn the new item starts: the worker hasn't taken the stale recovery yet.
+            world.player.afterPlay = {
+                world.player.afterPlay = nil
+                world.player.failBeforeReady()
+            }
+        }
+        lookup.release()
+        browser.streamGates["a"] = staleRecovery
+        if stage == "running" {
+            await settle("new item playing, stale recovery looking up") { world.player.plays.count == 2 && staleRecovery.isWaiting }
+            world.player.failBeforeReady()
+            staleRecovery.release()
+        } else {
+            await settle("new item started") { world.player.plays.count == 2 }
+            staleRecovery.release()
+        }
+        await settle("the new item's failure recovered") { !world.opened.isEmpty || !world.player.problems.isEmpty }
+        await drainTasks()
+        #expect(world.opened == [playerLink("a")], "the new item's failure was swallowed")
+        controller.turnOff()
+    }
+
+    /// The same Play-again race, but the new item plays fine: the stale recovery of the OLD item
+    /// must not restart the lecture over it when its fresh stream arrives. Every other check of
+    /// `recoverPlayback`'s `isCurrent` passes here (same Play, same lecture, its window open), so
+    /// only the item check stops it.
+    /// Mutation: drop `start == self.lectureStarts` from `isCurrent` and the player is handed a
+    /// third item at the old failure point.
+    @Test func aStaleRecoveryNeverReplacesTheNewerItemOfTheSameLecture() async throws {
+        defer { cleanUp() }
+        browser.streamResults["a"] = [.success(stream("a")), .success(stream("a")), .success(stream("a"))]
+        browser.playbackResults["a"] = .success(playerLink("a"))
+        // A known address, as after a first Play: the recovery goes straight to the stream lookup.
+        world.profileEmail = "mario.rossi@mail.polimi.it"
+        let controller = await readyController()
+        controller.play(recording("a"))
+        await settle("a playing") { world.player.plays.count == 1 }
+        let lookup = FakeRecmanBrowser.Gate()
+        defer { lookup.release() }
+        browser.streamGates["a"] = lookup
+        controller.play(recording("a"))
+        await settle("second Play looking up") { lookup.isWaiting }
+        world.player.failDuringPlayback(at: 700)
+        let staleRecovery = FakeRecmanBrowser.Gate()
+        defer { staleRecovery.release() }
+        lookup.release()
+        browser.streamGates["a"] = staleRecovery
+        await settle("new item playing, stale recovery looking up") { world.player.plays.count == 2 && staleRecovery.isWaiting }
+        staleRecovery.release()
+        await settle("stale recovery finished") { browser.streamResults["a"]?.isEmpty == true }
+        await drainTasks()
+        #expect(world.player.plays.count == 2, "the stale recovery replaced the newer item")
+        #expect(world.player.closes == 0)
+        #expect(world.opened.isEmpty)
         controller.turnOff()
     }
 

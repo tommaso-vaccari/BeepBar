@@ -6,6 +6,24 @@ Status: **Technical remediation delivered; legal/release gate OPEN. Not a GDPR c
 
 This is the controlling plan for the default-on decision; the dated analyses below are supporting history. Issue #180 / PR #181, baseline dev `039dc4092d29c23682ee3a8e802f40923af6ffce`; client reviewed at `5812b9ae59acc8516200bdeec7142ef5802d2ff5`. Product constraints are TelemetryDeck, minimal metadata, default-on and an effective opt-out. The intended result is a defensible decision for this configuration, not a general analytics exemption or a compliance certificate. A supported negative finding is not converted into approval by accepting product risk.
 
+### Binding scope clarification — 2026-10-18
+
+The publisher rejected reducing daily reporting. Preserve the existing at-most-daily protocol, monthly identity, minimal payload, TelemetryDeck and default-on/opt-out. Monthly/change-only/weekly protocols below are analytical comparators, not approved implementation tasks. The publisher selected public-document-only evidence: no provider outreach or paid external engagement is authorized. These constraints supersede earlier proposed execution routes; they do not supply affirmative findings on necessity or lawfulness.
+
+### Public-evidence disposition register
+
+Sources reopened on 2026-10-18: [privacy FAQ](https://telemetrydeck.com/docs/guides/privacy-faq/), [German supplemental agreement](https://telemetrydeck.com/avv/), [architecture/security overview](https://telemetrydeck.com/use-case/architecture-security/). “Not documented in the reviewed public sources” describes the evidence search; it does not mean the provider has no answer or does not follow safeguards. An absent statement is not adopted as a favorable assurance.
+
+| Question | Public answer / reasonable inference | Unanswered portion and effect |
+| --- | --- | --- |
+| Are IPs stored? | FAQ states they are not stored in databases or logs. Reasonable reliance is recorded without requiring an independent audit. | Connection handling still occurs; the statement does not remove every processing operation. |
+| Is event deletion guaranteed? | FAQ expressly gives no guaranteed cold-storage deletion schedule. Account closure retains analytics. Architecture overview offers deletion by arrangement. | This is an explicit limitation, not merely missing information. No arrangement is evidenced as enabled for this account. Do not infer deletion. |
+| Are retained data anonymous? | The provider describes its service as anonymous and supplies anonymization/security assurances. These support risk reduction and may be used as evidence. | This record does not establish the complete native/direct-client dataset's anonymity under reasonably likely identification means. No actual reidentification is asserted. |
+| Do all warranties cover this account/direct client? | The public supplemental agreement describes SDK use; the direct ingest API is documented. | Account-specific acceptance and the scope of SDK-described warranties for this client are not documented in the reviewed public sources. Do not infer either exclusion or confirmed coverage. |
+| Are combination and onward use sufficiently restricted? | Namespace isolation, limits on external identifier handover and infrastructure-access safeguards are documented. | A positive finding on every applicable analytics-exemption condition remains unsupported for this configuration. Do not describe public silence as proof of unrestricted reuse or as a prohibition. |
+
+**Final disposition within this scope:** complete the evidence assessment with daily reporting unchanged and no outreach. Documentary work can be complete while the legal/release finding remains non-positive. No planned reduction or provider contact remains an action awaiting automatic execution. To change that finding requires new applicable evidence or a newly authorized configuration change, rather than another rewording of the same material. The notice remains a draft; no publication approval is inferred.
+
 ### Proposed justification: legitimate interest plus a separate analytics exemption
 
 **Specific interest.** Allocate compatibility testing and version support using the distribution of active installations across BeepBar and major macOS versions. Counting installations, rather than launches, avoids assigning more maintenance priority to versions merely because their users launch the app more often. This purpose is concrete, relevant to the app's maintenance and confirmed by the publisher. Advertising, individual engagement scoring, study analysis and enrichment with account information are outside this justification. No claim that analytics is necessary to perform synchronization or a user contract is made.

@@ -1504,6 +1504,8 @@ enum MaterialsRunEnd: Equatable, Sendable {
         // Preview and apply settle interrupted Moodle moves first; an unreadable one blocks
         // "Organizza cartelle" until fixed, so the sheet names the path as a sync does (#184).
         case let error as RemoteMoveRecoveryError: return unreadableMoveMessage(error.path).text
+        // An unfinished course-folder rename blocks "Organizza cartelle" until a relaunch (#183).
+        case is PendingCourseFolderRenameError: return pendingFolderRenameMessage.text
         case is FileStoreError: return tr("Impossibile accedere ai file del corso. Controlla la cartella e riprova.", "Couldn't access the course files. Check the folder and try again.")
         default: return tr("Operazione non riuscita. Riprova.", "Operation failed. Try again.")
         }
@@ -2247,29 +2249,12 @@ enum MaterialsRunEnd: Equatable, Sendable {
                 let renamer = CourseFolderRenamer(database: database, fileStore: try FileStore(root: rootURL), gate: self.operationGate)
                 try await renamer.rename(rootID: rootID, courseID: course.id, from: oldFolder, to: trimmedFolder)
                 self.courseFolders[course.id] = trimmedFolder
+            } catch is PendingCourseFolderRenameError {
+                // An earlier rename is unfinished until a relaunch (#183): say so, not "failed".
+                self?.courseRenameErrors[course.id] = Self.pendingFolderRenameMessage.text
             } catch {
                 self?.courseRenameErrors[course.id] = (error as? CourseRenameError)?.errorDescription ?? tr("Rinomina non riuscita.", "Rename failed.")
             }
-            // Whatever the outcome: the renamer may have settled an earlier rename that was not
-            // durable (#183), this course's or another's, so the window shows the folder the
-            // database now records instead of the old name (RA-001).
-            await self?.followSavedCourseFolders(rootID: rootID, database: database)
-        }
-    }
-
-    /// Takes each course's folder from its saved scope where the two differ.
-    ///
-    /// Why (RA-001 of #183): a course-folder rename whose flush failed keeps the old name here,
-    /// since `renameFolder` only stores the new one on success, while a later sync or rename
-    /// settles it in the database. A manual sync built from the old name would then recreate
-    /// the old folder and split the course in two. Outside a settle the two always agree
-    /// (`restoreScopes` and `renameFolder` keep them in step), so this changes nothing. Only
-    /// courses already shown are touched; an unreadable database leaves the folders as they are.
-    private func followSavedCourseFolders(rootID: UUID, database: SyncDatabase) async {
-        guard let scopes = try? await database.scopes(rootID: rootID), self.rootID == rootID else { return }
-        for scope in scopes where !scope.localFolder.isEmpty {
-            guard let shown = courseFolders[scope.courseID], shown != scope.localFolder else { continue }
-            courseFolders[scope.courseID] = scope.localFolder
         }
     }
 
@@ -2333,12 +2318,6 @@ enum MaterialsRunEnd: Equatable, Sendable {
                     self.endOperation(operationID)
                     return
                 }
-                // A rename settled by an earlier sync or rename (#183) is followed before the
-                // targets are built, or this run would split the course (RA-001). The run that
-                // settles one follows it inside the coordinator.
-                await self.followSavedCourseFolders(rootID: rootID, database: database)
-                try Task.checkCancellation()
-                guard self.activeOperationID == operationID else { return }
                 let targets = selected.map { SyncTarget(courseID: $0.id, localFolder: self.folder(for: $0)) }
                 let token = try await self.credentialVault.load()
                 let coordinator = try SyncCoordinator(rootID: rootID, rootURL: rootURL, database: database, gate: self.operationGate, apiClient: self.apiClient, downloader: self.downloader, platformName: self.selectedSite.platformName)
@@ -2357,6 +2336,8 @@ enum MaterialsRunEnd: Equatable, Sendable {
                 self?.busySync(operationID)
             } catch let error as RemoteMoveRecoveryError {
                 await self?.failedSync(operationID, error: nil, automatic: false, unreadableMove: error.path)
+            } catch is PendingCourseFolderRenameError {
+                await self?.failedSync(operationID, error: nil, automatic: false, pendingFolderRename: true)
             } catch {
                 await self?.failedSync(operationID, error: nil, automatic: false)
             }
@@ -3487,6 +3468,8 @@ enum MaterialsRunEnd: Equatable, Sendable {
                 self?.deferredAutomaticSync(operationID)
             } catch let error as RemoteMoveRecoveryError {
                 await self?.failedSync(operationID, error: nil, automatic: true, unreadableMove: error.path)
+            } catch is PendingCourseFolderRenameError {
+                await self?.failedSync(operationID, error: nil, automatic: true, pendingFolderRename: true)
             } catch {
                 await self?.failedSync(operationID, error: nil, automatic: true)
             }
@@ -3823,6 +3806,16 @@ enum MaterialsRunEnd: Equatable, Sendable {
             "BeepBar can't read “\(path.value)”, part of an unfinished move to follow Moodle. Check that there's no alias or folder in its place and that the file is accessible, then choose “Sync now”.")
     }
 
+    /// What the window says while a course-folder rename is unfinished
+    /// (`PendingCourseFolderRenameError`, #183): sync, course renames and "Organizza cartelle"
+    /// stay blocked until BeepBar restarts, when launch recovery finishes the rename. It tells the
+    /// student the one thing that unblocks it and that their files were not touched.
+    nonisolated static var pendingFolderRenameMessage: BilingualText {
+        BilingualText(
+            "La rinomina di una cartella del corso è rimasta a metà. Riavvia BeepBar per completarla: fino ad allora sincronizzazione e rinomine sono sospese. I tuoi file non sono stati toccati.",
+            "A course folder rename was left unfinished. Restart BeepBar to complete it: until then, syncing and renaming are paused. Your files haven't been touched.")
+    }
+
     private func deferredAutomaticSync(_ operationID: UUID) {
         guard activeOperationID == operationID else { return }
         recordRunEnd(operationID, .deferredWhileBusy)
@@ -3836,16 +3829,22 @@ enum MaterialsRunEnd: Equatable, Sendable {
     /// "Sincronizzazione incompleta", since nothing syncs in that folder until the user fixes that
     /// path (release review I-A4). The notification stays the generic one: it has no room for a
     /// path, and opening BeepBar shows it.
-    private func failedSync(_ operationID: UUID, error: WeBeepAPIError?, automatic: Bool, unreadableMove: RelativePath? = nil) async {
+    ///
+    /// `pendingFolderRename`: the run refused because a course-folder rename is unfinished
+    /// (`PendingCourseFolderRenameError`, #183); the window says to restart BeepBar instead of
+    /// the generic failure, since every run refuses until then.
+    private func failedSync(_ operationID: UUID, error: WeBeepAPIError?, automatic: Bool, unreadableMove: RelativePath? = nil, pendingFolderRename: Bool = false) async {
         guard activeOperationID == operationID else { return }
         recordRunEnd(operationID, error.map(MaterialsRunEnd.serviceFailure) ?? .localFailure)
-        BeepbarLog.sync.error("Synchronization failed automatic=\(automatic, privacy: .public) errorType=\(error.map { String(reflecting: type(of: $0)) } ?? (unreadableMove == nil ? "unknown" : "unreadableMove"), privacy: .public)")
+        BeepbarLog.sync.error("Synchronization failed automatic=\(automatic, privacy: .public) errorType=\(error.map { String(reflecting: type(of: $0)) } ?? (unreadableMove != nil ? "unreadableMove" : pendingFolderRename ? "pendingFolderRename" : "unknown"), privacy: .public)")
         if let unreadableMove { BeepbarLog.sync.error("Interrupted move blocked by an unreadable path=\(unreadableMove.value, privacy: .private)") }
         let issue: AutomaticNotificationIssue?
         if let error {
             issue = await handleServiceFailure(error, automatic: automatic)
         } else {
-            setSyncState(.failed(unreadableMove.map { .local(Self.unreadableMoveMessage($0)) } ?? .partialSync))
+            if let unreadableMove { setSyncState(.failed(.local(Self.unreadableMoveMessage(unreadableMove)))) }
+            else if pendingFolderRename { setSyncState(.failed(.local(Self.pendingFolderRenameMessage))) }
+            else { setSyncState(.failed(.partialSync)) }
             issue = automatic ? .partialSync : nil
         }
         let isCurrent = currentNotificationCheck()

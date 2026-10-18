@@ -203,59 +203,62 @@ import os
         #expect(!FileManager.default.fileExists(atPath: install.file.path))
     }
 
-    /// A course-folder rename settled in the database by an earlier operation (#183) while the
-    /// window still shows the old name, which is what a rename whose flush failed leaves behind:
-    /// "Sincronizza ora" syncs into the renamed folder (RA-001). Fails if the manual sync builds
-    /// its targets from the stale name: it would recreate an empty "Analisi I", point the course
-    /// at it and download there, splitting the course between two folders.
-    @Test func aManualSyncFollowsACourseRenameSettledEarlier() async throws {
+    /// A course-folder rename whose sync-folder flush failed (#183) blocks the app safely until a
+    /// relaunch, through the real controller: "Sincronizza ora" fails with the message that says
+    /// to restart BeepBar, turning the course off and on again (which writes the old folder name
+    /// the window still shows) does not unblock it, and a rename of another course shows the same
+    /// message. Nothing recreates the old folder or moves the synced file. After launch recovery
+    /// the next launch shows the renamed folder and syncs into it. Guards against the in-session
+    /// settle that split the course (RA-001/RA-003 of PR #225): with the sync guard removed, the
+    /// manual sync recreates "Analisi I" from the stale name.
+    @Test func anUnfinishedCourseRenameBlocksTheAppUntilARelaunch() async throws {
         let install = try await Install.make()
         defer { install.remove() }
         let token = MoodleRecordingProtocol.register(courses: [(1, "Analisi"), (2, "Fisica")], files: [1: ["a.txt"]])
         defer { MoodleRecordingProtocol.revoke(token: token) }
         let controller = await launchAndSave(install, token: token)
+        controller.synchronizeNow()
+        await controller.waitForSyncForTesting()
+        let synced = install.root.appending(path: "Analisi I/Lezioni/a.txt")
+        let original = try Data(contentsOf: synced)
+        // The rename happens on disk but the sync folder cannot be flushed.
+        let failingFlush = try FileStore(root: install.root, beforeMove: nil, syncDirectory: { _ in throw FileStoreError.ioFailure })
+        await #expect(throws: FileStoreError.mutationNotDurable) {
+            try await CourseFolderRenamer(database: install.database, fileStore: failingFlush, gate: RootOperationGate()).rename(rootID: install.rootID, courseID: 1, from: "Analisi I", to: "Renamed")
+        }
         try #require(controller.courseFolders[1] == "Analisi I")
-        // A current list, so the sync does not reload it (and the folders with it) first.
-        try #require(controller.courseListFreshness == .current)
-        let store = try FileStore(root: install.root)
-        let identity = try await store.ensureTopLevelDirectory("Renamed").identity
-        try await install.database.upsertScope(SyncScope(rootID: install.rootID, courseID: 1, displayName: "Analisi", localFolder: "Renamed", enabled: true, managedDirectory: identity))
+        let blocked = AppSyncState.failed(.local(WeBeepAuthenticationController.pendingFolderRenameMessage))
+        let oldFolder = install.root.appending(path: "Analisi I")
+        let course = try #require(controller.courses.first { $0.id == 1 })
 
         controller.synchronizeNow()
         await controller.waitForSyncForTesting()
-        #expect(!FileManager.default.fileExists(atPath: install.root.appending(path: "Analisi I").path), "the sync recreated the old folder")
-        #expect(FileManager.default.fileExists(atPath: install.root.appending(path: "Renamed/Lezioni/a.txt").path))
-        let scope = try await install.database.scope(rootID: install.rootID, courseID: 1)
-        #expect(scope?.localFolder == "Renamed")
-        #expect(scope?.managedDirectory == identity)
-        #expect(controller.courseFolders[1] == "Renamed")
-    }
+        #expect(controller.syncState == blocked)
+        #expect(!FileManager.default.fileExists(atPath: oldFolder.path), "the sync recreated the old folder")
 
-    /// A rename (here of course 2) that settles another course's non-durable rename (#183)
-    /// leaves the window showing the folder the database now records, not the old name
-    /// (RA-001). Fails if `renameFolder` only reads back its own course's success.
-    @Test func aRenameThatSettlesAnEarlierOneShowsItsNewFolder() async throws {
-        let install = try await Install.make()
-        defer { install.remove() }
-        let token = MoodleRecordingProtocol.register(courses: [(1, "Analisi"), (2, "Fisica")])
-        defer { MoodleRecordingProtocol.revoke(token: token) }
-        let controller = await launchAndSave(install, token: token)
-        try #require(controller.courseFolders[1] == "Analisi I")
-        let store = try FileStore(root: install.root)
-        for (course, name, folder) in [(Int64(1), "Analisi", "Analisi I"), (2, "Fisica", "Fisica")] {
-            let identity = try await store.ensureTopLevelDirectory(folder).identity
-            try await install.database.upsertScope(SyncScope(rootID: install.rootID, courseID: course, displayName: name, localFolder: folder, enabled: course == 1, managedDirectory: identity))
-        }
-        // What a rename whose flush failed leaves: the folder renamed on disk, the row pending.
-        try FileManager.default.moveItem(at: install.root.appending(path: "Analisi I"), to: install.root.appending(path: "Renamed"))
-        try await install.database.beginScopeMove(PendingScopeMove(id: UUID(), rootID: install.rootID, courseID: 1, oldFolder: "Analisi I", newFolder: "Renamed"))
+        controller.setCourse(course, enabled: false)
+        controller.setCourse(course, enabled: true)
+        controller.synchronizeNow()
+        await controller.waitForSyncForTesting()
+        #expect(controller.syncState == blocked)
+        #expect(!FileManager.default.fileExists(atPath: oldFolder.path), "the course switch let a sync recreate the old folder")
 
-        controller.renameFolder(for: controller.courses.first { $0.id == 2 }!, to: "Fisica 2")
+        controller.renameFolder(for: try #require(controller.courses.first { $0.id == 2 }), to: "Fisica 2")
         try await waitUntil { controller.renamingCourseID == nil }
-        #expect(controller.courseRenameErrors.isEmpty)
-        #expect(try await install.database.pendingScopeMoves().isEmpty)
-        #expect(controller.courseFolders[2] == "Fisica 2")
-        #expect(controller.courseFolders[1] == "Renamed")
+        #expect(controller.courseRenameErrors[2] == WeBeepAuthenticationController.pendingFolderRenameMessage.text)
+        #expect(try Data(contentsOf: install.root.appending(path: "Renamed/Lezioni/a.txt")) == original)
+        #expect(try await install.database.pendingScopeMoves().count == 1)
+
+        // Quit and relaunch: launch recovery settles the rename before the window is built.
+        _ = try await RecoveryCoordinator(rootID: install.rootID, database: install.database, fileStore: FileStore(root: install.root)).recover()
+        let relaunched = await launchAndSave(install, token: token)
+        #expect(relaunched.courseFolders[1] == "Renamed")
+        relaunched.synchronizeNow()
+        await relaunched.waitForSyncForTesting()
+        guard case .synced = relaunched.syncState else { Issue.record("the sync after recovery did not complete: \(relaunched.syncState)"); return }
+        #expect(!FileManager.default.fileExists(atPath: oldFolder.path))
+        #expect(try Data(contentsOf: install.root.appending(path: "Renamed/Lezioni/a.txt")) == original)
+        #expect(try await install.database.scope(rootID: install.rootID, courseID: 1)?.localFolder == "Renamed")
     }
 
     /// Saved enrollments are not an authorization: "Sincronizza ora" over a saved list asks

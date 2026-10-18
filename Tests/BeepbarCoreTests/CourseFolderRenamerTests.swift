@@ -27,10 +27,12 @@ struct CourseFolderRenamerTests {
         #expect(try await reopened.baseline(rootID: rootID, remoteID: "file")?.relativePath == RelativePath("New/file.txt"))
     }
 
-    /// A rename whose flush failed once no longer blocks every later rename until a relaunch
-    /// (#183): the next rename (of another course) settles the pending one from the disk, then
-    /// runs. Fails when the renamer keeps refusing while the row exists.
-    @Test func aRenameThatWasNotDurableIsSettledByTheNextRename() async throws {
+    /// While a rename whose flush failed is unfinished (#183), renaming another course refuses
+    /// with `PendingCourseFolderRenameError` (the specific error the app explains, not the generic
+    /// database one) and moves nothing: both the pending rename and the other course stay as they
+    /// are. Launch recovery settles the row, after which the same rename succeeds. Fails if the
+    /// renamer settles the pending rename in-session or lets the second rename run.
+    @Test func anUnfinishedRenameBlocksTheNextRenameUntilLaunchRecovery() async throws {
         let root = try temporaryRoot()
         defer { try? FileManager.default.removeItem(at: root) }
         let rootID = UUID()
@@ -42,44 +44,23 @@ struct CourseFolderRenamerTests {
             let identity = try await store.ensureTopLevelDirectory(folder).identity
             try await database.upsertScope(SyncScope(rootID: rootID, courseID: course, displayName: folder, localFolder: folder, enabled: true, managedDirectory: identity))
         }
-        try Data("notes".utf8).write(to: root.appending(path: "Old/file.txt"))
-        try await database.upsertBaseline(rootID: rootID, baseline: Baseline(remoteID: "file", relativePath: RelativePath("Old/file.txt"), sha256: "original", remoteRevision: "1"))
         let renamer = CourseFolderRenamer(database: database, fileStore: store, gate: RootOperationGate())
         flush.failNext(1)
         await #expect(throws: FileStoreError.mutationNotDurable) { try await renamer.rename(rootID: rootID, courseID: 1, from: "Old", to: "New") }
-        #expect(try await database.pendingScopeMoves().count == 1)
 
-        try await renamer.rename(rootID: rootID, courseID: 2, from: "Other", to: "Renamed")
-        #expect(try await database.pendingScopeMoves().isEmpty)
-        #expect(try await database.scope(rootID: rootID, courseID: 1)?.localFolder == "New")
-        #expect(try await database.scope(rootID: rootID, courseID: 2)?.localFolder == "Renamed")
-        #expect(try await database.baseline(rootID: rootID, remoteID: "file")?.relativePath == RelativePath("New/file.txt"))
-        #expect(try Data(contentsOf: root.appending(path: "New/file.txt")) == Data("notes".utf8))
-    }
-
-    /// While the sync folder still cannot be flushed, the pending rename is not recorded: the row
-    /// stays, the scope keeps its old name and the next rename refuses, so the database never
-    /// claims a rename the disk could still lose (#183). Fails when the settle skips the flush.
-    @Test func aRenameIsNotRecordedWhileTheFolderStillCannotBeFlushed() async throws {
-        let root = try temporaryRoot()
-        defer { try? FileManager.default.removeItem(at: root) }
-        let rootID = UUID()
-        let database = try SyncDatabase(url: root.appending(path: "state.sqlite"))
-        try await database.registerRoot(id: rootID, canonicalPath: root.path)
-        let flush = FlushFailures()
-        let store = try FileStore(root: root, beforeMove: nil, syncDirectory: { try flush.sync($0) })
-        for (course, folder) in [(Int64(1), "Old"), (2, "Other")] {
-            let identity = try await store.ensureTopLevelDirectory(folder).identity
-            try await database.upsertScope(SyncScope(rootID: rootID, courseID: course, displayName: folder, localFolder: folder, enabled: true, managedDirectory: identity))
-        }
-        let renamer = CourseFolderRenamer(database: database, fileStore: store, gate: RootOperationGate())
-        flush.failNext(2)
-        await #expect(throws: FileStoreError.mutationNotDurable) { try await renamer.rename(rootID: rootID, courseID: 1, from: "Old", to: "New") }
-        await #expect(throws: SyncDatabaseError.execution) { try await renamer.rename(rootID: rootID, courseID: 2, from: "Other", to: "Renamed") }
+        await #expect(throws: PendingCourseFolderRenameError()) { try await renamer.rename(rootID: rootID, courseID: 2, from: "Other", to: "Renamed") }
         #expect(try await database.pendingScopeMoves().count == 1)
         #expect(try await database.scope(rootID: rootID, courseID: 1)?.localFolder == "Old")
         #expect(try await database.scope(rootID: rootID, courseID: 2)?.localFolder == "Other")
         #expect(FileManager.default.fileExists(atPath: root.appending(path: "Other").path))
+        #expect(!FileManager.default.fileExists(atPath: root.appending(path: "Renamed").path))
+
+        _ = try await RecoveryCoordinator(rootID: rootID, database: database, fileStore: FileStore(root: root)).recover()
+        #expect(try await database.pendingScopeMoves().isEmpty)
+        #expect(try await database.scope(rootID: rootID, courseID: 1)?.localFolder == "New")
+        try await renamer.rename(rootID: rootID, courseID: 2, from: "Other", to: "Renamed")
+        #expect(try await database.scope(rootID: rootID, courseID: 2)?.localFolder == "Renamed")
+        #expect(FileManager.default.fileExists(atPath: root.appending(path: "Renamed").path))
     }
 
     @Test func renamesDirectoryCreatedAfterScopeRegistration() async throws {
@@ -332,7 +313,7 @@ struct CourseFolderRenamerTests {
         try FileManager.default.moveItem(at: root.appending(path: "Old"), to: root.appending(path: "Saved"))
         _ = try await store.ensureTopLevelDirectory("Old")
         let renamer = CourseFolderRenamer(database: database, fileStore: store, gate: RootOperationGate())
-        await #expect(throws: SyncDatabaseError.execution) {
+        await #expect(throws: PendingCourseFolderRenameError()) {
             try await renamer.rename(rootID: rootID, courseID: 1, from: "Old", to: "Again")
         }
         #expect(try await database.scope(rootID: rootID, courseID: 1)?.managedDirectory == identity)

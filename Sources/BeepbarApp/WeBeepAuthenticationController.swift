@@ -787,6 +787,9 @@ enum MaterialsRunEnd: Equatable, Sendable {
     private var recordingsFollowUp: Task<Void, Never>?
     /// Identifies `recordingsFollowUp`, so a finishing task clears only itself.
     private var recordingsFollowUpID: UUID?
+    /// Whether a "Sincronizza ora" relies on `recordingsFollowUp` (started it or merged into it),
+    /// so dropping the schedule never stops it (RB-001 of #188). Replaced with each new follow-up.
+    private var recordingsFollowUpReliance = FollowUpReliance()
     /// Bumped by `cancelRecordingsFollowUp`: a follow-up that resumes under an older value belongs
     /// to an account, site or folder that is gone and publishes nothing.
     private var recordingsFollowUpGeneration = 0
@@ -2247,6 +2250,26 @@ enum MaterialsRunEnd: Equatable, Sendable {
             } catch {
                 self?.courseRenameErrors[course.id] = (error as? CourseRenameError)?.errorDescription ?? tr("Rinomina non riuscita.", "Rename failed.")
             }
+            // Whatever the outcome: the renamer may have settled an earlier rename that was not
+            // durable (#183), this course's or another's, so the window shows the folder the
+            // database now records instead of the old name (RA-001).
+            await self?.followSavedCourseFolders(rootID: rootID, database: database)
+        }
+    }
+
+    /// Takes each course's folder from its saved scope where the two differ.
+    ///
+    /// Why (RA-001 of #183): a course-folder rename whose flush failed keeps the old name here,
+    /// since `renameFolder` only stores the new one on success, while a later sync or rename
+    /// settles it in the database. A manual sync built from the old name would then recreate
+    /// the old folder and split the course in two. Outside a settle the two always agree
+    /// (`restoreScopes` and `renameFolder` keep them in step), so this changes nothing. Only
+    /// courses already shown are touched; an unreadable database leaves the folders as they are.
+    private func followSavedCourseFolders(rootID: UUID, database: SyncDatabase) async {
+        guard let scopes = try? await database.scopes(rootID: rootID), self.rootID == rootID else { return }
+        for scope in scopes where !scope.localFolder.isEmpty {
+            guard let shown = courseFolders[scope.courseID], shown != scope.localFolder else { continue }
+            courseFolders[scope.courseID] = scope.localFolder
         }
     }
 
@@ -2310,6 +2333,12 @@ enum MaterialsRunEnd: Equatable, Sendable {
                     self.endOperation(operationID)
                     return
                 }
+                // A rename settled by an earlier sync or rename (#183) is followed before the
+                // targets are built, or this run would split the course (RA-001). The run that
+                // settles one follows it inside the coordinator.
+                await self.followSavedCourseFolders(rootID: rootID, database: database)
+                try Task.checkCancellation()
+                guard self.activeOperationID == operationID else { return }
                 let targets = selected.map { SyncTarget(courseID: $0.id, localFolder: self.folder(for: $0)) }
                 let token = try await self.credentialVault.load()
                 let coordinator = try SyncCoordinator(rootID: rootID, rootURL: rootURL, database: database, gate: self.operationGate, apiClient: self.apiClient, downloader: self.downloader, platformName: self.selectedSite.platformName)
@@ -2454,14 +2483,20 @@ enum MaterialsRunEnd: Equatable, Sendable {
     /// `wait(for:atMost:)` that also cancels its timer when `task` finishes first, so a follow-up
     /// that ends in seconds leaves no sleeping task behind for the rest of the hold (#187). Kept
     /// apart from `wait(for:atMost:)`, which the quit path uses and `scripts/quit-probe.sh` covers.
+    /// It also ends when the waiting task is cancelled, without cancelling `task`: a dropped
+    /// schedule gets its `completion` at once even when the follow-up keeps running (RB-001).
     nonisolated static func waitReleasingTimer(for task: Task<Void, Never>, atMost timeout: Duration) async {
         let gate = FirstResume()
         var timer: Task<Void, Never>?
-        await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
-            gate.arm(continuation)
-            Task { await task.value; gate.resume() }
-            timer = Task { try? await Task.sleep(for: timeout); gate.resume() }
-        }
+        await withTaskCancellationHandler {
+            await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
+                gate.arm(continuation)
+                // A cancellation before `arm` found nothing to resume: checked again once armed.
+                if Task.isCancelled { gate.resume(); return }
+                Task { await task.value; gate.resume() }
+                timer = Task { try? await Task.sleep(for: timeout); gate.resume() }
+            }
+        } onCancel: { gate.resume() }
         timer?.cancel()
     }
 
@@ -3279,7 +3314,8 @@ enum MaterialsRunEnd: Equatable, Sendable {
         guard configuration != scheduledConfiguration else { return }
         backgroundScheduler?.invalidate()
         backgroundScheduler = nil
-        // Invalidating the scheduler does not stop a callback already running (#188).
+        // Invalidating the scheduler does not stop a callback already running (#188). Its
+        // follow-up stops too, unless "Sincronizza ora" relies on it (RB-001).
         schedulerCallbackTask?.cancel()
         schedulerCallbackTask = nil
         scheduledConfiguration = configuration
@@ -3471,9 +3507,15 @@ enum MaterialsRunEnd: Equatable, Sendable {
         if systemAsksToDefer { BeepbarLog.sync.notice("Recordings follow-up skipped reason=scheduler-defer") }
         if let followUp = followUpAfterRun(operationID, trigger: .automatic, stoppedByScheduler: Task.isCancelled || systemAsksToDefer) {
             let hold = followUpActivityHold
+            // Read in the same turn that returned `followUp`, so it is that follow-up's.
+            let reliance = recordingsFollowUpReliance
+            // The schedule dropped (#188) ends the hold at once, and stops the refresh only when
+            // no "Sincronizza ora" relies on it: this run may have merged into a manual refresh,
+            // or a manual sync into this one, and the user's refresh must not stop with the
+            // schedule (RB-001). The handler is synchronous and off the main actor, hence the lock.
             await withTaskCancellationHandler {
                 await Self.waitReleasingTimer(for: followUp, atMost: hold)
-            } onCancel: { followUp.cancel() }
+            } onCancel: { if !reliance.servesManualSync { followUp.cancel() } }
         }
         return outcome
     }
@@ -3568,10 +3610,15 @@ enum MaterialsRunEnd: Equatable, Sendable {
         guard !isTerminating else { return nil }
         guard let materials = Self.recordingsOutcome(for: end) else { return nil }
         guard case .refresh = recordingsSyncDecision(after: materials, trigger: trigger, network: nil).0 else { return nil }
-        if let recordingsFollowUp { return recordingsFollowUp }
+        if let recordingsFollowUp {
+            if trigger == .manual { recordingsFollowUpReliance.markManual() }
+            return recordingsFollowUp
+        }
         let generation = recordingsFollowUpGeneration
         let id = UUID()
         recordingsFollowUpID = id
+        recordingsFollowUpReliance = FollowUpReliance()
+        if trigger == .manual { recordingsFollowUpReliance.markManual() }
         let task = Task { @MainActor [weak self] in
             guard let self else { return }
             defer { if self.recordingsFollowUpID == id { self.recordingsFollowUp = nil; self.recordingsFollowUpID = nil } }
@@ -4035,6 +4082,15 @@ private actor BootstrapService {
 }
 
 /// Resumes one continuation once, whichever caller comes first (`WeBeepAuthenticationController.wait`).
+/// Whether a "Sincronizza ora" relies on a recordings follow-up: marked when a manual run starts
+/// it or merges into it, never cleared. Read by the automatic run's cancellation handler, which
+/// runs synchronously off the main actor, hence the lock (RB-001 of #188).
+private final class FollowUpReliance: Sendable {
+    private let manual = OSAllocatedUnfairLock(initialState: false)
+    func markManual() { manual.withLock { $0 = true } }
+    var servesManualSync: Bool { manual.withLock { $0 } }
+}
+
 private final class FirstResume: Sendable {
     private let continuation = OSAllocatedUnfairLock<CheckedContinuation<Void, Never>?>(initialState: nil)
 

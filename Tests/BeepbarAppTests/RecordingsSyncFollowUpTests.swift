@@ -360,6 +360,71 @@ import Testing
         }
     }
 
+    /// Proves that dropping the schedule (here: automatic sync turned off) while an automatic run
+    /// holds a follow-up that "Sincronizza ora" started does not stop the user's refresh, and
+    /// still delivers `completion` promptly. Guards against the automatic run's cancellation
+    /// handler cancelling whatever follow-up it merged into (RB-001 of #188).
+    @Test func droppingTheScheduleKeepsAManualRefreshTheAutomaticRunJoined() async throws {
+        let schedule = TestSchedule()
+        let harness = try await Harness(schedule: schedule)
+        defer { harness.remove() }
+        harness.controller.setFollowUpActivityHoldForTesting(.seconds(30))
+        harness.seam.honorsCancellation = true
+        harness.controller.synchronizeNow()
+        await harness.waitForCalls(1)
+        await harness.settle()
+        let manual = try #require(harness.controller.recordingsFollowUpForTesting)
+
+        let fired = Task { @MainActor in await schedule.fire(0) }
+        try await Self.waitUntilHeld(fired, harness)
+        #expect(harness.seam.calls.count == 1, "the automatic run started a refresh of its own")
+        #expect(harness.controller.recordingsFollowUpForTesting == manual)
+
+        let started = ContinuousClock.now
+        harness.controller.setAutomaticSync(enabled: false)
+        #expect(await fired.value == .finished)
+        #expect(ContinuousClock.now - started < .seconds(5), "completion waited for the manual refresh")
+        try? await Task.sleep(for: .milliseconds(100))
+        #expect(!harness.seam.sawCancellation, "the manual refresh was cancelled with the schedule")
+        #expect(harness.controller.recordingsFollowUpForTesting == manual)
+        manual.cancel()
+        await manual.value
+    }
+
+    /// The other order: an automatic run's follow-up is held when "Sincronizza ora" merges into
+    /// it, then the schedule is dropped. The refresh the user's sync now relies on keeps running.
+    /// Guards against deciding from who created the follow-up alone (RB-001 of #188).
+    @Test func droppingTheScheduleKeepsAnAutomaticRefreshAManualSyncJoined() async throws {
+        let schedule = TestSchedule()
+        let harness = try await Harness(schedule: schedule)
+        defer { harness.remove() }
+        harness.controller.setFollowUpActivityHoldForTesting(.seconds(30))
+        harness.seam.honorsCancellation = true
+        let fired = Task { @MainActor in await schedule.fire(0) }
+        await harness.waitForCalls(1)
+        let followUp = try #require(harness.controller.recordingsFollowUpForTesting)
+        harness.controller.synchronizeNow()
+        await harness.settle()
+        #expect(harness.seam.calls.count == 1)
+
+        harness.controller.setAutomaticSync(enabled: false)
+        #expect(await fired.value == .finished)
+        try? await Task.sleep(for: .milliseconds(100))
+        #expect(!harness.seam.sawCancellation, "the refresh a manual sync joined was cancelled with the schedule")
+        followUp.cancel()
+        await followUp.value
+    }
+
+    /// Waits until the automatic run of `fired` has finished its materials and sits in the hold
+    /// (its sync is over and `completion` has not come), so a cancellation lands on the hold.
+    private static func waitUntilHeld(_ fired: Task<NSBackgroundActivityScheduler.Result, Never>, _ harness: Harness) async throws {
+        let deadline = ContinuousClock.now + .seconds(10)
+        while !harness.controller.isSyncActive, ContinuousClock.now < deadline { try await Task.sleep(for: .milliseconds(1)) }
+        while harness.controller.isSyncActive, ContinuousClock.now < deadline { try await Task.sleep(for: .milliseconds(1)) }
+        try await Task.sleep(for: .milliseconds(100))
+        try #require(!harness.controller.isSyncActive)
+    }
+
     /// Proves that when the system asks background work to defer (`shouldDefer`), an automatic
     /// run still finishes its materials but starts no recordings refresh. Guards against ignoring
     /// the scheduler's request (#188): the WebKit listings ran under thermal or battery pressure.

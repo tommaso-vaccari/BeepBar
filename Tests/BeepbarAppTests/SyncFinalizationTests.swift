@@ -1057,6 +1057,32 @@ struct ConflictChoiceFeedbackTests {
         #expect(message == WeBeepAuthenticationController.unreadableMoveMessage(destination).text)
     }
 
+    /// Proves that "Organizza cartelle" refuses while a course-folder rename is unfinished (#183)
+    /// and says to restart BeepBar: the real `ModulePathMigrator.preview` error goes through the
+    /// sheet's own mapping. The window still shows the old folder name then, so a plan built from
+    /// it would create the old folder and split the course (RA-004 of PR #225). Fails if the
+    /// migrator lets the preview run, or if the mapping falls back to a generic message.
+    @Test @MainActor func organizingFoldersDuringAnUnfinishedCourseRenameSaysToRestart() async throws {
+        let fixture = try await ChoiceFixture()
+        defer { fixture.remove() }
+        let store = try FileStore(root: fixture.root)
+        let identity = try await store.ensureTopLevelDirectory("Course").identity
+        try await fixture.database.upsertScope(SyncScope(rootID: fixture.rootID, courseID: 1, displayName: "Course", localFolder: "Course", enabled: true, managedDirectory: identity))
+        // What a rename whose flush failed leaves: the folder renamed on disk, the row pending.
+        try FileManager.default.moveItem(at: fixture.root.appending(path: "Course"), to: fixture.root.appending(path: "Renamed"))
+        try await fixture.database.beginScopeMove(PendingScopeMove(id: UUID(), rootID: fixture.rootID, courseID: 1, oldFolder: "Course", newFolder: "Renamed"))
+        let migrator = ModulePathMigrator(rootID: fixture.rootID, database: fixture.database, fileStore: store, gate: RootOperationGate(), apiClient: WeBeepAPIClient(session: URLSession(configuration: .ephemeral)))
+        let contents = RemoteCourseContents(sections: [RemoteContentSection(id: 3, name: "Resources", modules: [RemoteContentModule(id: 7, name: "Slides", files: [])])], issueCount: 0)
+
+        var message: String?
+        do { _ = try await migrator.preview(courseID: 1, moduleID: 7, courseFolder: "Course", action: .set, folder: "Custom", contents: contents) }
+        catch { message = WeBeepAuthenticationController.moduleFolderErrorMessage(error) }
+
+        #expect(message == WeBeepAuthenticationController.pendingFolderRenameMessage.text)
+        #expect(!FileManager.default.fileExists(atPath: fixture.root.appending(path: "Course").path))
+        #expect(try await fixture.database.pendingScopeMoves().count == 1)
+    }
+
     @Test @MainActor func lateDatabaseFailureDoesNotPromiseLocalPreservation() async throws {
         let fixture = try await ChoiceFixture()
         defer { fixture.remove() }

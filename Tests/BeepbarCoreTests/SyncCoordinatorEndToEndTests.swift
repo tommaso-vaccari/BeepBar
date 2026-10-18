@@ -147,67 +147,61 @@ private let temporaryVolumeIgnoresCase: Bool = {
         let move = PendingScopeMove(id: UUID(), rootID: fixture.rootID, courseID: target.courseID, oldFolder: target.localFolder, newFolder: "Renamed")
         try await fixture.database.beginScopeMove(move)
         fixture.upstream.resetDownloadCount()
-        await #expect(throws: SyncDatabaseError.execution) { _ = try await fixture.synchronize(targets: [target]) }
+        await #expect(throws: PendingCourseFolderRenameError()) { _ = try await fixture.synchronize(targets: [target]) }
         #expect(try await fixture.database.pendingScopeMoves() == [move])
         #expect(fixture.upstream.downloadCount == 0)
         #expect(!FileManager.default.fileExists(atPath: fixture.root.appending(path: target.localFolder).path))
     }
 
-    /// A course-folder rename whose flush failed once no longer fails every sync until a relaunch
-    /// (#183): the next sync settles it from the disk and runs, and the files stay tracked in the
-    /// renamed folder. While the flush still fails, the sync refuses and records nothing.
-    @Test func aSyncSettlesACourseRenameThatWasNotDurable() async throws {
+    /// After a course-folder rename whose sync-folder flush failed (#183), every sync refuses with
+    /// `PendingCourseFolderRenameError` and touches nothing, whether its target names the old
+    /// folder (what the app still shows after the failed rename) or the new one: no folder is
+    /// created, nothing is downloaded or moved, the row and the scope stay as they were. Writing
+    /// the old name back between runs, as the app's course switch does, changes nothing either.
+    /// Only launch recovery settles the rename, and the next sync then runs in the renamed folder.
+    /// Guards the decision that replaced the in-session settle (RA-001/RA-003 of PR #225): with
+    /// the guard removed, the old-name sync recreates "Course 1" and splits the course.
+    @Test func anUnfinishedCourseRenameBlocksEverySyncUntilLaunchRecovery() async throws {
         let flush = FlushFailures()
         let fixture = try await Fixture(syncDirectory: { try flush.sync($0) })
         defer { fixture.remove() }
         _ = try await fixture.synchronize(targets: [fixture.targets[0]])
+        let original = try #require(fixture.contents("Course 1/Lezioni/0.txt"))
         let renamer = CourseFolderRenamer(database: fixture.database, fileStore: fixture.fileStore, gate: fixture.gate)
         flush.failNext(1)
         await #expect(throws: FileStoreError.mutationNotDurable) { try await renamer.rename(rootID: fixture.rootID, courseID: 1, from: "Course 1", to: "Renamed") }
-        let renamed = SyncTarget(courseID: 1, localFolder: "Renamed")
-
-        flush.failNext(1)
-        await #expect(throws: SyncDatabaseError.execution) { _ = try await fixture.synchronize(targets: [renamed]) }
-        #expect(try await fixture.database.pendingScopeMoves().count == 1)
-        #expect(try await fixture.database.scope(rootID: fixture.rootID, courseID: 1)?.localFolder == "Course 1")
-
-        fixture.upstream.resetDownloadCount()
-        let result = try await fixture.synchronize(targets: [renamed])
-        #expect(result.failures == 0 && result.conflicts == 0)
-        #expect(fixture.upstream.downloadCount == 0)
-        #expect(try await fixture.database.pendingScopeMoves().isEmpty)
-        #expect(try await fixture.database.scope(rootID: fixture.rootID, courseID: 1)?.localFolder == "Renamed")
-        #expect(try await fixture.database.baseline(rootID: fixture.rootID, remoteID: fixture.remoteID(course: 1, file: 0))?.relativePath == RelativePath("Renamed/Lezioni/0.txt"))
-        #expect(!FileManager.default.fileExists(atPath: fixture.root.appending(path: "Course 1").path))
-    }
-
-    /// The sync that settles a non-durable course-folder rename follows the rename even though
-    /// its target still names the OLD folder, which is what the app sends: after the failed
-    /// rename it keeps showing the old name (review RA-001 of #183). Guards against the sync
-    /// recreating an empty "Course 1", pointing the course at it and splitting it in two: tracked
-    /// files in "Renamed", new and updated files in "Course 1".
-    @Test func aSyncWithTheOldFolderNameFollowsASettledCourseRename() async throws {
-        let flush = FlushFailures()
-        let fixture = try await Fixture(syncDirectory: { try flush.sync($0) })
-        defer { fixture.remove() }
-        _ = try await fixture.synchronize(targets: [fixture.targets[0]])
-        let renamer = CourseFolderRenamer(database: fixture.database, fileStore: fixture.fileStore, gate: fixture.gate)
-        flush.failNext(1)
-        await #expect(throws: FileStoreError.mutationNotDurable) { try await renamer.rename(rootID: fixture.rootID, courseID: 1, from: "Course 1", to: "Renamed") }
-        let identity = try await fixture.database.scope(rootID: fixture.rootID, courseID: 1)?.managedDirectory
+        let before = try #require(try await fixture.database.scope(rootID: fixture.rootID, courseID: 1))
         fixture.upstream.setFile(course: 1, file: 0, value: "updated", revision: "2")
         fixture.upstream.addFile(course: 1, file: 500, filename: "new.txt", value: "new", revision: "1")
+        fixture.upstream.resetDownloadCount()
 
-        let stale = SyncTarget(courseID: 1, localFolder: "Course 1")
-        let result = try await fixture.synchronize(targets: [stale])
+        for folder in ["Course 1", "Renamed", "Course 1"] {
+            await #expect(throws: PendingCourseFolderRenameError()) { _ = try await fixture.synchronize(targets: [SyncTarget(courseID: 1, localFolder: folder)]) }
+            for enabled in [false, true] {
+                try await fixture.database.upsertScope(SyncScope(rootID: fixture.rootID, courseID: 1, displayName: before.displayName, localFolder: "Course 1", enabled: enabled))
+            }
+        }
+        #expect(fixture.upstream.downloadCount == 0)
+        #expect(!FileManager.default.fileExists(atPath: fixture.root.appending(path: "Course 1").path), "a refused sync recreated the old folder")
+        #expect(fixture.contents("Renamed/Lezioni/0.txt") == original)
+        #expect(fixture.contents("Renamed/Lezioni/new.txt") == nil)
+        #expect(try await fixture.database.pendingScopeMoves().count == 1)
+        let blocked = try await fixture.database.scope(rootID: fixture.rootID, courseID: 1)
+        #expect(blocked?.localFolder == "Course 1")
+        #expect(blocked?.managedDirectory == before.managedDirectory)
+        #expect(try await fixture.database.baseline(rootID: fixture.rootID, remoteID: fixture.remoteID(course: 1, file: 0))?.relativePath == RelativePath("Course 1/Lezioni/0.txt"))
+
+        // The next launch: recovery settles the rename before any sync is built.
+        _ = try await RecoveryCoordinator(rootID: fixture.rootID, database: fixture.database, fileStore: FileStore(root: fixture.root)).recover()
+        #expect(try await fixture.database.pendingScopeMoves().isEmpty)
+        let result = try await fixture.synchronize(targets: [SyncTarget(courseID: 1, localFolder: "Renamed")])
         #expect(result.failures == 0 && result.conflicts == 0)
         #expect(!FileManager.default.fileExists(atPath: fixture.root.appending(path: "Course 1").path))
-        let scope = try await fixture.database.scope(rootID: fixture.rootID, courseID: 1)
-        #expect(scope?.localFolder == "Renamed")
-        #expect(scope?.managedDirectory == identity)
         #expect(fixture.contents("Renamed/Lezioni/0.txt") == "updated")
         #expect(fixture.contents("Renamed/Lezioni/new.txt") == "new")
-        #expect(try await fixture.database.baseline(rootID: fixture.rootID, remoteID: fixture.remoteID(course: 1, file: 500, filename: "new.txt"))?.relativePath == RelativePath("Renamed/Lezioni/new.txt"))
+        let settled = try await fixture.database.scope(rootID: fixture.rootID, courseID: 1)
+        #expect(settled?.localFolder == "Renamed")
+        #expect(settled?.managedDirectory == before.managedDirectory)
     }
 
     @Test(arguments: ["manual", "reupload"])

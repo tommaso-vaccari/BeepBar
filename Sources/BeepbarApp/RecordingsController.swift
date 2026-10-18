@@ -160,6 +160,9 @@ struct RecordingsListing: Equatable {
 @MainActor final class RecordingsController: ObservableObject {
     nonisolated static let enabledKey = "io.github.tvaccari.beepbar.recordings-enabled.v1"
     nonisolated static let sessionDeletionPendingKey = "io.github.tvaccari.beepbar.recordings-session-deletion-pending.v1"
+    /// The session file is obsolete (turn-off, logout, account change, damage): never read it.
+    /// Cleared when its deletion is confirmed (`trackSessionDeletion`) or a new session is saved.
+    /// While set, every new controller and every session read retries the deletion (#200).
     private static let sessionDiscardedKey = "io.github.tvaccari.beepbar.recordings-session-discarded.v1"
 
     /// The switch as saved: on by default, and off wherever the feature isn't available. Shared by
@@ -195,7 +198,6 @@ struct RecordingsListing: Equatable {
     @Published private(set) var studyDeletionFailed = false
     nonisolated static let studyDeletionPendingKey = "io.github.tvaccari.beepbar.study-deletion-pending.v1"
     @Published private(set) var sessionDeletionFailed = false
-    private var sessionDeletionGeneration = 0
     private var sessionExpirationTask: Task<Void, Never>?
 
     @Published private(set) var isEnabled: Bool
@@ -244,10 +246,6 @@ struct RecordingsListing: Equatable {
     private var playbackMetadata: (recordingID: String, metadata: RecordingPlaybackMetadata)?
     /// The WeBeep profile's email address, or nil: any failure is "ask the user", never an error.
     private let fetchProfileEmail: @MainActor () async -> String?
-    /// Brings the lecture already playing forward for a menu Play of that same lecture
-    /// (`playFromMenu`). Activates the whole app until the player has its own front API
-    /// (package P4, `RecordingPlaying.bringToFront()`); injected so tests don't touch `NSApp`.
-    private let bringPlayerForward: @MainActor () -> Void
     /// Created by the first Play that has a stream, never earlier.
     private var player: RecordingPlaying?
     /// The lectures whose reports are still accepted, by recording id. Filled before a `play` (the
@@ -266,7 +264,26 @@ struct RecordingsListing: Equatable {
     /// The generation of a recovery or Play executing outside the queue. An invalidated
     /// worker must neither keep the browser alive nor clear a newer worker's running state.
     private var runningRecoveryGeneration: Int?
+    /// The lecture and item (`start`, see `lectureStarts`) of the recovery the worker runs now;
+    /// meaningful only while `runningRecoveryGeneration == generation`. `playerFailed` reads it,
+    /// with the queue, so a second failure report of the item whose recovery is pending queues
+    /// nothing (RB-002), while a failure of a newer item of the same lecture still gets its own
+    /// recovery (RB-101).
+    private var runningRecovery: (lectureID: String, start: Int)?
+    /// Counts the items handed to the player (`startPlayer`). A recovery carries the count of
+    /// the item that failed and gives up once another item replaced it: a recovery that already
+    /// resumed the lecture natively must never be closed in favour of the browser (RB-002), and
+    /// a recovery of an item replaced by a Play again must not restart the lecture over the new
+    /// one (`aStaleRecoveryNeverReplacesTheNewerItemOfTheSameLecture`).
+    private var lectureStarts = 0
     private var runningPlayGeneration: Int?
+    /// The Play lookup the worker is running now (`drain`), as its own task, so a newer Play can
+    /// stop it instead of queueing behind it (issue #194): the lookup may sit in the interactive
+    /// Webex sign-in, which waits for the student with no deadline, and a superseded result is
+    /// thrown away anyway (`request == openingRequest`). Cancelling it ends the browser operation
+    /// (`RecmanWebSession.stream`, its sign-in window included) with `CancellationError`, which
+    /// `drain` skips like any superseded request.
+    private var runningPlay: (request: Int, recordingID: String, task: Task<Void, Error>)?
 
     // MARK: Menu bar Play state
 
@@ -372,6 +389,11 @@ struct RecordingsListing: Equatable {
     /// `sessionOwner` is nil, and without this an account change would keep the previous
     /// account's address and send it to Webex for the new one (PR #152 review, P0).
     private var emailAccount: Int?
+    /// The session-file deletion in flight (a discard or its retry), so a read while it runs
+    /// doesn't enqueue another one. Its id tells a finished deletion whether it is still the
+    /// tracked one.
+    private var sessionDeletion: Int?
+    private var sessionDeletions = 0
 
     private let makeBrowser: @MainActor () -> RecmanBrowsing
     private let store: RecordingsSessionStore
@@ -410,7 +432,8 @@ struct RecordingsListing: Equatable {
         case list(RecmanCourseKey)
         case open(RecmanRecording, OpenAction, Int)
         /// A lecture in the player went wrong (#148): not a click, so it changes no spinner.
-        case recover(RecmanRecording, Recovery)
+        /// `start` is `lectureStarts` when the failure was reported: which item failed.
+        case recover(RecmanRecording, Recovery, start: Int)
     }
 
     /// What to do about a lecture that failed in the player.
@@ -479,14 +502,12 @@ struct RecordingsListing: Equatable {
         makePlayer: @escaping @MainActor () -> RecordingPlaying = { RecordingPlayerController() },
         courses: @escaping @MainActor () -> [RemoteCourseSummary] = { [] },
         fetchProfileEmail: @escaping @MainActor () async -> String? = { nil },
-        bringPlayerForward: @escaping @MainActor () -> Void = { NSApplication.shared.activate() },
         listingCapacity: Int = RecordingsController.listingCapacity,
         playbackURLCapacity: Int = RecordingsController.playbackURLCapacity
     ) {
         self.makePlayer = makePlayer
         self.courses = courses
         self.fetchProfileEmail = fetchProfileEmail
-        self.bringPlayerForward = bringPlayerForward
         listings = BoundedCache(capacity: listingCapacity)
         playbackURLs = BoundedCache(capacity: playbackURLCapacity)
         self.makeBrowser = makeBrowser
@@ -525,6 +546,10 @@ struct RecordingsListing: Equatable {
         studyDeletionFailed = defaults.bool(forKey: Self.studyDeletionPendingKey)
         if studyDeletionFailed { retryStudyDeletion() }
         scheduleSessionExpiration()
+        // A deletion that failed, or never ran because the app quit first, would otherwise leave
+        // the old account's Polimi and Webex cookies and email on disk for good (#200). Off the
+        // main actor, and only while the flag says there is something to delete.
+        retryObsoleteSessionDeletion()
     }
 
     /// The saved switch, on unless turned off; Polimi still decides (`isAvailable`). Shared with
@@ -709,6 +734,16 @@ struct RecordingsListing: Equatable {
 
     /// Called when the WeBeep account becomes known or changes. A session made for another
     /// account is dropped together with what that account had seen.
+    ///
+    /// With no session owner (a Polimi sign-in completed while the WeBeep account was unknown,
+    /// so nothing was saved), the live browser and whatever the controller holds in memory
+    /// (listings, playback links, watch progress) can't be attributed to anyone: they are
+    /// dropped as well, or the new account would use the previous student's Polimi login and
+    /// see their lectures (#191). Only memory goes in that case: the seen history, the resume
+    /// points and the session file are scoped by owner (and checked when read), and wiping
+    /// them could erase the same student's progress when the account merely became known. The
+    /// cost is one more "Accedi con Polimi" in that rare case. Nothing in memory, nothing done:
+    /// the account becoming known at a normal launch stays free.
     func webBeepAccountChanged(to userID: Int) {
         loadStudy()
         // Before the session check: an address learned with no Polimi session yet belongs to the
@@ -719,18 +754,25 @@ struct RecordingsListing: Equatable {
         }
         resumePoints = nil
         Self.forgetResumePoints(in: defaults, notOwnedBy: userID)
-        guard let sessionOwner, sessionOwner != userID else { return }
-        log.notice("Polimi session belongs to another WeBeep account: dropped")
+        let foreignSession = sessionOwner.map { $0 != userID } ?? false
+        let unattributedMemory = sessionOwner == nil && (browser != nil || !playbackURLs.isEmpty
+            || !watchProgress.known.isEmpty || listings.values.contains { $0.recordings != nil })
+        guard foreignSession || unattributedMemory else { return }
+        log.notice("Polimi session belongs to another or an unknown WeBeep account: dropped foreign=\(foreignSession, privacy: .public)")
         supersedeInitialSessionCheck()
         closePlayerForIdentityChange()
         invalidate()
         closeBrowser()
         listings.removeAll()
         playbackURLs.removeAll()
-        forgetSeen()
-        forgetResumePoints()
-        forgetEmailOptOut()
-        discardSessionFile()
+        if foreignSession {
+            forgetSeen()
+            forgetResumePoints()
+            forgetEmailOptOut()
+            discardSessionFile()
+        } else {
+            watchProgress.reset()
+        }
         if isEnabled { access = .needsSignIn(nil) }
     }
 
@@ -949,7 +991,9 @@ struct RecordingsListing: Equatable {
         guard resumeOwner() == owner else { return true }
         guard let key = Self.courseKey(of: recording), Self.validatedNext(recording, for: key) else { return false }
         if stillShowing(recording) {
-            bringPlayerForward()
+            // The player's own front API, not `NSApp.activate()`: a minimized window has to be
+            // restored from the Dock, or the click does nothing visible (issue #193).
+            player?.bringToFront()
             return true
         }
         open(recording, .play)
@@ -993,10 +1037,21 @@ struct RecordingsListing: Equatable {
 
     private func open(_ recording: RecmanRecording, _ action: OpenAction) {
         guard isEnabled, access == .ready else { return }
+        // The same lecture's Play is already being looked up and is still the latest click (a
+        // double click on the row's Play): it serves this one too. Re-queueing would restart the
+        // whole lookup after the first one finished, only to throw the first result away (#194).
+        if action == .play, let runningPlay, runningPlay.request == openingRequest, runningPlay.recordingID == recording.id,
+           !queue.contains(where: { if case .recover = $0 { true } else { false } }) {
+            return
+        }
         // A newer click replaces a menu Play: its failure is no longer the menu's.
         menuPlay = nil
         openingRequest += 1
-        if action == .play { playbackIntent += 1 }
+        if action == .play {
+            playbackIntent += 1
+            // A newer Play stops the one being looked up rather than waiting for it (#194).
+            runningPlay?.task.cancel()
+        }
         openingProblem = nil
         openingRecordingID = recording.id
         // The cached path must replace pending openings too, or a slow lookup can later
@@ -1064,7 +1119,7 @@ struct RecordingsListing: Equatable {
         "\(courseCode)-\(academicYear)"
     }
 
-    private func scheduleAcknowledge(_ ids: [String], for key: RecmanCourseKey, opening: Int? = nil, preserveHistoryProblem: Bool = false) {
+    private func scheduleAcknowledge(_ ids: [String], for key: RecmanCourseKey, opening: Int? = nil) {
         guard let owner = sessionOwner ?? ownerUserID(), !ids.isEmpty else { return }
         let pending = pendingAcknowledgementIDs[key] ?? []
         let added = ids.filter { !(listings[key]?.seenIDs?.contains($0) ?? false) && !pending.contains($0) }
@@ -1102,7 +1157,7 @@ struct RecordingsListing: Equatable {
                 if self.listings[key]?.seenIDs != nil { self.listings[key]?.seenIDs?.formUnion(added) }
                 // The unseen count of the saved summary (menu line) changes with the dots.
                 if self.listings[key]?.seenIDs != nil { self.refreshWatchSummary(for: key, persist: true) }
-                if !preserveHistoryProblem, self.listings[key]?.historyReadFailed != true, self.listings[key]?.problem == .historyUnavailable { self.listings[key]?.problem = nil }
+                if self.listings[key]?.historyReadFailed != true, self.listings[key]?.problem == .historyUnavailable { self.listings[key]?.problem = nil }
             } catch {
                 guard self.isCurrentHistory(history, owner: owner, generation: generation) else { return }
                 self.listings[key]?.problem = .historyUnavailable
@@ -1423,14 +1478,31 @@ struct RecordingsListing: Equatable {
                 case .open(let recording, .play, let request):
                     runningPlayGeneration = generation
                     defer { if runningPlayGeneration == generation { runningPlayGeneration = nil } }
-                    try await playNatively(recording, request: request, browser: browser, generation: generation)
+                    // Its own task, so `open` can cancel just this lookup (#194); the worker's
+                    // own cancellation (`invalidate`) still reaches it through the handler.
+                    let lookup = Task { [weak self] in
+                        guard let self else { return }
+                        // Cleared in the same main-actor turn as the player starts (or the
+                        // browser opens), not when `drain` resumes: a Play again clicked in
+                        // between must restart the lecture, not join a lookup that is over.
+                        defer { if self.runningPlay?.request == request { self.runningPlay = nil } }
+                        try await self.playNatively(recording, request: request, browser: browser, generation: generation)
+                    }
+                    runningPlay = (request, recording.id, lookup)
+                    defer { if runningPlay?.request == request { runningPlay = nil } }
+                    try await withTaskCancellationHandler {
+                        try await lookup.value
+                    } onCancel: {
+                        lookup.cancel()
+                    }
                     guard generation == self.generation else { return }
                     // Reached the player or the browser fallback: no longer the menu's to report.
                     if menuPlay?.request == request { menuPlay = nil }
-                case .recover(let recording, let recovery):
+                case .recover(let recording, let recovery, let start):
                     runningRecoveryGeneration = generation
-                    defer { if runningRecoveryGeneration == generation { runningRecoveryGeneration = nil } }
-                    try await recoverPlayback(recording, recovery, browser: browser, generation: generation)
+                    runningRecovery = (recording.id, start)
+                    defer { if runningRecoveryGeneration == generation { runningRecoveryGeneration = nil; runningRecovery = nil } }
+                    try await recoverPlayback(recording, recovery, start: start, browser: browser, generation: generation)
                     guard generation == self.generation else { return }
                 }
                 succeeded = true
@@ -1591,6 +1663,9 @@ struct RecordingsListing: Equatable {
         // Where the address came from, never the address: with none, a Play that needs a Webex
         // sign-in can only show the message.
         let emailState = Self.emailDiagnosis(confirmedEmail, fromProfile: emailFromProfile)
+        // A newer Play cancelled this one while the address was looked up (#194): no browser
+        // operation for a lecture the student no longer wants.
+        try Task.checkCancellation()
         PlaybackDiagnostics.log.notice("play: start email=\(emailState, privacy: .public)")
         let stream: RecordingStream
         do {
@@ -1624,6 +1699,7 @@ struct RecordingsListing: Equatable {
         // Before the call: the lecture this one replaces reports its position inside `play`.
         nowPlaying[recording.id] = recording
         currentLectureID = recording.id
+        lectureStarts += 1
         // The replaced lecture's report inside `play` reads this to tell an end from a re-play.
         pendingPlayID = recording.id
         let metadata = playbackMetadata(for: recording, stream: stream)
@@ -1952,9 +2028,18 @@ struct RecordingsListing: Equatable {
         enqueueProgress(.manual(done: done), for: recording, owner: owner, serial: nil, untickEpoch: untickCounts[identity, default: 0])
     }
 
-    /// One serial operation for the full course listing. Entries publish only after their
-    /// commits; summary and acknowledgement are batched once, avoiding a full-list scan per row.
+    /// One serial operation for the full course listing: one store transaction for every lecture
+    /// (`RecordingsSeenHistory.applyProgress(owner:key:ids:event:)`, issue #208), then one
+    /// publication of the committed entries, one summary and one acknowledgement. Before #208 it
+    /// was a connection, a durable commit and a publication per lecture, and the whole loop held
+    /// the progress chain, so a pause of the lecture playing waited behind N commits.
     /// Capture the history and owner before queueing so a reset cannot redirect these writes.
+    ///
+    /// All or nothing: a failed save leaves every lecture as it was (the store rolls back) and
+    /// shows the history banner; the label still reads what was saved, so clicking again retries
+    /// the whole set. Entries publish only after the commit, through `setEntries`, which writes
+    /// `entries` and `known` once each (each bumps `stateRevision`, which the toolbar's
+    /// `BulkActionCache` relies on, #209).
     func toggleAllDone(_ key: RecmanCourseKey) {
         let recordings = listings[key]?.recordings
         let action = RecordingsPresentation.WatchValues(watchProgress, canEdit: canEditProgress)
@@ -1985,18 +2070,30 @@ struct RecordingsListing: Equatable {
                     self.watchProgress.setPending(false, for: identities, course: key)
                 }
             }
-            var completed: [String] = []
-            var failed = false
-            for recording in recordings {
-                guard self.isCurrentIdentity(history, owner: owner) else { return }
-                let changedDone = await self.commitProgress(.manual(done: done), for: recording, key: key,
-                    owner: owner, history: history, serial: nil,
-                    untickEpoch: self.untickCounts[RecordingsStudyState.identity(recording), default: 0],
-                    deferCourseUpdate: true)
-                guard let changedDone else { failed = true; break }
-                if changedDone { completed.append(recording.id) }
-            }
             guard self.isCurrentIdentity(history, owner: owner) else { return }
+            let results: [RecordingProgressResult]
+            do {
+                results = try await history.applyProgress(owner: owner, key: key, ids: recordings.map(\.id), event: .manual(done: done))
+            } catch is CancellationError {
+                return
+            } catch {
+                guard self.isCurrentIdentity(history, owner: owner) else { return }
+                self.listings[key]?.problem = .historyUnavailable
+                self.log.error("Couldn't save the course's done marks")
+                return
+            }
+            // Same second check as `commitProgress`: the WeBeep account can change without a
+            // reset, and then only this keeps the old account's entries off the screen.
+            guard self.isCurrentIdentity(history, owner: owner), results.count == recordings.count else { return }
+            var committed: [String: RecordingWatchEntry] = [:]
+            var completed: [String] = []
+            for (recording, result) in zip(recordings, results) {
+                let identity = RecordingsStudyState.identity(recording)
+                if let entry = result.entry { committed[identity] = entry }
+                if result.changed, result.entry?.isCompleted == true { completed.append(recording.id) }
+            }
+            self.watchProgress.setEntries(committed, for: recordings.map(RecordingsStudyState.identity))
+            if results.contains(where: \.changed) { self.historyRevision[key, default: 0] += 1 }
             self.refreshWatchSummary(for: key, persist: true)
             // A refresh may have evicted the listing meanwhile, and then the summary above can't
             // be recomputed: drop a saved `next` that was just completed, as the per-row path does.
@@ -2004,7 +2101,7 @@ struct RecordingsListing: Equatable {
             for recording in recordings where completedIDs.contains(recording.id) {
                 self.clearSavedNextIfCompleted(recording, in: key)
             }
-            self.scheduleAcknowledge(completed, for: key, preserveHistoryProblem: failed)
+            self.scheduleAcknowledge(completed, for: key)
         }
     }
 
@@ -2037,7 +2134,7 @@ struct RecordingsListing: Equatable {
     /// - Other errors: a checkpoint is kept for the next one, logged, no banner; a tick shows the
     ///   history banner and the row keeps its saved value.
     @discardableResult
-    private func commitProgress(_ event: RecordingProgressEvent, for recording: RecmanRecording, key: RecmanCourseKey, owner: Int, history: RecordingsSeenHistory, serial: Int?, untickEpoch: Int, deferCourseUpdate: Bool = false) async -> Bool? {
+    private func commitProgress(_ event: RecordingProgressEvent, for recording: RecmanRecording, key: RecmanCourseKey, owner: Int, history: RecordingsSeenHistory, serial: Int?, untickEpoch: Int) async -> Bool? {
         let identity = RecordingsStudyState.identity(recording)
         let isManual = if case .manual = event { true } else { false }
         guard isCurrentIdentity(history, owner: owner) else { return nil }
@@ -2045,12 +2142,12 @@ struct RecordingsListing: Equatable {
         do {
             result = try await history.applyProgress(owner: owner, key: key, id: recording.id, event: event)
         } catch is CancellationError {
-            if isManual, !deferCourseUpdate, isCurrentIdentity(history, owner: owner) { watchProgress.setPending(false, for: identity) }
+            if isManual, isCurrentIdentity(history, owner: owner) { watchProgress.setPending(false, for: identity) }
             return nil
         } catch {
             guard isCurrentIdentity(history, owner: owner) else { return nil }
             if isManual {
-                if !deferCourseUpdate { watchProgress.setPending(false, for: identity) }
+                watchProgress.setPending(false, for: identity)
                 listings[key]?.problem = .historyUnavailable
                 log.error("Couldn't save a lecture's done mark")
             } else if let serial {
@@ -2073,14 +2170,14 @@ struct RecordingsListing: Equatable {
         // no Polimi session was saved, and then only this check keeps the old account's entry off
         // the screen.
         guard isCurrentIdentity(history, owner: owner) else { return nil }
-        if isManual && !deferCourseUpdate { watchProgress.setPending(false, for: identity) }
+        if isManual { watchProgress.setPending(false, for: identity) }
         // An ended session's position now lives in the entry (or never will, if the save failed
         // and is waiting for a retry): the live value goes unless the lecture is playing again.
         if case .checkpoint(_, true) = event, sessions[recording.id] == nil { watchProgress.setLive(nil, for: identity) }
         let published = watchProgress.setEntry(result.entry, for: identity)
         if result.changed { historyRevision[key, default: 0] += 1 }
-        if !deferCourseUpdate && (result.changed || published) { refreshWatchSummary(for: key, persist: true) }
-        if !deferCourseUpdate, result.changed, result.entry?.isCompleted == true {
+        if result.changed || published { refreshWatchSummary(for: key, persist: true) }
+        if result.changed, result.entry?.isCompleted == true {
             clearSavedNextIfCompleted(recording, in: key)
             scheduleAcknowledge([recording.id], for: key)
         }
@@ -2154,10 +2251,13 @@ struct RecordingsListing: Equatable {
 
     /// Saves a course's summary under `owner`, only when it differs from the saved one: a listing
     /// or a write that changes nothing in it writes nothing. The comparison is of the whole value,
-    /// `next` included, so only a change of the counts or of the next lecture writes.
+    /// `next` included, so only a change of the counts or of the next lecture writes. Both sides
+    /// go through the saved projection (`StoredCourseWatchSummary.persisted`): after a relaunch
+    /// the in-memory copy is the decoded one, whose `next` lacks the date, kind and size, and a
+    /// raw comparison rewrote and republished every course after each launch (#189).
     private func storeWatchSummary(_ summary: CourseWatchSummary, for key: RecmanCourseKey, owner: Int) {
         loadWatchSummaries(owner: owner)
-        guard watchSummaries[key] != summary else { return }
+        guard watchSummaries[key].map({ StoredCourseWatchSummary($0).persisted }) != StoredCourseWatchSummary(summary).persisted else { return }
         var updated = watchSummaries
         updated[key] = summary
         let stored = StoredWatchSummaries(owner: owner, courses: Dictionary(uniqueKeysWithValues: updated.map { (Self.baselineID(courseCode: $0.key.courseCode, academicYear: $0.key.academicYear), $0.value) }))
@@ -2226,6 +2326,20 @@ struct RecordingsListing: Equatable {
     private func playerFailed(id: String, failure: RecordingPlaybackFailure) {
         guard isEnabled, let recording = nowPlaying[id] else { return }
         if case .beforeReady = failure { endWatchSessionBeforeReady(id) }
+        // A recovery of this item is already queued or running: it resolves this failure too.
+        // Resuming the paused window re-arms the player's report (#197), so the dead item can
+        // fail again meanwhile; a second recovery (browser-only by then, the retry being spent)
+        // would close the natively recovered player or open the browser twice (RB-002).
+        // Only a recovery of the item on screen counts (`start == lectureStarts`): one of an
+        // item a Play again already replaced gives up in `recoverPlayback`, so treating it as
+        // pending would leave the newer item's failure with no browser and no message (RB-101).
+        let pending = runningRecoveryGeneration == generation
+            && runningRecovery?.lectureID == id && runningRecovery?.start == lectureStarts
+            || queue.contains { if case .recover(let queued, _, let start) = $0 { queued.id == id && start == lectureStarts } else { false } }
+        if pending {
+            PlaybackDiagnostics.log.notice("play: failure while its recovery is pending, ignored")
+            return
+        }
         // The retry is spent when the recovery runs (`recoverPlayback`), not here: a failure
         // that can't be recovered now (no Polimi session) or a recovery that never starts must
         // not use it up.
@@ -2236,22 +2350,26 @@ struct RecordingsListing: Equatable {
         PlaybackDiagnostics.log.notice("\(diagnosis, privacy: .public)")
         guard access == .ready else {
             // No Polimi session to look anything up with: the student has to sign in again.
-            if case .beforeReady = failure { openingProblem = .playbackUnavailable }
+            switch failure {
+            case .beforeReady: openingProblem = .playbackUnavailable
+            // The window stays open, paused where the stream stopped: it says why (#197).
+            case .duringPlayback: reportStoppedLecture(recording, message: Self.signInToContinueMessage)
+            }
             return
         }
         if visiblePages == 0 { closesBrowserWhenIdle = true }
-        queue.insert(.recover(recording, recovery), at: 0)
+        queue.insert(.recover(recording, recovery, start: lectureStarts), at: 0)
         startWorker()
     }
 
-    private func recoverPlayback(_ recording: RecmanRecording, _ recovery: Recovery, browser: RecmanBrowsing, generation: Int) async throws {
+    private func recoverPlayback(_ recording: RecmanRecording, _ recovery: Recovery, start: Int, browser: RecmanBrowsing, generation: Int) async throws {
         // The player link a failed fresh-stream lookup already found, for the browser below.
         var found: URL?
         let intent = playbackIntent
         let needsOpenPlayer: Bool
         if case .freshStream = recovery { needsOpenPlayer = true } else { needsOpenPlayer = false }
         let isCurrent = {
-            generation == self.generation && intent == self.playbackIntent
+            generation == self.generation && intent == self.playbackIntent && start == self.lectureStarts
                 && self.currentLectureID == recording.id && (!needsOpenPlayer || self.stillShowing(recording))
         }
         if case .freshStream(let position) = recovery {
@@ -2272,11 +2390,16 @@ struct RecordingsListing: Equatable {
                 found = player
                 let diagnosis = "play: recovery stream failed reason=\(Self.playFailureReason(cause).rawValue) error=\(PlaybackDiagnostics.errorName(cause))"
                 PlaybackDiagnostics.log.notice("\(diagnosis, privacy: .public)")
-                if cause is CancellationError || (cause as? RecmanBrowserError) == .needsSignIn { throw cause }
+                if (cause as? RecmanBrowserError) == .needsSignIn {
+                    reportStoppedLecture(recording, message: Self.signInToContinueMessage)
+                    throw cause
+                }
+                if cause is CancellationError { throw cause }
                 if (cause as? RecmanBrowserError) == .needsEmail {
                     // Same decision as for Play: no Webex page for the student, only the sentence.
-                    // The window stays, paused at the place it stopped.
+                    // The window stays, paused at the place it stopped, and says it too (#197).
                     openingProblem = RecordingsProblem(cause)
+                    reportStoppedLecture(recording, message: RecordingsProblem(cause).message)
                     log.notice("Fresh stream needs a confirmed email")
                     return
                 }
@@ -2293,10 +2416,32 @@ struct RecordingsListing: Equatable {
             openURL(url)
         } catch {
             guard isCurrent() else { return }
-            if error is CancellationError || (error as? RecmanBrowserError) == .needsSignIn { throw error }
+            if (error as? RecmanBrowserError) == .needsSignIn {
+                reportStoppedLecture(recording, message: Self.signInToContinueMessage)
+                throw error
+            }
+            if error is CancellationError { throw error }
             openingProblem = RecordingsProblem(error)
+            // A second mid-lecture failure leaves its window open: it says why too (#197).
+            reportStoppedLecture(recording, message: RecordingsProblem(error).message)
             log.error("Couldn't open a failed lecture in the browser")
         }
+    }
+
+    /// A mid-lecture failure whose recovery ended with neither a new stream nor the browser
+    /// (issue #197): `openingProblem` reaches only a Recordings page, and a lecture started from
+    /// the menu bar may have none, so the player window, still paused where the stream stopped,
+    /// shows the reason too. Only while that lecture is still the one on screen.
+    private func reportStoppedLecture(_ recording: RecmanRecording, message: String) {
+        guard stillShowing(recording) else { return }
+        player?.showProblem(message)
+    }
+
+    /// What the paused player window says when the lecture can't continue because the Polimi
+    /// session lapsed: the page shows "Accedi con Polimi", the window points there. Resolved when
+    /// shown (`tr`), never cached.
+    static var signInToContinueMessage: String {
+        tr("Accedi di nuovo con Polimi nella pagina Registrazioni per continuare.", "Sign in with Polimi again on the Recordings page to continue.")
     }
 
     /// Whether `recording` is still the lecture in the player's window: the student may have
@@ -2427,7 +2572,8 @@ struct RecordingsListing: Equatable {
             // `openingProblem` is shown by the page; with none on screen a menu Play asks for it.
             needsPage = takeMenuPlayNeedingPage(failing: job, queued: false)
         case .recover:
-            // Not a click: the lecture's window already says what happened to it.
+            // Not a click: `recoverPlayback` already told the lecture's window (#197) and only
+            // rethrows a cancellation or a lapsed session.
             break
         }
         // Offline or Polimi down: every other request would wait for the same timeout.
@@ -2450,14 +2596,29 @@ struct RecordingsListing: Equatable {
     /// Empties the queue, and with it every sync refresh still waiting, answered `background`
     /// (what emptied it: the session lapsed, Polimi not answering, a cancellation). Required, so
     /// no new way of clearing the queue can leave a caller of `refreshForSync` waiting forever.
-    private func clearQueue(background outcome: RecordingsSyncOutcome) {
+    private func clearQueue(background end: BackgroundEnd) {
         queue.removeAll()
         runningKey = nil
         openingRecordingID = nil
         for key in listings.keys where listings[key]?.isLoading == true {
             listings[key]?.isLoading = false
         }
-        for id in Array(backgroundWaiters.keys) { resolveBackground(id, outcome) }
+        for id in Array(backgroundWaiters.keys) {
+            // Each waiter keeps the lectures its finished courses already published (#190).
+            let newlyPublished = backgroundWaiters[id]?.newlyPublished ?? 0
+            switch end {
+            case .needsSignIn: resolveBackground(id, .needsSignIn(newlyPublished: newlyPublished))
+            case .unavailable: resolveBackground(id, .unavailable(newlyPublished: newlyPublished))
+            case .cancelled: resolveBackground(id, .cancelled)
+            }
+        }
+    }
+
+    /// What emptied the queue (`clearQueue`), turned into each waiting sync refresh's outcome with
+    /// its own count: the early endings carry the lectures its finished courses already published
+    /// (issue #190), a cancellation carries nothing (`RecordingsSyncOutcome.cancelled`).
+    private enum BackgroundEnd {
+        case needsSignIn, unavailable, cancelled
     }
 
     /// Sign-in, turn-off and an account change decide access themselves: the first visit's check
@@ -2663,6 +2824,7 @@ struct RecordingsListing: Equatable {
     /// opening cycle: later callers in the same cycle share the first read.
     private func savedCookies() async -> [HTTPCookie] {
         if defaults.bool(forKey: Self.sessionDiscardedKey) {
+            retryObsoleteSessionDeletion()
             emailLoaded = true
             return []
         }
@@ -2764,20 +2926,23 @@ struct RecordingsListing: Equatable {
         switch await vault.save(cookies, ownerUserID: owner, email: confirmedEmail?.value, keepingFileEmail: keepFileEmail, epoch: epoch, now: now()).value {
         case .saved:
             scheduleSessionExpiration()
-            if generation == self.generation, vault.epoch == epoch, defaults.bool(forKey: Self.sessionDiscardedKey) {
+            // The epoch alone proves the file now holds the current identity's session, so the
+            // discard flag goes whatever the generation: a newer sign-in started during the write
+            // must not leave it set, or the next launch's retry deletes this session (RA-002, #200).
+            if vault.epoch == epoch, defaults.bool(forKey: Self.sessionDiscardedKey) {
                 defaults.removeObject(forKey: Self.sessionDiscardedKey)
                 defaults.removeObject(forKey: Self.sessionDeletionPendingKey)
                 sessionDeletionFailed = false
-                sessionDeletionGeneration += 1
+                sessionDeletion = nil
             }
             // The cycle's cached read now describes an older file.
             sessionLoad = nil
         case .unchanged:
-            if generation == self.generation, vault.epoch == epoch, defaults.bool(forKey: Self.sessionDiscardedKey) {
+            if vault.epoch == epoch, defaults.bool(forKey: Self.sessionDiscardedKey) {
                 defaults.removeObject(forKey: Self.sessionDiscardedKey)
                 defaults.removeObject(forKey: Self.sessionDeletionPendingKey)
                 sessionDeletionFailed = false
-                sessionDeletionGeneration += 1
+                sessionDeletion = nil
             }
         case .stale:
             log.notice("Polimi session not saved: discarded while saving")
@@ -2813,23 +2978,46 @@ struct RecordingsListing: Equatable {
     private func discardSessionFile() {
         sessionExpirationTask?.cancel()
         defaults.set(true, forKey: Self.sessionDeletionPendingKey)
-        sessionDeletionGeneration += 1
-        let deletionGeneration = sessionDeletionGeneration
         defaults.set(true, forKey: Self.sessionDiscardedKey)
         sessionOwner = nil
         sessionLoad = nil
         // The email lives in the file and goes with it, in memory too.
         resetEmail()
         let delete = vault.discard()
+        trackSessionDeletion(delete, epoch: vault.epoch)
+    }
+
+    /// Deletes again a session file discarded earlier (`sessionDiscardedKey`) whose deletion
+    /// failed or never ran (#200). `RecmanSessionVault.retryDiscard` keeps a file a new session
+    /// was saved to since, and bumps no epoch, so a sign-in in progress is not disturbed.
+    private func retryObsoleteSessionDeletion() {
+        guard sessionDeletion == nil, defaults.bool(forKey: Self.sessionDiscardedKey) else { return }
+        trackSessionDeletion(vault.retryDiscard(), epoch: vault.epoch)
+    }
+
+    /// Clears the discard flag once the deletion is confirmed, unless a newer discard happened
+    /// meanwhile (`epoch`): that one's own deletion decides. A failure keeps the flag, so the
+    /// next controller or session read retries; it is only logged.
+    private func trackSessionDeletion(_ delete: Task<RecmanSessionVault.DeleteOutcome, Never>, epoch: Int) {
+        sessionDeletions += 1
+        let id = sessionDeletions
+        sessionDeletion = id
         Task { [weak self, log] in
             let outcome = await delete.value
-            guard let self, self.sessionDeletionGeneration == deletionGeneration else { return }
             if case .failed(let errorType) = outcome {
-                self.sessionDeletionFailed = true
                 log.error("Couldn't delete the saved Polimi session errorType=\(errorType, privacy: .public)")
-            } else {
+            }
+            guard let self else { return }
+            guard self.sessionDeletion == id else { return }
+            self.sessionDeletion = nil
+            guard self.vault.epoch == epoch else { return }
+            if outcome == .deleted {
                 self.sessionDeletionFailed = false
                 self.defaults.removeObject(forKey: Self.sessionDeletionPendingKey)
+                self.defaults.removeObject(forKey: Self.sessionDiscardedKey)
+            } else if case .failed = outcome {
+                self.sessionDeletionFailed = true
+                self.defaults.set(true, forKey: Self.sessionDeletionPendingKey)
             }
         }
     }

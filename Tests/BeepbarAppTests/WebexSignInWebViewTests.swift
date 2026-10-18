@@ -134,12 +134,18 @@ struct WebexSignInWebViewTests {
 
     /// A ticket set in the middle of the chain is seen through the cookie store's own change
     /// notification, without waiting for a page to finish.
+    ///
+    /// The ticket is set only once the page has finished and its probe ran (its "loaded" trace
+    /// line, #223): from then on no page event is left to find it, so only the cookie-store
+    /// observer can end the sign-in. A fixed sleep let a loaded runner set the ticket before the
+    /// page finished, and `webexPageFinished` found it instead (a vacuous pass). Mutation: empty
+    /// `cookiesDidChange` and the sign-in never ends (cancelled after `outcome`'s bound).
     @Test(.timeLimit(.minutes(1))) func aTicketMidChainEndsTheSignIn() async throws {
         let harness = Harness()
         defer { harness.session.close() }
         try await harness.open(fixture: "<p>idbroker</p>")
         let task = harness.start()
-        try await Task.sleep(for: .milliseconds(200))
+        try await harness.until { harness.lines.all.contains { $0.hasPrefix("loaded ") && $0.contains("asks credentials false") } }
         await harness.store.setCookie(Self.ticket())
         #expect(await outcome(task) == "signed in")
     }
@@ -226,12 +232,14 @@ struct WebexSignInWebViewTests {
         }
     }
 
-    /// `close()` and a cancelled Play both end a sign-in in flight at once.
+    /// `close()` and a cancelled Play both end a sign-in in flight at once. Each waits until the
+    /// sign-in has started its login page (`started`), not for a fixed time (#223), so the close
+    /// or cancel really lands on a running sign-in.
     @Test(.timeLimit(.minutes(1))) func closingOrCancellingEndsTheSignIn() async throws {
         let first = Harness()
         try await first.open(fixture: "<p></p>")
         let closed = first.start()
-        try await Task.sleep(for: .milliseconds(100))
+        try await first.until { first.started.count == 1 }
         first.session.close()
         #expect(await outcome(closed) == "cancelled")
 
@@ -239,7 +247,7 @@ struct WebexSignInWebViewTests {
         defer { second.session.close() }
         try await second.open(fixture: "<p></p>")
         let cancelled = second.start()
-        try await Task.sleep(for: .milliseconds(100))
+        try await second.until { second.started.count == 1 }
         cancelled.cancel()
         #expect(await outcome(cancelled) == "cancelled")
         try await second.untilBlank()

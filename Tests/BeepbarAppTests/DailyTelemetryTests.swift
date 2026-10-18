@@ -13,7 +13,7 @@ struct DailyTelemetryTests {
                                                 automaticSyncInterval: 28_800, dataSaverEnabled: false,
                                                 recordingsEnabled: true, launchAtLogin: true)
 
-    /// The wire contract: a hashed identifier and exactly the allowed fields, under the SDK's key
+    /// The wire contract: one shared identifier and exactly the allowed fields, under the SDK's key
     /// names and value formats where TelemetryDeck's built-in insights read them. Fails if a field
     /// is added, renamed, or reformatted (e.g. a full macOS build instead of the major version).
     @Test func payloadIsMinimalAndStable() throws {
@@ -339,7 +339,7 @@ struct DailyTelemetryTests {
         #expect(!second.isEnabled)
     }
 
-    /// Updates retain the installation identity while reporting the version from the new build.
+    /// Updates retain the shared identity while reporting the version from the new build.
     @Test func updateChangesVersionWithoutChangingIdentity() async throws {
         let harness = Harness()
         defer { harness.remove() }
@@ -391,7 +391,7 @@ struct DailyTelemetryTests {
 
     /// A clock rollback cannot send again until the next UTC day after the last attempt;
     /// catching up within the saved month retains that month's identifier.
-    @Test func clockRollbackWaitsForTheNextDayAndKeepsTheMonthIdentity() async throws {
+    @Test func clockRollbackWaitsForTheNextDayWithoutRecountingTheMonth() async throws {
         let harness = Harness()
         defer { harness.remove() }
         let recorder = Recorder()

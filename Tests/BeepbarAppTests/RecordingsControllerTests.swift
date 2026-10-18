@@ -28,6 +28,40 @@ import BeepbarCore
             isWaiting = false
             waiters.forEach { $0.resume() }
             waiters = []
+            cancellable.values.forEach { $0.resume() }
+            cancellable = [:]
+        }
+
+        private var cancellable: [UUID: CheckedContinuation<Void, Error>] = [:]
+        /// How many `waitOrCancel` calls ended because their task was cancelled.
+        private(set) var cancelledWaits = 0
+
+        /// Like `wait`, but ends with `CancellationError` as soon as the awaiting task is
+        /// cancelled, as the real browser's operations do (`RecmanWebSession.stream`, its Webex
+        /// sign-in included).
+        func waitOrCancel() async throws {
+            if released { return }
+            let id = UUID()
+            try await withTaskCancellationHandler {
+                try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
+                    if Task.isCancelled {
+                        cancelledWaits += 1
+                        continuation.resume(throwing: CancellationError())
+                        return
+                    }
+                    isWaiting = true
+                    cancellable[id] = continuation
+                }
+            } onCancel: {
+                Task { @MainActor in self.cancelWait(id) }
+            }
+        }
+
+        private func cancelWait(_ id: UUID) {
+            guard let continuation = cancellable.removeValue(forKey: id) else { return }
+            cancelledWaits += 1
+            if cancellable.isEmpty && waiters.isEmpty { isWaiting = false }
+            continuation.resume(throwing: CancellationError())
         }
     }
 
@@ -51,6 +85,9 @@ import BeepbarCore
     /// browser.
     var streamResults: [String: [Result<RecordingStream, Error>]] = [:]
     var streamGates: [String: Gate] = [:]
+    /// Whether a held stream ends with `CancellationError` when its task is cancelled, as the real
+    /// browser does; off by default, so older tests keep a held stream held.
+    var streamHonorsCancellation = false
     /// The email each `stream(for:email:)` call received (nil: none).
     private(set) var streamEmails: [String?] = []
 
@@ -97,7 +134,7 @@ import BeepbarCore
     func stream(for recording: RecmanRecording, email: PolimiEmail?) async throws -> RecordingStream {
         calls.append("stream \(recording.id)")
         streamEmails.append(email?.value)
-        await streamGates[recording.id]?.wait()
+        if streamHonorsCancellation { try await streamGates[recording.id]?.waitOrCancel() } else { await streamGates[recording.id]?.wait() }
         guard var results = streamResults[recording.id], !results.isEmpty else { throw RecmanBrowserError.playbackUnavailable }
         let result = results.removeFirst()
         streamResults[recording.id] = results
@@ -149,7 +186,12 @@ import BeepbarCore
         plays.append(Play(url: url, title: title, startAt: startAt, recordingID: recordingID, cookies: cookies.count))
         isOpen = true
         current = (recordingID, startAt ?? 0, duration)
+        afterPlay?()
     }
+
+    /// Runs at the end of each `play`, inside the controller's call: lets a test act in the exact
+    /// main-actor turn the player started.
+    var afterPlay: (() -> Void)?
 
     func pause() {}
 
@@ -161,6 +203,14 @@ import BeepbarCore
     }
 
     func adoptPolicyToRestore(_ policy: NSApplication.ActivationPolicy) { adoptedPolicies.append(policy) }
+
+    /// How many times the controller brought the open window forward (`bringToFront`).
+    private(set) var broughtToFront = 0
+    func bringToFront() { if isOpen { broughtToFront += 1 } }
+    /// What the controller told the open window about a lecture that can't continue
+    /// (`showProblem`), in order.
+    private(set) var problems: [String] = []
+    func showProblem(_ message: String) { if isOpen { problems.append(message) } }
 
     /// Reports the lecture on screen, if any, with `reason`: what the real player's checkpoint
     /// carries.
@@ -919,6 +969,66 @@ struct RecordingsControllerTests {
         #expect(controller.listings.isEmpty)
         #expect(controller.access == .needsSignIn(nil))
         #expect(defaults.object(forKey: RecordingsController.acknowledgedKey) == nil)
+    }
+
+    /// A Polimi sign-in completed while the WeBeep account was unknown has no session owner, so
+    /// nothing was saved. When an account then appears with that browser still open, the live
+    /// session can't be attributed: it goes, and the page asks for a sign-in (#191). Only memory
+    /// goes: the seen history's namespace is not rotated (the history is scoped by owner and
+    /// would hold the same student's progress if the account merely became known).
+    /// Guards a second student using the first one's Polimi login.
+    /// Mutation: restore `guard let sessionOwner, sessionOwner != userID` (browser stays open).
+    @Test func anAccountAppearingDropsALiveSessionWithNoOwner() async throws {
+        defer { cleanUp() }
+        defaults.set(true, forKey: RecordingsController.enabledKey)
+        world.owner = nil
+        let controller = makeController()
+        let namespace = defaults.string(forKey: RecordingsController.historyNamespaceKey)
+        controller.pageAppeared()
+        controller.signIn()
+        await settle("signed in, page open") { controller.access == .ready && browser.isOpen }
+        await controller.settleSessionFile()
+        #expect(try store.load() == nil, "fixture: an unknown owner saves nothing")
+
+        world.owner = 8
+        controller.webBeepAccountChanged(to: 8)
+        #expect(!browser.isOpen)
+        #expect(controller.access == .needsSignIn(nil))
+        #expect(defaults.string(forKey: RecordingsController.historyNamespaceKey) == namespace, "the seen history is untouched")
+    }
+
+    /// With no session owner, listings recorded under the account WeBeep reported at the time
+    /// (`ownerUserID()` fallback) and their watch progress go when the account changes (#191);
+    /// with nothing in memory, the account becoming known changes nothing (a normal launch
+    /// stays free and a sign-in made meanwhile stays usable).
+    /// Mutations: restore `guard let sessionOwner, sessionOwner != userID` (the listing and its
+    /// progress stay for account 8); drop the `unattributedMemory` emptiness checks (the first
+    /// `webBeepAccountChanged(to: 7)` asks for a sign-in).
+    @Test func anAccountChangeWithNoSessionOwnerDropsListingsInMemory() async throws {
+        defer { cleanUp() }
+        defaults.set(true, forKey: RecordingsController.enabledKey)
+        world.owner = nil
+        let controller = makeController()
+        controller.signIn()
+        await settle("signed in and closed") { controller.access == .ready && !browser.isOpen }
+        world.owner = 7
+        controller.webBeepAccountChanged(to: 7)
+        #expect(controller.access == .ready, "nothing in memory: nothing dropped")
+
+        browser.listResults[course.courseCode] = .success([recording("a")])
+        controller.pageAppeared()
+        controller.refresh([course], selected: course)
+        await settle("listed under the reported account") { controller.listing(for: course)?.recordings?.count == 1 }
+        #expect(!controller.watchProgress.known.isEmpty, "fixture: the listing's progress is known")
+        await controller.settleSessionFile()
+        #expect(try store.load() == nil, "fixture: still no session owner")
+
+        world.owner = 8
+        controller.webBeepAccountChanged(to: 8)
+        #expect(controller.listings.isEmpty)
+        #expect(controller.watchProgress.known.isEmpty)
+        #expect(!browser.isOpen)
+        #expect(controller.access == .needsSignIn(nil))
     }
 
     /// A file that can't be decoded (damage, a future version) is deleted and the user signs in
@@ -2198,6 +2308,77 @@ struct RecordingsControllerTests {
         controller.turnOff()
     }
 
+    /// A newer Play stops the stale lookup instead of queueing behind it (issue #194): the first
+    /// lookup, held as an interactive Webex sign-in would hold it, is cancelled, and the second
+    /// starts and reaches the player while the first is still unreleased.
+    /// Mutations: drop `runningPlay?.task.cancel()` in `open` (the second lookup never starts
+    /// while the first is held); run `playNatively` inline in `drain` again (same).
+    @Test func aNewerPlayCancelsTheStaleLookup() async {
+        defer { cleanUp() }
+        browser.streamHonorsCancellation = true
+        browser.streamResults["a"] = [.success(stream("a"))]
+        browser.streamResults["b"] = [.success(stream("b"))]
+        let gate = FakeRecmanBrowser.Gate()
+        defer { gate.release() }
+        browser.streamGates["a"] = gate
+        let controller = await readyController()
+        controller.play(recording("a"))
+        await settle("first stream held") { gate.isWaiting }
+        controller.play(recording("b"))
+        await settle("the newer Play reached the player") { world.player.plays.map(\.recordingID) == ["b"] }
+        #expect(gate.cancelledWaits == 1, "the stale lookup was cancelled, not waited for")
+        #expect(browser.streamCalls == ["stream a", "stream b"])
+        #expect(world.opened.isEmpty, "a cancelled lookup opens no browser")
+        #expect(controller.openingProblem == nil, "and reports nothing")
+        controller.turnOff()
+    }
+
+    /// A second Play of the lecture already being looked up (a double click on the row) is served
+    /// by that lookup: one stream request, one play (issue #194: it ran a second full lookup and
+    /// threw the first away). Mutation: drop the same-lecture early return in `open` (a second
+    /// stream request, or the first result discarded).
+    @Test func aSecondPlayOfTheSameLectureJoinsTheRunningLookup() async {
+        defer { cleanUp() }
+        browser.streamHonorsCancellation = true
+        browser.streamResults["a"] = [.success(stream("a")), .success(stream("a"))]
+        let gate = FakeRecmanBrowser.Gate()
+        defer { gate.release() }
+        browser.streamGates["a"] = gate
+        let controller = await readyController()
+        controller.play(recording("a"))
+        await settle("first stream held") { gate.isWaiting }
+        controller.play(recording("a"))
+        await drainTasks()
+        #expect(gate.cancelledWaits == 0)
+        gate.release()
+        await settle("a playing") { world.player.plays.count == 1 }
+        await drainTasks()
+        #expect(browser.streamCalls == ["stream a"])
+        #expect(world.player.plays.map(\.recordingID) == ["a"])
+        controller.turnOff()
+    }
+
+    /// A Play again of the same lecture, clicked right after the player started but before the
+    /// worker resumed from the finished lookup, restarts the lecture instead of joining a lookup
+    /// that is already over (#194's same-lecture shortcut). The click is scheduled from inside
+    /// the player's `play`, so it runs on the main actor after the lookup task ends and before
+    /// `drain` resumes. Mutation: clear `runningPlay` only when `drain` resumes (drop the
+    /// lookup task's own `defer`): the second click is swallowed.
+    @Test func aPlayAgainRightAfterThePlayerStartedIsNotSwallowed() async {
+        defer { cleanUp() }
+        browser.streamHonorsCancellation = true
+        browser.streamResults["a"] = [.success(stream("a")), .success(stream("a"))]
+        let controller = await readyController()
+        world.player.afterPlay = { [weak controller] in
+            world.player.afterPlay = nil
+            Task { @MainActor in controller?.play(recording("a")) }
+        }
+        controller.play(recording("a"))
+        await settle("played again") { world.player.plays.count == 2 }
+        #expect(browser.streamCalls == ["stream a", "stream a"])
+        controller.turnOff()
+    }
+
     /// A stream found after the feature was turned off starts nothing. Mutation: remove the
     /// generation guard after the stream in `playNatively`.
     @Test func aLateStreamAfterTurningOffStartsNothing() async {
@@ -2607,6 +2788,62 @@ struct RecordingsControllerTests {
         controller.turnOff()
     }
 
+    /// A mid-lecture failure whose recovery ends with neither a new stream nor the browser tells
+    /// the paused player window why, not only the Recordings page (issue #197: a lecture started
+    /// from the menu bar has no page, and its window just froze). Covers each way a recovery can
+    /// end like that: Webex needs a confirmed email, the second failure's browser link can't be
+    /// found (Polimi offline), and the Polimi session lapsing during the lookup.
+    /// Mutations: drop the `reportStoppedLecture` call of the scenario (no problem shown);
+    /// drop the `stillShowing` guard in it (not caught here: the window is open throughout).
+    @Test(arguments: ["needs email", "browser link unavailable", "session lapsed"])
+    func aRecoveryThatEndsWithNothingTellsThePlayerWindow(scenario name: String) async throws {
+        defer { cleanUp() }
+        switch name {
+        case "needs email":
+            browser.streamResults["a"] = [.success(stream("a")), .failure(RecmanBrowserError.needsEmail)]
+        case "browser link unavailable":
+            browser.streamResults["a"] = [.success(stream("a")), .success(stream("a"))]
+            browser.playbackResults["a"] = .failure(RecmanBrowserError.unavailable)
+        default:
+            browser.streamResults["a"] = [.success(stream("a")), .failure(RecmanBrowserError.needsSignIn)]
+        }
+        let controller = await readyController()
+        controller.play(recording("a"))
+        await settle("a playing") { world.player.plays.count == 1 }
+        world.player.failDuringPlayback(at: 300)
+        if name == "browser link unavailable" {
+            await settle("resumed once") { world.player.plays.count == 2 }
+            world.player.failDuringPlayback(at: 400)
+        }
+        await settle("the window was told") { !world.player.problems.isEmpty }
+        let expected: String = switch name {
+        case "needs email": RecordingsProblem.playbackUnavailable.message
+        case "browser link unavailable": RecordingsProblem.unavailable.message
+        default: RecordingsController.signInToContinueMessage
+        }
+        #expect(world.player.problems == [expected])
+        #expect(world.player.isOpen, "the paused window stays, with the reason")
+        #expect(world.opened.isEmpty)
+        controller.turnOff()
+    }
+
+    /// A lecture that stops while the Polimi session is gone can't be recovered: its paused
+    /// window says to sign in again (issue #197) instead of sitting frozen.
+    /// Mutation: drop the `.duringPlayback` report in `playerFailed`'s access guard.
+    @Test func aFailureWhileSignedOutTellsThePlayerWindow() async throws {
+        defer { cleanUp() }
+        browser.streamResults["a"] = [.success(stream("a"))]
+        let controller = await readyController()
+        controller.play(recording("a"))
+        await settle("a playing") { world.player.plays.count == 1 }
+        browser.listResults[course.courseCode] = .failure(RecmanBrowserError.needsSignIn)
+        controller.refresh([course], selected: course)
+        await settle("signed out") { controller.access == .needsSignIn(nil) }
+        world.player.failDuringPlayback(at: 300)
+        #expect(world.player.problems == [RecordingsController.signInToContinueMessage])
+        controller.turnOff()
+    }
+
     /// A recovery that runs with no Recordings page on screen does not leave the browser open
     /// (nothing at rest), and the lecture keeps playing. Mutation: remove `closesBrowserWhenIdle`.
     @Test func aRecoveryWithTheWindowClosedLeavesNoBrowserBehind() async {
@@ -2929,6 +3166,136 @@ struct RecordingsControllerTests {
         controller.turnOff()
     }
 
+    /// The student resumes the paused window while the first recovery is still looking up a
+    /// fresh stream, and the dead item fails again (RB-002 on #197: resuming re-arms the player's
+    /// failure report). That second report must not queue a second recovery: when the fresh
+    /// stream arrives the lecture goes on natively, with no browser and no closed window; when it
+    /// doesn't, the browser opens once, not twice.
+    /// Mutations: drop the pending-recovery check in `playerFailed` and "browser" opens it twice;
+    /// drop it together with the item check in `recoverPlayback` (`start == lectureStarts`) and
+    /// "fresh" also closes the recovered player and opens the browser. The item check alone is
+    /// masked here by the pending-recovery check, which stops the second recovery first; it has
+    /// its own test, `aStaleRecoveryNeverReplacesTheNewerItemOfTheSameLecture`.
+    @Test(arguments: ["fresh", "browser"])
+    func aSecondFailureDuringARecoveryQueuesNoSecondRecovery(outcome: String) async throws {
+        defer { cleanUp() }
+        browser.streamResults["a"] = outcome == "fresh"
+            ? [.success(stream("a")), .success(stream("a"))]
+            : [.success(stream("a")), .failure(RecmanBrowserError.playbackUnavailable)]
+        browser.playbackResults["a"] = .success(playerLink("a"))
+        let controller = await readyController()
+        controller.play(recording("a"))
+        await settle("a playing") { world.player.plays.count == 1 }
+        let gate = FakeRecmanBrowser.Gate()
+        defer { gate.release() }
+        browser.streamGates["a"] = gate
+        world.player.failDuringPlayback(at: 700)
+        await settle("recovery running") { gate.isWaiting }
+        // Space on the paused window, then the same dead item fails again.
+        world.player.failDuringPlayback(at: 700)
+        gate.release()
+        await settle("first recovery finished") { outcome == "fresh" ? world.player.plays.count == 2 : !world.opened.isEmpty }
+        await drainTasks()
+        if outcome == "fresh" {
+            #expect(world.player.plays.count == 2, "the lecture did not go on natively")
+            #expect(try world.player.play(1).startAt == 700)
+            #expect(world.player.closes == 0, "a second recovery closed the recovered player")
+            #expect(world.opened.isEmpty, "a second recovery opened the browser")
+        } else {
+            #expect(world.opened == [playerLink("a")], "the browser opened more than once")
+        }
+        controller.turnOff()
+    }
+
+    /// RB-101 on #197: the student presses Play again on the lecture already open; the old item
+    /// fails during that lookup, so a recovery of the OLD item is queued and runs after the new
+    /// item starts. The new item then fails before it is ready (its window closes), either while
+    /// that stale recovery is still looking up a stream ("running") or in the very turn the new
+    /// item starts, the stale recovery still queued ("queued"). The new item's failure must get
+    /// its own recovery, here the browser: before the fix the pending-recovery check matched the
+    /// lecture id alone, ignored the report, and the stale recovery then gave up (its item was
+    /// replaced), leaving no window, no browser and no message.
+    /// Mutations: drop the item comparison (`start == lectureStarts`) from the running half of
+    /// the pending check in `playerFailed` and "running" never opens the browser; drop it from
+    /// the queued half and "queued" never does.
+    @Test(arguments: ["running", "queued"])
+    func aFailureOfANewerItemIsRecoveredWhileAStaleRecoveryIsPending(stage: String) async throws {
+        defer { cleanUp() }
+        browser.streamResults["a"] = [.success(stream("a")), .success(stream("a")), .success(stream("a"))]
+        browser.playbackResults["a"] = .success(playerLink("a"))
+        // A known address, as after a first Play: the recovery goes straight to the stream lookup.
+        world.profileEmail = "mario.rossi@mail.polimi.it"
+        let controller = await readyController()
+        controller.play(recording("a"))
+        await settle("a playing") { world.player.plays.count == 1 }
+        let lookup = FakeRecmanBrowser.Gate()
+        defer { lookup.release() }
+        browser.streamGates["a"] = lookup
+        // Play again on the open lecture; the old item dies while the new stream is looked up.
+        controller.play(recording("a"))
+        await settle("second Play looking up") { lookup.isWaiting }
+        world.player.failDuringPlayback(at: 700)
+        let staleRecovery = FakeRecmanBrowser.Gate()
+        defer { staleRecovery.release() }
+        // Swapped in the same turn: the released lookup already holds its own gate.
+        if stage == "queued" {
+            // Inside the turn the new item starts: the worker hasn't taken the stale recovery yet.
+            world.player.afterPlay = {
+                world.player.afterPlay = nil
+                world.player.failBeforeReady()
+            }
+        }
+        lookup.release()
+        browser.streamGates["a"] = staleRecovery
+        if stage == "running" {
+            await settle("new item playing, stale recovery looking up") { world.player.plays.count == 2 && staleRecovery.isWaiting }
+            world.player.failBeforeReady()
+            staleRecovery.release()
+        } else {
+            await settle("new item started") { world.player.plays.count == 2 }
+            staleRecovery.release()
+        }
+        await settle("the new item's failure recovered") { !world.opened.isEmpty || !world.player.problems.isEmpty }
+        await drainTasks()
+        #expect(world.opened == [playerLink("a")], "the new item's failure was swallowed")
+        controller.turnOff()
+    }
+
+    /// The same Play-again race, but the new item plays fine: the stale recovery of the OLD item
+    /// must not restart the lecture over it when its fresh stream arrives. Every other check of
+    /// `recoverPlayback`'s `isCurrent` passes here (same Play, same lecture, its window open), so
+    /// only the item check stops it.
+    /// Mutation: drop `start == self.lectureStarts` from `isCurrent` and the player is handed a
+    /// third item at the old failure point.
+    @Test func aStaleRecoveryNeverReplacesTheNewerItemOfTheSameLecture() async throws {
+        defer { cleanUp() }
+        browser.streamResults["a"] = [.success(stream("a")), .success(stream("a")), .success(stream("a"))]
+        browser.playbackResults["a"] = .success(playerLink("a"))
+        // A known address, as after a first Play: the recovery goes straight to the stream lookup.
+        world.profileEmail = "mario.rossi@mail.polimi.it"
+        let controller = await readyController()
+        controller.play(recording("a"))
+        await settle("a playing") { world.player.plays.count == 1 }
+        let lookup = FakeRecmanBrowser.Gate()
+        defer { lookup.release() }
+        browser.streamGates["a"] = lookup
+        controller.play(recording("a"))
+        await settle("second Play looking up") { lookup.isWaiting }
+        world.player.failDuringPlayback(at: 700)
+        let staleRecovery = FakeRecmanBrowser.Gate()
+        defer { staleRecovery.release() }
+        lookup.release()
+        browser.streamGates["a"] = staleRecovery
+        await settle("new item playing, stale recovery looking up") { world.player.plays.count == 2 && staleRecovery.isWaiting }
+        staleRecovery.release()
+        await settle("stale recovery finished") { browser.streamResults["a"]?.isEmpty == true }
+        await drainTasks()
+        #expect(world.player.plays.count == 2, "the stale recovery replaced the newer item")
+        #expect(world.player.closes == 0)
+        #expect(world.opened.isEmpty)
+        controller.turnOff()
+    }
+
     @Test(arguments: ["duringPlayback", "beforeReady"])
     func aNewPlayRejectsALateRecoveryLink(failure: String) async {
         defer { cleanUp() }
@@ -3004,6 +3371,95 @@ struct RecordingsControllerTests {
         #expect(try store.load() == nil)
         let relaunched = makeController()
         #expect(!relaunched.sessionDeletionFailed)
+    }
+
+    /// A discarded session whose deletion failed is deleted later: by the next controller (a
+    /// relaunch, with nothing opened) or by the next session read of the same controller, and
+    /// the discard flag is cleared only once the file is gone (#200). Guards the previous
+    /// account's Polimi and Webex cookies and email staying on disk for good after turn-off.
+    /// Mutations: drop `retryObsoleteSessionDeletion()` from `init` (relaunch keeps the file) or
+    /// from `savedCookies` (same controller keeps it); clear the flag on any outcome (the flag
+    /// is gone while the file is still there after the first failure).
+    @Test(arguments: [false, true])
+    func aFailedSessionDeletionIsRetriedLater(relaunch: Bool) async throws {
+        defer { try? FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: folder.path); cleanUp() }
+        let discardedKey = "io.github.tvaccari.beepbar.recordings-session-discarded.v1"
+        try store.save(RecmanSessionCodec.encode([FakeRecmanBrowser.cookie("SSO_LOGIN", value: "obsolete")], ownerUserID: 42, email: "obsolete@mail.polimi.it", now: world.now))
+        defaults.set(true, forKey: RecordingsController.enabledKey)
+        let controller = makeController()
+        try FileManager.default.setAttributes([.posixPermissions: 0o500], ofItemAtPath: folder.path)
+        controller.setEnabled(false)
+        await controller.settleSessionFile()
+        await drainTasks()
+        #expect(try store.load() != nil, "fixture: the first unlink failed")
+        #expect(defaults.bool(forKey: discardedKey), "a failed deletion keeps the flag")
+        try FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: folder.path)
+
+        let next: RecordingsController
+        if relaunch {
+            next = makeController()
+        } else {
+            // The sign-in fails, so no new session replaces the file: only the retry removes it.
+            browser.signInError = RecmanBrowserError.unrecognized
+            next = controller
+            next.setEnabled(true)
+        }
+        await settle("the obsolete file is deleted") { (try? store.load()) == nil }
+        await next.settleSessionFile()
+        await drainTasks()
+        #expect(!defaults.bool(forKey: discardedKey), "a confirmed deletion clears the flag")
+        if !relaunch { next.turnOff() }
+    }
+
+    /// A session saved while a newer sign-in starts (the generation moves, the vault epoch does
+    /// not) still clears the discard flag, so the next launch keeps that session instead of
+    /// deleting it as obsolete (RA-002 on #200). Before the fix the flag was cleared only when the
+    /// generation was unchanged: it stayed set over the new file, and the relaunch's retry deleted
+    /// it, costing the student one more "Accedi con Polimi".
+    /// Mutation: require `generation == self.generation` again to clear the flag on `.saved`.
+    @Test func aSaveFinishingDuringANewerSignInStillClearsTheDiscardFlag() async throws {
+        defer { try? FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: folder.path); cleanUp() }
+        let discardedKey = "io.github.tvaccari.beepbar.recordings-session-discarded.v1"
+        // An earlier discard whose unlink failed: the obsolete file and the flag are both there.
+        try store.save(RecmanSessionCodec.encode([FakeRecmanBrowser.cookie("SSO_LOGIN", value: "obsolete")], ownerUserID: 42, email: nil, now: world.now))
+        defaults.set(true, forKey: discardedKey)
+        try FileManager.default.setAttributes([.posixPermissions: 0o500], ofItemAtPath: folder.path)
+        let controller = makeController()
+        let firstSignIn = FakeRecmanBrowser.Gate()
+        browser.signInGate = firstSignIn
+        controller.setEnabled(true)
+        await settle("first sign-in on screen") { firstSignIn.isWaiting }
+        await controller.settleSessionFile()
+        await drainTasks()
+        #expect(defaults.bool(forKey: discardedKey), "fixture: every retry so far failed")
+        // The disk works again; the sign-in's save is held mid-write by a slow disk.
+        try FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: folder.path)
+        world.sessionFiles.hold(access: world.storeAccesses + 1)
+        firstSignIn.release()
+        await settle("the save is held by the slow disk") { world.sessionFiles.isHolding }
+
+        // "Accedi con Polimi" again while the save is still writing: a new generation, no discard.
+        let secondSignIn = FakeRecmanBrowser.Gate()
+        defer { secondSignIn.release() }
+        browser.signInGate = secondSignIn
+        controller.signIn()
+        await settle("second sign-in on screen") { secondSignIn.isWaiting }
+        world.sessionFiles.release()
+        await controller.settleSessionFile()
+        await drainTasks()
+        #expect(try savedSession()?.cookies.map(\.value) == ["fresh"], "fixture: the first sign-in's session was written")
+        #expect(!defaults.bool(forKey: discardedKey), "the flag stayed set over a session saved in the current epoch")
+        #expect(!defaults.bool(forKey: RecordingsController.sessionDeletionPendingKey), "a successful current-epoch save must clear the privacy deletion intent")
+        #expect(!controller.sessionDeletionFailed, "a successful current-epoch save must clear the stale deletion warning")
+
+        let relaunched = makeController()
+        await relaunched.settleSessionFile()
+        await drainTasks()
+        #expect(try savedSession()?.cookies.map(\.value) == ["fresh"], "the next launch deleted a legitimate session")
+        #expect(!relaunched.sessionDeletionFailed, "a legitimate saved session must not reopen with a deletion warning")
+        #expect(!defaults.bool(forKey: RecordingsController.sessionDeletionPendingKey))
+        controller.turnOff()
+        await controller.settleSessionFile()
     }
 
     // MARK: Review follow-ups (#148)

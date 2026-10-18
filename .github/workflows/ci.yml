@@ -59,8 +59,14 @@ jobs:
             .build/repositories
             build/SourcePackages
           key: packages-v1-${{ runner.os }}-${{ runner.arch }}-${{ steps.toolchain.outputs.fingerprint }}-${{ hashFiles('Package.swift', 'Package.resolved', 'Beepbar.xcodeproj/project.pbxproj', 'Beepbar.xcodeproj/project.xcworkspace/xcshareddata/swiftpm/Package.resolved') }}
+      # Tooling tests that need no Swift build (#215, #222): cheap, so they run before `swift test`.
+      # `scripts/recordings-seen-isolated-tests.py` is not here: it builds a temporary Swift package.
       - name: Benchmark comparison tests
         run: python3 scripts/test_benchmark_compare.py
+      - name: UI benchmark driver tests
+        run: python3 scripts/test_ui_benchmark.py
+      - name: Linux test wrapper tests
+        run: bash scripts/test-linux-core-tests.sh
       - name: Swift tests
         run: swift test
       - name: Verify readable release notes
@@ -92,6 +98,21 @@ jobs:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
+      # Changelog release gate (issue #210), first so a bad changelog fails before the build.
+      # `release-notes.sh` refuses a non-empty `## Unreleased`, a newest dated section without
+      # highlights, and notes identical to those of the last published release, whose CHANGELOG.md
+      # is read from its `v*` tag (all tags are fetched above). Without such a tag, or with an
+      # older changelog format there, the comparison is skipped. Consequence: a push to `main`
+      # that publishes a release needs its own dated CHANGELOG section. The later appcast step
+      # uses the `release-notes.md` written here.
+      - name: Verify release notes
+        run: |
+          PREVIOUS_TAG=$(git tag --list 'v[0-9]*' --sort=-v:refname | head -n 1)
+          : > previous-changelog.md
+          if [ -n "$PREVIOUS_TAG" ] && git cat-file -e "$PREVIOUS_TAG:CHANGELOG.md" 2>/dev/null; then
+            git show "$PREVIOUS_TAG:CHANGELOG.md" > previous-changelog.md
+          fi
+          bash scripts/release-notes.sh CHANGELOG.md previous-changelog.md > release-notes.md
       - name: Verify toolchain
         run: |
           xcodebuild -version
@@ -126,7 +147,7 @@ jobs:
           SIGNATURE=$(echo "$SPARKLE_PRIVATE_KEY" | /tmp/sparkle-tools/bin/sign_update --ed-key-file - build/00-Beepbar.dmg -p)
           LENGTH=$(stat -f%z build/00-Beepbar.dmg)
           PUBDATE=$(date -u +"%a, %d %b %Y %H:%M:%S +0000")
-          bash scripts/release-notes.sh CHANGELOG.md > release-notes.md
+          test -s release-notes.md
           cat > release-body.md <<BODYEOF
           [**Download BeepBar for macOS**](https://github.com/${{ github.repository }}/releases/latest/download/00-Beepbar.dmg)
 

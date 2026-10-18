@@ -1006,6 +1006,83 @@ struct ConflictChoiceFeedbackTests {
         #expect(controller.conflictChoiceFeedback == nil)
     }
 
+    /// Proves that a choice in Conflicts about a file Moodle moved or uploaded again, blocked by an
+    /// interrupted move whose path cannot be read, names that path (the same message a sync shows)
+    /// instead of the generic "Impossibile completare la scelta", and leaves the choice open.
+    /// docs/sync-behavior §4.1 promises "the window says which path". Fails if `resolve(_:with:)`
+    /// stops catching `RemoteMoveRecoveryError` (#184).
+    @Test @MainActor func aChoiceBlockedByAnUnreadableMoveNamesThePath() async throws {
+        let fixture = try await ChoiceFixture()
+        defer { fixture.remove() }
+        try fixture.write("mine", path: "Course/old.txt")
+        try fixture.write("remote", path: "Course/new.txt")
+        let change = RemoteChange(rootID: fixture.rootID, courseID: 1, remoteID: "old", kind: .reuploaded, relativePath: try RelativePath("Course/old.txt"), targetPath: try RelativePath("Course/new.txt"), newRemoteID: "new", localSHA256: try await fixture.hash("Course/old.txt"), isLocallyModified: true)
+        _ = try await fixture.database.reconcileRemoteChanges(rootID: fixture.rootID, courseIDs: [1], desired: [change])
+        let destination = try RelativePath("Course/Moved/a.txt")
+        try await fixture.database.beginRemoteMoves(rootID: fixture.rootID, [
+            PendingRemoteMove(batchID: UUID(), remoteID: "interrupted", from: try RelativePath("Course/Lezioni/a.txt"), to: destination, sha256: String(repeating: "0", count: 64), placement: nil),
+        ])
+        // A Finder alias where the moved file's folder should be: recovery cannot read it.
+        try FileManager.default.createSymbolicLink(at: fixture.root.appending(path: "Course/Moved"), withDestinationURL: fixture.root)
+        let controller = fixture.controller()
+
+        // "Tieni entrambi" touches no file, yet it is blocked too, as documented.
+        controller.resolve(change, with: .keepBoth)
+        try await waitForChoice(controller)
+
+        #expect(controller.conflictChoiceFeedback == WeBeepAuthenticationController.unreadableMoveMessage(destination))
+        #expect(try await fixture.database.remoteChange(rootID: fixture.rootID, id: change.id) != nil)
+    }
+
+    /// Proves that "Organizza cartelle" blocked by an interrupted move whose path cannot be read
+    /// shows that path in the sheet: the real `ModulePathMigrator.preview` error goes through the
+    /// sheet's own mapping (`moduleFolderErrorMessage`). Fails if the mapping drops
+    /// `RemoteMoveRecoveryError` back to "Operazione non riuscita" (#184).
+    @Test @MainActor func organizingFoldersBlockedByAnUnreadableMoveNamesThePath() async throws {
+        let fixture = try await ChoiceFixture()
+        defer { fixture.remove() }
+        let destination = try RelativePath("Course/Moved/a.txt")
+        try await fixture.database.beginRemoteMoves(rootID: fixture.rootID, [
+            PendingRemoteMove(batchID: UUID(), remoteID: "interrupted", from: try RelativePath("Course/Lezioni/a.txt"), to: destination, sha256: String(repeating: "0", count: 64), placement: nil),
+        ])
+        try FileManager.default.createDirectory(at: fixture.root.appending(path: "Course"), withIntermediateDirectories: true)
+        try FileManager.default.createSymbolicLink(at: fixture.root.appending(path: "Course/Moved"), withDestinationURL: fixture.root)
+        let migrator = ModulePathMigrator(rootID: fixture.rootID, database: fixture.database, fileStore: try FileStore(root: fixture.root), gate: RootOperationGate(), apiClient: WeBeepAPIClient(session: URLSession(configuration: .ephemeral)))
+        let contents = RemoteCourseContents(sections: [RemoteContentSection(id: 3, name: "Resources", modules: [RemoteContentModule(id: 7, name: "Slides", files: [])])], issueCount: 0)
+
+        var message: String?
+        do { _ = try await migrator.preview(courseID: 1, moduleID: 7, courseFolder: "Course", action: .set, folder: "Custom", contents: contents) }
+        catch { message = WeBeepAuthenticationController.moduleFolderErrorMessage(error) }
+
+        #expect(message == WeBeepAuthenticationController.unreadableMoveMessage(destination).text)
+    }
+
+    /// Proves that "Organizza cartelle" refuses while a course-folder rename is unfinished (#183)
+    /// and says to restart BeepBar: the real `ModulePathMigrator.preview` error goes through the
+    /// sheet's own mapping. The window still shows the old folder name then, so a plan built from
+    /// it would create the old folder and split the course (RA-004 of PR #225). Fails if the
+    /// migrator lets the preview run, or if the mapping falls back to a generic message.
+    @Test @MainActor func organizingFoldersDuringAnUnfinishedCourseRenameSaysToRestart() async throws {
+        let fixture = try await ChoiceFixture()
+        defer { fixture.remove() }
+        let store = try FileStore(root: fixture.root)
+        let identity = try await store.ensureTopLevelDirectory("Course").identity
+        try await fixture.database.upsertScope(SyncScope(rootID: fixture.rootID, courseID: 1, displayName: "Course", localFolder: "Course", enabled: true, managedDirectory: identity))
+        // What a rename whose flush failed leaves: the folder renamed on disk, the row pending.
+        try FileManager.default.moveItem(at: fixture.root.appending(path: "Course"), to: fixture.root.appending(path: "Renamed"))
+        try await fixture.database.beginScopeMove(PendingScopeMove(id: UUID(), rootID: fixture.rootID, courseID: 1, oldFolder: "Course", newFolder: "Renamed"))
+        let migrator = ModulePathMigrator(rootID: fixture.rootID, database: fixture.database, fileStore: store, gate: RootOperationGate(), apiClient: WeBeepAPIClient(session: URLSession(configuration: .ephemeral)))
+        let contents = RemoteCourseContents(sections: [RemoteContentSection(id: 3, name: "Resources", modules: [RemoteContentModule(id: 7, name: "Slides", files: [])])], issueCount: 0)
+
+        var message: String?
+        do { _ = try await migrator.preview(courseID: 1, moduleID: 7, courseFolder: "Course", action: .set, folder: "Custom", contents: contents) }
+        catch { message = WeBeepAuthenticationController.moduleFolderErrorMessage(error) }
+
+        #expect(message == WeBeepAuthenticationController.pendingFolderRenameMessage.text)
+        #expect(!FileManager.default.fileExists(atPath: fixture.root.appending(path: "Course").path))
+        #expect(try await fixture.database.pendingScopeMoves().count == 1)
+    }
+
     @Test @MainActor func lateDatabaseFailureDoesNotPromiseLocalPreservation() async throws {
         let fixture = try await ChoiceFixture()
         defer { fixture.remove() }

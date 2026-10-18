@@ -33,6 +33,17 @@ import OSLog
     func pause()
     /// Stops playback and releases the player and its window. Safe to call at any time.
     func close()
+    /// Puts the open player window back in front of the student: restores it from the Dock if it
+    /// was minimized, then activates the app and makes it key. Does nothing when no lecture is
+    /// open. A menu Play of the lecture already open uses this (issue #193): activating the app
+    /// alone leaves a minimized window in the Dock, so the click looked dead.
+    func bringToFront()
+    /// Says in the window why the lecture on screen stopped and can't continue (`message`, already
+    /// in the user's language), in place of the course name under the title, until the next
+    /// `play` or the student resumes it. The caller uses it when a mid-lecture failure's recovery
+    /// ends without a new stream or the browser (issue #197): with no Recordings page open, the
+    /// paused window is the only place that can explain it. Does nothing when no lecture is open.
+    func showProblem(_ message: String)
     /// Makes the player restore `policy` when it closes, for code that raised BeepBar to a
     /// regular app and finds a lecture open when it is done; see
     /// `RecordingPlayerController.adoptPolicyToRestore`.
@@ -206,7 +217,9 @@ enum RecordingPlayerError: Error {
     private(set) var rateSupport = RateSupport.unknown
     /// Whether `onFailure` already fired for the current generation: the status KVO and the
     /// failed-to-play-to-end notification can both report the same failure, and the fallback must
-    /// run once.
+    /// run once. Cleared when playback starts again after the failure (the student pressed play,
+    /// Space or a media key on the paused window; `timeControlStatusChanged`), so a later stall of
+    /// that same item is reported again instead of leaving a frozen window (issue #197).
     private var failureReported = false
     /// The resume position waiting for the item to become ready.
     private var pendingStartAt: TimeInterval?
@@ -511,6 +524,22 @@ enum RecordingPlayerError: Error {
         window.close()
     }
 
+    func bringToFront() {
+        guard isOpen, let window else { return }
+        // `NSApp.activate()` never restores a minimized window (probed in #193); the window
+        // itself must leave the Dock before it is ordered front.
+        if window.isMiniaturized { window.deminiaturize(nil) }
+        present(window)
+    }
+
+    func showProblem(_ message: String) {
+        guard isOpen, let window else { return }
+        // The subtitle, not an alert: the window stays usable (the student can still seek, close
+        // it or press play), and the next `play` puts the course name back. The message is the
+        // language of the moment; it lasts only until the lecture moves on.
+        window.subtitle = message
+    }
+
     func windowWillClose(_ notification: Notification) {
         guard let closing = notification.object as? NSWindow, closing === window else { return }
         // The student closed the window: report where they stopped before anything is released.
@@ -810,6 +839,16 @@ enum RecordingPlayerError: Error {
             if !checkpointedSincePlaying { checkpointIfMeaningful(.paused) }
         } else {
             checkpointedSincePlaying = false
+            // Moving again after a reported mid-lecture failure: `fail` paused the player and
+            // cancelled any pending start, so only the student can have restarted it. A new
+            // failure of this item must reach `onFailure` again, and the problem shown in the
+            // window (`showProblem`) no longer describes what is on screen (issue #197). The
+            // restart may come while the first failure's recovery is still running: the
+            // controller ignores a report for a lecture whose recovery is pending (RB-002).
+            if failureReported, isCurrentItemReady {
+                failureReported = false
+                window?.subtitle = nowPlayingMetadata?.courseName ?? ""
+            }
         }
         updateProgressObserver(generation: observed)
         publishNowPlaying()

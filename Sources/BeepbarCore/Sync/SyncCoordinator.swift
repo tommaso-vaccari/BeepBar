@@ -57,7 +57,10 @@ public actor SyncCoordinator {
     private func synchronizeWithinLease(targets: [SyncTarget], token: String, mode: SyncCoordinatorMode, networkAccess: NetworkAccess, progress: @escaping @Sendable (SyncProgress) async -> Void) async throws -> SyncProgress {
         try Task.checkCancellation()
         guard try await database.hasPendingModuleMoves(rootID: rootID) == false else { throw SyncDatabaseError.execution }
-        guard try await database.pendingScopeMoves().contains(where: { $0.rootID == rootID }) == false else { throw SyncDatabaseError.execution }
+        // An unfinished course-folder rename blocks the run before any folder is created: the
+        // targets may still name the old folder. Settled only by launch recovery; see
+        // `PendingCourseFolderRenameError` (#183).
+        guard try await database.pendingScopeMoves(rootID: rootID).isEmpty else { throw PendingCourseFolderRenameError() }
         guard !targets.isEmpty else { return SyncProgress(completed: 0, total: 0, installed: 0, preservedLocal: 0, unchanged: 0, conflicts: 0, failures: 0) }
         // Before any baseline is read: a move interrupted by a crash is completed or dropped first.
         try await RemoteMoveJournal.recover(rootID: rootID, database: database, fileStore: fileStore)

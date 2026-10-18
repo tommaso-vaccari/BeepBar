@@ -41,8 +41,7 @@ struct RecordingsSyncRefreshTests {
             copy: { world.copied.append($0) },
             now: { MainActor.assumeIsolated { world.now } },
             makePlayer: { world.playersMade += 1; return world.player },
-            courses: { world.courses },
-            bringPlayerForward: {}
+            courses: { world.courses }
         )
     }
 
@@ -151,7 +150,7 @@ struct RecordingsSyncRefreshTests {
     @Test func noSessionOpensNothing() async throws {
         defer { cleanUp() }
         let controller = try launched(withSession: false)
-        #expect(await controller.refreshForSync([course], force: false) == .needsSignIn)
+        #expect(await controller.refreshForSync([course], force: false) == .needsSignIn(newlyPublished: 0))
         #expect(world.browsersMade == 0)
         #expect(browser.calls.isEmpty)
         #expect(controller.access == .needsSignIn(nil))
@@ -171,7 +170,7 @@ struct RecordingsSyncRefreshTests {
         #expect(await controller.refreshForSync([course], force: false) == .refreshed(newlyPublished: 0, failedKeys: 0))
         browser.listResults[course.courseCode] = .failure(RecmanBrowserError.needsSignIn)
         var seen = browser.calls.count
-        #expect(await controller.refreshForSync([course], force: true) == .needsSignIn)
+        #expect(await controller.refreshForSync([course], force: true) == .needsSignIn(newlyPublished: 0))
         #expect(!browser.calls.dropFirst(seen).contains("signIn"), "no sign-in, so no window")
         #expect(!browser.isOpen)
         #expect(controller.access == .needsSignIn(nil))
@@ -217,8 +216,29 @@ struct RecordingsSyncRefreshTests {
         // Listed in key order: `other` (052499) first.
         browser.listResults[other.courseCode] = .failure(RecmanBrowserError.unavailable)
         list(["x"])
-        #expect(await controller.refreshForSync([course, other], force: true) == .unavailable)
+        #expect(await controller.refreshForSync([course, other], force: true) == .unavailable(newlyPublished: 0))
         #expect(browser.listCalls == ["052499"])
+    }
+
+    /// A batch cut short after an earlier course published new lectures keeps their count in its
+    /// outcome, so they are still announced (issue #190): they are on the page with their dots
+    /// and the next sync compares against them, so dropping the count lost the "N nuove
+    /// registrazioni" for good. Covers both early endings, Polimi not answering and the session
+    /// lapsing, on the second course in key order (`other`, 052499, lists first).
+    /// Mutation: resolve `.needsSignIn`/`.unavailable` with 0 in `clearQueue` (count lost).
+    @Test(arguments: [RecmanBrowserError.unavailable, .needsSignIn])
+    func aBatchCutShortKeepsWhatItAlreadyPublished(_ failure: RecmanBrowserError) async throws {
+        defer { cleanUp() }
+        let controller = try launched()
+        list(["x"], for: other)
+        list(["a"])
+        #expect(await controller.refreshForSync([course, other], force: true) == .refreshed(newlyPublished: 0, failedKeys: 0), "baseline")
+        list(["x", "y", "z"], for: other)
+        browser.listResults[course.courseCode] = .failure(failure)
+        let outcome = await controller.refreshForSync([course, other], force: true)
+        #expect(outcome == (failure == .unavailable ? .unavailable(newlyPublished: 2) : .needsSignIn(newlyPublished: 2)))
+        #expect(controller.listing(for: other)?.recordings?.map(\.id) == ["x", "y", "z"], "already published")
+        #expect(RecordingsNotificationDecision.count(for: outcome, notificationsEnabled: true) == 2)
     }
 
     // MARK: Identity changes while a listing is in flight
@@ -461,6 +481,32 @@ struct RecordingsSyncRefreshTests {
         await controller.settleSessionFile()
         #expect(defaults.writes.isEmpty, "wrote \(defaults.writes)")
         #expect(sessionFileNumber() == file)
+    }
+
+    /// After a relaunch, an unchanged listing writes no summary and publishes no changed one
+    /// (#189). The saved `next` reads back without its date, kind and size, so a raw comparison
+    /// with the fresh summary rewrote and republished every course with an unfinished lecture on
+    /// each launch. The only push allowed is the lazy read of the saved summaries, identical to
+    /// what the menu seeded itself with. Unlike `aSecondIdenticalRefreshWritesNothing`, the
+    /// second refresh runs in a new controller that only has the decoded copy.
+    /// Mutation: compare raw values in `storeWatchSummary` (one write, a second push).
+    @Test func anUnchangedListingAfterARelaunchWritesAndPublishesNothing() async throws {
+        defer { cleanUp() }
+        let first = try launched()
+        list(["a", "b"])
+        _ = await first.refreshForSync([course], force: true)
+        await first.settleSessionFile()
+        let saved = try #require(RecordingsController.storedWatchSummaries(in: defaults, owner: 42))
+        #expect(saved[course]?.next?.id == "a", "the fixture needs a saved next lecture")
+
+        let relaunched = makeController()
+        var pushes: [[RecmanCourseKey: CourseWatchSummary]] = []
+        relaunched.onWatchSummaryChange = { pushes.append($0) }
+        defaults.resetWrites()
+        #expect(await relaunched.refreshForSync([course], force: true) == .refreshed(newlyPublished: 0, failedKeys: 0))
+        await relaunched.settleSessionFile()
+        #expect(summaryWrites == 0, "wrote \(defaults.writes)")
+        #expect(pushes == [saved], "pushed \(pushes.count) summaries")
     }
 
     /// Non-force respects the 300 s freshness (zero browser calls); force and an expired

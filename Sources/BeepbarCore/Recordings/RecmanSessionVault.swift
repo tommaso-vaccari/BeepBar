@@ -76,6 +76,9 @@ public final class RecmanSessionVault: Sendable {
     public enum DeleteOutcome: Sendable, Equatable {
         case deleted
         case failed(String)
+        /// `retryDiscard()` only: a save in the current epoch wrote the file since the last
+        /// `discard()` (or this launch), so it holds a new session, not the obsolete one.
+        case kept
     }
 
     private struct Saved: Equatable {
@@ -91,6 +94,12 @@ public final class RecmanSessionVault: Sendable {
         var epoch = 0
         /// What the file holds, when this process knows it (after a load or a save); a delete forgets it.
         var saved: Saved?
+        /// A `save` wrote the file after the last `discard()` call (or since launch). Every such
+        /// write passed the epoch check, so it is a session of the current epoch: the one thing
+        /// `retryDiscard()` must never delete (#200). Reset by `discard()` under the same lock
+        /// that bumps the epoch, so a save enqueued before the discard can't set it afterwards
+        /// (it is refused as stale and writes nothing).
+        var currentEpochWritten = false
     }
 
     private let storage: Storage
@@ -158,7 +167,7 @@ public final class RecmanSessionVault: Sendable {
             // the controller awaited the browser, must win. Nothing is written for a stale epoch.
             guard state.withLock({ $0.epoch == epoch }) else { return .stale }
             do { try storage.save(data) } catch { return .failed(String(reflecting: type(of: error))) }
-            state.withLock { $0.saved = candidate }
+            state.withLock { $0.saved = candidate; $0.currentEpochWritten = true }
             return .saved
         }
     }
@@ -202,11 +211,28 @@ public final class RecmanSessionVault: Sendable {
     @discardableResult public func discard() -> Task<DeleteOutcome, Never> {
         state.withLock { state in
             state.epoch += 1
+            state.currentEpochWritten = false
             return enqueue(into: &state) { [storage, lock = self.state] in
                 defer { lock.withLock { $0.saved = nil } }
                 do { try storage.delete() } catch { return .failed(String(reflecting: type(of: error))) }
                 return .deleted
             }
+        }
+    }
+
+    /// Deletes the file again after a `discard()` whose delete failed or never ran (the process
+    /// ended first), for the caller that persisted the intent to discard (#200). Unlike
+    /// `discard()` it does not bump the epoch: a save cycle that started since belongs to a new,
+    /// legitimate session and must still be written. For the same reason it deletes nothing
+    /// (`.kept`) when a save has written the file since the last `discard()` or since launch;
+    /// checked when it runs, in turn, so a save enqueued before it is accounted for. A failed
+    /// delete forgets what the file holds, as in `discard()`.
+    @discardableResult public func retryDiscard() -> Task<DeleteOutcome, Never> {
+        enqueue { [storage, state] in
+            if state.withLock({ $0.currentEpochWritten }) { return .kept }
+            defer { state.withLock { $0.saved = nil } }
+            do { try storage.delete() } catch { return .failed(String(reflecting: type(of: error))) }
+            return .deleted
         }
     }
 

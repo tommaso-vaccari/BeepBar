@@ -178,6 +178,42 @@ public struct RecordingsSeenStore: Sendable {
         }
     }
 
+    /// Applies the same watch-progress event to several recordings of one course, in one
+    /// connection and at most one `BEGIN IMMEDIATE` transaction (issue #208: "Mark all as
+    /// completed" opened a connection and committed a durable transaction per lecture). Returns
+    /// one result per element of `ids`, in order.
+    ///
+    /// Same rules as `applyProgress(owner:key:id:event:)`, per entry: an unlocked first read
+    /// decides whether anything would change (nothing: no transaction, no journal), and inside the
+    /// transaction every row is read and decided again and written only if it still changes.
+    ///
+    /// All or nothing: a failure on any row rolls back the rows written before it, so a failed
+    /// batch leaves every recording exactly as it was and a retry redoes the whole set. A
+    /// repeated ID is decided after the earlier occurrence's write, so it reports no change.
+    public func applyProgress(owner: Int, key: RecmanCourseKey, ids: [String], event: RecordingProgressEvent) throws -> [RecordingProgressResult] {
+        guard !ids.isEmpty else { return [] }
+        return try withDatabase { db in
+            let statement = try prepare(Self.progressLookup, db: db)
+            defer { finalizeProgress(statement) }
+            let results = try ids.map { id -> RecordingProgressResult in
+                let stored = try readProgress(statement, owner: owner, key: key, id: id)
+                return RecordingProgressResult(entry: stored?.entry, changed: Self.apply(event, to: stored) != nil)
+            }
+            guard results.contains(where: \.changed) else { return results }
+            probe?.afterUnlockedRead?()
+            var decided = results
+            try transaction(db) {
+                for (index, id) in ids.enumerated() {
+                    let stored = try readProgress(statement, owner: owner, key: key, id: id)
+                    let new = Self.apply(event, to: stored)
+                    decided[index] = RecordingProgressResult(entry: new ?? stored?.entry, changed: new != nil)
+                    if let new { try write(new, owner: owner, key: key, id: id, db: db) }
+                }
+            }
+            return decided
+        }
+    }
+
     /// One stored row as this build understands it. `unknownCompletion` marks a non-null
     /// `completed` value other than the known raw values: `entry` then reads as done (`.manual`,
     /// the kind no checkpoint can undo) and checkpoints must leave the row untouched.
@@ -518,6 +554,23 @@ public actor RecordingsSeenHistory {
         // as long as its namespace is still the active one.
         guard validity.isActive else { throw CancellationError() }
         return result
+    }
+
+    /// `applyProgress` for one event over several recordings of one course, in one store
+    /// transaction (`RecordingsSeenStore.applyProgress(owner:key:ids:event:)`, issue #208), with
+    /// exactly the same validity contract as the single-recording call: refused before the disk
+    /// once invalidated or cancelled, a commit racing a reset reported as `CancellationError`,
+    /// and all or nothing on failure.
+    public func applyProgress(owner: Int, key: RecmanCourseKey, ids: [String], event: RecordingProgressEvent) async throws -> [RecordingProgressResult] {
+        await beforeProgress()
+        guard validity.isActive, !Task.isCancelled else { throw CancellationError() }
+        try? store.removeObsoleteFiles()
+        let results: [RecordingProgressResult]
+        do { results = try store.applyProgress(owner: owner, key: key, ids: ids, event: event) }
+        catch { throw validity.isActive ? error : CancellationError() }
+        await afterProgress()
+        guard validity.isActive else { throw CancellationError() }
+        return results
     }
 
     public nonisolated func invalidate() { validity.invalidate() }

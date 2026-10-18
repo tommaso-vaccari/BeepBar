@@ -217,6 +217,46 @@ struct RecmanSessionVaultTests {
         #expect(try fileValue() == "same")
     }
 
+    /// A discard whose delete failed leaves the file; `retryDiscard()` removes it later, from
+    /// the same vault or from a new one (a relaunch), and bumps no epoch (#200). Guards an
+    /// obsolete session file that nothing ever deletes again.
+    /// Mutation: make `retryDiscard()` return `.kept` without deleting.
+    @Test(arguments: [false, true])
+    func aRetryRemovesWhatAFailedDiscardLeft(relaunch: Bool) async throws {
+        #expect(await vault.save(cookies("obsolete"), ownerUserID: 42, email: nil, epoch: vault.epoch, now: now).value == .saved)
+        disk.state.withLock { $0.deleteFails = true }
+        #expect(await vault.discard().value != .deleted)
+        #expect(try fileValue() == "obsolete", "fixture: the first delete failed")
+        disk.state.withLock { $0.deleteFails = false }
+        let retrying = relaunch ? RecmanSessionVault(storage: disk.storage) : vault
+        let epoch = retrying.epoch
+        #expect(await retrying.retryDiscard().value == .deleted)
+        #expect(disk.data == nil)
+        #expect(retrying.epoch == epoch, "a retry must not make a sign-in in progress stale")
+    }
+
+    /// A retry never deletes a session saved since the last discard, including one enqueued just
+    /// before it and still writing (#200): that file is a new sign-in, not the obsolete one.
+    /// Guards a retry that logs the student out again right after a successful sign-in.
+    /// Mutation: drop the `currentEpochWritten` check in `retryDiscard()`, or the reset of the
+    /// flag in `discard()` (then the obsolete file survives the retry in the first case).
+    @Test func aRetryKeepsASessionSavedSinceTheDiscard() async throws {
+        #expect(await vault.save(cookies("obsolete"), ownerUserID: 42, email: nil, epoch: vault.epoch, now: now).value == .saved)
+        disk.state.withLock { $0.deleteFails = true }
+        #expect(await vault.discard().value != .deleted)
+        disk.state.withLock { $0.deleteFails = false }
+        #expect(await vault.retryDiscard().value == .deleted, "nothing saved since the discard: the obsolete file goes")
+
+        disk.hold(.save)
+        let save = vault.save(cookies("fresh"), ownerUserID: 42, email: nil, epoch: vault.epoch, now: now)
+        await disk.waitUntilHeld()
+        let retry = vault.retryDiscard()
+        disk.release()
+        #expect(await save.value == .saved)
+        #expect(await retry.value == .kept)
+        #expect(try fileValue() == "fresh")
+    }
+
     /// Each kind of file gets its own answer: nothing saved, a readable session (expired cookies
     /// dropped), a damaged file the caller should discard, and a read error the caller keeps for
     /// the next try.

@@ -83,6 +83,11 @@ public actor FileStore {
     /// window only the post-swap check of the displaced copy guards.
     private let beforeSwap: (@Sendable (RelativePath) throws -> Void)?
     private let syncDirectory: @Sendable (Int32) throws -> Void
+    /// `linkat(fromDir, fromName, toDir, toName, 0)`, returning 0 or the `errno` of the failure.
+    /// Tests replace it to act like a volume without hard links (exFAT/FAT, some network or
+    /// FileProvider folders) and to change the file at that exact point of `trashRegularFile`,
+    /// between its first verification and the fallback's last one (#182).
+    private let hardLink: @Sendable (Int32, String, Int32, String) -> Int32
     private let beforeReadChunk: (@Sendable (Bool, Int64) -> Void)?
     /// Number of times a file's full contents were read to compute a SHA-256 digest.
     /// Test instrumentation: lets tests prove that unchanged files are not re-read on every sync.
@@ -123,7 +128,7 @@ public actor FileStore {
 
     /// Tests inject a filesystem change after destination selection, before move validation.
     /// `beforeSwap` comes last so that existing trailing closures keep binding to `trash`.
-    init(root: URL, beforeMove: (@Sendable (RelativePath, RelativePath) throws -> Void)?, trash: @escaping @Sendable (URL) throws -> Void = FileStore.defaultTrash, beforeSwap: (@Sendable (RelativePath) throws -> Void)? = nil, beforeReadChunk: (@Sendable (Bool, Int64) -> Void)? = nil, syncDirectory: @escaping @Sendable (Int32) throws -> Void = { guard fsync($0) == 0 else { throw FileStoreError.ioFailure } }) throws {
+    init(root: URL, beforeMove: (@Sendable (RelativePath, RelativePath) throws -> Void)?, trash: @escaping @Sendable (URL) throws -> Void = FileStore.defaultTrash, beforeSwap: (@Sendable (RelativePath) throws -> Void)? = nil, beforeReadChunk: (@Sendable (Bool, Int64) -> Void)? = nil, syncDirectory: @escaping @Sendable (Int32) throws -> Void = { guard fsync($0) == 0 else { throw FileStoreError.ioFailure } }, hardLink: @escaping @Sendable (Int32, String, Int32, String) -> Int32 = { linkat($0, $1, $2, $3, 0) == 0 ? 0 : errno }) throws {
         let fd = open(root.standardizedFileURL.path, O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW)
         guard fd >= 0 else { throw FileStoreError.invalidRoot }
         guard (try? Self.identity(of: fd)) != nil else { close(fd); throw FileStoreError.invalidRoot }
@@ -134,6 +139,7 @@ public actor FileStore {
         self.beforeSwap = beforeSwap
         self.beforeReadChunk = beforeReadChunk
         self.syncDirectory = syncDirectory
+        self.hardLink = hardLink
     }
 
     deinit { close(rootFD) }
@@ -388,6 +394,25 @@ public actor FileStore {
 
     /// Moves a regular file to the Trash, where the user can still recover it, provided it is
     /// still the file that was hashed (`expected`).
+    ///
+    /// Where the volume allows it, the verified file is pinned by a hard link in a private staging
+    /// folder and that link is what goes to the Trash: the user's path is only unlinked after the
+    /// trash, once the file there is proven to still be the same, unchanged one, so a change at any
+    /// moment leaves it in place. Volumes without hard links (exFAT/FAT, some network or
+    /// FileProvider folders) refuse the link, and a staging folder on another device cannot hold
+    /// one; there the file is trashed by its path after a last check (`trashWithoutHardLink`), so
+    /// the choice keeps working there as it did in released versions (#182).
+    ///
+    /// Cost and cancellation (#185): the hard-link path reads the file three times, on purpose.
+    /// The two reads before the Trash call (the file, then its pinning link) stop at the next
+    /// chunk when the task is cancelled: nothing has changed on disk until the Trash call, and the
+    /// staging link is removed on the way out, so a cancelled choice leaves the file exactly where
+    /// it was. The read after the Trash call guards the only irreversible step (unlinking the
+    /// user's path) and is not cancellable: once the Trash holds the link, the action finishes or
+    /// reports `localChanged`, never half-done. None of the reads is skipped on `fstat` evidence:
+    /// a content stamp cannot prove the bytes unchanged on every volume (see `contentStamp(of:)`),
+    /// and these checks are what keep an edit made meanwhile out of the Trash and in place. The
+    /// actor is still busy for the whole action, so other `FileStore` calls wait behind it.
     public func trashRegularFile(_ path: RelativePath, expected: FileSnapshot) throws {
         try requireMovablePath(path)
         let namedRoot = open(rootURL.path, O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW)
@@ -401,8 +426,10 @@ public actor FileStore {
         defer { close(source) }
         try requireRegularFile(source)
         let identity = FileIdentity(device: expected.device, inode: expected.inode)
+        // Taken before the hash, so the fallback's last check sees any write since the read began.
+        let verifiedStamp = try Self.contentStamp(of: source)
         guard try Self.identity(of: source) == identity,
-              try sha256(of: source, checksCancellation: false) == expected.sha256 else { throw FileStoreError.localChanged }
+              try sha256(of: source, checksCancellation: true) == expected.sha256 else { throw FileStoreError.localChanged }
         #if canImport(Darwin)
         let stagingURL = try FileManager.default.url(for: .itemReplacementDirectory, in: .userDomainMask, appropriateFor: rootURL, create: true)
         #else
@@ -417,15 +444,22 @@ public actor FileStore {
             close(staging)
             _ = rmdir(stagingURL.path)
         }
-        guard fchmod(staging, S_IRWXU) == 0,
-              try Self.identity(of: staging).device == identity.device else { throw FileStoreError.ioFailure }
-        guard linkat(parent, name, staging, name, 0) == 0 else { throw fileStoreError() }
+        guard fchmod(staging, S_IRWXU) == 0 else { throw FileStoreError.ioFailure }
+        // A staging folder on another device cannot hold a hard link to the file (#182).
+        guard try Self.identity(of: staging).device == identity.device else {
+            return try trashWithoutHardLink(path, parent: parent, name: name, source: source, identity: identity, verifiedStamp: verifiedStamp)
+        }
+        let linkFailure = hardLink(parent, name, staging, name)
+        if linkFailure != 0 {
+            guard Self.meansNoHardLinks(linkFailure) else { throw linkFailure == ELOOP ? FileStoreError.symbolicLink : FileStoreError.ioFailure }
+            return try trashWithoutHardLink(path, parent: parent, name: name, source: source, identity: identity, verifiedStamp: verifiedStamp)
+        }
         let staged = openat(staging, name, O_RDONLY | O_CLOEXEC | O_NOFOLLOW)
         guard staged >= 0 else { throw FileStoreError.localChanged }
         defer { close(staged) }
         try requireRegularFile(staged)
         guard try Self.identity(of: staged) == identity,
-              try sha256(of: staged, checksCancellation: false) == expected.sha256 else { throw FileStoreError.localChanged }
+              try sha256(of: staged, checksCancellation: true) == expected.sha256 else { throw FileStoreError.localChanged }
         let namedStaging = open(stagingURL.path, O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW)
         guard namedStaging >= 0 else { throw FileStoreError.localChanged }
         defer { close(namedStaging) }
@@ -438,6 +472,60 @@ public actor FileStore {
               (current.st_mode & S_IFMT) == S_IFREG,
               Int64(current.st_dev) == identity.device, UInt64(current.st_ino) == identity.inode else { throw FileStoreError.localChanged }
         guard unlinkat(parent, name, 0) == 0 else { throw fileStoreError() }
+    }
+
+    /// `linkat` errors that mean "this volume (or this pair of folders) cannot hard-link", as
+    /// opposed to a failure the fallback would not fix: exFAT/FAT answer `ENOTSUP`, some network
+    /// and FileProvider folders `EPERM`, and two devices `EXDEV` (#182).
+    static func meansNoHardLinks(_ error: Int32) -> Bool {
+        error == ENOTSUP || error == EOPNOTSUPP || error == EPERM || error == EXDEV
+    }
+
+    /// Trashes the file by its path, for volumes that cannot pin it with a hard link (#182).
+    /// `trashRegularFile` has already proven that `source` is the expected file with the expected
+    /// contents, and recorded its `fstat` state before that read (`verifiedStamp`).
+    ///
+    /// What is guaranteed, checked immediately before the Trash call, after the last point where
+    /// cancelling stops the action (nothing has changed on disk until then):
+    /// - the open file still has the state it had before its verified read, so a write since then
+    ///   (in place, or a replacement that unlinked it) leaves the file where it is and throws
+    ///   `localChanged`;
+    /// - the path, as the Trash will resolve it from `rootURL`, still names the verified file: the
+    ///   named parent folder is the folder reached through `O_NOFOLLOW` from the pinned root, so a
+    ///   moved root or a folder swapped for a symbolic link is refused, and the entry at the name
+    ///   is still the verified regular file;
+    /// - after the Trash call, if the verified file is still at its path, the Trash took something
+    ///   else: the user's file is untouched and `localChanged` is thrown, never success.
+    ///
+    /// What is not: the Trash API takes a path, not a descriptor, so a change landing between the
+    /// last check and the moment the Trash moves the item cannot be refused. A write to the file
+    /// in that window goes to the Trash with it, and a file put at the path (or a folder swapped)
+    /// in that window goes to the Trash instead, with the verified file left in place and the
+    /// action reported as changed. In every case the item is in the Trash, recoverable, never
+    /// deleted. The window lasts only as long as the Trash call takes to move the item, never the
+    /// verified read, and is narrower than in released versions, which trashed by path with no
+    /// check between the hash and the Trash call. On
+    /// FAT and exFAT the timestamps are coarse (2 s / 10 ms) and there is no real ctime, so a
+    /// same-size in-place write during the verified read can also go unnoticed there. No hash is
+    /// repeated after the Trash call: unlike the hard-link path there is nothing left to guard,
+    /// since the file is already in the Trash whatever the result.
+    private func trashWithoutHardLink(_ path: RelativePath, parent: Int32, name: String, source: Int32, identity: FileIdentity, verifiedStamp: ContentStamp) throws {
+        try Task.checkCancellation()
+        guard try Self.contentStamp(of: source) == verifiedStamp else { throw FileStoreError.localChanged }
+        let url = rootURL.appending(path: path.value, directoryHint: .notDirectory)
+        let namedParent = open(url.deletingLastPathComponent().path, O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW)
+        guard namedParent >= 0 else { throw FileStoreError.localChanged }
+        defer { close(namedParent) }
+        var current = stat()
+        guard try Self.identity(of: namedParent) == Self.identity(of: parent),
+              fstatat(parent, name, &current, AT_SYMLINK_NOFOLLOW) == 0,
+              (current.st_mode & S_IFMT) == S_IFREG,
+              Int64(current.st_dev) == identity.device, UInt64(current.st_ino) == identity.inode else { throw FileStoreError.localChanged }
+        do { try trash(url) }
+        catch { throw FileStoreError.ioFailure }
+        var after = stat()
+        if fstatat(parent, name, &after, AT_SYMLINK_NOFOLLOW) == 0,
+           Int64(after.st_dev) == identity.device, UInt64(after.st_ino) == identity.inode { throw FileStoreError.localChanged }
     }
 
     /// Removes the directories that held `path` while they are empty, deepest first, stopping at the

@@ -1,5 +1,8 @@
 # Recording history beyond 5,000 IDs — #106
 
+Status (2026-10-17): integrated into `dev` by [PR #131](https://github.com/tommaso-vaccari/BeepBar/pull/131),
+merge `6e64e4e` (2026-10-10); not yet released on `main`. The evidence below was recorded while the PR was open.
+
 Base: `origin/dev` `ac68333`, branch `fix/recordings-seen-overflow`. Historical finding
 rechecked: v1 drops old IDs from a shared 5,000-element acknowledgement list, while each
 course/year baseline remains. A 5,001st existing ID therefore becomes “New”, and acknowledging
@@ -111,7 +114,7 @@ the **local full suite and Release app build have passed**.
 
 ### PR #131: integration with current `dev`
 
-[PR #131](https://github.com/tommaso-vaccari/BeepBar/pull/131) remains open against `dev`.
+[PR #131](https://github.com/tommaso-vaccari/BeepBar/pull/131) was still open against `dev` at this checkpoint (merged later as `6e64e4e`).
 Merge commit `b0a5477` incorporates `dev 713033c` without rewriting the shared branch.
 The controller conflict preserves scoped Watchlist state and reconciliation after a successful
 atomic list/history publication, alongside the off-main history worker and namespace reset.

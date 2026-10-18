@@ -43,11 +43,13 @@ public final class RecmanSessionVault: Sendable {
         public var save: @Sendable (Data) throws -> Void
         /// Removes the file and anything a crash mid-save left; no file is not an error.
         public var delete: @Sendable () throws -> Void
+        public var expirationDate: @Sendable () throws -> Date?
 
-        public init(load: @escaping @Sendable () throws -> Data?, save: @escaping @Sendable (Data) throws -> Void, delete: @escaping @Sendable () throws -> Void) {
+        public init(load: @escaping @Sendable () throws -> Data?, save: @escaping @Sendable (Data) throws -> Void, delete: @escaping @Sendable () throws -> Void, expirationDate: @escaping @Sendable () throws -> Date? = { nil }) {
             self.load = load
             self.save = save
             self.delete = delete
+            self.expirationDate = expirationDate
         }
     }
 
@@ -115,6 +117,10 @@ public final class RecmanSessionVault: Sendable {
     /// The epoch a save cycle must capture *before* awaiting anything (the browser's cookies), and
     /// pass to `save`. A `discard()` in between makes that save stale.
     public var epoch: Int { state.withLock { $0.epoch } }
+
+    public func expirationDate() -> Task<Date?, Never> {
+        enqueue { [storage] in try? storage.expirationDate() }
+    }
 
     /// Reads and decodes the file off the caller's executor. Expired cookies are dropped as of `now`.
     public func load(now: Date) -> Task<LoadOutcome, Never> {

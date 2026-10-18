@@ -23,3 +23,14 @@ Non trovare l'informativa nel repo non dimostra assenza ovunque; sito pubblico n
 Eseguiti: lettura statica, ricerca connessioni/privacy, confronto nomi dei file main→dev, acquisizione fonti pubbliche con hash. Non eseguiti: test app, build, account reali, rete live, accesso a DB utente o assistenza.
 
 Su dev differiscono da main RecordingsController, RecordingsStudyState, WeBeepAuthenticationController: non attribuire i finding alla release senza confronto mirato. API issue GitHub non raggiungibile durante l'indagine; nessuna assegnazione o aggiornamento remoto. [[30 Wiki/Piano di verifica]]
+
+## Aggiornamento 2026-10-17 — issue #180
+
+Base dev `039dc4092d29c23682ee3a8e802f40923af6ffce`; rimedi in PR separata, non ancora attribuibili a main. C02/C03: rilevati cancellazione interrotta da temporanei non rimovibili e mancato restringimento cartella sessione preesistente. C08: payload ridotto nel branch a versioni app/macOS con hash mensile; non dimostra anonimato o liceita default-on. Nuove fonti [[20 Sources/S-0008 TelemetryDeck accordo]], [[20 Sources/S-0009 TelemetryDeck FAQ]], [[20 Sources/S-0010 EDPB basi giuridiche]], [[20 Sources/S-0011 EDPB ePrivacy]], [[20 Sources/S-0012 Garante tracciamento]]. Stato e criteri puntuali nel [gate](../../privacy-release-gate.md); conformita non dimostrata.
+
+Delta #181 dopo decisioni del 2026-10-17: scadenza sessione dopo dieci giorni dal salvataggio iniziale (rimozione attiva o al successivo avvio), backup macOS esclusi per token/sessioni, erasure per account con materiali conservati e warning/retry cronologia persistenti. I blocchi giuridici e runtime del gate rimangono aperti.
+
+
+## Configurazione aggregata v2 — 2026-10-18, PR #181
+
+Questa valutazione corrente sostituisce C08 per il nuovo protocollo, non per la release o gli eventi storici. `code-backed`: valore comune a tutte le installazioni, conteggio mensile locale, massimo un tentativo giornaliero, soli metadati versione app/macOS, avviso prima dell’invio e opt-out. `inference`: valutazione motivata favorevole art. 6(1)(f), esenzione analytics e anonimato ragionevole dell’archivio v2, basata su codice e dichiarazioni pubbliche del servizio, senza presumere cancellazioni o contratti verificati. Fonte e limiti nel [gate corrente](../../privacy-release-gate.md), riesaminato indipendentemente. Informativa candidata IT/EN e procedura operativa aggiornate; nessuna certificazione globale, sanatoria storica o verifica manuale del binario implicita.

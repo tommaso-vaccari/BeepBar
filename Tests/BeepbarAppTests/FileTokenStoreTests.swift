@@ -51,6 +51,19 @@ final class FileTokenStoreTests: XCTestCase {
         XCTAssertEqual(try FileTokenStore.load(.nonInteractive), "a-token")
     }
 
+    func testTokenAndExistingTokenAreExcludedFromBackups() throws {
+        try FileTokenStore.save("synthetic-token")
+        let directory = try FileManager.default.url(for: .applicationSupportDirectory, in: .userDomainMask, appropriateFor: nil, create: false)
+            .appendingPathComponent(testDirectoryName, isDirectory: true)
+        var url = directory.appendingPathComponent("credential.token")
+        XCTAssertEqual(try url.resourceValues(forKeys: [.isExcludedFromBackupKey]).isExcludedFromBackup, true)
+        var values = URLResourceValues()
+        values.isExcludedFromBackup = false
+        try url.setResourceValues(values)
+        XCTAssertTrue(try FileTokenStore.containsCredential())
+        XCTAssertEqual(try url.resourceValues(forKeys: [.isExcludedFromBackupKey]).isExcludedFromBackup, true)
+    }
+
     func testSaveOverwritesPreviousToken() throws {
         try FileTokenStore.save("first")
         try FileTokenStore.save("second")
@@ -84,6 +97,26 @@ final class FileTokenStoreTests: XCTestCase {
 
         XCTAssertFalse(FileManager.default.fileExists(atPath: tempURL.path))
         XCTAssertFalse(try FileTokenStore.containsCredential())
+    }
+
+    func testDeletionAttemptsEverySecretAfterAFailure() throws {
+        for primaryFails in [false, true] {
+            try FileTokenStore.save("synthetic-token")
+            let directory = try FileManager.default.url(for: .applicationSupportDirectory, in: .userDomainMask, appropriateFor: nil, create: false)
+                .appendingPathComponent(testDirectoryName, isDirectory: true)
+            let orphan = directory.appendingPathComponent(".credential-crash.tmp")
+            try Data("synthetic-leftover".utf8).write(to: orphan)
+            var attempted: Set<String> = []
+            XCTAssertThrowsError(try FileTokenStore.delete { url in
+                attempted.insert(url.lastPathComponent)
+                if (url.lastPathComponent == "credential.token") == primaryFails { throw CocoaError(.fileWriteNoPermission) }
+                try FileManager.default.removeItem(at: url)
+            })
+            XCTAssertEqual(attempted, ["credential.token", orphan.lastPathComponent])
+            XCTAssertEqual(try FileTokenStore.containsCredential(), primaryFails)
+            XCTAssertEqual(FileManager.default.fileExists(atPath: orphan.path), !primaryFails)
+            try FileTokenStore.delete()
+        }
     }
 
     func testDeleteReportsFailureAndKeepsStoredCredential() throws {

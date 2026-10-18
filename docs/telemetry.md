@@ -1,64 +1,32 @@
-# Minimal daily telemetry (#128)
+# Minimal aggregate telemetry
 
-BeepBar uses TelemetryDeck's [Ingest API v2](https://telemetrydeck.com/docs/ingest/v2/) directly through URLSession. No SDK, backend or additional dependency is required.
+TelemetryDeck remains enabled by default with opt-out. Production configuration is in `App/Info.plist`; missing/invalid configuration or DEBUG disables sending. Before the first configured, enabled launch, including upgrades, a one-time IT/EN notice describes the purpose, interest, data, recipient, retention limits and rights. Continue acknowledges information, not consent; Disable saves opt-out without affecting app features. Settings retains the switch and factual explanation.
 
-## Configuration and user choice
+## Wire protocol v2
 
-`App/Info.plist` holds the public App ID and organization namespace (`com.beepbar`). These are ingest identifiers, not credentials. Missing or invalid configuration disables telemetry. `BeepBarTelemetryDefaultEnabled` is true: new and existing installations with no saved choice send automatically on their first Release launch after updating. The Telemetry switch in Settings lets users disable it; a saved opt-out always takes precedence over the build default. The info button explains the purpose, the monthly identifier, every transmitted field and that turning telemetry off deletes the identifier, in Italian and English.
+One POST per UTC day at most to the configured TelemetryDeck namespace. Exactly four payload fields: `TelemetryDeck.AppInfo.version`, `TelemetryDeck.Device.platform = macOS`, `TelemetryDeck.Device.operatingSystem = macOS`, `TelemetryDeck.Device.systemMajorVersion` (major only). `appID` identifies the app. **Every installation sends `clientUser = aggregate`**; it contains no installation UUID, account identity, language, settings, course/file information, custom timestamp or event identifier. User-Agent is `BeepBar` and Accept-Language is the fixed `en`, independent of user preferences.
 
-Debug builds, tests and UI previews do not use production configuration. Release builds send only when the setting is enabled. Tests inject their own isolated preferences, sender, clock and scheduler. Nothing requires the installed app or its data.
+The first attempted daily report in a later UTC calendar month uses `BeepBar.monthlyActive.v2`; later attempts use `BeepBar.dailyActive.v2`. A monotonic local `dailyTelemetryCountedMonth` marker replaces server deduplication. It never leaves the Mac. Both markers are persisted before sending; a failure/cancellation consumes the slot. There are no queues, catch-up reports or same-day retries. The month marker survives opt-out/re-enable; the old permanent/monthly UUID keys are deleted on construction regardless of the enabled state. An existing daily attempt from an older build still suppresses today's new report.
 
-## Signal and identity
+## Metrics and limits
 
-One JSON array containing one signal is POSTed to `https://nom.telemetrydeck.com/v2/namespace/com.beepbar/`:
-
-- `appID`: the public app identifier.
-- `clientUser`: SHA-256 of the App ID and a random UUID that lives for one UTC calendar month. The UUID is never transmitted. When the UTC month changes it is replaced by a fresh random UUID, not derived from the previous one, so the client keeps no link between months (a clock moved back sends nothing until the UTC day after the last attempt; the next allowed signal reuses the UUID if its month still matches, otherwise it creates a fresh one). The receiver may still re-link months from the payload and the source IP, see below. Turning telemetry off deletes it; turning it on again starts a new one. The permanent installation UUID of the first `dev` build (`dailyTelemetryInstallationID`, never released) is deleted on launch. TelemetryDeck's Swift SDK states in a code comment that the server hashes and salts `clientUser` again; its public ingest documentation does not say so, so this document does not rely on it.
-- `type`: `BeepBar.dailyActive`.
-- `payload`, all values as strings:
-
-| Key | Value | Why this key |
-| --- | --- | --- |
-| `TelemetryDeck.AppInfo.version` | `CFBundleShortVersionString` | SDK key: the dashboard's version insights read it |
-| `TelemetryDeck.Device.platform` / `TelemetryDeck.Device.operatingSystem` | `macOS` | SDK keys, constant |
-| `TelemetryDeck.Device.systemMajorVersion` | `macOS 15` (major version only, SDK format) | SDK key |
-| `TelemetryDeck.RunContext.language` | `it` or `en`, BeepBar's language at send time | SDK key |
-| `BeepBar.automaticSync` | `true` / `false` | custom |
-| `BeepBar.automaticSyncInterval` | seconds, one of the Settings options | custom |
-| `BeepBar.dataSaver` | `true` / `false` | custom |
-| `BeepBar.recordings` | `true` / `false` (read without creating the Recordings controller); `true` means Polimi is selected (the default), the only university with Recordings; it does not prove an authenticated account | custom |
-| `BeepBar.launchAtLogin` | `true` / `false`; omitted while macOS has not reported the login item | custom |
-
-`BeepBar.*` settings that are unknown when a signal is sent (the login item before macOS answers, or every setting when telemetry is switched on during launch, before the app installed its settings reader) are omitted, never reported as `false`.
-
-The SDK keys reuse TelemetryDeck's standard names and formats so the built-in insights work; TelemetryDeck's advice to avoid the `TelemetryDeck.` scope concerns inventing new keys there. No other SDK default is sent: no device model, screen, architecture, time zone, region, locale, full OS build or retention counters. Settings are read when the signal is sent, so a change made during a day appears in the next day's signal.
-
-There is no account, course, file, device model, location or session metadata in the payload, and no university field (but see `BeepBar.recordings`). Each field has few possible values; with a small user base their combination can still be distinctive and stable across months, so together with the source IP the receiver could re-link an installation's months. The monthly identifier limits linking on the client; it does not make the data anonymous. Like any HTTPS receiver, the service necessarily receives network connection information, including the source IP. Use TelemetryDeck's [privacy information](https://telemetrydeck.com/privacy/) for its handling; hashing is not a guarantee that network traffic contains no identifying information.
-
-## Scheduling and limits
-
-A running, enabled app attempts a signal on startup and then near the next UTC midnight using a one-shot `NSBackgroundActivityScheduler`, with background QoS and a tolerance window whose earliest edge follows midnight. Wake/activation notifications provide another opportunity if the day changed. The previous attempt date is stored before sending, preventing repeated attempts on relaunch, wake or failure. A failed or cancelled attempt consumes that day's slot; there are no queues, catch-up signals or same-day retries. The app does not wake a sleeping Mac.
-
-A request has a 10-second request timeout and a 15-second resource timeout. The session is ephemeral, with no cookies, credentials or cache, blocks redirects and opts out of expensive/constrained networks. Only response headers are required and the session is cancelled afterward. Disabling invalidates scheduling, removes observers and cancels the sender without waiting. Telemetry adds no wait to app termination.
-
-This is a best-effort measure of **running installations**, not people or user interaction. Offline days, disabled telemetry and scheduler delays can undercount activity. Rolling the system clock backward postpones further attempts until it passes the recorded day.
-
-## Dashboard recipes
-
-Filter all production queries to `type = BeepBar.dailyActive` and exclude Test Mode:
-
-| Question | Measurement |
+| Metric | Query |
 | --- | --- |
-| Daily active installations | Number of signals per UTC day: each installation sends at most one. |
-| Monthly active installations | Distinct users per **calendar month**. Never count distinct users across a month boundary: the identifier changes there, so a rolling 7 / 30 day window that spans two months counts each installation twice. Turning telemetry off and on within a month also starts a new identifier, so that installation counts twice that month. |
-| Weekly activity | Average daily signals over the week, not distinct users. |
-| App version / macOS / language adoption | Built-in insights, or signals grouped by `TelemetryDeck.AppInfo.version`, `TelemetryDeck.Device.systemMajorVersion`, `TelemetryDeck.RunContext.language`, per day. |
-| Settings in use | Signals per day grouped by a `BeepBar.*` key; divide by that day's signals for a share. |
+| Daily reporting installations | Count BOTH v2 event types per UTC day. |
+| Monthly reporting installations | Count ONLY `BeepBar.monthlyActive.v2` per UTC calendar month. |
+| Version/macOS exposure by day | Group both v2 event types by app/major OS version per UTC day. |
+| First-reported monthly configuration | Group monthly events by version; this is the first attempted configuration, not every version used during the month. |
 
-Recent Events shows a fixed set of columns: `TelemetryDeck.Device.modelName` stays empty because it is never sent, and other payload keys appear after adding them as columns or opening an event. Signals sent before this change carry `BeepBar.appVersion` instead of `TelemetryDeck.AppInfo.version`. The free plan currently offers 50,000 signals/month and three months of queryable history; longer historical trends require exporting aggregates or a different plan. Verify current limits in the dashboard's billing page before a release; the free tier is not realtime.
+Do not use TelemetryDeck unique-user, retention or individual-funnel insights: all installations share one user value. Do not combine old `BeepBar.dailyActive` unique-ID data with the new series as if methodology were unchanged. Existing server events are not retroactively changed or deleted.
 
-## Verification
+These are best-effort reporting-installation counts, not people or all installed copies. Failed first attempts undercount the month; reinstalling/resetting preferences can overcount. A clock moved forward can suppress later monthly counts until that month is passed; clock rollback never recounts an earlier month. Offline/opted-out installations undercount. Provider timestamps, small version cohorts and connection handling remain relevant privacy limitations; a shared identifier is not by itself a proof that every server operation is anonymous.
 
-On 2026-10-10 the owner confirmed two manually authorized synthetic signals in Explore → Recent Events with Test Mode enabled: `BeepBar.integrationCheck` (namespaced endpoint, boolean `isTestMode = true`) and `BeepBar.sdkFormatTest` (generic endpoint, string `isTestMode = "true"`). Both used the configured App ID. This verifies ingestion, processing and dashboard visibility without an SDK; the earlier empty results did not establish a payload-format failure. No production signal was submitted during development.
+## Scheduling and transport
 
-The free namespace status warns that processing occurs between once an hour and once a day. HTTP 200 / `OK` means the ingest endpoint accepted the request; dashboard visibility can lag. The device-model column remains empty because that field is omitted. Signals from the earlier payload use the custom `BeepBar.appVersion` key; signals from this change use the SDK keys listed above for built-in version, system and language insights.
+An energy-aware background scheduler runs no earlier than the next UTC day; activation/wake provide another opportunity. The app does not wake a sleeping Mac. Request/resource timeouts are 10/15 seconds. The ephemeral session has no cookie, credential or URL cache stores; redirects are rejected; expensive/constrained networks are excluded. Only headers are consumed and the session is cancelled afterward. Opt-out cancels the sender, observers and scheduling without waiting, preserving suppression markers. Telemetry adds no quit wait.
+
+## Evidence and privacy decision
+
+[Assessment and release gate](privacy-release-gate.md), [notice](privacy-notice.md). The provider [FAQ](https://telemetrydeck.com/docs/guides/privacy-faq/) states no IP storage and EU hosting, but explicitly guarantees no cold-event deletion schedule and retains analytics after customer account closure. Do not substitute plan query-history limits for deletion. The [supplemental agreement](https://telemetrydeck.com/avv/) describes SDK use; this client remains direct API and does not claim verified account-specific contractual coverage.
+
+Earlier manually authorized synthetic v1 signals verified ingestion/dashboard visibility in October 2026. No v2 production or dashboard validation was performed in this change; automated requests use synthetic fixtures. Packaged-app network/manual checks were waived by the owner, not passed.

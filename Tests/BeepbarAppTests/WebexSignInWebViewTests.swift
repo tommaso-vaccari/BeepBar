@@ -418,6 +418,6 @@ struct WebexSignInWebViewTests {
 
     /// Traces mask the recording's uuid in a playback page's path.
     @Test func tracesMaskTheRecordingID() {
-        #expect(RecmanWebSession.redacted(URL(string: Self.page)) == "https://politecnicomilano.webex.com/recordingservice/sites/politecnicomilano/recording/playback/<id>")
+        #expect(RecmanWebSession.redacted(URL(string: Self.page)) == "https://politecnicomilano.webex.com")
     }
 }

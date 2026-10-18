@@ -407,8 +407,10 @@ import Testing
         await harness.settle()
         #expect(harness.seam.calls.count == 1)
 
+        let started = ContinuousClock.now
         harness.controller.setAutomaticSync(enabled: false)
         #expect(await fired.value == .finished)
+        #expect(ContinuousClock.now - started < .seconds(5), "completion waited out the whole hold (RB-102 of #225)")
         try? await Task.sleep(for: .milliseconds(100))
         #expect(!harness.seam.sawCancellation, "the refresh a manual sync joined was cancelled with the schedule")
         followUp.cancel()

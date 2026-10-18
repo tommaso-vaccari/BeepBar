@@ -3091,6 +3091,46 @@ struct RecordingsControllerTests {
         controller.turnOff()
     }
 
+    /// The student resumes the paused window while the first recovery is still looking up a
+    /// fresh stream, and the dead item fails again (RB-002 on #197: resuming re-arms the player's
+    /// failure report). That second report must not queue a second recovery: when the fresh
+    /// stream arrives the lecture goes on natively, with no browser and no closed window; when it
+    /// doesn't, the browser opens once, not twice.
+    /// Mutations: drop the pending-recovery check in `playerFailed` and "browser" opens it twice;
+    /// drop it together with the item check in `recoverPlayback` (`start == lectureStarts`) and
+    /// "fresh" also closes the recovered player and opens the browser. The item check alone is
+    /// masked by the pending-recovery check, which stops the second recovery first.
+    @Test(arguments: ["fresh", "browser"])
+    func aSecondFailureDuringARecoveryQueuesNoSecondRecovery(outcome: String) async throws {
+        defer { cleanUp() }
+        browser.streamResults["a"] = outcome == "fresh"
+            ? [.success(stream("a")), .success(stream("a"))]
+            : [.success(stream("a")), .failure(RecmanBrowserError.playbackUnavailable)]
+        browser.playbackResults["a"] = .success(playerLink("a"))
+        let controller = await readyController()
+        controller.play(recording("a"))
+        await settle("a playing") { world.player.plays.count == 1 }
+        let gate = FakeRecmanBrowser.Gate()
+        defer { gate.release() }
+        browser.streamGates["a"] = gate
+        world.player.failDuringPlayback(at: 700)
+        await settle("recovery running") { gate.isWaiting }
+        // Space on the paused window, then the same dead item fails again.
+        world.player.failDuringPlayback(at: 700)
+        gate.release()
+        await settle("first recovery finished") { outcome == "fresh" ? world.player.plays.count == 2 : !world.opened.isEmpty }
+        await drainTasks()
+        if outcome == "fresh" {
+            #expect(world.player.plays.count == 2, "the lecture did not go on natively")
+            #expect(try world.player.play(1).startAt == 700)
+            #expect(world.player.closes == 0, "a second recovery closed the recovered player")
+            #expect(world.opened.isEmpty, "a second recovery opened the browser")
+        } else {
+            #expect(world.opened == [playerLink("a")], "the browser opened more than once")
+        }
+        controller.turnOff()
+    }
+
     @Test(arguments: ["duringPlayback", "beforeReady"])
     func aNewPlayRejectsALateRecoveryLink(failure: String) async {
         defer { cleanUp() }

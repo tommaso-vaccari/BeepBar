@@ -842,7 +842,9 @@ enum RecordingPlayerError: Error {
             // Moving again after a reported mid-lecture failure: `fail` paused the player and
             // cancelled any pending start, so only the student can have restarted it. A new
             // failure of this item must reach `onFailure` again, and the problem shown in the
-            // window (`showProblem`) no longer describes what is on screen (issue #197).
+            // window (`showProblem`) no longer describes what is on screen (issue #197). The
+            // restart may come while the first failure's recovery is still running: the
+            // controller ignores a report for a lecture whose recovery is pending (RB-002).
             if failureReported, isCurrentItemReady {
                 failureReported = false
                 window?.subtitle = nowPlayingMetadata?.courseName ?? ""

@@ -407,12 +407,48 @@ import Testing
         await harness.settle()
         #expect(harness.seam.calls.count == 1)
 
+        let started = ContinuousClock.now
         harness.controller.setAutomaticSync(enabled: false)
         #expect(await fired.value == .finished)
+        #expect(ContinuousClock.now - started < .seconds(5), "completion waited out the whole hold (RB-102 of #225)")
         try? await Task.sleep(for: .milliseconds(100))
         #expect(!harness.seam.sawCancellation, "the refresh a manual sync joined was cancelled with the schedule")
         followUp.cancel()
         await followUp.value
+    }
+
+    /// A follow-up the dropped schedule already cancelled but that has not finished unwinding (its
+    /// refresh ignores cancellation for a while, as a WebKit listing can) must not take in a
+    /// "Sincronizza ora": the user's sync would end with no refresh at all. Proves the manual
+    /// sync starts a refresh of its own. Guards against the merge branch of
+    /// `startRecordingsFollowUp` returning a cancelled task (RB-104 of #225).
+    @Test func aManualSyncDoesNotMergeIntoAFollowUpTheDroppedScheduleCancelled() async throws {
+        let schedule = TestSchedule()
+        let harness = try await Harness(schedule: schedule)
+        defer { harness.remove() }
+        harness.controller.setFollowUpActivityHoldForTesting(.seconds(30))
+        let gate = FakeRecmanBrowser.Gate()
+        harness.seam.gate = gate
+        let fired = Task { @MainActor in await schedule.fire(0) }
+        await harness.waitForCalls(1)
+        let cancelled = try #require(harness.controller.recordingsFollowUpForTesting)
+
+        harness.controller.setAutomaticSync(enabled: false)
+        #expect(await fired.value == .finished)
+        #expect(cancelled.isCancelled, "no manual sync relied on it, so the schedule stopped it")
+        #expect(harness.controller.recordingsFollowUpForTesting == cancelled, "it is still unwinding")
+
+        harness.controller.synchronizeNow()
+        await harness.waitForCalls(2)
+        #expect(harness.seam.calls.count == 2, "the manual sync got no refresh of its own")
+        #expect(harness.seam.calls.last?.force == true)
+        let fresh = try #require(harness.controller.recordingsFollowUpForTesting)
+        #expect(fresh != cancelled)
+
+        gate.release()
+        await cancelled.value
+        await fresh.value
+        #expect(harness.controller.recordingsFollowUpForTesting == nil)
     }
 
     /// Waits until the automatic run of `fired` has finished its materials and sits in the hold

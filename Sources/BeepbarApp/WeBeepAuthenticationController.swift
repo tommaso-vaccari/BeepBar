@@ -3593,7 +3593,11 @@ enum MaterialsRunEnd: Equatable, Sendable {
         guard !isTerminating else { return nil }
         guard let materials = Self.recordingsOutcome(for: end) else { return nil }
         guard case .refresh = recordingsSyncDecision(after: materials, trigger: trigger, network: nil).0 else { return nil }
-        if let recordingsFollowUp {
+        // A follow-up the dropped schedule already cancelled can still be unwinding (a refresh
+        // that ignores cancellation for a while): merging into it would leave this request with no
+        // refresh at all, so it counts as absent. The old task's `defer` compares ids, so it
+        // clears only itself (RB-104 of #225).
+        if let recordingsFollowUp, !recordingsFollowUp.isCancelled {
             if trigger == .manual { recordingsFollowUpReliance.markManual() }
             return recordingsFollowUp
         }
@@ -4080,7 +4084,6 @@ private actor BootstrapService {
     }
 }
 
-/// Resumes one continuation once, whichever caller comes first (`WeBeepAuthenticationController.wait`).
 /// Whether a "Sincronizza ora" relies on a recordings follow-up: marked when a manual run starts
 /// it or merges into it, never cleared. Read by the automatic run's cancellation handler, which
 /// runs synchronously off the main actor, hence the lock (RB-001 of #188).
@@ -4090,6 +4093,7 @@ private final class FollowUpReliance: Sendable {
     var servesManualSync: Bool { manual.withLock { $0 } }
 }
 
+/// Resumes one continuation once, whichever caller comes first (`WeBeepAuthenticationController.wait`).
 private final class FirstResume: Sendable {
     private let continuation = OSAllocatedUnfairLock<CheckedContinuation<Void, Never>?>(initialState: nil)
 

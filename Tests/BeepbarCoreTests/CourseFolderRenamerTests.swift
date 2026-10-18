@@ -27,6 +27,42 @@ struct CourseFolderRenamerTests {
         #expect(try await reopened.baseline(rootID: rootID, remoteID: "file")?.relativePath == RelativePath("New/file.txt"))
     }
 
+    /// While a rename whose flush failed is unfinished (#183), renaming another course refuses
+    /// with `PendingCourseFolderRenameError` (the specific error the app explains, not the generic
+    /// database one) and moves nothing: both the pending rename and the other course stay as they
+    /// are. Launch recovery settles the row, after which the same rename succeeds. Fails if the
+    /// renamer settles the pending rename in-session or lets the second rename run.
+    @Test func anUnfinishedRenameBlocksTheNextRenameUntilLaunchRecovery() async throws {
+        let root = try temporaryRoot()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let rootID = UUID()
+        let database = try SyncDatabase(url: root.appending(path: "state.sqlite"))
+        try await database.registerRoot(id: rootID, canonicalPath: root.path)
+        let flush = FlushFailures()
+        let store = try FileStore(root: root, beforeMove: nil, syncDirectory: { try flush.sync($0) })
+        for (course, folder) in [(Int64(1), "Old"), (2, "Other")] {
+            let identity = try await store.ensureTopLevelDirectory(folder).identity
+            try await database.upsertScope(SyncScope(rootID: rootID, courseID: course, displayName: folder, localFolder: folder, enabled: true, managedDirectory: identity))
+        }
+        let renamer = CourseFolderRenamer(database: database, fileStore: store, gate: RootOperationGate())
+        flush.failNext(1)
+        await #expect(throws: FileStoreError.mutationNotDurable) { try await renamer.rename(rootID: rootID, courseID: 1, from: "Old", to: "New") }
+
+        await #expect(throws: PendingCourseFolderRenameError()) { try await renamer.rename(rootID: rootID, courseID: 2, from: "Other", to: "Renamed") }
+        #expect(try await database.pendingScopeMoves().count == 1)
+        #expect(try await database.scope(rootID: rootID, courseID: 1)?.localFolder == "Old")
+        #expect(try await database.scope(rootID: rootID, courseID: 2)?.localFolder == "Other")
+        #expect(FileManager.default.fileExists(atPath: root.appending(path: "Other").path))
+        #expect(!FileManager.default.fileExists(atPath: root.appending(path: "Renamed").path))
+
+        _ = try await RecoveryCoordinator(rootID: rootID, database: database, fileStore: FileStore(root: root)).recover()
+        #expect(try await database.pendingScopeMoves().isEmpty)
+        #expect(try await database.scope(rootID: rootID, courseID: 1)?.localFolder == "New")
+        try await renamer.rename(rootID: rootID, courseID: 2, from: "Other", to: "Renamed")
+        #expect(try await database.scope(rootID: rootID, courseID: 2)?.localFolder == "Renamed")
+        #expect(FileManager.default.fileExists(atPath: root.appending(path: "Renamed").path))
+    }
+
     @Test func renamesDirectoryCreatedAfterScopeRegistration() async throws {
         let root = try temporaryRoot()
         defer { try? FileManager.default.removeItem(at: root) }
@@ -277,7 +313,7 @@ struct CourseFolderRenamerTests {
         try FileManager.default.moveItem(at: root.appending(path: "Old"), to: root.appending(path: "Saved"))
         _ = try await store.ensureTopLevelDirectory("Old")
         let renamer = CourseFolderRenamer(database: database, fileStore: store, gate: RootOperationGate())
-        await #expect(throws: SyncDatabaseError.execution) {
+        await #expect(throws: PendingCourseFolderRenameError()) {
             try await renamer.rename(rootID: rootID, courseID: 1, from: "Old", to: "Again")
         }
         #expect(try await database.scope(rootID: rootID, courseID: 1)?.managedDirectory == identity)
@@ -317,5 +353,21 @@ struct CourseFolderRenamerTests {
         let root = FileManager.default.temporaryDirectory.appending(path: UUID().uuidString, directoryHint: .isDirectory)
         try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
         return root
+    }
+}
+
+/// Makes the next `n` directory flushes fail, then flushes for real.
+final class FlushFailures: @unchecked Sendable {
+    private let lock = NSLock()
+    private var remaining = 0
+    func failNext(_ count: Int) { lock.withLock { remaining = count } }
+    func sync(_ descriptor: Int32) throws {
+        let fail = lock.withLock { () -> Bool in
+            guard remaining > 0 else { return false }
+            remaining -= 1
+            return true
+        }
+        if fail { throw FileStoreError.ioFailure }
+        guard fsync(descriptor) == 0 else { throw FileStoreError.ioFailure }
     }
 }

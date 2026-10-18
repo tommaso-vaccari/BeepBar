@@ -34,7 +34,7 @@ import Testing
 
     /// Proves the order of an automatic run: the materials state is already `.synced` while the
     /// refresh is gated, and the scheduler's completion is delivered only after the refresh ends
-    /// (the system activity covers it, no timer of our own); the refresh respects the freshness
+    /// (the system activity covers it, within the default hold); the refresh respects the freshness
     /// window (`force: false`) and gets the course's key. Guards against starting it after
     /// `completion` (the activity would end under it), awaiting it before the materials result, or
     /// forcing automatic runs.
@@ -66,6 +66,46 @@ import Testing
         #expect(await fired.value == .finished)
         #expect(log.withLock { $0 } == ["released", "completion"])
         #expect(harness.controller.lastRecordingsOutcome == .refreshed(newlyPublished: 0, failedKeys: 0))
+    }
+
+    /// Proves that the scheduler's completion is delivered once the hold runs out even though the
+    /// follow-up is still blocked (as behind a Play waiting for a Webex sign-in), that the
+    /// follow-up keeps going and still publishes its result afterwards, and that an automatic run
+    /// fired meanwhile starts no second refresh. Guards against awaiting the follow-up without a
+    /// bound (#187): `completion` never called, so no automatic sync was ever scheduled again.
+    @Test func theSchedulerCompletesWhileTheFollowUpIsStillBlocked() async throws {
+        let schedule = TestSchedule()
+        let harness = try await Harness(schedule: schedule)
+        defer { harness.remove() }
+        harness.controller.setFollowUpActivityHoldForTesting(.milliseconds(200))
+        let gate = FakeRecmanBrowser.Gate()
+        harness.seam.gate = gate
+        let completed = OSAllocatedUnfairLock(initialState: false)
+        let fired = Task { @MainActor in
+            let result = await schedule.fire(0)
+            completed.withLock { $0 = true }
+            return result
+        }
+        while !gate.isWaiting { await Task.yield() }
+        let deadline = ContinuousClock.now + .seconds(5)
+        while !completed.withLock({ $0 }), ContinuousClock.now < deadline { try? await Task.sleep(for: .milliseconds(5)) }
+        guard completed.withLock({ $0 }) else {
+            Issue.record("The scheduler's completion waited for the blocked follow-up")
+            gate.release(); _ = await fired.value
+            return
+        }
+        #expect(await fired.value == .finished)
+        let followUp = try #require(harness.controller.recordingsFollowUpForTesting, "the follow-up was dropped at the hold")
+        #expect(harness.controller.lastRecordingsOutcome == nil)
+
+        // The next automatic run, while the first follow-up is still blocked.
+        #expect(await schedule.fire(0) == .finished)
+        #expect(harness.seam.calls.count == 1)
+
+        gate.release()
+        await followUp.value
+        #expect(harness.controller.lastRecordingsOutcome == .refreshed(newlyPublished: 0, failedKeys: 0))
+        #expect(harness.seam.calls.count == 1)
     }
 
     /// Proves that a manual sync starts its follow-up with `force: true` after the list is loaded
@@ -171,10 +211,11 @@ import Testing
         #expect(harness.controller.lastRecordingsOutcome == nil)
     }
 
-    /// Proves that a refresh ending `.unavailable`, `.needsSignIn` or `.cancelled` leaves the
-    /// materials state and the notifications exactly as a refresh that skipped would. Guards
-    /// against the follow-up reporting its trouble through `setSyncState` or a failure notification.
-    @Test(arguments: [RecordingsSyncOutcome.unavailable, .needsSignIn, .cancelled])
+    /// Proves that a refresh ending `.unavailable`, `.needsSignIn` or `.cancelled` with nothing
+    /// newly published leaves the materials state and the notifications exactly as a refresh that
+    /// skipped would. Guards against the follow-up reporting its trouble through `setSyncState` or
+    /// a failure notification.
+    @Test(arguments: [RecordingsSyncOutcome.unavailable(newlyPublished: 0), .needsSignIn(newlyPublished: 0), .cancelled])
     func aRecordingsFailureLeavesTheSyncStateAndNotificationsAlone(_ outcome: RecordingsSyncOutcome) async throws {
         let baseline = try await Harness()
         defer { baseline.remove() }
@@ -196,6 +237,24 @@ import Testing
         #expect(harness.center.sent.map { $0.prefix(17) } == expectedSent.map { $0.prefix(17) })
         #expect(!harness.center.sent.isEmpty)
         #expect(harness.controller.lastRecordingsOutcome == outcome)
+    }
+
+    /// Proves that a refresh cut short after publishing new lectures still announces them through
+    /// the follow-up, and only them: one "new recordings" notification on top of what a skipped
+    /// refresh sends (issue #190). Mutation: make `count(for:)` return nil for the early endings.
+    @Test(arguments: [RecordingsSyncOutcome.unavailable(newlyPublished: 2), .needsSignIn(newlyPublished: 2)])
+    func aRefreshCutShortStillAnnouncesWhatItPublished(_ outcome: RecordingsSyncOutcome) async throws {
+        let baseline = try await Harness()
+        defer { baseline.remove() }
+        baseline.seam.result = .skipped(.noCourses)
+        await baseline.controller.runAutomaticSyncForTesting()
+
+        let harness = try await Harness()
+        defer { harness.remove() }
+        harness.seam.result = outcome
+        await harness.controller.runAutomaticSyncForTesting()
+        #expect(harness.center.sent.filter { $0 == "beepbar-new-recordings" }.count == 1)
+        #expect(harness.center.sent.count == baseline.center.sent.count + 1)
     }
 
     /// Proves the follow-up decision after a failed materials run: a WeBeep service failure still
@@ -273,24 +332,153 @@ import Testing
 
     // MARK: Cancellation and quit
 
-    /// Proves that cancelling the automatic run's task while the follow-up is running cancels the
-    /// refresh and finishes the run within a second. Guards against the follow-up outliving a
-    /// cancelled scheduler task.
+    /// Proves, through the real scheduler callback, that turning automatic sync off while the
+    /// follow-up of an automatic run is still inside the system activity cancels the refresh and
+    /// delivers `completion` promptly, well before the hold runs out. Guards against the callback
+    /// task having no handle (#188): before, nothing in the app could cancel it, and this test
+    /// cancelled a task of its own instead, proving a path the app never took.
     @Test func cancellingAnAutomaticRunStopsTheFollowUpPromptly() async throws {
-        let harness = try await Harness()
+        let schedule = TestSchedule()
+        let harness = try await Harness(schedule: schedule)
         defer { harness.remove() }
+        harness.controller.setFollowUpActivityHoldForTesting(.seconds(30))
         harness.seam.honorsCancellation = true
-        let run = Task { @MainActor in await harness.controller.runAutomaticSyncForTesting() }
+        let fired = Task { @MainActor in await schedule.fire(0) }
         await harness.waitForCalls(1)
 
         let started = ContinuousClock.now
-        run.cancel()
-        let outcome = await run.value
+        harness.controller.setAutomaticSync(enabled: false)
+        let result = await fired.value
 
         // The materials run had already finished: cancelling the follow-up doesn't rewrite that.
-        #expect(outcome == .finished)
+        #expect(result == .finished)
         #expect(ContinuousClock.now - started < .seconds(5))
         #expect(harness.seam.sawCancellation)
+        guard case .synced = harness.controller.syncState else {
+            Issue.record("Expected the materials result to stay, got \(harness.controller.syncState)")
+            return
+        }
+    }
+
+    /// Proves that dropping the schedule (here: automatic sync turned off) while an automatic run
+    /// holds a follow-up that "Sincronizza ora" started does not stop the user's refresh, and
+    /// still delivers `completion` promptly. Guards against the automatic run's cancellation
+    /// handler cancelling whatever follow-up it merged into (RB-001 of #188).
+    @Test func droppingTheScheduleKeepsAManualRefreshTheAutomaticRunJoined() async throws {
+        let schedule = TestSchedule()
+        let harness = try await Harness(schedule: schedule)
+        defer { harness.remove() }
+        harness.controller.setFollowUpActivityHoldForTesting(.seconds(30))
+        harness.seam.honorsCancellation = true
+        harness.controller.synchronizeNow()
+        await harness.waitForCalls(1)
+        await harness.settle()
+        let manual = try #require(harness.controller.recordingsFollowUpForTesting)
+
+        let fired = Task { @MainActor in await schedule.fire(0) }
+        try await Self.waitUntilHeld(fired, harness)
+        #expect(harness.seam.calls.count == 1, "the automatic run started a refresh of its own")
+        #expect(harness.controller.recordingsFollowUpForTesting == manual)
+
+        let started = ContinuousClock.now
+        harness.controller.setAutomaticSync(enabled: false)
+        #expect(await fired.value == .finished)
+        #expect(ContinuousClock.now - started < .seconds(5), "completion waited for the manual refresh")
+        try? await Task.sleep(for: .milliseconds(100))
+        #expect(!harness.seam.sawCancellation, "the manual refresh was cancelled with the schedule")
+        #expect(harness.controller.recordingsFollowUpForTesting == manual)
+        manual.cancel()
+        await manual.value
+    }
+
+    /// The other order: an automatic run's follow-up is held when "Sincronizza ora" merges into
+    /// it, then the schedule is dropped. The refresh the user's sync now relies on keeps running.
+    /// Guards against deciding from who created the follow-up alone (RB-001 of #188).
+    @Test func droppingTheScheduleKeepsAnAutomaticRefreshAManualSyncJoined() async throws {
+        let schedule = TestSchedule()
+        let harness = try await Harness(schedule: schedule)
+        defer { harness.remove() }
+        harness.controller.setFollowUpActivityHoldForTesting(.seconds(30))
+        harness.seam.honorsCancellation = true
+        let fired = Task { @MainActor in await schedule.fire(0) }
+        await harness.waitForCalls(1)
+        let followUp = try #require(harness.controller.recordingsFollowUpForTesting)
+        harness.controller.synchronizeNow()
+        await harness.settle()
+        #expect(harness.seam.calls.count == 1)
+
+        let started = ContinuousClock.now
+        harness.controller.setAutomaticSync(enabled: false)
+        #expect(await fired.value == .finished)
+        #expect(ContinuousClock.now - started < .seconds(5), "completion waited out the whole hold (RB-102 of #225)")
+        try? await Task.sleep(for: .milliseconds(100))
+        #expect(!harness.seam.sawCancellation, "the refresh a manual sync joined was cancelled with the schedule")
+        followUp.cancel()
+        await followUp.value
+    }
+
+    /// A follow-up the dropped schedule already cancelled but that has not finished unwinding (its
+    /// refresh ignores cancellation for a while, as a WebKit listing can) must not take in a
+    /// "Sincronizza ora": the user's sync would end with no refresh at all. Proves the manual
+    /// sync starts a refresh of its own. Guards against the merge branch of
+    /// `startRecordingsFollowUp` returning a cancelled task (RB-104 of #225).
+    @Test func aManualSyncDoesNotMergeIntoAFollowUpTheDroppedScheduleCancelled() async throws {
+        let schedule = TestSchedule()
+        let harness = try await Harness(schedule: schedule)
+        defer { harness.remove() }
+        harness.controller.setFollowUpActivityHoldForTesting(.seconds(30))
+        let gate = FakeRecmanBrowser.Gate()
+        harness.seam.gate = gate
+        let fired = Task { @MainActor in await schedule.fire(0) }
+        await harness.waitForCalls(1)
+        let cancelled = try #require(harness.controller.recordingsFollowUpForTesting)
+
+        harness.controller.setAutomaticSync(enabled: false)
+        #expect(await fired.value == .finished)
+        #expect(cancelled.isCancelled, "no manual sync relied on it, so the schedule stopped it")
+        #expect(harness.controller.recordingsFollowUpForTesting == cancelled, "it is still unwinding")
+
+        harness.controller.synchronizeNow()
+        await harness.waitForCalls(2)
+        #expect(harness.seam.calls.count == 2, "the manual sync got no refresh of its own")
+        #expect(harness.seam.calls.last?.force == true)
+        let fresh = try #require(harness.controller.recordingsFollowUpForTesting)
+        #expect(fresh != cancelled)
+
+        gate.release()
+        await cancelled.value
+        await fresh.value
+        #expect(harness.controller.recordingsFollowUpForTesting == nil)
+    }
+
+    /// Waits until the automatic run of `fired` has finished its materials and sits in the hold
+    /// (its sync is over and `completion` has not come), so a cancellation lands on the hold.
+    private static func waitUntilHeld(_ fired: Task<NSBackgroundActivityScheduler.Result, Never>, _ harness: Harness) async throws {
+        let deadline = ContinuousClock.now + .seconds(10)
+        while !harness.controller.isSyncActive, ContinuousClock.now < deadline { try await Task.sleep(for: .milliseconds(1)) }
+        while harness.controller.isSyncActive, ContinuousClock.now < deadline { try await Task.sleep(for: .milliseconds(1)) }
+        try await Task.sleep(for: .milliseconds(100))
+        try #require(!harness.controller.isSyncActive)
+    }
+
+    /// Proves that when the system asks background work to defer (`shouldDefer`), an automatic
+    /// run still finishes its materials but starts no recordings refresh. Guards against ignoring
+    /// the scheduler's request (#188): the WebKit listings ran under thermal or battery pressure.
+    @Test func aSchedulerAskingToDeferSkipsTheFollowUp() async throws {
+        let schedule = TestSchedule()
+        schedule.defers.withLock { $0 = true }
+        let harness = try await Harness(schedule: schedule)
+        defer { harness.remove() }
+
+        #expect(await schedule.fire(0) == .finished)
+        await harness.settle()
+
+        guard case .synced = harness.controller.syncState else {
+            Issue.record("Expected the materials run to finish synced, got \(harness.controller.syncState)")
+            return
+        }
+        #expect(harness.seam.calls.isEmpty)
+        #expect(harness.controller.recordingsFollowUpForTesting == nil)
     }
 
     /// Proves that "Esci" with a follow-up running does not wait for it and does not get it from
@@ -528,9 +716,12 @@ private final class NetworkSequence: Sendable {
 /// Deterministic registration of the scheduler callback.
 @MainActor private final class TestSchedule {
     private var callbacks: [@Sendable (@escaping NSBackgroundActivityScheduler.CompletionHandler) -> Void] = []
+    /// What the registration answers for `shouldDefer`.
+    let defers = OSAllocatedUnfairLock(initialState: false)
     func register(_ interval: TimeInterval, _ callback: @escaping @Sendable (@escaping NSBackgroundActivityScheduler.CompletionHandler) -> Void) -> BackgroundActivityRegistration {
         callbacks.append(callback)
-        return BackgroundActivityRegistration { }
+        let defers = defers
+        return BackgroundActivityRegistration(invalidate: { }, shouldDefer: { defers.withLock { $0 } })
     }
     func fire(_ index: Int) async -> NSBackgroundActivityScheduler.Result {
         let callback = callbacks[index]

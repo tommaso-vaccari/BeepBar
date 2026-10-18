@@ -1,6 +1,6 @@
 # Recordings validation — 2026-10-07
 
-Branch: `dev`, reviewed for draft release PR #86 against `main`. Production merge remains gated on local beta testing.
+Branch: `dev`, reviewed for release PR #86 against `main`; #86 has since been merged and released (`3ce0ba0`). The sections from 2026-10-13 onward cover work for the next release PR, [#150](https://github.com/tommaso-vaccari/BeepBar/pull/150); PR #154 was merged into `dev` as `5c7518f` (2026-10-14).
 
 ## Automated checks
 
@@ -153,7 +153,7 @@ Source: `092d113` plus the uncommitted completion patch; these checks are not an
 - Naming: 17 focused tests passed; lowercase/hyphenated names are honored, unknown historical slugs retain their existing names.
 - Independent final reviews of player/naming/privacy/docs and controller/sync/auth/notification fixes found no remaining P0/P1/P2. Core progress/store/reset and status-item paths were also reviewed during completion. Reviews are static and the live evidence remains the single bounded run above.
 
-Pending: final exact-commit suite/build and publication, plus the PR's manual appearance/VoiceOver/menu-wake/Now Playing/display-sleep/notification checks. Issue #162 remains open for its manual gate. The requested iterative dev-to-main review follows an eventual dev merge; no release or installed-app replacement is authorized here.
+Pending at this checkpoint: final exact-commit suite/build and publication, plus the PR's manual appearance/VoiceOver/menu-wake/Now Playing/display-sleep/notification checks. Issue #162 remains open for its manual gate. The requested iterative dev-to-main review follows an eventual dev merge; no release or installed-app replacement is authorized here. Later status: PR #154 was merged into `dev` as `5c7518f`; its menu Recordings section was removed by PR #166 (`f9c6e95`), so menu checks no longer involve Recordings rows.
 
 ## Committed-source UI benchmark (PR #154, 2026-10-14)
 

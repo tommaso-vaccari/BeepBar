@@ -751,6 +751,19 @@ enum MaterialsRunEnd: Equatable, Sendable {
     private let credentialVault: CredentialVault
     private let notificationCoordinator: SyncNotificationCoordinator
     private var backgroundScheduler: BackgroundActivityRegistration?
+    /// How long a scheduler callback keeps the system activity open for the recordings follow-up
+    /// before calling `completion` anyway (#187). The follow-up's listings queue behind a Play in
+    /// the Recordings worker, and a Play can wait for an interactive Webex sign-in with no
+    /// deadline: awaiting it unbounded kept `completion` from ever being called, so no further
+    /// automatic sync was scheduled. Past the hold the follow-up goes on by itself and still
+    /// publishes its result; a later automatic run merges into it rather than starting another.
+    private var followUpActivityHold: Duration = .seconds(120)
+    /// The automatic run of the scheduler callback in progress (#188). Kept so that dropping the
+    /// schedule it belongs to (`configureBackgroundScheduler`: automatic sync turned off, Frequenza
+    /// changed, signed out…) cancels it: a follow-up still inside the activity then stops, and a
+    /// materials run still going (its own `syncTask`, not cancelled) starts none. Without a
+    /// handle nothing could ever cancel it, and the follow-up's cancellation path was dead code.
+    private var schedulerCallbackTask: Task<AutomaticSyncOutcome, Never>?
     /// Owns the real registration; tests replace it with a clock-backed registration, never macOS activity.
     private var scheduleBackgroundActivity: (TimeInterval, @escaping @Sendable (@escaping NSBackgroundActivityScheduler.CompletionHandler) -> Void) -> BackgroundActivityRegistration = { interval, callback in
         let scheduler = NSBackgroundActivityScheduler(identifier: "io.github.tvaccari.beepbar.auto-sync")
@@ -759,7 +772,7 @@ enum MaterialsRunEnd: Equatable, Sendable {
         scheduler.tolerance = interval * 0.5
         scheduler.qualityOfService = .utility
         scheduler.schedule(callback)
-        return BackgroundActivityRegistration(invalidate: { scheduler.invalidate() })
+        return BackgroundActivityRegistration(invalidate: { scheduler.invalidate() }, shouldDefer: { scheduler.shouldDefer })
     }
     private var bootstrapTask: Task<Void, Never>?
     private var syncTask: Task<Void, Never>?
@@ -774,6 +787,9 @@ enum MaterialsRunEnd: Equatable, Sendable {
     private var recordingsFollowUp: Task<Void, Never>?
     /// Identifies `recordingsFollowUp`, so a finishing task clears only itself.
     private var recordingsFollowUpID: UUID?
+    /// Whether a "Sincronizza ora" relies on `recordingsFollowUp` (started it or merged into it),
+    /// so dropping the schedule never stops it (RB-001 of #188). Replaced with each new follow-up.
+    private var recordingsFollowUpReliance = FollowUpReliance()
     /// Bumped by `cancelRecordingsFollowUp`: a follow-up that resumes under an older value belongs
     /// to an account, site or folder that is gone and publishes nothing.
     private var recordingsFollowUpGeneration = 0
@@ -1092,6 +1108,8 @@ enum MaterialsRunEnd: Equatable, Sendable {
 
     /// The account going away as `forgetCourseList()` sees it, at a moment a test chooses.
     func forgetCourseListForTesting() { forgetCourseList() }
+
+    func setFollowUpActivityHoldForTesting(_ hold: Duration) { followUpActivityHold = hold }
 
     func setBackgroundSchedulerForTesting(_ register: @escaping (TimeInterval, @escaping @Sendable (@escaping NSBackgroundActivityScheduler.CompletionHandler) -> Void) -> BackgroundActivityRegistration) {
         scheduleBackgroundActivity = register
@@ -1483,6 +1501,11 @@ enum MaterialsRunEnd: Equatable, Sendable {
             case .incompatibleResponse: return AppFailure.incompatibleResponse.detail
             }
         case is CredentialStorageError: return AppFailure.credentialUnavailable.detail
+        // Preview and apply settle interrupted Moodle moves first; an unreadable one blocks
+        // "Organizza cartelle" until fixed, so the sheet names the path as a sync does (#184).
+        case let error as RemoteMoveRecoveryError: return unreadableMoveMessage(error.path).text
+        // An unfinished course-folder rename blocks "Organizza cartelle" until a relaunch (#183).
+        case is PendingCourseFolderRenameError: return pendingFolderRenameMessage.text
         case is FileStoreError: return tr("Impossibile accedere ai file del corso. Controlla la cartella e riprova.", "Couldn't access the course files. Check the folder and try again.")
         default: return tr("Operazione non riuscita. Riprova.", "Operation failed. Try again.")
         }
@@ -2226,6 +2249,9 @@ enum MaterialsRunEnd: Equatable, Sendable {
                 let renamer = CourseFolderRenamer(database: database, fileStore: try FileStore(root: rootURL), gate: self.operationGate)
                 try await renamer.rename(rootID: rootID, courseID: course.id, from: oldFolder, to: trimmedFolder)
                 self.courseFolders[course.id] = trimmedFolder
+            } catch is PendingCourseFolderRenameError {
+                // An earlier rename is unfinished until a relaunch (#183): say so, not "failed".
+                self?.courseRenameErrors[course.id] = Self.pendingFolderRenameMessage.text
             } catch {
                 self?.courseRenameErrors[course.id] = (error as? CourseRenameError)?.errorDescription ?? tr("Rinomina non riuscita.", "Rename failed.")
             }
@@ -2310,6 +2336,8 @@ enum MaterialsRunEnd: Equatable, Sendable {
                 self?.busySync(operationID)
             } catch let error as RemoteMoveRecoveryError {
                 await self?.failedSync(operationID, error: nil, automatic: false, unreadableMove: error.path)
+            } catch is PendingCourseFolderRenameError {
+                await self?.failedSync(operationID, error: nil, automatic: false, pendingFolderRename: true)
             } catch {
                 await self?.failedSync(operationID, error: nil, automatic: false)
             }
@@ -2433,6 +2461,26 @@ enum MaterialsRunEnd: Equatable, Sendable {
         }
     }
 
+    /// `wait(for:atMost:)` that also cancels its timer when `task` finishes first, so a follow-up
+    /// that ends in seconds leaves no sleeping task behind for the rest of the hold (#187). Kept
+    /// apart from `wait(for:atMost:)`, which the quit path uses and `scripts/quit-probe.sh` covers.
+    /// It also ends when the waiting task is cancelled, without cancelling `task`: a dropped
+    /// schedule gets its `completion` at once even when the follow-up keeps running (RB-001).
+    nonisolated static func waitReleasingTimer(for task: Task<Void, Never>, atMost timeout: Duration) async {
+        let gate = FirstResume()
+        var timer: Task<Void, Never>?
+        await withTaskCancellationHandler {
+            await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
+                gate.arm(continuation)
+                // A cancellation before `arm` found nothing to resume: checked again once armed.
+                if Task.isCancelled { gate.resume(); return }
+                Task { await task.value; gate.resume() }
+                timer = Task { try? await Task.sleep(for: timeout); gate.resume() }
+            }
+        } onCancel: { gate.resume() }
+        timer?.cancel()
+    }
+
     func refreshConflicts() {
         guard !isSyncActive else { return }
         guard database != nil, rootID != nil else { return }
@@ -2516,6 +2564,11 @@ enum MaterialsRunEnd: Equatable, Sendable {
                 case .done, .gone: break
                 default: self.reportConflictChoiceFeedback(SyncCopy.remoteChangeFeedback(outcome, action: action), rootID: rootID)
                 }
+            } catch let error as RemoteMoveRecoveryError {
+                // `perform` settles interrupted Moodle moves first; an unreadable one blocks every
+                // choice here, even those that touch no file, until the user fixes that path. Name
+                // it, as a sync does, instead of the generic failure (#184).
+                self?.reportConflictChoiceFeedback(Self.unreadableMoveMessage(error.path), rootID: rootID)
             } catch {
                 self?.reportConflictChoiceFeedback(BilingualText("Impossibile completare la scelta. Nessun file è stato sovrascritto o cancellato definitivamente.", "Couldn't carry out the choice. No file was overwritten or permanently deleted."), rootID: rootID)
             }
@@ -3242,6 +3295,10 @@ enum MaterialsRunEnd: Equatable, Sendable {
         guard configuration != scheduledConfiguration else { return }
         backgroundScheduler?.invalidate()
         backgroundScheduler = nil
+        // Invalidating the scheduler does not stop a callback already running (#188). Its
+        // follow-up stops too, unless "Sincronizza ora" relies on it (RB-001).
+        schedulerCallbackTask?.cancel()
+        schedulerCallbackTask = nil
         scheduledConfiguration = configuration
         schedulerGeneration += 1
         schedulerRegistrationGeneration += 1
@@ -3275,7 +3332,11 @@ enum MaterialsRunEnd: Equatable, Sendable {
                 BeepbarLog.scheduler.notice("Scheduler callback started")
                 let trace = PerformanceTrace.shared.begin("scheduler.callback", category: .scheduler)
                 defer { PerformanceTrace.shared.end("scheduler.callback", category: .scheduler, state: trace) }
-                let outcome = await self.runAutomaticSync()
+                // A task of its own, so `configureBackgroundScheduler` can cancel it (#188).
+                let run = Task { @MainActor [weak self] in await self?.runAutomaticSync() ?? .finished }
+                self.schedulerCallbackTask = run
+                let outcome = await run.value
+                if self.schedulerCallbackTask == run { self.schedulerCallbackTask = nil }
                 BeepbarLog.scheduler.notice("Scheduler callback completed outcome=\(outcome.diagnosticName, privacy: .public)")
                 completion(outcome.schedulerResult)
             }
@@ -3407,6 +3468,8 @@ enum MaterialsRunEnd: Equatable, Sendable {
                 self?.deferredAutomaticSync(operationID)
             } catch let error as RemoteMoveRecoveryError {
                 await self?.failedSync(operationID, error: nil, automatic: true, unreadableMove: error.path)
+            } catch is PendingCourseFolderRenameError {
+                await self?.failedSync(operationID, error: nil, automatic: true, pendingFolderRename: true)
             } catch {
                 await self?.failedSync(operationID, error: nil, automatic: true)
             }
@@ -3416,22 +3479,39 @@ enum MaterialsRunEnd: Equatable, Sendable {
         // Captured before the follow-up, which never changes the materials outcome.
         let outcome = Task.isCancelled ? AutomaticSyncOutcome.cancelled : automaticOutcome
         // After the run and before the scheduler's `completion`: the system activity that ran the
-        // materials covers the recordings listings too, with no timer of our own. Never inside
-        // `task` (`syncTask`), which a quit waits for.
-        if let followUp = followUpAfterRun(operationID, trigger: .automatic, schedulerCancelled: Task.isCancelled) {
-            await withTaskCancellationHandler { await followUp.value } onCancel: { followUp.cancel() }
+        // materials covers the recordings listings too. Never inside `task` (`syncTask`), which a
+        // quit waits for. Held at most `followUpActivityHold`, so `completion` is always called and
+        // the next automatic run always scheduled (#187).
+        // The system asks background work to yield (heavy use, thermal or battery pressure): the
+        // materials are done, and the recordings refresh waits for the next run instead of
+        // starting now (#188). Read once, here, where nothing is under way: polling it during the
+        // follow-up would need a timer of our own.
+        let systemAsksToDefer = backgroundScheduler?.shouldDefer() ?? false
+        if systemAsksToDefer { BeepbarLog.sync.notice("Recordings follow-up skipped reason=scheduler-defer") }
+        if let followUp = followUpAfterRun(operationID, trigger: .automatic, stoppedByScheduler: Task.isCancelled || systemAsksToDefer) {
+            let hold = followUpActivityHold
+            // Read in the same turn that returned `followUp`, so it is that follow-up's.
+            let reliance = recordingsFollowUpReliance
+            // The schedule dropped (#188) ends the hold at once, and stops the refresh only when
+            // no "Sincronizza ora" relies on it: this run may have merged into a manual refresh,
+            // or a manual sync into this one, and the user's refresh must not stop with the
+            // schedule (RB-001). The handler is synchronous and off the main actor, hence the lock.
+            await withTaskCancellationHandler {
+                await Self.waitReleasingTimer(for: followUp, atMost: hold)
+            } onCancel: { if !reliance.servesManualSync { followUp.cancel() } }
         }
         return outcome
     }
 
     /// Starts the recordings follow-up of `operationID` from what its ending path recorded, or
     /// nothing when it recorded nothing (superseded). An automatic run whose scheduler task was
-    /// cancelled ends as `.cancelled` (mapping table: `runAutomaticSync` returning `.cancelled`).
+    /// cancelled (its schedule dropped) or whose scheduler asks to defer ends as `.cancelled`
+    /// (mapping table: `runAutomaticSync` returning `.cancelled`), so no refresh starts.
     /// Returns the task that runs (new or merged into), nil when skipped.
     @discardableResult
-    private func followUpAfterRun(_ operationID: UUID, trigger: RecordingsSyncTrigger, schedulerCancelled: Bool = false) -> Task<Void, Never>? {
+    private func followUpAfterRun(_ operationID: UUID, trigger: RecordingsSyncTrigger, stoppedByScheduler: Bool = false) -> Task<Void, Never>? {
         guard let end = takeRunEnd(operationID) else { return nil }
-        return startRecordingsFollowUp(after: schedulerCancelled ? .cancelled : end, trigger: trigger)
+        return startRecordingsFollowUp(after: stoppedByScheduler ? .cancelled : end, trigger: trigger)
     }
 
     /// Records how `operationID`'s materials run ended. Only the active operation records: a
@@ -3513,10 +3593,19 @@ enum MaterialsRunEnd: Equatable, Sendable {
         guard !isTerminating else { return nil }
         guard let materials = Self.recordingsOutcome(for: end) else { return nil }
         guard case .refresh = recordingsSyncDecision(after: materials, trigger: trigger, network: nil).0 else { return nil }
-        if let recordingsFollowUp { return recordingsFollowUp }
+        // A follow-up the dropped schedule already cancelled can still be unwinding (a refresh
+        // that ignores cancellation for a while): merging into it would leave this request with no
+        // refresh at all, so it counts as absent. The old task's `defer` compares ids, so it
+        // clears only itself (RB-104 of #225).
+        if let recordingsFollowUp, !recordingsFollowUp.isCancelled {
+            if trigger == .manual { recordingsFollowUpReliance.markManual() }
+            return recordingsFollowUp
+        }
         let generation = recordingsFollowUpGeneration
         let id = UUID()
         recordingsFollowUpID = id
+        recordingsFollowUpReliance = FollowUpReliance()
+        if trigger == .manual { recordingsFollowUpReliance.markManual() }
         let task = Task { @MainActor [weak self] in
             guard let self else { return }
             defer { if self.recordingsFollowUpID == id { self.recordingsFollowUp = nil; self.recordingsFollowUpID = nil } }
@@ -3535,8 +3624,9 @@ enum MaterialsRunEnd: Equatable, Sendable {
             // An account, site or folder change meanwhile: the result belongs to a world that is gone.
             guard self.recordingsFollowUpGeneration == generation else { return }
             self.lastRecordingsOutcome = result
-            // One aggregated notification for the lectures first seen by this refresh (nothing for a
-            // baseline, a failure or an expired session; the coordinator applies the Notifiche switch).
+            // One aggregated notification for the lectures first seen by this refresh, including those
+            // published before an outage or an expired session cut it short (#190); nothing for a
+            // baseline or a cancellation. The coordinator applies the Notifiche switch.
             await self.notificationCoordinator.announceRecordingsRefresh(result, isCurrent: { [weak self] in self?.recordingsFollowUpGeneration == generation })
         }
         recordingsFollowUp = task
@@ -3720,6 +3810,16 @@ enum MaterialsRunEnd: Equatable, Sendable {
             "BeepBar can't read “\(path.value)”, part of an unfinished move to follow Moodle. Check that there's no alias or folder in its place and that the file is accessible, then choose “Sync now”.")
     }
 
+    /// What the window says while a course-folder rename is unfinished
+    /// (`PendingCourseFolderRenameError`, #183): sync, course renames and "Organizza cartelle"
+    /// stay blocked until BeepBar restarts, when launch recovery finishes the rename. It tells the
+    /// student the one thing that unblocks it and that their files were not touched.
+    nonisolated static var pendingFolderRenameMessage: BilingualText {
+        BilingualText(
+            "La rinomina di una cartella del corso è rimasta a metà. Riavvia BeepBar per completarla: fino ad allora sincronizzazione e rinomine sono sospese. I tuoi file non sono stati toccati.",
+            "A course folder rename was left unfinished. Restart BeepBar to complete it: until then, syncing and renaming are paused. Your files haven't been touched.")
+    }
+
     private func deferredAutomaticSync(_ operationID: UUID) {
         guard activeOperationID == operationID else { return }
         recordRunEnd(operationID, .deferredWhileBusy)
@@ -3733,16 +3833,22 @@ enum MaterialsRunEnd: Equatable, Sendable {
     /// "Sincronizzazione incompleta", since nothing syncs in that folder until the user fixes that
     /// path (release review I-A4). The notification stays the generic one: it has no room for a
     /// path, and opening BeepBar shows it.
-    private func failedSync(_ operationID: UUID, error: WeBeepAPIError?, automatic: Bool, unreadableMove: RelativePath? = nil) async {
+    ///
+    /// `pendingFolderRename`: the run refused because a course-folder rename is unfinished
+    /// (`PendingCourseFolderRenameError`, #183); the window says to restart BeepBar instead of
+    /// the generic failure, since every run refuses until then.
+    private func failedSync(_ operationID: UUID, error: WeBeepAPIError?, automatic: Bool, unreadableMove: RelativePath? = nil, pendingFolderRename: Bool = false) async {
         guard activeOperationID == operationID else { return }
         recordRunEnd(operationID, error.map(MaterialsRunEnd.serviceFailure) ?? .localFailure)
-        BeepbarLog.sync.error("Synchronization failed automatic=\(automatic, privacy: .public) errorType=\(error.map { String(reflecting: type(of: $0)) } ?? (unreadableMove == nil ? "unknown" : "unreadableMove"), privacy: .public)")
+        BeepbarLog.sync.error("Synchronization failed automatic=\(automatic, privacy: .public) errorType=\(error.map { String(reflecting: type(of: $0)) } ?? (unreadableMove != nil ? "unreadableMove" : pendingFolderRename ? "pendingFolderRename" : "unknown"), privacy: .public)")
         if let unreadableMove { BeepbarLog.sync.error("Interrupted move blocked by an unreadable path=\(unreadableMove.value, privacy: .private)") }
         let issue: AutomaticNotificationIssue?
         if let error {
             issue = await handleServiceFailure(error, automatic: automatic)
         } else {
-            setSyncState(.failed(unreadableMove.map { .local(Self.unreadableMoveMessage($0)) } ?? .partialSync))
+            if let unreadableMove { setSyncState(.failed(.local(Self.unreadableMoveMessage(unreadableMove)))) }
+            else if pendingFolderRename { setSyncState(.failed(.local(Self.pendingFolderRenameMessage))) }
+            else { setSyncState(.failed(.partialSync)) }
             issue = automatic ? .partialSync : nil
         }
         let isCurrent = currentNotificationCheck()
@@ -3813,6 +3919,9 @@ enum MaterialsRunEnd: Equatable, Sendable {
 /// A registration can be invalidated without coupling schedule identity to an enabled-course count.
 struct BackgroundActivityRegistration {
     let invalidate: () -> Void
+    /// The system's `NSBackgroundActivityScheduler.shouldDefer`: true when it wants background
+    /// work to yield. Registrations that never defer (DailyTelemetry, tests) keep the default.
+    var shouldDefer: () -> Bool = { false }
 }
 
 private struct BackgroundScheduleConfiguration: Equatable {
@@ -3973,6 +4082,15 @@ private actor BootstrapService {
         }
         return !report.unresolved.isEmpty
     }
+}
+
+/// Whether a "Sincronizza ora" relies on a recordings follow-up: marked when a manual run starts
+/// it or merges into it, never cleared. Read by the automatic run's cancellation handler, which
+/// runs synchronously off the main actor, hence the lock (RB-001 of #188).
+private final class FollowUpReliance: Sendable {
+    private let manual = OSAllocatedUnfairLock(initialState: false)
+    func markManual() { manual.withLock { $0 = true } }
+    var servesManualSync: Bool { manual.withLock { $0 } }
 }
 
 /// Resumes one continuation once, whichever caller comes first (`WeBeepAuthenticationController.wait`).

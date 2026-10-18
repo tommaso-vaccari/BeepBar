@@ -402,6 +402,17 @@ public actor FileStore {
     /// FileProvider folders) refuse the link, and a staging folder on another device cannot hold
     /// one; there the file is trashed by its path after a last check (`trashWithoutHardLink`), so
     /// the choice keeps working there as it did in released versions (#182).
+    ///
+    /// Cost and cancellation (#185): the hard-link path reads the file three times, on purpose.
+    /// The two reads before the Trash call (the file, then its pinning link) stop at the next
+    /// chunk when the task is cancelled: nothing has changed on disk until the Trash call, and the
+    /// staging link is removed on the way out, so a cancelled choice leaves the file exactly where
+    /// it was. The read after the Trash call guards the only irreversible step (unlinking the
+    /// user's path) and is not cancellable: once the Trash holds the link, the action finishes or
+    /// reports `localChanged`, never half-done. None of the reads is skipped on `fstat` evidence:
+    /// a content stamp cannot prove the bytes unchanged on every volume (see `contentStamp(of:)`),
+    /// and these checks are what keep an edit made meanwhile out of the Trash and in place. The
+    /// actor is still busy for the whole action, so other `FileStore` calls wait behind it.
     public func trashRegularFile(_ path: RelativePath, expected: FileSnapshot) throws {
         try requireMovablePath(path)
         let namedRoot = open(rootURL.path, O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW)
@@ -418,7 +429,7 @@ public actor FileStore {
         // Taken before the hash, so the fallback's last check sees any write since the read began.
         let verifiedStamp = try Self.contentStamp(of: source)
         guard try Self.identity(of: source) == identity,
-              try sha256(of: source, checksCancellation: false) == expected.sha256 else { throw FileStoreError.localChanged }
+              try sha256(of: source, checksCancellation: true) == expected.sha256 else { throw FileStoreError.localChanged }
         #if canImport(Darwin)
         let stagingURL = try FileManager.default.url(for: .itemReplacementDirectory, in: .userDomainMask, appropriateFor: rootURL, create: true)
         #else
@@ -448,7 +459,7 @@ public actor FileStore {
         defer { close(staged) }
         try requireRegularFile(staged)
         guard try Self.identity(of: staged) == identity,
-              try sha256(of: staged, checksCancellation: false) == expected.sha256 else { throw FileStoreError.localChanged }
+              try sha256(of: staged, checksCancellation: true) == expected.sha256 else { throw FileStoreError.localChanged }
         let namedStaging = open(stagingURL.path, O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW)
         guard namedStaging >= 0 else { throw FileStoreError.localChanged }
         defer { close(namedStaging) }

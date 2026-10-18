@@ -49,6 +49,8 @@
 - If your Polimi sign-in has expired, Recordings now starts a fresh sign-in instead of reusing the one that failed, and Polimi’s “Il servizio richiesto non è presente” page ends the attempt instead of leaving Recordings waiting.
 - Turning Recordings off no longer lets your Polimi sign-in come back, even if its saved file could not be deleted.
 - Old lecture recordings stay marked as seen even after browsing more than 5,000 recordings across courses. Recordings that earlier versions forgot may show as new again after updating: open them, or use “Segna novità come lette” (“Mark new recordings as read”) in the course.
+- In Recordings, a course with a single recording now reads “1 registrazione” instead of “1 registrazioni”, and VoiceOver announces one new lecture as “1 nuova”.
+- In Recordings, VoiceOver no longer stops on an unnamed element at the start of lectures that aren't new.
 
 ## 2026-10-07
 

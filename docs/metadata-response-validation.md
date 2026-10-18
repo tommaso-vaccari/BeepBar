@@ -3,7 +3,8 @@
 Date: 2026-10-09. Base dev: `ac68333265a68b3f1e01e7f0958c3aae31cc7850`.
 Implementation: `3d94bdab0e20896fae63318c30f782afb2267e3c`.
 Frozen released main: `3ce0ba02c10dcf51836057f7119ba0e78da3c6e4`.
-This is a proposal for dev, not integrated or released work.
+Status (2026-10-17): integrated into `dev` by [PR #127](https://github.com/tommaso-vaccari/BeepBar/pull/127),
+merge `508811b` (2026-10-10); not yet released on `main`. The evidence below was recorded while the PR was open.
 
 ## Contract and decision
 
@@ -118,7 +119,7 @@ CI on `096570b` did not cover its missing cancellation handoff regression.
 The owner’s independent review of `096570b` identified a P1: Foundation can complete a
 cancelled suspended URLSession task before the checked continuation is installed. The old
 callback discarded that terminal result, so the later consumer could remain suspended.
-[PR #127](https://github.com/tommaso-vaccari/BeepBar/pull/127) remains open against `dev`.
+[PR #127](https://github.com/tommaso-vaccari/BeepBar/pull/127) was still open against `dev` at this checkpoint (merged later as `508811b`).
 Merge `f23b8ee` incorporates current dev `713033cb164e549dd1ba652d19bb559ec68d8146`.
 
 Fix `1e65515e245c200e31f61fa0789dff5649761aed` retains the first terminal Result under the same

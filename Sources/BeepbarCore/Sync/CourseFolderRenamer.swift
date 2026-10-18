@@ -11,6 +11,23 @@ public enum CourseRenameError: Error, Sendable, Equatable, LocalizedError {
     }
 }
 
+/// A course-folder rename of this sync folder is still unfinished: its `pending_scope_moves` row
+/// exists, typically because the rename happened on disk but the flush of the sync folder failed
+/// (`FileStoreError.mutationNotDurable`, #183). Thrown by every operation that would read or
+/// write course folders while the row is there: a sync (`SyncCoordinator`), another rename
+/// (`CourseFolderRenamer`) and "Organizza cartelle" (`ModulePathMigrator`).
+///
+/// Why they refuse instead of settling the rename in-session: the app keeps the course's folder
+/// name in several places (the window, the scopes it upserts, the sync targets, the module
+/// destinations), and a settle in a running app left some of them on the old name, so a later
+/// sync, course switch or module move recreated the old folder and split the course in two
+/// (review RA-001/RA-003/RA-004 of PR #225). Only launch recovery (`RecoveryCoordinator`), which
+/// runs before any of them is built, settles the row. Nothing on disk is touched meanwhile; the
+/// app turns this error into a message that says to restart BeepBar.
+public struct PendingCourseFolderRenameError: Error, Sendable, Equatable {
+    public init() {}
+}
+
 public actor CourseFolderRenamer {
     private let database: SyncDatabase
     private let fileStore: FileStore
@@ -32,7 +49,8 @@ public actor CourseFolderRenamer {
               !ReservedNamespace.isReservedTopLevelName(newFolder) else { throw FileStoreError.invalidStage }
         try await gate.withLease(.renaming(courseID)) { [database, fileStore, interruption] in
             guard try await database.hasPendingModuleMoves(rootID: rootID) == false else { throw SyncDatabaseError.execution }
-            guard try await database.pendingScopeMoves().contains(where: { $0.rootID == rootID }) == false else { throw SyncDatabaseError.execution }
+            // Settled only by launch recovery; see `PendingCourseFolderRenameError` (#183).
+            guard try await database.pendingScopeMoves(rootID: rootID).isEmpty else { throw PendingCourseFolderRenameError() }
             guard !(try await database.hasOpenConflicts(rootID: rootID, prefix: oldFolder)),
                   !(try await database.hasPendingOperations(rootID: rootID, prefix: oldFolder)),
                   let scope = try await database.scope(rootID: rootID, courseID: courseID), scope.localFolder == oldFolder else { throw SyncDatabaseError.execution }

@@ -83,6 +83,38 @@ struct RecordingPlayerControllerTests {
         controller.close()
     }
 
+    /// `bringToFront` restores a minimized player window and orders it front through `present`,
+    /// on a real `NSWindow` (issue #193: `NSApp.activate()` alone left it in the Dock, so a menu
+    /// Play of the open lecture looked dead), and does nothing once the player is closed.
+    /// Mutations: drop the `deminiaturize` (stays minimized when `present` is a no-op, as here);
+    /// drop the `present` call (never presented).
+    @Test func bringToFrontRestoresAMinimizedWindow() async throws {
+        let media = try await TestMedia.shared.url()
+        var presented: [NSWindow] = []
+        let controller = RecordingPlayerController(present: { presented.append($0) }, makePlayerView: { FakePlayerView() },
+                                                   activationPolicy: FakePolicy(.accessory).control, frameAutosaveName: nil,
+                                                   defaults: PlayerTestDefaults.throwaway(), toggleFullScreen: { _ in }, nowPlaying: SilentNowPlaying())
+        defer { controller.close() }
+        controller.play(media, title: "Lezione", cookies: [])
+        let window = try #require(controller.window)
+        presented.removeAll()
+        // On screen without activating the test process, then into the Dock.
+        window.orderFront(nil)
+        window.miniaturize(nil)
+        for _ in 0..<500 where !window.isMiniaturized { try await Task.sleep(for: .milliseconds(5)) }
+        try #require(window.isMiniaturized, "the window server must minimize the window for this test to mean anything")
+
+        controller.bringToFront()
+        // AppKit restores the window asynchronously (the Dock animation).
+        for _ in 0..<500 where window.isMiniaturized { try await Task.sleep(for: .milliseconds(5)) }
+        #expect(window.isMiniaturized == false)
+        #expect(presented.count == 1 && presented.first === window)
+
+        controller.close()
+        controller.bringToFront()
+        #expect(presented.count == 1, "a closed player has nothing to bring forward")
+    }
+
     /// macOS defaults sleep prevention off: every newly created player must opt in, including
     /// one opened after closing the previous lecture. AVFoundation owns the playback assertion.
     @Test func videoPlaybackPreventsIdleSleepAcrossReplacementAndReopen() async throws {
@@ -381,6 +413,38 @@ struct RecordingPlayerControllerTests {
         #expect(controller.window != nil)
         #expect(controller.player?.rate == 0)
         controller.close()
+    }
+
+    /// After a mid-lecture failure the window can show why the lecture stopped (`showProblem`, in
+    /// place of the course name), and when the student starts the paused item again the course
+    /// name comes back and a later failure of that same item is reported again (issue #197: the
+    /// once-per-item flag stayed set, so a second stall left a frozen window nobody explained).
+    /// Mutations: drop the `failureReported = false` reset in `timeControlStatusChanged` (one
+    /// failure only); drop the subtitle restore there (the problem stays); make `showProblem` a
+    /// no-op (subtitle never changes).
+    @Test(.timeLimit(.minutes(1))) func resumingAfterAFailureReportsTheNextOneAgain() async throws {
+        let media = try await TestMedia.shared.url()
+        let controller = makeController()
+        var failures = 0
+        controller.onFailure = { _, _ in failures += 1 }
+        controller.play(media, title: "Lezione", cookies: [], startAt: nil, recordingID: "a",
+                        metadata: RecordingPlaybackMetadata(title: "Lezione", courseName: "Analisi", artworkURL: nil))
+        try await Self.waitUntil { controller.isCurrentItemReady }
+        let window = try #require(controller.window)
+        #expect(window.subtitle == "Analisi")
+        controller.fail(generation: controller.generation, error: nil)
+        #expect(failures == 1)
+        controller.showProblem("Il Politecnico non risponde.")
+        #expect(window.subtitle == "Il Politecnico non risponde.")
+
+        let player = try #require(controller.player)
+        player.play()
+        try await Self.waitUntil { window.subtitle == "Analisi" }
+        controller.fail(generation: controller.generation, error: nil)
+        #expect(failures == 2, "a stall after the student resumed is reported again")
+        controller.close()
+        controller.showProblem("dopo la chiusura")
+        #expect(controller.window == nil)
     }
 
     /// The failed-to-play-to-end notification of an item a newer Play replaced, or of the item

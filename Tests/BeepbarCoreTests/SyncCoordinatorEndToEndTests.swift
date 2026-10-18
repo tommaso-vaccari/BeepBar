@@ -5,6 +5,14 @@ import FoundationNetworking
 import Testing
 @testable import BeepbarCore
 
+/// Whether the volume holding the fixtures' temporary folders ignores case, the only place where
+/// renaming "Course 1" to "course 1" leaves "Course 1" reachable. The case-rename tests need it and
+/// are reported as skipped elsewhere instead of passing with no assertion (#220).
+private let temporaryVolumeIgnoresCase: Bool = {
+    let values = try? FileManager.default.temporaryDirectory.resourceValues(forKeys: [.volumeSupportsCaseSensitiveNamesKey])
+    return values?.volumeSupportsCaseSensitiveNames == false
+}()
+
 @Suite(.serialized) struct SyncCoordinatorEndToEndTests {
     @Test(arguments: [false, true])
     func directorySyncFailureRetainsRemoteMoveJournalAndStopsPlanning(_ swap: Bool) async throws {
@@ -104,19 +112,24 @@ import Testing
     }
 
     /// One unreadable batch neither stops the others from being settled nor loses its own row.
-    /// Batches are visited in no fixed order, so throwing at the first unreadable one could leave
-    /// a settleable batch pending behind it.
-    @Test func anUnreadableBatchDoesNotHoldBackTheOthers() async throws {
+    /// Recovery visits batches by batch id, so the unreadable batch is put first, in the middle and
+    /// last: throwing at the first unreadable batch leaves the batches behind it pending and fails
+    /// the first two orders on every run. With a dictionary's order the same mutant passed about a
+    /// quarter of the runs (#224).
+    @Test(arguments: ["00000000-0000-0000-0000-000000000000", "6FFFFFFF-FFFF-FFFF-FFFF-FFFFFFFFFFFF", "FFFFFFFF-FFFF-FFFF-FFFF-FFFFFFFFFFFF"])
+    func anUnreadableBatchDoesNotHoldBackTheOthers(_ unreadableBatch: String) async throws {
         let fixture = try await Fixture()
         defer { fixture.remove() }
         let target = fixture.targets[0]
         _ = try await fixture.synchronize(targets: [target])
+        let readableBatches = ["40000000-0000-0000-0000-000000000000", "80000000-0000-0000-0000-000000000000", "C0000000-0000-0000-0000-000000000000"]
         var moves: [PendingRemoteMove] = []
         for file in 0..<4 {
             let id = fixture.remoteID(course: 1, file: file)
             let baseline = try #require(try await fixture.database.baseline(rootID: fixture.rootID, remoteID: id))
             let folder = file == 0 ? "Moved" : "Elsewhere"
-            let move = PendingRemoteMove(batchID: UUID(), remoteID: id, from: baseline.relativePath, to: try RelativePath("Course 1/\(folder)/\(file).txt"), sha256: baseline.sha256, placement: nil)
+            let batch = try #require(UUID(uuidString: file == 0 ? unreadableBatch : readableBatches[file - 1]))
+            let move = PendingRemoteMove(batchID: batch, remoteID: id, from: baseline.relativePath, to: try RelativePath("Course 1/\(folder)/\(file).txt"), sha256: baseline.sha256, placement: nil)
             try await fixture.database.beginRemoteMoves(rootID: fixture.rootID, [move])
             moves.append(move)
         }
@@ -134,10 +147,61 @@ import Testing
         let move = PendingScopeMove(id: UUID(), rootID: fixture.rootID, courseID: target.courseID, oldFolder: target.localFolder, newFolder: "Renamed")
         try await fixture.database.beginScopeMove(move)
         fixture.upstream.resetDownloadCount()
-        await #expect(throws: SyncDatabaseError.execution) { _ = try await fixture.synchronize(targets: [target]) }
+        await #expect(throws: PendingCourseFolderRenameError()) { _ = try await fixture.synchronize(targets: [target]) }
         #expect(try await fixture.database.pendingScopeMoves() == [move])
         #expect(fixture.upstream.downloadCount == 0)
         #expect(!FileManager.default.fileExists(atPath: fixture.root.appending(path: target.localFolder).path))
+    }
+
+    /// After a course-folder rename whose sync-folder flush failed (#183), every sync refuses with
+    /// `PendingCourseFolderRenameError` and touches nothing, whether its target names the old
+    /// folder (what the app still shows after the failed rename) or the new one: no folder is
+    /// created, nothing is downloaded or moved, the row and the scope stay as they were. Writing
+    /// the old name back between runs, as the app's course switch does, changes nothing either.
+    /// Only launch recovery settles the rename, and the next sync then runs in the renamed folder.
+    /// Guards the decision that replaced the in-session settle (RA-001/RA-003 of PR #225): with
+    /// the guard removed, the old-name sync recreates "Course 1" and splits the course.
+    @Test func anUnfinishedCourseRenameBlocksEverySyncUntilLaunchRecovery() async throws {
+        let flush = FlushFailures()
+        let fixture = try await Fixture(syncDirectory: { try flush.sync($0) })
+        defer { fixture.remove() }
+        _ = try await fixture.synchronize(targets: [fixture.targets[0]])
+        let original = try #require(fixture.contents("Course 1/Lezioni/0.txt"))
+        let renamer = CourseFolderRenamer(database: fixture.database, fileStore: fixture.fileStore, gate: fixture.gate)
+        flush.failNext(1)
+        await #expect(throws: FileStoreError.mutationNotDurable) { try await renamer.rename(rootID: fixture.rootID, courseID: 1, from: "Course 1", to: "Renamed") }
+        let before = try #require(try await fixture.database.scope(rootID: fixture.rootID, courseID: 1))
+        fixture.upstream.setFile(course: 1, file: 0, value: "updated", revision: "2")
+        fixture.upstream.addFile(course: 1, file: 500, filename: "new.txt", value: "new", revision: "1")
+        fixture.upstream.resetDownloadCount()
+
+        for folder in ["Course 1", "Renamed", "Course 1"] {
+            await #expect(throws: PendingCourseFolderRenameError()) { _ = try await fixture.synchronize(targets: [SyncTarget(courseID: 1, localFolder: folder)]) }
+            for enabled in [false, true] {
+                try await fixture.database.upsertScope(SyncScope(rootID: fixture.rootID, courseID: 1, displayName: before.displayName, localFolder: "Course 1", enabled: enabled))
+            }
+        }
+        #expect(fixture.upstream.downloadCount == 0)
+        #expect(!FileManager.default.fileExists(atPath: fixture.root.appending(path: "Course 1").path), "a refused sync recreated the old folder")
+        #expect(fixture.contents("Renamed/Lezioni/0.txt") == original)
+        #expect(fixture.contents("Renamed/Lezioni/new.txt") == nil)
+        #expect(try await fixture.database.pendingScopeMoves().count == 1)
+        let blocked = try await fixture.database.scope(rootID: fixture.rootID, courseID: 1)
+        #expect(blocked?.localFolder == "Course 1")
+        #expect(blocked?.managedDirectory == before.managedDirectory)
+        #expect(try await fixture.database.baseline(rootID: fixture.rootID, remoteID: fixture.remoteID(course: 1, file: 0))?.relativePath == RelativePath("Course 1/Lezioni/0.txt"))
+
+        // The next launch: recovery settles the rename before any sync is built.
+        _ = try await RecoveryCoordinator(rootID: fixture.rootID, database: fixture.database, fileStore: FileStore(root: fixture.root)).recover()
+        #expect(try await fixture.database.pendingScopeMoves().isEmpty)
+        let result = try await fixture.synchronize(targets: [SyncTarget(courseID: 1, localFolder: "Renamed")])
+        #expect(result.failures == 0 && result.conflicts == 0)
+        #expect(!FileManager.default.fileExists(atPath: fixture.root.appending(path: "Course 1").path))
+        #expect(fixture.contents("Renamed/Lezioni/0.txt") == "updated")
+        #expect(fixture.contents("Renamed/Lezioni/new.txt") == "new")
+        let settled = try await fixture.database.scope(rootID: fixture.rootID, courseID: 1)
+        #expect(settled?.localFolder == "Renamed")
+        #expect(settled?.managedDirectory == before.managedDirectory)
     }
 
     @Test(arguments: ["manual", "reupload"])
@@ -1517,7 +1581,7 @@ import Testing
         if !symlink { #expect(fixture.contents("Course 1/Lezioni") == "user file") }
     }
 
-    @Test(arguments: ["automatic", "manual", "reupload", "missing"])
+    @Test(.enabled(if: temporaryVolumeIgnoresCase), arguments: ["automatic", "manual", "reupload", "missing"])
     func aCaseRenamedParentStillAllowsRemoteFileMoves(_ mode: String) async throws {
         let fixture = try await Fixture()
         defer { fixture.remove() }
@@ -1528,7 +1592,7 @@ import Testing
         if mode == "manual" { try fixture.write("my notes", to: "Course 1/Lezioni/0.txt") }
         if mode == "missing" { try FileManager.default.removeItem(at: fixture.root.appending(path: "Course 1/Lezioni/0.txt")) }
         try FileManager.default.moveItem(at: fixture.root.appending(path: "Course 1"), to: fixture.root.appending(path: "course 1"))
-        guard FileManager.default.fileExists(atPath: fixture.root.appending(path: "Course 1").path) else { return }
+        try #require(FileManager.default.fileExists(atPath: fixture.root.appending(path: "Course 1").path))
         fixture.upstream.resetDownloadCount()
         if mode == "reupload" {
             fixture.upstream.removeFile(course: 1, file: 500)
@@ -1552,12 +1616,12 @@ import Testing
         #expect(try await fixture.changes().isEmpty)
     }
 
-    @Test func aCaseRenamedParentStillAcceptsNewDownloads() async throws {
+    @Test(.enabled(if: temporaryVolumeIgnoresCase)) func aCaseRenamedParentStillAcceptsNewDownloads() async throws {
         let fixture = try await Fixture()
         defer { fixture.remove() }
         _ = try await fixture.synchronize(targets: [fixture.targets[0]])
         try FileManager.default.moveItem(at: fixture.root.appending(path: "Course 1"), to: fixture.root.appending(path: "course 1"))
-        guard FileManager.default.fileExists(atPath: fixture.root.appending(path: "Course 1").path) else { return }
+        try #require(FileManager.default.fileExists(atPath: fixture.root.appending(path: "Course 1").path))
         fixture.upstream.addFile(course: 1, file: 501, filename: "new.txt", value: "new", revision: "1")
         let result = try await fixture.synchronize(targets: [fixture.targets[0]])
         #expect(result.added == 1 && result.failures == 0)

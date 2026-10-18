@@ -258,15 +258,17 @@ struct RecordingsListing: Equatable {
     /// The generation of a recovery or Play executing outside the queue. An invalidated
     /// worker must neither keep the browser alive nor clear a newer worker's running state.
     private var runningRecoveryGeneration: Int?
-    /// The lecture of the recovery the worker runs now; meaningful only while
-    /// `runningRecoveryGeneration == generation`. `playerFailed` reads it, with the queue, so a
-    /// second failure report of a lecture whose recovery is pending queues nothing (RB-002).
-    private var runningRecoveryLectureID: String?
+    /// The lecture and item (`start`, see `lectureStarts`) of the recovery the worker runs now;
+    /// meaningful only while `runningRecoveryGeneration == generation`. `playerFailed` reads it,
+    /// with the queue, so a second failure report of the item whose recovery is pending queues
+    /// nothing (RB-002), while a failure of a newer item of the same lecture still gets its own
+    /// recovery (RB-101).
+    private var runningRecovery: (lectureID: String, start: Int)?
     /// Counts the items handed to the player (`startPlayer`). A recovery carries the count of
     /// the item that failed and gives up once another item replaced it: a recovery that already
-    /// resumed the lecture natively must never be closed in favour of the browser (RB-002).
-    /// A second guard: today the pending-recovery check in `playerFailed` already stops the only
-    /// known path, so no test fails without this one alone.
+    /// resumed the lecture natively must never be closed in favour of the browser (RB-002), and
+    /// a recovery of an item replaced by a Play again must not restart the lecture over the new
+    /// one (`aStaleRecoveryNeverReplacesTheNewerItemOfTheSameLecture`).
     private var lectureStarts = 0
     private var runningPlayGeneration: Int?
     /// The Play lookup the worker is running now (`drain`), as its own task, so a newer Play can
@@ -1444,8 +1446,8 @@ struct RecordingsListing: Equatable {
                     if menuPlay?.request == request { menuPlay = nil }
                 case .recover(let recording, let recovery, let start):
                     runningRecoveryGeneration = generation
-                    runningRecoveryLectureID = recording.id
-                    defer { if runningRecoveryGeneration == generation { runningRecoveryGeneration = nil; runningRecoveryLectureID = nil } }
+                    runningRecovery = (recording.id, start)
+                    defer { if runningRecoveryGeneration == generation { runningRecoveryGeneration = nil; runningRecovery = nil } }
                     try await recoverPlayback(recording, recovery, start: start, browser: browser, generation: generation)
                     guard generation == self.generation else { return }
                 }
@@ -2270,12 +2272,16 @@ struct RecordingsListing: Equatable {
     private func playerFailed(id: String, failure: RecordingPlaybackFailure) {
         guard isEnabled, let recording = nowPlaying[id] else { return }
         if case .beforeReady = failure { endWatchSessionBeforeReady(id) }
-        // A recovery of this lecture is already queued or running: it resolves this failure too.
+        // A recovery of this item is already queued or running: it resolves this failure too.
         // Resuming the paused window re-arms the player's report (#197), so the dead item can
         // fail again meanwhile; a second recovery (browser-only by then, the retry being spent)
         // would close the natively recovered player or open the browser twice (RB-002).
-        let pending = runningRecoveryGeneration == generation && runningRecoveryLectureID == id
-            || queue.contains { if case .recover(let queued, _, _) = $0 { queued.id == id } else { false } }
+        // Only a recovery of the item on screen counts (`start == lectureStarts`): one of an
+        // item a Play again already replaced gives up in `recoverPlayback`, so treating it as
+        // pending would leave the newer item's failure with no browser and no message (RB-101).
+        let pending = runningRecoveryGeneration == generation
+            && runningRecovery?.lectureID == id && runningRecovery?.start == lectureStarts
+            || queue.contains { if case .recover(let queued, _, let start) = $0 { queued.id == id && start == lectureStarts } else { false } }
         if pending {
             PlaybackDiagnostics.log.notice("play: failure while its recovery is pending, ignored")
             return

@@ -4081,7 +4081,6 @@ private actor BootstrapService {
     }
 }
 
-/// Resumes one continuation once, whichever caller comes first (`WeBeepAuthenticationController.wait`).
 /// Whether a "Sincronizza ora" relies on a recordings follow-up: marked when a manual run starts
 /// it or merges into it, never cleared. Read by the automatic run's cancellation handler, which
 /// runs synchronously off the main actor, hence the lock (RB-001 of #188).
@@ -4091,6 +4090,7 @@ private final class FollowUpReliance: Sendable {
     var servesManualSync: Bool { manual.withLock { $0 } }
 }
 
+/// Resumes one continuation once, whichever caller comes first (`WeBeepAuthenticationController.wait`).
 private final class FirstResume: Sendable {
     private let continuation = OSAllocatedUnfairLock<CheckedContinuation<Void, Never>?>(initialState: nil)
 

@@ -258,6 +258,16 @@ struct RecordingsListing: Equatable {
     /// The generation of a recovery or Play executing outside the queue. An invalidated
     /// worker must neither keep the browser alive nor clear a newer worker's running state.
     private var runningRecoveryGeneration: Int?
+    /// The lecture of the recovery the worker runs now; meaningful only while
+    /// `runningRecoveryGeneration == generation`. `playerFailed` reads it, with the queue, so a
+    /// second failure report of a lecture whose recovery is pending queues nothing (RB-002).
+    private var runningRecoveryLectureID: String?
+    /// Counts the items handed to the player (`startPlayer`). A recovery carries the count of
+    /// the item that failed and gives up once another item replaced it: a recovery that already
+    /// resumed the lecture natively must never be closed in favour of the browser (RB-002).
+    /// A second guard: today the pending-recovery check in `playerFailed` already stops the only
+    /// known path, so no test fails without this one alone.
+    private var lectureStarts = 0
     private var runningPlayGeneration: Int?
     /// The Play lookup the worker is running now (`drain`), as its own task, so a newer Play can
     /// stop it instead of queueing behind it (issue #194): the lookup may sit in the interactive
@@ -414,7 +424,8 @@ struct RecordingsListing: Equatable {
         case list(RecmanCourseKey)
         case open(RecmanRecording, OpenAction, Int)
         /// A lecture in the player went wrong (#148): not a click, so it changes no spinner.
-        case recover(RecmanRecording, Recovery)
+        /// `start` is `lectureStarts` when the failure was reported: which item failed.
+        case recover(RecmanRecording, Recovery, start: Int)
     }
 
     /// What to do about a lecture that failed in the player.
@@ -1431,10 +1442,11 @@ struct RecordingsListing: Equatable {
                     guard generation == self.generation else { return }
                     // Reached the player or the browser fallback: no longer the menu's to report.
                     if menuPlay?.request == request { menuPlay = nil }
-                case .recover(let recording, let recovery):
+                case .recover(let recording, let recovery, let start):
                     runningRecoveryGeneration = generation
-                    defer { if runningRecoveryGeneration == generation { runningRecoveryGeneration = nil } }
-                    try await recoverPlayback(recording, recovery, browser: browser, generation: generation)
+                    runningRecoveryLectureID = recording.id
+                    defer { if runningRecoveryGeneration == generation { runningRecoveryGeneration = nil; runningRecoveryLectureID = nil } }
+                    try await recoverPlayback(recording, recovery, start: start, browser: browser, generation: generation)
                     guard generation == self.generation else { return }
                 }
                 succeeded = true
@@ -1631,6 +1643,7 @@ struct RecordingsListing: Equatable {
         // Before the call: the lecture this one replaces reports its position inside `play`.
         nowPlaying[recording.id] = recording
         currentLectureID = recording.id
+        lectureStarts += 1
         // The replaced lecture's report inside `play` reads this to tell an end from a re-play.
         pendingPlayID = recording.id
         let metadata = playbackMetadata(for: recording, stream: stream)
@@ -2257,6 +2270,16 @@ struct RecordingsListing: Equatable {
     private func playerFailed(id: String, failure: RecordingPlaybackFailure) {
         guard isEnabled, let recording = nowPlaying[id] else { return }
         if case .beforeReady = failure { endWatchSessionBeforeReady(id) }
+        // A recovery of this lecture is already queued or running: it resolves this failure too.
+        // Resuming the paused window re-arms the player's report (#197), so the dead item can
+        // fail again meanwhile; a second recovery (browser-only by then, the retry being spent)
+        // would close the natively recovered player or open the browser twice (RB-002).
+        let pending = runningRecoveryGeneration == generation && runningRecoveryLectureID == id
+            || queue.contains { if case .recover(let queued, _, _) = $0 { queued.id == id } else { false } }
+        if pending {
+            PlaybackDiagnostics.log.notice("play: failure while its recovery is pending, ignored")
+            return
+        }
         // The retry is spent when the recovery runs (`recoverPlayback`), not here: a failure
         // that can't be recovered now (no Polimi session) or a recovery that never starts must
         // not use it up.
@@ -2275,18 +2298,18 @@ struct RecordingsListing: Equatable {
             return
         }
         if visiblePages == 0 { closesBrowserWhenIdle = true }
-        queue.insert(.recover(recording, recovery), at: 0)
+        queue.insert(.recover(recording, recovery, start: lectureStarts), at: 0)
         startWorker()
     }
 
-    private func recoverPlayback(_ recording: RecmanRecording, _ recovery: Recovery, browser: RecmanBrowsing, generation: Int) async throws {
+    private func recoverPlayback(_ recording: RecmanRecording, _ recovery: Recovery, start: Int, browser: RecmanBrowsing, generation: Int) async throws {
         // The player link a failed fresh-stream lookup already found, for the browser below.
         var found: URL?
         let intent = playbackIntent
         let needsOpenPlayer: Bool
         if case .freshStream = recovery { needsOpenPlayer = true } else { needsOpenPlayer = false }
         let isCurrent = {
-            generation == self.generation && intent == self.playbackIntent
+            generation == self.generation && intent == self.playbackIntent && start == self.lectureStarts
                 && self.currentLectureID == recording.id && (!needsOpenPlayer || self.stillShowing(recording))
         }
         if case .freshStream(let position) = recovery {
@@ -2842,13 +2865,16 @@ struct RecordingsListing: Equatable {
         let keepFileEmail = !emailLoaded && !emailEditedByUser
         switch await vault.save(cookies, ownerUserID: owner, email: confirmedEmail?.value, keepingFileEmail: keepFileEmail, epoch: epoch, now: now()).value {
         case .saved:
-            if generation == self.generation, vault.epoch == epoch, defaults.bool(forKey: Self.sessionDiscardedKey) {
+            // The epoch alone proves the file now holds the current identity's session, so the
+            // discard flag goes whatever the generation: a newer sign-in started during the write
+            // must not leave it set, or the next launch's retry deletes this session (RA-002, #200).
+            if vault.epoch == epoch, defaults.bool(forKey: Self.sessionDiscardedKey) {
                 defaults.removeObject(forKey: Self.sessionDiscardedKey)
             }
             // The cycle's cached read now describes an older file.
             sessionLoad = nil
         case .unchanged:
-            if generation == self.generation, vault.epoch == epoch, defaults.bool(forKey: Self.sessionDiscardedKey) {
+            if vault.epoch == epoch, defaults.bool(forKey: Self.sessionDiscardedKey) {
                 defaults.removeObject(forKey: Self.sessionDiscardedKey)
             }
         case .stale:

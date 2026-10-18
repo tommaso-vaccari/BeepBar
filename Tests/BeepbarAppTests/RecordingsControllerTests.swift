@@ -3091,6 +3091,46 @@ struct RecordingsControllerTests {
         controller.turnOff()
     }
 
+    /// The student resumes the paused window while the first recovery is still looking up a
+    /// fresh stream, and the dead item fails again (RB-002 on #197: resuming re-arms the player's
+    /// failure report). That second report must not queue a second recovery: when the fresh
+    /// stream arrives the lecture goes on natively, with no browser and no closed window; when it
+    /// doesn't, the browser opens once, not twice.
+    /// Mutations: drop the pending-recovery check in `playerFailed` and "browser" opens it twice;
+    /// drop it together with the item check in `recoverPlayback` (`start == lectureStarts`) and
+    /// "fresh" also closes the recovered player and opens the browser. The item check alone is
+    /// masked by the pending-recovery check, which stops the second recovery first.
+    @Test(arguments: ["fresh", "browser"])
+    func aSecondFailureDuringARecoveryQueuesNoSecondRecovery(outcome: String) async throws {
+        defer { cleanUp() }
+        browser.streamResults["a"] = outcome == "fresh"
+            ? [.success(stream("a")), .success(stream("a"))]
+            : [.success(stream("a")), .failure(RecmanBrowserError.playbackUnavailable)]
+        browser.playbackResults["a"] = .success(playerLink("a"))
+        let controller = await readyController()
+        controller.play(recording("a"))
+        await settle("a playing") { world.player.plays.count == 1 }
+        let gate = FakeRecmanBrowser.Gate()
+        defer { gate.release() }
+        browser.streamGates["a"] = gate
+        world.player.failDuringPlayback(at: 700)
+        await settle("recovery running") { gate.isWaiting }
+        // Space on the paused window, then the same dead item fails again.
+        world.player.failDuringPlayback(at: 700)
+        gate.release()
+        await settle("first recovery finished") { outcome == "fresh" ? world.player.plays.count == 2 : !world.opened.isEmpty }
+        await drainTasks()
+        if outcome == "fresh" {
+            #expect(world.player.plays.count == 2, "the lecture did not go on natively")
+            #expect(try world.player.play(1).startAt == 700)
+            #expect(world.player.closes == 0, "a second recovery closed the recovered player")
+            #expect(world.opened.isEmpty, "a second recovery opened the browser")
+        } else {
+            #expect(world.opened == [playerLink("a")], "the browser opened more than once")
+        }
+        controller.turnOff()
+    }
+
     @Test(arguments: ["duringPlayback", "beforeReady"])
     func aNewPlayRejectsALateRecoveryLink(failure: String) async {
         defer { cleanUp() }
@@ -3181,6 +3221,53 @@ struct RecordingsControllerTests {
         await drainTasks()
         #expect(!defaults.bool(forKey: discardedKey), "a confirmed deletion clears the flag")
         if !relaunch { next.turnOff() }
+    }
+
+    /// A session saved while a newer sign-in starts (the generation moves, the vault epoch does
+    /// not) still clears the discard flag, so the next launch keeps that session instead of
+    /// deleting it as obsolete (RA-002 on #200). Before the fix the flag was cleared only when the
+    /// generation was unchanged: it stayed set over the new file, and the relaunch's retry deleted
+    /// it, costing the student one more "Accedi con Polimi".
+    /// Mutation: require `generation == self.generation` again to clear the flag on `.saved`.
+    @Test func aSaveFinishingDuringANewerSignInStillClearsTheDiscardFlag() async throws {
+        defer { try? FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: folder.path); cleanUp() }
+        let discardedKey = "io.github.tvaccari.beepbar.recordings-session-discarded.v1"
+        // An earlier discard whose unlink failed: the obsolete file and the flag are both there.
+        try store.save(RecmanSessionCodec.encode([FakeRecmanBrowser.cookie("SSO_LOGIN", value: "obsolete")], ownerUserID: 42, email: nil, now: world.now))
+        defaults.set(true, forKey: discardedKey)
+        try FileManager.default.setAttributes([.posixPermissions: 0o500], ofItemAtPath: folder.path)
+        let controller = makeController()
+        let firstSignIn = FakeRecmanBrowser.Gate()
+        browser.signInGate = firstSignIn
+        controller.setEnabled(true)
+        await settle("first sign-in on screen") { firstSignIn.isWaiting }
+        await controller.settleSessionFile()
+        await drainTasks()
+        #expect(defaults.bool(forKey: discardedKey), "fixture: every retry so far failed")
+        // The disk works again; the sign-in's save is held mid-write by a slow disk.
+        try FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: folder.path)
+        world.sessionFiles.hold(access: world.storeAccesses + 1)
+        firstSignIn.release()
+        await settle("the save is held by the slow disk") { world.sessionFiles.isHolding }
+
+        // "Accedi con Polimi" again while the save is still writing: a new generation, no discard.
+        let secondSignIn = FakeRecmanBrowser.Gate()
+        defer { secondSignIn.release() }
+        browser.signInGate = secondSignIn
+        controller.signIn()
+        await settle("second sign-in on screen") { secondSignIn.isWaiting }
+        world.sessionFiles.release()
+        await controller.settleSessionFile()
+        await drainTasks()
+        #expect(try savedSession()?.cookies.map(\.value) == ["fresh"], "fixture: the first sign-in's session was written")
+        #expect(!defaults.bool(forKey: discardedKey), "the flag stayed set over a session saved in the current epoch")
+
+        let relaunched = makeController()
+        await relaunched.settleSessionFile()
+        await drainTasks()
+        #expect(try savedSession()?.cookies.map(\.value) == ["fresh"], "the next launch deleted a legitimate session")
+        controller.turnOff()
+        await controller.settleSessionFile()
     }
 
     // MARK: Review follow-ups (#148)

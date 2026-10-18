@@ -219,12 +219,29 @@ enum ScopeMoveRecovery {
     /// launch recovery settled it. The root is flushed again first, so the database records the
     /// rename only once the disk has it durably; while the flush keeps failing the row stays and
     /// the next attempt retries.
-    static func settlePending(rootID: UUID, database: SyncDatabase, fileStore: FileStore) async throws {
+    ///
+    /// Returns the moves it committed. A caller holding folder names read before the settle (the
+    /// sync's targets, built by the app from the folder it still shows after the failed rename)
+    /// must follow them, or it would recreate the old folder and split the course (RA-001).
+    @discardableResult
+    static func settlePending(rootID: UUID, database: SyncDatabase, fileStore: FileStore) async throws -> [PendingScopeMove] {
         let moves = try await database.pendingScopeMoves(rootID: rootID)
-        guard !moves.isEmpty else { return }
+        guard !moves.isEmpty else { return [] }
         do { try await fileStore.syncRootDirectory() } catch { throw SyncDatabaseError.execution }
         for move in moves {
             guard (try? await recover(move, database: database, fileStore: fileStore)) == true else { throw SyncDatabaseError.execution }
+        }
+        return moves
+    }
+
+    /// `targets` with each course whose folder `settled` just moved pointed at the new name.
+    /// Only a target that still names the move's old folder is rewritten: any other folder is the
+    /// caller's own choice and keeps the existing handling.
+    static func following(_ settled: [PendingScopeMove], targets: [SyncTarget]) -> [SyncTarget] {
+        guard !settled.isEmpty else { return targets }
+        return targets.map { target in
+            guard let move = settled.first(where: { $0.courseID == target.courseID && $0.oldFolder == target.localFolder }) else { return target }
+            return SyncTarget(courseID: target.courseID, localFolder: move.newFolder)
         }
     }
 }

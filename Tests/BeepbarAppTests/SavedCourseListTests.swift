@@ -2,7 +2,7 @@ import Combine
 import Foundation
 import Testing
 import os
-import BeepbarCore
+@testable import BeepbarCore
 @testable import BeepbarApp
 
 /// The course list saved between launches (#98), through the real controller: a local Moodle
@@ -201,6 +201,61 @@ import BeepbarCore
         #expect(controller.courses.isEmpty)
         #expect(controller.courseListFreshness == .unknown)
         #expect(!FileManager.default.fileExists(atPath: install.file.path))
+    }
+
+    /// A course-folder rename settled in the database by an earlier operation (#183) while the
+    /// window still shows the old name, which is what a rename whose flush failed leaves behind:
+    /// "Sincronizza ora" syncs into the renamed folder (RA-001). Fails if the manual sync builds
+    /// its targets from the stale name: it would recreate an empty "Analisi I", point the course
+    /// at it and download there, splitting the course between two folders.
+    @Test func aManualSyncFollowsACourseRenameSettledEarlier() async throws {
+        let install = try await Install.make()
+        defer { install.remove() }
+        let token = MoodleRecordingProtocol.register(courses: [(1, "Analisi"), (2, "Fisica")], files: [1: ["a.txt"]])
+        defer { MoodleRecordingProtocol.revoke(token: token) }
+        let controller = await launchAndSave(install, token: token)
+        try #require(controller.courseFolders[1] == "Analisi I")
+        // A current list, so the sync does not reload it (and the folders with it) first.
+        try #require(controller.courseListFreshness == .current)
+        let store = try FileStore(root: install.root)
+        let identity = try await store.ensureTopLevelDirectory("Renamed").identity
+        try await install.database.upsertScope(SyncScope(rootID: install.rootID, courseID: 1, displayName: "Analisi", localFolder: "Renamed", enabled: true, managedDirectory: identity))
+
+        controller.synchronizeNow()
+        await controller.waitForSyncForTesting()
+        #expect(!FileManager.default.fileExists(atPath: install.root.appending(path: "Analisi I").path), "the sync recreated the old folder")
+        #expect(FileManager.default.fileExists(atPath: install.root.appending(path: "Renamed/Lezioni/a.txt").path))
+        let scope = try await install.database.scope(rootID: install.rootID, courseID: 1)
+        #expect(scope?.localFolder == "Renamed")
+        #expect(scope?.managedDirectory == identity)
+        #expect(controller.courseFolders[1] == "Renamed")
+    }
+
+    /// A rename (here of course 2) that settles another course's non-durable rename (#183)
+    /// leaves the window showing the folder the database now records, not the old name
+    /// (RA-001). Fails if `renameFolder` only reads back its own course's success.
+    @Test func aRenameThatSettlesAnEarlierOneShowsItsNewFolder() async throws {
+        let install = try await Install.make()
+        defer { install.remove() }
+        let token = MoodleRecordingProtocol.register(courses: [(1, "Analisi"), (2, "Fisica")])
+        defer { MoodleRecordingProtocol.revoke(token: token) }
+        let controller = await launchAndSave(install, token: token)
+        try #require(controller.courseFolders[1] == "Analisi I")
+        let store = try FileStore(root: install.root)
+        for (course, name, folder) in [(Int64(1), "Analisi", "Analisi I"), (2, "Fisica", "Fisica")] {
+            let identity = try await store.ensureTopLevelDirectory(folder).identity
+            try await install.database.upsertScope(SyncScope(rootID: install.rootID, courseID: course, displayName: name, localFolder: folder, enabled: course == 1, managedDirectory: identity))
+        }
+        // What a rename whose flush failed leaves: the folder renamed on disk, the row pending.
+        try FileManager.default.moveItem(at: install.root.appending(path: "Analisi I"), to: install.root.appending(path: "Renamed"))
+        try await install.database.beginScopeMove(PendingScopeMove(id: UUID(), rootID: install.rootID, courseID: 1, oldFolder: "Analisi I", newFolder: "Renamed"))
+
+        controller.renameFolder(for: controller.courses.first { $0.id == 2 }!, to: "Fisica 2")
+        try await waitUntil { controller.renamingCourseID == nil }
+        #expect(controller.courseRenameErrors.isEmpty)
+        #expect(try await install.database.pendingScopeMoves().isEmpty)
+        #expect(controller.courseFolders[2] == "Fisica 2")
+        #expect(controller.courseFolders[1] == "Renamed")
     }
 
     /// Saved enrollments are not an authorization: "Sincronizza ora" over a saved list asks

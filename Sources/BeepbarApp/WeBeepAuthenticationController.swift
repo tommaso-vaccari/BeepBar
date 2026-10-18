@@ -2247,6 +2247,26 @@ enum MaterialsRunEnd: Equatable, Sendable {
             } catch {
                 self?.courseRenameErrors[course.id] = (error as? CourseRenameError)?.errorDescription ?? tr("Rinomina non riuscita.", "Rename failed.")
             }
+            // Whatever the outcome: the renamer may have settled an earlier rename that was not
+            // durable (#183), this course's or another's, so the window shows the folder the
+            // database now records instead of the old name (RA-001).
+            await self?.followSavedCourseFolders(rootID: rootID, database: database)
+        }
+    }
+
+    /// Takes each course's folder from its saved scope where the two differ.
+    ///
+    /// Why (RA-001 of #183): a course-folder rename whose flush failed keeps the old name here,
+    /// since `renameFolder` only stores the new one on success, while a later sync or rename
+    /// settles it in the database. A manual sync built from the old name would then recreate
+    /// the old folder and split the course in two. Outside a settle the two always agree
+    /// (`restoreScopes` and `renameFolder` keep them in step), so this changes nothing. Only
+    /// courses already shown are touched; an unreadable database leaves the folders as they are.
+    private func followSavedCourseFolders(rootID: UUID, database: SyncDatabase) async {
+        guard let scopes = try? await database.scopes(rootID: rootID), self.rootID == rootID else { return }
+        for scope in scopes where !scope.localFolder.isEmpty {
+            guard let shown = courseFolders[scope.courseID], shown != scope.localFolder else { continue }
+            courseFolders[scope.courseID] = scope.localFolder
         }
     }
 
@@ -2310,6 +2330,12 @@ enum MaterialsRunEnd: Equatable, Sendable {
                     self.endOperation(operationID)
                     return
                 }
+                // A rename settled by an earlier sync or rename (#183) is followed before the
+                // targets are built, or this run would split the course (RA-001). The run that
+                // settles one follows it inside the coordinator.
+                await self.followSavedCourseFolders(rootID: rootID, database: database)
+                try Task.checkCancellation()
+                guard self.activeOperationID == operationID else { return }
                 let targets = selected.map { SyncTarget(courseID: $0.id, localFolder: self.folder(for: $0)) }
                 let token = try await self.credentialVault.load()
                 let coordinator = try SyncCoordinator(rootID: rootID, rootURL: rootURL, database: database, gate: self.operationGate, apiClient: self.apiClient, downloader: self.downloader, platformName: self.selectedSite.platformName)

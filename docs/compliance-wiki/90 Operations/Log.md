@@ -50,3 +50,8 @@ Analisi statica del completamento della PR: `StoredCourseWatchSummary` scrive so
 Ingestione S-0008–S-0012: accordo/FAQ fornitore, basi GDPR, ePrivacy finale e Garante. La finestra dashboard non dimostra cancellazione; contratto fornitore non equivale automaticamente a nomina art. 28. Branch di rimedio riduce payload ed espone errori di cancellazione. Gate legale, runtime e approvazione informativa aperti. Nessun dato reale o invio al fornitore.
 
 Decisioni utente del 2026-10-17: sessioni massimo dieci giorni dal primo salvataggio, esclusione token/sessioni dai futuri backup e comando di cancellazione dati di studio per account conservando i materiali. Implementazione nel branch #181, verifiche automatiche e revisione indipendente; nessuna conclusione di conformità giuridica.
+
+
+## 2026-10-18 — telemetria aggregata v2, PR #181
+
+Eliminata identità mensile; metrica conservata tramite contatore locale e valore comune. Rivalutate fonti pubbliche Garante §7.2, FAQ/architettura TelemetryDeck e GDPR, con affidamento proporzionato e analisi dei mezzi ragionevoli. Esito favorevole qualificato alla configurazione v2 nel gate, non alle serie storiche o all’intera app. Aggiornati informativa candidata e procedura; controlli manuali esclusi restano non eseguiti. Evidenze automatiche per SHA nella PR.

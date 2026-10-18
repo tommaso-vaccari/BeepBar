@@ -1,6 +1,6 @@
-# Privacy operations — proposed procedure
+# Privacy operations — operating procedure
 
-Owner/request handler: Tommaso Vaccari, confirmed 2026-10-17. Correspondence retention approved: delete within 90 days of closure except documented legal obligations or disputes. Approval of the remaining procedure is pending; the owner waived the synthetic dry run for this PR, which remains unperformed; see [release gate](privacy-release-gate.md). Public contact: [draft notice](privacy-notice.md). Never place actual requests, account details, incidents or secrets in GitHub issues or this repository.
+Owner/request handler: Tommaso Vaccari, confirmed 2026-10-17. Correspondence retention approved: delete within 90 days of closure except documented legal obligations or disputes. The procedure is part of the requested remediation; the owner waived the synthetic dry run for this PR, which remains unperformed; see [release gate](privacy-release-gate.md). Public contact: [candidate notice](privacy-notice.md). Never place actual requests, account details, incidents or secrets in GitHub issues or this repository.
 
 ## Requests
 

@@ -3183,6 +3183,53 @@ struct RecordingsControllerTests {
         if !relaunch { next.turnOff() }
     }
 
+    /// A session saved while a newer sign-in starts (the generation moves, the vault epoch does
+    /// not) still clears the discard flag, so the next launch keeps that session instead of
+    /// deleting it as obsolete (RA-002 on #200). Before the fix the flag was cleared only when the
+    /// generation was unchanged: it stayed set over the new file, and the relaunch's retry deleted
+    /// it, costing the student one more "Accedi con Polimi".
+    /// Mutation: require `generation == self.generation` again to clear the flag on `.saved`.
+    @Test func aSaveFinishingDuringANewerSignInStillClearsTheDiscardFlag() async throws {
+        defer { try? FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: folder.path); cleanUp() }
+        let discardedKey = "io.github.tvaccari.beepbar.recordings-session-discarded.v1"
+        // An earlier discard whose unlink failed: the obsolete file and the flag are both there.
+        try store.save(RecmanSessionCodec.encode([FakeRecmanBrowser.cookie("SSO_LOGIN", value: "obsolete")], ownerUserID: 42, email: nil, now: world.now))
+        defaults.set(true, forKey: discardedKey)
+        try FileManager.default.setAttributes([.posixPermissions: 0o500], ofItemAtPath: folder.path)
+        let controller = makeController()
+        let firstSignIn = FakeRecmanBrowser.Gate()
+        browser.signInGate = firstSignIn
+        controller.setEnabled(true)
+        await settle("first sign-in on screen") { firstSignIn.isWaiting }
+        await controller.settleSessionFile()
+        await drainTasks()
+        #expect(defaults.bool(forKey: discardedKey), "fixture: every retry so far failed")
+        // The disk works again; the sign-in's save is held mid-write by a slow disk.
+        try FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: folder.path)
+        world.sessionFiles.hold(access: world.storeAccesses + 1)
+        firstSignIn.release()
+        await settle("the save is held by the slow disk") { world.sessionFiles.isHolding }
+
+        // "Accedi con Polimi" again while the save is still writing: a new generation, no discard.
+        let secondSignIn = FakeRecmanBrowser.Gate()
+        defer { secondSignIn.release() }
+        browser.signInGate = secondSignIn
+        controller.signIn()
+        await settle("second sign-in on screen") { secondSignIn.isWaiting }
+        world.sessionFiles.release()
+        await controller.settleSessionFile()
+        await drainTasks()
+        #expect(try savedSession()?.cookies.map(\.value) == ["fresh"], "fixture: the first sign-in's session was written")
+        #expect(!defaults.bool(forKey: discardedKey), "the flag stayed set over a session saved in the current epoch")
+
+        let relaunched = makeController()
+        await relaunched.settleSessionFile()
+        await drainTasks()
+        #expect(try savedSession()?.cookies.map(\.value) == ["fresh"], "the next launch deleted a legitimate session")
+        controller.turnOff()
+        await controller.settleSessionFile()
+    }
+
     // MARK: Review follow-ups (#148)
 
     /// Closing the Settings window (or leaving the page) while a lecture recovery is running or

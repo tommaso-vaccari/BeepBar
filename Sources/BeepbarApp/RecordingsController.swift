@@ -2842,13 +2842,16 @@ struct RecordingsListing: Equatable {
         let keepFileEmail = !emailLoaded && !emailEditedByUser
         switch await vault.save(cookies, ownerUserID: owner, email: confirmedEmail?.value, keepingFileEmail: keepFileEmail, epoch: epoch, now: now()).value {
         case .saved:
-            if generation == self.generation, vault.epoch == epoch, defaults.bool(forKey: Self.sessionDiscardedKey) {
+            // The epoch alone proves the file now holds the current identity's session, so the
+            // discard flag goes whatever the generation: a newer sign-in started during the write
+            // must not leave it set, or the next launch's retry deletes this session (RA-002, #200).
+            if vault.epoch == epoch, defaults.bool(forKey: Self.sessionDiscardedKey) {
                 defaults.removeObject(forKey: Self.sessionDiscardedKey)
             }
             // The cycle's cached read now describes an older file.
             sessionLoad = nil
         case .unchanged:
-            if generation == self.generation, vault.epoch == epoch, defaults.bool(forKey: Self.sessionDiscardedKey) {
+            if vault.epoch == epoch, defaults.bool(forKey: Self.sessionDiscardedKey) {
                 defaults.removeObject(forKey: Self.sessionDiscardedKey)
             }
         case .stale:

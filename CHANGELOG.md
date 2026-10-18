@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+### Improved
+
+- Telemetry counts daily and monthly reporting installations without an individual installation identifier. Before the first report after updating, an explanation lets you disable it immediately.
+
 ### Privacy
 
 - Expire saved Polimi sessions after ten days without renewing on cookie updates; exclude local token/session files from future macOS backups.

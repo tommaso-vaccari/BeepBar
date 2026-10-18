@@ -43,7 +43,7 @@ Static source inspection on the remediation branch; runtime and OS-managed reten
 | Resume/summary/email opt-out defaults | Resume positions (cap 200), playback summary, per-session email choice | Resume: study-erasure command or logout/university/account change, preserved by normal disable; summary/email opt-out also removed by disable |
 | `recordings-study.v1.<owner>` defaults | Per-account watchlist/queue; no TTL | Intentionally survives logout/disable; individual bookmarks or this account’s entire study data can be erased in Settings; whole-app reset removes all account records |
 | Preferences/bookmarks/last-sync defaults | Settings, selected root/account state and sync summaries | Some cleared on disconnect; whole-app reset removes remaining preferences |
-| Monthly telemetry identity/defaults | Random UUID/month, daily attempt and choice | Rotation; opt-out removes UUID; server history unaffected |
+| Telemetry suppression/defaults | Monotonic counted month, daily attempt, notice version and choice; no installation UUID | Markers stay local and survive opt-out to prevent recounting; legacy UUIDs removed on construction; server history unaffected |
 | Downloaded materials, backups and conflict copies | User-controlled files under selected root; no automatic retention limit | User-managed; preserve before app reset |
 | WebKit and URLSession | Browser cookies use nonpersistent stores; API/download/resolver use ephemeral sessions | Browser/session close; explicit saved session above remains separate |
 | Logs, notifications, Now Playing, clipboard, OS crash diagnostics | Operational errors, displayed titles/links and system-managed diagnostics | OS/user-controlled; clipboard may be retained by other apps; no guaranteed OS purge by logout |

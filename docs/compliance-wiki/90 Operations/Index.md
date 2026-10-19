@@ -38,3 +38,14 @@
 - [[20 Sources/S-0012 Garante tracciamento]]
 
 - [Gate di rilascio](../../privacy-release-gate.md) — issue #180, ancora aperto.
+
+## Riverifica avviso Chiudi — 2026-10-19
+
+- [[20 Sources/S-0008 TelemetryDeck accordo]]
+- [[20 Sources/S-0009 TelemetryDeck FAQ]]
+- [[20 Sources/S-0013 TelemetryDeck Ingest v2]]
+- [[20 Sources/S-0014 TelemetryDeck termini]]
+- [[20 Sources/S-0015 TelemetryDeck architettura]]
+- [[20 Sources/S-0016 TelemetryDeck privacy]]
+
+[Valutazione interazione](../../privacy-release-gate.md#notice-interaction-update--issue-230).

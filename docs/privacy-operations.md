@@ -10,6 +10,14 @@ Owner/request handler: Tommaso Vaccari, confirmed 2026-10-17. Correspondence ret
 4. For local erasure, guide the user; do not access their device without separate authorization. For telemetry establish whether records can actually be linked and the provider's assistance; GDPR Article 11 does not require collecting extra identifiers solely for identification. Opt-out only stops future sends.
 5. Send exports privately, verify recipient and exclude other people's data. Retain only evidence necessary to handle/account for the request; delete support/privacy correspondence within 90 days after closure, except documented legal obligations or disputes.
 
+## Telemetry opposition — single-Close notice
+
+The notice is information, not a consent request. Explain the exact route Settings → Telemetry and that switching off stops future attempts and cancels in-flight work. A first eligible event may already have been transmitted immediately after Close; neither cancellation nor the switch guarantees its recall or deletion at the provider. Do not promise a pre-send grace period or claim that closing waived the right to object. No account, justification or support request is required to use the local switch; functionality remains available.
+
+When investigating an objection-path failure, record app/build, language, the navigation/accessibility obstacle and whether the switch persisted, using synthetic state where possible. Do not request university credentials or create an identifier to locate shared-value events. A hidden/inoperable switch or continued reporting after opt-out reopens the release-gate interaction assessment and must be fixed before relying on the qualified conclusion. Separately handle any identifiable correspondence under the existing request procedure.
+
+Before release or a provider/protocol change, compare the actual direct-client endpoint and payload with the current [public-evidence assessment](privacy-release-gate.md#public-evidence-and-reasonable-reliance--refreshed-2026-10-19). Keep applicable account terms/acceptance evidence privately when available; do not publish account details. Distinguish service representations from binding direct-client coverage and transient IP processing from retained anonymous statistics. A changed provider premise requires reassessing roles, retention, combination and transfers, not merely changing notice wording. This is an operating responsibility; the source refresh does not claim that account inspection or a contractual agreement happened.
+
 ## Local cleanup guidance
 
 Disconnect the university account and disable Recordings. Resolve any deletion error in Settings → Data and privacy before assuming session deletion succeeded. Revoke the university mobile token through the university's supported mechanism if revocation is needed; deleting a local token does not revoke it remotely.

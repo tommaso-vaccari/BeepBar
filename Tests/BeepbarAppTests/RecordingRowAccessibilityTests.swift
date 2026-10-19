@@ -65,6 +65,76 @@ import BeepbarCore
         NSApplication.shared.perform(Selector(("accessibilitySetValue:forAttribute:")), with: NSNumber(value: on), with: "AXEnhancedUserInterface")
     }
 
+    /// Operates the production Settings switch through its accessibility action after the
+    /// disclosure, proving the UI binding stops work and persists opposition across an upgrade.
+    @Test(.timeLimit(.minutes(1))) func telemetrySettingsOptOutAfterClosingNotice() async throws {
+        setAssistiveClient(true)
+        defer { setAssistiveClient(false) }
+        let suite = WeBeepAuthenticationController.throwawayDefaultsSuite()
+        let defaults = try #require(UserDefaults(suiteName: suite))
+        defer {
+            defaults.removePersistentDomain(forName: suite)
+            try? FileManager.default.removeItem(at: URL(fileURLWithPath: suite).deletingLastPathComponent())
+        }
+        let configuration = try #require(DailyTelemetryConfiguration(appID: "AD3B2F70-8FAE-47B1-A58B-4870921E2398", namespace: "test", version: "1"))
+        var notices = 0
+        var invalidations = 0
+        let attempts = TelemetrySettingsAttempts()
+        let controller = DailyTelemetryController(defaults: defaults, configuration: configuration, defaultEnabled: true,
+            disclose: { notices += 1; return true }, send: { _ in await attempts.record() },
+            schedule: { _, _ in BackgroundActivityRegistration(invalidate: { invalidations += 1 }) })
+        defer { controller.stop() }
+        await controller.start()
+        #expect(notices == 1)
+        #expect(await attempts.count == 1)
+        let host = NSHostingView(rootView: Form { TelemetrySettingsSection(telemetry: controller) }.formStyle(.grouped))
+        let window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 680, height: 300), styleMask: [.titled], backing: .buffered, defer: false)
+        window.isReleasedWhenClosed = false
+        window.alphaValue = 0
+        window.contentView = host
+        window.orderFront(nil)
+        defer { window.close() }
+        func toggle(_ element: Any, depth: Int = 0) -> AnyObject? {
+            guard depth < 30 else { return nil }
+            let object = element as AnyObject
+            if object.accessibilityIdentifier?() == "telemetry-toggle" { return object }
+            let children: [Any] = (object.accessibilityChildren?() ?? nil) ?? []
+            for child in children { if let found = toggle(child, depth: depth + 1) { return found } }
+            return nil
+        }
+        let deadline = Date().addingTimeInterval(10)
+        var control: AnyObject?
+        repeat {
+            host.layoutSubtreeIfNeeded()
+            host.displayIfNeeded()
+            try await Task.sleep(for: .milliseconds(20))
+            control = toggle(window)
+        } while control == nil && Date() < deadline
+        let accessible = try #require(control)
+        #expect(accessible.accessibilityLabel?() == tr("Telemetria", "Telemetry"))
+        #expect(accessible.isAccessibilityEnabled?() == true)
+        _ = accessible.accessibilityPerformPress?()
+        for _ in 0..<100 where controller.isEnabled { try await Task.sleep(for: .milliseconds(10)) }
+        #expect(!controller.isEnabled)
+        #expect(invalidations == 1)
+        #expect(defaults.object(forKey: DailyTelemetryController.enabledKey) as? Bool == false)
+        let upgraded = try #require(DailyTelemetryConfiguration(appID: configuration.appID, namespace: configuration.namespace, version: "2"))
+        let relaunched = DailyTelemetryController(defaults: defaults, configuration: upgraded, defaultEnabled: true,
+            disclose: { notices += 1; return true }, send: { _ in await attempts.record() },
+            schedule: { _, _ in Issue.record("Disabled telemetry must not schedule"); return BackgroundActivityRegistration(invalidate: {}) })
+        defer { relaunched.stop() }
+        await relaunched.start()
+        await relaunched.checkIn()
+        #expect(!relaunched.isEnabled)
+        #expect(notices == 1)
+        #expect(await attempts.count == 1)
+    }
+
+    private actor TelemetrySettingsAttempts {
+        var count = 0
+        func record() { count += 1 }
+    }
+
     /// A row that isn't new exposes no unnamed element: the clear dot is hidden from VoiceOver,
     /// so it no longer stops on an empty element at the start of most rows. A new row still
     /// announces "Nuova". Mutation: put back `.accessibilityLabel(isNew ? … : "")` without

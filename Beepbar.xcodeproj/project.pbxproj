@@ -7,6 +7,7 @@
 	objects = {
 
 /* Begin PBXBuildFile section */
+		D18000000000000000000001 /* privacy-notice.md in Resources */ = {isa = PBXBuildFile; fileRef = D18000000000000000000002 /* privacy-notice.md */; };
 		D781C25133AC471FAB128002 /* DailyTelemetry.swift in Sources */ = {isa = PBXBuildFile; fileRef = D781C25133AC471FAB128001 /* DailyTelemetry.swift */; };
 		A10000000000000000000001 /* BeepbarApp.swift in Sources */ = {isa = PBXBuildFile; fileRef = A10000000000000000000011 /* BeepbarApp.swift */; };
 		A10000000000000000000002 /* WeBeepAuthenticationController.swift in Sources */ = {isa = PBXBuildFile; fileRef = A10000000000000000000012 /* WeBeepAuthenticationController.swift */; };
@@ -43,6 +44,7 @@
 /* End PBXBuildFile section */
 
 /* Begin PBXFileReference section */
+		D18000000000000000000002 /* privacy-notice.md */ = {isa = PBXFileReference; lastKnownFileType = net.daringfireball.markdown; path = Sources/BeepbarApp/Resources/privacy-notice.md; sourceTree = SOURCE_ROOT; };
 		D781C25133AC471FAB128001 /* DailyTelemetry.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DailyTelemetry.swift; sourceTree = "<group>"; };
 		A10000000000000000000010 /* Beepbar.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = Beepbar.app; sourceTree = BUILT_PRODUCTS_DIR; };
 		A10000000000000000000011 /* BeepbarApp.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = BeepbarApp.swift; sourceTree = "<group>"; };
@@ -98,6 +100,7 @@
 			buildActionMask = 2147483647;
 			files = (
 				A10000000000000000000007 /* Assets.xcassets in Resources */,
+				D18000000000000000000001 /* privacy-notice.md in Resources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
@@ -107,6 +110,7 @@
 		A10000000000000000000050 = {
 			isa = PBXGroup;
 			children = (
+				D18000000000000000000002 /* privacy-notice.md */,
 				A10000000000000000000051 /* Sources */,
 				A10000000000000000000052 /* App */,
 				A10000000000000000000053 /* Frameworks */,

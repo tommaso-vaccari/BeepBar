@@ -8,6 +8,8 @@
 
 ### Privacy
 
+- Read the full privacy notice offline before signing in or from Settings, in Italian or English.
+
 - Expire saved Polimi sessions after ten days without renewing on cookie updates; exclude local token/session files from future macOS backups.
 - Add per-account study erasure preserving materials, with persistent history deletion warnings and retry.
 

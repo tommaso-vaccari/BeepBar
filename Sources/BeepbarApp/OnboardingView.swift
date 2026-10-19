@@ -5,6 +5,7 @@ struct OnboardingView: View {
     @ObservedObject var authentication: WeBeepAuthenticationController
     @State private var step: Step = .welcome
     @State private var movingForward = true
+    @State private var showPrivacy = false
 
     private enum Step: Int, CaseIterable { case welcome, folder, wrapUp }
 
@@ -25,10 +26,13 @@ struct OnboardingView: View {
                 removal: .move(edge: movingForward ? .leading : .trailing).combined(with: .opacity)
             ))
             Spacer(minLength: 16)
+            Button(tr("Informativa privacy", "Privacy notice")) { showPrivacy = true }
+                .padding(.bottom, 12)
             footer
         }
         .padding(32)
         .frame(maxWidth: .infinity, maxHeight: .infinity)
+        .sheet(isPresented: $showPrivacy) { PrivacyNoticeView() }
         .clipped()
         .background(Color(nsColor: .windowBackgroundColor))
     }

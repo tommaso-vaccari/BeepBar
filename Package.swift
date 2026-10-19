@@ -50,6 +50,7 @@ let package = Package(
         .executableTarget(
             name: "BeepbarApp",
             dependencies: ["BeepbarCore", .product(name: "Sparkle", package: "Sparkle")],
+            resources: [.copy("Resources/privacy-notice.md")],
             linkerSettings: [.linkedFramework("WebKit")]
         ),
         .target(name: "BeepbarBenchmarkKit", dependencies: ["BeepbarCore"]),

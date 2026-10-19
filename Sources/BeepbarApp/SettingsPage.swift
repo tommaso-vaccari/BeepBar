@@ -71,20 +71,7 @@ struct SettingsPage: View {
     }
 
     private var privacyDetails: some View {
-        VStack(alignment: .leading, spacing: 16) {
-            Text(tr("Dati e privacy", "Data and privacy")).font(.title2)
-            ScrollView {
-                VStack(alignment: .leading, spacing: 12) {
-                    Text(tr("Il token dell’ateneo e le sessioni Polimi/Webex sono salvati in locale con permessi ristretti. Per usare le funzioni richieste, BeepBar si collega all’ateneo e a Webex. Alla prima riproduzione o aprendo le impostazioni Registrazioni, può leggere automaticamente l’email dal profilo WeBeep e usarla per l’accesso Webex. Puoi modificarla o rimuoverla nelle impostazioni Registrazioni.", "The university token and Polimi/Webex sessions are saved locally with restricted permissions. BeepBar connects to your university and Webex to provide the requested features. On first playback or when opening Recordings settings, it may automatically read your WeBeep profile email and use it to sign in to Webex. You can edit or remove it in Recordings settings."))
-                    Text(tr("Disconnettersi elimina il token e richiede la cancellazione della sessione Registrazioni; non elimina i materiali, il database di sincronizzazione o la watchlist salvata per account. Token e sessioni sono esclusi dai futuri backup; le copie già presenti non vengono cancellate. La sessione salvata scade dopo 10 giorni e richiede un nuovo accesso; se BeepBar è chiuso, viene rimossa al successivo avvio. Puoi cancellare watchlist e stato delle lezioni con “Dimentica i dati di studio di questo account”. Prima di eliminare manualmente i dati dell’app, chiudi BeepBar e conserva i materiali e le modifiche che vuoi tenere.", "Disconnecting deletes the token and requests deletion of the Recordings session; materials, the sync database and per-account watchlist remain. Tokens and sessions are excluded from future backups; existing copies remain. Saved sessions expire after 10 days and require signing in again; if BeepBar is closed, removal happens at next launch. Use “Forget this account’s study data” to erase the watchlist and viewing state. Before manually deleting app data, quit BeepBar and preserve any materials and edits you want to keep."))
-                    Text(tr("I controlli degli aggiornamenti sono attivi di default ogni otto ore e contattano il servizio di distribuzione degli aggiornamenti. Puoi disattivarli in Impostazioni. Anche la telemetria è attiva di default: puoi spegnerla nella sezione Telemetria e leggere lì i dati inviati.", "Update checks are enabled by default every eight hours and contact the update distribution service. You can turn them off in Settings. Telemetry is also enabled by default: turn it off in the Telemetry section, where the transmitted data is described."))
-                    Text(tr("Richieste privacy: tommaso.vaccari@mail.polimi.it. Non inviare password, token, cookie o registrazioni delle lezioni. Questa schermata descrive i flussi dell’app; l’informativa completa e la verifica della telemetria restano un requisito prima del rilascio.", "Privacy requests: tommaso.vaccari@mail.polimi.it. Do not send passwords, tokens, cookies or lecture recordings. This screen describes the app’s data flows; the complete privacy notice and telemetry assessment remain requirements before release."))
-                }
-            }
-            Button(tr("Chiudi", "Close")) { showPrivacy = false }.keyboardShortcut(.cancelAction)
-        }
-        .padding(24)
-        .frame(width: 560, height: 460)
+        PrivacyNoticeView()
     }
 
     // MARK: Language
@@ -504,5 +491,52 @@ private struct RecordingsEmailField: View {
         let latest = recordings.confirmedEmail?.value ?? ""
         if draft == source { draft = latest }
         source = latest
+    }
+}
+
+/// The complete notice is bundled so it remains available before login and without network access.
+enum PrivacyNotice {
+    static var bundle: Bundle {
+#if SWIFT_PACKAGE
+        .module
+#else
+        .main
+#endif
+    }
+
+    static func text(language: AppLanguage) throws -> String {
+        guard let url = bundle.url(forResource: "privacy-notice", withExtension: "md") else {
+            throw CocoaError(.fileNoSuchFile)
+        }
+        let document = try String(contentsOf: url, encoding: .utf8)
+        guard let italian = document.components(separatedBy: "## Italiano\n").dropFirst().first else {
+            throw CocoaError(.fileReadCorruptFile)
+        }
+        let sections = italian.components(separatedBy: "## English\n")
+        guard sections.count == 2 else { throw CocoaError(.fileReadCorruptFile) }
+        let englishAndReferences = sections[1].components(separatedBy: "Provider documentation / documentazione del fornitore:")
+        guard englishAndReferences.count == 2 else { throw CocoaError(.fileReadCorruptFile) }
+        let localized = language == .italian ? sections[0] : englishAndReferences[0]
+        return localized + "\nProvider documentation / documentazione del fornitore:" + englishAndReferences[1]
+    }
+}
+
+struct PrivacyNoticeView: View {
+    @Environment(\.dismiss) private var dismiss
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 16) {
+            Text(tr("Informativa privacy", "Privacy notice")).font(.title2)
+            ScrollView {
+                Text((try? PrivacyNotice.text(language: .current)) ?? tr(
+                    "Informativa non disponibile. Contatta tommaso.vaccari@mail.polimi.it.",
+                    "Privacy notice unavailable. Contact tommaso.vaccari@mail.polimi.it."))
+                    .textSelection(.enabled)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+            }
+            Button(tr("Chiudi", "Close")) { dismiss() }.keyboardShortcut(.cancelAction)
+        }
+        .padding(24)
+        .frame(width: 560, height: 460)
     }
 }

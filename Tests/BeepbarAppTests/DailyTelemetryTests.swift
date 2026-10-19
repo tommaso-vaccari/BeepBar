@@ -737,7 +737,7 @@ struct DailyTelemetryTests {
         var intervals: [TimeInterval] = []
         var invalidations = 0
         var disclosure: @MainActor () -> Bool = { true }
-        init() { defaults = UserDefaults(suiteName: suite)! }
+        init() { defaults = MemoryCountingDefaults(suiteName: suite)! }
         func controller(_ configuration: DailyTelemetryConfiguration?, clock: Clock = Clock(Date()), recorder: Recorder) -> DailyTelemetryController {
             DailyTelemetryController(defaults: defaults, configuration: configuration, defaultEnabled: true,
                 now: { clock.date }, disclose: { [self] in disclosure() }, send: { try await recorder.send($0) }, schedule: { [self] interval, callback in

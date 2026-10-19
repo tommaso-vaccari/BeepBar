@@ -49,13 +49,9 @@ private final class FakeNotificationCenter: NotificationCenterClient, @unchecked
     }
 }
 
-/// The coordinator against the fake center and a throwaway defaults suite (#64).
+/// The coordinator against the fake center and isolated in-memory preferences (#64).
 @MainActor final class SyncNotificationCoordinatorTests {
-    private let suiteName = WeBeepAuthenticationController.throwawayDefaultsSuite()
-    private let defaults: UserDefaults
-
-    init() { defaults = UserDefaults(suiteName: suiteName)! }
-    deinit { removeTestDefaults(suiteName) }
+    private let defaults = MemoryCountingDefaults.isolated()
 
     private func conflict(_ remoteID: String) throws -> ConflictRecord {
         ConflictRecord(id: UUID(), rootID: UUID(uuidString: "00000000-0000-0000-0000-000000000001")!, remoteID: remoteID,
@@ -183,9 +179,9 @@ private final class FakeNotificationCenter: NotificationCenterClient, @unchecked
     /// If the user turns the switch off while the permission read is pending, macOS's prompt must
     /// not appear afterwards: the switch is checked again once the read answers.
     @Test func turningOffDuringThePermissionReadPreventsThePrompt() async {
-        let suite = suiteName   // UserDefaults isn't Sendable; a second handle on the same suite is.
+        let defaults = defaults
         let center = FakeNotificationCenter(authorization: .notDetermined, onAuthorizationRead: {
-            UserDefaults(suiteName: suite)?.set(false, forKey: NotificationPolicy.enabledKey)
+            defaults.set(false, forKey: NotificationPolicy.enabledKey)
         })
         await SyncNotificationCoordinator(defaults: defaults, center: center).requestAuthorizationIfNeeded()
         #expect(center.requests == 0)
@@ -195,11 +191,11 @@ private final class FakeNotificationCenter: NotificationCenterClient, @unchecked
     /// is pending, nothing is sent and nothing is recorded, so once it is back on the conflict is
     /// still announced. Covers both the manual and the automatic path.
     @Test func turningOffDuringTheReadBeforeASendPreventsIt() async throws {
-        let suite = suiteName
+        let defaults = defaults
         let turnOffOnRead = OSAllocatedUnfairLock(initialState: true)
         let center = FakeNotificationCenter(onAuthorizationRead: {
             guard turnOffOnRead.withLock({ $0 }) else { return }
-            UserDefaults(suiteName: suite)?.set(false, forKey: NotificationPolicy.enabledKey)
+            defaults.set(false, forKey: NotificationPolicy.enabledKey)
         })
         let coordinator = SyncNotificationCoordinator(defaults: defaults, center: center)
         let open = [try conflict("a")]
@@ -220,9 +216,9 @@ private final class FakeNotificationCenter: NotificationCenterClient, @unchecked
     /// A run that sends twice (conflicts, then new materials) checks the switch before each send:
     /// turned off after the first, the second doesn't go out.
     @Test func turningOffBetweenTwoSendsOfARunStopsTheSecond() async throws {
-        let suite = suiteName
+        let defaults = defaults
         let center = FakeNotificationCenter(onSend: {
-            UserDefaults(suiteName: suite)?.set(false, forKey: NotificationPolicy.enabledKey)
+            defaults.set(false, forKey: NotificationPolicy.enabledKey)
         })
         let coordinator = SyncNotificationCoordinator(defaults: defaults, center: center)
         await coordinator.notifyAutomaticRun(installed: 3, conflicts: [try conflict("a")], failures: 0)

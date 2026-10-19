@@ -112,7 +112,7 @@ struct RecordingsMenuBarTests {
     /// survives the deselection); drop the `enabledIDs.contains` filter in `recordingMenuLines`.
     @Test func linesFollowTheCourseSelection() async throws {
         defer { try? FileManager.default.removeItem(at: root) }
-        let defaults = WeBeepAuthenticationController.throwawayDefaults()
+        let defaults = MemoryCountingDefaults.isolated()
         try storeSummaries([analisi: analisiSummary, fisica: fisicaSummary], owner: 7, in: defaults)
         let controller = try await signedIn(defaults: defaults)
 
@@ -141,7 +141,7 @@ struct RecordingsMenuBarTests {
     /// Mutation: drop `recordingMenuInputsChanged()` from `courses.didSet`.
     @Test func aNewCourseListRedrawsTheLines() async throws {
         defer { try? FileManager.default.removeItem(at: root) }
-        let defaults = WeBeepAuthenticationController.throwawayDefaults()
+        let defaults = MemoryCountingDefaults.isolated()
         try storeSummaries([analisi: analisiSummary], owner: 7, in: defaults)
         let controller = try await signedIn(defaults: defaults)
         select([11], on: controller)
@@ -204,7 +204,7 @@ struct RecordingsMenuBarTests {
     @Test(arguments: [9, 7])
     func theSavedSummaryIsShownOnlyToItsAccountWithoutAController(storedOwner: Int) async throws {
         defer { try? FileManager.default.removeItem(at: root) }
-        let defaults = WeBeepAuthenticationController.throwawayDefaults()
+        let defaults = MemoryCountingDefaults.isolated()
         try storeSummaries([analisi: analisiSummary], owner: storedOwner, in: defaults)
         let controller = try await signedIn(defaults: defaults)
         #expect(controller.recordingsIfCreated == nil)
@@ -228,7 +228,7 @@ struct RecordingsMenuBarTests {
     @Test(arguments: [false, true])
     func recordingsOffOrAnotherUniversityShowNoLines(otherUniversity: Bool) async throws {
         defer { try? FileManager.default.removeItem(at: root) }
-        let defaults = WeBeepAuthenticationController.throwawayDefaults()
+        let defaults = MemoryCountingDefaults.isolated()
         if !otherUniversity { defaults.set(false, forKey: RecordingsController.enabledKey) }
         try storeSummaries([analisi: analisiSummary], owner: 7, in: defaults)
         let controller = try await signedIn(defaults: defaults, site: otherUniversity ? MoodleSite.unipd[0] : .polimi)
@@ -244,7 +244,7 @@ struct RecordingsMenuBarTests {
     /// together with the reset push in `forgetSeen` (sign-out also turns Recordings off).
     @Test func signingOutClearsTheLines() async throws {
         defer { try? FileManager.default.removeItem(at: root) }
-        let defaults = WeBeepAuthenticationController.throwawayDefaults()
+        let defaults = MemoryCountingDefaults.isolated()
         try storeSummaries([analisi: analisiSummary], owner: 7, in: defaults)
         let controller = try await signedIn(defaults: defaults)
         select([11], on: controller)
@@ -263,7 +263,7 @@ struct RecordingsMenuBarTests {
     /// Mutation: drop the `onWatchSummaryChange` assignment in `makeRecordings` (no line appears).
     @Test func aLoadedListingReachesTheMenuAndTurningOffClearsIt() async throws {
         defer { try? FileManager.default.removeItem(at: root) }
-        let defaults = WeBeepAuthenticationController.throwawayDefaults()
+        let defaults = MemoryCountingDefaults.isolated()
         defaults.set(true, forKey: RecordingsController.enabledKey)
         try store.save(RecmanSessionCodec.encode([FakeRecmanBrowser.cookie("SSO_LOGIN")], ownerUserID: 7))
         let browser = FakeRecmanBrowser()
@@ -294,7 +294,7 @@ struct RecordingsMenuBarTests {
     /// `[:]` → `[:]`, and the seeded line stays).
     @Test func turningOffClearsSeededLinesTheControllerNeverLoaded() async throws {
         defer { try? FileManager.default.removeItem(at: root) }
-        let defaults = WeBeepAuthenticationController.throwawayDefaults()
+        let defaults = MemoryCountingDefaults.isolated()
         try storeSummaries([analisi: analisiSummary], owner: 7, in: defaults)
         let controller = try await signedIn(defaults: defaults)
         select([11], on: controller)
@@ -327,7 +327,7 @@ struct RecordingsMenuBarTests {
         #expect(english.lines.map(\.title) == ["Analisi 2 — 30/30 · all done", "Fisica — 3/10 · ~45 min"])
 
         defer { try? FileManager.default.removeItem(at: root) }
-        let defaults = WeBeepAuthenticationController.throwawayDefaults()
+        let defaults = MemoryCountingDefaults.isolated()
         try storeSummaries([analisi: CourseWatchSummary(done: 30, total: 30, remainingMinutes: 0, unknownDurationCount: 0)], owner: 7, in: defaults)
         let controller = try await signedIn(defaults: defaults)
         select([11], on: controller)
@@ -343,7 +343,7 @@ struct RecordingsMenuBarTests {
     /// `language` in `refreshMenuBarSnapshot`; hardcode `recordingsTitle` there.
     @Test func theSnapshotUsesTheControllersLanguage() async throws {
         defer { try? FileManager.default.removeItem(at: root) }
-        let defaults = WeBeepAuthenticationController.throwawayDefaults()
+        let defaults = MemoryCountingDefaults.isolated()
         try storeSummaries([analisi: CourseWatchSummary(done: 30, total: 30, remainingMinutes: 0, unknownDurationCount: 0)], owner: 7, in: defaults)
         let controller = try await signedIn(defaults: defaults, language: .english)
         select([11], on: controller)
@@ -409,7 +409,7 @@ struct RecordingsMenuBarTests {
     /// known (nil → 7). Mutation: seed only when no controller exists.
     @Test func anExistingControllerStillGetsTheSeededLines() async throws {
         defer { try? FileManager.default.removeItem(at: root) }
-        let defaults = WeBeepAuthenticationController.throwawayDefaults()
+        let defaults = MemoryCountingDefaults.isolated()
         try storeSummaries([analisi: analisiSummary], owner: 7, in: defaults)
         let controller = try await makeController(defaults: defaults)
         let recordings = controller.recordings
@@ -426,7 +426,7 @@ struct RecordingsMenuBarTests {
     @Test(arguments: [false, true])
     func aDirectAccountSwitchNeverShowsThePreviousAccountsLines(withController: Bool) async throws {
         defer { try? FileManager.default.removeItem(at: root) }
-        let defaults = WeBeepAuthenticationController.throwawayDefaults()
+        let defaults = MemoryCountingDefaults.isolated()
         try storeSummaries([analisi: analisiSummary], owner: 7, in: defaults)
         let controller = try await signedIn(defaults: defaults)
         select([11], on: controller)
@@ -447,7 +447,7 @@ struct RecordingsMenuBarTests {
     /// `siteInfo.didSet` (the reload reads the changed copy and the line changes).
     @Test func reloadingTheSameAccountDoesNotReseed() async throws {
         defer { try? FileManager.default.removeItem(at: root) }
-        let defaults = WeBeepAuthenticationController.throwawayDefaults()
+        let defaults = MemoryCountingDefaults.isolated()
         try storeSummaries([analisi: analisiSummary], owner: 7, in: defaults)
         let controller = try await signedIn(defaults: defaults)
         select([11], on: controller)
@@ -466,7 +466,7 @@ struct RecordingsMenuBarTests {
     /// Mutation: call `forgetWatchSummary(in:notOwnedBy:)` only when no controller exists.
     @Test func anotherAccountsSavedNumbersGoEvenWithAControllerWithoutSession() async throws {
         defer { try? FileManager.default.removeItem(at: root) }
-        let defaults = WeBeepAuthenticationController.throwawayDefaults()
+        let defaults = MemoryCountingDefaults.isolated()
         try storeSummaries([analisi: analisiSummary], owner: 7, in: defaults)
         let controller = try await makeController(defaults: defaults)
         let recordings = controller.recordings
@@ -483,7 +483,7 @@ struct RecordingsMenuBarTests {
     /// Mutation: make `seedWatchSummariesIfNeeded` a no-op, or drop its `isEmpty` guard.
     @Test func openingThePageSeedsSavedSummariesOnce() async throws {
         defer { try? FileManager.default.removeItem(at: root) }
-        let defaults = WeBeepAuthenticationController.throwawayDefaults()
+        let defaults = MemoryCountingDefaults.isolated()
         let controller = try await signedIn(defaults: defaults)
         #expect(controller.watchSummaries.isEmpty)
         try storeSummaries([analisi: analisiSummary], owner: 7, in: defaults)
@@ -500,7 +500,7 @@ struct RecordingsMenuBarTests {
     /// `seedWatchSummariesIfNeeded`.
     @Test func theSeedDoesNothingWithRecordingsOff() async throws {
         defer { try? FileManager.default.removeItem(at: root) }
-        let defaults = WeBeepAuthenticationController.throwawayDefaults()
+        let defaults = MemoryCountingDefaults.isolated()
         let controller = try await signedIn(defaults: defaults)
         try storeSummaries([analisi: analisiSummary], owner: 7, in: defaults)
         defaults.set(false, forKey: RecordingsController.enabledKey)
@@ -516,7 +516,7 @@ struct RecordingsMenuBarTests {
     /// drop the hold (`menuRebuildHolds += 1`: one rebuild per course).
     @Test func restoringRenamedFoldersRebuildsTheMenuOnce() async throws {
         defer { try? FileManager.default.removeItem(at: root) }
-        let defaults = WeBeepAuthenticationController.throwawayDefaults()
+        let defaults = MemoryCountingDefaults.isolated()
         try storeSummaries([analisi: analisiSummary, fisica: fisicaSummary], owner: 7, in: defaults)
         let controller = try await signedIn(defaults: defaults)
         select([11, 12], on: controller)
@@ -541,7 +541,7 @@ struct RecordingsMenuBarTests {
     /// Mutation: drop `recordingMenuInputsChanged()` from `courseFolders.didSet`.
     @Test func renamingAFolderRedrawsTheLine() async throws {
         defer { try? FileManager.default.removeItem(at: root) }
-        let defaults = WeBeepAuthenticationController.throwawayDefaults()
+        let defaults = MemoryCountingDefaults.isolated()
         try storeSummaries([analisi: analisiSummary], owner: 7, in: defaults)
         let controller = try await signedIn(defaults: defaults)
         select([11], on: controller)
@@ -582,7 +582,7 @@ struct RecordingsMenuBarTests {
     /// Recordings controller.
     private func clickSetup(next: RecmanRecording? = nil, extra: [RecmanCourseKey: CourseWatchSummary] = [:], language: AppLanguage = .italian) async throws
         -> (WeBeepAuthenticationController, FakeRecmanBrowser, FakeRecordingPlayer, PageRequests, UserDefaults) {
-        let defaults = WeBeepAuthenticationController.throwawayDefaults()
+        let defaults = MemoryCountingDefaults.isolated()
         defaults.set(true, forKey: RecordingsController.enabledKey)
         try store.save(RecmanSessionCodec.encode([FakeRecmanBrowser.cookie("SSO_LOGIN")], ownerUserID: 7))
         try storeSummaries(extra.merging([analisi: summary(next: next ?? lecture("a"))]) { $1 }, owner: 7, in: defaults)

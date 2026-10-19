@@ -44,3 +44,11 @@ After the owner unlocked the session, both scenarios completed five measured sam
 | Same-process warm reopen | 64.118 ms | 65.303 ms | 100 ms |
 
 First recording-content median is 190.947 ms; warm course-content median is 31.965 ms. Content means SwiftUI onAppear, not compositor presentation. All observed window samples met the targets. Five samples do not establish reliable p95, scrolling smoothness, every 16 ms stall, production bootstrap or performance gains against main/dev; those remain unmeasured. No idle or memory-cycle scenario was run in this focused series. Full local traces are retained for further interpretation. This resolves the missing current-source/warm measurement for the local fixes, but final source identity must still be tied to the published commit before release.
+
+### CI preference-fixture follow-up
+
+On `ff6d26125a006d36ae1e3bcae8c0ff799c4aeb32`, [run 39308990563](https://github.com/tommaso-vaccari/BeepBar/actions/runs/39308990563) failed with 19 preference-state assertions across notification, telemetry and recordings-menu tests, while [run 39308997853](https://github.com/tommaso-vaccari/BeepBar/actions/runs/39308997853) passed on the same commit. The 79 affected tests also passed locally before the change; the intermittent failure was not reproduced locally.
+
+The behavioral fixtures now reuse the existing in-memory defaults double, removing their dependence on asynchronous disk preferences. Notification callbacks share that fixture rather than reopening a disk suite. Assertions and production code are unchanged. Real disk persistence and second-handle visibility remain covered by `ThrowawayDefaultsTests`. Independent review found no blocking issues. The earlier source manifest describes the earlier candidate and is not a manifest of this test-fixture follow-up.
+
+Validation of this follow-up: full local `swift test` passed (16 XCTest, 649 core, 31 benchmark and 853 app tests; 1,549 total), and the CI-equivalent Release build passed. Online CI must pass on the resulting published commit before release.

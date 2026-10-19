@@ -113,6 +113,14 @@ struct DailyTelemetryTests {
 #endif
     }
 
+    /// The production alert only closes and prominently explains the Settings opt-out.
+    @Test func disclosureHasOnlyCloseAndSettingsInstructions() {
+        let alert = DailyTelemetryController.disclosureAlert()
+        #expect(alert.buttons.map(\.title) == [tr("Chiudi", "Close")])
+        #expect(alert.informativeText.contains(tr("Impostazioni → Telemetria", "Settings → Telemetry")))
+        #expect(alert.informativeText.contains(tr("attive per impostazione predefinita", "enabled by default")))
+    }
+
     /// Information is presented before scheduling, creating markers or sending, once per version.
     @Test func disclosurePrecedesFirstAttemptAndSurvivesRelaunch() async {
         let harness = Harness()

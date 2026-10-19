@@ -60,3 +60,7 @@ Eliminata identità mensile; metrica conservata tramite contatore locale e valor
 ## 2026-10-19 — coerenza informativa, issue #202, #203 e #218
 
 Riverificato dev c22f194: la disattivazione conserva i punti di ripresa, logout/cambio identità e cancellazione dati di studio li eliminano. Corretta la riga dell’inventario e distinto il protocollo v2 dalla telemetria storica. Il testo IT/EN nelle Impostazioni descrive Webex/idbroker e il possibile inoltro al Politecnico, senza pretendere una verifica live. README descrive il protocollo aggregato v2 e i limiti di opt-out, distinguendo dev non rilasciata. Nessun flusso, base giuridica o configurazione modificati; nessuna nuova fonte o conclusione di conformità.
+
+## 2026-10-19 — avviso Chiudi, PR #231
+
+Riverificate e salvate revisioni immutabili S-0008/S-0009 e fonti S-0013–S-0016. Rivalutati primo invio subito dopo Chiudi e opposizione tramite Impostazioni. Esito favorevole qualificato v2, costo navigazione e limiti documentali espliciti; nessuna certificazione globale, accettazione contrattuale, contatto o invio reale. Valutazioni storiche UUID non riaperte.

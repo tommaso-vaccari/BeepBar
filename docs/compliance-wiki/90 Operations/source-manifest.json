@@ -135,5 +135,71 @@
     "bytes": 243070,
     "content_type": "text/html;charset=UTF-8",
     "raw": "S-0012-2026-10-17.html"
+  },
+  {
+    "id": "S-0008",
+    "title": "TelemetryDeck accordo",
+    "url": "https://telemetrydeck.com/avv/",
+    "resolved_url": "https://telemetrydeck.com/avv/",
+    "retrieved_date": "2026-10-19",
+    "sha256": "b1b63176b8c500f4251488b9de4301d259f7dc07a53adc9cf6c613761e5de3c1",
+    "bytes": 107547,
+    "content_type": "text/html",
+    "raw": "S-0008-2026-10-19.html"
+  },
+  {
+    "id": "S-0009",
+    "title": "TelemetryDeck FAQ",
+    "url": "https://telemetrydeck.com/docs/guides/privacy-faq/",
+    "resolved_url": "https://telemetrydeck.com/docs/guides/privacy-faq/",
+    "retrieved_date": "2026-10-19",
+    "sha256": "5b146c6de7f104b411498d3cfc043112b7221380b00acc7b8a3f595aac60699b",
+    "bytes": 140834,
+    "content_type": "text/html",
+    "raw": "S-0009-2026-10-19.html"
+  },
+  {
+    "id": "S-0013",
+    "title": "TelemetryDeck Ingest v2",
+    "url": "https://telemetrydeck.com/docs/ingest/v2/",
+    "resolved_url": "https://telemetrydeck.com/docs/ingest/v2/",
+    "retrieved_date": "2026-10-19",
+    "sha256": "7873e1127e83ddf23eb801f9e5088a856c37bbee094a611cdf9637521e2be3c5",
+    "bytes": 141649,
+    "content_type": "text/html",
+    "raw": "S-0013-2026-10-19.html"
+  },
+  {
+    "id": "S-0014",
+    "title": "TelemetryDeck termini",
+    "url": "https://telemetrydeck.com/terms/",
+    "resolved_url": "https://telemetrydeck.com/terms/",
+    "retrieved_date": "2026-10-19",
+    "sha256": "45a09e0f886f7bac15c3ef862f98a429f39d3edb6065bc9e4f75aadfd5394fe4",
+    "bytes": 133682,
+    "content_type": "text/html",
+    "raw": "S-0014-2026-10-19.html"
+  },
+  {
+    "id": "S-0015",
+    "title": "TelemetryDeck architettura",
+    "url": "https://telemetrydeck.com/use-case/architecture-security/",
+    "resolved_url": "https://telemetrydeck.com/use-case/architecture-security/",
+    "retrieved_date": "2026-10-19",
+    "sha256": "ae633a17f8d412d52e6aaaec5d263ccdc2d31c5be927837345bb154ea6757f68",
+    "bytes": 183970,
+    "content_type": "text/html",
+    "raw": "S-0015-2026-10-19.html"
+  },
+  {
+    "id": "S-0016",
+    "title": "TelemetryDeck privacy",
+    "url": "https://telemetrydeck.com/privacy/",
+    "resolved_url": "https://telemetrydeck.com/privacy/",
+    "retrieved_date": "2026-10-19",
+    "sha256": "568f5daf4cd2b614c78538a178f2fe8cfc69e036e5fa071106c295e1dde9401b",
+    "bytes": 145562,
+    "content_type": "text/html",
+    "raw": "S-0016-2026-10-19.html"
   }
 ]

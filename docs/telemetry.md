@@ -1,6 +1,6 @@
 # Minimal aggregate telemetry
 
-TelemetryDeck remains enabled by default with opt-out. Production configuration is in `App/Info.plist`; missing/invalid configuration or DEBUG disables sending. Before the first configured, enabled launch, including upgrades, a one-time IT/EN notice describes the purpose, interest, data, recipient, retention limits and rights. Continue acknowledges information, not consent; Disable saves opt-out without affecting app features. Settings retains the switch and factual explanation.
+TelemetryDeck remains enabled by default with opt-out. Production configuration is in `App/Info.plist`; missing/invalid configuration or DEBUG disables sending. Before the first configured, enabled launch, including upgrades, a one-time IT/EN notice describes the purpose, interest, data, recipient, retention limits and rights. Close acknowledges information, not consent. The notice has only that button and prominently explains how to disable telemetry in Settings → Telemetry without affecting app features. Reports may start immediately after Close, before the user opens Settings. Settings retains the switch and factual explanation; disabling cancels outstanding client work and stops future reports, but cannot retract data already received by the provider.
 
 ## Wire protocol v2
 

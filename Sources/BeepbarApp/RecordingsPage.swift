@@ -2,109 +2,301 @@ import SwiftUI
 import BeepbarCore
 
 /// The rules of what the Recordings page shows, kept out of the views so tests can pin them.
+/// The list rules live in Core (`RecmanPresentation`, `RecmanCourseSidebar`), where the page's
+/// cached derivations use them (#100); these forward to them, so the page and its tests can never
+/// disagree with what the cache derives.
 enum RecordingsPresentation {
+    typealias WeekSection = RecmanPresentation.WeekSection
+
     static func syncedCourses(_ courses: [RemoteCourseSummary], enabledIDs: Set<Int64>) -> [RemoteCourseSummary] {
-        courses.filter { enabledIDs.contains($0.id) }
+        RecmanCourseSidebar(.init(courses: courses, enabledIDs: enabledIDs)).courses
     }
 
     static func selectedCourse(_ courses: [RemoteCourseSummary], selectedID: Int64?) -> RemoteCourseSummary? {
-        courses.first { $0.id == selectedID }
-            ?? courses.first { RecmanCourseKey(course: $0) != nil }
-            ?? courses.first
+        RecmanCourseSidebar(.init(courses: courses, enabledIDs: Set(courses.map(\.id)))).selectedCourse(id: selectedID)
     }
 
     /// Hide recognized archive identifiers without changing the course's wording or acronyms.
     static func courseName(_ course: RemoteCourseSummary) -> String {
-        let displayName = course.displayName.trimmingCharacters(in: .whitespacesAndNewlines)
-        let name = displayName.isEmpty ? course.shortName.trimmingCharacters(in: .whitespacesAndNewlines) : displayName
-        guard let key = RecmanCourseKey(course: course) else { return name }
-        let nextYear = key.academicYear + 1
-        let year = "\(key.academicYear)\\s*[-/]\\s*(?:\(nextYear)|\(String(format: "%02d", nextYear % 100)))"
-        let suffix = "\\s*(?:\\[\\s*\(year)\\s*\\]|\\(\\s*\(year)\\s*\\))\\s*$"
-        let cleaned = name
-            .replacingOccurrences(of: #"^\s*[0-9]{6}\s*-\s*"#, with: "", options: .regularExpression)
-            .replacingOccurrences(of: suffix, with: "", options: .regularExpression)
-            .trimmingCharacters(in: .whitespacesAndNewlines)
-        return cleaned.isEmpty ? name : cleaned
-    }
-
-    struct WeekSection: Equatable {
-        let title: String
-        let recordings: [RecmanRecording]
+        RecmanCourseSidebar.courseName(course)
     }
 
     /// Weeks start on Monday, as Polimi's timetable does, whatever the Mac's region says.
     static func calendar(timeZone: TimeZone = .current) -> Calendar {
-        var calendar = Calendar(identifier: .gregorian)
-        calendar.firstWeekday = 2
-        calendar.timeZone = timeZone
-        return calendar
+        RecmanPresentation.calendar(timeZone: timeZone)
     }
 
-    /// The minutes in Recman's duration ("97 min"); the parser accepts no other shape.
+    /// The minutes in Recman's duration ("97 min"); the parser accepts no other shape. Delegates to
+    /// Core so the row, the course header and the hours-left estimate read the same number.
     static func minutes(_ duration: String) -> Int? {
-        Int(duration.prefix { $0.isNumber })
+        RecmanRecording.minutes(inDuration: duration)
     }
 
-    /// "45 min", "1 h 37 min", "36 h".
-    static func durationText(minutes: Int) -> String {
-        let hours = minutes / 60
-        let rest = minutes % 60
-        if hours == 0 { return "\(rest) min" }
-        return rest == 0 ? "\(hours) h" : "\(hours) h \(rest) min"
-    }
+    static func durationText(minutes: Int) -> String { RecmanPresentation.durationText(minutes: minutes) }
 
-    /// Newest first, grouped by calendar week: "Questa settimana", "Settimana scorsa", then the
-    /// week's dates ("14 – 20 set"), with the year only when it isn't the current one.
     static func weekSections(_ recordings: [RecmanRecording], now: Date, calendar: Calendar, locale: Locale) -> [WeekSection] {
-        guard let thisWeek = calendar.dateInterval(of: .weekOfYear, for: now)?.start else { return [] }
-        let lastWeek = calendar.date(byAdding: .weekOfYear, value: -1, to: thisWeek)
-        var sections: [(start: Date, recordings: [RecmanRecording])] = []
-        for recording in recordings.sorted(by: { $0.recordedAt > $1.recordedAt }) {
-            guard let start = calendar.dateInterval(of: .weekOfYear, for: recording.recordedAt)?.start else { continue }
-            if sections.last?.start == start {
-                sections[sections.count - 1].recordings.append(recording)
-            } else {
-                sections.append((start, [recording]))
-            }
-        }
-        return sections.map { section in
-            let title: String
-            if section.start == thisWeek {
-                title = tr("Questa settimana", "This week")
-            } else if section.start == lastWeek {
-                title = tr("Settimana scorsa", "Last week")
-            } else {
-                title = weekRange(from: section.start, now: now, calendar: calendar, locale: locale)
-            }
-            return WeekSection(title: title, recordings: section.recordings)
-        }
+        RecmanPresentation.weekSections(recordings, now: now, calendar: calendar, locale: locale)
     }
 
     static func weekRange(from start: Date, now: Date, calendar: Calendar, locale: Locale) -> String {
-        let end = calendar.date(byAdding: .day, value: 6, to: start) ?? start
-        var style = Date.FormatStyle(timeZone: calendar.timeZone).day().month(.abbreviated).locale(locale)
-        if calendar.component(.year, from: end) != calendar.component(.year, from: now) { style = style.year() }
-        let sameMonth = calendar.component(.month, from: start) == calendar.component(.month, from: end)
-        let startText = sameMonth ? Date.FormatStyle(timeZone: calendar.timeZone).day().locale(locale).format(start) : style.format(start)
-        return "\(startText) – \(style.format(end))"
+        RecmanPresentation.weekRange(from: start, now: now, calendar: calendar, locale: locale)
     }
 
-    /// Each recording's place in its course, oldest first, as students count lessons ("#12").
-    static func numbers(_ recordings: [RecmanRecording]) -> [String: Int] {
-        let ordered = recordings.sorted { ($0.recordedAt, $0.id) < ($1.recordedAt, $1.id) }
-        return Dictionary(ordered.enumerated().map { ($0.element.id, $0.offset + 1) }, uniquingKeysWith: { first, _ in first })
+    static func numbers(_ recordings: [RecmanRecording]) -> [String: Int] { RecmanPresentation.numbers(recordings) }
+
+    static func title(_ recording: RecmanRecording) -> String { RecmanPresentation.title(recording) }
+
+    static func matches(_ recording: RecmanRecording, query: String) -> Bool { RecmanPresentation.matches(recording, query: query) }
+
+    /// The sidebar row's title: the course name, or the renamed local folder plus the part in
+    /// parentheses at the end of the WeBeep name (usually the teacher).
+    /// See `RecmanCourseSidebar.sidebarName`.
+    static func sidebarName(courseName: String, courseDisplayName: String, courseID: Int64 = 0, localFolderName: String?) -> String {
+        RecmanCourseSidebar.sidebarName(courseName: courseName, courseDisplayName: courseDisplayName, courseID: courseID, localFolderName: localFolderName)
     }
 
-    /// What a row is called: Recman's title, or the kind of lesson when the teacher left it empty.
-    static func title(_ recording: RecmanRecording) -> String {
-        recording.title.isEmpty ? recording.kind : recording.title
+    /// Whether the sidebar row shows the orange "lectures to watch" marker: only for a known
+    /// summary of a course with recordings that are not all done. An unknown summary (nil: the
+    /// listing was never loaded, another account) claims nothing; a course with none (0/0) or all
+    /// done shows nothing (`done < total` is false for both). `next` is not used: it is nil for old saved data that still has counts.
+    static func hasLecturesToWatch(summary: CourseWatchSummary?) -> Bool {
+        guard let summary else { return false }
+        return summary.done < summary.total
     }
 
-    static func matches(_ recording: RecmanRecording, query: String) -> Bool {
-        let needle = query.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !needle.isEmpty else { return true }
-        return recording.title.localizedStandardContains(needle) || recording.kind.localizedStandardContains(needle)
+    /// VoiceOver's label of that marker.
+    static let lecturesToWatchLabel = BilingualText("Lezioni da guardare", "Lectures to watch")
+
+    /// VoiceOver's value of that marker: how many lectures are left.
+    static func lecturesToWatchValue(_ summary: CourseWatchSummary) -> BilingualText {
+        let left = max(0, summary.total - summary.done)
+        return BilingualText("\(left) da guardare", "\(left) left")
+    }
+
+    /// "1 registrazione" / "3 registrazioni": the course's recording count, in the sidebar
+    /// subtitle and the course header. Both languages agree in number (#195).
+    static func recordingCount(_ count: Int) -> BilingualText {
+        BilingualText(italianCount(count, "registrazione", "registrazioni"), englishCount(count, "recording", "recordings"))
+    }
+
+    /// VoiceOver's label of the sidebar badge counting new lectures: "1 nuova" / "3 nuove" (#195).
+    static func newCountLabel(_ count: Int) -> BilingualText {
+        BilingualText(italianCount(count, "nuova", "nuove"), "\(count) new")
+    }
+
+    /// The sidebar course row's third line: the recording count, or what the listing is doing.
+    static func courseSubtitle(for listing: RecordingsListing?) -> String {
+        if let count = listing?.recordings?.count {
+            return count == 0 ? tr("Nessuna registrazione", "No recordings") : recordingCount(count).text
+        }
+        if listing?.isLoading == true { return tr("Caricamento…", "Loading…") }
+        if listing?.problem != nil { return tr("Non disponibile", "Unavailable") }
+        return " "
+    }
+
+    // MARK: Watch progress
+
+    /// What one row shows of its watch progress, as plain values: the row compares it with `==`,
+    /// so a ~30 s tick of the playing lecture (`RecordingsWatchProgressModel.live`) runs the body
+    /// of that lecture's row only, never every row (principle 6).
+    ///
+    /// `known == false` means the store's state is not loaded for this recording (a Watchlist row
+    /// offline, signed out or still loading): the store may well say "done", so the row shows no
+    /// bar and no checkbox rather than claiming 0 % or "not done". All other fields are zero then,
+    /// so changes the row can't show don't re-render it either.
+    struct WatchRow: Equatable, Sendable {
+        /// The stored state of this recording is known (see `RecordingsWatchProgressModel.known`).
+        let known: Bool
+        /// Furthest point reached, in 0...1, live session included.
+        let fraction: Double
+        let completed: Bool
+        /// A tick or un-tick of this recording is being saved.
+        let pending: Bool
+        /// The student can tick lectures now (`RecordingsController.canEditProgress`).
+        let canEdit: Bool
+
+        static let unknown = WatchRow(known: false, fraction: 0, completed: false, pending: false, canEdit: false)
+
+        // The row's view reads only the fields below (never `known`, `completed` or `pending`
+        // directly), so every visible decision is pinned by `RecordingRowProgressTests`.
+
+        /// The checkbox is ticked: the committed state only, never the value being saved, so a
+        /// failed save can't leave a box that lies (no optimistic flip while `pending`).
+        var isOn: Bool { completed }
+
+        /// The checkbox is drawn: only when the stored state is known. An empty box for an
+        /// unknown row would say "not done" for a lecture the store may say is done. Hidden rows
+        /// keep their slot (opacity), so the layout doesn't jump when the listing loads.
+        var checkboxVisible: Bool { known }
+
+        /// The checkbox is hidden from VoiceOver, for the same reason it is hidden on screen.
+        var checkboxAccessibilityHidden: Bool { !known }
+
+        /// The checkbox accepts a click: known, editable, and no save of it in flight.
+        var checkboxEnabled: Bool { known && canEdit && !pending }
+
+        /// The bar's value, nil when there is no bar (unknown state). Full once done, whatever the
+        /// furthest point: ticking a lecture attended in person completes it at 0 %.
+        var barValue: Double? {
+            guard known else { return nil }
+            return completed ? 1 : Self.clamped(fraction)
+        }
+
+        /// The "done" styling: green bar and a check mark after it.
+        var showsDoneStyle: Bool { known && completed }
+
+        /// The bar's colour: green once done, the accent colour otherwise.
+        var barTint: Color { showsDoneStyle ? .green : .accentColor }
+
+        /// The whole percent shown for a lecture that is not done: rounded down and never above
+        /// 99, so the row never claims 100 % before the lecture is done (a lecture played to the
+        /// very end but still open, or un-ticked after being watched, reads 99 %). Rounding down
+        /// also keeps 0.4 % from reading as 1 %. The tiny epsilon absorbs binary representation
+        /// error before flooring: 0.29 × 100 is 28.999999999999996 in `Double` and must read 29.
+        var percent: Int { min(99, Int((Self.clamped(fraction) * 100 + 1e-9).rounded(.down))) }
+
+        /// VoiceOver's value for the bar: "Fatta"/"Done" once done, otherwise "N% visto"/"N%
+        /// watched". Both languages, so tests can check each without switching the app language.
+        var accessibilityValue: BilingualText {
+            completed ? BilingualText("Fatta", "Done") : BilingualText("\(percent)% visto", "\(percent)% watched")
+        }
+
+        private static func clamped(_ value: Double) -> Double { value.isFinite ? min(1, max(0, value)) : 0 }
+    }
+
+    /// A copy of what `RecordingsWatchProgressModel` publishes, taken once per update by
+    /// `WatchProgressReader` and handed to the list as a value.
+    ///
+    /// Why a value and not the model: a `List`'s rows are built lazily, outside the reader's body,
+    /// and SwiftUI rebuilds them only when the row-building closure's captured values change. With
+    /// the model captured (a reference that never changes) a tick re-ran the reader and left every
+    /// row as it was, bar included; with these values captured, the closure changes with the model.
+    /// The dictionaries are copy-on-write, so taking the copy costs nothing per row. Deliberately
+    /// not `Equatable`: comparing it would walk every entry.
+    struct WatchValues {
+        let entries: [String: RecordingWatchEntry]
+        let live: [String: Double]
+        let pending: Set<String>
+        let pendingCourses: Set<RecmanCourseKey>
+        let known: Set<String>
+        /// Each loaded course's summary, live position included: the course header's line.
+        let summaries: [RecmanCourseKey: CourseWatchSummary]
+        /// `RecordingsController.canEditProgress` when the reader was built (see
+        /// `WatchProgressReader.init` on why a stale value is harmless).
+        let canEdit: Bool
+        /// `RecordingsWatchProgressModel.stateRevision` when the copy was taken.
+        let stateRevision: Int
+
+        @MainActor init(_ model: RecordingsWatchProgressModel, canEdit: Bool) {
+            entries = model.entries
+            live = model.live
+            pending = model.pending
+            pendingCourses = model.pendingCourses
+            known = model.known
+            summaries = model.summaries
+            stateRevision = model.stateRevision
+            self.canEdit = canEdit
+        }
+
+        /// The row values of `recording`: `.unknown` when its stored state isn't known, whatever
+        /// is in memory for it; otherwise the rules of `RecordingsWatchProgressModel`'s accessors
+        /// (`fraction(for:)`: the further of stored and live).
+        func row(for recording: RecmanRecording) -> WatchRow {
+            let identity = RecordingsStudyState.identity(recording)
+            guard known.contains(identity) else { return .unknown }
+            let entry = entries[identity] ?? .untouched
+            return WatchRow(known: true, fraction: max(entry.furthest, live[identity] ?? 0), completed: entry.isCompleted,
+                            pending: pending.contains(identity) || RecmanCourseKey(courseCode: recording.courseCode, academicYear: recording.academicYear).map(pendingCourses.contains) == true, canEdit: canEdit)
+        }
+
+        /// Uses the whole loaded listing, never search results; unknown or pending entries
+        /// cannot authorize a bulk change. The label follows committed entries only. A course
+        /// with a bulk save in flight is covered through `row(for:)`, which counts every row of a
+        /// `pendingCourses` course as pending, also rows a refresh added meanwhile.
+        /// One `row(for:)` per recording: the page asks through `BulkActionCache`, never on each
+        /// publication (#209).
+        func bulkAction(for key: RecmanCourseKey, recordings: [RecmanRecording]?) -> BulkAction {
+            guard let recordings, !recordings.isEmpty else { return BulkAction(allDone: false, enabled: false) }
+            var allDone = true
+            var enabled = canEdit
+            for recording in recordings {
+                let value = row(for: recording)
+                allDone = allDone && value.known && value.completed
+                enabled = enabled && value.checkboxEnabled
+            }
+            return BulkAction(allDone: allDone, enabled: enabled)
+        }
+
+        /// The course header's summary line: `base` ("2026/27 · 30 registrazioni · 36 h"), then
+        /// the progress line of `key` when there is one (`watchSummaryText`).
+        func headerLine(_ base: String, for key: RecmanCourseKey) -> String {
+            guard let watched = RecordingsPresentation.watchSummaryText(summaries[key]) else { return base }
+            return "\(base) · \(watched.text)"
+        }
+    }
+
+    /// The course toolbar's bulk button, scanned again only when something it reads changed.
+    ///
+    /// Why: the button sits in a `WatchProgressReader`, whose closure runs on every publication
+    /// of the progress model, a playing lecture's ~30 s tick included, and `bulkAction` visits
+    /// every recording of the listing. Scanning on each run made the tick's cost proportional to
+    /// the listing (and a bulk save of N lectures cost N scans of N rows), against principle 6
+    /// and `WatchProgressReader`'s flat-cost design (#209). The scan's inputs are the model's
+    /// committed state (tracked by `stateRevision`, which a tick doesn't change), `canEdit` and
+    /// the listing.
+    ///
+    /// While the course's own bulk save runs (`pendingCourses`), every commit of it changes the
+    /// entries, but the button stays disabled whatever they say (every row is pending): the
+    /// label of the last scan is kept, without a scan, until the save ends; the save's end
+    /// changes `pendingCourses` and so rescans, and the label follows the saved state again.
+    ///
+    /// A class, held in the page's `@State` and filled during `body` like `DerivedValueCache`:
+    /// a cache, not state SwiftUI observes. One per course page, on the main actor.
+    @MainActor final class BulkActionCache {
+        /// How many times the listing was scanned, so tests can prove that a tick costs none.
+        private(set) var scans = 0
+        private var stored: (key: RecmanCourseKey, revision: Int, canEdit: Bool, recordings: [RecmanRecording], action: BulkAction)?
+
+        func action(for key: RecmanCourseKey, recordings: [RecmanRecording]?, values: WatchValues) -> BulkAction {
+            guard let recordings, !recordings.isEmpty else { return BulkAction(allDone: false, enabled: false) }
+            if let stored, stored.key == key, stored.recordings == recordings {
+                // Keep the caller's array, so the next comparison hits the shared-storage fast
+                // path instead of comparing a refetched listing element by element each time.
+                self.stored?.recordings = recordings
+                if values.pendingCourses.contains(key) { return BulkAction(allDone: stored.action.allDone, enabled: false) }
+                if stored.revision == values.stateRevision, stored.canEdit == values.canEdit { return stored.action }
+            }
+            scans += 1
+            #if DEBUG
+            RecordingsPageProbes.bulkScan?(recordings.count)
+            #endif
+            let action = values.bulkAction(for: key, recordings: recordings)
+            stored = (key, values.stateRevision, values.canEdit, recordings, action)
+            return action
+        }
+    }
+
+    struct BulkAction: Equatable {
+        let allDone: Bool
+        let enabled: Bool
+        var label: BilingualText {
+            allDone ? BilingualText("Segna tutte come non viste", "Mark all as unseen") :
+                BilingualText("Segna tutte come completate", "Mark all as completed")
+        }
+    }
+
+    /// The course header's progress line, "12/30 fatte · ~14 h rimanenti" / "12/30 done · ~14 h
+    /// left", or nil when there is nothing to say: the summary is unknown (listing not loaded,
+    /// account unknown) or the course has no recordings, which never reads "0/0". The time left
+    /// comes from Core (`remainingTimeText`) so it rounds exactly like the menu bar; it is left
+    /// out when nothing is left to watch.
+    static func watchSummaryText(_ summary: CourseWatchSummary?) -> BilingualText? {
+        guard let summary, summary.total > 0 else { return nil }
+        let count = "\(summary.done)/\(summary.total)"
+        guard let left = RecordingWatchProgress.remainingTimeText(minutes: summary.remainingMinutes), summary.done < summary.total else {
+            return BilingualText("\(count) fatte", "\(count) done")
+        }
+        return BilingualText("\(count) fatte · \(left) rimanenti", "\(count) done · \(left) left")
     }
 }
 
@@ -117,55 +309,82 @@ enum RecordingsPresentation {
 struct RecordingsPage: View {
     @ObservedObject var authentication: WeBeepAuthenticationController
     @ObservedObject var recordings: RecordingsController
-    @State private var selectedCourseID: Int64?
+    /// The sidebar derived from the synced courses (#100). The page observes every publication of
+    /// both controllers (a spinner, a row opening, a bookmark), and each archive key costs two
+    /// regular expressions per course name and each display name two more: they are worked out
+    /// again only when the course list or the courses chosen for syncing change. The course shown
+    /// on the right is not part of the key: picking it is a lookup in the result. A cache, not
+    /// view state: filling it during `body` changes nothing SwiftUI observes.
+    @State private var sidebarCache = DerivedValueCache<RecmanCourseSidebar.Inputs, RecmanCourseSidebar>()
 
-    private var courses: [RemoteCourseSummary] {
-        RecordingsPresentation.syncedCourses(authentication.courses, enabledIDs: authentication.enabledCourseIDs)
+    /// Every use in one `body` after the first is an equality check of the inputs. For arrays the
+    /// controllers republish unchanged it is a storage comparison; equal content in new storage
+    /// is compared once, after which the cache holds the new array.
+    private var model: RecmanCourseSidebar {
+        sidebarCache.value(for: .init(courses: authentication.courses, enabledIDs: authentication.enabledCourseIDs, folders: authentication.courseFolders), compute: RecmanCourseSidebar.init)
     }
 
-    private var searchableCourses: [(course: RemoteCourseSummary, key: RecmanCourseKey)] {
-        courses.compactMap { course in RecmanCourseKey(course: course).map { (course, $0) } }
+    private var keys: [RecmanCourseKey] { model.keys }
+
+    private var selectedCourseID: Int64? {
+        if case .course(let id) = recordings.study.destination { return id }
+        return nil
     }
 
-    private var unsearchableCourses: [RemoteCourseSummary] {
-        courses.filter { RecmanCourseKey(course: $0) == nil }
+    private var destination: RecordingsDestination {
+        if recordings.study.destination == .watchlist { return .watchlist }
+        return selectedCourse.map { .course($0.id) } ?? .watchlist
     }
-
-    private var keys: [RecmanCourseKey] { searchableCourses.map(\.key) }
 
     private var selectedCourse: RemoteCourseSummary? {
-        RecordingsPresentation.selectedCourse(courses, selectedID: selectedCourseID)
+        model.selectedCourse(id: selectedCourseID)
+    }
+
+    /// The selected course's archive entry, nil when its name carries no code and year.
+    private var selectedEntry: RecmanCourseSidebar.Entry? {
+        guard let selectedCourse else { return nil }
+        return model.searchable.first { $0.course.id == selectedCourse.id }
     }
 
     var body: some View {
         Group {
             switch recordings.access {
             case .ready: browser
-            case .signingIn, .needsSignIn, .off: signIn
+            case .signingIn, .needsSignIn:
+                if !recordings.study.bookmarks.isEmpty { browser } else { signIn }
+            case .off: signIn
             }
         }
         .onAppear {
+            authentication.seedWatchSummariesIfNeeded()
             recordings.pageAppeared()
             refresh()
         }
         .onDisappear { recordings.pageDisappeared() }
         .onChange(of: keys) { refresh() }
-        .onChange(of: selectedCourseID) { refresh() }
+        .onChange(of: destination) { refresh() }
+        .onChange(of: recordings.study.bookmarks.map(\.id)) { refresh() }
     }
 
     private func refresh(force: Bool = false) {
-        recordings.refresh(keys, selected: selectedCourse.flatMap(RecmanCourseKey.init(course:)), force: force)
+        let savedKeys = recordings.study.bookmarks.compactMap { RecmanCourseKey(courseCode: $0.recording.courseCode, academicYear: $0.recording.academicYear) }
+        let requested = destination == .watchlist ? Array(Set(keys + savedKeys)).sorted { ($0.academicYear, $0.courseCode) < ($1.academicYear, $1.courseCode) } : keys
+        recordings.refresh(requested, selected: destination == .watchlist ? nil : selectedEntry?.key, force: force)
     }
 
     // MARK: Sign-in
 
     private var signIn: some View {
         VStack(spacing: 14) {
+            if let problem = recordings.studyProblem {
+                NoticeBanner(text: problem.text, systemImage: "exclamationmark.triangle", tint: .orange)
+                    .frame(maxWidth: 420)
+            }
             SymbolTile(systemImage: "play.rectangle.fill", size: 52)
             Text(tr("Registrazioni delle lezioni", "Lecture recordings"))
                 .font(.title3.weight(.semibold))
-            Text(tr("Trova le registrazioni dei corsi che sincronizzi, cerca una lezione e riproducila nel browser. Accedi con Polimi per iniziare. Se non ti serve questa funzione, disattiva Registrazioni in Impostazioni.",
-                    "Find recordings for the courses you sync, search for a lecture and play it in your browser. Sign in with Polimi to get started. If you don't need this feature, turn off Recordings in Settings."))
+            Text(tr("Trova le registrazioni dei corsi che sincronizzi, cerca una lezione e riproducila in BeepBar. Accedi con Polimi per iniziare. Se non ti serve questa funzione, disattiva Registrazioni in Impostazioni.",
+                    "Find recordings for the courses you sync, search for a lecture and play it in BeepBar. Sign in with Polimi to get started. If you don't need this feature, turn off Recordings in Settings."))
                 .multilineTextAlignment(.center)
                 .foregroundStyle(.secondary)
                 .frame(maxWidth: 420)
@@ -193,40 +412,73 @@ struct RecordingsPage: View {
 
     // MARK: Two panes
 
-    @ViewBuilder private var browser: some View {
-        if courses.isEmpty {
-            ContentUnavailableView {
-                Label(tr("Nessun corso sincronizzato", "No synced courses"), systemImage: "books.vertical")
-            } description: {
-                Text(tr("Scegli i corsi da sincronizzare in Corsi: qui trovi le loro registrazioni.", "Choose the courses to sync in Courses: their recordings show up here."))
-            }
-        } else {
-            HStack(spacing: 0) {
-                sidebar
-                    .frame(width: 230)
+    private var browser: some View {
+        VStack(spacing: 0) {
+            if recordings.access != .ready {
+                HStack(spacing: 10) {
+                    Text(tr("La watchlist è salvata. Accedi con Polimi per riprodurre e aggiornare le lezioni.", "Your watchlist is saved. Sign in with Polimi to play and refresh lessons."))
+                        .font(.callout)
+                    Spacer()
+                    if recordings.access == .signingIn { ProgressView().controlSize(.small) }
+                    else { Button(tr("Accedi con Polimi", "Sign in with Polimi")) { recordings.signIn() } }
+                }
+                .padding(14)
+                if case .needsSignIn(let problem?) = recordings.access {
+                    NoticeBanner(text: problem.message, systemImage: "wifi.exclamationmark", tint: .orange)
+                        .padding(.horizontal, 14)
+                        .padding(.bottom, 14)
+                }
                 Divider()
-                detail
-                    .frame(maxWidth: .infinity, maxHeight: .infinity)
+            }
+            if let problem = recordings.studyProblem {
+                NoticeBanner(text: problem.text, systemImage: "exclamationmark.triangle", tint: .orange)
+                    .padding(14)
+            }
+            HStack(spacing: 0) {
+                sidebar.frame(width: 230)
+                Divider()
+                detail.frame(maxWidth: .infinity, maxHeight: .infinity)
             }
         }
     }
 
     private var sidebar: some View {
-        List(selection: Binding(get: { selectedCourse?.id }, set: { selectedCourseID = $0 })) {
+        List(selection: Binding<RecordingsDestination?>(get: { destination }, set: { if let value = $0 { recordings.selectDestination(value) } })) {
+            Section {
+                HStack {
+                    Label(tr("Watchlist", "Watchlist"), systemImage: "bookmark")
+                    Spacer()
+                    Text(recordings.study.bookmarks.count, format: .number)
+                        .foregroundStyle(.secondary)
+                        .monospacedDigit()
+                }
+                .tag(RecordingsDestination.watchlist)
+            }
             Section(tr("I tuoi corsi", "Your courses")) {
-                ForEach(searchableCourses, id: \.course.id) { entry in
-                    CourseRow(name: RecordingsPresentation.courseName(entry.course), key: entry.key, listing: recordings.listing(for: entry.key), newCount: recordings.newCount(for: entry.key))
-                        .tag(entry.course.id)
+                // The marker reads the committed summaries the menu bar uses
+                // (`authentication.watchSummaries`: seeded from storage when the account is
+                // known, so it shows before any listing loads or without a Polimi session, and
+                // `@Published`, so the page redraws on a commit). Not the window's live
+                // summaries and not a `WatchProgressReader`: a ~30 s tick publishes neither this
+                // page nor these values. `CourseRow` is `Equatable` on plain values.
+                // The row shows the sidebar name (renamed folder + trailing part); the detail
+                // header keeps the WeBeep name on purpose: owner decision, sidebar and menu only.
+                ForEach(model.searchable) { entry in
+                    let summary = authentication.watchSummaries[entry.key]
+                    CourseRow(name: entry.sidebarName, key: entry.key, subtitle: RecordingsPresentation.courseSubtitle(for: recordings.listing(for: entry.key)), newCount: recordings.newCount(for: entry.key),
+                              toWatch: RecordingsPresentation.hasLecturesToWatch(summary: summary) ? summary.map(RecordingsPresentation.lecturesToWatchValue) : nil)
+                        .equatable()
+                        .tag(RecordingsDestination.course(entry.course.id))
                 }
             }
-            if !unsearchableCourses.isEmpty {
+            if !model.unsearchable.isEmpty {
                 Section(tr("Senza codice o anno", "No code or year")) {
-                    ForEach(unsearchableCourses) { course in
-                        Text(RecordingsPresentation.courseName(course))
+                    ForEach(model.unsearchable) { entry in
+                        Text(entry.sidebarName)
                             .lineLimit(3)
                             .fixedSize(horizontal: false, vertical: true)
                             .foregroundStyle(.secondary)
-                            .tag(course.id)
+                            .tag(RecordingsDestination.course(entry.course.id))
                     }
                 }
             }
@@ -237,15 +489,17 @@ struct RecordingsPage: View {
     }
 
     @ViewBuilder private var detail: some View {
-        if let course = selectedCourse {
-            if let key = RecmanCourseKey(course: course) {
-                CourseRecordings(name: RecordingsPresentation.courseName(course), key: key, recordings: recordings) {
+        if destination == .watchlist {
+            WatchlistRecordings(recordings: recordings) { refresh(force: true) }
+        } else if let course = selectedCourse {
+            if let entry = selectedEntry {
+                CourseRecordings(name: entry.name, key: entry.key, recordings: recordings) {
                     refresh(force: true)
                 }
                 .id(course.id)
             } else {
                 ContentUnavailableView {
-                    Label(RecordingsPresentation.courseName(course), systemImage: "questionmark.folder")
+                    Label(model.unsearchable.first { $0.course.id == course.id }?.name ?? RecordingsPresentation.courseName(course), systemImage: "questionmark.folder")
                 } description: {
                     Text(tr("Il nome del corso su WeBeep non riporta codice e anno accademico, quindi BeepBar non sa quali registrazioni cercare.",
                             "The course's name on WeBeep doesn't carry its code and academic year, so BeepBar can't tell which recordings to look for."))
@@ -256,13 +510,21 @@ struct RecordingsPage: View {
 }
 
 /// A course in the sidebar keeps its code and year visible to distinguish matching names.
-private struct CourseRow: View {
+///
+/// `Equatable` on plain values on purpose (see `WatchProgressReader`): the sidebar sits inside a
+/// reader that runs on every progress publication, and equal values skip this body.
+private struct CourseRow: View, Equatable {
     let name: String
     let key: RecmanCourseKey
-    let listing: RecordingsListing?
+    let subtitle: String
     let newCount: Int
+    /// Non-nil (the lectures left, as VoiceOver's value) when the orange marker shows.
+    let toWatch: BilingualText?
 
     var body: some View {
+#if DEBUG
+        let _ = RecordingsPageProbes.sidebarRow?(name, toWatch != nil)
+#endif
         HStack(spacing: 8) {
             VStack(alignment: .leading, spacing: 2) {
                 Text(name)
@@ -278,6 +540,17 @@ private struct CourseRow: View {
                     .lineLimit(1)
             }
             Spacer(minLength: 0)
+            // The marker sits before the "new" badge in the same trailing stack: both can show,
+            // side by side, without overlapping. Orange is not the accent colour of the badge.
+            if let toWatch {
+                Circle()
+                    .fill(Color.orange)
+                    .frame(width: 8, height: 8)
+                    .help(RecordingsPresentation.lecturesToWatchLabel.text)
+                    .accessibilityElement()
+                    .accessibilityLabel(RecordingsPresentation.lecturesToWatchLabel.text)
+                    .accessibilityValue(toWatch.text)
+            }
             if newCount > 0 {
                 Text(newCount, format: .number)
                     .font(.caption2.weight(.bold))
@@ -286,19 +559,10 @@ private struct CourseRow: View {
                     .padding(.horizontal, 6)
                     .frame(minHeight: 17)
                     .background(Color.accentColor, in: Capsule())
-                    .accessibilityLabel(tr("\(newCount) nuove", "\(newCount) new"))
+                    .accessibilityLabel(RecordingsPresentation.newCountLabel(newCount).text)
             }
         }
         .padding(.vertical, 2)
-    }
-
-    private var subtitle: String {
-        if let count = listing?.recordings?.count {
-            return count == 0 ? tr("Nessuna registrazione", "No recordings") : tr("\(count) registrazioni", englishCount(count, "recording", "recordings"))
-        }
-        if listing?.isLoading == true { return tr("Caricamento…", "Loading…") }
-        if listing?.problem != nil { return tr("Non disponibile", "Unavailable") }
-        return " "
     }
 }
 
@@ -311,8 +575,27 @@ private struct CourseRecordings: View {
     @State private var query = ""
     @State private var selection: String?
     @FocusState private var searchFocused: Bool
+    /// The pane's rows and week sections (#100). The pane observes the whole controller, so its
+    /// `body` runs again when a spinner flips, a row starts opening or another course's listing
+    /// arrives; the search and the grouping by week (a calendar lookup per recording) are redone
+    /// only when the listing, the search, the language, the time zone or the day changes.
+    /// `RecmanCourseListDerivation.Inputs` says why each is there.
+    @State private var derivation = DerivedValueCache<RecmanCourseListDerivation.Inputs, RecmanCourseListDerivation>()
+    /// Lesson numbers and total minutes, which depend on the listing alone: typing in the search
+    /// doesn't sort the whole list again.
+    @State private var summaryCache = DerivedValueCache<[RecmanRecording], RecmanCourseListSummary>()
+    /// The bulk button's last scan, so a progress tick doesn't scan the listing (#209).
+    @State private var bulkCache = RecordingsPresentation.BulkActionCache()
 
     private var listing: RecordingsListing? { recordings.listing(for: key) }
+
+    private func derivedList(_ list: [RecmanRecording]) -> RecmanCourseListDerivation {
+        derivation.value(for: .init(recordings: list, query: query, language: AppLanguage.current, timeZone: .current, now: Date()), compute: RecmanCourseListDerivation.init)
+    }
+
+    private func summary(_ list: [RecmanRecording]) -> RecmanCourseListSummary {
+        summaryCache.value(for: list, compute: RecmanCourseListSummary.init)
+    }
 
     var body: some View {
         VStack(spacing: 0) {
@@ -333,15 +616,24 @@ private struct CourseRecordings: View {
     }
 
     private var header: some View {
-        VStack(alignment: .leading, spacing: 6) {
+        // `summary` sums the listing's minutes: computed here, where a progress tick doesn't
+        // reach, and only joined with the progress line inside the reader.
+        let summary = summary
+        return VStack(alignment: .leading, spacing: 6) {
             Text(name)
                 .font(.title3.weight(.semibold))
                 .lineLimit(3)
                 .fixedSize(horizontal: false, vertical: true)
-            Text(summary)
-                .font(.callout)
-                .foregroundStyle(.secondary)
-                .fixedSize(horizontal: false, vertical: true)
+            WatchProgressReader(recordings: recordings) { progress in
+                let line = progress.headerLine(summary, for: key)
+                #if DEBUG
+                let _ = RecordingsPageProbes.header?(line)
+                #endif
+                Text(line)
+                    .font(.callout)
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
             if let updatedAt = listing?.updatedAt {
                 Text(tr("Aggiornato \(updatedAt.relativeText)", "Updated \(updatedAt.relativeText)"))
                     .font(.caption)
@@ -358,8 +650,16 @@ private struct CourseRecordings: View {
         HStack(spacing: 12) {
             searchField
             Spacer(minLength: 0)
+            WatchProgressReader(recordings: recordings) { progress in
+                let action = bulkCache.action(for: key, recordings: listing?.recordings, values: progress)
+                Button(action.label.text) { recordings.toggleAllDone(key) }
+                    .buttonStyle(.borderless)
+                    .font(.callout)
+                    .fixedSize()
+                    .disabled(!action.enabled)
+            }
             if recordings.newCount(for: key) > 0 {
-                Button(tr("Segna come viste", "Mark as seen")) { recordings.markSeen(key) }
+                Button(tr("Segna novità come lette", "Mark new recordings as read")) { recordings.markSeen(key) }
                     .buttonStyle(.borderless)
                     .font(.callout)
                     .fixedSize()
@@ -385,8 +685,8 @@ private struct CourseRecordings: View {
         guard let list = listing?.recordings else {
             return listing?.isLoading == true ? "\(year) · \(tr("caricamento…", "loading…"))" : year
         }
-        let minutes = list.compactMap { RecordingsPresentation.minutes($0.duration) }.reduce(0, +)
-        var parts = [year, tr("\(list.count) registrazioni", englishCount(list.count, "recording", "recordings"))]
+        let minutes = summary(list).totalMinutes
+        var parts = [year, RecordingsPresentation.recordingCount(list.count).text]
         if minutes > 0 { parts.append(RecordingsPresentation.durationText(minutes: minutes)) }
         return parts.joined(separator: " · ")
     }
@@ -417,17 +717,17 @@ private struct CourseRecordings: View {
 
     @ViewBuilder private var content: some View {
         if let list = listing?.recordings {
-            let shown = list.filter { RecordingsPresentation.matches($0, query: query) }
+            let model = derivedList(list)
             if list.isEmpty {
                 ContentUnavailableView {
                     Label(tr("Ancora nessuna registrazione", "No recordings yet"), systemImage: "video.slash")
                 } description: {
                     Text(tr("Quando ne viene pubblicata una, la trovi qui.", "When one is published, you'll find it here."))
                 }
-            } else if shown.isEmpty {
+            } else if model.shown.isEmpty {
                 ContentUnavailableView.search(text: query)
             } else {
-                recordingList(shown, numbers: RecordingsPresentation.numbers(list))
+                recordingList(model, numbers: summary(list).numbers)
             }
         } else if listing?.isLoading == true {
             VStack(spacing: 10) {
@@ -439,32 +739,55 @@ private struct CourseRecordings: View {
         }
     }
 
-    private func recordingList(_ shown: [RecmanRecording], numbers: [String: Int]) -> some View {
-        let sections = RecordingsPresentation.weekSections(shown, now: Date(), calendar: RecordingsPresentation.calendar(), locale: BeepbarStyle.locale)
-        let byID = Dictionary(shown.map { ($0.id, $0) }, uniquingKeysWith: { first, _ in first })
-        return List(selection: $selection) {
-            ForEach(sections, id: \.title) { section in
-                Section(section.title) {
-                    ForEach(section.recordings) { recording in
-                        RecordingRow(
-                            recording: recording,
-                            number: numbers[recording.id],
-                            isNew: recordings.isNew(recording),
-                            isOpening: recordings.openingRecordingID == recording.id,
-                            play: { recordings.play(recording) }
-                        )
-                        .tag(recording.id)
+    private func recordingList(_ model: RecmanCourseListDerivation, numbers: [String: Int]) -> some View {
+        let byID = model.byID
+        let firstID = model.shown.first?.id
+        // One set per `body` instead of a scan of every bookmark for every row.
+        let watchlisted = Set(recordings.study.bookmarks.map(\.id))
+        // Sections, filtering and numbering stay here (this view doesn't observe the progress
+        // model); a tick re-runs only the reader's closure below, see `WatchProgressReader`.
+        return WatchProgressReader(recordings: recordings) { progress in
+            List(selection: $selection) {
+                ForEach(model.sections, id: \.title) { section in
+                    Section(section.title) {
+                        ForEach(section.recordings) { recording in
+                            RecordingRow(
+                                recording: recording,
+                                number: numbers[recording.id],
+                                isNew: recordings.isNew(recording),
+                                isOpening: recordings.openingRecordingID == recording.id,
+                                isWatchlisted: watchlisted.contains(RecordingsStudyState.identity(recording)),
+                                canEdit: recordings.canEditStudy,
+                                canPlay: recordings.access == .ready,
+                                watchlistCourseName: name,
+                                watch: progress.row(for: recording),
+                                actions: RecordingRow.Actions(
+                                    toggleWatchlist: { recordings.toggleWatchlist(recording, courseName: name) },
+                                    play: { recordings.play(recording) },
+                                    setDone: { recordings.setDone(recording, $0) }
+                                )
+                            )
+                            .equatable()
+                            .uiContentReady(.recordings, enabled: recording.id == firstID)
+                            .tag(recording.id)
+                        }
                     }
                 }
             }
         }
         .listStyle(.inset)
         .scrollContentBackground(.hidden)
-        // Double click and Return open the player, the way Finder opens a file.
+        // Double click and Return open the player, the way Finder opens a file. The modifier
+        // sits on the reader, not on the `List` inside it; SwiftUI still hands it to the list
+        // (`courseListMenuAndPrimaryActionReachTheList` drives the real AppKit list, #198).
         .contextMenu(forSelectionType: String.self) { ids in
             if let recording = ids.first.flatMap({ byID[$0] }) {
-                Button(tr("Apri nel browser", "Open in browser")) { recordings.play(recording) }
+                // Really the browser: Play (double click, Return, the row's button) is BeepBar's
+                // own player since #148, and this item is the way around it.
+                Button(tr("Apri nel browser", "Open in browser")) { recordings.openInBrowser(recording) }
                 Button(tr("Copia link", "Copy link")) { recordings.copyLink(recording) }
+                Button(recordings.study.contains(recording) ? tr("Rimuovi dalla watchlist", "Remove from watchlist") : tr("Aggiungi alla watchlist", "Add to watchlist")) { recordings.toggleWatchlist(recording, courseName: name) }
+                    .disabled(!recordings.canEditStudy)
             }
         } primaryAction: { ids in
             if let recording = ids.first.flatMap({ byID[$0] }) { recordings.play(recording) }
@@ -472,26 +795,260 @@ private struct CourseRecordings: View {
     }
 }
 
+/// The global queue uses saved snapshots, so choosing what to watch never requires visiting each course.
+private struct WatchlistRecordings: View {
+    @ObservedObject var recordings: RecordingsController
+    let refresh: () -> Void
+    @State private var query = ""
+    @State private var selection: String?
+    /// The bookmarks matching the search, newest first (#100): filtered and sorted again only when
+    /// the bookmarks or the search change, not on every publication of the controller.
+    @State private var shownCache = DerivedValueCache<ShownInputs, [RecordingsStudyState.Bookmark]>()
+
+    private struct ShownInputs: Equatable {
+        let bookmarks: [RecordingsStudyState.Bookmark]
+        let query: String
+    }
+
+    private var shown: [RecordingsStudyState.Bookmark] {
+        let study = recordings.study
+        return shownCache.value(for: ShownInputs(bookmarks: study.bookmarks, query: query)) { study.visibleBookmarks(query: $0.query) }
+    }
+
+    private var listings: [RecordingsListing] {
+        let keys = Set(recordings.study.bookmarks.compactMap {
+            RecmanCourseKey(courseCode: $0.recording.courseCode, academicYear: $0.recording.academicYear)
+        })
+        return keys.sorted { ($0.academicYear, $0.courseCode) < ($1.academicYear, $1.courseCode) }
+            .compactMap { recordings.listing(for: $0) }
+    }
+
+    // `listings` looks up every bookmarked course, and depends on listings the controller updates
+    // all the time: worked out once per `body` and passed down, not once per use (#100).
+    var body: some View {
+        let shown = self.shown
+        let listings = self.listings
+        let isLoading = listings.contains { $0.isLoading }
+        VStack(spacing: 0) {
+            VStack(alignment: .leading, spacing: 6) {
+                Text(tr("Watchlist", "Watchlist")).font(.title3.weight(.semibold))
+                Text(tr("Le lezioni che hai scelto, da tutti i corsi.", "The lessons you chose, from every course."))
+                    .font(.callout).foregroundStyle(.secondary)
+            }
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .padding(.horizontal, 20).padding(.top, 18).padding(.bottom, 14)
+            HStack(spacing: 12) {
+                TextField(tr("Cerca lezioni o corsi", "Search lessons or courses"), text: $query)
+                    .textFieldStyle(.roundedBorder)
+                    .frame(minWidth: 120, maxWidth: 280)
+                Spacer(minLength: 0)
+                Button(action: refresh) {
+                    ZStack {
+                        Image(systemName: "arrow.clockwise").opacity(isLoading ? 0 : 1)
+                        if isLoading { ProgressView().controlSize(.small) }
+                    }
+                }
+                    .buttonStyle(.borderless)
+                    .help(tr("Aggiorna la watchlist", "Refresh watchlist"))
+                    .accessibilityLabel(tr("Aggiorna la watchlist", "Refresh watchlist"))
+                    .disabled(recordings.access != .ready || isLoading)
+            }
+            .padding(.horizontal, 20).padding(.bottom, 14)
+            Divider()
+            if let problem = listings.compactMap(\.problem).first {
+                NoticeBanner(text: problem.message, systemImage: "wifi.exclamationmark", tint: .orange).padding(14)
+            }
+            if let problem = recordings.openingProblem {
+                NoticeBanner(text: problem.message, systemImage: "play.slash", tint: .orange).padding(14)
+            }
+            if shown.isEmpty { empty.frame(maxWidth: .infinity, maxHeight: .infinity) }
+            else {
+                // Same split as the course list: only the reader observes the progress model.
+                // A bookmark whose course listing isn't loaded is unknown to the model and shows
+                // neither bar nor checkbox (`RecordingsPresentation.WatchRow.unknown`).
+                WatchProgressReader(recordings: recordings) { progress in
+                    List(selection: $selection) {
+                        ForEach(shown) { bookmark in
+                            let item = bookmark.recording
+                            RecordingRow(recording: item, number: nil, isNew: recordings.isNew(item),
+                                isOpening: recordings.openingRecordingID == item.id,
+                                isWatchlisted: true,
+                                canEdit: recordings.canEditStudy, canPlay: recordings.access == .ready && !bookmark.unavailable,
+                                courseName: bookmark.courseName, unavailable: bookmark.unavailable,
+                                watchlistCourseName: bookmark.courseName,
+                                watch: progress.row(for: item),
+                                actions: RecordingRow.Actions(
+                                    toggleWatchlist: { recordings.toggleWatchlist(item, courseName: bookmark.courseName) },
+                                    play: { recordings.play(item) },
+                                    setDone: { recordings.setDone(item, $0) }
+                                ))
+                                .equatable()
+                                .tag(bookmark.id)
+                        }
+                    }
+                }
+                .listStyle(.inset).scrollContentBackground(.hidden)
+                // On the reader like the course list's; pinned by
+                // `watchlistMenuAndPrimaryActionReachTheList` (#198).
+                .contextMenu(forSelectionType: String.self) { ids in
+                    if let bookmark = shown.first(where: { ids.contains($0.id) }) {
+                        Button(tr("Rimuovi dalla watchlist", "Remove from watchlist")) { recordings.toggleWatchlist(bookmark.recording, courseName: bookmark.courseName) }
+                            .disabled(!recordings.canEditStudy)
+                        Button(tr("Apri nel browser", "Open in browser")) { recordings.openInBrowser(bookmark.recording) }
+                            .disabled(recordings.access != .ready || bookmark.unavailable)
+                    }
+                } primaryAction: { ids in
+                    if let bookmark = shown.first(where: { ids.contains($0.id) }), !bookmark.unavailable {
+                        recordings.play(bookmark.recording)
+                    }
+                }
+            }
+        }
+    }
+
+    @ViewBuilder private var empty: some View {
+        if recordings.study.bookmarks.isEmpty {
+            ContentUnavailableView {
+                Label(tr("La watchlist è vuota", "Your watchlist is empty"), systemImage: "bookmark")
+            } description: {
+                Text(tr("Scegli un corso e usa il segnalibro accanto a una lezione per aggiungerla qui.", "Choose a course and bookmark a lesson to add it here."))
+            }
+        } else {
+            ContentUnavailableView.search(text: query)
+        }
+    }
+}
+
+/// Observes the watch progress model once for a whole list (or header) and hands its content a
+/// copy of the model's values (`RecordingsPresentation.WatchValues`) to build plain row values
+/// from.
+///
+/// Why: a playing lecture's ~30 s tick re-renders every view observing the model. The parent
+/// pages observe only the controller and build the list's data (filtering, week sections,
+/// numbers) in their own body, which a tick never reaches; the tick re-runs only this reader's
+/// closure, `List` builds the visible rows again (the content must capture the values, see
+/// `WatchValues`), and `RecordingRow` being `Equatable` keeps SwiftUI from running the body of
+/// any row whose values didn't change: in practice the playing lecture's row. Never observe the
+/// model in a row (one subscription per row, every row's body on each tick) or in the pages
+/// themselves (sections recomputed on each tick).
+///
+/// Cost per tick, measured on the isolated fixture at 5eb7199 (a temporary counter in
+/// `WatchValues.row`, `aTickReRendersOnlyThePlayingRow`, 1000×700 window): 302 `row` calls with
+/// 1,000 recordings and 326 with 5,000 (the rows `List` keeps built around the visible ones,
+/// nearly flat in the listing's size), and one row body in both. Package G records these numbers
+/// with the rest of the delivery evidence. Every reader closure must keep that property: the
+/// course toolbar's bulk button, added later, scanned the whole listing on each tick until it
+/// went through `RecordingsPresentation.BulkActionCache` (#209; `aTickDoesNotScanTheListing`
+/// pins zero scans per tick). Nothing in a reader may visit every recording on a publication.
+struct WatchProgressReader<Content: View>: View {
+    @ObservedObject var progress: RecordingsWatchProgressModel
+    /// `RecordingsController.canEditProgress` when the page built this reader. It can go stale
+    /// until the page's next update (it isn't published), and that is harmless: `setDone`
+    /// checks the account again and does nothing without one, and the checkbox draws only the
+    /// committed value, so a click that was refused leaves the box as it was.
+    let canEdit: Bool
+    @ViewBuilder let content: (RecordingsPresentation.WatchValues) -> Content
+
+    init(recordings: RecordingsController, @ViewBuilder content: @escaping (RecordingsPresentation.WatchValues) -> Content) {
+        progress = recordings.watchProgress
+        canEdit = recordings.canEditProgress
+        self.content = content
+    }
+
+    /// What the content receives; a property so tests can read it without rendering.
+    var values: RecordingsPresentation.WatchValues { RecordingsPresentation.WatchValues(progress, canEdit: canEdit) }
+
+    var body: some View { content(values) }
+}
+
+#if DEBUG
+/// Test seams of the Recordings page, nil (no cost beyond the check) outside tests: each row
+/// body hands over the row it draws, and the course header the line it shows, so a hosting test
+/// can prove what reached the screen and how often.
+@MainActor enum RecordingsPageProbes {
+    static var row: ((RecordingRow) -> Void)?
+    static var header: ((String) -> Void)?
+    /// A scan of the listing by the course toolbar's bulk button, with the listing's size.
+    static var bulkScan: ((Int) -> Void)?
+    /// A sidebar course row's body: its title and whether the orange marker shows.
+    static var sidebarRow: ((_ name: String, _ marker: Bool) -> Void)?
+}
+#endif
+
 /// A recording keeps its title above its metadata and its play action visible without hover.
-private struct RecordingRow: View {
+///
+/// `Equatable` on purpose (see `WatchProgressReader`): `==` compares every value the body shows
+/// and ignores `actions`. Invariant: the actions capture only the controller (one per page),
+/// `recording` and `watchlistCourseName`, all compared or constant, so a row skipped as equal
+/// can never hold an action aimed at another recording or course name. Add any new captured
+/// value as a compared field.
+struct RecordingRow: View, Equatable {
+    /// What the row's controls do. Closures, so the row needs no controller and tests can host it.
+    struct Actions {
+        let toggleWatchlist: () -> Void
+        let play: () -> Void
+        /// Ticks (true) or un-ticks the lecture: `RecordingsController.setDone`.
+        let setDone: (Bool) -> Void
+    }
+
     let recording: RecmanRecording
     let number: Int?
     let isNew: Bool
     let isOpening: Bool
-    let play: () -> Void
+    let isWatchlisted: Bool
+    let canEdit: Bool
+    let canPlay: Bool
+    var courseName: String? = nil
+    var unavailable = false
+    /// The course name a bookmark made from this row stores (the page's name in a course list,
+    /// the bookmark's own in the Watchlist). Captured by `actions.toggleWatchlist`.
+    let watchlistCourseName: String
+    let watch: RecordingsPresentation.WatchRow
+    let actions: Actions
+
+    nonisolated static func == (lhs: RecordingRow, rhs: RecordingRow) -> Bool {
+        lhs.recording == rhs.recording && lhs.number == rhs.number && lhs.isNew == rhs.isNew
+            && lhs.isOpening == rhs.isOpening && lhs.isWatchlisted == rhs.isWatchlisted
+            && lhs.canEdit == rhs.canEdit && lhs.canPlay == rhs.canPlay && lhs.courseName == rhs.courseName
+            && lhs.unavailable == rhs.unavailable && lhs.watchlistCourseName == rhs.watchlistCourseName
+            && lhs.watch == rhs.watch
+    }
+
+    /// The checkbox's binding: reads the committed value only (`WatchRow.isOn`, no optimistic
+    /// flip) and forwards exactly the value the student asked for.
+    static func doneBinding(watch: RecordingsPresentation.WatchRow, setDone: @escaping (Bool) -> Void) -> Binding<Bool> {
+        Binding(get: { watch.isOn }, set: { setDone($0) })
+    }
+
+    /// VoiceOver's label of the bookmark button. It names the lecture, like Play's label, so a
+    /// VoiceOver user moving between rows knows which lecture the button adds or removes (#196);
+    /// the tooltip stays short because the row is next to it on screen.
+    static func watchlistAccessibilityLabel(isWatchlisted: Bool, title: String) -> BilingualText {
+        isWatchlisted ? BilingualText("Rimuovi \(title) dalla watchlist", "Remove \(title) from watchlist")
+            : BilingualText("Aggiungi \(title) alla watchlist", "Add \(title) to watchlist")
+    }
 
     var body: some View {
+        #if DEBUG
+        let _ = RecordingsPageProbes.row?(self)
+        #endif
         HStack(spacing: 10) {
+            // Hidden from VoiceOver when clear: an empty label still made the dot an unnamed
+            // element at the start of every row that isn't new (#196).
             Circle()
                 .fill(isNew ? Color.accentColor : .clear)
                 .frame(width: 7, height: 7)
-                .accessibilityLabel(isNew ? tr("Nuova", "New") : "")
-            Text(number.map { "#\($0)" } ?? "")
-                .font(.callout)
-                .monospacedDigit()
-                .foregroundStyle(.tertiary)
-                .frame(width: 34, alignment: .leading)
+                .accessibilityLabel(tr("Nuova", "New"))
+                .accessibilityHidden(!isNew)
+            if let number {
+                Text("#\(number)")
+                    .font(.callout).monospacedDigit().foregroundStyle(.tertiary)
+                    .frame(width: 34, alignment: .leading)
+            }
             VStack(alignment: .leading, spacing: 6) {
+                if let courseName {
+                    Text(courseName).font(.caption.weight(.semibold)).foregroundStyle(.secondary)
+                }
                 Text(RecordingsPresentation.title(recording))
                     .font(.body.weight(isNew ? .semibold : .medium))
                     .lineLimit(3)
@@ -506,9 +1063,24 @@ private struct RecordingRow: View {
                         kind
                     }
                 }
+                if unavailable {
+                    Text(tr("Non più disponibile nell’archivio", "No longer available in the archive"))
+                        .font(.caption).foregroundStyle(.secondary)
+                }
+                progressBar
             }
             .frame(maxWidth: .infinity, alignment: .leading)
-            Button(action: play) {
+            doneCheckbox
+            Button(action: actions.toggleWatchlist) {
+                Image(systemName: isWatchlisted ? "bookmark.fill" : "bookmark")
+                    .font(.system(size: 20))
+                    .foregroundStyle(isWatchlisted ? Color.accentColor : .secondary)
+                    .frame(width: 32, height: 32)
+            }
+            .buttonStyle(.plain).disabled(!canEdit)
+            .help(isWatchlisted ? tr("Rimuovi dalla watchlist", "Remove from watchlist") : tr("Aggiungi alla watchlist", "Add to watchlist"))
+            .accessibilityLabel(Self.watchlistAccessibilityLabel(isWatchlisted: isWatchlisted, title: RecordingsPresentation.title(recording)).text)
+            Button(action: actions.play) {
                 ZStack {
                     ProgressView().controlSize(.small).opacity(isOpening ? 1 : 0)
                     Image(systemName: "play.circle.fill")
@@ -519,11 +1091,52 @@ private struct RecordingRow: View {
                 .frame(width: 32, height: 32)
             }
             .buttonStyle(.plain)
-            .help(tr("Apri nel browser", "Open in browser"))
+            .disabled(!canPlay)
+            // Play is BeepBar's own player since #148 (the browser only when that isn't possible);
+            // "Apri nel browser" is the row menu's item.
+            .help(tr("Riproduci", "Play"))
             .accessibilityLabel(tr("Riproduci \(RecordingsPresentation.title(recording))", "Play \(RecordingsPresentation.title(recording))"))
         }
         .padding(.vertical, 9)
         .contentShape(Rectangle())
+    }
+
+    /// A thin read-only bar under the metadata: how far the student got, full and green once
+    /// done. Absent while the stored state is unknown, so the row never claims 0 % for a lecture
+    /// the store may say is done.
+    @ViewBuilder private var progressBar: some View {
+        if let value = watch.barValue {
+            HStack(spacing: 6) {
+                ProgressView(value: value)
+                    .progressViewStyle(.linear)
+                    .controlSize(.mini)
+                    .tint(watch.barTint)
+                    .frame(maxWidth: 220)
+                if watch.showsDoneStyle {
+                    Image(systemName: "checkmark.circle.fill")
+                        .font(.caption)
+                        .foregroundStyle(.green)
+                }
+            }
+            .accessibilityElement(children: .ignore)
+            .accessibilityLabel(tr("Avanzamento", "Progress"))
+            .accessibilityValue(watch.accessibilityValue.text)
+        }
+    }
+
+    /// "Done (watched or attended in person)". Shows the committed value only: a click asks the
+    /// controller, and the box flips when the saved value is published (disabled meanwhile), so
+    /// a failed save never leaves a box that lies. While the state is unknown the box keeps its
+    /// place but is hidden: an empty box would say "not done" for a lecture that may be done.
+    private var doneCheckbox: some View {
+        let label = tr("Fatta (vista o seguita in presenza)", "Done (watched or attended in person)")
+        return Toggle(label, isOn: Self.doneBinding(watch: watch, setDone: actions.setDone))
+            .toggleStyle(.checkbox)
+            .labelsHidden()
+            .disabled(!watch.checkboxEnabled)
+            .opacity(watch.checkboxVisible ? 1 : 0)
+            .accessibilityHidden(watch.checkboxAccessibilityHidden)
+            .help(label)
     }
 
     private var metadata: some View {
@@ -540,7 +1153,11 @@ private struct RecordingRow: View {
     }
 
     private var details: String {
-        let when = recording.recordedAt.formatted(Date.FormatStyle().weekday(.abbreviated).day().month(.abbreviated).hour().minute().locale(BeepbarStyle.locale))
+        var style = Date.FormatStyle().weekday(.abbreviated).day().month(.abbreviated).hour().minute().locale(BeepbarStyle.locale)
+        if Calendar.current.component(.year, from: recording.recordedAt) != Calendar.current.component(.year, from: Date()) {
+            style = style.year()
+        }
+        let when = recording.recordedAt.formatted(style)
         let length = RecordingsPresentation.minutes(recording.duration).map { RecordingsPresentation.durationText(minutes: $0) } ?? recording.duration
         return "\(when) · \(length)"
     }

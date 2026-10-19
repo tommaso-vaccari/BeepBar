@@ -1,0 +1,66 @@
+# Log
+
+## [2026-10-10] ingest | Avvio Compliance Wiki
+
+Quattro fonti ufficiali, gist Karpathy originale alla revisione ac46de1 ed estratti del codice pubblico dev c9a04dc. Creati schema, schede, quadro normativo, mappa dati, valutazione e piano. Nessun dato personale/chat acquisito. Indagine statica, conformità aperta; nessun fix, commit, push o release. Fonti/hash nel manifest; verifica in [[90 Operations/Lint 2026-10-10]].
+
+## [2026-10-11] update | Riproduzione nativa delle registrazioni (#148)
+
+Aggiornate mappa dei dati (file di sessione con cookie Webex ed email Polimi, posizione di riproduzione, riproduzione nativa) e valutazione C05 sul branch feature/rnp-app-integration, analisi statica del codice. Nessuna nuova fonte esterna; la passata GDPR sul binario prima della release resta aperta. Test e build non eseguiti nell'ambiente di sviluppo (Linux).
+
+## [2026-10-11] update | Email Polimi dal profilo senza conferma (#148)
+
+Decisione del responsabile: l'email del profilo WeBeep è usata per l'accesso a Webex senza conferma esplicita, letta al primo Play. Aggiornate mappa dei dati (riga sessione Webex/email, marcatore di rimozione per account) e C05 (manca ora un'azione dell'utente prima dell'uso: da valutare informazione e base). Analisi statica sul branch fix/rnp-email-confirmed-by-default; test e build non eseguiti (Linux). Nessuna nuova fonte esterna.
+
+## [2026-10-12] update | Riproduzione nativa verificata su macOS (PR #152)
+
+Test completi e build Release eseguiti su macOS sul branch della PR #152, dopo il merge di dev. La review indipendente ha trovato un caso in cui l'email di un account restava in memoria dopo un cambio account senza sessione Polimi: corretto, con test di regressione. Mappa e C05 aggiornate: riferimento alla PR, minimizzazione della lettura del profilo, inoltro dell'email lungo la catena idbroker → IdP Polimi da verificare. Nessuna nuova fonte esterna; la passata GDPR sul binario prima della release resta aperta.
+
+## [2026-10-10] integrate | Preparazione integrazione in dev
+
+Allineamento a origin/dev d3a42dc: integrazione telemetria sopraggiunta rispetto a c9a04dc. Aggiunta fonte codice S-0007 e aggiornate mappa, valutazione e piano; gli snapshot originari restano immutabili. Integrazione della wiki autorizzata; passata finale GDPR prima della prossima release registrata nel piano e nel protocollo release di AGENTS.md. Nessun comportamento dell’app modificato.
+
+## [2026-10-11] update | Elenco corsi salvato (PR #138)
+
+Aggiunta alla mappa dei dati la riga del nuovo file locale `course-list.json` (D10, #98): contenuto, assenza di destinatari, limiti, permessi ed eventi di eliminazione, verificati sul codice del branch della PR. Minimizzazione: niente token né ID utente Moodle, l'account è riconosciuto da un'impronta unidirezionale. Nessuna nuova fonte; valutazione e piano invariati. Da riverificare quando la PR arriva in dev e nella passata GDPR pre-release.
+
+## [2026-10-12] update | Elenco corsi salvato: conservazione (PR #138)
+
+Riga della mappa dei dati corretta dopo la seconda review: aggiunti `savedAt` e la versione del formato; il limite di 30 giorni era applicato solo alla lettura (apertura della finestra), quindi un utente che usa solo la barra dei menu conservava un elenco scaduto. Ora il file scaduto viene eliminato anche all'avvio e a ogni sync, e la credenziale assente all'avvio lo elimina anche con il recupero bloccato; verificato sul codice e con test del branch della PR. Nessuna nuova fonte; valutazione e piano invariati.
+
+## [2026-10-12] update | Telemetria: identificativo mensile e campi del payload
+
+Sul branch `feature/telemetry-monthly-identity` (non ancora in dev): l'UUID permanente di installazione è sostituito da un UUID casuale per mese UTC, rigenerato in modo indipendente a ogni cambio di mese e cancellato all'opt-out; l'UUID della prima build dev viene cancellato all'avvio. Il payload usa le chiavi standard dell'SDK TelemetryDeck per versione app, piattaforma, versione principale di macOS e lingua, più cinque impostazioni `BeepBar.*` a bassa cardinalità. Aggiornate mappa dei dati, C08 e piano di verifica; nessuna nuova fonte, S-0007 resta lo snapshot di d3a42dc e va rinnovato quando il branch arriva in dev. C08 resta aperto.
+
+## 2026-10-13 — Snapshot telemetria dopo il merge
+
+PR #158 integrata in dev a `50177f3905d50d9fa4252fc952a2fa8bf275de0d`. Rinnovata S-0007 con snapshot immutabile del codice integrato e dei lettori di impostazioni; conservati snapshot e hash precedenti. Registrati revisione, test e build sul candidato integrato, limiti di collegabilità, semantica dell'ateneo selezionato e recupero dell'orologio. C08 e la verifica pre-release restano aperti.
+
+## [2026-10-14] update | Avanzamento, riepilogo nel menu, aggiornamento a ogni sync e Now Playing (PR #154, draft)
+
+Aggiornata la mappa dei dati sul branch `feature/recordings-progress-and-player` (punta d85b090, base dev 38702ea), solo per analisi statica del codice: nuove righe per la tabella `progress` (stesso file SQLite dello stato «visto») e per il riepilogo per il menu in UserDefaults (compresa la prossima lezione come riga completa dell'archivio, accettata dal responsabile); riga «Archivio Polimi» corretta da «quando la pagina è aperta» a «anche in background a ogni sync»; indirizzo dell'immagine del corso nell'elenco corsi salvato e riga Now Playing riferite alla PR. Nessun nuovo destinatario né telemetria. Nessuna nuova fonte esterna. **La passata GDPR completa su codice e binario di release NON è stata eseguita: è un'attività da fare prima del rilascio (piano di verifica, punto 6). Nessuna affermazione di conformità.** Aperti: contenuto del link di anteprima salvato nel riepilogo; costo reale delle richieste in background (non misurato); verifica a runtime di eliminazione dei nuovi dati a logout e cambio account. Test e build non rieseguiti per questa voce.
+
+
+### 2026-10-14 — Minimizzazione riepilogo PR #154
+
+Analisi statica del completamento della PR: `StoredCourseWatchSummary` scrive solo ID, codice/anno, titolo e durata della prossima lezione. URL originale, query, data, tipo e dimensione esclusi; URL ricostruito da ID validato. Le righe legacy restano sul disco fino alla successiva riscrittura o rimozione. Aggiornata la mappa, nessuna nuova fonte esterna né conclusione giuridica; verifica pre-release ancora aperta.
+
+## 2026-10-17 — issue #180
+
+Ingestione S-0008–S-0012: accordo/FAQ fornitore, basi GDPR, ePrivacy finale e Garante. La finestra dashboard non dimostra cancellazione; contratto fornitore non equivale automaticamente a nomina art. 28. Branch di rimedio riduce payload ed espone errori di cancellazione. Gate legale, runtime e approvazione informativa aperti. Nessun dato reale o invio al fornitore.
+
+Decisioni utente del 2026-10-17: sessioni massimo dieci giorni dal primo salvataggio, esclusione token/sessioni dai futuri backup e comando di cancellazione dati di studio per account conservando i materiali. Implementazione nel branch #181, verifiche automatiche e revisione indipendente; nessuna conclusione di conformità giuridica.
+
+
+## 2026-10-18 — telemetria aggregata v2, PR #181
+
+Eliminata identità mensile; metrica conservata tramite contatore locale e valore comune. Rivalutate fonti pubbliche Garante §7.2, FAQ/architettura TelemetryDeck e GDPR, con affidamento proporzionato e analisi dei mezzi ragionevoli. Esito favorevole qualificato alla configurazione v2 nel gate, non alle serie storiche o all’intera app. Aggiornati informativa candidata e procedura; controlli manuali esclusi restano non eseguiti. Evidenze automatiche per SHA nella PR.
+
+
+## 2026-10-19 — coerenza informativa, issue #202, #203 e #218
+
+Riverificato dev c22f194: la disattivazione conserva i punti di ripresa, logout/cambio identità e cancellazione dati di studio li eliminano. Corretta la riga dell’inventario e distinto il protocollo v2 dalla telemetria storica. Il testo IT/EN nelle Impostazioni descrive Webex/idbroker e il possibile inoltro al Politecnico, senza pretendere una verifica live. README descrive il protocollo aggregato v2 e i limiti di opt-out, distinguendo dev non rilasciata. Nessun flusso, base giuridica o configurazione modificati; nessuna nuova fonte o conclusione di conformità.
+
+## 2026-10-19 — avviso Chiudi, PR #231
+
+Riverificate e salvate revisioni immutabili S-0008/S-0009 e fonti S-0013–S-0016. Rivalutati primo invio subito dopo Chiudi e opposizione tramite Impostazioni. Esito favorevole qualificato v2, costo navigazione e limiti documentali espliciti; nessuna certificazione globale, accettazione contrattuale, contatto o invio reale. Valutazioni storiche UUID non riaperte.

@@ -1,10 +1,14 @@
 import Foundation
+#if canImport(FoundationNetworking)
+import FoundationNetworking
+#endif
 import Testing
 @testable import BeepbarCore
 
 /// The Polimi session file. What it guards: a sign-in that doesn't survive a relaunch (the user
-/// would be asked every time), a session that outlives its account, and anything but Polimi's own
-/// live cookies being written to disk.
+/// would be asked every time), a session that outlives its account, anything but Polimi's and
+/// Webex's own live cookies being written to disk, and (v2, issue #148) users of a v1 file being
+/// signed out by the format change.
 struct RecmanSessionCodecTests {
     private let now = Date(timeIntervalSince1970: 1_790_000_000)
 
@@ -24,8 +28,8 @@ struct RecmanSessionCodecTests {
             cookie("__Host-shib_idp_session", domain: "shibidp.polimi.it"),
             cookie("JSESSIONID", domain: "onlineservices.polimi.it", path: "/recman_frontend"),
             cookie("OLD", domain: "aunicalogin.polimi.it", expires: now.addingTimeInterval(-1)),
-            cookie("webex", domain: ".webex.com"),
             cookie("lookalike", domain: "evilpolimi.it"),
+            cookie("other", domain: "example.com"),
         ]
         let data = try RecmanSessionCodec.encode(cookies, ownerUserID: 4242, now: now)
         let snapshot = try RecmanSessionCodec.decode(data, now: now)
@@ -36,7 +40,10 @@ struct RecmanSessionCodecTests {
         #expect(restored["__Host-shib_idp_session"]?.domain == "shibidp.polimi.it")
         #expect(restored["RESTA_CONNESSO"]?.domain == ".polimi.it")
         #expect(restored["JSESSIONID"]?.path == "/recman_frontend")
+#if canImport(Darwin)
+        // swift-corelibs-foundation drops the Secure attribute when it rebuilds a cookie from properties.
         #expect(restored["SSO_LOGIN"]?.isSecure == true)
+#endif
         #expect(restored["SSO_LOGIN"]?.expiresDate == nil)
         #expect(restored["SSO_LOGIN"]?.value == "v-SSO_LOGIN")
     }
@@ -56,5 +63,149 @@ struct RecmanSessionCodecTests {
         #expect(throws: RecmanSessionCodec.DecodeError.unsupportedVersion) { try RecmanSessionCodec.decode(newer) }
         let ownerless = try PropertyListSerialization.data(fromPropertyList: ["version": RecmanSessionCodec.currentVersion, "cookies": []], format: .binary, options: 0)
         #expect(throws: RecmanSessionCodec.DecodeError.unreadable) { try RecmanSessionCodec.decode(ownerless) }
+    }
+
+    // MARK: - v2 (issue #148)
+
+    /// The bytes a v1 BeepBar wrote, built exactly as its encoder did (version 1, no email key),
+    /// so these tests don't depend on the current encoder.
+    private func v1File(owner: Int, cookies: [HTTPCookie], extra: [String: Any] = [:]) throws -> Data {
+        let values: [[String: Any]] = cookies.compactMap { cookie in
+            cookie.properties.map { Dictionary(uniqueKeysWithValues: $0.map { ($0.key.rawValue, $0.value) }) }
+        }
+        var plist: [String: Any] = ["version": 1, "owner": owner, "cookies": values]
+        plist.merge(extra) { _, new in new }
+        return try PropertyListSerialization.data(fromPropertyList: plist, format: .binary, options: 0)
+    }
+
+    private func plist(_ data: Data) throws -> [String: Any] {
+        try #require(PropertyListSerialization.propertyList(from: data, format: nil) as? [String: Any])
+    }
+
+    /// The confirmed email survives a save and a read, and the file says it is v2. Guards against
+    /// an encoder that drops the email (the user would be asked to confirm it after every launch).
+    @Test func v2RoundTripKeepsTheEmail() throws {
+        let data = try RecmanSessionCodec.encode([cookie("SSO_LOGIN", domain: "aunicalogin.polimi.it")], ownerUserID: 7, email: "mario.rossi@mail.polimi.it", now: now)
+        #expect(try plist(data)["version"] as? Int == 2)
+        let snapshot = try RecmanSessionCodec.decode(data, now: now)
+        #expect(snapshot.email == "mario.rossi@mail.polimi.it")
+        #expect(snapshot.ownerUserID == 7)
+        #expect(snapshot.cookies.map(\.name) == ["SSO_LOGIN"])
+    }
+
+    /// Without an email (the default, as for callers that predate it) the key is absent rather
+    /// than an empty string, and reads back as nil.
+    @Test func v2RoundTripWithoutEmail() throws {
+        let data = try RecmanSessionCodec.encode([cookie("SSO_LOGIN", domain: "aunicalogin.polimi.it")], ownerUserID: 7, now: now)
+        #expect(try plist(data)["email"] == nil)
+        #expect(try RecmanSessionCodec.decode(data, now: now).email == nil)
+    }
+
+    /// A user updating from a v1 release keeps their Polimi session with no action: the v1 file
+    /// decodes with no email, and an email key a v1 file can't legitimately hold is ignored.
+    /// Guards against dropping v1 support, which would sign every existing user out.
+    @Test func v1FileDecodesWithoutEmail() throws {
+        let data = try v1File(owner: 4242, cookies: [
+            cookie("SSO_LOGIN", domain: "aunicalogin.polimi.it"),
+            cookie("JSESSIONID", domain: "onlineservices.polimi.it", path: "/recman_frontend"),
+        ], extra: ["email": "ignored@polimi.it"])
+        let snapshot = try RecmanSessionCodec.decode(data, now: now)
+        #expect(snapshot.ownerUserID == 4242)
+        #expect(snapshot.email == nil)
+        #expect(Set(snapshot.cookies.map(\.name)) == ["SSO_LOGIN", "JSESSIONID"])
+    }
+
+    /// The migration path: a v1 file, decoded and saved again (the controller does so on the next
+    /// save whose contents changed), becomes a v2 file holding the same session and the email.
+    @Test func v1FileIsRewrittenAsV2OnNextSave() throws {
+        let old = try RecmanSessionCodec.decode(try v1File(owner: 9, cookies: [cookie("SSO_LOGIN", domain: "aunicalogin.polimi.it")]), now: now)
+        let data = try RecmanSessionCodec.encode(old.cookies, ownerUserID: old.ownerUserID, email: "a.b@polimi.it", now: now)
+        let raw = try plist(data)
+        #expect(raw["version"] as? Int == 2)
+        #expect(raw["email"] as? String == "a.b@polimi.it")
+        let snapshot = try RecmanSessionCodec.decode(data, now: now)
+        #expect(snapshot.ownerUserID == 9)
+        #expect(snapshot.cookies.map(\.name) == ["SSO_LOGIN"])
+    }
+
+    /// The Webex login is kept, so playback doesn't sign in to Webex after each relaunch; Webex
+    /// lookalikes, expired Webex cookies and unrelated sites never reach the file.
+    @Test func keepsLiveWebexCookiesButNotLookalikes() throws {
+        let cookies = [
+            cookie("apex", domain: "webex.com"),
+            cookie("dotted", domain: ".webex.com", expires: now.addingTimeInterval(2 * 86_400)),
+            cookie("site", domain: "polimi.webex.com"),
+            cookie("deep", domain: "idbroker.eu.webex.com"),
+            cookie("upper", domain: "Polimi.WebEx.com"),
+            cookie("expired", domain: "polimi.webex.com", expires: now.addingTimeInterval(-1)),
+            cookie("prefix", domain: "evilwebex.com"),
+            cookie("suffix", domain: "webex.com.evil.com"),
+            cookie("tld", domain: "webex.co"),
+            cookie("cisco", domain: "cisco.com"),
+        ]
+        let data = try RecmanSessionCodec.encode(cookies, ownerUserID: 1, now: now)
+        // Checked on the raw file too: what is filtered must never be written, not only hidden on read.
+        #expect((try plist(data)["cookies"] as? [[String: Any]])?.count == 5)
+        #expect(Set(try RecmanSessionCodec.decode(data, now: now).cookies.map(\.name)) == ["apex", "dotted", "site", "deep", "upper"])
+    }
+
+    /// Short-lived Webex cookies (a ~30-minute tracker seen live) are not kept: they can't help
+    /// after a relaunch and would change the save fingerprint, rewriting the file on every Play.
+    /// Session cookies, the 2-day `WBX_*` kind and the 1-year `CK_LastLogin` kind stay. The
+    /// boundary is inclusive: exactly 12 hours left is kept, a second less is not.
+    @Test func shortLivedWebexCookiesAreNotKept() throws {
+        let twelveHours = RecmanSessionCodec.minimumWebexLifetime
+        #expect(twelveHours == 12 * 3_600)
+        let cookies = [
+            cookie("tracker", domain: "nfg1wss.webex.com", expires: now.addingTimeInterval(30 * 60)),
+            cookie("WBX_two_days", domain: "nfg1wss.webex.com", expires: now.addingTimeInterval(2 * 86_400)),
+            cookie("CK_LastLogin", domain: ".webex.com", expires: now.addingTimeInterval(365 * 86_400)),
+            cookie("session", domain: "politecnicomilano.webex.com"),
+            cookie("at_boundary", domain: "webex.com", expires: now.addingTimeInterval(twelveHours)),
+            cookie("just_short", domain: "webex.com", expires: now.addingTimeInterval(twelveHours - 1)),
+        ]
+        let data = try RecmanSessionCodec.encode(cookies, ownerUserID: 1, now: now)
+        #expect(Set(try RecmanSessionCodec.decode(data, now: now).cookies.map(\.name)) == ["WBX_two_days", "CK_LastLogin", "session", "at_boundary"])
+        // Applied on read too: two days later, the 2-day cookie has under 12 hours left.
+        let later = try RecmanSessionCodec.decode(data, now: now.addingTimeInterval(2 * 86_400 - 3_600))
+        #expect(Set(later.cookies.map(\.name)) == ["CK_LastLogin", "session"])
+    }
+
+    /// The 12-hour floor is Webex-only: a Polimi cookie with 30 minutes left is still kept until
+    /// it actually expires, as before v2.
+    @Test func polimiCookiesKeepTheirOwnExpiryRule() {
+        #expect(RecmanSessionCodec.keeps(cookie("short", domain: "aunicalogin.polimi.it", expires: now.addingTimeInterval(30 * 60)), now: now))
+        #expect(RecmanSessionCodec.keeps(cookie("last_second", domain: "polimi.it", expires: now.addingTimeInterval(1)), now: now))
+        #expect(!RecmanSessionCodec.keeps(cookie("expired", domain: "polimi.it", expires: now), now: now))
+    }
+
+    /// The host predicate on its own, with the label boundary checked on both sides.
+    @Test func webexHostMatchesOnALabelBoundary() {
+        for host in ["webex.com", "x.webex.com", "polimi.webex.com", "a.b.webex.com", "WEBEX.COM"] {
+            #expect(RecmanSessionCodec.isWebexHost(host), "\(host)")
+        }
+        for host in ["evilwebex.com", "webex.com.evil.com", "webex.co", "webexcom", "xwebex.com", "", "com", "polimi.it"] {
+            #expect(!RecmanSessionCodec.isWebexHost(host), "\(host)")
+        }
+    }
+
+    /// Versions other than 1 and 2 are refused rather than guessed at, so a downgrade never
+    /// half-uses a session it doesn't understand.
+    @Test func versionsOtherThanV1AndV2AreUnsupported() throws {
+        #expect(RecmanSessionCodec.currentVersion == 2)
+        for version in [0, 3, 99] {
+            let data = try PropertyListSerialization.data(fromPropertyList: ["version": version, "owner": 1, "cookies": [Any]()], format: .binary, options: 0)
+            #expect(throws: RecmanSessionCodec.DecodeError.unsupportedVersion) { try RecmanSessionCodec.decode(data) }
+        }
+    }
+
+    /// A v2 email of the wrong type marks a corrupt file: refused as unreadable, never a crash,
+    /// never read as "no email" while trusting the rest.
+    @Test func wrongTypedEmailIsUnreadable() throws {
+        let values: [Any] = [42, ["a@polimi.it"], Data("a@polimi.it".utf8), true]
+        for value in values {
+            let data = try PropertyListSerialization.data(fromPropertyList: ["version": 2, "owner": 1, "cookies": [Any](), "email": value], format: .binary, options: 0)
+            #expect(throws: RecmanSessionCodec.DecodeError.unreadable) { try RecmanSessionCodec.decode(data) }
+        }
     }
 }

@@ -57,21 +57,19 @@ public actor SyncCoordinator {
     private func synchronizeWithinLease(targets: [SyncTarget], token: String, mode: SyncCoordinatorMode, networkAccess: NetworkAccess, progress: @escaping @Sendable (SyncProgress) async -> Void) async throws -> SyncProgress {
         try Task.checkCancellation()
         guard try await database.hasPendingModuleMoves(rootID: rootID) == false else { throw SyncDatabaseError.execution }
+        // An unfinished course-folder rename blocks the run before any folder is created: the
+        // targets may still name the old folder. Settled only by launch recovery; see
+        // `PendingCourseFolderRenameError` (#183).
+        guard try await database.pendingScopeMoves(rootID: rootID).isEmpty else { throw PendingCourseFolderRenameError() }
         guard !targets.isEmpty else { return SyncProgress(completed: 0, total: 0, installed: 0, preservedLocal: 0, unchanged: 0, conflicts: 0, failures: 0) }
         // Before any baseline is read: a move interrupted by a crash is completed or dropped first.
         try await RemoteMoveJournal.recover(rootID: rootID, database: database, fileStore: fileStore)
         try await ensureManagedDirectories(targets)
-        let baselines: [String: Baseline]
-        do {
-            let trace = PerformanceTrace.shared.begin("sync.baselines", category: .database)
-            defer { PerformanceTrace.shared.end("sync.baselines", category: .database, state: trace) }
-            baselines = try await database.baselines(rootID: rootID)
-        }
         let prepared: PreparedRun
         do {
             let trace = PerformanceTrace.shared.begin("sync.metadata", category: .sync)
             defer { PerformanceTrace.shared.end("sync.metadata", category: .sync, state: trace) }
-            prepared = try await prepareItems(targets: targets, token: token, baselines: baselines, concurrency: mode.metadataConcurrency)
+            prepared = try await prepareItems(targets: targets, token: token, concurrency: mode.metadataConcurrency)
         }
         let work: [PreparedSyncItem]
         do {
@@ -163,7 +161,25 @@ public actor SyncCoordinator {
         }
     }
 
-    private func prepareItems(targets: [SyncTarget], token: String, baselines: [String: Baseline], concurrency: Int) async throws -> PreparedRun {
+    /// Only unanimous, nonempty metadata may rename an override. Keep the saved name when
+    /// Moodle disagrees, rather than letting response order pick it; each changed module writes once.
+    package static func moduleOverrideRenames(files: [RemoteFileCandidate], overrides: [Int64: [Int64: ModulePathOverride]]) -> [Int64: [Int64: String]] {
+        var names: [Int64: [Int64: Set<String>]] = [:]
+        for file in files where overrides[file.courseID]?[file.moduleID] != nil {
+            names[file.courseID, default: [:]][file.moduleID, default: []].insert(file.moduleName)
+        }
+        var changes: [Int64: [Int64: String]] = [:]
+        for (course, modules) in names {
+            for (module, candidates) in modules {
+                guard candidates.count == 1, let name = candidates.first, !name.isEmpty,
+                      name != overrides[course]?[module]?.lastKnownName else { continue }
+                changes[course, default: [:]][module] = name
+            }
+        }
+        return changes
+    }
+
+    private func prepareItems(targets: [SyncTarget], token: String, concurrency: Int) async throws -> PreparedRun {
         try await withThrowingTaskGroup(of: (Int, Result<RemoteCourseContents, WeBeepAPIError>).self) { group in
             var next = 0
             var fetched: [(Int, [RemoteFileCandidate])] = []
@@ -210,7 +226,14 @@ public actor SyncCoordinator {
             let allFiles = fetched.flatMap { $0.1 }
             try Self.validateUniqueRemoteIDs(allFiles)
             try await database.backfillModuleOwnership(rootID: rootID, files: allFiles)
-            var currentBaselines = try await database.baselines(rootID: rootID)
+            // This is the authoritative snapshot: recovery ran before metadata and ownership
+            // backfill must finish before planning can trust course/module identity.
+            var currentBaselines: [String: Baseline]
+            do {
+                let trace = PerformanceTrace.shared.begin("sync.baselines", category: .database)
+                defer { PerformanceTrace.shared.end("sync.baselines", category: .database, state: trace) }
+                currentBaselines = try await database.baselines(rootID: rootID)
+            }
             for file in allFiles {
                 guard let baseline = currentBaselines[file.id] else { continue }
                 guard (baseline.courseID == nil && baseline.moduleID == nil)
@@ -247,8 +270,12 @@ public actor SyncCoordinator {
                     baselineIDsByPath?[preferred]?.removeAll { $0 == legacyID }
                 }
             }
-            for file in allFiles where !file.moduleName.isEmpty && overridesByCourse[file.courseID]?[file.moduleID] != nil {
-                try await database.updateModulePathOverrideName(rootID: rootID, courseID: file.courseID, moduleID: file.moduleID, name: file.moduleName)
+            let renamedOverrides = Self.moduleOverrideRenames(files: allFiles, overrides: overridesByCourse)
+            for courseID in renamedOverrides.keys.sorted() {
+                for moduleID in renamedOverrides[courseID]!.keys.sorted() {
+                    try Task.checkCancellation()
+                    try await database.updateModulePathOverrideName(rootID: rootID, courseID: courseID, moduleID: moduleID, name: renamedOverrides[courseID]![moduleID]!)
+                }
             }
             let openChanges = Dictionary(try await database.remoteChanges(rootID: rootID).map { ($0.remoteID, $0) }, uniquingKeysWith: { first, _ in first })
             let unsettled = Set(try await database.conflicts(rootID: rootID).map(\.remoteID)).union(try await database.pendingOperations(rootID: rootID).map(\.remoteID))
@@ -403,7 +430,7 @@ public actor SyncCoordinator {
                 let source: FileSnapshotState
                 // Unreadable right now (permissions, an evicted cloud file, an I/O error): nothing
                 // is recorded, so the move is tried again next run instead of being forgotten.
-                do { source = try await fileStore.snapshotRegularFile(old) } catch { continue }
+                do { source = try await fileStore.snapshotRegularFile(old) } catch is CancellationError { throw CancellationError() } catch { continue }
                 switch source {
                 case .missing:
                     // Nothing to move: the user deleted it, and it is downloaded again in its new
@@ -429,6 +456,7 @@ public actor SyncCoordinator {
                     } else if try await fileStore.downloadDestinationIsOccupied(plan.target) {
                         destination = try await numberedFreePath(for: plan.target, owners: state.owners)
                     }
+                    try Task.checkCancellation()
                     let step = PendingRemoteMove(batchID: UUID(), remoteID: id, from: old, to: destination, sha256: plan.baseline.sha256, placement: placement)
                     guard (try? await database.commitRemoteMoves(rootID: rootID, [step])) != nil else { continue }
                     state.record(step, baseline: plan.baseline)
@@ -518,6 +546,8 @@ public actor SyncCoordinator {
                 try await database.discardRemoteMoves(rootID: rootID, remoteIDs: [mover.id, holder.id])
                 try await move(mover, to: try await numberedFreePath(for: mover.target, owners: state.owners), state: &state)
                 continue
+            } catch FileStoreError.mutationNotDurable {
+                throw FileStoreError.mutationNotDurable
             } catch {
                 try await database.discardRemoteMoves(rootID: rootID, remoteIDs: [mover.id, holder.id])
                 continue
@@ -550,6 +580,8 @@ public actor SyncCoordinator {
                 try await database.discardRemoteMoves(rootID: rootID, remoteIDs: [mover.id])
                 candidate = try await numberedFreePath(for: mover.target, owners: state.owners)
                 continue
+            } catch FileStoreError.mutationNotDurable {
+                throw FileStoreError.mutationNotDurable
             } catch {
                 try await database.discardRemoteMoves(rootID: rootID, remoteIDs: [mover.id])
                 if error is CancellationError { throw error }
@@ -681,6 +713,7 @@ public actor SyncCoordinator {
             let step = PendingRemoteMove(batchID: UUID(), remoteID: ghost.remoteID, from: ghost.relativePath, to: destination, sha256: snapshot.sha256, placement: RemotePlacement(file))
             try await database.beginRemoteMoves(rootID: rootID, [step])
             do { try await fileStore.moveRegularFile(from: ghost.relativePath, to: destination, expected: snapshot) }
+            catch FileStoreError.mutationNotDurable { throw FileStoreError.mutationNotDurable }
             catch {
                 try await database.discardRemoteMoves(rootID: rootID, remoteIDs: [ghost.remoteID])
                 if error is CancellationError { throw error }

@@ -13,46 +13,45 @@ private final class FakeNotificationCenter: NotificationCenterClient, @unchecked
         var authorization: NotificationAuthorization
         var authorizationAfterRequest: NotificationAuthorization
         var sent: [Sent] = []
+        /// The body of each entry in `sent`, kept apart so `Sent` stays as the older tests build it.
+        var bodies: [String] = []
         var requests = 0
         var authorizationReads = 0
     }
     private let state: OSAllocatedUnfairLock<State>
     /// Runs inside every permission read, before it answers: lets a test change the switch while
     /// the read is pending.
-    private let onAuthorizationRead: (@Sendable () -> Void)?
+    private let onAuthorizationRead: (@MainActor @Sendable () -> Void)?
     /// Runs after every send: lets a test change the switch between two sends of the same run.
-    private let onSend: (@Sendable () -> Void)?
+    private let onSend: (@MainActor @Sendable () -> Void)?
 
-    init(authorization: NotificationAuthorization = .allowed, afterRequest: NotificationAuthorization = .allowed, onAuthorizationRead: (@Sendable () -> Void)? = nil, onSend: (@Sendable () -> Void)? = nil) {
+    init(authorization: NotificationAuthorization = .allowed, afterRequest: NotificationAuthorization = .allowed, onAuthorizationRead: (@MainActor @Sendable () -> Void)? = nil, onSend: (@MainActor @Sendable () -> Void)? = nil) {
         state = OSAllocatedUnfairLock(initialState: State(authorization: authorization, authorizationAfterRequest: afterRequest))
         self.onAuthorizationRead = onAuthorizationRead
         self.onSend = onSend
     }
 
     var sent: [Sent] { state.withLock { $0.sent } }
+    var bodies: [String] { state.withLock { $0.bodies } }
     var requests: Int { state.withLock { $0.requests } }
     /// Every contact with macOS: permission reads, requests and sends.
     var contacts: Int { state.withLock { $0.authorizationReads + $0.requests + $0.sent.count } }
     func setAuthorization(_ value: NotificationAuthorization) { state.withLock { $0.authorization = value } }
 
     func authorization() async -> NotificationAuthorization {
-        onAuthorizationRead?()
+        await onAuthorizationRead?()
         return state.withLock { $0.authorizationReads += 1; return $0.authorization }
     }
     func requestAuthorization() async { state.withLock { $0.requests += 1; $0.authorization = $0.authorizationAfterRequest } }
     func send(identifier: String, title: String, body: String, destination: NotificationDestination) async {
-        state.withLock { $0.sent.append(Sent(identifier: identifier, title: title, destination: destination)) }
-        onSend?()
+        state.withLock { $0.sent.append(Sent(identifier: identifier, title: title, destination: destination)); $0.bodies.append(body) }
+        await onSend?()
     }
 }
 
-/// The coordinator against the fake center and a throwaway defaults suite (#64).
+/// The coordinator against the fake center and isolated in-memory preferences (#64).
 @MainActor final class SyncNotificationCoordinatorTests {
-    private let suiteName = WeBeepAuthenticationController.throwawayDefaultsSuite()
-    private let defaults: UserDefaults
-
-    init() { defaults = UserDefaults(suiteName: suiteName)! }
-    deinit { removeTestDefaults(suiteName) }
+    private let defaults = MemoryCountingDefaults.isolated()
 
     private func conflict(_ remoteID: String) throws -> ConflictRecord {
         ConflictRecord(id: UUID(), rootID: UUID(uuidString: "00000000-0000-0000-0000-000000000001")!, remoteID: remoteID,
@@ -74,6 +73,62 @@ private final class FakeNotificationCenter: NotificationCenterClient, @unchecked
         #expect(center.sent.map(\.destination) == [.conflicts, .activity, .activity, .home])
         #expect(center.sent.first?.identifier == "beepbar-conflicts")
         #expect(center.sent.last?.identifier == "beepbar-authenticationExpired")
+    }
+
+    /// A refresh that newly published lectures sends ONE notification with the count, the Recordings
+    /// destination and the fixed identifier (a second post replaces, not stacks). Guards against one
+    /// notification per course, a wrong page, or stacking.
+    @Test func newRecordingsSendOneNotificationWithAStableIdentifier() async {
+        let center = FakeNotificationCenter()
+        let coordinator = SyncNotificationCoordinator(defaults: defaults, center: center)
+        await coordinator.announceRecordingsRefresh(.refreshed(newlyPublished: 3, failedKeys: 0))
+        await coordinator.announceRecordingsRefresh(.refreshed(newlyPublished: 1, failedKeys: 0))
+        #expect(center.sent.map(\.identifier) == ["beepbar-new-recordings", "beepbar-new-recordings"])
+        #expect(center.sent.map(\.destination) == [.recordings, .recordings])
+        #expect(center.sent.map(\.title) == ["3 nuove registrazioni", "1 nuova registrazione"])
+    }
+
+    /// Nothing is sent for zero, a baseline, a skip, an expired session, an outage or a cancel, nor
+    /// with the switch off or macOS denying. Guards against any failure or silent ending notifying.
+    @Test func everyOtherEndingSendsNothing() async {
+        let center = FakeNotificationCenter()
+        let coordinator = SyncNotificationCoordinator(defaults: defaults, center: center)
+        for outcome: RecordingsSyncOutcome in [.refreshed(newlyPublished: 0, failedKeys: 0), .skipped(.switchedOff), .needsSignIn(newlyPublished: 0), .unavailable(newlyPublished: 0), .cancelled] {
+            await coordinator.announceRecordingsRefresh(outcome)
+        }
+        await coordinator.postRecordingsSummary(newCount: 0)
+        await coordinator.postRecordingsSummary(newCount: -1)
+        #expect(center.sent.isEmpty)
+        turnOff()
+        await coordinator.announceRecordingsRefresh(.refreshed(newlyPublished: 2, failedKeys: 0))
+        #expect(center.contacts == 0)
+        turnOn()
+        let denied = FakeNotificationCenter(authorization: .denied)
+        await SyncNotificationCoordinator(defaults: defaults, center: denied).announceRecordingsRefresh(.refreshed(newlyPublished: 2, failedKeys: 0))
+        #expect(denied.sent.isEmpty)
+    }
+
+    /// A result no longer current (sign-out, account change) is not posted, whether it turned stale
+    /// before or during the permission read. Guards against the old account's lectures being announced.
+    @Test func aStaleResultIsNotPosted() async {
+        let center = FakeNotificationCenter()
+        let coordinator = SyncNotificationCoordinator(defaults: defaults, center: center)
+        await coordinator.announceRecordingsRefresh(.refreshed(newlyPublished: 2, failedKeys: 0), isCurrent: { false })
+        let flag = OSAllocatedUnfairLock(initialState: true)
+        let late = FakeNotificationCenter(onAuthorizationRead: { flag.withLock { $0 = false } })
+        await SyncNotificationCoordinator(defaults: defaults, center: late).postRecordingsSummary(newCount: 2, isCurrent: { flag.withLock { $0 } })
+        #expect(center.contacts == 0)
+        #expect(late.sent.isEmpty)
+    }
+
+    /// Singular and plural in both languages, through BilingualText, and no course or lecture name:
+    /// the text depends on the count alone. Guards against a wrong plural or leaking names (privacy).
+    @Test func theTextIsCountOnlyInBothLanguages() throws {
+        let one = try #require(NotificationPolicy.recordingsNotification(newCount: 1))
+        let many = try #require(NotificationPolicy.recordingsNotification(newCount: 5))
+        #expect(one.title == BilingualText("1 nuova registrazione", "1 new recording"))
+        #expect(many.title == BilingualText("5 nuove registrazioni", "5 new recordings"))
+        #expect(many.body.english == "They're available in Recordings.")
     }
 
     /// The core promise of the switch: with it off, no path reaches macOS at all, not even a
@@ -124,9 +179,9 @@ private final class FakeNotificationCenter: NotificationCenterClient, @unchecked
     /// If the user turns the switch off while the permission read is pending, macOS's prompt must
     /// not appear afterwards: the switch is checked again once the read answers.
     @Test func turningOffDuringThePermissionReadPreventsThePrompt() async {
-        let suite = suiteName   // UserDefaults isn't Sendable; a second handle on the same suite is.
+        let defaults = defaults
         let center = FakeNotificationCenter(authorization: .notDetermined, onAuthorizationRead: {
-            UserDefaults(suiteName: suite)?.set(false, forKey: NotificationPolicy.enabledKey)
+            defaults.set(false, forKey: NotificationPolicy.enabledKey)
         })
         await SyncNotificationCoordinator(defaults: defaults, center: center).requestAuthorizationIfNeeded()
         #expect(center.requests == 0)
@@ -136,11 +191,11 @@ private final class FakeNotificationCenter: NotificationCenterClient, @unchecked
     /// is pending, nothing is sent and nothing is recorded, so once it is back on the conflict is
     /// still announced. Covers both the manual and the automatic path.
     @Test func turningOffDuringTheReadBeforeASendPreventsIt() async throws {
-        let suite = suiteName
+        let defaults = defaults
         let turnOffOnRead = OSAllocatedUnfairLock(initialState: true)
         let center = FakeNotificationCenter(onAuthorizationRead: {
             guard turnOffOnRead.withLock({ $0 }) else { return }
-            UserDefaults(suiteName: suite)?.set(false, forKey: NotificationPolicy.enabledKey)
+            defaults.set(false, forKey: NotificationPolicy.enabledKey)
         })
         let coordinator = SyncNotificationCoordinator(defaults: defaults, center: center)
         let open = [try conflict("a")]
@@ -161,9 +216,9 @@ private final class FakeNotificationCenter: NotificationCenterClient, @unchecked
     /// A run that sends twice (conflicts, then new materials) checks the switch before each send:
     /// turned off after the first, the second doesn't go out.
     @Test func turningOffBetweenTwoSendsOfARunStopsTheSecond() async throws {
-        let suite = suiteName
+        let defaults = defaults
         let center = FakeNotificationCenter(onSend: {
-            UserDefaults(suiteName: suite)?.set(false, forKey: NotificationPolicy.enabledKey)
+            defaults.set(false, forKey: NotificationPolicy.enabledKey)
         })
         let coordinator = SyncNotificationCoordinator(defaults: defaults, center: center)
         await coordinator.notifyAutomaticRun(installed: 3, conflicts: [try conflict("a")], failures: 0)
@@ -317,6 +372,20 @@ struct NotificationMappingTests {
         #expect(ShellPage(NotificationDestination.conflicts) == .conflicts)
         #expect(ShellPage(NotificationDestination.activity) == .activity)
         #expect(ShellPage(NotificationDestination.home) == .home)
+        #expect(ShellPage(NotificationDestination.recordings) == .recordings)
+    }
+
+    /// A click on a notification whose userInfo says "recordings" opens Recordings; an unknown value
+    /// opens Courses; a dismissal opens nothing. Guards against the wrong page or a crash on a
+    /// destination written by another build.
+    @Test @MainActor func clickRoutingOpensRecordingsAndFallsBackSafely() async {
+        let opened = OSAllocatedUnfairLock(initialState: [NotificationDestination]())
+        let responder = NotificationResponder(open: { destination in opened.withLock { $0.append(destination) } })
+        responder.route(isDefaultAction: true, userInfo: SystemNotificationCenter.userInfo(for: .recordings))
+        responder.route(isDefaultAction: true, userInfo: [NotificationPolicy.destinationKey: "from-a-newer-build"])
+        responder.route(isDefaultAction: false, userInfo: SystemNotificationCenter.userInfo(for: .recordings))
+        for _ in 0..<20 { await Task.yield() }
+        #expect(opened.withLock { $0 } == [.recordings, .home])
     }
 
     /// The switch shows the stored choice at launch; never set means on.

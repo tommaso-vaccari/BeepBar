@@ -11,7 +11,12 @@ public enum NotificationAuthorization: Sendable, Equatable {
     case allowed
 }
 
-/// Where a click on a BeepBar notification takes the user.
+/// Where a click on a BeepBar notification takes the user. The raw value travels in the
+/// notification's `userInfo` (`NotificationPolicy.destinationKey`) and outlives the build that sent
+/// it: a notification still in Notification Centre can be clicked after an update or a rollback.
+/// Raw values therefore never change, and a reader never trusts them: `NotificationPolicy.destination`
+/// turns a missing or unknown value (e.g. "recordings" read by a build older than that case) into
+/// `.home` instead of failing.
 public enum NotificationDestination: String, Sendable, Equatable {
     /// "Conflitti da risolvere": the Conflicts page, where the choice is made.
     case conflicts
@@ -19,6 +24,19 @@ public enum NotificationDestination: String, Sendable, Equatable {
     case activity
     /// Account and sync problems: the Courses page, whose status explains them and offers the fix.
     case home
+    /// "Nuove registrazioni": the Recordings page, where the new lectures carry their dot.
+    case recordings
+}
+
+/// The words of a notification, in both languages so the text is picked when it is sent.
+public struct NotificationText: Equatable, Sendable {
+    public let title: BilingualText
+    public let body: BilingualText
+
+    public init(title: BilingualText, body: BilingualText) {
+        self.title = title
+        self.body = body
+    }
 }
 
 /// Decisions behind BeepBar's notifications and the "Notifiche" switch (#64): on by default for
@@ -53,5 +71,22 @@ public enum NotificationPolicy {
     public static func destination(isDefaultAction: Bool, userInfo: [AnyHashable: Any]) -> NotificationDestination? {
         guard isDefaultAction else { return nil }
         return (userInfo[destinationKey] as? String).flatMap(NotificationDestination.init(rawValue:)) ?? .home
+    }
+
+    /// The one notification a sync sends when it finds lectures published since the previous
+    /// listing ("2 nuove registrazioni"), or nil when there are none: the caller sends nothing for
+    /// zero, so a run that finds nothing new is silent. One per sync, whatever the number of
+    /// courses (the caller sums `RecordingsSyncPolicy.newlyPublishedCount` over them).
+    ///
+    /// No course name, lecture title or other personal detail: the text shows on the lock screen
+    /// and in Notification Centre, and the count alone says what the click opens.
+    public static func recordingsNotification(newCount: Int) -> NotificationText? {
+        guard newCount > 0 else { return nil }
+        if newCount == 1 {
+            return NotificationText(title: BilingualText("1 nuova registrazione", "1 new recording"),
+                                    body: BilingualText("È disponibile in Registrazioni.", "It's available in Recordings."))
+        }
+        return NotificationText(title: BilingualText("\(newCount) nuove registrazioni", englishCount(newCount, "new recording", "new recordings")),
+                                body: BilingualText("Sono disponibili in Registrazioni.", "They're available in Recordings."))
     }
 }

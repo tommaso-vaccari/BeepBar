@@ -41,6 +41,54 @@ struct RecordingsSessionStoreTests {
         #expect(try leftovers().isEmpty)
     }
 
+    @Test func savingRestrictsAnExistingSharedFolder() throws {
+        defer { try? FileManager.default.removeItem(at: folder) }
+        try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true, attributes: [.posixPermissions: 0o755])
+        try store.save(Data("synthetic-session".utf8))
+        #expect(try permissions(folder) == 0o700)
+    }
+
+    @Test(arguments: [false, true])
+    func deletionAttemptsEverySecretAfterAFailure(primaryFails: Bool) throws {
+        defer { try? FileManager.default.removeItem(at: folder) }
+        try store.save(Data("synthetic-session".utf8))
+        let orphan = folder.appendingPathComponent(".recordings-session-crash.tmp")
+        try Data("synthetic-leftover".utf8).write(to: orphan)
+        var attempted: Set<String> = []
+        #expect(throws: (any Error).self) {
+            try store.delete { url in
+                attempted.insert(url.lastPathComponent)
+                if (url == file) == primaryFails { throw CocoaError(.fileWriteNoPermission) }
+                try FileManager.default.removeItem(at: url)
+            }
+        }
+        #expect(attempted == [file.lastPathComponent, orphan.lastPathComponent])
+        #expect(FileManager.default.fileExists(atPath: file.path) == primaryFails)
+        #expect(FileManager.default.fileExists(atPath: orphan.path) != primaryFails)
+    }
+
+    @Test func sessionLifetimeIsNotExtendedByReplacement() throws {
+        defer { try? FileManager.default.removeItem(at: folder) }
+        let start = Date().addingTimeInterval(-9 * 86_400)
+        try store.save(Data("first".utf8), now: start)
+        try store.save(Data("replacement".utf8))
+        #expect(try store.load(now: start.addingTimeInterval(10 * 86_400 - 1)) == Data("replacement".utf8))
+        #expect(try store.load(now: start.addingTimeInterval(10 * 86_400)) == nil)
+        #expect(!FileManager.default.fileExists(atPath: file.path))
+    }
+
+    @Test func sessionAndMigratedFileAreExcludedFromBackups() throws {
+        defer { try? FileManager.default.removeItem(at: folder) }
+        try store.save(Data("session".utf8))
+        #expect(try file.resourceValues(forKeys: [.isExcludedFromBackupKey]).isExcludedFromBackup == true)
+        var url = file
+        var values = URLResourceValues()
+        values.isExcludedFromBackup = false
+        try url.setResourceValues(values)
+        _ = try store.load()
+        #expect(try file.resourceValues(forKeys: [.isExcludedFromBackupKey]).isExcludedFromBackup == true)
+    }
+
     /// Delete removes the session and the temporary files a crash mid-save can leave, but
     /// nothing else in BeepBar's folder (the token and the sync database live there too).
     @Test func deleteRemovesTheSessionAndCrashLeftoversOnly() throws {

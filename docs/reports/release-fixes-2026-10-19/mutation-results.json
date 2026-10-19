@@ -1,0 +1,18 @@
+{
+  "mutations": [
+    {
+      "name": "mutation-trash-middle-read",
+      "exitCode": 1,
+      "expectationFailure": true,
+      "compileError": false
+    },
+    {
+      "name": "mutation-recovery-stale-folders",
+      "exitCode": 1,
+      "expectationFailure": true,
+      "compileError": false
+    }
+  ],
+  "restoredRegressionSuite": "passed",
+  "scope": "Disposable copy only; no production source mutation retained."
+}

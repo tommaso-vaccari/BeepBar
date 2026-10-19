@@ -112,7 +112,7 @@ final class InMemoryLoginItemService: LoginItemService, @unchecked Sendable {
                 registered = true
                 BeepbarLog.lifecycle.notice("Registered as login item by default")
             } catch {
-                BeepbarLog.lifecycle.error("Default login item registration failed: \(error.localizedDescription, privacy: .public)")
+                BeepbarLog.lifecycle.error("Default login item registration failed code=\((error as NSError).code, privacy: .public)")
             }
             setStatus(await readStatus())
         }
@@ -148,7 +148,7 @@ final class InMemoryLoginItemService: LoginItemService, @unchecked Sendable {
         let failed = LaunchAtLoginPolicy.changeFailed(enabling: enabled, threw: failure != nil, statusAfter: after)
         if enabled, !failed { defaults.set(true, forKey: Self.defaultAppliedKey) }
         if failed {
-            BeepbarLog.lifecycle.error("Login item change failed enabled=\(enabled, privacy: .public): \(failure?.localizedDescription ?? "", privacy: .public)")
+            BeepbarLog.lifecycle.error("Login item change failed enabled=\(enabled, privacy: .public): \(failure.map { ($0 as NSError).code } ?? 0, privacy: .public)")
             errorMessage = enabled
                 ? BilingualText("Non è stato possibile aggiungere BeepBar agli elementi di login.", "Couldn't add BeepBar to your login items.")
                 : BilingualText("Non è stato possibile rimuovere BeepBar dagli elementi di login.", "Couldn't remove BeepBar from your login items.")

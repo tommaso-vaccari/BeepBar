@@ -10,6 +10,7 @@ enum BeepbarLog {
     static let sync = Logger(subsystem: "io.github.tvaccari.beepbar", category: "sync")
 }
 
+#if !UI_PERFORMANCE_HARNESS
 @main
 struct BeepbarApp: App {
     @NSApplicationDelegateAdaptor(AppDelegate.self) private var appDelegate
@@ -23,6 +24,8 @@ struct BeepbarApp: App {
         Settings { EmptyView() }
     }
 }
+
+#endif
 
 @MainActor final class AppDelegate: NSObject, NSApplicationDelegate {
     // Owned here, not by the SwiftUI App struct: for a window-less scene, SwiftUI doesn't
@@ -52,11 +55,24 @@ struct BeepbarApp: App {
         BeepbarLog.lifecycle.notice("Application launched version=\(version, privacy: .public) build=\(build, privacy: .public)")
         _ = UpdaterController.shared
         // Once per install: on by default, never re-applied after the user turns it off.
-        Task { await LaunchAtLoginController.shared.applyDefaultOnLaunch() }
+        // Telemetry starts after it, so the day's first signal reports the login item's real state.
+        Task { [authentication] in
+            await LaunchAtLoginController.shared.applyDefaultOnLaunch()
+            await DailyTelemetryController.shared.startForApplication(context: {
+                DailyTelemetryContext(
+                    language: .current,
+                    systemMajorVersion: ProcessInfo.processInfo.operatingSystemVersion.majorVersion,
+                    automaticSyncEnabled: authentication.automaticSyncEnabled,
+                    automaticSyncInterval: authentication.automaticSyncInterval,
+                    dataSaverEnabled: authentication.dataSaverEnabled,
+                    recordingsEnabled: authentication.recordingsEnabledWithoutCreating,
+                    launchAtLogin: LaunchAtLoginController.shared.status.map(LaunchAtLoginPolicy.isOn))
+            })
+        }
         statusItemController = StatusItemController(authentication: authentication)
 #if DEBUG
         if ProcessInfo.processInfo.arguments.contains("--ui-preview") {
-            ConfigurationWindowController.shared.show(authentication)
+            ConfigurationWindowController.shared.show(authentication, page: ProcessInfo.processInfo.arguments.contains("--watchlist-preview") ? .recordings : .home)
             return
         }
 #endif
@@ -132,9 +148,12 @@ final class StatusItemController: NSObject, NSMenuDelegate {
         // Updates arrive from the main actor (see `onMenuBarSymbolChange`), never from an AppKit
         // callback into this class.
         authentication.onMenuBarSymbolChange = { [statusItem] symbol in Self.setSymbol(symbol, on: statusItem) }
+#if !UI_PERFORMANCE_HARNESS
         let menu = NSMenu()
         menu.delegate = self
         statusItem.menu = menu
+#endif
+        PerformanceTrace.shared.event("ui.iconReady", category: .ui)
     }
 
     @MainActor private static func setSymbol(_ symbol: String, on statusItem: NSStatusItem) {
@@ -144,8 +163,19 @@ final class StatusItemController: NSObject, NSMenuDelegate {
     }
 
     nonisolated func menuNeedsUpdate(_ menu: NSMenu) {
+        // Budget: 1 ms (AGENTS.md, Performance). The interval shows the build in Instruments.
+        let trace = PerformanceTrace.shared.begin("ui.menuNeedsUpdate", category: .ui)
+        defer { PerformanceTrace.shared.end("ui.menuNeedsUpdate", category: .ui, state: trace) }
+        Self.build(from: authentication.menuBarSnapshot, into: menu, target: self)
+    }
+
+    /// The whole menu, from `snapshot` alone, replacing what `menu` held: status, detail, action,
+    /// Open, separator, Quit. `nonisolated` and
+    /// static for the same reason as `menuNeedsUpdate` (it runs inside that AppKit callback and
+    /// must not touch main-actor state), and so tests can check the item order without a status
+    /// item; `target` is nil there. The three actions keep their `Task { @MainActor in … }` hops.
+    nonisolated static func build(from snapshot: MenuBarSnapshot, into menu: NSMenu, target: StatusItemController?) {
         menu.removeAllItems()
-        let snapshot = authentication.menuBarSnapshot
 
         let titleItem = NSMenuItem()
         titleItem.title = snapshot.title
@@ -161,18 +191,82 @@ final class StatusItemController: NSObject, NSMenuDelegate {
         menu.addItem(detailItem)
 
         let actionItem = NSMenuItem(title: snapshot.actionTitle, action: #selector(performAction), keyEquivalent: "")
-        actionItem.target = self
+        actionItem.target = target
         menu.addItem(actionItem)
+
+        // Open sits right under the action (Sync now), not at the end of the menu.
+        let openItem = NSMenuItem(title: snapshot.openTitle, action: #selector(openConfiguration), keyEquivalent: "")
+        openItem.target = target
+        menu.addItem(openItem)
 
         menu.addItem(.separator())
 
-        let openItem = NSMenuItem(title: snapshot.openTitle, action: #selector(openConfiguration), keyEquivalent: "")
-        openItem.target = self
-        menu.addItem(openItem)
-
         let quitItem = NSMenuItem(title: snapshot.quitTitle, action: #selector(quit), keyEquivalent: "")
-        quitItem.target = self
+        quitItem.target = target
         menu.addItem(quitItem)
+    }
+
+    /// Not called by `build` since issue #164: the icon popup shows no recordings section.
+    /// Kept, with its tests, because the issue discussion proposes bringing the section back
+    /// behind a Settings option; remove it together with `recordingLines` if that is dropped.
+    ///
+    /// The recordings section: nothing when `snapshot.recordingLines` is empty, otherwise a
+    /// separator, the "Registrazioni" section header (`NSMenuItem.sectionHeader`, macOS 14, the
+    /// deployment target) and one line per course. It reads the snapshot it is given and nothing
+    /// else.
+    /// - A line is clickable only when it has a target, which `recordingMenuLines` gives only with
+    ///   a known account (owner) and a known next lecture that passes `validatedNext`. It gets
+    ///   `target` (this `StatusItemController`, never `NSApp` or the account controller),
+    ///   `playRecording(_:)`, the `RecordingMenuTarget` as `representedObject`, and the
+    ///   "Riproduci: «…»" tooltip. Its only path to the main actor is that action's
+    ///   `Task { @MainActor in … }` hop (issue #30).
+    /// - A line without one (all done, no known or valid next, no account) stays grey:
+    ///   disabled, no target, no action.
+    /// Enabling relies on NSMenu's autoenabling (an item whose target answers its action is
+    /// enabled, one without an action is not). `validateMenuItem(_:)` is deliberately not
+    /// implemented: its protocol is `@MainActor`, a new AppKit-to-main-actor crossing.
+    nonisolated static func addRecordingItems(from snapshot: MenuBarSnapshot, to menu: NSMenu, target: StatusItemController?) {
+        guard !snapshot.recordingLines.isEmpty else { return }
+        menu.addItem(.separator())
+        menu.addItem(.sectionHeader(title: snapshot.recordingsTitle))
+        for line in snapshot.recordingLines {
+            let item = NSMenuItem()
+            item.title = line.title
+            if let payload = line.target {
+                item.target = target
+                item.action = #selector(playRecording(_:))
+                item.representedObject = payload
+                item.toolTip = line.toolTip
+            } else {
+                item.isEnabled = false
+            }
+            menu.addItem(item)
+        }
+    }
+
+    /// A click on a recordings line. `nonisolated` on purpose and kept minimal (a log line and the
+    /// dispatch): it reads only the clicked item's `representedObject` (a plain `Sendable`
+    /// value), no main-actor state, not even `menuBarSnapshot`, and hands it to
+    /// `dispatchRecordingClick`, which hops. Never
+    /// mark it `@MainActor` or point the item at a `@MainActor` method: AppKit's Objective-C call
+    /// would then make the Swift runtime verify the executor, the check that crashed with SIGBUS
+    /// after wake (issues #30, #31). `RecordingsMenuBarTests` calls it from a nonisolated
+    /// context, so marking it `@MainActor` no longer compiles.
+    @objc nonisolated func playRecording(_ sender: NSMenuItem) {
+        BeepbarLog.lifecycle.notice("Menu recording line selected")
+        Self.dispatchRecordingClick(sender.representedObject, to: authentication)
+    }
+
+    /// Hands a recordings click to the main actor: anything but a `RecordingMenuTarget` (or
+    /// nothing) is ignored; the target is played by `playNextRecording` inside the
+    /// `Task { @MainActor in … }` hop, the issue #30 fix, like the other actions. Reads no
+    /// main-actor state. To change what a click does, change what runs inside the hop, never
+    /// the hop itself (no `DispatchQueue.main.async`, `MainActor.assumeIsolated`,
+    /// `RunLoop.main.perform`). Static so tests can prove the hop by behaviour without a status
+    /// item.
+    nonisolated static func dispatchRecordingClick(_ payload: Any?, to authentication: WeBeepAuthenticationController) {
+        guard let target = payload as? RecordingMenuTarget else { return }
+        Task { @MainActor in authentication.playNextRecording(target) }
     }
 
     @objc private func performAction() {
@@ -245,7 +339,12 @@ final class StatusItemController: NSObject, NSMenuDelegate {
     /// Builds the window `show` opens, apart from its delegate and saved frame, so tests can host
     /// the real shell in exactly this window.
     static func makeWindow(authentication: WeBeepAuthenticationController, router: ShellRouter) -> ConfigurationWindow {
-        let controller = NSHostingController(rootView: BeepbarShellView(authentication: authentication, recordings: authentication.recordings, router: router))
+        makeWindow(content: BeepbarShellView(authentication: authentication, recordings: authentication.recordings, router: router))
+    }
+
+    /// Shared window chrome and hosting options for the real app and isolated performance shell.
+    static func makeWindow<Content: View>(content: Content) -> ConfigurationWindow {
+        let controller = NSHostingController(rootView: content)
         // Only let SwiftUI enforce the minimum size; otherwise the window keeps resizing
         // itself to the content's ideal size on every page switch.
         controller.sizingOptions = [.minSize]
@@ -286,6 +385,8 @@ final class StatusItemController: NSObject, NSMenuDelegate {
             // Dropping the hierarchy doesn't reliably report the Recordings page as gone, and its
             // browser must not outlive the window (quiet at rest).
             self.authentication?.recordingsIfCreated?.windowClosed()
+            // A course list load waiting for a sync to end is not wanted without a window (#98).
+            self.authentication?.windowClosed()
         }
     }
 

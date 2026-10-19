@@ -1,0 +1,46 @@
+{
+  "baseDevSHA": "26edaf0f2d2fca29deaf4eb46227c59d1e606efc",
+  "temporaryValidationSnapshotSHA": "67e17fe7705e9195cf132ce9722b9164f5fd699b",
+  "snapshotIsDevCommit": false,
+  "sourceManifest": "source-sha256.json",
+  "swiftTests": {
+    "xctest": 16,
+    "core": 649,
+    "benchmark": 31,
+    "app": 853,
+    "total": 1549,
+    "result": "passed"
+  },
+  "releaseBuild": "passed",
+  "architecture": "arm64",
+  "plistLint": "passed",
+  "assets": "present",
+  "sparkle": "embedded",
+  "adHocSignature": "verified",
+  "bundledPrivacyNotice": "byte-identical to both documented and source resources",
+  "independentReview": "clean after fixes",
+  "manualChecks": "owner-attested positive on 2026-10-19 for PR 150; not independently observed or rerun by reviewer",
+  "tooling": {
+    "benchmarkComparisonTests": 11,
+    "uiDriverTests": 13,
+    "linuxWrapperCases": 10,
+    "releaseNotes": "passed",
+    "buildVersion": "passed"
+  },
+  "limitations": [
+    "Source is the uncommitted dev working tree, identified by its file hashes; no new remote CI applies yet.",
+    "Unsigned/ad-hoc local build is not the eventual signed and versioned Sparkle release artifact.",
+    "No installed app, live account or website was changed."
+  ],
+  "uiBenchmark": {
+    "valid": true,
+    "scenarios": [
+      "recordings-1000",
+      "launch-warm"
+    ],
+    "runsEach": 5,
+    "allObservedWindowSamplesWithinBudget": true,
+    "retainedSeries": "ui-series.json",
+    "priorInvalidAttempt": "ui-attempt.json"
+  }
+}

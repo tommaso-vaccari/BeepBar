@@ -1,5 +1,7 @@
 import Foundation
+#if canImport(os)
 import os
+#endif
 
 public enum PerformanceCategory: String, Sendable {
     case bootstrap
@@ -10,6 +12,7 @@ public enum PerformanceCategory: String, Sendable {
     case filesystem
 }
 
+#if canImport(os)
 public final class PerformanceTrace: @unchecked Sendable {
     public static let shared = PerformanceTrace()
 
@@ -34,5 +37,23 @@ public final class PerformanceTrace: @unchecked Sendable {
     }
 
 }
+#else
+/// Stand-in for the `os` interval state on Linux, where signposts do not exist (Core tests only).
+public struct OSSignpostIntervalState: Sendable {}
+
+/// Same interface as the macOS tracer above, emitting nothing: Linux runs only the Core tests
+/// and has no Instruments to read signposts.
+public final class PerformanceTrace: Sendable {
+    public static let shared = PerformanceTrace()
+
+    private init() {}
+
+    public func begin(_ name: StaticString, category: PerformanceCategory) -> OSSignpostIntervalState { OSSignpostIntervalState() }
+
+    public func end(_ name: StaticString, category: PerformanceCategory, state: OSSignpostIntervalState) {}
+
+    public func event(_ name: StaticString, category: PerformanceCategory) {}
+}
+#endif
 
 extension PerformanceCategory: CaseIterable {}

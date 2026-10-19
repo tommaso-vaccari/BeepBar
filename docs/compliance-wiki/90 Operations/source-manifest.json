@@ -1,0 +1,205 @@
+[
+  {
+    "id": "S-0001",
+    "title": "GDPR",
+    "url": "https://eur-lex.europa.eu/legal-content/IT/TXT/?uri=CELEX:02016R0679-20160504",
+    "resolved_url": "https://eur-lex.europa.eu/legal-content/IT/TXT/?uri=CELEX:02016R0679-20160504",
+    "retrieved_date": "2026-10-10",
+    "sha256": "dbdfcbde42b0b713bfc9155eb6cef691ddecccf11de9ccb7cd639d864e1ce818",
+    "bytes": 751183,
+    "content_type": "text/html; charset=UTF-8",
+    "raw": "S-0001-2026-10-10.html"
+  },
+  {
+    "id": "S-0002",
+    "title": "EDPB roles",
+    "url": "https://www.edpb.europa.eu/sme/learn-the-basics/data-controller-or-data-processor_en",
+    "resolved_url": "https://www.edpb.europa.eu/sme/learn-the-basics/data-controller-or-data-processor_en",
+    "retrieved_date": "2026-10-10",
+    "sha256": "5eab779d44a96ff3dec8ec84550252bf7bd6b5a31b049ff40164043358092daf",
+    "bytes": 32339,
+    "content_type": "text/html; charset=utf-8",
+    "raw": "S-0002-2026-10-10.html"
+  },
+  {
+    "id": "S-0003",
+    "title": "Sparkle customization",
+    "url": "https://sparkle-project.org/documentation/customization/",
+    "resolved_url": "https://sparkle-project.org/documentation/customization/",
+    "retrieved_date": "2026-10-10",
+    "sha256": "c860ca4da5e4a48d12df94fad37421bf2d46e2c1076549a1b9993f52bfaa6baf",
+    "bytes": 19433,
+    "content_type": "text/html; charset=utf-8",
+    "raw": "S-0003-2026-10-10.html"
+  },
+  {
+    "id": "S-0004",
+    "title": "GitHub privacy",
+    "url": "https://docs.github.com/en/site-policy/privacy-policies/github-general-privacy-statement",
+    "resolved_url": "https://docs.github.com/en/site-policy/privacy-policies/github-general-privacy-statement",
+    "retrieved_date": "2026-10-10",
+    "sha256": "97bc9907b7194d21a88a777319e5443a0dbf1bb898f1687c01fc464faaffadad",
+    "bytes": 304812,
+    "content_type": "text/html; charset=utf-8",
+    "raw": "S-0004-2026-10-10.html"
+  },
+  {
+    "id": "S-0005",
+    "title": "BeepBar code evidence",
+    "commit": "c9a04dc2f510fb02d0662f1c66ce0c53f54e5296",
+    "retrieved_date": "2026-10-10",
+    "sha256": "3161f46cd294a4e2df520569f607201f48195a01508bd62721e0e2405ca9d7d0",
+    "bytes": 18137,
+    "raw": "S-0005-code-c9a04dc.md"
+  },
+  {
+    "id": "S-0006",
+    "title": "Karpathy LLM Wiki",
+    "url": "https://gist.github.com/karpathy/442a6bf555914893e9891c11519de94f",
+    "resolved_url": "https://gist.githubusercontent.com/karpathy/442a6bf555914893e9891c11519de94f/raw/ac46de1ad27f92b28ac95459c782c07f6b8c964a/llm-wiki.md",
+    "retrieved_date": "2026-10-10",
+    "sha256": "dc3efe98ae62f23dd08acad13aba2e95287beb20b6bec2f4af0423557fe37401",
+    "bytes": 11985,
+    "raw": "S-0006-karpathy-ac46de1.md",
+    "revision": "ac46de1ad27f92b28ac95459c782c07f6b8c964a"
+  },
+  {
+    "id": "S-0007",
+    "title": "BeepBar telemetry code",
+    "commit": "d3a42dc775ef461f5406c85818a1e1e0f57ad6dc",
+    "retrieved_date": "2026-10-10",
+    "sha256": "5fa18baa8a2d18f41d40bca2eb8a0f6043a8c62f401d5edc859338dac28ba0f3",
+    "bytes": 11961,
+    "raw": "S-0007-telemetry-d3a42dc.md"
+  },
+  {
+    "id": "S-0007",
+    "title": "BeepBar telemetry code",
+    "commit": "50177f3905d50d9fa4252fc952a2fa8bf275de0d",
+    "retrieved_date": "2026-10-13",
+    "sha256": "8f392f9d2a173c5e5f9b582e66639b160c9432b523fd7aca75a0700b54ec0963",
+    "bytes": 19651,
+    "raw": "S-0007-telemetry-50177f3.md"
+  },
+  {
+    "id": "S-0008",
+    "title": "TelemetryDeck agreement",
+    "url": "https://telemetrydeck.com/dpa/",
+    "resolved_url": "https://telemetrydeck.com/dpa/",
+    "retrieved_date": "2026-10-17",
+    "sha256": "f580452bbfe25f37b68a796087e04bfbe09c69c9748623b20a55f090bc01060e",
+    "bytes": 106675,
+    "content_type": "text/html",
+    "raw": "S-0008-2026-10-17.html"
+  },
+  {
+    "id": "S-0009",
+    "title": "TelemetryDeck Privacy FAQ",
+    "url": "https://telemetrydeck.com/docs/guides/privacy-faq/",
+    "resolved_url": "https://telemetrydeck.com/docs/guides/privacy-faq/",
+    "retrieved_date": "2026-10-17",
+    "sha256": "dad2da67f4fbf8d1c1a8bbc6e95d43d86b9181e22296a4bf5d15f507f8434b81",
+    "bytes": 140350,
+    "content_type": "text/html",
+    "raw": "S-0009-2026-10-17.html"
+  },
+  {
+    "id": "S-0010",
+    "title": "EDPB lawful processing",
+    "url": "https://www.edpb.europa.eu/sme/be-compliant/process-personal-data-lawfully_en",
+    "resolved_url": "https://www.edpb.europa.eu/sme/be-compliant/process-personal-data-lawfully_en",
+    "retrieved_date": "2026-10-17",
+    "sha256": "550b89a6388552ab1ea3a34f697352f3eaa0e97c1b725901d88153eed53ea92a",
+    "bytes": 65101,
+    "content_type": "text/html; charset=utf-8",
+    "raw": "S-0010-2026-10-17.html"
+  },
+  {
+    "id": "S-0011",
+    "title": "EDPB technical scope Article 5(3) final 2.0",
+    "url": "https://www.edpb.europa.eu/system/files/documents/2024-10/edpb_guidelines_202302_technical_scope_art_53_eprivacydirective_v2_en_0.pdf",
+    "resolved_url": "https://www.edpb.europa.eu/system/files/documents/2024-10/edpb_guidelines_202302_technical_scope_art_53_eprivacydirective_v2_en_0.pdf",
+    "retrieved_date": "2026-10-17",
+    "sha256": "dbc1d37783e35ae8668925f92a590ae282eec24c98381a5a8f91b5c2048b5b03",
+    "bytes": 409348,
+    "content_type": "application/pdf",
+    "raw": "S-0011-2026-10-17.pdf"
+  },
+  {
+    "id": "S-0012",
+    "title": "Garante cookie guidance 10 June 2021",
+    "url": "https://www.garanteprivacy.it/home/docweb/-/docweb-display/docweb/9677876",
+    "resolved_url": "https://www.garanteprivacy.it/home/docweb/-/docweb-display/docweb/9677876",
+    "retrieved_date": "2026-10-17",
+    "sha256": "447d87fd23135545c8886ce5d70fb45f0374653ee21ad52446ca8ee6e8cea25a",
+    "bytes": 243070,
+    "content_type": "text/html;charset=UTF-8",
+    "raw": "S-0012-2026-10-17.html"
+  },
+  {
+    "id": "S-0008",
+    "title": "TelemetryDeck accordo",
+    "url": "https://telemetrydeck.com/avv/",
+    "resolved_url": "https://telemetrydeck.com/avv/",
+    "retrieved_date": "2026-10-19",
+    "sha256": "b1b63176b8c500f4251488b9de4301d259f7dc07a53adc9cf6c613761e5de3c1",
+    "bytes": 107547,
+    "content_type": "text/html",
+    "raw": "S-0008-2026-10-19.html"
+  },
+  {
+    "id": "S-0009",
+    "title": "TelemetryDeck FAQ",
+    "url": "https://telemetrydeck.com/docs/guides/privacy-faq/",
+    "resolved_url": "https://telemetrydeck.com/docs/guides/privacy-faq/",
+    "retrieved_date": "2026-10-19",
+    "sha256": "5b146c6de7f104b411498d3cfc043112b7221380b00acc7b8a3f595aac60699b",
+    "bytes": 140834,
+    "content_type": "text/html",
+    "raw": "S-0009-2026-10-19.html"
+  },
+  {
+    "id": "S-0013",
+    "title": "TelemetryDeck Ingest v2",
+    "url": "https://telemetrydeck.com/docs/ingest/v2/",
+    "resolved_url": "https://telemetrydeck.com/docs/ingest/v2/",
+    "retrieved_date": "2026-10-19",
+    "sha256": "7873e1127e83ddf23eb801f9e5088a856c37bbee094a611cdf9637521e2be3c5",
+    "bytes": 141649,
+    "content_type": "text/html",
+    "raw": "S-0013-2026-10-19.html"
+  },
+  {
+    "id": "S-0014",
+    "title": "TelemetryDeck termini",
+    "url": "https://telemetrydeck.com/terms/",
+    "resolved_url": "https://telemetrydeck.com/terms/",
+    "retrieved_date": "2026-10-19",
+    "sha256": "45a09e0f886f7bac15c3ef862f98a429f39d3edb6065bc9e4f75aadfd5394fe4",
+    "bytes": 133682,
+    "content_type": "text/html",
+    "raw": "S-0014-2026-10-19.html"
+  },
+  {
+    "id": "S-0015",
+    "title": "TelemetryDeck architettura",
+    "url": "https://telemetrydeck.com/use-case/architecture-security/",
+    "resolved_url": "https://telemetrydeck.com/use-case/architecture-security/",
+    "retrieved_date": "2026-10-19",
+    "sha256": "ae633a17f8d412d52e6aaaec5d263ccdc2d31c5be927837345bb154ea6757f68",
+    "bytes": 183970,
+    "content_type": "text/html",
+    "raw": "S-0015-2026-10-19.html"
+  },
+  {
+    "id": "S-0016",
+    "title": "TelemetryDeck privacy",
+    "url": "https://telemetrydeck.com/privacy/",
+    "resolved_url": "https://telemetrydeck.com/privacy/",
+    "retrieved_date": "2026-10-19",
+    "sha256": "568f5daf4cd2b614c78538a178f2fe8cfc69e036e5fa071106c295e1dde9401b",
+    "bytes": 145562,
+    "content_type": "text/html",
+    "raw": "S-0016-2026-10-19.html"
+  }
+]

@@ -1,5 +1,7 @@
 import Foundation
+#if canImport(UniformTypeIdentifiers)
 import UniformTypeIdentifiers
+#endif
 
 /// What sits at a tracked path, as `FileStore.openableFileState` sees it.
 public enum OpenableFileState: Sendable, Equatable {
@@ -59,13 +61,20 @@ public enum ActivityFilePolicy {
     /// (`.doc`, `.xls`, `.xlt`, `.xlw`, `.ppt`, `.pps`, `.pot`, behind Office's prompt) and
     /// OpenDocument files (`.odt`, `.ods`, `.odp`, behind LibreOffice's macro security).
     public static func opensDirectly(filename: String) -> Bool {
+#if !canImport(UniformTypeIdentifiers)
+        // Type identifiers are a macOS service; without them nothing is known to be a document,
+        // so everything would be revealed. Only reached by the Linux Core test build.
+        return false
+#else
         let fileExtension = (filename as NSString).pathExtension.lowercased()
         guard !fileExtension.isEmpty, !isExcluded(fileExtension: fileExtension) else { return false }
         guard let type = UTType(filenameExtension: fileExtension), !type.isDynamic else { return false }
         guard !runnableTypes.contains(where: { type.conforms(to: $0) }) else { return false }
         return exactDocumentTypes.contains(type.identifier) || documentFamilies.contains { type.conforms(to: $0) }
+#endif
     }
 
+#if canImport(UniformTypeIdentifiers)
     /// Families matched by conformance: their members are media and office documents.
     private static let documentFamilies: [UTType] = [.pdf, .image, .audiovisualContent, .presentation, .spreadsheet, .epub]
 
@@ -81,6 +90,7 @@ public enum ActivityFilePolicy {
 
     /// Checked first: some of these also conform to a document family above (an SVG is an image).
     private static let runnableTypes: [UTType] = [.sourceCode, .script, .executable, .application, .applicationBundle, .bundle, .package, .internetLocation, .diskImage, .xml, .html]
+#endif
 
     /// Extensions refused regardless of the type macOS assigns, so the decision doesn't depend on
     /// the macOS version or the installed apps. On macOS 27 most of them are already caught by

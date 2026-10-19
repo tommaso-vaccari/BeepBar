@@ -1,0 +1,36 @@
+{
+  "architecture": "arm64",
+  "baseDevSHA": "26edaf0f2d2fca29deaf4eb46227c59d1e606efc",
+  "binarySHA256": "87c3f615beb1e592604a2085ac2aaed1a07e004d8ab74715d2d2b5df02369f97",
+  "conditions": "Dedicated synthetic fixture; no real scheduler/network/updater. Release arm64 with DEBUG DI seams. Controls disabled. 300ms shown + 3s after-close settling.",
+  "driverSHA256": "d604e575cfd2a4a4092fd90e5720b6981f36c3d0e9643d4229f5a82a11cd6570",
+  "error": "recordings-1000 warmup exited 54: missingContent; window reported below system shield; no valid timing series or warm reopen measurement.",
+  "limitations": [
+    "Tooling validation is separate from app performance gains.",
+    "Base-dev and main comparisons are not measured; older revisions need a reviewed equivalent UI fixture.",
+    "Cold means first window in a fresh fixture process, not cold filesystem cache or production bootstrap.",
+    "Content onAppear is distinct from compositor presentation. Time Profiler samples establish stacks, not a proof of every <=16ms stall.",
+    "Only synthetic known-content offline refresh is covered; persisted cold offline restoration remains D10.",
+    "Idle runs once, unprofiled, for 30 minutes; real scheduled checks are disabled and count zero by construction.",
+    "Five measured runs cannot establish a reliable p95. Manual scrolling/actions remain required."
+  ],
+  "macOS": "ProductName:\t\tmacOS\nProductVersion:\t\t27.0.1\nBuildVersion:\t\t26A434",
+  "machine": "arm64",
+  "mainSHA": "3ce0ba02c10dcf51836057f7119ba0e78da3c6e4",
+  "memoryBytes": "34359738368",
+  "model": "Mac17,3",
+  "power": "Now drawing from 'AC Power'",
+  "runs": 5,
+  "scenarios": [
+    "recordings-1000",
+    "launch-warm"
+  ],
+  "schemaVersion": 1,
+  "sourceSHA": "67e17fe7705e9195cf132ce9722b9164f5fd699b",
+  "valid": false,
+  "warmup": 1,
+  "xcode": "Xcode 27.1\nBuild version 27A9275",
+  "xctrace": "xctrace version 27.1 (27A9275)",
+  "rawEvidence": "Original local series/logs/traces remain in ignored PerformanceReports/release-2026-10-19; this retained metadata omits machine-local paths.",
+  "sourceIdentity": "Temporary committed snapshot of local dev source, not a published dev commit; see source-sha256.json."
+}

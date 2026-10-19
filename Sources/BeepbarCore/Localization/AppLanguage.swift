@@ -1,5 +1,7 @@
 import Foundation
+#if canImport(os)
 import os
+#endif
 
 /// The language Beepbar's own text is shown in, chosen in onboarding and in Settings.
 ///
@@ -45,6 +47,13 @@ public enum AppLanguage: String, CaseIterable, Identifiable, Sendable {
 
 /// "1 file" / "3 files". Italian often needs no branch ("file" is invariable), English does.
 public func englishCount(_ count: Int, _ one: String, _ many: String) -> String {
+    "\(count) \(count == 1 ? one : many)"
+}
+
+/// "1 registrazione" / "3 registrazioni": the Italian counterpart of `englishCount`, for the
+/// nouns and adjectives that do change in the plural ("nuova"/"nuove"). Without it a count of one
+/// read "1 registrazioni" in the Recordings page (#195). Same rule as English: only 1 is singular.
+public func italianCount(_ count: Int, _ one: String, _ many: String) -> String {
     "\(count) \(count == 1 ? one : many)"
 }
 

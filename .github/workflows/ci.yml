@@ -15,6 +15,7 @@ jobs:
   changes:
     name: Detect changes
     runs-on: ubuntu-latest
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
     outputs:
       production: ${{ steps.filter.outputs.production }}
     steps:
@@ -37,25 +38,44 @@ jobs:
   test:
     name: Test
     runs-on: xcode-27
+    concurrency:
+      # Release and manual runs get unique groups so no validation prerequisite is dropped.
+      group: ${{ github.workflow }}-test-${{ github.event_name }}-${{ (github.event_name == 'workflow_dispatch' || github.ref == 'refs/heads/main') && github.run_id || github.ref }}
+      cancel-in-progress: true
     steps:
       - uses: actions/checkout@v4
       - name: Verify toolchain
+        id: toolchain
         run: |
           xcodebuild -version
           test "$(xcrun --sdk macosx --show-sdk-version)" = "27.0"
+          echo "fingerprint=$( { xcodebuild -version; swift --version; } | shasum -a 256 | cut -d ' ' -f 1)" >> "$GITHUB_OUTPUT"
+      - name: Cache package dependencies
+        uses: actions/cache@v4
+        with:
+          path: |
+            .build/artifacts
+            .build/checkouts
+            .build/repositories
+            build/SourcePackages
+          key: packages-v1-${{ runner.os }}-${{ runner.arch }}-${{ steps.toolchain.outputs.fingerprint }}-${{ hashFiles('Package.swift', 'Package.resolved', 'Beepbar.xcodeproj/project.pbxproj', 'Beepbar.xcodeproj/project.xcworkspace/xcshareddata/swiftpm/Package.resolved') }}
+      # Tooling tests that need no Swift build (#215, #222): cheap, so they run before `swift test`.
+      # `scripts/recordings-seen-isolated-tests.py` is not here: it builds a temporary Swift package.
+      - name: Benchmark comparison tests
+        run: python3 scripts/test_benchmark_compare.py
+      - name: UI benchmark driver tests
+        run: python3 scripts/test_ui_benchmark.py
+      - name: Linux test wrapper tests
+        run: bash scripts/test-linux-core-tests.sh
       - name: Swift tests
         run: swift test
       - name: Verify readable release notes
         run: bash scripts/test-release-notes.sh
       - name: Verify release version numbering
-        run: |
-          test "$(scripts/build-version.sh 2.0 99)" = "2.0.99"
-          test "$(scripts/build-version.sh 2.0 100)" = "2.1.0"
-          test "$(scripts/build-version.sh 2.0 215)" = "2.2.15"
-          ! scripts/build-version.sh 2 110
+        run: bash scripts/test-build-version.sh
       - name: Build and verify Release app
         run: |
-          xcodebuild -project Beepbar.xcodeproj -target Beepbar -configuration Release build CODE_SIGNING_ALLOWED=NO
+          xcodebuild -project Beepbar.xcodeproj -target Beepbar -configuration Release -clonedSourcePackagesDirPath build/SourcePackages build CODE_SIGNING_ALLOWED=NO
           file build/Release/Beepbar.app/Contents/MacOS/Beepbar | grep -q 'arm64'
           plutil -lint build/Release/Beepbar.app/Contents/Info.plist
           test -f build/Release/Beepbar.app/Contents/Resources/Assets.car
@@ -74,14 +94,39 @@ jobs:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
+      # Changelog release gate (issue #210), first so a bad changelog fails before the build.
+      # `release-notes.sh` refuses a non-empty `## Unreleased`, a newest dated section without
+      # highlights, and notes identical to those of the last published release, whose CHANGELOG.md
+      # is read from its `v*` tag (all tags are fetched above). Without such a tag, or with an
+      # older changelog format there, the comparison is skipped. Consequence: a push to `main`
+      # that publishes a release needs its own dated CHANGELOG section. The later appcast step
+      # uses the `release-notes.md` written here.
+      - name: Verify release notes
+        run: |
+          PREVIOUS_TAG=$(git tag --list 'v[0-9]*' --sort=-v:refname | head -n 1)
+          : > previous-changelog.md
+          if [ -n "$PREVIOUS_TAG" ] && git cat-file -e "$PREVIOUS_TAG:CHANGELOG.md" 2>/dev/null; then
+            git show "$PREVIOUS_TAG:CHANGELOG.md" > previous-changelog.md
+          fi
+          bash scripts/release-notes.sh CHANGELOG.md previous-changelog.md > release-notes.md
       - name: Verify toolchain
         run: |
           xcodebuild -version
           test "$(xcrun --sdk macosx --show-sdk-version)" = "27.0"
+      # The version follows the last published release's `v*` tag (the same lookup as the release
+      # notes step): a higher MARKETING_VERSION starts at patch 0 (3.0 after v2.2.35 is 3.0.0), the
+      # same one moves the patch up by one. It fails closed rather than publish a version twice:
+      # no previous tag (tags not fetched), this commit already released, or the tag already taken.
       - name: Compute build version
         run: |
           BASE_VERSION=$(xcodebuild -project Beepbar.xcodeproj -target Beepbar -configuration Release -showBuildSettings | awk '/ MARKETING_VERSION =/ { print $3 }')
-          echo "FULL_VERSION=$(scripts/build-version.sh "$BASE_VERSION" "$GITHUB_RUN_NUMBER")" >> "$GITHUB_ENV"
+          PREVIOUS_TAG=$(git tag --list 'v[0-9]*' --sort=-v:refname | head -n 1)
+          if [ -z "$PREVIOUS_TAG" ]; then echo "No previous v* release tag found" >&2; exit 1; fi
+          if [ -n "$(git tag --points-at HEAD --list 'v[0-9]*')" ]; then echo "This commit is already released as $(git tag --points-at HEAD --list 'v[0-9]*')" >&2; exit 1; fi
+          FULL_VERSION=$(scripts/build-version.sh "$BASE_VERSION" "$PREVIOUS_TAG")
+          if git rev-parse -q --verify "refs/tags/v$FULL_VERSION" >/dev/null; then echo "Tag v$FULL_VERSION already exists" >&2; exit 1; fi
+          echo "Releasing $FULL_VERSION (previous: $PREVIOUS_TAG)"
+          echo "FULL_VERSION=$FULL_VERSION" >> "$GITHUB_ENV"
       - name: Build arm64 Release app
         run: xcodebuild -project Beepbar.xcodeproj -target Beepbar -configuration Release build CODE_SIGNING_ALLOWED=NO MARKETING_VERSION=$FULL_VERSION CURRENT_PROJECT_VERSION=$FULL_VERSION
       - name: Verify app
@@ -108,7 +153,7 @@ jobs:
           SIGNATURE=$(echo "$SPARKLE_PRIVATE_KEY" | /tmp/sparkle-tools/bin/sign_update --ed-key-file - build/00-Beepbar.dmg -p)
           LENGTH=$(stat -f%z build/00-Beepbar.dmg)
           PUBDATE=$(date -u +"%a, %d %b %Y %H:%M:%S +0000")
-          bash scripts/release-notes.sh CHANGELOG.md > release-notes.md
+          test -s release-notes.md
           cat > release-body.md <<BODYEOF
           [**Download BeepBar for macOS**](https://github.com/${{ github.repository }}/releases/latest/download/00-Beepbar.dmg)
 
@@ -152,23 +197,10 @@ jobs:
           files: |
             build/00-Beepbar.dmg
             appcast.xml
-      - name: Move legacy latest tag to this commit
-        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
-        run: |
-          git tag -f latest "$GITHUB_SHA"
-          git push -f origin latest
-      - name: Publish legacy latest feed (backward compatibility for installs predating versioned releases)
-        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
-        uses: softprops/action-gh-release@v2
-        with:
-          tag_name: latest
-          name: Legacy update feed
-          body: >-
-            Kept only so installs from before versioned releases (SUFeedURL baked into their
-            Info.plist as `releases/download/latest/appcast.xml`) can still discover and install
-            an update. Not meant for direct download — use the link in the README instead.
-          prerelease: true
-          make_latest: false
-          files: |
-            build/00-Beepbar.dmg
-            appcast.xml
+      # The `latest` tag and its "Legacy update feed" release are frozen at v2.2.35 and must stay
+      # published, together with the `v2.2.35` release and its `00-Beepbar.dmg`: the frozen
+      # appcast's enclosure points to that DMG. Builds 2.0.31–2.0.42 (before v2.0.44) still look
+      # for `T-vaccari/Beepbar/releases/download/latest/appcast.xml`, which GitHub redirects
+      # here. They update to v2.2.35, whose SUFeedURL points to
+      # `releases/latest/download/appcast.xml`, and from there they follow the versioned
+      # releases above. Deleting either release would leave them without updates.

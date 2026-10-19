@@ -1,4 +1,8 @@
+#if canImport(CryptoKit)
 import CryptoKit
+#else
+import Crypto
+#endif
 import Foundation
 
 public enum ModulePathMigrationError: Error, Sendable, Equatable, LocalizedError {
@@ -118,7 +122,7 @@ public actor ModulePathMigrator {
     public func deleteUnavailableRule(courseID: Int64, moduleID: Int64, token: String) async throws {
         try await gate.withLease(.movingModule(courseID, moduleID)) {
             guard try await self.database.hasPendingModuleMoves(rootID: self.rootID) == false else { throw ModulePathMigrationError.pendingRecovery }
-            guard try await self.database.pendingScopeMoves(rootID: self.rootID).isEmpty else { throw ModulePathMigrationError.pendingRecovery }
+            guard try await self.database.pendingScopeMoves(rootID: self.rootID).isEmpty else { throw PendingCourseFolderRenameError() }
             guard try await self.database.pendingOperations(rootID: self.rootID).isEmpty else { throw ModulePathMigrationError.pendingOperation }
             let contents = try await self.apiClient.fetchContents(courseID: courseID, token: token)
             let modules = contents.sections.flatMap(\.modules)
@@ -154,7 +158,9 @@ public actor ModulePathMigrator {
         let candidateIDs = Set(candidates.keys)
         let excluded = ownedBaselines.filter { !candidateIDs.contains($0.remoteID) }.map(\.remoteID).sorted()
         guard try await database.pendingOperations(rootID: rootID).isEmpty else { throw ModulePathMigrationError.pendingOperation }
-        guard try await database.pendingScopeMoves(rootID: rootID).isEmpty else { throw ModulePathMigrationError.pendingRecovery }
+        // Module destinations are built from the course folder the window shows, which an
+        // unfinished course rename makes unreliable (#183, RA-004).
+        guard try await database.pendingScopeMoves(rootID: rootID).isEmpty else { throw PendingCourseFolderRenameError() }
         let openConflicts = try await database.conflicts(rootID: rootID)
         let trackedIDs = Set(ownedBaselines.map(\.remoteID)).union(candidateIDs.filter { baselines[$0]?.courseID == nil })
         guard !openConflicts.contains(where: { trackedIDs.contains($0.remoteID) }) else { throw ModulePathMigrationError.openConflict }

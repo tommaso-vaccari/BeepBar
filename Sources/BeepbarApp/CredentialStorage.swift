@@ -22,11 +22,15 @@ enum FileTokenStore {
         // Written with 0600 permissions from the moment the file is created (rather than
         // written-then-chmod'd), and moved into place atomically, so there is never a window
         // where the token sits on disk under the default, more permissive umask.
-        let tempURL = url.deletingLastPathComponent().appendingPathComponent("\(tempFilePrefix)\(UUID().uuidString)\(tempFileSuffix)")
+        var tempURL = url.deletingLastPathComponent().appendingPathComponent("\(tempFilePrefix)\(UUID().uuidString)\(tempFileSuffix)")
         do {
-            guard FileManager.default.createFile(atPath: tempURL.path, contents: data, attributes: [.posixPermissions: 0o600]) else {
+            guard FileManager.default.createFile(atPath: tempURL.path, contents: nil, attributes: [.posixPermissions: 0o600]) else {
                 throw CredentialStorageError.write
             }
+            var values = URLResourceValues()
+            values.isExcludedFromBackup = true
+            try tempURL.setResourceValues(values)
+            try data.write(to: tempURL)
             _ = try FileManager.default.replaceItemAt(url, withItemAt: tempURL, options: .usingNewMetadataOnly)
         } catch {
             try? FileManager.default.removeItem(at: tempURL)
@@ -62,12 +66,21 @@ enum FileTokenStore {
     }
 
     static func delete(removeFile: (URL) throws -> Void = { try FileManager.default.removeItem(at: $0) }) throws {
-        let url = try fileURL()
-        try cleanUpOrphanedTempFiles(in: url.deletingLastPathComponent())
-        if FileManager.default.fileExists(atPath: url.path) { try removeFile(url) }
+        let url = try fileURL(excludeFromBackup: false)
+        var failure: (any Error)?
+        if FileManager.default.fileExists(atPath: url.path) {
+            do { try removeFile(url) } catch { failure = error }
+        }
+        do {
+            let contents = try FileManager.default.contentsOfDirectory(at: url.deletingLastPathComponent(), includingPropertiesForKeys: nil)
+            for item in contents where item.lastPathComponent.hasPrefix(tempFilePrefix) && item.lastPathComponent.hasSuffix(tempFileSuffix) {
+                do { try removeFile(item) } catch { failure = failure ?? error }
+            }
+        } catch { failure = failure ?? error }
+        if let failure { throw failure }
     }
 
-    private static func fileURL() throws -> URL {
+    private static func fileURL(excludeFromBackup: Bool = true) throws -> URL {
         do {
             let directory = try applicationSupportDirectory().appendingPathComponent(directoryName, isDirectory: true)
             if !FileManager.default.fileExists(atPath: directory.path) {
@@ -77,8 +90,21 @@ enum FileTokenStore {
             // by `WeBeepAuthenticationController.databaseDirectory()` with default permissions
             // when it runs first — re-assert 0700 here so the credential file's directory is
             // never left group/world-readable regardless of creation order.
-            try? FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: directory.path)
-            return directory.appendingPathComponent(fileName)
+            try FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: directory.path)
+            guard excludeFromBackup else { return directory.appendingPathComponent(fileName) }
+            for name in try FileManager.default.contentsOfDirectory(atPath: directory.path) where name.hasPrefix(tempFilePrefix) && name.hasSuffix(tempFileSuffix) {
+                var temporary = directory.appendingPathComponent(name)
+                var values = URLResourceValues()
+                values.isExcludedFromBackup = true
+                try temporary.setResourceValues(values)
+            }
+            var url = directory.appendingPathComponent(fileName)
+            if FileManager.default.fileExists(atPath: url.path) {
+                var values = URLResourceValues()
+                values.isExcludedFromBackup = true
+                try url.setResourceValues(values)
+            }
+            return url
         } catch {
             throw CredentialStorageError.write
         }

@@ -69,16 +69,50 @@ struct RecmanWebSessionTests {
         session.close()
     }
 
-    /// Only host and path reach the trace: Polimi's query strings carry sign-on tickets.
+    /// A web view that has no page yet (right after `open(cookies:)`) or is still loading skips
+    /// the archive probe; any page with an address is probed. Guards #174: probing the URL-less
+    /// web view ran a script whose answer could not matter, and a cold web process missing the
+    /// script deadline (as CI saw for that same fresh session) could end the first Recordings
+    /// operation as `unavailable` before it tried to enter. The session's own check is covered
+    /// by `aFreshSessionSkipsTheArchiveProbe` and `aLoadedPageIsStillProbedForTheArchive`.
+    @Test func theArchiveProbeRunsOnlyOnALoadedPage() throws {
+        let archive = try #require(URL(string: "https://\(RecmanURLPolicy.archiveHost)\(RecmanURLPolicy.archivePath)"))
+        #expect(!RecmanWebSession.archiveProbeCanAnswer(url: nil, isLoading: false))
+        #expect(!RecmanWebSession.archiveProbeCanAnswer(url: nil, isLoading: true))
+        #expect(!RecmanWebSession.archiveProbeCanAnswer(url: archive, isLoading: true))
+        #expect(RecmanWebSession.archiveProbeCanAnswer(url: archive, isLoading: false))
+        // Pages that are not the archive are still probed, so a stalled one keeps ending as
+        // `unavailable` inside a search.
+        #expect(RecmanWebSession.archiveProbeCanAnswer(url: RecmanWebSession.blankPage, isLoading: false))
+        // The skip changes no outcome: a missing address is never the archive.
+        #expect(PolimiPage.classify(archive, facts: PolimiPageFacts(hasArchiveForm: true)) == .archive)
+        #expect(PolimiPage.classify(nil, facts: PolimiPageFacts(hasArchiveForm: true)) != .archive)
+    }
+
+    /// The session's real archive check, right after `open(cookies:)`, answers "not the archive"
+    /// without running a script. Fails if `isOnArchive` stops using `archiveProbeCanAnswer`
+    /// (#174): the first Recordings operation would again start with a bounded script on an
+    /// empty web view. Nothing loads, so nothing reaches polimi.it.
+    @Test func aFreshSessionSkipsTheArchiveProbe() async throws {
+        let session = RecmanWebSession()
+        await session.open(cookies: [])
+        defer { session.close() }
+        let webView = try #require(session.webView)
+        #expect(webView.url == nil)
+        #expect(try await session.probeArchive() == false)
+        #expect(session.lastScriptCall == nil)
+    }
+
     @Test func tracesNeverCarryTheQuery() {
-        let url = URL(string: "https://onlineservices.polimi.it/recman_frontend/?ticket=ST-secret#frag")!
-        #expect(RecmanWebSession.redacted(url) == "https://onlineservices.polimi.it/recman_frontend/")
+        for address in [
+            "https://user:password@onlineservices.polimi.it/recman_frontend/?ticket=ST-secret#frag",
+            "https://onlineservices.polimi.it/aunicalogin.jsp;jsessionid=SECRET",
+            "https://onlineservices.polimi.it/mario.rossi@polimi.it/12345678-1234-1234-1234-123456789abc",
+            "https://onlineservices.polimi.it/arbitrary-private-course-title/0123456789abcdef0123456789abcdef",
+        ] {
+            #expect(RecmanWebSession.redacted(URL(string: address)) == "https://onlineservices.polimi.it")
+        }
         #expect(RecmanWebSession.redacted(nil) == "(none)")
-        // Java and Shibboleth pages put the session id in the path.
-        let pathSession = URL(string: "https://aunicalogin.polimi.it/aunicalogin/aunicalogin.jsp;jsessionid=SECRET?x=1")!
-        #expect(RecmanWebSession.redacted(pathSession) == "https://aunicalogin.polimi.it/aunicalogin/aunicalogin.jsp")
-        let middle = URL(string: "https://shibidp.polimi.it/idp/profile;jsessionid=SECRET/SAML2/Redirect/SSO")!
-        #expect(RecmanWebSession.redacted(middle) == "https://shibidp.polimi.it/idp/profile/SAML2/Redirect/SSO")
     }
 
     /// ⌘A, ⌘C, ⌘V, ⌘X and undo/redo work in the sign-in page with no Edit menu around: the web
@@ -137,3 +171,264 @@ struct RecmanWebSessionTests {
     }
 }
 
+
+/// A page script that never answers no longer holds an operation hostage (#112). Before, the
+/// session waited for WebKit's callback alone: a Promise that never settled kept a search or a
+/// playback request suspended, and `close()`, a newer operation or the controller cancelling its
+/// worker could not end it.
+///
+/// Each test loads a local document in an isolated session (a non-persistent store, no network, no
+/// Polimi session) and runs scripts through `runScript`, which starts an operation exactly as the
+/// archive operations do. `callAsyncJavaScript` (the form with arguments) waits for a returned
+/// Promise, which is how a script is made to never answer.
+@MainActor
+struct RecmanWebSessionScriptTests {
+    /// A Promise that never settles. WebKit has been seen to give up on it by itself after about
+    /// 6 s, answering nil, so the interruption tests check how the call ended (`.interrupted`),
+    /// not only how soon: a call that WebKit ended reads `.answered(nil)`, whatever the timing.
+    private static let stalled = "return new Promise(() => {})"
+
+    /// A backstop on how soon an interruption ends a stalled script. Interrupted calls end in
+    /// milliseconds; the bound is loose because a full parallel suite keeps the main actor busy
+    /// (CI's runner took 5.6 s on 911b46d). It only has to stay below the 20 s `scriptTimeout`
+    /// these tests use: `call.outcome == .interrupted` is what proves the timeout didn't end it.
+    private static let interruptBound: Duration = .seconds(15)
+
+    private func openSession(scriptTimeout: Duration) async throws -> RecmanWebSession {
+        let session = RecmanWebSession()
+        session.scriptTimeout = scriptTimeout
+        await session.open(cookies: [])
+        do {
+            let webView = try #require(session.webView)
+            let loaded = ScriptPageLoad()
+            let delegate = webView.navigationDelegate
+            webView.navigationDelegate = loaded
+            defer { webView.navigationDelegate = delegate }
+            // Process/document startup is fixture setup, not part of the script's deadline.
+            webView.loadHTMLString("<html><body id='script-fixture'></body></html>", baseURL: nil)
+            try await loaded.wait()
+            return session
+        } catch {
+            session.close()
+            throw error
+        }
+    }
+
+    /// Temporary navigation delegate used only while `openSession` loads the fixture document.
+    /// It reports the first finished or failed load, so a missing or broken document fails setup
+    /// within 30 s instead of letting a script start on a web view that has none.
+    @MainActor private final class ScriptPageLoad: NSObject, WKNavigationDelegate {
+        private var result: Result<Void, Error>?
+
+        func wait() async throws {
+            let deadline = ContinuousClock.now.advanced(by: .seconds(30))
+            while result == nil && ContinuousClock.now < deadline {
+                try await Task.sleep(for: .milliseconds(10))
+            }
+            try #require(result, "local script fixture did not finish loading").get()
+        }
+
+        func webView(_ webView: WKWebView, didFinish navigation: WKNavigation!) {
+            result = .success(())
+        }
+
+        func webView(_ webView: WKWebView, didFail navigation: WKNavigation!, withError error: Error) {
+            result = .failure(error)
+        }
+
+        func webView(_ webView: WKWebView, didFailProvisionalNavigation navigation: WKNavigation!, withError error: Error) {
+            result = .failure(error)
+        }
+    }
+
+    /// Cold WebContent startup belongs to setup, not to a script's deadline: a CI run once had
+    /// `scriptsThatAnswerStillAnswer` end as `unavailable` because the first script also paid for
+    /// starting WebKit. Fails if the fixture stops loading its document, runs a session script
+    /// during setup, or leaves its own navigation delegate in place of the session's.
+    @Test func theLocalDocumentIsReadyBeforeTheScriptDeadlineStarts() async throws {
+        let session = try await openSession(scriptTimeout: .seconds(10))
+        defer { session.close() }
+        #expect(session.lastScriptCall == nil)
+        #expect(session.webView?.navigationDelegate === session)
+        #expect(try await session.runScript("document.readyState + ':' + document.body.id") == "complete:script-fixture")
+    }
+
+    /// A page with an address (the local fixture, `about:blank`) is still probed: the check runs
+    /// the page-facts script and answers "not the archive". Fails if the #174 skip widens to pages
+    /// that have loaded, which would change how a stalled page inside a search ends.
+    @Test func aLoadedPageIsStillProbedForTheArchive() async throws {
+        let session = try await openSession(scriptTimeout: .seconds(10))
+        defer { session.close() }
+        #expect(session.webView?.url != nil)
+        #expect(try await session.probeArchive() == false)
+        #expect(session.lastScriptCall != nil)
+    }
+
+    private func start(_ script: String, in session: RecmanWebSession) -> Task<String, Error> {
+        Task { try await session.runScript(script, arguments: [:]) }
+    }
+
+    /// Returns once `session` is waiting for a script's answer, so an interruption hits a call in
+    /// flight rather than one that has not started.
+    private func untilPending(_ session: RecmanWebSession) async throws {
+        for _ in 0..<300 where !session.hasPendingScript {
+            try await Task.sleep(for: .milliseconds(10))
+        }
+        try #require(session.hasPendingScript, "the script never started")
+    }
+
+    /// The call `session` is waiting on, once it is waiting.
+    private func pendingCall(_ session: RecmanWebSession) async throws -> BoundedScriptCall<String?> {
+        try await untilPending(session)
+        return try #require(session.lastScriptCall)
+    }
+
+    private func outcome(_ task: Task<String, Error>) async -> String {
+        switch await task.result {
+        case .success(let answer): "answered \(answer)"
+        case .failure(is CancellationError): "cancelled"
+        case .failure(let error): "\(error)"
+        }
+    }
+
+    /// The bounded wait changes nothing for scripts that answer: a string comes back from both
+    /// WebKit forms, and anything else is still `unrecognized`.
+    @Test func scriptsThatAnswerStillAnswer() async throws {
+        let session = try await openSession(scriptTimeout: .seconds(10))
+        defer { session.close() }
+        #expect(try await session.runScript("return 'ok'", arguments: [:]) == "ok")
+        #expect(try await session.runScript("'plain'") == "plain")
+        #expect(try await session.runScript("return Promise.resolve('later')", arguments: [:]) == "later")
+        await #expect(throws: RecmanBrowserError.unrecognized) { try await session.runScript("return 42", arguments: [:]) }
+        #expect(!session.hasPendingScript)
+    }
+
+    /// A script that never answers ends at `scriptTimeout` as `unavailable`, the error a page load
+    /// that never finishes gives, so the controller stops instead of waiting forever.
+    @Test(.timeLimit(.minutes(1))) func aScriptThatNeverAnswersEndsAtTheTimeout() async throws {
+        let session = try await openSession(scriptTimeout: .milliseconds(300))
+        defer { session.close() }
+        let clock = ContinuousClock()
+        let started = clock.now
+        await #expect(throws: RecmanBrowserError.unavailable) { try await session.runScript(Self.stalled, arguments: [:]) }
+        let elapsed = clock.now - started
+        #expect(elapsed >= .milliseconds(300))
+        // Loose for the same reason as `interruptBound` (CI took 5.9 s): the failure guarded
+        // against is a wait that never ends, which would also hit the time limit.
+        #expect(elapsed < .seconds(15))
+        #expect(!session.hasPendingScript)
+    }
+
+    /// `close()` (Recordings turned off, sign-out, another account) ends a script in flight at
+    /// once, well before the timeout.
+    @Test(.timeLimit(.minutes(1))) func closingEndsAScriptInFlight() async throws {
+        let session = try await openSession(scriptTimeout: .seconds(20))
+        let task = start(Self.stalled, in: session)
+        let call = try await pendingCall(session)
+        let clock = ContinuousClock()
+        let started = clock.now
+        session.close()
+        #expect(await outcome(task) == "cancelled")
+        #expect(call.outcome == .interrupted)
+        #expect(clock.now - started < Self.interruptBound)
+        #expect(!session.hasPendingScript)
+    }
+
+    /// A newer operation (another course, a playback request) ends the previous operation's script
+    /// and gets its own answer, not the old one.
+    @Test(.timeLimit(.minutes(1))) func aNewOperationEndsThePreviousScript() async throws {
+        let session = try await openSession(scriptTimeout: .seconds(20))
+        defer { session.close() }
+        let first = start(Self.stalled, in: session)
+        let call = try await pendingCall(session)
+        let clock = ContinuousClock()
+        let started = clock.now
+        let second = start("return 'second'", in: session)
+        #expect(await outcome(first) == "cancelled")
+        #expect(call.outcome == .interrupted)
+        #expect(clock.now - started < Self.interruptBound)
+        #expect(await outcome(second) == "answered second")
+        #expect(!session.hasPendingScript)
+    }
+
+    /// Cancelling the task that awaits the script (the controller's `worker?.cancel()`) ends it
+    /// at once, and the session keeps working for the next operation.
+    @Test(.timeLimit(.minutes(1))) func cancellingTheAwaitingTaskEndsTheScript() async throws {
+        let session = try await openSession(scriptTimeout: .seconds(20))
+        defer { session.close() }
+        let task = start(Self.stalled, in: session)
+        let call = try await pendingCall(session)
+        let clock = ContinuousClock()
+        let started = clock.now
+        task.cancel()
+        #expect(await outcome(task) == "cancelled")
+        #expect(call.outcome == .interrupted)
+        #expect(clock.now - started < Self.interruptBound)
+        #expect(!session.hasPendingScript)
+        #expect(try await session.runScript("return 'next'", arguments: [:]) == "next")
+    }
+
+    /// An answer WebKit delivers after the call ended (here, after the timeout) is dropped: the
+    /// ended call keeps its timeout and records the answer as late, and the next operation gets
+    /// its own answer.
+    @Test(.timeLimit(.minutes(1))) func anAnswerAfterTheCallEndedIsDropped() async throws {
+        let session = try await openSession(scriptTimeout: .milliseconds(100))
+        defer { session.close() }
+        let late = "return new Promise(resolve => setTimeout(() => resolve('late'), 400))"
+        await #expect(throws: RecmanBrowserError.unavailable) { try await session.runScript(late, arguments: [:]) }
+        let ended = try #require(session.lastScriptCall)
+        for _ in 0..<300 where ended.lateSignals.isEmpty {
+            try await Task.sleep(for: .milliseconds(10))
+        }
+        #expect(ended.outcome == .timedOut)
+        #expect(ended.lateSignals == [.answered("late")])
+        session.scriptTimeout = .seconds(10)
+        let next = start("return 'next'", in: session)
+        #expect(await outcome(next) == "answered next")
+    }
+
+    /// `close()` lets the web view go even while WebKit still holds the callback of a Promise that
+    /// never settles: the callback captures the pending call, not the session or its web view.
+    @Test(.timeLimit(.minutes(1))) func closingReleasesTheWebViewDespiteAStalledScript() async throws {
+        let session = try await openSession(scriptTimeout: .seconds(20))
+        weak var webView = session.webView
+        #expect(webView != nil)
+        let task = start(Self.stalled, in: session)
+        let call = try await pendingCall(session)
+        session.close()
+        #expect(await outcome(task) == "cancelled")
+        #expect(call.outcome == .interrupted)
+        for _ in 0..<300 where webView != nil {
+            try await Task.sleep(for: .milliseconds(10))
+        }
+        #expect(webView == nil)
+    }
+
+    /// A page probe that answered is a page with those facts, an unreadable answer a page with
+    /// none; one that timed out or was interrupted is fed to the entry as nothing at all.
+    @Test func aProbeThatGaveNoAnswerSaysNothingAboutThePage() {
+        let url = URL(string: "https://aunicalogin.polimi.it/aunicalogin/aunicalogin.jsp")
+        var facts = PolimiPageFacts()
+        facts.asksForCredentials = true
+        #expect(RecmanWebSession.entryEvent(afterProbe: .success(facts), load: 3, url: url) == .loadFinished(id: 3, url: url, facts: facts))
+        #expect(RecmanWebSession.entryEvent(afterProbe: .failure(RecmanBrowserError.unrecognized), load: 3, url: url) == .loadFinished(id: 3, url: url, facts: PolimiPageFacts()))
+        #expect(RecmanWebSession.entryEvent(afterProbe: .failure(RecmanBrowserError.unavailable), load: 3, url: url) == nil)
+        #expect(RecmanWebSession.entryEvent(afterProbe: .failure(CancellationError()), load: 3, url: url) == nil)
+    }
+
+    /// A background entry whose probe of the login page stalls ends as "Polimi isn't responding"
+    /// at the deadline, as before scripts were bounded, not as "sign in again": treating the
+    /// timeout as a page with no facts would make the login page look like a dead end (#112 review).
+    @Test func aStalledProbeOnTheLoginPageEndsAtTheDeadline() {
+        let url = URL(string: "https://aunicalogin.polimi.it/aunicalogin/aunicalogin.jsp")
+        var navigator = RecmanEntryNavigator(mode: .background)
+        #expect(navigator.handle(.loadStarted(id: 1)).isEmpty)
+        if let event = RecmanWebSession.entryEvent(afterProbe: .failure(RecmanBrowserError.unavailable), load: 1, url: url) {
+            for command in navigator.handle(event) {
+                if case .schedulePatience(let id, _) = command { _ = navigator.handle(.patienceElapsed(id: id)) }
+            }
+        }
+        #expect(!navigator.isFinished)
+        #expect(navigator.handle(.deadlineElapsed) == [.finish(.timedOut)])
+    }
+}

@@ -1,0 +1,549 @@
+{
+  "architecture": "arm64",
+  "baseDevSHA": "26edaf0f2d2fca29deaf4eb46227c59d1e606efc",
+  "binarySHA256": "2a515002d611eaf9fe0d4674113df026dbbeec766d6dc90f9a86559fa378908c",
+  "conditions": "Dedicated synthetic fixture; no real scheduler/network/updater. Release arm64 with DEBUG DI seams. Controls disabled. 300ms shown + 3s after-close settling.",
+  "driverSHA256": "d604e575cfd2a4a4092fd90e5720b6981f36c3d0e9643d4229f5a82a11cd6570",
+  "limitations": [
+    "Tooling validation is separate from app performance gains.",
+    "Base-dev and main comparisons are not measured; older revisions need a reviewed equivalent UI fixture.",
+    "Cold means first window in a fresh fixture process, not cold filesystem cache or production bootstrap.",
+    "Content onAppear is distinct from compositor presentation. Time Profiler samples establish stacks, not a proof of every <=16ms stall.",
+    "Only synthetic known-content offline refresh is covered; persisted cold offline restoration remains D10.",
+    "Idle runs once, unprofiled, for 30 minutes; real scheduled checks are disabled and count zero by construction.",
+    "Five measured runs cannot establish a reliable p95. Manual scrolling/actions remain required."
+  ],
+  "macOS": "ProductName:\t\tmacOS\nProductVersion:\t\t27.0.1\nBuildVersion:\t\t26A434",
+  "machine": "arm64",
+  "mainSHA": "3ce0ba02c10dcf51836057f7119ba0e78da3c6e4",
+  "memoryBytes": "34359738368",
+  "model": "Mac17,3",
+  "power": "Now drawing from 'AC Power'",
+  "runs": 5,
+  "scenarios": [
+    "recordings-1000",
+    "launch-warm"
+  ],
+  "schemaVersion": 1,
+  "sourceSHA": "67e17fe7705e9195cf132ce9722b9164f5fd699b",
+  "valid": true,
+  "warmup": 1,
+  "windowBudgets": {
+    "launch-warm": {
+      "allObservedSamplesWithinBudget": true,
+      "maximumObservedMilliseconds": 65.302625,
+      "targetMilliseconds": 100
+    },
+    "recordings-1000": {
+      "allObservedSamplesWithinBudget": true,
+      "maximumObservedMilliseconds": 103.052167,
+      "targetMilliseconds": 250
+    }
+  },
+  "xcode": "Xcode 27.1\nBuild version 27A9275",
+  "xctrace": "xctrace version 27.1 (27A9275)",
+  "sourceIdentity": "Disposable committed snapshot of local dev source, not published dev; source-sha256.json identifies tested files.",
+  "command": "scripts/ui-benchmark.py --ref <temporary snapshot> --out <new evidence directory> --scenarios recordings-1000 launch-warm --runs 5 --warmup 1 --dependency-cache <dependency cache>",
+  "samples": {
+    "recordings-1000": [
+      {
+        "activityCount": 0,
+        "courseCount": 100,
+        "cycles": [
+          {
+            "contentMilliseconds": {
+              "recordings": 189.696709
+            },
+            "index": 1,
+            "keyMilliseconds": 99.863667,
+            "resourcesAfterClose": {
+              "cpuNanoseconds": 365469166.6666667,
+              "diskBytesWritten": 532480,
+              "footprintBytes": 55690176,
+              "idleWakeups": 25,
+              "interruptWakeups": 83,
+              "logicalBytesWritten": 733280
+            }
+          }
+        ],
+        "fixtureSetupMilliseconds": 12.31875,
+        "iconConstructionMilliseconds": 15.411667,
+        "idleSeconds": 0,
+        "limitations": [
+          "Synthetic controller DI startup; production credential/bootstrap/migration and process-loader latency are not measured.",
+          "Content is SwiftUI onAppear of populated data; not compositor presentation. Key window latency is separate.",
+          "Fixtures seed known courses online before offline refresh; this does not prove persisted course restoration at offline app launch (D10).",
+          "Activity expands via a fixture-only state seam; manual scrolling and actions require a separate isolated interactive verification.",
+          "Controls are disabled to forbid interactive external side effects; fixture status item has no menu.",
+          "Progress stressor uses an off-main producer and the current sync publication path; deterministic producer ingress counts remain D08.",
+          "Real scheduler, notifications, login-at-launch and Sparkle are absent. Idle measures the isolated closed-window baseline, not due production checks.",
+          "Five samples produce a maximum labeled p95; no reliable tail claim. Main-thread occupancy requires a Time Profiler trace."
+        ],
+        "lowPowerMode": false,
+        "operatingSystem": "Version 27.0.1 (Build 26A434)",
+        "recordingsCount": 1000,
+        "scenario": "recordings-1000",
+        "scheduledChecksDuringIdle": 0,
+        "schemaVersion": 1,
+        "thermalState": 0,
+        "valid": true
+      },
+      {
+        "activityCount": 0,
+        "courseCount": 100,
+        "cycles": [
+          {
+            "contentMilliseconds": {
+              "recordings": 193.342667
+            },
+            "index": 1,
+            "keyMilliseconds": 101.282292,
+            "resourcesAfterClose": {
+              "cpuNanoseconds": 364585625,
+              "diskBytesWritten": 532480,
+              "footprintBytes": 56148928,
+              "idleWakeups": 31,
+              "interruptWakeups": 84,
+              "logicalBytesWritten": 749664
+            }
+          }
+        ],
+        "fixtureSetupMilliseconds": 12.308792,
+        "iconConstructionMilliseconds": 13.989,
+        "idleSeconds": 0,
+        "limitations": [
+          "Synthetic controller DI startup; production credential/bootstrap/migration and process-loader latency are not measured.",
+          "Content is SwiftUI onAppear of populated data; not compositor presentation. Key window latency is separate.",
+          "Fixtures seed known courses online before offline refresh; this does not prove persisted course restoration at offline app launch (D10).",
+          "Activity expands via a fixture-only state seam; manual scrolling and actions require a separate isolated interactive verification.",
+          "Controls are disabled to forbid interactive external side effects; fixture status item has no menu.",
+          "Progress stressor uses an off-main producer and the current sync publication path; deterministic producer ingress counts remain D08.",
+          "Real scheduler, notifications, login-at-launch and Sparkle are absent. Idle measures the isolated closed-window baseline, not due production checks.",
+          "Five samples produce a maximum labeled p95; no reliable tail claim. Main-thread occupancy requires a Time Profiler trace."
+        ],
+        "lowPowerMode": false,
+        "operatingSystem": "Version 27.0.1 (Build 26A434)",
+        "recordingsCount": 1000,
+        "scenario": "recordings-1000",
+        "scheduledChecksDuringIdle": 0,
+        "schemaVersion": 1,
+        "thermalState": 0,
+        "valid": true
+      },
+      {
+        "activityCount": 0,
+        "courseCount": 100,
+        "cycles": [
+          {
+            "contentMilliseconds": {
+              "recordings": 190.499375
+            },
+            "index": 1,
+            "keyMilliseconds": 99.388375,
+            "resourcesAfterClose": {
+              "cpuNanoseconds": 362003208.3333333,
+              "diskBytesWritten": 532480,
+              "footprintBytes": 55329728,
+              "idleWakeups": 21,
+              "interruptWakeups": 83,
+              "logicalBytesWritten": 729184
+            }
+          }
+        ],
+        "fixtureSetupMilliseconds": 12.927084,
+        "iconConstructionMilliseconds": 14.264041,
+        "idleSeconds": 0,
+        "limitations": [
+          "Synthetic controller DI startup; production credential/bootstrap/migration and process-loader latency are not measured.",
+          "Content is SwiftUI onAppear of populated data; not compositor presentation. Key window latency is separate.",
+          "Fixtures seed known courses online before offline refresh; this does not prove persisted course restoration at offline app launch (D10).",
+          "Activity expands via a fixture-only state seam; manual scrolling and actions require a separate isolated interactive verification.",
+          "Controls are disabled to forbid interactive external side effects; fixture status item has no menu.",
+          "Progress stressor uses an off-main producer and the current sync publication path; deterministic producer ingress counts remain D08.",
+          "Real scheduler, notifications, login-at-launch and Sparkle are absent. Idle measures the isolated closed-window baseline, not due production checks.",
+          "Five samples produce a maximum labeled p95; no reliable tail claim. Main-thread occupancy requires a Time Profiler trace."
+        ],
+        "lowPowerMode": false,
+        "operatingSystem": "Version 27.0.1 (Build 26A434)",
+        "recordingsCount": 1000,
+        "scenario": "recordings-1000",
+        "scheduledChecksDuringIdle": 0,
+        "schemaVersion": 1,
+        "thermalState": 0,
+        "valid": true
+      },
+      {
+        "activityCount": 0,
+        "courseCount": 100,
+        "cycles": [
+          {
+            "contentMilliseconds": {
+              "recordings": 190.94725
+            },
+            "index": 1,
+            "keyMilliseconds": 100.629541,
+            "resourcesAfterClose": {
+              "cpuNanoseconds": 364072333.3333333,
+              "diskBytesWritten": 532480,
+              "footprintBytes": 55133120,
+              "idleWakeups": 20,
+              "interruptWakeups": 79,
+              "logicalBytesWritten": 733280
+            }
+          }
+        ],
+        "fixtureSetupMilliseconds": 10.659667,
+        "iconConstructionMilliseconds": 13.85375,
+        "idleSeconds": 0,
+        "limitations": [
+          "Synthetic controller DI startup; production credential/bootstrap/migration and process-loader latency are not measured.",
+          "Content is SwiftUI onAppear of populated data; not compositor presentation. Key window latency is separate.",
+          "Fixtures seed known courses online before offline refresh; this does not prove persisted course restoration at offline app launch (D10).",
+          "Activity expands via a fixture-only state seam; manual scrolling and actions require a separate isolated interactive verification.",
+          "Controls are disabled to forbid interactive external side effects; fixture status item has no menu.",
+          "Progress stressor uses an off-main producer and the current sync publication path; deterministic producer ingress counts remain D08.",
+          "Real scheduler, notifications, login-at-launch and Sparkle are absent. Idle measures the isolated closed-window baseline, not due production checks.",
+          "Five samples produce a maximum labeled p95; no reliable tail claim. Main-thread occupancy requires a Time Profiler trace."
+        ],
+        "lowPowerMode": false,
+        "operatingSystem": "Version 27.0.1 (Build 26A434)",
+        "recordingsCount": 1000,
+        "scenario": "recordings-1000",
+        "scheduledChecksDuringIdle": 0,
+        "schemaVersion": 1,
+        "thermalState": 0,
+        "valid": true
+      },
+      {
+        "activityCount": 0,
+        "courseCount": 100,
+        "cycles": [
+          {
+            "contentMilliseconds": {
+              "recordings": 196.688625
+            },
+            "index": 1,
+            "keyMilliseconds": 103.052167,
+            "resourcesAfterClose": {
+              "cpuNanoseconds": 360127000,
+              "diskBytesWritten": 532480,
+              "footprintBytes": 55641048,
+              "idleWakeups": 12,
+              "interruptWakeups": 82,
+              "logicalBytesWritten": 712800
+            }
+          }
+        ],
+        "fixtureSetupMilliseconds": 11.305084,
+        "iconConstructionMilliseconds": 14.066125,
+        "idleSeconds": 0,
+        "limitations": [
+          "Synthetic controller DI startup; production credential/bootstrap/migration and process-loader latency are not measured.",
+          "Content is SwiftUI onAppear of populated data; not compositor presentation. Key window latency is separate.",
+          "Fixtures seed known courses online before offline refresh; this does not prove persisted course restoration at offline app launch (D10).",
+          "Activity expands via a fixture-only state seam; manual scrolling and actions require a separate isolated interactive verification.",
+          "Controls are disabled to forbid interactive external side effects; fixture status item has no menu.",
+          "Progress stressor uses an off-main producer and the current sync publication path; deterministic producer ingress counts remain D08.",
+          "Real scheduler, notifications, login-at-launch and Sparkle are absent. Idle measures the isolated closed-window baseline, not due production checks.",
+          "Five samples produce a maximum labeled p95; no reliable tail claim. Main-thread occupancy requires a Time Profiler trace."
+        ],
+        "lowPowerMode": false,
+        "operatingSystem": "Version 27.0.1 (Build 26A434)",
+        "recordingsCount": 1000,
+        "scenario": "recordings-1000",
+        "scheduledChecksDuringIdle": 0,
+        "schemaVersion": 1,
+        "thermalState": 0,
+        "valid": true
+      }
+    ],
+    "launch-warm": [
+      {
+        "activityCount": 0,
+        "courseCount": 100,
+        "cycles": [
+          {
+            "contentMilliseconds": {
+              "courses": 34.656583
+            },
+            "index": 1,
+            "keyMilliseconds": 133.181625,
+            "resourcesAfterClose": {
+              "cpuNanoseconds": 257174291.66666666,
+              "diskBytesWritten": 237568,
+              "footprintBytes": 36406184,
+              "idleWakeups": 31,
+              "interruptWakeups": 71,
+              "logicalBytesWritten": 442380
+            }
+          },
+          {
+            "contentMilliseconds": {
+              "courses": 31.964791
+            },
+            "index": 2,
+            "keyMilliseconds": 64.117833,
+            "resourcesAfterClose": {
+              "cpuNanoseconds": 405651333.3333333,
+              "diskBytesWritten": 237568,
+              "footprintBytes": 36520872,
+              "idleWakeups": 63,
+              "interruptWakeups": 115,
+              "logicalBytesWritten": 442380
+            }
+          }
+        ],
+        "fixtureSetupMilliseconds": 15.394916,
+        "iconConstructionMilliseconds": 14.236083,
+        "idleSeconds": 0,
+        "limitations": [
+          "Synthetic controller DI startup; production credential/bootstrap/migration and process-loader latency are not measured.",
+          "Content is SwiftUI onAppear of populated data; not compositor presentation. Key window latency is separate.",
+          "Fixtures seed known courses online before offline refresh; this does not prove persisted course restoration at offline app launch (D10).",
+          "Activity expands via a fixture-only state seam; manual scrolling and actions require a separate isolated interactive verification.",
+          "Controls are disabled to forbid interactive external side effects; fixture status item has no menu.",
+          "Progress stressor uses an off-main producer and the current sync publication path; deterministic producer ingress counts remain D08.",
+          "Real scheduler, notifications, login-at-launch and Sparkle are absent. Idle measures the isolated closed-window baseline, not due production checks.",
+          "Five samples produce a maximum labeled p95; no reliable tail claim. Main-thread occupancy requires a Time Profiler trace."
+        ],
+        "lowPowerMode": false,
+        "operatingSystem": "Version 27.0.1 (Build 26A434)",
+        "recordingsCount": 0,
+        "scenario": "launch-warm",
+        "scheduledChecksDuringIdle": 0,
+        "schemaVersion": 1,
+        "thermalState": 0,
+        "valid": true
+      },
+      {
+        "activityCount": 0,
+        "courseCount": 100,
+        "cycles": [
+          {
+            "contentMilliseconds": {
+              "courses": 34.512959
+            },
+            "index": 1,
+            "keyMilliseconds": 124.3135,
+            "resourcesAfterClose": {
+              "cpuNanoseconds": 254006666.66666666,
+              "diskBytesWritten": 237568,
+              "footprintBytes": 36324288,
+              "idleWakeups": 29,
+              "interruptWakeups": 70,
+              "logicalBytesWritten": 442380
+            }
+          },
+          {
+            "contentMilliseconds": {
+              "courses": 28.675708
+            },
+            "index": 2,
+            "keyMilliseconds": 58.100208,
+            "resourcesAfterClose": {
+              "cpuNanoseconds": 392687125,
+              "diskBytesWritten": 237568,
+              "footprintBytes": 36520896,
+              "idleWakeups": 61,
+              "interruptWakeups": 115,
+              "logicalBytesWritten": 442380
+            }
+          }
+        ],
+        "fixtureSetupMilliseconds": 11.681667,
+        "iconConstructionMilliseconds": 13.359916,
+        "idleSeconds": 0,
+        "limitations": [
+          "Synthetic controller DI startup; production credential/bootstrap/migration and process-loader latency are not measured.",
+          "Content is SwiftUI onAppear of populated data; not compositor presentation. Key window latency is separate.",
+          "Fixtures seed known courses online before offline refresh; this does not prove persisted course restoration at offline app launch (D10).",
+          "Activity expands via a fixture-only state seam; manual scrolling and actions require a separate isolated interactive verification.",
+          "Controls are disabled to forbid interactive external side effects; fixture status item has no menu.",
+          "Progress stressor uses an off-main producer and the current sync publication path; deterministic producer ingress counts remain D08.",
+          "Real scheduler, notifications, login-at-launch and Sparkle are absent. Idle measures the isolated closed-window baseline, not due production checks.",
+          "Five samples produce a maximum labeled p95; no reliable tail claim. Main-thread occupancy requires a Time Profiler trace."
+        ],
+        "lowPowerMode": false,
+        "operatingSystem": "Version 27.0.1 (Build 26A434)",
+        "recordingsCount": 0,
+        "scenario": "launch-warm",
+        "scheduledChecksDuringIdle": 0,
+        "schemaVersion": 1,
+        "thermalState": 0,
+        "valid": true
+      },
+      {
+        "activityCount": 0,
+        "courseCount": 100,
+        "cycles": [
+          {
+            "contentMilliseconds": {
+              "courses": 34.732084
+            },
+            "index": 1,
+            "keyMilliseconds": 118.72,
+            "resourcesAfterClose": {
+              "cpuNanoseconds": 255517375,
+              "diskBytesWritten": 237568,
+              "footprintBytes": 36242344,
+              "idleWakeups": 25,
+              "interruptWakeups": 71,
+              "logicalBytesWritten": 458764
+            }
+          },
+          {
+            "contentMilliseconds": {
+              "courses": 26.779583
+            },
+            "index": 2,
+            "keyMilliseconds": 53.106792,
+            "resourcesAfterClose": {
+              "cpuNanoseconds": 392225625,
+              "diskBytesWritten": 237568,
+              "footprintBytes": 36553640,
+              "idleWakeups": 55,
+              "interruptWakeups": 115,
+              "logicalBytesWritten": 458764
+            }
+          }
+        ],
+        "fixtureSetupMilliseconds": 12.213208,
+        "iconConstructionMilliseconds": 15.34325,
+        "idleSeconds": 0,
+        "limitations": [
+          "Synthetic controller DI startup; production credential/bootstrap/migration and process-loader latency are not measured.",
+          "Content is SwiftUI onAppear of populated data; not compositor presentation. Key window latency is separate.",
+          "Fixtures seed known courses online before offline refresh; this does not prove persisted course restoration at offline app launch (D10).",
+          "Activity expands via a fixture-only state seam; manual scrolling and actions require a separate isolated interactive verification.",
+          "Controls are disabled to forbid interactive external side effects; fixture status item has no menu.",
+          "Progress stressor uses an off-main producer and the current sync publication path; deterministic producer ingress counts remain D08.",
+          "Real scheduler, notifications, login-at-launch and Sparkle are absent. Idle measures the isolated closed-window baseline, not due production checks.",
+          "Five samples produce a maximum labeled p95; no reliable tail claim. Main-thread occupancy requires a Time Profiler trace."
+        ],
+        "lowPowerMode": false,
+        "operatingSystem": "Version 27.0.1 (Build 26A434)",
+        "recordingsCount": 0,
+        "scenario": "launch-warm",
+        "scheduledChecksDuringIdle": 0,
+        "schemaVersion": 1,
+        "thermalState": 0,
+        "valid": true
+      },
+      {
+        "activityCount": 0,
+        "courseCount": 100,
+        "cycles": [
+          {
+            "contentMilliseconds": {
+              "courses": 35.379
+            },
+            "index": 1,
+            "keyMilliseconds": 128.443917,
+            "resourcesAfterClose": {
+              "cpuNanoseconds": 260695416.66666666,
+              "diskBytesWritten": 237568,
+              "footprintBytes": 36537280,
+              "idleWakeups": 37,
+              "interruptWakeups": 71,
+              "logicalBytesWritten": 438284
+            }
+          },
+          {
+            "contentMilliseconds": {
+              "courses": 33.554667
+            },
+            "index": 2,
+            "keyMilliseconds": 65.302625,
+            "resourcesAfterClose": {
+              "cpuNanoseconds": 405809708.3333333,
+              "diskBytesWritten": 237568,
+              "footprintBytes": 36701120,
+              "idleWakeups": 71,
+              "interruptWakeups": 115,
+              "logicalBytesWritten": 438284
+            }
+          }
+        ],
+        "fixtureSetupMilliseconds": 12.823667,
+        "iconConstructionMilliseconds": 15.196459,
+        "idleSeconds": 0,
+        "limitations": [
+          "Synthetic controller DI startup; production credential/bootstrap/migration and process-loader latency are not measured.",
+          "Content is SwiftUI onAppear of populated data; not compositor presentation. Key window latency is separate.",
+          "Fixtures seed known courses online before offline refresh; this does not prove persisted course restoration at offline app launch (D10).",
+          "Activity expands via a fixture-only state seam; manual scrolling and actions require a separate isolated interactive verification.",
+          "Controls are disabled to forbid interactive external side effects; fixture status item has no menu.",
+          "Progress stressor uses an off-main producer and the current sync publication path; deterministic producer ingress counts remain D08.",
+          "Real scheduler, notifications, login-at-launch and Sparkle are absent. Idle measures the isolated closed-window baseline, not due production checks.",
+          "Five samples produce a maximum labeled p95; no reliable tail claim. Main-thread occupancy requires a Time Profiler trace."
+        ],
+        "lowPowerMode": false,
+        "operatingSystem": "Version 27.0.1 (Build 26A434)",
+        "recordingsCount": 0,
+        "scenario": "launch-warm",
+        "scheduledChecksDuringIdle": 0,
+        "schemaVersion": 1,
+        "thermalState": 0,
+        "valid": true
+      },
+      {
+        "activityCount": 0,
+        "courseCount": 100,
+        "cycles": [
+          {
+            "contentMilliseconds": {
+              "courses": 35.082833
+            },
+            "index": 1,
+            "keyMilliseconds": 130.499291,
+            "resourcesAfterClose": {
+              "cpuNanoseconds": 255730666.66666666,
+              "diskBytesWritten": 237568,
+              "footprintBytes": 36176808,
+              "idleWakeups": 33,
+              "interruptWakeups": 72,
+              "logicalBytesWritten": 454668
+            }
+          },
+          {
+            "contentMilliseconds": {
+              "courses": 33.372666
+            },
+            "index": 2,
+            "keyMilliseconds": 65.198208,
+            "resourcesAfterClose": {
+              "cpuNanoseconds": 404800875,
+              "diskBytesWritten": 237568,
+              "footprintBytes": 36389800,
+              "idleWakeups": 61,
+              "interruptWakeups": 116,
+              "logicalBytesWritten": 454668
+            }
+          }
+        ],
+        "fixtureSetupMilliseconds": 13.016041,
+        "iconConstructionMilliseconds": 13.438959,
+        "idleSeconds": 0,
+        "limitations": [
+          "Synthetic controller DI startup; production credential/bootstrap/migration and process-loader latency are not measured.",
+          "Content is SwiftUI onAppear of populated data; not compositor presentation. Key window latency is separate.",
+          "Fixtures seed known courses online before offline refresh; this does not prove persisted course restoration at offline app launch (D10).",
+          "Activity expands via a fixture-only state seam; manual scrolling and actions require a separate isolated interactive verification.",
+          "Controls are disabled to forbid interactive external side effects; fixture status item has no menu.",
+          "Progress stressor uses an off-main producer and the current sync publication path; deterministic producer ingress counts remain D08.",
+          "Real scheduler, notifications, login-at-launch and Sparkle are absent. Idle measures the isolated closed-window baseline, not due production checks.",
+          "Five samples produce a maximum labeled p95; no reliable tail claim. Main-thread occupancy requires a Time Profiler trace."
+        ],
+        "lowPowerMode": false,
+        "operatingSystem": "Version 27.0.1 (Build 26A434)",
+        "recordingsCount": 0,
+        "scenario": "launch-warm",
+        "scheduledChecksDuringIdle": 0,
+        "schemaVersion": 1,
+        "thermalState": 0,
+        "valid": true
+      }
+    ]
+  },
+  "rawEvidence": "Full original series/logs/traces remain locally in ignored PerformanceReports/release-2026-10-19-unlocked. Machine-local temporary paths omitted here."
+}

@@ -10,6 +10,68 @@ import Testing
 @MainActor struct DataSaverTests {
     private nonisolated static let lastResult = SyncCompletionSummary(completedAt: Date(timeIntervalSince1970: 1_800_000_000), added: 3, updated: 0, unchanged: 10, preservedLocal: 0, conflicts: 0, failures: 0)
 
+    /// A nonempty selection keeps the original deadline; empty selection and recovery stop activity.
+    @Test func schedulerKeepsDeadlineAndTracksRecovery() async throws {
+        let schedule = TestSchedule()
+        let harness = try await Harness(networks: [.hotspot], schedule: schedule)
+        defer { harness.remove() }
+        #expect(schedule.registrations == 1)
+        let deadline = schedule.deadline
+        schedule.now = 120
+        let second = RemoteCourseSummary(id: 2, shortName: "Second", displayName: "Second", isVisible: nil, startDate: nil, endDate: nil)
+        harness.controller.setCourse(second, enabled: true)
+        #expect(schedule.registrations == 1)
+        #expect(schedule.deadline == deadline)
+        harness.controller.setCourse(harness.controller.courses[0], enabled: false)
+        #expect(schedule.registrations == 1)
+        harness.controller.setCourse(second, enabled: false)
+        #expect(!schedule.active)
+        harness.controller.setCourse(second, enabled: true)
+        #expect(schedule.registrations == 2 && schedule.active)
+        harness.controller.setRecoveryBlockedForTesting(true)
+        #expect(!schedule.active)
+        harness.controller.setRecoveryBlockedForTesting(true)
+        #expect(schedule.registrations == 2)
+        harness.controller.setRecoveryBlockedForTesting(false)
+        #expect(schedule.registrations == 3 && schedule.active)
+        harness.controller.setRecoveryBlockedForTesting(false)
+        #expect(schedule.registrations == 3)
+    }
+
+    /// A queued callback from an invalidated registration must finish without reading the network.
+    @Test func invalidatedSchedulerCallbackDoesNotRun() async throws {
+        let schedule = TestSchedule()
+        let harness = try await Harness(networks: [.hotspot], schedule: schedule)
+        defer { harness.remove() }
+        harness.controller.setDataSaver(enabled: true)
+        harness.controller.setAutomaticSync(enabled: false)
+        harness.controller.setAutomaticSync(enabled: true)
+        #expect(await schedule.fire(0) == .finished)
+        #expect(harness.networkReads == 0)
+        #expect(harness.controller.dataSaverPause == nil)
+        #expect(await schedule.fire(1) == .deferred)
+        #expect(harness.networkReads == 1)
+        #expect(harness.controller.dataSaverPause == .hotspot)
+    }
+
+    /// Selection changes clear a pause and reject pending path answers without replacing the timer.
+    @Test func selectionInvalidatesPathButNotDeadline() async throws {
+        let schedule = TestSchedule()
+        let harness = try await Harness(networks: [.hotspot, .hotspot], schedule: schedule)
+        defer { harness.remove() }
+        harness.controller.setDataSaver(enabled: true)
+        #expect(await schedule.fire(0) == .deferred)
+        let deadline = schedule.deadline
+        let first = harness.controller.courses[0]
+        harness.controller.setCourse(RemoteCourseSummary(id: 2, shortName: "Second", displayName: "Second", isVisible: nil, startDate: nil, endDate: nil), enabled: true)
+        #expect(harness.controller.dataSaverPause == nil)
+        #expect(schedule.registrations == 1 && schedule.deadline == deadline)
+        harness.sequence.onRead(2) { harness.controller.setCourse(first, enabled: false) }
+        #expect(await schedule.fire(0) == .finished)
+        #expect(harness.controller.dataSaverPause == nil)
+        #expect(schedule.registrations == 1 && schedule.deadline == deadline)
+    }
+
     // MARK: Before a run
 
     /// Proves that with Data Saver on, an automatic run on a hotspot or a Low Data Mode network
@@ -317,6 +379,21 @@ import Testing
         #expect(harness.controller.syncState == .synced(Self.lastResult))
     }
 
+    @Test func cancelledNetworkReadDoesNotStartAutomaticSync() async throws {
+        let harness = try await Harness(networks: [nil])
+        defer { harness.remove() }
+        harness.controller.setDataSaver(enabled: true)
+        harness.controller.setSyncStateForTesting(.synced(Self.lastResult))
+        let requestsBefore = harness.requests.count
+        let task = Task { await harness.controller.runAutomaticSyncForTesting() }
+        harness.sequence.onRead(1) { task.cancel() }
+        #expect(await task.value == .finished)
+        #expect(harness.requests.count == requestsBefore)
+        #expect(!harness.controller.isSyncActive)
+        #expect(harness.controller.dataSaverPause == nil)
+        #expect(harness.controller.syncState == .synced(Self.lastResult))
+    }
+
     // MARK: What clears the pause
 
     /// Proves that "Sincronizza ora" on a hotspot clears the pause and downloads at once, Data
@@ -534,6 +611,37 @@ private final class NetworkSequence: Sendable {
     }
 }
 
+/// Uses the signed-in harness below, which runs real syncs against a local Moodle.
+@MainActor struct UnreadableMoveRecoveryTests {
+    /// An interrupted Moodle move whose destination became a symbolic link blocks the folder until
+    /// the user fixes it. Both a manual and an automatic run say which path, rather than the
+    /// generic "Sincronizzazione incompleta" that gave the user nothing to act on (release review
+    /// I-A4). Fails if the app stops catching `RemoteMoveRecoveryError` or drops the path.
+    @Test(arguments: [false, true])
+    func aBlockedMoveNamesThePathToFix(automatic: Bool) async throws {
+        let harness = try await Harness(networks: [.unrestricted, .unrestricted])
+        defer { harness.remove() }
+        await harness.controller.runAutomaticSyncForTesting()
+        #expect(harness.downloaded("a.txt"))
+        let destination = try RelativePath("Course/Moved/a.txt")
+        try await harness.database.beginRemoteMoves(rootID: harness.rootID, [
+            PendingRemoteMove(batchID: UUID(), remoteID: "interrupted", from: try RelativePath("Course/Lezioni/a.txt"), to: destination, sha256: String(repeating: "0", count: 64), placement: nil),
+        ])
+        try FileManager.default.createSymbolicLink(at: harness.root.appending(path: "Course/Moved"), withDestinationURL: harness.root)
+
+        if automatic {
+            await harness.controller.runAutomaticSyncForTesting()
+        } else {
+            harness.controller.synchronizeNow()
+            await harness.controller.waitForSyncForTesting()
+        }
+
+        #expect(harness.controller.syncState == .failed(.local(WeBeepAuthenticationController.unreadableMoveMessage(destination))))
+        #expect(WeBeepAuthenticationController.unreadableMoveMessage(destination).italian.contains("«Course/Moved/a.txt»"))
+        #expect(WeBeepAuthenticationController.unreadableMoveMessage(destination).english.contains("“Course/Moved/a.txt”"))
+    }
+}
+
 /// A controller signed in to a local Moodle where course 1 is selected and lists `a.txt`, with a
 /// folder of its own, a scripted network, and automatic sync on, as users have it.
 @MainActor private struct Harness {
@@ -544,7 +652,7 @@ private final class NetworkSequence: Sendable {
     let rootID: UUID
     let sequence: NetworkSequence
 
-    init(networks: [NetworkPathConditions?], lowPowerMode: Bool = false) async throws {
+    init(networks: [NetworkPathConditions?], lowPowerMode: Bool = false, schedule: TestSchedule? = nil) async throws {
         root = FileManager.default.temporaryDirectory.appending(path: UUID().uuidString, directoryHint: .isDirectory)
         try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
         let database = try SyncDatabase(url: root.appending(path: "state.sqlite"))
@@ -567,6 +675,7 @@ private final class NetworkSequence: Sendable {
         #expect(controller.courseLoadError == nil)
         #expect(controller.enabledCourseIDs == [1])
         // A test controller registers no real background activity, so this is safe here.
+        if let schedule { controller.setBackgroundSchedulerForTesting { interval, callback in schedule.register(interval, callback) } }
         controller.setAutomaticSync(enabled: true)
         #expect(controller.automaticSyncEnabled)
     }
@@ -580,4 +689,23 @@ private final class NetworkSequence: Sendable {
     }
 
     func remove() { try? FileManager.default.removeItem(at: root) }
+}
+
+/// Deterministic registration clock; keeps old callbacks to model macOS callbacks already queued.
+@MainActor private final class TestSchedule {
+    var now: TimeInterval = 0
+    private(set) var deadline: TimeInterval?
+    private(set) var active = false
+    private var callbacks: [@Sendable (@escaping NSBackgroundActivityScheduler.CompletionHandler) -> Void] = []
+    var registrations: Int { callbacks.count }
+    func register(_ interval: TimeInterval, _ callback: @escaping @Sendable (@escaping NSBackgroundActivityScheduler.CompletionHandler) -> Void) -> BackgroundActivityRegistration {
+        callbacks.append(callback)
+        deadline = now + interval
+        active = true
+        return BackgroundActivityRegistration { self.active = false; self.deadline = nil }
+    }
+    func fire(_ index: Int) async -> NSBackgroundActivityScheduler.Result {
+        let callback = callbacks[index]
+        return await withCheckedContinuation { continuation in callback { continuation.resume(returning: $0) } }
+    }
 }

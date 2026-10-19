@@ -1,8 +1,16 @@
+#if canImport(CryptoKit)
 import CryptoKit
+#else
+import Crypto
+#endif
+#if canImport(Darwin)
 import Darwin
+#else
+import Glibc
+#endif
 import Foundation
 
-public enum FileStoreError: Error, Sendable, Equatable { case invalidRoot, symbolicLink, invalidStage, localChanged, destinationExists, sizeMismatch, tooLarge, ioFailure, unsupported }
+public enum FileStoreError: Error, Sendable, Equatable { case invalidRoot, symbolicLink, invalidStage, localChanged, destinationExists, sizeMismatch, tooLarge, ioFailure, mutationNotDurable, unsupported }
 
 private struct FileIdentity: Sendable, Equatable {
     let device: Int64
@@ -74,13 +82,23 @@ public actor FileStore {
     /// Tests change the destination after `install`'s pre-swap check and before the swap, the
     /// window only the post-swap check of the displaced copy guards.
     private let beforeSwap: (@Sendable (RelativePath) throws -> Void)?
+    private let syncDirectory: @Sendable (Int32) throws -> Void
+    /// `linkat(fromDir, fromName, toDir, toName, 0)`, returning 0 or the `errno` of the failure.
+    /// Tests replace it to act like a volume without hard links (exFAT/FAT, some network or
+    /// FileProvider folders) and to change the file at that exact point of `trashRegularFile`,
+    /// between its first verification and the fallback's last one (#182).
+    private let hardLink: @Sendable (Int32, String, Int32, String) -> Int32
+    private let beforeReadChunk: (@Sendable (Bool, Int64) -> Void)?
     /// Number of times a file's full contents were read to compute a SHA-256 digest.
     /// Test instrumentation: lets tests prove that unchanged files are not re-read on every sync.
     private(set) var hashCount = 0
     /// Bytes read to compute those digests: tells one large file read twice from two small ones.
     private var bytesHashed: Int64 = 0
-    /// Paths resolved from the root, one directory `openat` per component, before any per-file
-    /// call (`inspect`, `containsRegularFile`, occupancy checks, moves) touches the file itself.
+    /// Directory resolutions from the root, one `openat` per component, before a call touches the
+    /// files in that directory. Per-file calls (`inspect`, `containsRegularFile`, occupancy checks,
+    /// moves) resolve once per path; `existingRegularFiles` resolves once per distinct parent
+    /// directory per call (R03, #111), so for a run with nothing new this counts module folders,
+    /// not tracked files.
     private var pathLookups = 0
     /// Hashes `inspect` computed during this store's life, keyed by the exact state of the file
     /// they were read from. Only `install`'s check before replacing a file consults them, through
@@ -104,13 +122,13 @@ public actor FileStore {
     }
 
     /// `trash` moves a file to the Trash; tests replace it so they never touch the user's Trash.
-    public init(root: URL, trash: @escaping @Sendable (URL) throws -> Void = { try FileManager.default.trashItem(at: $0, resultingItemURL: nil) }) throws {
+    public init(root: URL, trash: @escaping @Sendable (URL) throws -> Void = FileStore.defaultTrash) throws {
         try self.init(root: root, beforeMove: nil, trash: trash)
     }
 
     /// Tests inject a filesystem change after destination selection, before move validation.
     /// `beforeSwap` comes last so that existing trailing closures keep binding to `trash`.
-    init(root: URL, beforeMove: (@Sendable (RelativePath, RelativePath) throws -> Void)?, trash: @escaping @Sendable (URL) throws -> Void = { try FileManager.default.trashItem(at: $0, resultingItemURL: nil) }, beforeSwap: (@Sendable (RelativePath) throws -> Void)? = nil) throws {
+    init(root: URL, beforeMove: (@Sendable (RelativePath, RelativePath) throws -> Void)?, trash: @escaping @Sendable (URL) throws -> Void = FileStore.defaultTrash, beforeSwap: (@Sendable (RelativePath) throws -> Void)? = nil, beforeReadChunk: (@Sendable (Bool, Int64) -> Void)? = nil, syncDirectory: @escaping @Sendable (Int32) throws -> Void = { guard fsync($0) == 0 else { throw FileStoreError.ioFailure } }, hardLink: @escaping @Sendable (Int32, String, Int32, String) -> Int32 = { linkat($0, $1, $2, $3, 0) == 0 ? 0 : errno }) throws {
         let fd = open(root.standardizedFileURL.path, O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW)
         guard fd >= 0 else { throw FileStoreError.invalidRoot }
         guard (try? Self.identity(of: fd)) != nil else { close(fd); throw FileStoreError.invalidRoot }
@@ -119,11 +137,15 @@ public actor FileStore {
         self.trash = trash
         self.beforeMove = beforeMove
         self.beforeSwap = beforeSwap
+        self.beforeReadChunk = beforeReadChunk
+        self.syncDirectory = syncDirectory
+        self.hardLink = hardLink
     }
 
     deinit { close(rootFD) }
 
-    public func inspect(_ path: RelativePath) throws -> LocalState {
+    /// Ordinary reads can stop; recovery and a journaled change explicitly finish their read.
+    public func inspect(_ path: RelativePath, checksCancellation: Bool = true) throws -> LocalState {
         let parentAndName: (Int32, String)
         do {
             parentAndName = try parentDirectory(for: path, create: false)
@@ -136,7 +158,7 @@ public actor FileStore {
         if fd < 0 { if errno == ENOENT { return .missing }; throw fileStoreError() }
         defer { close(fd) }
         try requireRegularFile(fd)
-        return .present(sha256: try rememberingSHA256(of: fd))
+        return .present(sha256: try rememberingSHA256(of: fd, checksCancellation: checksCancellation))
     }
 
     public func containsRegularFile(_ path: RelativePath) throws -> Bool {
@@ -183,6 +205,7 @@ public actor FileStore {
             }
         }
         guard (metadata.st_mode & S_IFMT) == S_IFREG else { return .notARegularFile }
+#if canImport(Darwin)
         // Finder aliases are regular files, but Launch Services follows them even when their
         // name says PDF. Read FinderInfo relative to the checked parent without following links.
         var attributes = attrlist()
@@ -199,6 +222,7 @@ public actor FileStore {
         }
         // Finder flags are big-endian at byte eight; 0x8000 marks an alias.
         guard finderInfo[12] & 0x80 == 0 else { return .notARegularFile }
+#endif
         // stat does not check permission to read the leaf. Effective access also honors ACLs,
         // without opening or hydrating an evicted document just to check permission.
         guard faccessat(parent, name, R_OK, AT_EACCESS) == 0 else {
@@ -209,7 +233,7 @@ public actor FileStore {
         return .regular(executable: metadata.st_mode & 0o111 != 0)
     }
 
-    public func snapshotRegularFile(_ path: RelativePath) throws -> FileSnapshotState {
+    public func snapshotRegularFile(_ path: RelativePath, checksCancellation: Bool = true) throws -> FileSnapshotState {
         try requireMovablePath(path)
         let (parent, name): (Int32, String)
         do { (parent, name) = try parentDirectory(for: path, create: false) }
@@ -220,7 +244,7 @@ public actor FileStore {
         defer { close(fd) }
         try requireRegularFile(fd)
         let identity = try Self.identity(of: fd)
-        return .present(FileSnapshot(device: identity.device, inode: identity.inode, sha256: try sha256(of: fd)))
+        return .present(FileSnapshot(device: identity.device, inode: identity.inode, sha256: try sha256(of: fd, checksCancellation: checksCancellation)))
     }
 
     public func regularFileIdentity(_ path: RelativePath) throws -> DirectoryIdentity? {
@@ -324,7 +348,7 @@ public actor FileStore {
         try requireRegularFile(sourceFD)
         guard try Self.identity(of: sourceFD) == FileIdentity(device: expected.device, inode: expected.inode) else { throw FileStoreError.localChanged }
         if !preservingCurrentContents {
-            guard try sha256(of: sourceFD) == expected.sha256 else { throw FileStoreError.localChanged }
+            guard try sha256(of: sourceFD, checksCancellation: false) == expected.sha256 else { throw FileStoreError.localChanged }
         }
         let (destinationParent, destinationName) = try parentDirectory(for: destination, create: true)
         defer { close(destinationParent) }
@@ -335,7 +359,8 @@ public actor FileStore {
             if errno == EEXIST { throw FileStoreError.destinationExists }
             throw fileStoreError()
         }
-        guard fsync(sourceParent) == 0, fsync(destinationParent) == 0 else { throw fileStoreError() }
+        do { try syncDirectory(sourceParent); try syncDirectory(destinationParent) }
+        catch { throw FileStoreError.mutationNotDurable }
     }
 
     /// Exchanges two regular files in one atomic rename (`RENAME_SWAP`), each checked to still be
@@ -354,7 +379,7 @@ public actor FileStore {
             defer { close(fd) }
             try requireRegularFile(fd)
             guard try Self.identity(of: fd) == FileIdentity(device: snapshot.device, inode: snapshot.inode),
-                  try sha256(of: fd) == snapshot.sha256 else { throw FileStoreError.localChanged }
+                  try sha256(of: fd, checksCancellation: false) == snapshot.sha256 else { throw FileStoreError.localChanged }
             var current = stat()
             guard fstatat(parent, name, &current, AT_SYMLINK_NOFOLLOW) == 0,
                   Int64(current.st_dev) == snapshot.device, UInt64(current.st_ino) == snapshot.inode else { throw FileStoreError.localChanged }
@@ -363,15 +388,138 @@ public actor FileStore {
             if errno == ENOTSUP || errno == EINVAL { throw FileStoreError.unsupported }
             throw fileStoreError()
         }
-        guard fsync(firstParent) == 0, fsync(secondParent) == 0 else { throw fileStoreError() }
+        do { try syncDirectory(firstParent); try syncDirectory(secondParent) }
+        catch { throw FileStoreError.mutationNotDurable }
     }
 
     /// Moves a regular file to the Trash, where the user can still recover it, provided it is
     /// still the file that was hashed (`expected`).
+    ///
+    /// Where the volume allows it, the verified file is pinned by a hard link in a private staging
+    /// folder and that link is what goes to the Trash: the user's path is only unlinked after the
+    /// trash, once the file there is proven to still be the same, unchanged one, so a change at any
+    /// moment leaves it in place. Volumes without hard links (exFAT/FAT, some network or
+    /// FileProvider folders) refuse the link, and a staging folder on another device cannot hold
+    /// one; there the file is trashed by its path after a last check (`trashWithoutHardLink`), so
+    /// the choice keeps working there as it did in released versions (#182).
+    ///
+    /// The pinning link shares the verified source's inode, so hashing it again adds a full
+    /// read without protecting the final unlink (#185). Check its identity and cancellation
+    /// before Trash, then hash the still-open source before unlinking the user's path: an edit
+    /// meanwhile leaves that path in place. This final read cannot be cancelled once Trash acts.
     public func trashRegularFile(_ path: RelativePath, expected: FileSnapshot) throws {
-        guard case .present(let current) = try snapshotRegularFile(path), current == expected else { throw FileStoreError.localChanged }
-        do { try trash(rootURL.appending(path: path.value, directoryHint: .notDirectory)) }
+        try requireMovablePath(path)
+        let namedRoot = open(rootURL.path, O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW)
+        guard namedRoot >= 0 else { throw FileStoreError.localChanged }
+        defer { close(namedRoot) }
+        guard try Self.identity(of: namedRoot) == Self.identity(of: rootFD) else { throw FileStoreError.localChanged }
+        let (parent, name) = try parentDirectory(for: path, create: false)
+        defer { close(parent) }
+        let source = openat(parent, name, O_RDONLY | O_CLOEXEC | O_NOFOLLOW)
+        guard source >= 0 else { throw fileStoreError() }
+        defer { close(source) }
+        try requireRegularFile(source)
+        let identity = FileIdentity(device: expected.device, inode: expected.inode)
+        // Taken before the hash, so the fallback's last check sees any write since the read began.
+        let verifiedStamp = try Self.contentStamp(of: source)
+        guard try Self.identity(of: source) == identity,
+              try sha256(of: source, checksCancellation: true) == expected.sha256 else { throw FileStoreError.localChanged }
+        #if canImport(Darwin)
+        let stagingURL = try FileManager.default.url(for: .itemReplacementDirectory, in: .userDomainMask, appropriateFor: rootURL, create: true)
+        #else
+        var template = Array(FileManager.default.temporaryDirectory.appending(path: "beepbar-trash-XXXXXX").path.utf8CString)
+        guard mkdtemp(&template) != nil else { throw fileStoreError() }
+        let stagingURL = URL(fileURLWithPath: String(cString: template))
+        #endif
+        let staging = open(stagingURL.path, O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW)
+        guard staging >= 0 else { throw fileStoreError() }
+        defer {
+            _ = unlinkat(staging, name, 0)
+            close(staging)
+            _ = rmdir(stagingURL.path)
+        }
+        guard fchmod(staging, S_IRWXU) == 0 else { throw FileStoreError.ioFailure }
+        // A staging folder on another device cannot hold a hard link to the file (#182).
+        guard try Self.identity(of: staging).device == identity.device else {
+            return try trashWithoutHardLink(path, parent: parent, name: name, source: source, identity: identity, verifiedStamp: verifiedStamp)
+        }
+        let linkFailure = hardLink(parent, name, staging, name)
+        if linkFailure != 0 {
+            guard Self.meansNoHardLinks(linkFailure) else { throw linkFailure == ELOOP ? FileStoreError.symbolicLink : FileStoreError.ioFailure }
+            return try trashWithoutHardLink(path, parent: parent, name: name, source: source, identity: identity, verifiedStamp: verifiedStamp)
+        }
+        let staged = openat(staging, name, O_RDONLY | O_CLOEXEC | O_NOFOLLOW)
+        guard staged >= 0 else { throw FileStoreError.localChanged }
+        defer { close(staged) }
+        try requireRegularFile(staged)
+        guard try Self.identity(of: staged) == identity else { throw FileStoreError.localChanged }
+        try Task.checkCancellation()
+        let namedStaging = open(stagingURL.path, O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW)
+        guard namedStaging >= 0 else { throw FileStoreError.localChanged }
+        defer { close(namedStaging) }
+        guard try Self.identity(of: namedStaging) == Self.identity(of: staging) else { throw FileStoreError.localChanged }
+        do { try trash(stagingURL.appending(path: name, directoryHint: .notDirectory)) }
         catch { throw FileStoreError.ioFailure }
+        var current = stat()
+        guard try sha256(of: source, checksCancellation: false) == expected.sha256,
+              fstatat(parent, name, &current, AT_SYMLINK_NOFOLLOW) == 0,
+              (current.st_mode & S_IFMT) == S_IFREG,
+              Int64(current.st_dev) == identity.device, UInt64(current.st_ino) == identity.inode else { throw FileStoreError.localChanged }
+        guard unlinkat(parent, name, 0) == 0 else { throw fileStoreError() }
+    }
+
+    /// `linkat` errors that mean "this volume (or this pair of folders) cannot hard-link", as
+    /// opposed to a failure the fallback would not fix: exFAT/FAT answer `ENOTSUP`, some network
+    /// and FileProvider folders `EPERM`, and two devices `EXDEV` (#182).
+    static func meansNoHardLinks(_ error: Int32) -> Bool {
+        error == ENOTSUP || error == EOPNOTSUPP || error == EPERM || error == EXDEV
+    }
+
+    /// Trashes the file by its path, for volumes that cannot pin it with a hard link (#182).
+    /// `trashRegularFile` has already proven that `source` is the expected file with the expected
+    /// contents, and recorded its `fstat` state before that read (`verifiedStamp`).
+    ///
+    /// What is guaranteed, checked immediately before the Trash call, after the last point where
+    /// cancelling stops the action (nothing has changed on disk until then):
+    /// - the open file still has the state it had before its verified read, so a write since then
+    ///   (in place, or a replacement that unlinked it) leaves the file where it is and throws
+    ///   `localChanged`;
+    /// - the path, as the Trash will resolve it from `rootURL`, still names the verified file: the
+    ///   named parent folder is the folder reached through `O_NOFOLLOW` from the pinned root, so a
+    ///   moved root or a folder swapped for a symbolic link is refused, and the entry at the name
+    ///   is still the verified regular file;
+    /// - after the Trash call, if the verified file is still at its path, the Trash took something
+    ///   else: the user's file is untouched and `localChanged` is thrown, never success.
+    ///
+    /// What is not: the Trash API takes a path, not a descriptor, so a change landing between the
+    /// last check and the moment the Trash moves the item cannot be refused. A write to the file
+    /// in that window goes to the Trash with it, and a file put at the path (or a folder swapped)
+    /// in that window goes to the Trash instead, with the verified file left in place and the
+    /// action reported as changed. In every case the item is in the Trash, recoverable, never
+    /// deleted. The window lasts only as long as the Trash call takes to move the item, never the
+    /// verified read, and is narrower than in released versions, which trashed by path with no
+    /// check between the hash and the Trash call. On
+    /// FAT and exFAT the timestamps are coarse (2 s / 10 ms) and there is no real ctime, so a
+    /// same-size in-place write during the verified read can also go unnoticed there. No hash is
+    /// repeated after the Trash call: unlike the hard-link path there is nothing left to guard,
+    /// since the file is already in the Trash whatever the result.
+    private func trashWithoutHardLink(_ path: RelativePath, parent: Int32, name: String, source: Int32, identity: FileIdentity, verifiedStamp: ContentStamp) throws {
+        try Task.checkCancellation()
+        guard try Self.contentStamp(of: source) == verifiedStamp else { throw FileStoreError.localChanged }
+        let url = rootURL.appending(path: path.value, directoryHint: .notDirectory)
+        let namedParent = open(url.deletingLastPathComponent().path, O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW)
+        guard namedParent >= 0 else { throw FileStoreError.localChanged }
+        defer { close(namedParent) }
+        var current = stat()
+        guard try Self.identity(of: namedParent) == Self.identity(of: parent),
+              fstatat(parent, name, &current, AT_SYMLINK_NOFOLLOW) == 0,
+              (current.st_mode & S_IFMT) == S_IFREG,
+              Int64(current.st_dev) == identity.device, UInt64(current.st_ino) == identity.inode else { throw FileStoreError.localChanged }
+        do { try trash(url) }
+        catch { throw FileStoreError.ioFailure }
+        var after = stat()
+        if fstatat(parent, name, &after, AT_SYMLINK_NOFOLLOW) == 0,
+           Int64(after.st_dev) == identity.device, UInt64(after.st_ino) == identity.inode { throw FileStoreError.localChanged }
     }
 
     /// Removes the directories that held `path` while they are empty, deepest first, stopping at the
@@ -392,44 +540,97 @@ public actor FileStore {
         }
     }
 
-    /// Returns the subset of `paths` that currently exist as regular files, using one `stat` per path and
-    /// never reading file contents. Directories, symbolic links and other non-regular entries, as well as
-    /// paths whose parent is missing or is no longer a directory, are reported as absent rather than thrown.
+    /// Returns the subset of `paths` that currently exist as regular files, using one `fstatat` per
+    /// path and never reading file contents. Directories, symbolic links and other non-regular
+    /// entries, as well as paths whose parent is missing or is no longer a directory, are reported
+    /// as absent rather than thrown.
+    ///
+    /// Each distinct parent directory is resolved once per call and its descriptor reused for the
+    /// files it holds (R03, #111, PR #142). A run with nothing new checks every tracked file this
+    /// way, and resolving `Corso/Modulo` again for each of its files cost one `dup`, one `openat`
+    /// per component and as many `close` calls per file, several times the one `fstatat` that
+    /// answers the question (measurements in the R03 section of `docs/performance-plan.md`).
+    ///
+    /// The checks are the ones the per-file version made: every directory is reached from the
+    /// root descriptor pinned at `init` through `O_NOFOLLOW` opens, and each name is looked at
+    /// with `AT_SYMLINK_NOFOLLOW`, so no symbolic link is followed and no path is resolved outside
+    /// the root. A missing directory, a file where a directory should be, or a symbolic link in the
+    /// path makes only that directory's files absent; any other error (a folder that cannot be
+    /// opened or searched) still fails the whole call rather than being read as a deletion.
+    /// `ExistingRegularFilesSafetyTests` pins each of these.
+    ///
+    /// The one difference is timing. A directory replaced or moved while this call is checking
+    /// its files is noticed by the next call instead of at the next file, and a folder moved out
+    /// of the root during the call still has its files checked through the descriptor already
+    /// held. The per-file version had the same window for one file at a time. The answer was
+    /// already a snapshot that can go stale right after the `fstatat`; what a stale answer does
+    /// depends on the caller in `SyncCoordinator`:
+    /// - reconciliation (`itemsRequiringReconciliation`): a stale "present" skips the item until
+    ///   the next run; a stale "absent" sends it to `inspect`/`install`, whose expected-state
+    ///   checks refuse to overwrite anything;
+    /// - files removed from Moodle (`vanishedFiles`): a stale "absent" drops the open entry for
+    ///   that file (the next run that sees the file creates it again, with a new id and detection
+    ///   date) or skips adopting it for a re-upload, which is then downloaded as usual; a stale
+    ///   "present" reads the file again before opening an entry, or keeps an open one whose action
+    ///   re-checks the file;
+    /// - ghost name reservation: a stale "absent" frees a name a newcomer may pick, and installing
+    ///   there still goes through `RENAME_EXCL`, so an existing file is never replaced; a stale
+    ///   "present" only reserves a name for one run;
+    /// - an open "moved" entry: a stale "present" keeps the entry, whose action re-checks the file;
+    ///   a stale "absent" reads the source again.
+    /// Local data safety is therefore unchanged: no answer of this call can make sync overwrite or
+    /// delete a file. Descriptors live only for this call, never in a cache, so a later call never
+    /// trusts a directory it did not open itself.
     public func existingRegularFiles(_ paths: [RelativePath]) throws -> Set<RelativePath> {
         var existing: Set<RelativePath> = []
+        var namesByParent: [[String]: [(path: RelativePath, name: String)]] = [:]
+        var parents: [[String]] = []
         for path in paths {
+            let components = path.components
+            let parent = Array(components.dropLast())
+            if namesByParent[parent] == nil { parents.append(parent) }
+            namesByParent[parent, default: []].append((path, components.last!))
+        }
+        for parent in parents {
             try Task.checkCancellation()
-            if try isRegularFile(at: path) { existing.insert(path) }
+            let directory: Int32
+            do {
+                directory = try directoryFD(for: parent, create: false)
+            } catch FileStoreError.symbolicLink {
+                continue
+            } catch where errno == ENOENT || errno == ENOTDIR {
+                continue
+            }
+            defer { close(directory) }
+            for (path, name) in namesByParent[parent]! {
+                try Task.checkCancellation()
+                var metadata = stat()
+                guard fstatat(directory, name, &metadata, AT_SYMLINK_NOFOLLOW) == 0 else {
+                    if errno == ENOENT || errno == ENOTDIR { continue }
+                    throw fileStoreError()
+                }
+                if (metadata.st_mode & S_IFMT) == S_IFREG { existing.insert(path) }
+            }
         }
         return existing
     }
 
-    private func isRegularFile(at path: RelativePath) throws -> Bool {
-        let parentAndName: (Int32, String)
-        do {
-            parentAndName = try parentDirectory(for: path, create: false)
-        } catch FileStoreError.symbolicLink {
-            return false
-        } catch where errno == ENOENT || errno == ENOTDIR {
-            return false
-        }
-        let (parent, name) = parentAndName
-        defer { close(parent) }
-        var metadata = stat()
-        guard fstatat(parent, name, &metadata, AT_SYMLINK_NOFOLLOW) == 0 else {
-            if errno == ENOENT || errno == ENOTDIR { return false }
-            throw fileStoreError()
-        }
-        return (metadata.st_mode & S_IFMT) == S_IFREG
-    }
-
-    public func renameTopLevelDirectory(from old: String, to new: String) throws {
+    public func renameTopLevelDirectory(from old: String, to new: String, expectedIdentity: DirectoryIdentity? = nil) throws {
         guard isSafeTopLevelName(old), isSafeTopLevelName(new) else { throw FileStoreError.invalidStage }
         let oldFD = openat(rootFD, old, O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW)
         guard oldFD >= 0 else { throw fileStoreError() }
         defer { close(oldFD) }
+        if let expectedIdentity {
+            let identity = try Self.identity(of: oldFD)
+            guard DirectoryIdentity(device: identity.device, inode: identity.inode) == expectedIdentity else { throw FileStoreError.invalidStage }
+            var current = stat()
+            guard fstatat(rootFD, old, &current, AT_SYMLINK_NOFOLLOW) == 0 else { throw fileStoreError() }
+            guard (current.st_mode & S_IFMT) == S_IFDIR,
+                  Int64(current.st_dev) == expectedIdentity.device, UInt64(current.st_ino) == expectedIdentity.inode else { throw FileStoreError.invalidStage }
+        }
         guard renameatx_np(rootFD, old, rootFD, new, UInt32(RENAME_EXCL)) == 0 else { throw fileStoreError() }
-        guard fsync(rootFD) == 0 else { throw fileStoreError() }
+        do { try syncDirectory(rootFD) }
+        catch { throw FileStoreError.mutationNotDurable }
     }
 
     public func topLevelDirectoryIdentity(_ name: String) throws -> DirectoryIdentity? {
@@ -479,7 +680,7 @@ public actor FileStore {
         try data.withUnsafeBytes { bytes in
             var offset = 0
             while offset < bytes.count {
-                let count = Darwin.write(fd, bytes.baseAddress!.advanced(by: offset), bytes.count - offset)
+                let count = posixWrite(fd, bytes.baseAddress!.advanced(by: offset), bytes.count - offset)
                 if count < 0, errno == EINTR { continue }
                 guard count > 0 else { throw fileStoreError() }
                 offset += count
@@ -518,7 +719,7 @@ public actor FileStore {
         try data.withUnsafeBytes { bytes in
             var offset = 0
             while offset < bytes.count {
-                let count = Darwin.write(fd, bytes.baseAddress!.advanced(by: offset), bytes.count - offset)
+                let count = posixWrite(fd, bytes.baseAddress!.advanced(by: offset), bytes.count - offset)
                 if count < 0, errno == EINTR { continue }
                 guard count > 0 else { throw FileStoreError.ioFailure }
                 offset += count
@@ -532,9 +733,11 @@ public actor FileStore {
         let fd = try openStage(stage, in: staging, flags: O_RDONLY)
         defer { close(fd) }
         guard fsync(fd) == 0 else { throw fileStoreError() }
-        return StagedArtifact(name: stage.name, identity: stage.identity, stagePath: stage.relativePath, sha256: try sha256(of: fd), size: try fileSize(of: fd))
+        return StagedArtifact(name: stage.name, identity: stage.identity, stagePath: stage.relativePath, sha256: try sha256(of: fd, checksCancellation: true), size: try fileSize(of: fd))
     }
 
+    // Once journaled, installation, displaced-copy validation and rollback finish even if the
+    // caller cancels. Interruptible inspection happens before the journal is written.
     public func install(_ artifact: StagedArtifact, at path: RelativePath, expectedLocal: LocalState) throws -> InstallResult {
         let trace = PerformanceTrace.shared.begin("filesystem.install", category: .filesystem)
         defer { PerformanceTrace.shared.end("filesystem.install", category: .filesystem, state: trace) }
@@ -571,7 +774,7 @@ public actor FileStore {
                 guard current >= 0 else { return false }
                 defer { close(current) }
                 try self.requireRegularFile(current)
-                guard try self.sha256(of: current) == artifact.sha256 else { return false }
+                guard try self.sha256(of: current, checksCancellation: false) == artifact.sha256 else { return false }
                 guard renameatx_np(staging, artifact.name, destinationParent, destinationName, UInt32(RENAME_SWAP)) == 0 else { throw self.fileStoreError() }
                 guard fsync(staging) == 0, fsync(destinationParent) == 0 else { throw self.fileStoreError() }
                 return true
@@ -581,7 +784,7 @@ public actor FileStore {
                 guard displacedFD >= 0 else { throw fileStoreError() }
                 defer { close(displacedFD) }
                 try requireRegularFile(displacedFD)
-                let displacedHash = try sha256(of: displacedFD)
+                let displacedHash = try sha256(of: displacedFD, checksCancellation: false)
                 guard displacedHash == expectedHash else {
                     guard try rollbackIfRemoteIsStillInstalled() else { throw FileStoreError.localChanged }
                     return .localChanged
@@ -601,7 +804,7 @@ public actor FileStore {
         defer { close(staging) }
         let stage = StageHandle(name: recovery.name, identity: recovery.identity, relativePath: recovery.relativePath)
         let fd = try openStage(stage, in: staging, flags: O_RDONLY)
-        let hash = try sha256(of: fd)
+        let hash = try sha256(of: fd, checksCancellation: false)
         close(fd)
         guard hash == recovery.sha256 else { throw FileStoreError.localChanged }
         guard unlinkat(staging, recovery.name, 0) == 0 else { throw fileStoreError() }
@@ -622,7 +825,7 @@ public actor FileStore {
         return incoming
     }
 
-    public func conflictArtifact(at path: RelativePath) throws -> StagedArtifact? {
+    public func conflictArtifact(at path: RelativePath, checksCancellation: Bool = true) throws -> StagedArtifact? {
         let components = path.components
         guard components.count >= 4, components[0] == ".beepbar", components[1] == "conflicts" else { throw FileStoreError.invalidStage }
         let (parent, name): (Int32, String)
@@ -636,7 +839,7 @@ public actor FileStore {
         if fd < 0 { if errno == ENOENT { return nil }; throw fileStoreError() }
         defer { close(fd) }
         try requireRegularFile(fd)
-        return StagedArtifact(name: name, identity: try Self.identity(of: fd), stagePath: path, sha256: try sha256(of: fd), size: try fileSize(of: fd))
+        return StagedArtifact(name: name, identity: try Self.identity(of: fd), stagePath: path, sha256: try sha256(of: fd, checksCancellation: checksCancellation), size: try fileSize(of: fd))
     }
 
     public func copyConflictArtifactToStage(at path: RelativePath, expectedSHA256: String) throws -> StagedArtifact {
@@ -653,7 +856,13 @@ public actor FileStore {
             guard duplicate >= 0 else { throw FileStoreError.ioFailure }
             let handle = FileHandle(fileDescriptor: duplicate, closeOnDealloc: true)
             defer { try? handle.close() }
-            try Self.forEachChunk(of: handle) { try write($0, to: stage) }
+            var copiedBytes: Int64 = 0
+            try Self.forEachChunk(of: handle) { chunk in
+                beforeReadChunk?(true, copiedBytes)
+                try Task.checkCancellation()
+                try write(chunk, to: stage)
+                copiedBytes += Int64(chunk.count)
+            }
             let copied = try finalize(stage)
             guard copied.sha256 == expectedSHA256 && copied.size == artifact.size else { throw FileStoreError.invalidStage }
             return copied
@@ -664,7 +873,7 @@ public actor FileStore {
     }
 
     public func discardConflictArtifact(at path: RelativePath, expectedSHA256: String) throws {
-        guard let artifact = try conflictArtifact(at: path), artifact.sha256 == expectedSHA256 else { throw FileStoreError.localChanged }
+        guard let artifact = try conflictArtifact(at: path, checksCancellation: false), artifact.sha256 == expectedSHA256 else { throw FileStoreError.localChanged }
         let (parent, name) = try parentDirectory(for: path, create: false)
         defer { close(parent) }
         guard unlinkat(parent, name, 0) == 0 else { throw fileStoreError() }
@@ -733,7 +942,7 @@ public actor FileStore {
         if fd < 0 { if errno == ENOENT { return nil }; throw fileStoreError() }
         defer { close(fd) }
         try requireRegularFile(fd)
-        return StagedArtifact(name: components[2], identity: try Self.identity(of: fd), stagePath: path, sha256: try sha256(of: fd), size: try fileSize(of: fd))
+        return StagedArtifact(name: components[2], identity: try Self.identity(of: fd), stagePath: path, sha256: try sha256(of: fd, checksCancellation: false), size: try fileSize(of: fd))
     }
 
     private func parentDirectory(for path: RelativePath, create: Bool) throws -> (Int32, String) {
@@ -818,17 +1027,17 @@ public actor FileStore {
         return FileIdentity(device: Int64(metadata.st_dev), inode: UInt64(metadata.st_ino))
     }
 
-    private func sha256(of fd: Int32) throws -> String {
-        try hashContents(of: fd).sha256
+    private func sha256(of fd: Int32, checksCancellation: Bool) throws -> String {
+        try hashContents(of: fd, checksCancellation: checksCancellation).sha256
     }
 
     /// Hashes the file like `sha256(of:)` and remembers the result for `currentSHA256(of:)`, but
     /// only when the file's state was the same before and after the read, so a hash of half-old,
     /// half-new bytes is never stored. Belt and braces: the entry is keyed by the stamp taken
     /// before the read, which a write during the read has already left behind.
-    private func rememberingSHA256(of fd: Int32) throws -> String {
+    private func rememberingSHA256(of fd: Int32, checksCancellation: Bool) throws -> String {
         let before = try Self.contentStamp(of: fd)
-        let hash = try sha256(of: fd)
+        let hash = try sha256(of: fd, checksCancellation: checksCancellation)
         if try Self.contentStamp(of: fd) == before, inspectedHashes.updateValue(hash, forKey: before) == nil {
             inspectedOrder.append(before)
             if inspectedOrder.count > Self.inspectedHashLimit { inspectedHashes[inspectedOrder.removeFirst()] = nil }
@@ -856,7 +1065,7 @@ public actor FileStore {
     /// outcome never changes: a file edited and then restored to identical bytes still installs.
     private func currentSHA256(of fd: Int32) throws -> String {
         if let known = inspectedHashes[try Self.contentStamp(of: fd)] { return known }
-        return try sha256(of: fd)
+        return try sha256(of: fd, checksCancellation: false)
     }
 
     /// What `fstat` says about a file's identity and content state. On APFS, the sync folder's
@@ -875,7 +1084,8 @@ public actor FileStore {
         )
     }
 
-    private func hashContents(of fd: Int32, copyingTo destinationFD: Int32? = nil, maximumSize: Int64? = nil, checksCancellation: Bool = false) throws -> (sha256: String, size: Int64) {
+    private func hashContents(of fd: Int32, copyingTo destinationFD: Int32? = nil, maximumSize: Int64? = nil, checksCancellation: Bool) throws -> (sha256: String, size: Int64) {
+        if checksCancellation { try Task.checkCancellation() }
         hashCount += 1
         let duplicate = dup(fd)
         guard duplicate >= 0 else { throw FileStoreError.ioFailure }
@@ -885,6 +1095,7 @@ public actor FileStore {
         var total: Int64 = 0
         var hash = SHA256()
         try Self.forEachChunk(of: handle) { chunk in
+            beforeReadChunk?(checksCancellation, total)
             if checksCancellation { try Task.checkCancellation() }
             total += Int64(chunk.count)
             bytesHashed += Int64(chunk.count)
@@ -914,3 +1125,26 @@ public actor FileStore {
         }) {}
     }
 }
+
+extension FileStore {
+    /// Where a file goes when the user chooses to trash it and no caller supplied its own policy:
+    /// the Finder trash. On Linux, where only the Core tests run and there is no trash, it is
+    /// moved under a per-process folder in the temporary directory, so a test can still prove
+    /// that nothing was deleted outright.
+    public static let defaultTrash: @Sendable (URL) throws -> Void = {
+#if canImport(Darwin)
+        try FileManager.default.trashItem(at: $0, resultingItemURL: nil)
+#else
+        let trash = FileManager.default.temporaryDirectory.appending(path: "beepbar-trash-\(ProcessInfo.processInfo.processIdentifier)", directoryHint: .isDirectory)
+        try FileManager.default.createDirectory(at: trash, withIntermediateDirectories: true)
+        try FileManager.default.moveItem(at: $0, to: trash.appending(path: "\(UUID().uuidString)-\($0.lastPathComponent)", directoryHint: .notDirectory))
+#endif
+    }
+}
+
+/// `write(2)`, named so it is not shadowed by `FileStore`'s own `write` methods.
+#if canImport(Darwin)
+private let posixWrite = Darwin.write
+#else
+private let posixWrite = Glibc.write
+#endif

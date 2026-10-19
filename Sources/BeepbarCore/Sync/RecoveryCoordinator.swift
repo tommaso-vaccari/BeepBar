@@ -64,7 +64,7 @@ public actor RecoveryCoordinator {
 
     private func recover(_ operation: PendingOperation) async throws -> Outcome {
         let stage = try await fileStore.stagedArtifact(at: operation.stagePath)
-        let destination = try await fileStore.inspect(operation.destination)
+        let destination = try await fileStore.inspect(operation.destination, checksCancellation: false)
         let baseline = Baseline(remoteID: operation.remoteID, relativePath: operation.destination, sha256: operation.remoteSHA256, remoteRevision: operation.remoteRevision, courseID: operation.courseID, moduleID: operation.moduleID)
 
         switch operation.phase {
@@ -91,7 +91,7 @@ public actor RecoveryCoordinator {
         switch (old, new) {
         case (.directory, .missing):
             guard try await fileStore.topLevelDirectoryIdentity(move.oldFolder) == managedDirectory else { return .unresolved }
-            try await fileStore.renameTopLevelDirectory(from: move.oldFolder, to: move.newFolder)
+            try await fileStore.renameTopLevelDirectory(from: move.oldFolder, to: move.newFolder, expectedIdentity: managedDirectory)
             guard try await fileStore.topLevelDirectoryIdentity(move.newFolder) == managedDirectory else { return .unresolved }
             try await database.commitScopeMove(move)
             return .recovered
@@ -107,7 +107,7 @@ public actor RecoveryCoordinator {
     private func recoverPrepared(_ operation: PendingOperation, stage: StagedArtifact?, destination: LocalState, baseline: Baseline) async throws -> Outcome {
         guard let stage else {
             let incomingPath = try RelativePath(internal: ".beepbar/conflicts/\(operation.id.uuidString)/\(operation.destination.value)")
-            if let incoming = try await fileStore.conflictArtifact(at: incomingPath),
+            if let incoming = try await fileStore.conflictArtifact(at: incomingPath, checksCancellation: false),
                incoming.sha256 == operation.remoteSHA256,
                destination != .present(sha256: operation.remoteSHA256) {
                 let conflict = ConflictRecord(id: operation.id, rootID: operation.rootID, remoteID: operation.remoteID, relativePath: operation.destination, incomingPath: incomingPath, baseSHA256: operation.expectedLocal.sha256, localSHA256: destination.sha256, remoteSHA256: operation.remoteSHA256, remoteRevision: operation.remoteRevision, detectedAt: Date(), status: .open)
@@ -128,7 +128,7 @@ public actor RecoveryCoordinator {
             // compares the file as it is now with Moodle and the last synced version, and never
             // overwrites a local change. A conflict copy with other bytes is not something this
             // sequence writes, so that stays unresolved.
-            if try await fileStore.conflictArtifact(at: incomingPath) == nil {
+            if try await fileStore.conflictArtifact(at: incomingPath, checksCancellation: false) == nil {
                 try await database.finishOperation(id: operation.id)
                 return .recovered
             }
@@ -164,7 +164,7 @@ public actor RecoveryCoordinator {
                 try await database.finishOperation(id: operation.id)
                 return .recovered
             case .localChanged:
-                return try await preserveConflict(operation, stage: stage, destination: try await fileStore.inspect(operation.destination))
+                return try await preserveConflict(operation, stage: stage, destination: try await fileStore.inspect(operation.destination, checksCancellation: false))
             }
         }
         return try await preserveConflict(operation, stage: stage, destination: destination)

@@ -35,7 +35,7 @@ public struct RecmanCourseKey: Sendable, Equatable, Hashable {
 
 /// One row of the Recman archive. `id` is Recman's `transfer_id`, the only stable identifier a
 /// row has; `previewURL` is the row's own link, which leads to the Webex player.
-public struct RecmanRecording: Sendable, Equatable, Identifiable {
+public struct RecmanRecording: Sendable, Equatable, Identifiable, Codable {
     public let id: String
     public let courseCode: String
     public let academicYear: Int
@@ -56,6 +56,26 @@ public struct RecmanRecording: Sendable, Equatable, Identifiable {
         self.duration = duration
         self.size = size
         self.previewURL = previewURL
+    }
+
+    /// The length in minutes from Recman's duration ("97 min" → 97, "0 min" → 0), or nil when it
+    /// can't be read. Used both to show the length and to estimate the hours left in a course
+    /// (`RecordingWatchProgress.courseSummary`), so both read the same number.
+    public var minutes: Int? { Self.minutes(inDuration: duration) }
+
+    /// The longest length taken at face value: 24 hours. The parser accepts any `^[0-9]+\s*min$`,
+    /// so a damaged row could say "9223372036854775807 min"; summing such values (the course
+    /// header, the hours-left estimate) would trap on `Int` overflow. No lecture recording is a day
+    /// long, so anything longer is treated as an unknown length: the row then shows Recman's text
+    /// as is and adds nothing to the totals.
+    public static let maxPlausibleMinutes = 1_440
+
+    /// The leading ASCII digits of a duration text, or nil when there are none or the number is
+    /// above `maxPlausibleMinutes` (including numbers too large for `Int`). The parser accepts only
+    /// `^[0-9]+\s*min$`, so for a parsed row the digits are the whole number.
+    public static func minutes(inDuration duration: String) -> Int? {
+        guard let value = Int(duration.prefix { ("0"..."9").contains($0) }), value <= maxPlausibleMinutes else { return nil }
+        return value
     }
 }
 

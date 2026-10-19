@@ -37,7 +37,8 @@ If you're updating from an older version that stored your token in the macOS Key
 - **Sync**: run it manually with **"Sincronizza ora"**, or pick how often to check automatically from the menu under that button (or **"Sincronizzazione automatica"** in Impostazioni), from every 30 minutes to 3 times a day.
 - **See what arrived**: after each sync, **Attività** lists the new and updated files, course by course.
 - **Resolve conflicts**: when both a local and remote version of a file changed, it shows up in the **Conflitti** section (with a badge count in the menu) — see [How the three-way sync works](#how-the-three-way-sync-works) for what to expect there.
-- **Check for updates**: opt in from Impostazioni — see [Auto-updates](#auto-updates).
+- **Watch lectures**: with a Polimi account, **Registrazioni** lists the recordings of your synced courses and plays them in BeepBar's own player.
+- **Check for updates**: BeepBar checks automatically; switch it off or check by hand in Impostazioni — see [Auto-updates](#auto-updates).
 
 <p align="center">
   <img src="docs/images/activity.png" width="730" alt="The BeepBar Attività tab after a sync: 12 new, 4 updated, 1 of your edits kept, 0 not updated, with the files that arrived in each course.">
@@ -57,8 +58,9 @@ In a preliminary local measurement of the Release build, with automatic sync dis
 - Opens at login by default, so scheduled syncs resume after a restart (switch it off in Impostazioni)
 - Controlled parallel downloads, byte-level progress, and real cancellation
 - Selectable sync root and editable course-folder names
+- Lecture recordings for Polimi courses: play them in a native player (or the browser), keep your place, track what you've watched, and save lectures to a Watchlist. Videos are streamed, never downloaded
 - [Three-way sync](#how-the-three-way-sync-works) backed by SQLite, atomic staging, and explicit conflict resolution
-- [Opt-in auto-updates](#auto-updates) via Sparkle, checked against a signed appcast
+- [Automatic update checks](#auto-updates) via Sparkle, on by default and checked against a signed appcast
 
 ## How the three-way sync works
 
@@ -74,7 +76,11 @@ Open conflicts show up as a badge in the menu bar and in the app's **Conflitti**
 
 ## Auto-updates
 
-BeepBar checks for new builds via [Sparkle](https://sparkle-project.org), against an appcast published alongside every push to `main`. Automatic checks are enabled by default and run every eight hours; you can disable **"Controlla automaticamente"** in Settings or trigger a one-off check with **"Cerca aggiornamenti…"**. Every update is signed with an EdDSA key that never leaves this repo's secrets, and Sparkle verifies that signature before installing anything.
+BeepBar checks for new builds via [Sparkle](https://sparkle-project.org), against an appcast published alongside every push to `main`. Automatic checks are enabled by default and run every eight hours; you can disable **"Controlla automaticamente gli aggiornamenti"** in Impostazioni or trigger a one-off check with **"Cerca aggiornamenti…"**. Every update is signed with an EdDSA key that never leaves this repo's secrets, and Sparkle verifies that signature before installing anything.
+
+## Telemetry
+
+The upcoming version on `dev` uses [TelemetryDeck](https://telemetrydeck.com) for aggregate app and major macOS version statistics to plan maintenance and compatibility. Telemetry is optional and enabled by default, with a notice before the first report. It makes at most one reporting attempt per UTC day; the first monthly attempt is counted separately using a local marker. Every installation sends the same shared identifier, with no individual installation ID, language, settings, account, course or file data. TelemetryDeck receives the connection IP; it states that it does not retain IPs, but guarantees no deletion deadline for archived events. Turn off **"Telemetria"** in Impostazioni to stop future reports and cancel pending work without losing features; this does not delete events already sent. These are best-effort reporting-installation counts, not counts of people. See the [protocol and limits](docs/telemetry.md) and [privacy notice](docs/privacy-notice.md). This describes unreleased `dev` behavior; published releases can differ.
 
 ## Requirements
 
@@ -89,9 +95,11 @@ xcodebuild -project Beepbar.xcodeproj -target Beepbar -configuration Release bui
 scripts/create-dmg.sh build/Release/Beepbar.app build/Beepbar.dmg
 ```
 
-CI runs the tests and builds an ad-hoc-signed arm64 DMG.
+CI runs the tests and the Release build on every PR and push; a push to `main` that changes the app also builds the ad-hoc-signed arm64 DMG and publishes it as a release.
 
 ## Contributing
+
+Development PRs target `dev`. Before taking a task, read the [shared Performance Plan](docs/performance-plan.md) and [team workflow](docs/team-workflow.md), claim its linked issue, and follow the independent review and regression verification gates.
 
 Found a bug or have a feature request? [Open an issue](https://github.com/tommaso-vaccari/BeepBar/issues). Pull requests are welcome too.
 

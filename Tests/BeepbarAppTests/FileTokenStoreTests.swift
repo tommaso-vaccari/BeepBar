@@ -51,6 +51,19 @@ final class FileTokenStoreTests: XCTestCase {
         XCTAssertEqual(try FileTokenStore.load(.nonInteractive), "a-token")
     }
 
+    func testTokenAndExistingTokenAreExcludedFromBackups() throws {
+        try FileTokenStore.save("synthetic-token")
+        let directory = try FileManager.default.url(for: .applicationSupportDirectory, in: .userDomainMask, appropriateFor: nil, create: false)
+            .appendingPathComponent(testDirectoryName, isDirectory: true)
+        var url = directory.appendingPathComponent("credential.token")
+        XCTAssertEqual(try url.resourceValues(forKeys: [.isExcludedFromBackupKey]).isExcludedFromBackup, true)
+        var values = URLResourceValues()
+        values.isExcludedFromBackup = false
+        try url.setResourceValues(values)
+        XCTAssertTrue(try FileTokenStore.containsCredential())
+        XCTAssertEqual(try url.resourceValues(forKeys: [.isExcludedFromBackupKey]).isExcludedFromBackup, true)
+    }
+
     func testSaveOverwritesPreviousToken() throws {
         try FileTokenStore.save("first")
         try FileTokenStore.save("second")
@@ -84,6 +97,26 @@ final class FileTokenStoreTests: XCTestCase {
 
         XCTAssertFalse(FileManager.default.fileExists(atPath: tempURL.path))
         XCTAssertFalse(try FileTokenStore.containsCredential())
+    }
+
+    func testDeletionAttemptsEverySecretAfterAFailure() throws {
+        for primaryFails in [false, true] {
+            try FileTokenStore.save("synthetic-token")
+            let directory = try FileManager.default.url(for: .applicationSupportDirectory, in: .userDomainMask, appropriateFor: nil, create: false)
+                .appendingPathComponent(testDirectoryName, isDirectory: true)
+            let orphan = directory.appendingPathComponent(".credential-crash.tmp")
+            try Data("synthetic-leftover".utf8).write(to: orphan)
+            var attempted: Set<String> = []
+            XCTAssertThrowsError(try FileTokenStore.delete { url in
+                attempted.insert(url.lastPathComponent)
+                if (url.lastPathComponent == "credential.token") == primaryFails { throw CocoaError(.fileWriteNoPermission) }
+                try FileManager.default.removeItem(at: url)
+            })
+            XCTAssertEqual(attempted, ["credential.token", orphan.lastPathComponent])
+            XCTAssertEqual(try FileTokenStore.containsCredential(), primaryFails)
+            XCTAssertEqual(FileManager.default.fileExists(atPath: orphan.path), !primaryFails)
+            try FileTokenStore.delete()
+        }
     }
 
     func testDeleteReportsFailureAndKeepsStoredCredential() throws {
@@ -251,7 +284,7 @@ struct LoginFeedbackTests {
         controller.selectSite(MoodleSite.unipd[1])
         #expect(controller.selectedSite == .polimi)
         #expect(controller.apiHostForTesting == MoodleSite.polimi.serverPolicy.host)
-        gate.release.signal()
+        gate.open()
         await login.value
         #expect(!controller.isAuthenticating)
         #expect(!controller.hasStoredCredential)
@@ -295,7 +328,7 @@ struct LoginFeedbackTests {
         controller.selectSite(MoodleSite.unipd[1])
         #expect(controller.selectedSite == .polimi)
         #expect(controller.apiHostForTesting == MoodleSite.polimi.serverPolicy.host)
-        gate.release.signal()
+        gate.open()
         await verification.value
         #expect(!controller.isVerifying)
         #expect(controller.hasStoredCredential)
@@ -331,7 +364,7 @@ struct LoginFeedbackTests {
         #expect(controller.hasStoredCredential)
         #expect(controller.isLoadingCourses)
         #expect(!callbackFinished)
-        gate.release.signal()
+        gate.open()
         await login.value
         #expect(callbackFinished)
         #expect(!controller.isLoadingCourses)
@@ -371,6 +404,7 @@ private final class LoginTokenMemory: @unchecked Sendable {
     func record(_ token: String) { lock.withLock { value = token } }
 }
 
+/// Holds a login at a chosen point until the test calls `open()`.
 private final class LoginSuspension: @unchecked Sendable {
     let outcome: String
     let coursesOnly: Bool
@@ -379,10 +413,44 @@ private final class LoginSuspension: @unchecked Sendable {
         self.coursesOnly = coursesOnly
     }
     let started = AsyncStream<Void>.makeStream()
-    let release = DispatchSemaphore(value: 0)
+    private let release = DispatchSemaphore(value: 0)
+    private let lock = NSLock()
+    private var isOpen = false
+    private var held: [@Sendable () -> Void] = []
+
+    /// Parks the calling thread: only for the credential vault's write, which runs on a
+    /// cooperative-pool thread (`CredentialVault` is an actor and its write is synchronous, so
+    /// this one can't be made non-blocking without changing that API). It parks one pool thread,
+    /// never the URL loading thread. Never call it from `URLProtocol.startLoading` (see `hold(_:)`).
     func pause() {
         started.continuation.yield()
         release.wait()
+    }
+
+    /// Keeps `answer` until `open()` without blocking. Every custom `URLProtocol` in the process
+    /// starts on one shared CFNetwork thread (`com.apple.CFNetwork.CustomProtocols`): a wait in
+    /// `startLoading` stalls every other test's mocked request, and the 10 s course-picture request
+    /// of `aCoursePictureArrivingAfterAnAccountChangeIsDropped` timed out on CI (a0c311b) while
+    /// one of these logins waited for the busy main actor.
+    func hold(_ answer: @escaping @Sendable () -> Void) {
+        started.continuation.yield()
+        let now = lock.withLock { () -> Bool in
+            if isOpen { return true }
+            held.append(answer)
+            return false
+        }
+        if now { answer() }
+    }
+
+    /// Lets the held login go on, whichever way it was held.
+    func open() {
+        release.signal()
+        let pending = lock.withLock { () -> [@Sendable () -> Void] in
+            isOpen = true
+            defer { held = [] }
+            return held
+        }
+        pending.forEach { $0() }
     }
 }
 
@@ -406,11 +474,20 @@ private final class LoginFeedbackProtocol: URLProtocol, @unchecked Sendable {
         let token = body.split(separator: "&").first { $0.hasPrefix("wstoken=") }.map { String($0.dropFirst(8)) } ?? ""
         let suspension = Self.suspensions.withLock { $0[token] }
         if let suspension, !suspension.coursesOnly || body.contains("core_enrol_get_users_courses") {
-            suspension.pause()
-            if suspension.outcome == "network" {
-                client?.urlProtocol(self, didFailWithError: URLError(.notConnectedToInternet))
-                return
-            }
+            // Never wait here: `hold(_:)` explains why. The answer goes out when the test opens it.
+            let this = self
+            suspension.hold { this.answer(body: body, suspension: suspension, held: true) }
+            return
+        }
+        answer(body: body, suspension: suspension, held: false)
+    }
+
+    /// The local Moodle's answer. `held` says this request was the one the suspension held: the
+    /// "network" outcome fails only that request, so the other calls under `coursesOnly` still go through.
+    private func answer(body: String, suspension: LoginSuspension?, held: Bool) {
+        if held, suspension?.outcome == "network" {
+            client?.urlProtocol(self, didFailWithError: URLError(.notConnectedToInternet))
+            return
         }
         if body.contains("wstoken=network") {
             client?.urlProtocol(self, didFailWithError: URLError(.notConnectedToInternet))

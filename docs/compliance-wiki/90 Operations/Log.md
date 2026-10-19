@@ -55,3 +55,8 @@ Decisioni utente del 2026-10-17: sessioni massimo dieci giorni dal primo salvata
 ## 2026-10-18 — telemetria aggregata v2, PR #181
 
 Eliminata identità mensile; metrica conservata tramite contatore locale e valore comune. Rivalutate fonti pubbliche Garante §7.2, FAQ/architettura TelemetryDeck e GDPR, con affidamento proporzionato e analisi dei mezzi ragionevoli. Esito favorevole qualificato alla configurazione v2 nel gate, non alle serie storiche o all’intera app. Aggiornati informativa candidata e procedura; controlli manuali esclusi restano non eseguiti. Evidenze automatiche per SHA nella PR.
+
+
+## 2026-10-19 — coerenza informativa, issue #202, #203 e #218
+
+Riverificato dev c22f194: la disattivazione conserva i punti di ripresa, logout/cambio identità e cancellazione dati di studio li eliminano. Corretta la riga dell’inventario e distinto il protocollo v2 dalla telemetria storica. Il testo IT/EN nelle Impostazioni descrive Webex/idbroker e il possibile inoltro al Politecnico, senza pretendere una verifica live. README descrive il protocollo aggregato v2 e i limiti di opt-out, distinguendo dev non rilasciata. Nessun flusso, base giuridica o configurazione modificati; nessuna nuova fonte o conclusione di conformità.

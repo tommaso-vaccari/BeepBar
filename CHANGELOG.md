@@ -25,7 +25,7 @@
 - BeepBar now keeps your recordings up to date: after every sync it checks your selected courses for new recordings (it never downloads video) and, if notifications are on, tells you once with “N nuove registrazioni” (“N new recordings”); a click opens Recordings. It never opens a window or asks you to sign in on its own: if your Polimi sign-in has expired, Recordings shows the prompt next time you open it.
 - In the BeepBar menu, “Apri BeepBar” (“Open BeepBar”) now sits right under “Sincronizza ora”.
 - Telemetry is enabled by default to count how many installations use BeepBar each day and each month, with at most one ping a day to TelemetryDeck: only the app version and the macOS version, under a value shared by every installation, so no one can be told apart. Before the first ping a notice explains it and lets you turn it off without losing any feature; you can also turn it off any time in Settings. No account, course, file, language or settings information is included.
-- Settings › “Dati e privacy” (“Data and privacy”) lists what BeepBar keeps on your Mac and which services it connects to, with a privacy contact.
+- Read the full privacy notice, in Italian or English and even offline, with “Informativa privacy” (“Privacy notice”) before signing in or from Settings › “Dati e privacy” (“Data and privacy”), which also has a privacy contact.
 - “Dimentica i dati di studio di questo account…” (“Forget this account’s study data…”) in Settings › Recordings deletes the account’s Watchlist, progress and resume positions; downloaded materials stay on your Mac.
 
 ### Improved

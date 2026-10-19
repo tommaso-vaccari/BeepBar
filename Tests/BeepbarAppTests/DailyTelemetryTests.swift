@@ -595,6 +595,49 @@ struct DailyTelemetryTests {
         #expect(await task.value)
     }
 
+    /// Opt-out reaches the real URLSession task, rather than only cancelling a mocked sender.
+    /// The fixture holds response headers; cancellation must stop it before its normal timeout.
+    @Test func optOutStopsTheInFlightTransportAndSurvivesRelaunch() async throws {
+        let harness = Harness()
+        defer { harness.remove() }
+        let id = UUID().uuidString
+        let session = URLSessionConfiguration.ephemeral
+        session.protocolClasses = [TelemetryProtocol.self]
+        TelemetryProtocol.statuses.withLock { $0[id] = 200 }
+        defer {
+            TelemetryProtocol.statuses.withLock { _ = $0.removeValue(forKey: id) }
+            TelemetryProtocol.started.withLock { _ = $0.remove(id) }
+            TelemetryProtocol.stopped.withLock { _ = $0.remove(id) }
+        }
+        let controller = DailyTelemetryController(defaults: harness.defaults, configuration: configuration,
+            defaultEnabled: true, disclose: { true }, send: { request in
+                var fixture = request
+                fixture.url = URL(string: "https://telemetry.invalid/\(id)?stall")!
+                try await DailyTelemetryTransport.send(fixture, configuration: session)
+            }, schedule: { _, _ in BackgroundActivityRegistration(invalidate: {}) })
+        defer { controller.stop() }
+        let launch = Task { await controller.start() }
+        for _ in 0..<1_000 {
+            if TelemetryProtocol.started.withLock({ $0.contains(id) }) { break }
+            try await Task.sleep(for: .milliseconds(1))
+        }
+        try #require(TelemetryProtocol.started.withLock { $0.contains(id) })
+        controller.setEnabled(false)
+        for _ in 0..<1_000 {
+            if TelemetryProtocol.stopped.withLock({ $0.contains(id) }) { break }
+            try await Task.sleep(for: .milliseconds(1))
+        }
+        #expect(TelemetryProtocol.stopped.withLock { $0.contains(id) })
+        await launch.value
+        #expect(harness.defaults.bool(forKey: DailyTelemetryController.enabledKey) == false)
+        let recorder = Recorder()
+        let relaunched = harness.controller(configuration, recorder: recorder)
+        await relaunched.start()
+        #expect(!relaunched.isEnabled)
+        #expect(await recorder.count == 0)
+        relaunched.stop()
+    }
+
     private final class TelemetryProtocol: URLProtocol, @unchecked Sendable {
         static let statuses = OSAllocatedUnfairLock(initialState: [String: Int]())
         static let redirected = OSAllocatedUnfairLock(initialState: Set<String>())

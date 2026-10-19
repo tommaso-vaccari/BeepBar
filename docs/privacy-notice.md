@@ -1,6 +1,6 @@
 # BeepBar — informativa privacy / privacy notice
 
-**Informativa della configurazione candidata / Candidate-configuration notice — 2026-10-18.** Descrive la PR #181 per `dev`, non la versione attualmente distribuita. La pubblicazione con la prossima release richiede il confronto finale con codice e binario secondo [la valutazione](privacy-release-gate.md). Non costituisce consenso o certificazione di conformità.
+**Informativa della configurazione dev / Dev-configuration notice — 2026-10-19.** Inclusa nell’app e disponibile prima dell’accesso. Si applica alla configurazione descritta, destinata alla prossima release; non attribuisce queste modifiche alle versioni precedenti. Non costituisce consenso. / Included in the app and available before sign-in. Applies to the described configuration intended for the next release, not earlier versions. Does not constitute consent.
 
 ## Italiano
 

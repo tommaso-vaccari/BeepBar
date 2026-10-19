@@ -10,3 +10,9 @@ Aperto, 2026-10-10. Base/limiti in [[30 Wiki/Valutazione BeepBar]]. Questo piano
 6. **Release (prima della prossima release).** Completare la passata finale GDPR prima di integrare dev in main. L’integrazione della wiki in dev non chiude la verifica di conformità. Riesaminare SHA/binario destinato agli utenti e i punti giuridici controversi. Chiusura: nessun claim “full compliant” con lacune aperte. Nessuna release o modifica del sito implicita.
 
 Prima di implementare/coordinare recuperare issue e dipendenze secondo AGENTS.md. [[30 Wiki/Mappa dei dati BeepBar]] · [[30 Wiki/GDPR per applicazioni locali]] · [[PROTOCOL]]
+
+Aggiornamento 2026-10-19: il protocollo v2 sostituisce l'identificatore mensile del punto 3 con un valore condiviso e conteggio locale. Inventario, valutazione motivata v2 e processi sono nel [gate aggiornato](../../privacy-release-gate.md) e nella [procedura](../../privacy-operations.md); verifiche locali di test e packaging documentate, verifica della release finale distinta dalle prove sintetiche di sviluppo. Casella accettata su conferma del responsabile, senza inventare una verifica contrattuale indipendente. L'informativa completa ora e inclusa offline nel follow-up di sviluppo; integrazione ed esito CI registrati in issue #180.
+
+Verifica runtime 2026-10-19: quattro scenari strumentati sul binario Release (disabilita/continua e riavvio per entrambe le scelte) superati con rete negata, home sintetica e payload intercettato; limiti e riproduzione nel [gate](../../privacy-release-gate.md).
+
+Completamento sviluppo: aggiunti controllo del vero trasporto URLSession durante opt-out e osservazione della configurazione Sparkle sul pacchetto isolato; copertura WebKit e filesystem esistente ricondotta alle garanzie effettive. Backup preesistenti e diagnostica macOS non sono oggetto di una promessa di cancellazione. Evidenze finali e integrazione: [gate](../../privacy-release-gate.md) e issue #180.

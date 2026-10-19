@@ -72,11 +72,7 @@ jobs:
       - name: Verify readable release notes
         run: bash scripts/test-release-notes.sh
       - name: Verify release version numbering
-        run: |
-          test "$(scripts/build-version.sh 2.0 99)" = "2.0.99"
-          test "$(scripts/build-version.sh 2.0 100)" = "2.1.0"
-          test "$(scripts/build-version.sh 2.0 215)" = "2.2.15"
-          ! scripts/build-version.sh 2 110
+        run: bash scripts/test-build-version.sh
       - name: Build and verify Release app
         run: |
           xcodebuild -project Beepbar.xcodeproj -target Beepbar -configuration Release -clonedSourcePackagesDirPath build/SourcePackages build CODE_SIGNING_ALLOWED=NO
@@ -117,10 +113,20 @@ jobs:
         run: |
           xcodebuild -version
           test "$(xcrun --sdk macosx --show-sdk-version)" = "27.0"
+      # The version follows the last published release's `v*` tag (the same lookup as the release
+      # notes step): a higher MARKETING_VERSION starts at patch 0 (3.0 after v2.2.35 is 3.0.0), the
+      # same one moves the patch up by one. It fails closed rather than publish a version twice:
+      # no previous tag (tags not fetched), this commit already released, or the tag already taken.
       - name: Compute build version
         run: |
           BASE_VERSION=$(xcodebuild -project Beepbar.xcodeproj -target Beepbar -configuration Release -showBuildSettings | awk '/ MARKETING_VERSION =/ { print $3 }')
-          echo "FULL_VERSION=$(scripts/build-version.sh "$BASE_VERSION" "$GITHUB_RUN_NUMBER")" >> "$GITHUB_ENV"
+          PREVIOUS_TAG=$(git tag --list 'v[0-9]*' --sort=-v:refname | head -n 1)
+          if [ -z "$PREVIOUS_TAG" ]; then echo "No previous v* release tag found" >&2; exit 1; fi
+          if [ -n "$(git tag --points-at HEAD --list 'v[0-9]*')" ]; then echo "This commit is already released as $(git tag --points-at HEAD --list 'v[0-9]*')" >&2; exit 1; fi
+          FULL_VERSION=$(scripts/build-version.sh "$BASE_VERSION" "$PREVIOUS_TAG")
+          if git rev-parse -q --verify "refs/tags/v$FULL_VERSION" >/dev/null; then echo "Tag v$FULL_VERSION already exists" >&2; exit 1; fi
+          echo "Releasing $FULL_VERSION (previous: $PREVIOUS_TAG)"
+          echo "FULL_VERSION=$FULL_VERSION" >> "$GITHUB_ENV"
       - name: Build arm64 Release app
         run: xcodebuild -project Beepbar.xcodeproj -target Beepbar -configuration Release build CODE_SIGNING_ALLOWED=NO MARKETING_VERSION=$FULL_VERSION CURRENT_PROJECT_VERSION=$FULL_VERSION
       - name: Verify app

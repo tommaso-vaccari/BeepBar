@@ -24,7 +24,7 @@
 - Save lessons from different courses in a single Watchlist inside Recordings. Add or remove bookmarks and find your saved list again after restarting.
 - BeepBar now keeps your recordings up to date: after every sync it checks your selected courses for new recordings (it never downloads video) and, if notifications are on, tells you once with “N nuove registrazioni” (“N new recordings”); a click opens Recordings. It never opens a window or asks you to sign in on its own: if your Polimi sign-in has expired, Recordings shows the prompt next time you open it.
 - In the BeepBar menu, “Apri BeepBar” (“Open BeepBar”) now sits right under “Sincronizza ora”.
-- Telemetry is enabled by default to count how many installations use BeepBar each day and each month, with at most one ping a day to TelemetryDeck: only the app version and the macOS version, under a value shared by every installation, so no one can be told apart. Before the first ping a notice explains it and lets you turn it off without losing any feature; you can also turn it off any time in Settings. No account, course, file, language or settings information is included.
+- Telemetry is enabled by default to count how many installations use BeepBar each day and each month, with at most one ping a day to TelemetryDeck: only the app version and the macOS version, under a value shared by every installation, so no one can be told apart. Before the first ping a notice explains it; reporting can start as soon as you press “Chiudi” (“Close”). You can turn it off any time in Settings → Telemetry without losing any feature. No account, course, file, language or settings information is included.
 - Read the full privacy notice, in Italian or English and even offline, with “Informativa privacy” (“Privacy notice”) before signing in or from Settings › “Dati e privacy” (“Data and privacy”), which also has a privacy contact.
 - “Dimentica i dati di studio di questo account…” (“Forget this account’s study data…”) in Settings › Recordings deletes the account’s Watchlist, progress and resume positions; downloaded materials stay on your Mac.
 
@@ -41,6 +41,7 @@
 
 ### Fixed
 
+- An interrupted course-folder rename can now be completed with “Riprova recupero” (“Retry recovery”) from the menu, without restarting BeepBar. Sync stays paused until folder names are refreshed safely.
 - If BeepBar was interrupted while following files Moodle had moved, the next sync no longer stays stuck when you have since edited or deleted one of them. If an alias or a folder sits where one of those files should be, sync stops for all courses and the window names the path to fix.
 - Moving a local file to Trash and recovering a course-folder rename now preserve your files when the materials folder changes or a filesystem operation fails.
 - Renaming a course folder works after restoring or copying your files to another Mac, without extra prompts and while keeping your files tracked.

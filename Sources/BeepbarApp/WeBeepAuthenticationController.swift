@@ -808,6 +808,8 @@ enum MaterialsRunEnd: Equatable, Sendable {
     /// Tests set it to a fake so no WebKit or Polimi request is involved.
     var recordingsRefresh: (@MainActor (Set<RecmanCourseKey>, Bool) async -> RecordingsSyncOutcome)?
     private var scopeWriteTask: Task<Void, Never>?
+    private var recoveryRetryTask: Task<Void, Never>?
+    private var bootstrapCredentialAwaitingRecovery: BootstrapService.CredentialStatus?
     // Published because views read it through `isSyncActive` / `canSynchronize` (Annulla vs
     // Sincronizza ora). An operation often ends after a suspension (the new-materials notification,
     // a failure notice) with no other published change following it: when this was a plain `var`,
@@ -856,6 +858,7 @@ enum MaterialsRunEnd: Equatable, Sendable {
     /// Off in every test controller, so a test can turn automatic sync on, as users have it,
     /// without registering a real background activity on the Mac running the tests.
     private var registersBackgroundActivity = true
+    var courseRenameFileStoreForTesting: ((URL) throws -> FileStore)?
     private var beforeScopeRestoreForTesting: (@MainActor () -> Void)?
 #endif
 
@@ -1190,6 +1193,7 @@ enum MaterialsRunEnd: Equatable, Sendable {
 
     /// Waits for the course refresh `loadCourses()` started, which it does not return.
     func waitForCourseLoadForTesting() async { await courseLoadTaskForTesting?.value }
+    func waitForRecoveryForTesting() async { await recoveryRetryTask?.value }
 
     func setRootIDForTesting(_ id: UUID) { rootID = id }
 
@@ -1235,11 +1239,29 @@ enum MaterialsRunEnd: Equatable, Sendable {
         // no sync runs then, so nothing else would enforce the age limit.
         if Self.credentialIsGone(result.credential) { forgetCourseList() } else { pruneExpiredCourseList() }
         if result.recoveryBlocked {
+            bootstrapCredentialAwaitingRecovery = result.credential
             recoveryBlocked = true
             setSyncState(.recoveryBlocked)
             return
         }
+        if let rootID {
+            do {
+                let scopes = try await result.database.scopes(rootID: rootID)
+                guard self.rootID == rootID else { return }
+                // All recovery exits come here, including abandoning a module after a partial
+                // scope recovery. No operation may resume with pre-recovery folder names (#183).
+                courseFolders = Dictionary(scopes.map { ($0.courseID, $0.localFolder) }, uniquingKeysWith: { first, _ in first })
+                defaultCourseFolders = Self.defaultFolders(for: courses, saved: courseFolders)
+                courseRenameErrors = [:]
+                activityItemProblems = [:]
+            } catch {
+                recoveryBlocked = true
+                setSyncState(.recoveryBlocked)
+                return
+            }
+        }
         recoveryBlocked = false
+        bootstrapCredentialAwaitingRecovery = nil
         switch result.credential {
         case .present:
             hasStoredCredential = true
@@ -1277,19 +1299,51 @@ enum MaterialsRunEnd: Equatable, Sendable {
     /// operation that could not be recovered (for example after the user fixed the file on disk)
     /// no longer keeps every sync blocked.
     func retryRecovery() {
-        guard recoveryBlocked, case .recoveryBlocked = syncState, !isSyncActive, let rootURL, let rootID, let database else { return }
+        guard recoveryBlocked, !isSyncActive,
+              !isLoadingCourses, renamingCourseID == nil, recoveryRetryTask == nil,
+              let rootURL, let rootID, let database else { return }
         setSyncState(.starting)
-        let bootstrap = BootstrapService()
         let operationGate = self.operationGate
-        Task { [weak self] in
+        recoveryRetryTask = Task { [weak self] in
+            guard let self else { return }
+            defer { self.recoveryRetryTask = nil }
             let trace = PerformanceTrace.shared.begin("bootstrap.retryRecovery", category: .bootstrap)
             defer { PerformanceTrace.shared.end("bootstrap.retryRecovery", category: .bootstrap, state: trace) }
             do {
-                let result = try await bootstrap.retryRecovery(rootURL: rootURL, rootID: rootID, database: database, gate: operationGate)
-                await self?.applyBootstrap(result)
+                // Drain captured old folder writes before recovery. While blocked no new course
+                // load, selection or rename may start; publish recovered folders before unblocking
+                // so no target or module preview can recreate the old folder (#183, PR #225).
+                await self.scopeWriteTask?.value
+                guard self.rootID == rootID, self.rootURL == rootURL else { return }
+                try await self.recoverAndReload(rootURL: rootURL, rootID: rootID, database: database, gate: operationGate)
             } catch {
-                self?.setSyncState(.recoveryBlocked)
+                guard self.rootID == rootID, self.rootURL == rootURL else { return }
+                await self.refreshPendingModuleMoves()
+                guard self.rootID == rootID, self.rootURL == rootURL else { return }
+                self.setSyncState(.recoveryBlocked)
             }
+        }
+    }
+
+    private func recoverAndReload(rootURL: URL, rootID: UUID, database: SyncDatabase, gate: RootOperationGate) async throws {
+        let scopes = try await gate.withLease(.recovering) {
+            let report = try await RecoveryCoordinator(rootID: rootID, database: database, fileStore: FileStore(root: rootURL)).recover()
+            guard report.unresolved.isEmpty else { throw SyncDatabaseError.execution }
+            return try await database.scopes(rootID: rootID)
+        }
+        guard self.rootID == rootID, self.rootURL == rootURL else { return }
+        self.courseFolders = Dictionary(scopes.map { ($0.courseID, $0.localFolder) }, uniquingKeysWith: { first, _ in first })
+        self.defaultCourseFolders = Self.defaultFolders(for: self.courses, saved: self.courseFolders)
+        self.courseRenameErrors = [:]
+        self.activityItemProblems = [:]
+        await self.refreshPendingModuleMoves()
+        guard self.rootID == rootID, self.rootURL == rootURL else { return }
+        if let credential = self.bootstrapCredentialAwaitingRecovery {
+            await self.applyBootstrap(BootstrapService.Result(database: database, recoveryBlocked: false, credential: credential))
+        } else {
+            self.recoveryBlocked = false
+            await self.restorePersistedSyncState()
+            self.configureBackgroundScheduler()
         }
     }
 
@@ -1302,22 +1356,27 @@ enum MaterialsRunEnd: Equatable, Sendable {
     /// each one keeps the path it is really at, and the module keeps its previous folder rule.
     /// Recovery then runs again so the root unblocks if nothing else is pending.
     func abandonPendingModuleMoves() {
-        guard recoveryBlocked, hasPendingModuleMoves, !isSyncActive, let rootURL, let rootID, let database else { return }
+        guard recoveryBlocked, hasPendingModuleMoves, !isSyncActive, !isLoadingCourses, renamingCourseID == nil, recoveryRetryTask == nil, let rootURL, let rootID, let database else { return }
         setSyncState(.starting)
         let operationGate = self.operationGate
-        Task { [weak self] in
+        recoveryRetryTask = Task { [weak self] in
+            guard let self else { return }
+            defer { self.recoveryRetryTask = nil }
             do {
+                await self.scopeWriteTask?.value
+                guard self.rootID == rootID, self.rootURL == rootURL else { return }
                 try await operationGate.withLease(.recovering) {
                     let fileStore = try FileStore(root: rootURL)
                     for move in try await database.pendingModuleMoves(rootID: rootID) {
                         try await ModuleMoveRecovery.abandon(move, database: database, fileStore: fileStore)
                     }
                 }
-                let result = try await BootstrapService().retryRecovery(rootURL: rootURL, rootID: rootID, database: database, gate: operationGate)
-                await self?.applyBootstrap(result)
+                try await self.recoverAndReload(rootURL: rootURL, rootID: rootID, database: database, gate: operationGate)
             } catch {
-                await self?.refreshPendingModuleMoves()
-                self?.setSyncState(.recoveryBlocked)
+                guard self.rootID == rootID, self.rootURL == rootURL else { return }
+                await self.refreshPendingModuleMoves()
+                guard self.rootID == rootID, self.rootURL == rootURL else { return }
+                self.setSyncState(.recoveryBlocked)
             }
         }
     }
@@ -2095,7 +2154,7 @@ enum MaterialsRunEnd: Equatable, Sendable {
 
     func setCourse(_ course: RemoteCourseSummary, enabled: Bool) {
         // A saved list is not Moodle's: its courses get no records until it is confirmed (#98).
-        guard !isSyncActive, !isLoadingCourses, !isShowingSavedCourseList else { return }
+        guard !recoveryBlocked, !isSyncActive, !isLoadingCourses, !isShowingSavedCourseList else { return }
         if enabled { enabledCourseIDs.insert(course.id) }
         else { enabledCourseIDs.remove(course.id) }
         operationDefaults.set(enabledCourseIDs.map(String.init).sorted(), forKey: Self.enabledCoursesKey)
@@ -2239,7 +2298,7 @@ enum MaterialsRunEnd: Equatable, Sendable {
     func setAutomaticSyncInterval(_ seconds: Int) { guard !isSyncActive else { return }; automaticSyncInterval = Self.validatedAutomaticInterval(seconds); operationDefaults.set(automaticSyncInterval, forKey: Self.autoSyncIntervalKey); configureBackgroundScheduler() }
 
     func renameFolder(for course: RemoteCourseSummary, to newFolder: String) {
-        guard let rootURL, let rootID, let database, !recoveryBlocked, !isSyncActive, !isShowingSavedCourseList else { return }
+        guard let rootURL, let rootID, let database, !recoveryBlocked, !isSyncActive, !isLoadingCourses, renamingCourseID == nil, !isShowingSavedCourseList else { return }
         let oldFolder = folder(for: course)
         let trimmedFolder = newFolder.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmedFolder.isEmpty, !ReservedNamespace.isReservedTopLevelName(trimmedFolder) else {
@@ -2256,10 +2315,17 @@ enum MaterialsRunEnd: Equatable, Sendable {
                 try await renamer.rename(rootID: rootID, courseID: course.id, from: oldFolder, to: trimmedFolder)
                 self.courseFolders[course.id] = trimmedFolder
             } catch is PendingCourseFolderRenameError {
-                // An earlier rename is unfinished until a relaunch (#183): say so, not "failed".
+                self?.recoveryBlocked = true
+                self?.setSyncState(.recoveryBlocked)
                 self?.courseRenameErrors[course.id] = Self.pendingFolderRenameMessage.text
             } catch {
-                self?.courseRenameErrors[course.id] = (error as? CourseRenameError)?.errorDescription ?? tr("Rinomina non riuscita.", "Rename failed.")
+                if (try? await database.pendingScopeMoves(rootID: rootID).isEmpty) == false {
+                    self?.recoveryBlocked = true
+                    self?.setSyncState(.recoveryBlocked)
+                    self?.courseRenameErrors[course.id] = Self.pendingFolderRenameMessage.text
+                } else {
+                    self?.courseRenameErrors[course.id] = (error as? CourseRenameError)?.errorDescription ?? tr("Rinomina non riuscita.", "Rename failed.")
+                }
             }
         }
     }
@@ -2635,10 +2701,11 @@ enum MaterialsRunEnd: Equatable, Sendable {
                 let token = try await self.credentialVault.load()
                 let siteInfo = try await self.apiClient.validateToken(token)
                 self.siteInfo = siteInfo
+                self.bootstrapCredentialAwaitingRecovery = nil
                 self.accountState = .connected
                 self.operationDefaults.removeObject(forKey: Self.credentialExpiredKey)
                 self.notificationCoordinator.clearFailure()
-                self.setSyncState(self.rootURL == nil ? .needsFolder : .readyUnchecked)
+                self.setSyncState(self.recoveryBlocked ? .recoveryBlocked : (self.rootURL == nil ? .needsFolder : .readyUnchecked))
                 self.configureBackgroundScheduler()
             } catch let error as WeBeepAPIError {
                 _ = await self?.handleServiceFailure(error, automatic: false)
@@ -2652,6 +2719,7 @@ enum MaterialsRunEnd: Equatable, Sendable {
 
     func loadCourses() {
         guard !Self.isUIPreview else { return }
+        guard !recoveryBlocked else { isPreparingCourseList = false; return }
         guard accountState == .connected, hasStoredCredential else { isPreparingCourseList = false; return }
         // A load already running answers this request too.
         guard !isLoadingCourses else { isPreparingCourseList = false; return }
@@ -2880,6 +2948,7 @@ enum MaterialsRunEnd: Equatable, Sendable {
     /// new sign-in, the stored credential gone) and deletes its saved copy. Bumps the epoch first,
     /// so a refresh, a restore or a save still running for that account is dropped (#98).
     private func forgetCourseList() {
+        bootstrapCredentialAwaitingRecovery = nil
         courseListEpoch += 1
         // The account goes: its recordings follow-up, its last fetched enrollments and the last
         // follow-up's result go with it (memory only).
@@ -2990,7 +3059,7 @@ enum MaterialsRunEnd: Equatable, Sendable {
                 self.accountState = .connected
                 self.operationDefaults.removeObject(forKey: Self.credentialExpiredKey)
                 self.notificationCoordinator.clearFailure()
-                self.setSyncState(self.rootURL == nil ? .needsFolder : .readyUnchecked)
+                self.setSyncState(self.recoveryBlocked ? .recoveryBlocked : (self.rootURL == nil ? .needsFolder : .readyUnchecked))
                 self.configureBackgroundScheduler()
                 self.loadCourses()
             } catch let error as WeBeepAPIError where error == .invalidToken {
@@ -3083,7 +3152,12 @@ enum MaterialsRunEnd: Equatable, Sendable {
                 )
                 if let replacement, let rootURL {
                     do {
-                        let renamer = CourseFolderRenamer(database: database, fileStore: try FileStore(root: rootURL), gate: operationGate)
+#if DEBUG
+                        let store = try courseRenameFileStoreForTesting?(rootURL) ?? FileStore(root: rootURL)
+#else
+                        let store = try FileStore(root: rootURL)
+#endif
+                        let renamer = CourseFolderRenamer(database: database, fileStore: store, gate: operationGate)
                         try await renamer.rename(rootID: rootID, courseID: course.id, from: scope.localFolder, to: replacement)
                         if courseFolders[course.id] != replacement { courseFolders[course.id] = replacement }
                         try await database.upsertScope(SyncScope(
@@ -3095,6 +3169,11 @@ enum MaterialsRunEnd: Equatable, Sendable {
                         ))
                     } catch {
                         if courseFolders[course.id] != scope.localFolder { courseFolders[course.id] = scope.localFolder }
+                        if (try? await database.pendingScopeMoves(rootID: rootID).isEmpty) == false {
+                            recoveryBlocked = true
+                            setSyncState(.recoveryBlocked)
+                            throw PendingCourseFolderRenameError()
+                        }
                     }
                 } else {
                     if courseFolders[course.id] != scope.localFolder { courseFolders[course.id] = scope.localFolder }
@@ -3818,12 +3897,12 @@ enum MaterialsRunEnd: Equatable, Sendable {
 
     /// What the window says while a course-folder rename is unfinished
     /// (`PendingCourseFolderRenameError`, #183): sync, course renames and "Organizza cartelle"
-    /// stay blocked until BeepBar restarts, when launch recovery finishes the rename. It tells the
+    /// stay blocked until recovery finishes and refreshes the displayed folders. It tells the
     /// student the one thing that unblocks it and that their files were not touched.
     nonisolated static var pendingFolderRenameMessage: BilingualText {
         BilingualText(
-            "La rinomina di una cartella del corso è rimasta a metà. Riavvia BeepBar per completarla: fino ad allora sincronizzazione e rinomine sono sospese. I tuoi file non sono stati toccati.",
-            "A course folder rename was left unfinished. Restart BeepBar to complete it: until then, syncing and renaming are paused. Your files haven't been touched.")
+            "La rinomina di una cartella del corso è rimasta a metà. Premi «Riprova recupero» dal menu per completarla: fino ad allora sincronizzazione e rinomine sono sospese. I tuoi file restano conservati.",
+            "A course folder rename was left unfinished. Choose “Retry recovery” from the menu to complete it: until then, syncing and renaming are paused. Your files are preserved.")
     }
 
     private func deferredAutomaticSync(_ operationID: UUID) {
@@ -3841,8 +3920,7 @@ enum MaterialsRunEnd: Equatable, Sendable {
     /// path, and opening BeepBar shows it.
     ///
     /// `pendingFolderRename`: the run refused because a course-folder rename is unfinished
-    /// (`PendingCourseFolderRenameError`, #183); the window says to restart BeepBar instead of
-    /// the generic failure, since every run refuses until then.
+    /// (`PendingCourseFolderRenameError`, #183); the retry action recovers it before more work.
     private func failedSync(_ operationID: UUID, error: WeBeepAPIError?, automatic: Bool, unreadableMove: RelativePath? = nil, pendingFolderRename: Bool = false) async {
         guard activeOperationID == operationID else { return }
         recordRunEnd(operationID, error.map(MaterialsRunEnd.serviceFailure) ?? .localFailure)
@@ -3853,7 +3931,10 @@ enum MaterialsRunEnd: Equatable, Sendable {
             issue = await handleServiceFailure(error, automatic: automatic)
         } else {
             if let unreadableMove { setSyncState(.failed(.local(Self.unreadableMoveMessage(unreadableMove)))) }
-            else if pendingFolderRename { setSyncState(.failed(.local(Self.pendingFolderRenameMessage))) }
+            else if pendingFolderRename {
+                recoveryBlocked = true
+                setSyncState(.recoveryBlocked)
+            }
             else { setSyncState(.failed(.partialSync)) }
             issue = automatic ? .partialSync : nil
         }

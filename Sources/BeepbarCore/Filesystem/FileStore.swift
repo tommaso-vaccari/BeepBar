@@ -403,16 +403,10 @@ public actor FileStore {
     /// one; there the file is trashed by its path after a last check (`trashWithoutHardLink`), so
     /// the choice keeps working there as it did in released versions (#182).
     ///
-    /// Cost and cancellation (#185): the hard-link path reads the file three times, on purpose.
-    /// The two reads before the Trash call (the file, then its pinning link) stop at the next
-    /// chunk when the task is cancelled: nothing has changed on disk until the Trash call, and the
-    /// staging link is removed on the way out, so a cancelled choice leaves the file exactly where
-    /// it was. The read after the Trash call guards the only irreversible step (unlinking the
-    /// user's path) and is not cancellable: once the Trash holds the link, the action finishes or
-    /// reports `localChanged`, never half-done. None of the reads is skipped on `fstat` evidence:
-    /// a content stamp cannot prove the bytes unchanged on every volume (see `contentStamp(of:)`),
-    /// and these checks are what keep an edit made meanwhile out of the Trash and in place. The
-    /// actor is still busy for the whole action, so other `FileStore` calls wait behind it.
+    /// The pinning link shares the verified source's inode, so hashing it again adds a full
+    /// read without protecting the final unlink (#185). Check its identity and cancellation
+    /// before Trash, then hash the still-open source before unlinking the user's path: an edit
+    /// meanwhile leaves that path in place. This final read cannot be cancelled once Trash acts.
     public func trashRegularFile(_ path: RelativePath, expected: FileSnapshot) throws {
         try requireMovablePath(path)
         let namedRoot = open(rootURL.path, O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW)
@@ -458,8 +452,8 @@ public actor FileStore {
         guard staged >= 0 else { throw FileStoreError.localChanged }
         defer { close(staged) }
         try requireRegularFile(staged)
-        guard try Self.identity(of: staged) == identity,
-              try sha256(of: staged, checksCancellation: true) == expected.sha256 else { throw FileStoreError.localChanged }
+        guard try Self.identity(of: staged) == identity else { throw FileStoreError.localChanged }
+        try Task.checkCancellation()
         let namedStaging = open(stagingURL.path, O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW)
         guard namedStaging >= 0 else { throw FileStoreError.localChanged }
         defer { close(namedStaging) }

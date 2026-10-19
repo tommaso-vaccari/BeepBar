@@ -131,24 +131,19 @@ struct FileHashCancellationTests {
         #expect(try await fixture.store.conflictArtifact(at: conflict.incomingPath)?.sha256 == artifact.sha256)
     }
 
-    /// Moving a file to the Trash reads it twice before anything changes on disk: the file, then
-    /// the hard link that pins it (#185). Cancelling during either read (`skipReads` picks which)
-    /// stops at the next chunk with the file unchanged at its path, nothing handed to the Trash
-    /// and the staging link gone. Fails when either read ignores cancellation: the probe only
-    /// cancels cooperative reads, so the action then runs to the end and trashes the file.
-    @Test(arguments: [0, 1])
-    func cancellingATrashBeforeItActsLeavesTheFileInPlace(skipReads: Int) async throws {
+    /// Cancelling the initial verification leaves the file in place and never calls Trash.
+    @Test func cancellingATrashBeforeItActsLeavesTheFileInPlace() async throws {
         let trashed = OSAllocatedUnfairLock(initialState: [URL]())
         let fixture = try await Fixture(read: .inspect, trash: { url in trashed.withLock { $0.append(url) } })
         defer { fixture.remove() }
         guard case .present(let snapshot) = try await fixture.store.snapshotRegularFile(fixture.path) else { Issue.record("fixture file missing"); return }
         let before = await fixture.store.counters()
-        fixture.probe.arm(skipReads: skipReads)
+        fixture.probe.arm()
         let result = await Task { try await fixture.store.trashRegularFile(fixture.path, expected: snapshot) }.result
         #expect(result.isCancellation)
         #expect(fixture.probe.chunksAfterCancellation == 0)
         // Stopped 8 MiB into the read that was meant to be cancelled, not in a later one.
-        #expect(await fixture.store.counters().since(before).bytesHashed == Int64(skipReads) * Fixture.size + 8 << 20)
+        #expect(await fixture.store.counters().since(before).bytesHashed == 8 << 20)
         #expect(trashed.withLock { $0 }.isEmpty)
         #expect(try await fixture.store.inspect(fixture.path) == fixture.original)
         let links = try FileManager.default.attributesOfItem(atPath: fixture.root.appending(path: fixture.path.value).path)[.referenceCount] as? Int
@@ -169,7 +164,9 @@ struct FileHashCancellationTests {
         })
         defer { fixture.remove() }
         guard case .present(let snapshot) = try await fixture.store.snapshotRegularFile(fixture.path) else { Issue.record("fixture file missing"); return }
+        let before = await fixture.store.counters()
         let result = await Task { try await fixture.store.trashRegularFile(fixture.path, expected: snapshot) }.result
+        #expect(await fixture.store.counters().since(before).bytesHashed == 2 * Fixture.size)
         guard case .success = result else { Issue.record("Expected the trash to finish, got \(result)"); return }
         #expect(!FileManager.default.fileExists(atPath: fixture.root.appending(path: fixture.path.value).path))
         #expect(FileManager.default.fileExists(atPath: trashFolder.appending(path: "local.bin").path))

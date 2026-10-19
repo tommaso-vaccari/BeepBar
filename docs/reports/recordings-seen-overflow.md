@@ -67,7 +67,12 @@ acknowledgement. Repeated clicks coalesce IDs already pending so slow storage do
 one duplicate task/list per click. Cleanup uses unlink and never recursively removes a directory
 unexpectedly replacing a database file.
 
-### Current verified implementation: `378175a`
+### Historical verification: `378175a`
+
+Evidence availability (2026-10-19, #206): the `/tmp/issue106-*.log` paths below are
+historical locations, not retained artifacts available in this checkout. Their reported
+results cannot be independently reconstructed from this document. They do not attest
+the current release candidate. No synthetic replacement logs have been created.
 
 The actor/reset/snapshot revision is commit
 `378175a9ef3c19e12db235747f03255540171451`. Standard gates passed on that exact commit
@@ -76,7 +81,7 @@ The previous Command Line Tools limitation was resolved before these runs. The w
 was clean and `git diff --check` passed. No installed app was signed, launched or replaced,
 and this task performed no license-acceptance action.
 
-| Command | Result on `378175a` | Exact local log |
+| Command | Result on `378175a` | Historical log (not retained) |
 |---|---|---|
 | `swift test` | PASS: 362 Core + 27 Benchmark + 268 App Swift Testing tests, plus 14 XCTest tests = **671 total**, zero failures | `/tmp/issue106-full-378175a.log` |
 | `xcodebuild -project Beepbar.xcodeproj -target Beepbar -configuration Release -clonedSourcePackagesDirPath build/SourcePackages build CODE_SIGNING_ALLOWED=NO` | **BUILD SUCCEEDED**, signing disabled | `/tmp/issue106-release-378175a.log` |
@@ -95,7 +100,7 @@ Every mutant compiled, ran its regression and returned nonzero; none is a compil
 Restoring the original source passed **49 targeted tests in two suites**, with zero failures
 (0.328 s runtime), logged at `/tmp/issue106-actor-restored-green.log`.
 
-| Removed guarantee | Regression result | Exact local log |
+| Removed guarantee | Regression result | Historical log (not retained) |
 |---|---|---|
 | History executor moved to main actor | Red: one test, one issue | `/tmp/issue106-mutation-main-actor.log` |
 | Persisted reset namespace | Red: one test, six issues | `/tmp/issue106-mutation-reset.log` |

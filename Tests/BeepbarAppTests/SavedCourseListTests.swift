@@ -203,15 +203,80 @@ import os
         #expect(!FileManager.default.fileExists(atPath: install.file.path))
     }
 
-    /// A course-folder rename whose sync-folder flush failed (#183) blocks the app safely until a
-    /// relaunch, through the real controller: "Sincronizza ora" fails with the message that says
-    /// to restart BeepBar, turning the course off and on again (which writes the old folder name
-    /// the window still shows) does not unblock it, and a rename of another course shows the same
-    /// message. Nothing recreates the old folder or moves the synced file. After launch recovery
-    /// the next launch shows the renamed folder and syncs into it. Guards against the in-session
-    /// settle that split the course (RA-001/RA-003 of PR #225): with the sync guard removed, the
-    /// manual sync recreates "Analisi I" from the stale name.
-    @Test func anUnfinishedCourseRenameBlocksTheAppUntilARelaunch() async throws {
+    /// A scope may commit before a different journal row fails. Both retry and abandoning that
+    /// row must refresh the old window's folder cache before any new target can be built (#183).
+    @Test func anAutomaticRenameFlushFailureOffersRecovery() async throws {
+        let install = try await Install.make()
+        defer { install.remove() }
+        let name = "GPUS & HETEROGENEOUS SYSTEMS"
+        let token = MoodleRecordingProtocol.register(courses: [(1, name)])
+        defer { MoodleRecordingProtocol.revoke(token: token) }
+        let old = "GPUS &amp; HETEROGENEOUS SYSTEMS"
+        let path = install.root.appending(path: old)
+        try FileManager.default.createDirectory(at: path, withIntermediateDirectories: true)
+        try Data("local".utf8).write(to: path.appending(path: "local.txt"))
+        let store = try FileStore(root: install.root)
+        let identity = try #require(try await store.topLevelDirectoryIdentity(old))
+        try await install.database.upsertScope(SyncScope(rootID: install.rootID, courseID: 1, displayName: name, localFolder: old, enabled: true, managedDirectory: identity))
+        let controller = install.launch(token: token)
+        controller.courseRenameFileStoreForTesting = { root in
+            try FileStore(root: root, beforeMove: nil, syncDirectory: { _ in throw FileStoreError.ioFailure })
+        }
+        controller.loadCourses()
+        await controller.waitForCourseLoadForTesting()
+        #expect(controller.recoveryBlocked)
+        #expect(controller.syncState == .recoveryBlocked)
+        #expect(try await install.database.pendingScopeMoves(rootID: install.rootID).count == 1)
+        controller.retryRecovery()
+        await controller.waitForRecoveryForTesting()
+        #expect(!controller.recoveryBlocked)
+        let folder = try #require(controller.courseFolders[1])
+        #expect(folder != old)
+        #expect(try Data(contentsOf: install.root.appending(path: folder).appending(path: "local.txt")) == Data("local".utf8))
+        #expect(!FileManager.default.fileExists(atPath: path.path))
+    }
+
+    @Test(arguments: [false, true])
+    func aPartialRecoveryRefreshesFoldersBeforeEitherExit(abandon: Bool) async throws {
+        let install = try await Install.make()
+        defer { install.remove() }
+        let token = MoodleRecordingProtocol.register(courses: [(1, "Analisi"), (2, "Fisica")], files: [1: ["a.txt"]])
+        defer { MoodleRecordingProtocol.revoke(token: token) }
+        let controller = await launchAndSave(install, token: token)
+        controller.synchronizeNow()
+        await controller.waitForSyncForTesting()
+        let store = try FileStore(root: install.root)
+        let identity = try #require(try await store.topLevelDirectoryIdentity("Analisi I"))
+        try await install.database.upsertScope(SyncScope(rootID: install.rootID, courseID: 1, displayName: "Analisi", localFolder: "Analisi I", enabled: true, managedDirectory: identity))
+        try FileManager.default.moveItem(at: install.root.appending(path: "Analisi I"), to: install.root.appending(path: "Renamed"))
+        try await install.database.beginScopeMove(PendingScopeMove(id: UUID(), rootID: install.rootID, courseID: 1, oldFolder: "Analisi I", newFolder: "Renamed"))
+        try await install.database.upsertBaseline(rootID: install.rootID, baseline: Baseline(remoteID: "missing", relativePath: try RelativePath("missing.txt"), sha256: "missing", remoteRevision: "fixture", courseID: 2, moduleID: 99))
+        let obstacle = install.root.appending(path: "obstacle.txt")
+        try Data("unrelated".utf8).write(to: obstacle)
+        try await install.database.beginModuleMove(PendingModuleMove(rootID: install.rootID, courseID: 2, moduleID: 99, action: .set, oldFolder: nil, newFolder: "Custom", lastKnownName: "Fixture", files: [PendingModuleMoveFile(remoteID: "missing", oldPath: try RelativePath("missing.txt"), newPath: try RelativePath("obstacle.txt"), source: .missing)]))
+        controller.setRecoveryBlockedForTesting(true)
+        await controller.restorePersistedSyncStateForTesting()
+        controller.retryRecovery()
+        await controller.waitForRecoveryForTesting()
+        #expect(controller.recoveryBlocked)
+        #expect(controller.hasPendingModuleMoves)
+        #expect(try await install.database.pendingScopeMoves().isEmpty)
+        if abandon {
+            controller.abandonPendingModuleMoves()
+        } else {
+            try FileManager.default.removeItem(at: obstacle)
+            controller.retryRecovery()
+        }
+        await controller.waitForRecoveryForTesting()
+        #expect(!controller.recoveryBlocked)
+        #expect(controller.courseFolders[1] == "Renamed")
+        #expect(try await install.database.pendingModuleMoves(rootID: install.rootID).isEmpty)
+        #expect(!FileManager.default.fileExists(atPath: install.root.appending(path: "Analisi I").path))
+    }
+
+    /// Recovery retries in the same controller must replace every displayed folder before sync
+    /// can build targets. Toggling selection while blocked must never restore the old name.
+    @Test func anUnfinishedCourseRenameRecoversWithoutRelaunching() async throws {
         let install = try await Install.make()
         defer { install.remove() }
         let token = MoodleRecordingProtocol.register(courses: [(1, "Analisi"), (2, "Fisica")], files: [1: ["a.txt"]])
@@ -227,7 +292,7 @@ import os
             try await CourseFolderRenamer(database: install.database, fileStore: failingFlush, gate: RootOperationGate()).rename(rootID: install.rootID, courseID: 1, from: "Analisi I", to: "Renamed")
         }
         try #require(controller.courseFolders[1] == "Analisi I")
-        let blocked = AppSyncState.failed(.local(WeBeepAuthenticationController.pendingFolderRenameMessage))
+        let blocked = AppSyncState.recoveryBlocked
         let oldFolder = install.root.appending(path: "Analisi I")
         let course = try #require(controller.courses.first { $0.id == 1 })
 
@@ -245,17 +310,20 @@ import os
 
         controller.renameFolder(for: try #require(controller.courses.first { $0.id == 2 }), to: "Fisica 2")
         try await waitUntil { controller.renamingCourseID == nil }
-        #expect(controller.courseRenameErrors[2] == WeBeepAuthenticationController.pendingFolderRenameMessage.text)
+        #expect(controller.courseFolders[2] != "Fisica 2")
         #expect(try Data(contentsOf: install.root.appending(path: "Renamed/Lezioni/a.txt")) == original)
         #expect(try await install.database.pendingScopeMoves().count == 1)
 
-        // Quit and relaunch: launch recovery settles the rename before the window is built.
-        _ = try await RecoveryCoordinator(rootID: install.rootID, database: install.database, fileStore: FileStore(root: install.root)).recover()
-        let relaunched = await launchAndSave(install, token: token)
-        #expect(relaunched.courseFolders[1] == "Renamed")
-        relaunched.synchronizeNow()
-        await relaunched.waitForSyncForTesting()
-        guard case .synced = relaunched.syncState else { Issue.record("the sync after recovery did not complete: \(relaunched.syncState)"); return }
+        controller.retryRecovery()
+        await controller.waitForRecoveryForTesting()
+        #expect(!controller.recoveryBlocked)
+        #expect(controller.courseFolders[1] == "Renamed")
+        #expect(try await install.database.pendingScopeMoves().isEmpty)
+        controller.setCourse(course, enabled: false)
+        controller.setCourse(course, enabled: true)
+        controller.synchronizeNow()
+        await controller.waitForSyncForTesting()
+        guard case .synced = controller.syncState else { Issue.record("the sync after recovery did not complete: \(controller.syncState)"); return }
         #expect(!FileManager.default.fileExists(atPath: oldFolder.path))
         #expect(try Data(contentsOf: install.root.appending(path: "Renamed/Lezioni/a.txt")) == original)
         #expect(try await install.database.scope(rootID: install.rootID, courseID: 1)?.localFolder == "Renamed")
@@ -551,6 +619,41 @@ import os
         await controller.waitForCourseListWriteForTesting()
         #expect(controller.recoveryBlocked)
         #expect(!FileManager.default.fileExists(atPath: install.file.path), "an expired list outlived a blocked launch")
+    }
+
+    @Test func aBlockedLaunchCompletesAccountInitializationOnRetry() async throws {
+        let install = try await Install.make()
+        defer { install.remove() }
+        let token = MoodleRecordingProtocol.register(courses: [(1, "Analisi")])
+        defer { MoodleRecordingProtocol.revoke(token: token) }
+        let controller = install.launch(token: token)
+        await controller.applyBootstrapWithCredentialForTesting(recoveryBlocked: true)
+        controller.setSyncStateForTesting(.failed(.authenticationExpired))
+        controller.retryRecovery()
+        await controller.waitForRecoveryForTesting()
+        #expect(!controller.recoveryBlocked)
+        #expect(controller.hasStoredCredential)
+        #expect(controller.accountState == .connected)
+        controller.loadCourses()
+        await controller.waitForCourseLoadForTesting()
+        #expect(controller.courses.map(\.id) == [1])
+    }
+
+    @Test func signingInDuringBlockedRecoveryKeepsTheNewAccount() async throws {
+        let install = try await Install.make()
+        defer { install.remove() }
+        let token = MoodleRecordingProtocol.register(courses: [(1, "Analisi")])
+        defer { MoodleRecordingProtocol.revoke(token: token) }
+        let controller = install.launch(token: token)
+        await controller.applyBootstrapWithoutCredentialForTesting(recoveryBlocked: true)
+        await controller.completeLoginForTesting(moodleLoginCallback(token: token))
+        #expect(controller.recoveryBlocked)
+        #expect(controller.syncState == .recoveryBlocked)
+        controller.retryRecovery()
+        await controller.waitForRecoveryForTesting()
+        #expect(!controller.recoveryBlocked)
+        #expect(controller.hasStoredCredential)
+        #expect(controller.accountState == .connected)
     }
 
     /// A menu-bar-only user, app running for weeks: the automatic sync, which never reads or

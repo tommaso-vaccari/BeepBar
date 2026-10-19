@@ -138,6 +138,15 @@ Prima di iniziare, assegnarsi la issue e indicare branch, base dev/SHA e dipende
 
 Non lavorare contemporaneamente sugli stessi percorsi senza concordare l’ordine. D06 precede D08/D10 nel controller autenticazione; D09 precede D12 nelle registrazioni. D07 può partire in parallelo a D06, coordinando eventuali hook nel controller. I fix indipendenti I1/I4/I9b/I11 non devono aspettare la conclusione delle misure UI.
 
+## Disponibilita delle prove storiche — 2026-10-19 (#206)
+
+I percorsi `PerformanceReports/` citati nelle sezioni storiche erano locali e non versionati.
+Le serie R01/R02/R03/D09 e le relative tracce non sono disponibili in questo checkout:
+le tabelle restano resoconti storici, non risultati riproducibili dai soli file del repository.
+Non ricostruire campioni grezzi a partire dalle mediane. Le misure su revisioni precedenti
+non attestano il budget del candidato corrente; servono nuove serie con SHA, ambiente,
+campioni e riepilogo conservati insieme. Anche il warm reopen richiede una misura dedicata (#205).
+
 ## Consegne integrate
 
 | Consegna | PR | Risultato |
@@ -553,3 +562,5 @@ Base dev integrata `a30f46c07c7abf71b796f55fa9d7756ac3670f6d`; follow-up su `doc
 Four isolated, instrumented packaged telemetry scenarios passed; no production sends. Final independent tooling review clean after strengthening network isolation and executable-hash checks. Scope and limitations: [privacy gate](privacy-release-gate.md).
 
 Privacy completion evidence: the release gate now distinguishes owner-confirmed mailbox suitability, real WebKit synthetic session tests, real URLSession in-flight opt-out, packaged Sparkle configuration, and filesystem backup metadata from live provider and final-release verification. Default-on/opt-out is preserved; no app-wide legal certification is claimed. Delivery targets dev only.
+
+Current local release-fix verification and source identity: [2026-10-19 report](reports/release-fixes-2026-10-19.md). This does not recover missing historical raw evidence.

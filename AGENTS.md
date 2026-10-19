@@ -84,7 +84,7 @@ Every push to `main` that touches production paths publishes a Sparkle release t
 - Release PR (`dev` → `main`) protocol:
   - Before release, complete the final GDPR/privacy review against the release code and binary using the Compliance Wiki verification plan. Update its evidence and unresolved findings; integrating the wiki into `dev` does not establish full compliance.
   - `CHANGELOG.md` must be updated in the same PR: it is what users read, since the Sparkle update dialog links to it on `main`.
-  - Move the `## Unreleased` entries under a dated heading (`## YYYY-MM-DD`) and leave a fresh, empty `## Unreleased` on top. The version number is assigned by CI at merge time, so it is not written by hand.
+  - Move the `## Unreleased` entries under a dated heading (`## YYYY-MM-DD`) and leave a fresh, empty `## Unreleased` on top. The version number is assigned by CI at merge time, so it is not written by hand: it follows the last `v*` tag (next patch), and raising `MARKETING_VERSION` in `project.pbxproj` starts a new line at patch 0 (`scripts/build-version.sh`).
   - Write for users, not developers. Describe what changed in what they see and do: what now works, what no longer goes wrong, what to expect after updating. Mention the app's own labels (e.g. "Sincronizza ora") when they help. No type, function, or file names, no database or implementation terms (baseline, hash, lease, journal…), no PR mechanics.
   - Keep each entry short: one or two sentences, most important first. Group under `### New`, `### Improved`, `### Fixed`. Merge related PRs into one entry, and drop internal-only changes (refactors, tests, CI) that users cannot notice.
   - Call out anything that happens by itself on the first launch after updating (a migration, files being moved, a one-time permission prompt), so nobody is surprised.
@@ -139,7 +139,7 @@ Every push to `main` that touches production paths publishes a Sparkle release t
 - Green means what CI runs. The `Test` job in `.github/workflows/ci.yml` is the authority; this is the single shared copy of its step list (update it with `ci.yml`; other docs point here):
   - tooling tests that need no Swift build: `python3 scripts/test_benchmark_compare.py`, `python3 scripts/test_ui_benchmark.py`, `bash scripts/test-linux-core-tests.sh`;
   - `swift test`;
-  - `bash scripts/test-release-notes.sh` and the `scripts/build-version.sh` numbering checks;
+  - `bash scripts/test-release-notes.sh` and the version numbering checks `bash scripts/test-build-version.sh`;
   - the Release build `xcodebuild -project Beepbar.xcodeproj -target Beepbar -configuration Release build CODE_SIGNING_ALLOWED=NO`, plus arm64, `Info.plist`, asset, Sparkle and ad-hoc signature checks on the built app.
   - Not in CI, so local evidence only: `scripts/quit-probe.sh` (required for quit-path changes, see the hard rules), `scripts/recordings-seen-isolated-tests.py` (builds a temporary package) and `scripts/linux-core-tests.sh` (needs Linux; there is no Linux job).
 - Put decision logic in pure `nonisolated static` functions so Swift Testing can cover it (`resolveNeedsOnboarding`, `resolveLanguage`, `menuBarSymbol(for:)`, `MenuBarActionPolicy`).

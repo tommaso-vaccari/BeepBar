@@ -17,13 +17,10 @@ public enum CourseRenameError: Error, Sendable, Equatable, LocalizedError {
 /// write course folders while the row is there: a sync (`SyncCoordinator`), another rename
 /// (`CourseFolderRenamer`) and "Organizza cartelle" (`ModulePathMigrator`).
 ///
-/// Why they refuse instead of settling the rename in-session: the app keeps the course's folder
-/// name in several places (the window, the scopes it upserts, the sync targets, the module
-/// destinations), and a settle in a running app left some of them on the old name, so a later
-/// sync, course switch or module move recreated the old folder and split the course in two
-/// (review RA-001/RA-003/RA-004 of PR #225). Only launch recovery (`RecoveryCoordinator`), which
-/// runs before any of them is built, settles the row. Nothing on disk is touched meanwhile; the
-/// app turns this error into a message that says to restart BeepBar.
+/// These operations cannot settle the row themselves: their callers may already hold the old
+/// folder in a target, selection write or module preview (PR #225). Recovery must run with root
+/// operations blocked, drain old writes and reload the app's displayed folders before unblocking.
+/// The app exposes this through "Retry recovery"; launch recovery uses the same coordinator.
 public struct PendingCourseFolderRenameError: Error, Sendable, Equatable {
     public init() {}
 }

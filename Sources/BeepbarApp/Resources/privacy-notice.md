@@ -1,6 +1,6 @@
 # BeepBar — informativa privacy / privacy notice
 
-**Informativa della configurazione dev / Dev-configuration notice — 2026-10-19.** Inclusa nell’app e disponibile prima dell’accesso. Si applica alla configurazione descritta, destinata alla prossima release; non attribuisce queste modifiche alle versioni precedenti. Non costituisce consenso. / Included in the app and available before sign-in. Applies to the described configuration intended for the next release, not earlier versions. Does not constitute consent.
+**Informativa privacy di BeepBar 3.0 / BeepBar 3.0 privacy notice — 2026-10-19.** Inclusa nell’app e disponibile prima dell’accesso. Si applica a BeepBar 3.0 e alle versioni successive finché non viene aggiornata; non attribuisce queste modifiche alle versioni precedenti. Non costituisce consenso. / Included in the app and available before sign-in. Applies to BeepBar 3.0 and later versions until it is updated, not to earlier versions. Does not constitute consent.
 
 ## Italiano
 

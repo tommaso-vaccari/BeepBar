@@ -44,7 +44,7 @@ with tempfile.TemporaryDirectory(prefix="beepbar-privacy-probe-") as temporary:
                                 capture_output=True, text=True)
         assert denied.returncode != 0 and "Operation not permitted" in denied.stderr, denied.stderr
     results = []
-    for choice in ["disable", "continue"]:
+    for choice in ["saved-disabled", "close"]:
         home = work / choice
         home.mkdir()
         info = app / "Contents/Info.plist"
@@ -66,12 +66,14 @@ with tempfile.TemporaryDirectory(prefix="beepbar-privacy-probe-") as temporary:
             assert updater["httpHeaders"] == {} and updater["hasDelegate"] is False, updater
             alerts = [e for e in events if e["kind"] == "alert"]
             requests = [e for e in events if e["kind"] == "request" and "nom.telemetrydeck.com" in e["url"]]
-            assert len(alerts) == (1 if launch == 1 else 0), events
-            assert len(requests) == (1 if choice == "continue" and launch == 1 else 0), events
+            assert len(alerts) == (1 if choice == "close" and launch == 1 else 0), events
+            assert len(requests) == (1 if choice == "close" and launch == 1 else 0), events
             state = next(e for e in events if e["kind"] == "state")
-            assert state["effectiveTelemetryEnabled"] == (choice == "continue"), state
-            assert state["dailyTelemetryDisclosureVersion"] == 1, state
+            assert state["effectiveTelemetryEnabled"] == (choice == "close"), state
+            assert state.get("dailyTelemetryDisclosureVersion", 0) == (1 if choice == "close" else 0), state
             if alerts:
+                assert alerts[0]["buttons"] in (["Chiudi"], ["Close"]), alerts
+                assert any(label in alerts[0]["summary"] for label in ["Impostazioni → Telemetria", "Settings → Telemetry"]), alerts
                 details = " ".join(alerts[0]["details"])
                 assert "TelemetryDeck" in details and "tommaso.vaccari@mail.polimi.it" in details
             if requests:

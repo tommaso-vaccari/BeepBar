@@ -58,7 +58,7 @@ static void record(NSDictionary *entry) {
         [pending addObjectsFromArray:view.subviews];
     }
     record(@{@"kind":@"alert", @"title":self.messageText, @"summary":self.informativeText, @"details":texts, @"buttons":[self.buttons valueForKey:@"title"]});
-    return strcmp(getenv("BEEPBAR_PROBE_CHOICE") ?: "disable", "continue") == 0 ? NSAlertFirstButtonReturn : NSAlertSecondButtonReturn;
+    return NSAlertFirstButtonReturn;
 }
 @end
 
@@ -77,6 +77,9 @@ static void record(NSDictionary *entry) {
 @end
 @implementation PrivacyProbe
 + (void)load {
+    if (strcmp(getenv("BEEPBAR_PROBE_CHOICE") ?: "close", "saved-disabled") == 0) {
+        [NSUserDefaults.standardUserDefaults setBool:NO forKey:@"dailyTelemetryEnabled"];
+    }
     Class updater = NSClassFromString(@"SPUUpdater");
     SEL original = NSSelectorFromString(@"initWithHostBundle:applicationBundle:userDriver:delegate:");
     SEL replacement = @selector(privacyProbeInitWithHostBundle:applicationBundle:userDriver:delegate:);

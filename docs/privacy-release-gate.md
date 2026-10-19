@@ -2,6 +2,10 @@
 
 Status: **Favorable, qualified lawful-basis assessment for aggregate telemetry v2; integrated into dev through #181.** Implementation reviewed 2026-10-18; deployment scope clarified 2026-10-19. This is not certification of the whole app or retrospective approval of earlier telemetry. Final release-code/binary review remains required under the repository release procedure.
 
+## Notice interaction update — issue #230
+
+The owner requested a single Close button, with default-on status and Settings → Telemetry opt-out prominent in the summary. The full bilingual disclosure remains available before transmission; closing acknowledges information and is not consent. Disabling now requires opening Settings rather than selecting a button in the notice. The qualified v2 assessment of purpose, payload and recipients is unchanged in scope; earlier immediate in-dialog opt-out observations describe the previous UI and do not validate this interaction. This change does not establish whole-app GDPR compliance or close the release gate.
+
 ## Integration and historical deployment scope — 2026-10-19
 
 PR #181 is integrated at `a30f46c07c7abf71b796f55fa9d7756ac3670f6d`. [Post-merge CI](https://github.com/tommaso-vaccari/BeepBar/actions/runs/39115775764) passed on that SHA. Integration into dev is complete; publication and final release verification remain separate.

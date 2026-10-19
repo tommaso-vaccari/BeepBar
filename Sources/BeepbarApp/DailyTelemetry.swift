@@ -249,15 +249,19 @@ final class DailyTelemetryController: ObservableObject {
         await checkIn()
     }
 
-    /// Inform before the first request, including upgrades. Continue acknowledges the notice,
-    /// not consent; opt-out leaves every app feature available. Tests inject a synthetic choice.
+    /// Inform before the first request, including upgrades. Close acknowledges the notice,
+    /// not consent; Settings opt-out leaves every app feature available. Tests inject a synthetic choice.
     static func presentDisclosure() -> Bool {
+        disclosureAlert().runModal() == .alertFirstButtonReturn
+    }
+
+    static func disclosureAlert() -> NSAlert {
         let alert = NSAlert()
         alert.messageText = tr("Statistiche di BeepBar", "BeepBar statistics")
         let details = tr(
-            "Tommaso Vaccari usa TelemetryDeck per statistiche aggregate sulla diffusione delle versioni di BeepBar e macOS, per pianificare manutenzione e compatibilità. Per i dati personali trasmessi, la base è il legittimo interesse a mantenere l’app affidabile (art. 6.1.f GDPR). Telemetria facoltativa e attiva di default: al massimo un invio al giorno, senza identificativo individuale, account, corsi, file, lingua o impostazioni. Il primo invio mensile viene contato separatamente. TelemetryDeck GmbH riceve l’IP; dichiara di non conservarlo e di usare server UE. Non garantisce un termine di cancellazione degli eventi archiviati. Puoi opporti ora o spegnere Telemetria nelle Impostazioni senza perdere funzionalità; questo non cancella gli eventi già inviati. Titolare e contatto: Tommaso Vaccari, tommaso.vaccari@mail.polimi.it. Puoi chiedere accesso, rettifica, cancellazione e limitazione nei casi applicabili, opporti e presentare reclamo al Garante. Non usiamo questi dati per profilazione o decisioni automatizzate; non raccogliamo altri dati per attribuirti gli eventi. Continuare non costituisce consenso.",
-            "Tommaso Vaccari uses TelemetryDeck for aggregate statistics about BeepBar and macOS version adoption to plan maintenance and compatibility. For transmitted personal data, the basis is the legitimate interest in maintaining a reliable app (GDPR Article 6(1)(f)). Telemetry is optional and enabled by default: at most one daily report, without an individual identifier, accounts, courses, files, language or settings. The first monthly report is counted separately. TelemetryDeck GmbH receives your IP; it states that it does not retain it and uses EU servers. It guarantees no deletion deadline for archived events. You can object now or turn off Telemetry in Settings without losing features; this does not delete previously sent events. Controller and contact: Tommaso Vaccari, tommaso.vaccari@mail.polimi.it. You may request access, correction, erasure and restriction where applicable, object and complain to your supervisory authority. We do not use these data for profiling or automated decisions, or collect additional data to attribute events to you. Continuing does not constitute consent.")
-        alert.informativeText = tr("Statistiche facoltative giornaliere e mensili, senza identificativo individuale. Puoi disattivarle senza perdere funzionalità.", "Optional daily and monthly statistics, without an individual identifier. You can disable them without losing features.")
+            "Tommaso Vaccari usa TelemetryDeck per statistiche aggregate sulla diffusione delle versioni di BeepBar e macOS, per pianificare manutenzione e compatibilità. Per i dati personali trasmessi, la base è il legittimo interesse a mantenere l’app affidabile (art. 6.1.f GDPR). Telemetria facoltativa e attiva di default: al massimo un invio al giorno, senza identificativo individuale, account, corsi, file, lingua o impostazioni. Il primo invio mensile viene contato separatamente. TelemetryDeck GmbH riceve l’IP; dichiara di non conservarlo e di usare server UE. Non garantisce un termine di cancellazione degli eventi archiviati. Puoi opporti disattivando Telemetria nelle Impostazioni senza perdere funzionalità; questo non cancella gli eventi già inviati. Titolare e contatto: Tommaso Vaccari, tommaso.vaccari@mail.polimi.it. Puoi chiedere accesso, rettifica, cancellazione e limitazione nei casi applicabili, opporti e presentare reclamo al Garante. Non usiamo questi dati per profilazione o decisioni automatizzate; non raccogliamo altri dati per attribuirti gli eventi. Chiudere questo avviso non costituisce consenso.",
+            "Tommaso Vaccari uses TelemetryDeck for aggregate statistics about BeepBar and macOS version adoption to plan maintenance and compatibility. For transmitted personal data, the basis is the legitimate interest in maintaining a reliable app (GDPR Article 6(1)(f)). Telemetry is optional and enabled by default: at most one daily report, without an individual identifier, accounts, courses, files, language or settings. The first monthly report is counted separately. TelemetryDeck GmbH receives your IP; it states that it does not retain it and uses EU servers. It guarantees no deletion deadline for archived events. You can object by turning off Telemetry in Settings without losing features; this does not delete previously sent events. Controller and contact: Tommaso Vaccari, tommaso.vaccari@mail.polimi.it. You may request access, correction, erasure and restriction where applicable, object and complain to your supervisory authority. We do not use these data for profiling or automated decisions, or collect additional data to attribute events to you. Closing this notice does not constitute consent.")
+        alert.informativeText = tr("Statistiche facoltative giornaliere e mensili, senza identificativo individuale. Sono attive per impostazione predefinita. Puoi disattivarle in Impostazioni → Telemetria senza perdere funzionalità.", "Optional daily and monthly statistics, without an individual identifier. They are enabled by default. You can disable them in Settings → Telemetry without losing features.")
         let scroll = NSScrollView(frame: NSRect(x: 0, y: 0, width: 420, height: 220))
         scroll.hasVerticalScroller = true
         scroll.borderType = .bezelBorder
@@ -274,9 +278,8 @@ final class DailyTelemetryController: ObservableObject {
         text.setAccessibilityLabel(tr("Informativa sulla telemetria", "Telemetry privacy information"))
         scroll.documentView = text
         alert.accessoryView = scroll
-        alert.addButton(withTitle: tr("Continua", "Continue"))
-        alert.addButton(withTitle: tr("Disattiva telemetria", "Disable telemetry"))
-        return alert.runModal() == .alertFirstButtonReturn
+        alert.addButton(withTitle: tr("Chiudi", "Close"))
+        return alert
     }
 
     func startForApplication(context: (() -> DailyTelemetryContext)? = nil) async {

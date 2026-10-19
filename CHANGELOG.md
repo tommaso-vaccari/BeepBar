@@ -2,21 +2,7 @@
 
 ## Unreleased
 
-### Improved
-
-- Telemetry counts daily and monthly reporting installations without an individual installation identifier. Before the first report after updating, an explanation lets you disable it immediately.
-
-### Privacy
-
-- Read the full privacy notice offline before signing in or from Settings, in Italian or English.
-
-- Expire saved Polimi sessions after ten days without renewing on cookie updates; exclude local token/session files from future macOS backups.
-- Add per-account study erasure preserving materials, with persistent history deletion warnings and retry.
-
-- Browser diagnostic logs omit URL paths and login-item failures omit free-text errors.
-- Telemetry no longer sends language or settings. Settings explains stored data and external connections, with a privacy contact and a retry for failed recording-session deletion.
-
-## 2026-10-17
+## 2026-10-19
 
 ### Release highlights
 
@@ -26,7 +12,7 @@
 - After every sync BeepBar checks your selected courses for new recordings and tells you once when there are some.
 - Opening BeepBar shows your courses straight away while the current list loads in the background.
 
-**After updating:** telemetry is on from the first launch: BeepBar sends one daily ping to TelemetryDeck, and you can turn it off in Settings, which also deletes its identifier. With Recordings on, every sync also checks your selected courses for new recordings; the first check of a course never sends a notification. The first time you press Play or open Settings › Recordings, BeepBar may read your email from WeBeep and sign in to Webex on its own; if no Polimi email is available, recordings that need that sign-in don't open until you enter one in Settings. While a lecture plays, BeepBar also shows in the Dock and in ⌘-Tab. Every lecture starts at 0% progress: tick “Fatta” (“Done”) for the ones you have already watched. Turning Recordings off removes the Webex sign-in, the email and your progress, but keeps where you stopped in each lecture; disconnecting also removes those positions.
+**After updating:** telemetry is on by default: before the first report a notice explains what is sent, and “Disattiva telemetria” (“Disable telemetry”) turns it off right away; you can also turn it off any time in Settings. With Recordings on, every sync also checks your selected courses for new recordings; the first check of a course never sends a notification. The first time you press Play or open Settings › Recordings, BeepBar may read your email from WeBeep and sign in to Webex on its own; if no Polimi email is available, recordings that need that sign-in don't open until you enter one in Settings. While a lecture plays, BeepBar also shows in the Dock and in ⌘-Tab. Every lecture starts at 0% progress: tick “Fatta” (“Done”) for the ones you have already watched. Turning Recordings off removes the Webex sign-in, the email and your progress, but keeps where you stopped in each lecture; disconnecting also removes those positions.
 
 ### New
 
@@ -38,7 +24,9 @@
 - Save lessons from different courses in a single Watchlist inside Recordings. Add or remove bookmarks and find your saved list again after restarting.
 - BeepBar now keeps your recordings up to date: after every sync it checks your selected courses for new recordings (it never downloads video) and, if notifications are on, tells you once with “N nuove registrazioni” (“N new recordings”); a click opens Recordings. It never opens a window or asks you to sign in on its own: if your Polimi sign-in has expired, Recordings shows the prompt next time you open it.
 - In the BeepBar menu, “Apri BeepBar” (“Open BeepBar”) now sits right under “Sincronizza ora”.
-- Telemetry is enabled by default to count how many people use BeepBar and how, with one daily ping to TelemetryDeck: the app and macOS versions, the language and which settings are on, under a random identifier that changes every month. Turn it off in Settings, which also deletes the identifier; the info button explains what is sent. No account, course or file information is included.
+- Telemetry is enabled by default to count how many installations use BeepBar each day and each month, with at most one ping a day to TelemetryDeck: only the app version and the macOS version, under a value shared by every installation, so no one can be told apart. Before the first ping a notice explains it and lets you turn it off without losing any feature; you can also turn it off any time in Settings. No account, course, file, language or settings information is included.
+- Read the full privacy notice, in Italian or English and even offline, with “Informativa privacy” (“Privacy notice”) before signing in or from Settings › “Dati e privacy” (“Data and privacy”), which also has a privacy contact.
+- “Dimentica i dati di studio di questo account…” (“Forget this account’s study data…”) in Settings › Recordings deletes the account’s Watchlist, progress and resume positions; downloaded materials stay on your Mac.
 
 ### Improved
 
@@ -49,6 +37,7 @@
 - Expanding a course in Activity with more than 200 new, moved or failed files now shows the first 200, with a link below them (“Mostra altri N” / “Show N more”) that reveals more, down to the last one, so opening a large course stays quick.
 - Cancelling sync stops large local file checks promptly while file changes already underway still finish safely.
 - Closing Settings no longer cancels a lecture you just started to play; if it needs a Webex sign-in or opens in your browser, that can happen a few seconds later.
+- A saved Polimi sign-in for Recordings now lasts at most ten days from when it was first saved, and BeepBar's saved sign-ins are left out of future backups of your Mac.
 
 ### Fixed
 
@@ -61,7 +50,7 @@
 - With “Risparmio dati” on, cancelling while BeepBar checks which network you're on now stops right away, and no automatic sync starts afterwards.
 - Unexpectedly large course responses stop downloading promptly, keeping memory use bounded while your saved materials remain protected.
 - If your Polimi sign-in has expired, Recordings now starts a fresh sign-in instead of reusing the one that failed, and Polimi’s “Il servizio richiesto non è presente” page ends the attempt instead of leaving Recordings waiting.
-- Turning Recordings off no longer lets your Polimi sign-in come back, even if its saved file could not be deleted.
+- Turning Recordings off no longer lets your Polimi sign-in come back, even if its saved file could not be deleted; if deleting it or the old recordings history fails, Settings says so and offers to retry.
 - Old lecture recordings stay marked as seen even after browsing more than 5,000 recordings across courses. Recordings that earlier versions forgot may show as new again after updating: open them, or use “Segna novità come lette” (“Mark new recordings as read”) in the course.
 - In Recordings, a course with a single recording now reads “1 registrazione” instead of “1 registrazioni”, and VoiceOver announces one new lecture as “1 nuova”.
 - In Recordings, VoiceOver no longer stops on an unnamed element at the start of lectures that aren't new.

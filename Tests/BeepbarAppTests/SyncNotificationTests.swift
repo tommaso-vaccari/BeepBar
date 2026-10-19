@@ -21,11 +21,11 @@ private final class FakeNotificationCenter: NotificationCenterClient, @unchecked
     private let state: OSAllocatedUnfairLock<State>
     /// Runs inside every permission read, before it answers: lets a test change the switch while
     /// the read is pending.
-    private let onAuthorizationRead: (@Sendable () -> Void)?
+    private let onAuthorizationRead: (@MainActor @Sendable () -> Void)?
     /// Runs after every send: lets a test change the switch between two sends of the same run.
-    private let onSend: (@Sendable () -> Void)?
+    private let onSend: (@MainActor @Sendable () -> Void)?
 
-    init(authorization: NotificationAuthorization = .allowed, afterRequest: NotificationAuthorization = .allowed, onAuthorizationRead: (@Sendable () -> Void)? = nil, onSend: (@Sendable () -> Void)? = nil) {
+    init(authorization: NotificationAuthorization = .allowed, afterRequest: NotificationAuthorization = .allowed, onAuthorizationRead: (@MainActor @Sendable () -> Void)? = nil, onSend: (@MainActor @Sendable () -> Void)? = nil) {
         state = OSAllocatedUnfairLock(initialState: State(authorization: authorization, authorizationAfterRequest: afterRequest))
         self.onAuthorizationRead = onAuthorizationRead
         self.onSend = onSend
@@ -39,13 +39,13 @@ private final class FakeNotificationCenter: NotificationCenterClient, @unchecked
     func setAuthorization(_ value: NotificationAuthorization) { state.withLock { $0.authorization = value } }
 
     func authorization() async -> NotificationAuthorization {
-        onAuthorizationRead?()
+        await onAuthorizationRead?()
         return state.withLock { $0.authorizationReads += 1; return $0.authorization }
     }
     func requestAuthorization() async { state.withLock { $0.requests += 1; $0.authorization = $0.authorizationAfterRequest } }
     func send(identifier: String, title: String, body: String, destination: NotificationDestination) async {
         state.withLock { $0.sent.append(Sent(identifier: identifier, title: title, destination: destination)); $0.bodies.append(body) }
-        onSend?()
+        await onSend?()
     }
 }
 

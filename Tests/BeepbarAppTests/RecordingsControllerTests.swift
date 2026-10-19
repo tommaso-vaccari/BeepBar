@@ -4074,8 +4074,11 @@ struct RecordingsAccountTests {
         let other = MoodleRecordingProtocol.register(courses: [(1, "Course")], userID: 8)
         await controller.completeLoginForTesting(moodleLoginCallback(token: other))
         MoodleRecordingProtocol.releaseCourseImages(token: token)
+        // The identity guard's own refusal: any other failure (a timeout, a 404) would let this
+        // pass with the guard removed. A cancelled request also surfaces as `CancellationError`,
+        // so if an account change ever cancels the request, this no longer isolates the guard.
         let late = await fetch.result
-        #expect((try? late.get()) == nil, "the previous account's picture was delivered")
+        #expect(throws: CancellationError.self, "the previous account's picture was delivered") { try late.get() }
     }
 
     /// A controller signed in to the local Moodle as `userID`, whose profile holds `email`.

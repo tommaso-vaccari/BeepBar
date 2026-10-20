@@ -564,3 +564,21 @@ Four isolated, instrumented packaged telemetry scenarios passed; no production s
 Privacy completion evidence: the release gate now distinguishes owner-confirmed mailbox suitability, real WebKit synthetic session tests, real URLSession in-flight opt-out, packaged Sparkle configuration, and filesystem backup metadata from live provider and final-release verification. Default-on/opt-out is preserved; no app-wide legal certification is claimed. Delivery targets dev only.
 
 Current local release-fix verification and source identity: [2026-10-19 report](reports/release-fixes-2026-10-19.md). This does not recover missing historical raw evidence.
+
+
+## Open-issue completion scope — 2026-10-20 (draft)
+
+Base: `770260a7d245f0f069f0e6636f5423b00bd15fe9` (`dev`). Branch: `docs/complete-open-issues`. This section records intended delivery, not completed implementation or verification. Existing issue assignees retain ownership; coordinate work before changing their components.
+
+- [ ] #99: measure expanded Activity scenario I7, complete bounded/lazy row handling where required, and prove first/last access, stable identity, actions and accessibility within the documented budgets.
+- [ ] #107: measure Play behind a slow or blocked background list; deliver and verify the justified scheduling change or a measured decision satisfying the issue. Preserve one browser driver, latest-click precedence and resumption of needed lists.
+- [ ] #115: record an authorized real-account validation matrix with exact build/SHA, cold/warm launch, login/reopen/logout/expiry, course selection/removal, Play/Copy and both languages. Record failures as distinct bugs. Synthetic tests cannot complete this item.
+- [ ] #162: consolidate mutation/test evidence and owner-confirmed Now Playing checks; verify that real WeBeep picture URLs satisfy the actual host/path rules, without publishing account data.
+- [ ] #180: reconcile the release/legacy record with current privacy-gate evidence and the final signed/versioned artifact and matching published notice. Resolve or explicitly obtain an accepted disposition for each residual item; preserve opt-out and distinguish waived checks from successful checks. No invented historical deletion or whole-app certification.
+- [ ] #217: correct PR #154's stale title and reconcile PR #150's release summary, exact-SHA benchmark and final CI evidence with its historical record.
+- [ ] #222: reconcile the current shared verification gate and release-only CI policy with the issue; cover isolated recordings tooling and Linux compilation with appropriate automated checks, or obtain an explicit accepted rescope. Local-only evidence does not establish online coverage.
+- [ ] #116: refresh every roadmap entry against merged PRs and current evidence, complete #99/#107/#115, and close the tracker only after all deliveries are complete or explicitly rescoped with evidence and owner decision.
+
+Completion requires issue-specific evidence, updated plan/status, regression and mutation checks for code changes, independent code review, and the full shared gate on the final commit. Performance deliveries record both base-dev → HEAD and main → HEAD comparisons, with unavailable measurements identified. Manual work, provider access, website publication and release actions require the relevant authorization/access; missing access is a blocker, not a passing result. This draft does not authorize release, installation, outreach or taking over another assignee's work.
+
+The final PR must retain `Closes` references only for fully satisfied issues. After its authorized merge into `dev`, manually close and verify each completed issue, including #116 when all tracker criteria are met; do not wait for `main`.

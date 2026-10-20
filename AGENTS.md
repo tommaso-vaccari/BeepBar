@@ -66,12 +66,7 @@ Every new feature goes through this loop before its PR is opened.
    - **At least one P0:** the next review goes to a **different** reviewer.
    - **Only P1 and P2:** the **same** reviewer verifies the fixes and reviews again.
 6. Run the full `swift test` and the CI Release build, then present the result in chat. Push and open the PR to `dev` only after the user's go.
-7. When the user has authorized merging into `dev`, a local green run can stand in for waiting on the PR's CI, provided all of these hold:
-   - the full suite and the Release build ran on the exact commit that was pushed;
-   - the worktree was clean;
-   - the branch contains the latest `dev`.
-
-   Merge with a merge commit. Online CI keeps running, so check its result afterwards and fix on `dev` if it fails. This shortcut is for PRs into `dev` only: a release PR (`dev` → `main`) always waits for green online CI.
+7. When the user has authorized merging into `dev`, require the full local gate on the exact pushed commit, a clean worktree, and a branch containing the latest `dev`. Merge with a merge commit. If the destination changes, update and verify again before merging. PRs into `dev` do not wait for online CI. Release PRs (`dev` → `main`) always wait for green online CI as well as local verification.
 
 ## Branches and releases (`dev` → `main`)
 
@@ -79,9 +74,10 @@ Every push to `main` that touches production paths publishes a Sparkle release t
 
 - `main` stays the repository's default branch: it is what visitors see and what the README and download links describe. It only ever holds released code.
 - Feature branches start from `dev`, and ordinary PRs target `dev`: always `gh pr create --base dev`. Stacked PRs use the predecessor branch as described below. GitHub proposes `main` because it is the default branch, so the base must be set explicitly every time. A feature PR opened against `main` by mistake is retargeted to its intended base before merging, never merged into `main`.
-- `dev` runs CI (tests and the Release build check) on every PR and push. It never builds the DMG or publishes a release.
+- PRs into `dev` and development pushes use the local gate: install it in each clone with `git config --local core.hooksPath .githooks`. The pre-push hook requires a clean checkout of the commit being pushed and runs `bash scripts/verify.sh`. It never installs or launches the app. Hooks are a local convention and can be bypassed; they cannot enforce PR creation or GitHub UI merges.
+- Online tests run only for PRs from `dev` to `main`. Pushes to `main` retain release packaging/publication but do not repeat tests. No manual CI runs. `dev` never publishes a release.
 - Releasing is the user's decision alone: never open, approve, or merge a `dev` → `main` PR unless the user explicitly asks for a release. Merge it with a merge commit (not squash or rebase), so `main` and `dev` keep a shared history and later release PRs stay clean.
-- Hotfix for released code: branch from `main`, PR to `main` (this ships immediately, so only on the user's request), then merge `main` back into `dev` right away.
+- Hotfix for released code: branch from `main`, PR to `main` (this ships immediately, so only on the user's request), then merge `main` back into `dev` right away. These PRs use the local gate only: online tests are deliberately limited to `dev` → `main`. If online validation is required for a hotfix, route it through `dev` → `main`.
 - Release PR (`dev` → `main`) protocol:
   - Before release, complete the final GDPR/privacy review against the release code and binary using the Compliance Wiki verification plan. Update its evidence and unresolved findings; integrating the wiki into `dev` does not establish full compliance.
   - `CHANGELOG.md` must be updated in the same PR: it is what users read, since the Sparkle update dialog links to it on `main`.
@@ -137,12 +133,9 @@ Every push to `main` that touches production paths publishes a Sparkle release t
 ## Code structure and green checks
 
 - Two build systems: every app source file must also be registered by hand in `Beepbar.xcodeproj/project.pbxproj`; new Core files are picked up through the Swift package.
-- Green means what CI runs. The `Test` job in `.github/workflows/ci.yml` is the authority; this is the single shared copy of its step list (update it with `ci.yml`; other docs point here):
-  - tooling tests that need no Swift build: `python3 scripts/test_benchmark_compare.py`, `python3 scripts/test_ui_benchmark.py`, `bash scripts/test-linux-core-tests.sh`;
-  - `swift test`;
-  - `bash scripts/test-release-notes.sh` and the version numbering checks `bash scripts/test-build-version.sh`;
-  - the Release build `xcodebuild -project Beepbar.xcodeproj -target Beepbar -configuration Release build CODE_SIGNING_ALLOWED=NO`, plus arm64, `Info.plist`, asset, Sparkle and ad-hoc signature checks on the built app.
-  - Not in CI, so local evidence only: `scripts/quit-probe.sh` (required for quit-path changes, see the hard rules), `scripts/recordings-seen-isolated-tests.py` (builds a temporary package) and `scripts/linux-core-tests.sh` (needs Linux; there is no Linux job).
+- The single executable gate is `bash scripts/verify.sh`, used by `.githooks/pre-push` and the GitHub `Test` job. It runs tooling checks, the full Swift suite, release-note/version checks, the Release build, and arm64/plist/assets/Sparkle/signature checks. Keep local and online checks in that script instead of duplicating their command lists.
+- Install the hook in each clone with `git config --local core.hooksPath .githooks`. Every non-deletion push must refer to the checked-out HEAD with a clean tree before and after verification. Commit locally as often as useful; the full gate runs at push time. Do not bypass the hook for delivery.
+- Not in the gate: `scripts/quit-probe.sh` (required for quit-path changes), `scripts/recordings-seen-isolated-tests.py` (builds a temporary package), and `scripts/linux-core-tests.sh` (requires Linux).
 - Put decision logic in pure `nonisolated static` functions so Swift Testing can cover it (`resolveNeedsOnboarding`, `resolveLanguage`, `menuBarSymbol(for:)`, `MenuBarActionPolicy`).
 - `AppLanguage.current` is process-global and tests run in parallel: never switch it inside a test; existing assertions rely on the Italian default.
 

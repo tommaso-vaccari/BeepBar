@@ -2,11 +2,10 @@ name: CI
 
 on:
   pull_request:
+    branches: [main]
   push:
-    # `dev` collects every PR and is only tested; a push to `main` (a dev → main merge) is what
-    # publishes a release, see the `release-artifact` job condition.
-    branches: [main, dev]
-  workflow_dispatch:
+    # Pushes to main only publish releases; online validation runs on dev → main PRs.
+    branches: [main]
 
 permissions:
   contents: read
@@ -38,9 +37,9 @@ jobs:
   test:
     name: Test
     runs-on: xcode-27
+    if: github.event_name == 'pull_request' && github.base_ref == 'main' && github.head_ref == 'dev'
     concurrency:
-      # Release and manual runs get unique groups so no validation prerequisite is dropped.
-      group: ${{ github.workflow }}-test-${{ github.event_name }}-${{ (github.event_name == 'workflow_dispatch' || github.ref == 'refs/heads/main') && github.run_id || github.ref }}
+      group: ${{ github.workflow }}-test-${{ github.ref }}
       cancel-in-progress: true
     steps:
       - uses: actions/checkout@v4
@@ -59,34 +58,13 @@ jobs:
             .build/repositories
             build/SourcePackages
           key: packages-v1-${{ runner.os }}-${{ runner.arch }}-${{ steps.toolchain.outputs.fingerprint }}-${{ hashFiles('Package.swift', 'Package.resolved', 'Beepbar.xcodeproj/project.pbxproj', 'Beepbar.xcodeproj/project.xcworkspace/xcshareddata/swiftpm/Package.resolved') }}
-      # Tooling tests that need no Swift build (#215, #222): cheap, so they run before `swift test`.
-      # `scripts/recordings-seen-isolated-tests.py` is not here: it builds a temporary Swift package.
-      - name: Benchmark comparison tests
-        run: python3 scripts/test_benchmark_compare.py
-      - name: UI benchmark driver tests
-        run: python3 scripts/test_ui_benchmark.py
-      - name: Linux test wrapper tests
-        run: bash scripts/test-linux-core-tests.sh
-      - name: Swift tests
-        run: swift test
-      - name: Verify readable release notes
-        run: bash scripts/test-release-notes.sh
-      - name: Verify release version numbering
-        run: bash scripts/test-build-version.sh
-      - name: Build and verify Release app
-        run: |
-          xcodebuild -project Beepbar.xcodeproj -target Beepbar -configuration Release -clonedSourcePackagesDirPath build/SourcePackages build CODE_SIGNING_ALLOWED=NO
-          file build/Release/Beepbar.app/Contents/MacOS/Beepbar | grep -q 'arm64'
-          plutil -lint build/Release/Beepbar.app/Contents/Info.plist
-          test -f build/Release/Beepbar.app/Contents/Resources/Assets.car
-          test -d build/Release/Beepbar.app/Contents/Frameworks/Sparkle.framework
-          codesign --force --deep --sign - --identifier io.github.tvaccari.beepbar build/Release/Beepbar.app
-          codesign --verify --deep --strict --verbose=2 build/Release/Beepbar.app
+      - name: Verify tests and Release app
+        run: bash scripts/verify.sh
 
   release-artifact:
     name: Release DMG
     runs-on: xcode-27
-    needs: [test, changes]
+    needs: [changes]
     if: github.event_name == 'push' && github.ref == 'refs/heads/main' && needs.changes.outputs.production == 'true'
     permissions:
       contents: write

@@ -1,0 +1,26 @@
+#!/bin/bash
+set -euo pipefail
+cd "$(git rev-parse --show-toplevel)"
+
+head=$(git rev-parse HEAD)
+verify=false
+while read -r local_ref local_sha remote_ref remote_sha; do
+    # Deleting a remote ref sends no code to validate.
+    [[ "$local_sha" =~ ^0+$ ]] && continue
+    if [[ "$local_sha" != "$head" ]]; then
+        echo "Push blocked: check out the commit being pushed and verify it there." >&2
+        exit 1
+    fi
+    verify=true
+done
+$verify || exit 0
+
+check_tree() {
+    if [[ -n "$(git status --porcelain --untracked-files=normal)" ]] || [[ "$(git rev-parse HEAD)" != "$head" ]]; then
+        echo "Push blocked: HEAD and working tree must remain clean throughout verification." >&2
+        exit 1
+    fi
+}
+check_tree
+bash scripts/verify.sh
+check_tree

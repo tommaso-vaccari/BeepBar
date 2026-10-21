@@ -67,8 +67,8 @@ import BeepbarCore
         return nil
     }
 
-    @Test(.timeLimit(.minutes(2)), arguments: [1_000, 15_000])
-    func firstAndLastVisibleRowsKeepTheirAccessibleActions(count: Int) async throws {
+    @Test(.timeLimit(.minutes(2)), arguments: [1_000, 15_000], [480, 1_000])
+    func firstAndLastVisibleRowsKeepTheirAccessibleActions(count: Int, width: Int) async throws {
         let root = FileManager.default.temporaryDirectory.appending(path: "ActivityViewportTests-\(UUID().uuidString)", directoryHint: .isDirectory)
         try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
         defer { try? FileManager.default.removeItem(at: root) }
@@ -78,10 +78,10 @@ import BeepbarCore
         let opener = Opener()
         let controller = WeBeepAuthenticationController(testRootURL: root, database: database, rootID: rootID,
             fileOpener: opener, credentialVault: CredentialVault(read: { _ in "synthetic" }, write: { _ in }))
-        let firstName = "Synthetic slides 0.pdf"
-        let lastName = "Synthetic script \(count - 1).py"
+        let firstName = "Synthetic slides with a long descriptive filename for viewport accessibility 0.pdf"
+        let lastName = "Synthetic script with a long descriptive filename for viewport accessibility \(count - 1).py"
         let items = (0..<count).map { index in
-            SyncedItem(id: "fixture-\(index)", name: index == count - 1 ? lastName : "Synthetic slides \(index).pdf", kind: .added)
+            SyncedItem(id: "fixture-\(index)", name: index == 0 ? firstName : index == count - 1 ? lastName : "Synthetic slides \(index).pdf", kind: .added)
         }
         let course = CourseSyncCount(courseID: 1, courseFolder: "Synthetic course", added: count, updated: 0, items: items)
         controller.setSyncStateForTesting(.synced(SyncCompletionSummary(completedAt: Date(timeIntervalSince1970: 1_791_504_000),
@@ -97,7 +97,7 @@ import BeepbarCore
         NSApplication.shared.perform(Selector(("accessibilitySetValue:forAttribute:")), with: NSNumber(value: true), with: "AXEnhancedUserInterface")
         defer { NSApplication.shared.perform(Selector(("accessibilitySetValue:forAttribute:")), with: NSNumber(value: false), with: "AXEnhancedUserInterface") }
         let host = NSHostingView(rootView: ActivityPage(authentication: controller))
-        let window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 1000, height: 700), styleMask: [.titled], backing: .buffered, defer: false)
+        let window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: width, height: 700), styleMask: [.titled], backing: .buffered, defer: false)
         window.isReleasedWhenClosed = false
         window.alphaValue = 0
         window.contentView = host
@@ -124,6 +124,7 @@ import BeepbarCore
             let frame: NSRect = object.accessibilityFrame?() ?? .zero
             let viewport = window.convertToScreen(scroll.contentView.convert(scroll.contentView.bounds, to: nil))
             return !frame.isEmpty && viewport.intersects(frame)
+                && frame.minX >= viewport.minX - 1 && frame.maxX <= viewport.maxX + 1
         }
         func visibleButton(_ label: String) -> AnyObject? {
             guard let found = button(in: window, label: label), isVisible(found) else { return nil }

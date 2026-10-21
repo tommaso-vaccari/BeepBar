@@ -323,7 +323,10 @@ private struct ActivityFileRow<Title: View, Icon: View>: View {
                     icon.accessibilityHidden(true)
                     title
                     Spacer(minLength: 8)
-                    Label(action.title, systemImage: action.systemImage)
+                    HStack(spacing: 4) {
+                        Image(systemName: action.systemImage)
+                        Text(action.title)
+                    }
                         .font(.caption)
                         .fixedSize()
                         .foregroundStyle(.secondary)

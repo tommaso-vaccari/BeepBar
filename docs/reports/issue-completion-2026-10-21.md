@@ -26,11 +26,31 @@ the 15,000-row processes also exceed it (21.539–22.596 ms). Ordinary steps hav
 but excluding the jump would hide a repeatable failure. Display-link delivery intervals and
 synchronous work remain separate signals; neither proves compositor presentation.
 
-A subsequent intrinsic-height layout experiment at `68c5af9` has no valid performance result:
+The first intrinsic-height layout experiment at `68c5af9` was invalid:
 the screen was locked and the fixture could not become active. The driver now rejects locked
 or unknown console state and requires fixture frame-update evidence from Hitches during the
 single measured scroll interval. Source correction, final comparisons and performance
 acceptance remain pending; #99 remains open.
+
+After the owner unlocked the console, `activity-99-intrinsic-unlocked` completed one warm-up
+and one measured process per corpus at `68c5af9`: synchronous scroll maxima were 19.794 ms
+(1,000) and 20.329 ms (15,000). Five unprofiled processes plus a warm-up at the same source
+(`activity-99-intrinsic-unprofiled`) also fail the 16 ms budget: measured maxima
+19.651–21.177 ms and 18.970–22.430 ms respectively. Profiling overhead does not explain the
+failure. These series are separate; the unprofiled one has no trace or presentation evidence.
+
+Some Hitches exports contain positive-duration fixture rows with start time zero and no
+matching update. Their timing origin is unresolved; clipping such rows would falsely report
+an interval-long hitch. The validator now reports `scrollHitches.valid: false`, retains the
+anomalies, and omits hitch-count/duration verdicts. This does not turn the synchronous-work
+failure into a pass. Raw traces remain retained.
+
+A hosted accessibility regression at `dea9b4d` passes with 1,000/15,000 rows and 480/1,000-point
+windows, long filenames, actual Show more presses (three/seven), and first/last viewport
+geometry. The PDF opens through the injected opener and the final script reveals in Finder;
+labels, hints and absence of item problems are checked against an isolated synthetic database.
+This is hosted UI/AX evidence, not compositor presentation. Layout experiments and final
+comparisons remain in progress; #99 is still open.
 
 ## Tooling #222
 

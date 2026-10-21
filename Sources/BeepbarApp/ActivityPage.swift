@@ -171,6 +171,7 @@ private struct CourseActivityCard: View {
                 LazyVStack(alignment: .leading, spacing: 7) {
                     ForEach(page.rows) { row in
                         activityRow(row)
+                            .fixedSize(horizontal: false, vertical: true)
                             .uiContentReady(.expandedActivity, enabled: row.id == page.rows.first?.id)
                     }
                     if let title = ActivityRowLayout.showMoreTitle(for: page) {

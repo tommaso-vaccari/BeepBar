@@ -55,7 +55,13 @@ extension View {
 
 #if DEBUG
 private struct UIFixtureExpansionKey: EnvironmentKey { static let defaultValue = false }
+private struct UIFixtureActivityRowsKey: EnvironmentKey { static let defaultValue = ActivityRowLayout.pageSize }
 extension EnvironmentValues {
+    /// Lets a hosted regression exercise the final revealed prefix without thousands of clicks.
+    var uiFixtureActivityVisibleRows: Int {
+        get { self[UIFixtureActivityRowsKey.self] }
+        set { self[UIFixtureActivityRowsKey.self] = newValue }
+    }
     /// Only the isolated fixture uses this seam; ordinary app behavior stays collapsed.
     var uiFixtureExpandedActivity: Bool {
         get { self[UIFixtureExpansionKey.self] }

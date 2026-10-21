@@ -9,6 +9,7 @@ python3 scripts/test_benchmark_compare.py
 python3 scripts/test_ui_benchmark.py
 bash scripts/test-linux-core-tests.sh
 swift test
+python3 scripts/recordings-seen-isolated-tests.py
 bash scripts/test-release-notes.sh
 bash scripts/test-build-version.sh
 xcodebuild -project Beepbar.xcodeproj -target Beepbar -configuration Release -clonedSourcePackagesDirPath build/SourcePackages build CODE_SIGNING_ALLOWED=NO

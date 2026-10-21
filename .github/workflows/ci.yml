@@ -61,6 +61,18 @@ jobs:
       - name: Verify tests and Release app
         run: bash scripts/verify.sh
 
+  linux-core:
+    name: Linux Core
+    runs-on: ubuntu-latest
+    container: swift:6.2.1-jammy@sha256:6e33c70a59180c9b518f67728538312975cb3891177d20215cd2e31bdfe70791
+    if: github.event_name == 'pull_request' && github.base_ref == 'main' && github.head_ref == 'dev'
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install SQLite headers
+        run: apt-get update && apt-get install -y --no-install-recommends libsqlite3-dev
+      - name: Verify Linux Core
+        run: bash scripts/linux-core-tests.sh
+
   release-artifact:
     name: Release DMG
     runs-on: xcode-27

@@ -582,3 +582,8 @@ Base: `770260a7d245f0f069f0e6636f5423b00bd15fe9` (`dev`). Branch: `docs/complete
 Completion requires issue-specific evidence, updated plan/status, regression and mutation checks for code changes, independent code review, and the full shared gate on the final commit. Performance deliveries record both base-dev → HEAD and main → HEAD comparisons, with unavailable measurements identified. Manual work, provider access, website publication and release actions require the relevant authorization/access; missing access is a blocker, not a passing result. This draft does not authorize release, installation, outreach or taking over another assignee's work.
 
 The final PR must retain `Closes` references only for fully satisfied issues. After its authorized merge into `dev`, manually close and verify each completed issue, including #116 when all tracker criteria are met; do not wait for `main`.
+
+
+### Delivery update — 2026-10-21, PR #232
+
+The checklist above preserves the original requested scope; current status and evidence are in the [completion report](reports/issue-completion-2026-10-21.md). #162/#217 are closed after evidence reconciliation; #180 has its published-artifact/notice record completed; #222 adds isolated-fixture and release-only Linux coverage. #99 receives genuinely lazy inner rows and a hidden reachability/construction regression, but frame-time acceptance and candidate/base-dev/main timing comparisons remain unmeasured after foreground runs were stopped. It remains open. #107/#115/#116 were closed by a collaborator; no missing historical measurement or live account check is claimed as newly passed. No main release or installation is part of this delivery.

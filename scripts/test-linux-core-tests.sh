@@ -1,5 +1,9 @@
 #!/usr/bin/env bash
 set -euo pipefail
+# Hook repository variables must never redirect fixture Git commands into the caller's repo.
+for variable in $(git rev-parse --local-env-vars); do
+    unset "$variable"
+done
 
 script="$(cd "$(dirname "$0")" && pwd)/linux-core-tests.sh"
 fixture=$(mktemp -d)

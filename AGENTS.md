@@ -135,7 +135,7 @@ Every push to `main` that touches production paths publishes a Sparkle release t
 - Two build systems: every app source file must also be registered by hand in `Beepbar.xcodeproj/project.pbxproj`; new Core files are picked up through the Swift package.
 - The single executable gate is `bash scripts/verify.sh`, used by `.githooks/pre-push` and the GitHub `Test` job. It runs tooling checks, the full Swift suite, release-note/version checks, the Release build, and arm64/plist/assets/Sparkle/signature checks. Keep local and online checks in that script instead of duplicating their command lists.
 - Install the hook in each clone with `git config --local core.hooksPath .githooks`. Every non-deletion push must refer to the checked-out HEAD with a clean tree before and after verification. Commit locally as often as useful; the full gate runs at push time. Do not bypass the hook for delivery.
-- Not in the gate: `scripts/quit-probe.sh` (required for quit-path changes), `scripts/recordings-seen-isolated-tests.py` (builds a temporary package), and `scripts/linux-core-tests.sh` (requires Linux).
+- Not in the gate: `scripts/quit-probe.sh` (required for quit-path changes), `scripts/linux-core-tests.sh` (requires Linux; runs in the release PR Linux Core job). The isolated recordings fixture is included in the gate.
 - Put decision logic in pure `nonisolated static` functions so Swift Testing can cover it (`resolveNeedsOnboarding`, `resolveLanguage`, `menuBarSymbol(for:)`, `MenuBarActionPolicy`).
 - `AppLanguage.current` is process-global and tests run in parallel: never switch it inside a test; existing assertions rely on the Italian default.
 

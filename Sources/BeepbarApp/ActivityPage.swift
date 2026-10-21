@@ -120,8 +120,9 @@ private struct CourseActivityCard: View {
     @State private var isExpanded = false
 #if DEBUG
     @Environment(\.uiFixtureExpandedActivity) private var fixtureExpanded
+    @Environment(\.uiFixtureActivityVisibleRows) private var fixtureVisibleRows
 #endif
-    /// How many rows of the expanded course exist as views; grows with "Mostra altri", goes back
+    /// How many rows of the expanded course are revealed; grows with "Mostra altri", goes back
     /// to one page on collapse and on a new summary (`ActivityRowLayout.visibleCount`), and is
     /// clamped to the course by `ActivityRowLayout.page`.
     @State private var visibleRows = ActivityRowLayout.pageSize
@@ -158,17 +159,16 @@ private struct CourseActivityCard: View {
 
 #if DEBUG
             Color.clear.frame(height: 0).onAppear {
-                if fixtureExpanded { isExpanded = true }
+                if fixtureExpanded { isExpanded = true; visibleRows = fixtureVisibleRows }
             }
 #endif
             if isExpanded {
                 Divider().padding(.leading, 56)
-                // Only the first `visibleRows` rows exist as views (#99): the outer LazyVStack makes
-                // courses lazy, not the rows inside one, so a course with thousands of items used to
-                // build every row on expansion and on every redraw of the page. The page is a prefix
-                // of the course, so ids and positions never change while more rows are revealed.
+                // Keep revealed rows lazy too (#99): Show more can reveal the whole course,
+                // but only rows near the viewport should construct their controls. The prefix
+                // preserves identity and order while more rows are revealed.
                 let page = ActivityRowLayout.page(for: course, visible: visibleRows)
-                VStack(alignment: .leading, spacing: 7) {
+                LazyVStack(alignment: .leading, spacing: 7) {
                     ForEach(page.rows) { row in
                         activityRow(row)
                             .uiContentReady(.expandedActivity, enabled: row.id == page.rows.first?.id)
@@ -210,6 +210,9 @@ private struct CourseActivityCard: View {
     /// One row of the page, drawn as the card always drew it: the course failure and failed items
     /// as plain labels (there is no file to open), files and moved files as clickable rows.
     @ViewBuilder private func activityRow(_ row: ActivityRow) -> some View {
+#if DEBUG
+        let _ = ActivityPageProbes.row?(row.id)
+#endif
         switch row.content {
         case .courseFailure(let failure):
             Label {
@@ -370,3 +373,10 @@ private extension MovedSyncItem {
         }
     }
 }
+
+#if DEBUG
+/// Counts real row construction in hosted regressions; absent from production Release builds.
+@MainActor enum ActivityPageProbes {
+    static var row: ((String) -> Void)?
+}
+#endif

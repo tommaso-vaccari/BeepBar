@@ -43,7 +43,12 @@ with tempfile.TemporaryDirectory(prefix="beepbar-seen-fixture-") as scratch:
     marker = "/// Registrazioni: the synced courses"
     if presentation.count(marker) != 1:
         raise SystemExit("Presentation extraction anchor changed; update the isolated fixture")
-    (app / "RecordingsPresentation.swift").write_text(presentation.split(marker, 1)[0])
+    probe = "    static var bulkScan: ((Int) -> Void)?"
+    if presentation.count(probe) != 1:
+        raise SystemExit("Debug probe extraction anchor changed; update the isolated fixture")
+    (app / "RecordingsPresentation.swift").write_text(
+        presentation.split(marker, 1)[0] + "\n#if DEBUG\n@MainActor enum RecordingsPageProbes {\n" + probe + "\n}\n#endif\n"
+    )
     def section(text, start, end):
         if text.count(start) != 1 or text.count(end) != 1:
             raise SystemExit("Source extraction anchor changed; update the isolated fixture")

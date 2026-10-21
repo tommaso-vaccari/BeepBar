@@ -265,7 +265,7 @@ def run(args):
     out.mkdir(parents=True, exist_ok=False)
     series = {"schemaVersion": 1, "valid": False, "sourceSHA": sha, "mainSHA": main_sha,
               "baseDevSHA": base_sha, "runs": args.runs, "warmup": args.warmup,
-              "scenarios": args.scenarios, "driverSHA256": hashlib.sha256(Path(__file__).read_bytes()).hexdigest(),
+              "scenarios": args.scenarios, "scrollAll": args.scroll_all, "driverSHA256": hashlib.sha256(Path(__file__).read_bytes()).hexdigest(),
               "xcode": xcode, "xctrace": trace_version, "machine": platform.machine(),
               "macOS": command(["sw_vers"], repo), "model": command(["sysctl", "-n", "hw.model"], repo),
               "memoryBytes": command(["sysctl", "-n", "hw.memsize"], repo), "power": initial_power,
@@ -315,6 +315,9 @@ def run(args):
                 raise RuntimeError("not an arm64 fixture")
             fixture_parent = root / "fixtures"; fixture_parent.mkdir()
             fixture_env = dict(os.environ, BEEPBAR_UI_FIXTURE_TEMP_ROOT=str(fixture_parent))
+            fixture_env.pop("BEEPBAR_UI_SCROLL_ALL", None)
+            if args.scroll_all:
+                fixture_env["BEEPBAR_UI_SCROLL_ALL"] = "1"
             for scenario in args.scenarios:
                 scenario_out = out / scenario; scenario_out.mkdir()
                 # Idle is a single distinct 30-minute observation, never repeated as short UI samples.
@@ -328,6 +331,8 @@ def run(args):
                     if scenario != "idle":
                         trace = scenario_out / (name + ".trace")
                         launch = ["xcrun", "xctrace", "record", "--template", "Time Profiler", "--instrument", "os_signpost", "--output", str(trace), "--target-stdout", str(stdout), "--env", "BEEPBAR_UI_FIXTURE_TEMP_ROOT=" + str(fixture_parent), "--launch", "--"] + launch
+                        if args.scroll_all:
+                            launch[launch.index("--launch"):launch.index("--launch")] = ["--instrument", "Hitches", "--instrument", "Core Animation FPS", "--env", "BEEPBAR_UI_SCROLL_ALL=1"]
                     if power(repo) != initial_power:
                         raise RuntimeError("power source changed")
                     print("%s %s" % (scenario, name), flush=True)
@@ -387,9 +392,12 @@ def main():
     parser.add_argument("--warmup", default=1, type=count)
     parser.add_argument("--scenarios", nargs="+", choices=SCENARIOS, default=list(SCENARIOS))
     parser.add_argument("--dependency-cache", type=Path)
+    parser.add_argument("--scroll-all", action="store_true", help="scroll all revealed Activity rows and retain Hitches/FPS instruments")
     args = parser.parse_args()
     if len(args.scenarios) != len(set(args.scenarios)):
         parser.error("duplicate scenarios")
+    if args.scroll_all and any(not name.startswith("activity-") for name in args.scenarios):
+        parser.error("--scroll-all requires Activity scenarios only")
     try:
         run(args)
     except (RuntimeError, OSError, ValueError, ET.ParseError, subprocess.SubprocessError) as error:

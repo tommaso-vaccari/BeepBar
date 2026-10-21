@@ -4,6 +4,7 @@
 #if DEBUG
 import AppKit
 import SwiftUI
+import QuartzCore
 import BeepbarCore
 import os
 
@@ -314,6 +315,72 @@ struct UIFixtureResources: Codable {
     }
 }
 
+/// Measures synchronous scroll/layout work and display-link delivery separately. Neither
+/// quantity is a compositor presentation timestamp; retain Instruments hitches alongside it.
+@MainActor final class UIFixtureScroll: NSObject {
+    var scroll: NSScrollView?
+    var link: CADisplayLink?
+    var continuation: CheckedContinuation<Void, Error>?
+    var workMilliseconds: [Double] = []
+    var deliveryMilliseconds: [Double] = []
+    var previous: CFTimeInterval?
+    var tickCount = 0
+    var distance: CGFloat = 0
+    var constructed = Set<String>()
+
+    func run(in view: NSView, count: Int) async throws {
+        func find(_ view: NSView) -> NSScrollView? {
+            if let scroll = view as? NSScrollView { return scroll }
+            return view.subviews.lazy.compactMap { find($0) }.first
+        }
+        guard let scroll = find(view), scroll.documentView != nil else { throw UIFixtureError.missingContent }
+        self.scroll = scroll
+        let link = view.displayLink(target: self, selector: #selector(tick(_:)))
+        self.link = link
+        ActivityPageProbes.row = { [weak self] in self?.constructed.insert($0) }
+        let timeout = Task { @MainActor [weak self] in
+            do { try await Task.sleep(for: .seconds(15)) } catch { return }
+            self?.finish(error: UIFixtureError.missingContent)
+        }
+        defer { timeout.cancel(); link.invalidate(); self.link = nil; self.scroll = nil; ActivityPageProbes.row = nil }
+        try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
+            self.continuation = continuation
+            link.add(to: .main, forMode: .common)
+        }
+        guard workMilliseconds.count == 240, deliveryMilliseconds.count == 239, distance > 0,
+              constructed.contains("1/file/fixture-\(count - 1)") else { throw UIFixtureError.missingContent }
+    }
+
+    @objc private func tick(_ link: CADisplayLink) {
+        let start = CACurrentMediaTime()
+        if let previous { deliveryMilliseconds.append((start - previous) * 1000) }
+        previous = start
+        guard let scroll, let document = scroll.documentView else { finish(error: UIFixtureError.missingContent); return }
+        let maximum = max(0, document.bounds.height - scroll.contentView.bounds.height)
+        let y: CGFloat
+        switch tickCount {
+        case 120: y = maximum
+        case 121: y = 0
+        default: y = min(maximum, scroll.contentView.bounds.origin.y + 48)
+        }
+        distance += abs(y - scroll.contentView.bounds.origin.y)
+        scroll.contentView.scroll(to: NSPoint(x: 0, y: y))
+        scroll.reflectScrolledClipView(scroll.contentView)
+        document.layoutSubtreeIfNeeded()
+        document.displayIfNeeded()
+        workMilliseconds.append((CACurrentMediaTime() - start) * 1000)
+        tickCount += 1
+        if tickCount == 240 { finish() }
+    }
+
+    private func finish(error: Error? = nil) {
+        link?.invalidate()
+        if let error { continuation?.resume(throwing: error) }
+        else { continuation?.resume() }
+        continuation = nil
+    }
+}
+
 struct UIFixtureCycle: Codable {
     let index: Int
     let keyMilliseconds: Double
@@ -332,6 +399,8 @@ struct UIFixtureReport: Encodable {
     let fixtureSetupMilliseconds: Double
     let iconConstructionMilliseconds: Double
     let cycles: [UIFixtureCycle]
+    let scrollWorkMilliseconds: [Double]?
+    let scrollDeliveryMilliseconds: [Double]?
     let idleSeconds: Int
     let idleBefore: UIFixtureResources?
     let idleAfter: UIFixtureResources?
@@ -359,6 +428,7 @@ struct UIFixtureReport: Encodable {
     var timedOut = false
     var generation = 0
     var cycles: [UIFixtureCycle] = []
+    var scrollMeasurement: UIFixtureScroll?
     var setupMilliseconds = 0.0
     var iconMilliseconds = 0.0
     var idleBefore: UIFixtureResources?
@@ -400,6 +470,7 @@ struct UIFixtureReport: Encodable {
         // from launching settings, a real browser, login, folder panels or updater preferences.
         let root = BeepbarShellView(authentication: fixture.controller, recordings: fixture.controller.recordings, router: router)
             .environment(\.uiFixtureExpandedActivity, scenario.activityCount > 0)
+            .environment(\.uiFixtureActivityVisibleRows, ProcessInfo.processInfo.environment["BEEPBAR_UI_SCROLL_ALL"] == "1" ? scenario.activityCount : ActivityRowLayout.pageSize)
             .environment(\.uiContentObserver, { [weak self] kind in
                 guard let self, self.generation == generation, self.contentMilliseconds[kind.rawValue] == nil else { return }
                 self.contentMilliseconds[kind.rawValue] = self.elapsed(since: self.openedAt)
@@ -454,6 +525,11 @@ struct UIFixtureReport: Encodable {
                     guard fixture.controller.isSyncActive else { throw UIFixtureError.unexpectedResponse }
                 }
                 try await open(fixture)
+                if scenario.activityCount > 0, ProcessInfo.processInfo.environment["BEEPBAR_UI_SCROLL_ALL"] == "1", let view = window?.contentView {
+                    let measurement = UIFixtureScroll()
+                    scrollMeasurement = measurement
+                    try await measurement.run(in: view, count: scenario.activityCount)
+                }
                 if scenario.name == "reopen-sync" {
                     guard fixture.controller.isSyncActive else { throw UIFixtureError.unexpectedResponse }
                 }
@@ -477,7 +553,7 @@ struct UIFixtureReport: Encodable {
                 idleRequests = UIFixtureProtocol.accounts.withLock { ($0[fixture.token]?.requests ?? 0) - requestsBefore }
             }
         } catch { failure = error }
-        let report = UIFixtureReport(scenario: scenario.name, valid: failure == nil && cycles.count == scenario.cycles, error: failure.map { String(describing: $0) }, courseCount: scenario.courseCount, activityCount: scenario.activityCount, recordingsCount: scenario.recordingsCount, fixtureSetupMilliseconds: setupMilliseconds, iconConstructionMilliseconds: iconMilliseconds, cycles: cycles, idleSeconds: scenario.idleSeconds, idleBefore: idleBefore, idleAfter: idleAfter, fixtureRequestsDuringIdle: idleRequests, limitations: [
+        let report = UIFixtureReport(scenario: scenario.name, valid: failure == nil && cycles.count == scenario.cycles, error: failure.map { String(describing: $0) }, courseCount: scenario.courseCount, activityCount: scenario.activityCount, recordingsCount: scenario.recordingsCount, fixtureSetupMilliseconds: setupMilliseconds, iconConstructionMilliseconds: iconMilliseconds, cycles: cycles, scrollWorkMilliseconds: scrollMeasurement?.workMilliseconds, scrollDeliveryMilliseconds: scrollMeasurement?.deliveryMilliseconds, idleSeconds: scenario.idleSeconds, idleBefore: idleBefore, idleAfter: idleAfter, fixtureRequestsDuringIdle: idleRequests, limitations: [
             "Synthetic controller DI startup; production credential/bootstrap/migration and process-loader latency are not measured.",
             "Content is SwiftUI onAppear of populated data; not compositor presentation. Key window latency is separate.",
             "Fixtures seed known courses online before offline refresh; this does not prove persisted course restoration at offline app launch (D10).",

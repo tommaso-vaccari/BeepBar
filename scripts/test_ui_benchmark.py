@@ -32,6 +32,15 @@ def sample(scenario="courses-100"):
 
 
 class ReportValidationTests(unittest.TestCase):
+    def test_scroll_summary_preserves_each_runs_worst_sample(self):
+        values = [sample("activity-15000") for _ in range(5)]
+        for index, value in enumerate(values):
+            value["scrollWorkMilliseconds"] = [1.0] * 239 + [20.0 + index]
+            value["scrollDeliveryMilliseconds"] = [16.67] * 239
+        rows = {row[1]: row for row in driver.cost_rows(values, "activity-15000")}
+        worst = rows["scroll synchronous work per-run maximum (ms)"]
+        self.assertEqual(worst[2:], (5, 22.0, 24.0, 20.0, 24.0))
+
     def test_scroll_samples_must_be_complete_and_finite(self):
         value = sample("activity-15000")
         with self.assertRaises(ValueError):

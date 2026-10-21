@@ -131,6 +131,10 @@ def cost_rows(samples, scenario):
     kinds = samples[0]["cycles"][cycle_index]["contentMilliseconds"].keys()
     values = {"window key (ms)": [sample["cycles"][cycle_index]["keyMilliseconds"] for sample in samples]}
     values.update({"first %s (ms)" % kind: [sample["cycles"][cycle_index]["contentMilliseconds"][kind] for sample in samples] for kind in kinds})
+    if samples[0].get("scrollWorkMilliseconds") is not None:
+        for key, label in (("scrollWorkMilliseconds", "scroll synchronous work"), ("scrollDeliveryMilliseconds", "display-link delivery")):
+            values[label + " per-run maximum (ms)"] = [max(sample[key]) for sample in samples]
+            values[label + " per-run median (ms)"] = [statistics.median(sample[key]) for sample in samples]
     rows = []
     for metric, raw in values.items():
         if len(raw) < 5:

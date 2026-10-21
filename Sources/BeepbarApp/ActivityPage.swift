@@ -324,6 +324,7 @@ private struct ActivityFileRow<Title: View, Icon: View>: View {
                     Spacer(minLength: 8)
                     Label(action.title, systemImage: action.systemImage)
                         .font(.caption)
+                        .fixedSize()
                         .foregroundStyle(.secondary)
                         .opacity(isHovered ? 1 : 0)
                         .accessibilityHidden(true)

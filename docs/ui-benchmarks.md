@@ -149,11 +149,15 @@ row and a return to the top. Missing scroll movement, last-row construction, cal
 or completion invalidates the run. This establishes construction reachability; it does not
 prove viewport visibility, accessibility or real action behavior.
 
+`--unprofiled` produces a diagnostic series without Instruments to quantify profiling overhead
+on the same source revision and corpus. Its report explicitly records missing trace/frame
+evidence; do not combine it with a profiled series or present it as compositor validation.
+
 The report preserves synchronous scroll callback work and display-link delivery intervals
 separately, including the worst sample from every process. Neither signal proves compositor
 presentation. The retained Hitches instrument must contain fixture frame updates during the
 single `ui.fixtureActivityScroll` interval; an empty hitch table alone is insufficient evidence.
-Hitches and Time Profiler stacks complement these callback measurements. Preserve outliers,
+Hitch rows with an unresolved zero timing origin make `scrollHitches.valid` false; retain the raw trace and make no hitch-count or presentation claim from it. Hitches and Time Profiler stacks complement these callback measurements. Preserve outliers,
 including the explicit end jump, when assessing the 16ms budget.
 
 ## Tooling verification

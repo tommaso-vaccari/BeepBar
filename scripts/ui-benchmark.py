@@ -270,6 +270,7 @@ def scrolling_interval(path, target_pid):
 
 def hitches_summary(hitches, updates, target_pid, interval):
     start, end = interval
+    invalid_hitch_rows = []
     def matching(path, schema, clip_overlap=False):
         if not any(value.get("name") == schema for _, value in ET.iterparse(path, events=("end",)) if value.tag == "schema"):
             raise ValueError("trace lacks required " + schema + " schema")
@@ -285,6 +286,9 @@ def hitches_summary(hitches, updates, target_pid, interval):
             if timestamp < 0 or duration < 0:
                 raise ValueError("invalid fixture Hitches timing")
             if clip_overlap:
+                if timestamp == 0 and duration > 0:
+                    invalid_hitch_rows.append({"startNanoseconds": timestamp, "durationNanoseconds": duration})
+                    continue
                 overlap = min(timestamp + duration, end) - max(timestamp, start)
                 if overlap > 0:
                     yield max(timestamp, start), overlap
@@ -294,7 +298,11 @@ def hitches_summary(hitches, updates, target_pid, interval):
     if not frames:
         raise ValueError("trace has no fixture frame updates during scrolling")
     durations = [duration / 1_000_000 for _, duration in matching(hitches, "hitches", clip_overlap=True)]
-    return {"fixtureUpdatesDuringScroll": len(frames), "fixtureHitchesDuringScroll": len(durations),
+    if invalid_hitch_rows:
+        return {"valid": False, "reason": "fixture hitch rows have an unresolved zero timing origin",
+                "fixtureUpdatesDuringScroll": len(frames), "invalidHitchRows": invalid_hitch_rows,
+                "scrollStartNanoseconds": start, "scrollEndNanoseconds": end}
+    return {"valid": True, "fixtureUpdatesDuringScroll": len(frames), "fixtureHitchesDuringScroll": len(durations),
             "hitchDurationScope": "overlap clipped to scroll interval",
             "hitchDurationsMilliseconds": durations, "totalHitchMilliseconds": sum(durations),
             "maximumHitchMilliseconds": max(durations, default=0),
@@ -356,7 +364,7 @@ def run(args):
     out.mkdir(parents=True, exist_ok=False)
     series = {"schemaVersion": 1, "valid": False, "sourceSHA": sha, "mainSHA": main_sha,
               "baseDevSHA": base_sha, "runs": args.runs, "warmup": args.warmup,
-              "scenarios": args.scenarios, "scrollAll": args.scroll_all, "driverSHA256": hashlib.sha256(Path(__file__).read_bytes()).hexdigest(),
+              "scenarios": args.scenarios, "scrollAll": args.scroll_all, "instrumentation": "none" if args.unprofiled else "Time Profiler and signposts" + (" and Hitches" if args.scroll_all else ""), "driverSHA256": hashlib.sha256(Path(__file__).read_bytes()).hexdigest(),
               "xcode": xcode, "xctrace": trace_version, "machine": platform.machine(),
               "macOS": command(["sw_vers"], repo), "model": command(["sysctl", "-n", "hw.model"], repo),
               "memoryBytes": command(["sysctl", "-n", "hw.memsize"], repo), "power": initial_power,
@@ -368,6 +376,8 @@ def run(args):
                 "Only synthetic known-content offline refresh is covered; persisted cold offline restoration remains D10.",
                 "Idle runs once, unprofiled, for 30 minutes; real scheduled checks are disabled and count zero by construction.",
                 "Five measured runs cannot establish a reliable p95. Manual scrolling/actions remain required."]}
+    if args.unprofiled:
+        series["limitations"].append("Unprofiled diagnostic series: no trace, frame-update or hitch evidence. Compare with a profiled series at the same source SHA; callback work does not prove compositor frame time.")
     results = {}
     try:
         with tempfile.TemporaryDirectory(prefix="BeepbarUIBuild-") as temporary:
@@ -419,7 +429,7 @@ def run(args):
                     report = scenario_out / (name + ".json")
                     stdout = scenario_out / (name + ".stdout.log")
                     launch = [str(executable), "--scenario", scenario, "--report", str(report)]
-                    if scenario != "idle":
+                    if scenario != "idle" and not args.unprofiled:
                         trace = scenario_out / (name + ".trace")
                         launch = ["xcrun", "xctrace", "record", "--template", "Time Profiler", "--instrument", "os_signpost", "--output", str(trace), "--target-stdout", str(stdout), "--env", "BEEPBAR_UI_FIXTURE_TEMP_ROOT=" + str(fixture_parent), "--launch", "--"] + launch
                         if args.scroll_all:
@@ -434,7 +444,7 @@ def run(args):
                     require_unlocked_console(repo)
                     # A final idle run must not make a series valid after switching to battery.
                     validate_power_source(initial_power, power(repo))
-                    if scenario != "idle":
+                    if scenario != "idle" and not args.unprofiled:
                         series["commands"][-1]["trace"] = validate_trace(trace, scenario, source, scenario_out / name, args.scroll_all)
                         validate_power_source(initial_power, power(repo))
                     sample = validate_sample(json.loads(report.read_text()), scenario, args.scroll_all)
@@ -485,6 +495,7 @@ def main():
     parser.add_argument("--warmup", default=1, type=count)
     parser.add_argument("--scenarios", nargs="+", choices=SCENARIOS, default=list(SCENARIOS))
     parser.add_argument("--dependency-cache", type=Path)
+    parser.add_argument("--unprofiled", action="store_true", help="diagnostic timings without Instruments; no frame or trace evidence")
     parser.add_argument("--scroll-all", action="store_true", help="scroll all revealed Activity rows and retain the Hitches instrument")
     args = parser.parse_args()
     if len(args.scenarios) != len(set(args.scenarios)):

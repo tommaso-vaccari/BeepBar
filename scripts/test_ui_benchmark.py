@@ -32,6 +32,29 @@ def sample(scenario="courses-100"):
 
 
 class ReportValidationTests(unittest.TestCase):
+    def test_zero_origin_hitches_are_invalid_evidence_not_zero_or_clipped(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary); hitches = root / "hitches.xml"; updates = root / "updates.xml"
+            updates.write_text('<trace-query-result><node><schema name="hitches-updates"/>'
+                               '<row><start-time>1200000000</start-time><duration>17000000</duration>'
+                               '<process><pid>7</pid></process></row></node></trace-query-result>')
+            for duration in (16666625, 30881134000):
+                hitches.write_text('<trace-query-result><node><schema name="hitches"/>'
+                                   '<row><start-time id="1">0</start-time><duration>%d</duration>'
+                                   '<process id="2"><pid>7</pid></process></row>'
+                                   '<row><start-time ref="1"/><duration>50000000</duration>'
+                                   '<process ref="2"/></row></node></trace-query-result>' % duration)
+                result = driver.hitches_summary(hitches, updates, "7", (1000000000, 2000000000))
+                self.assertIs(result["valid"], False)
+                self.assertIn("zero timing origin", result["reason"])
+                self.assertEqual(result["fixtureUpdatesDuringScroll"], 1)
+                self.assertEqual(result["invalidHitchRows"], [
+                    {"startNanoseconds": 0, "durationNanoseconds": duration},
+                    {"startNanoseconds": 0, "durationNanoseconds": 50000000}])
+                for metric in ("fixtureHitchesDuringScroll", "hitchDurationsMilliseconds",
+                               "totalHitchMilliseconds", "maximumHitchMilliseconds"):
+                    self.assertNotIn(metric, result)
+
     def test_locked_or_unknown_console_is_rejected(self):
         for output in ('"IOConsoleLocked" = Yes', ""):
             with mock.patch.object(driver, "command", return_value=output):

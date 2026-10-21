@@ -337,7 +337,7 @@ def run(args):
                         trace = scenario_out / (name + ".trace")
                         launch = ["xcrun", "xctrace", "record", "--template", "Time Profiler", "--instrument", "os_signpost", "--output", str(trace), "--target-stdout", str(stdout), "--env", "BEEPBAR_UI_FIXTURE_TEMP_ROOT=" + str(fixture_parent), "--launch", "--"] + launch
                         if args.scroll_all:
-                            launch[launch.index("--launch"):launch.index("--launch")] = ["--instrument", "Hitches", "--instrument", "Core Animation FPS", "--env", "BEEPBAR_UI_SCROLL_ALL=1"]
+                            launch[launch.index("--launch"):launch.index("--launch")] = ["--instrument", "Hitches", "--env", "BEEPBAR_UI_SCROLL_ALL=1"]
                     if power(repo) != initial_power:
                         raise RuntimeError("power source changed")
                     print("%s %s" % (scenario, name), flush=True)
@@ -397,7 +397,7 @@ def main():
     parser.add_argument("--warmup", default=1, type=count)
     parser.add_argument("--scenarios", nargs="+", choices=SCENARIOS, default=list(SCENARIOS))
     parser.add_argument("--dependency-cache", type=Path)
-    parser.add_argument("--scroll-all", action="store_true", help="scroll all revealed Activity rows and retain Hitches/FPS instruments")
+    parser.add_argument("--scroll-all", action="store_true", help="scroll all revealed Activity rows and retain the Hitches instrument")
     args = parser.parse_args()
     if len(args.scenarios) != len(set(args.scenarios)):
         parser.error("duplicate scenarios")

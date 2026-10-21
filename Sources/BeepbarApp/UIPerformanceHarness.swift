@@ -343,6 +343,8 @@ struct UIFixtureResources: Codable {
             self?.finish(error: UIFixtureError.missingContent)
         }
         defer { timeout.cancel(); link.invalidate(); self.link = nil; self.scroll = nil; ActivityPageProbes.row = nil }
+        let trace = PerformanceTrace.shared.begin("ui.fixtureActivityScroll", category: .ui)
+        defer { PerformanceTrace.shared.end("ui.fixtureActivityScroll", category: .ui, state: trace) }
         try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
             self.continuation = continuation
             link.add(to: .main, forMode: .common)
@@ -489,6 +491,8 @@ struct UIFixtureReport: Encodable {
             self.ready?.resume(throwing: UIFixtureError.missingContent); self.ready = nil
         }
         defer { timeout.cancel() }
+        let trace = PerformanceTrace.shared.begin("ui.fixtureActivityScroll", category: .ui)
+        defer { PerformanceTrace.shared.end("ui.fixtureActivityScroll", category: .ui, state: trace) }
         try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
             if timedOut { continuation.resume(throwing: UIFixtureError.missingContent) }
             else { ready = continuation; signalReady() }

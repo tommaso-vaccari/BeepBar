@@ -10,6 +10,28 @@ Before implementation, `python3 scripts/ui-benchmark.py --ref origin/dev --out P
 
 Further foreground app launches were stopped at the owner's request. Hidden hosted tests establish construction bounds and reachability, not compositor/frame-time guarantees. Candidate/base-dev and candidate/main timing comparisons and the 16 ms scrolling budget remain unmeasured. Do not close #99 on the strength of this structural fix alone or describe its performance acceptance as passed.
 
+### Resumed Activity acceptance
+
+The owner subsequently authorized foreground synthetic benchmarks. Work continues in
+`perf/activity-99-acceptance`, based on integrated dev `7ad62a2`. The local ignored
+`PerformanceReports/activity-99-base` series contains five measured processes plus a warm-up
+per corpus on the current Mac17,3 / 32 GB machine, AC power. Initial-page key median/max is
+111.981/114.768 ms (1,000) and 116.873/120.787 ms (15,000). These measurements are not a
+comparison with the earlier M2 / 8 GB machine.
+
+`PerformanceReports/activity-99-scroll-all` at `3cf30ef` reveals the complete corpus and
+performs 240 display-link callbacks per process. All five 1,000-row processes exceed the
+16 ms synchronous-work budget at the explicit jump to the last row (22.034–23.302 ms maxima);
+the 15,000-row processes also exceed it (21.539–22.596 ms). Ordinary steps have lower maxima,
+but excluding the jump would hide a repeatable failure. Display-link delivery intervals and
+synchronous work remain separate signals; neither proves compositor presentation.
+
+A subsequent intrinsic-height layout experiment at `68c5af9` has no valid performance result:
+the screen was locked and the fixture could not become active. The driver now rejects locked
+or unknown console state and requires fixture frame-update evidence from Hitches during the
+single measured scroll interval. Source correction, final comparisons and performance
+acceptance remain pending; #99 remains open.
+
 ## Tooling #222
 
 The shared gate now executes the isolated recordings fixture; repairing its extracted debug probe dependency demonstrates the previously untested dependency rot. The extraction checks its source anchor and copies only the needed bulk-scan declaration. The fixture passes 142 tests. UI benchmark and Linux-wrapper regression suites already belong to the gate and remain enabled. Mutation switches intentionally expect failing tests and are not normal green gate invocations.

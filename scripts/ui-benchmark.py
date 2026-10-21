@@ -234,7 +234,74 @@ def signpost_summary(path, scenario):
     return names
 
 
-def validate_trace(trace, scenario, cwd, output_prefix):
+def resolved_trace_rows(path):
+    values = {}
+    for _, row in ET.iterparse(path, events=("end",)):
+        if row.tag != "row":
+            continue
+        for value in row.iter():
+            if value.get("id"):
+                values[value.get("id")] = value
+        yield {value.tag: values.get(value.get("ref") or value.get("id"), value) for value in row}
+
+
+def scrolling_interval(path, target_pid):
+    events = []
+    for row in resolved_trace_rows(path):
+        def text(tag):
+            value = row.get(tag)
+            return None if value is None else value.text
+        process = row.get("process")
+        if (text("subsystem") == "io.github.tvaccari.beepbar.performance" and
+                text("category") == "ui" and text("signpost-name") == "ui.fixtureActivityScroll"):
+            if process is None or process.findtext("pid") != target_pid:
+                raise ValueError("scroll interval lacks fixture process")
+            try:
+                timestamp = int(text("event-time"))
+            except (ValueError, TypeError):
+                raise ValueError("invalid scroll interval timestamp") from None
+            events.append((text("event-type"), timestamp, text("os-signpost-identifier")))
+    if (len(events) != 2 or [event[0] for event in events] != ["Begin", "End"] or
+            events[0][1] < 0 or events[1][1] <= events[0][1] or
+            events[0][2] is None or events[0][2] != events[1][2]):
+        raise ValueError("trace requires exactly one complete scroll interval")
+    return events[0][1], events[1][1]
+
+
+def hitches_summary(hitches, updates, target_pid, interval):
+    start, end = interval
+    def matching(path, schema, clip_overlap=False):
+        if not any(value.get("name") == schema for _, value in ET.iterparse(path, events=("end",)) if value.tag == "schema"):
+            raise ValueError("trace lacks required " + schema + " schema")
+        for row in resolved_trace_rows(path):
+            process = row.get("process")
+            if process is None or process.findtext("pid") != target_pid:
+                continue
+            try:
+                timestamp = int(row["start-time"].text)
+                duration = int(row["duration"].text)
+            except (KeyError, ValueError, TypeError):
+                raise ValueError("invalid fixture Hitches timing") from None
+            if timestamp < 0 or duration < 0:
+                raise ValueError("invalid fixture Hitches timing")
+            if clip_overlap:
+                overlap = min(timestamp + duration, end) - max(timestamp, start)
+                if overlap > 0:
+                    yield max(timestamp, start), overlap
+            elif start <= timestamp < end:
+                yield timestamp, duration
+    frames = list(matching(updates, "hitches-updates"))
+    if not frames:
+        raise ValueError("trace has no fixture frame updates during scrolling")
+    durations = [duration / 1_000_000 for _, duration in matching(hitches, "hitches", clip_overlap=True)]
+    return {"fixtureUpdatesDuringScroll": len(frames), "fixtureHitchesDuringScroll": len(durations),
+            "hitchDurationScope": "overlap clipped to scroll interval",
+            "hitchDurationsMilliseconds": durations, "totalHitchMilliseconds": sum(durations),
+            "maximumHitchMilliseconds": max(durations, default=0),
+            "scrollStartNanoseconds": start, "scrollEndNanoseconds": end}
+
+
+def validate_trace(trace, scenario, cwd, output_prefix, scroll_all=False):
     if not trace.is_dir() or not any(path.is_file() and path.stat().st_size > 0 for path in trace.rglob("*")):
         raise ValueError("missing or empty required trace")
     toc = output_prefix.with_suffix(".toc.xml")
@@ -243,13 +310,27 @@ def validate_trace(trace, scenario, cwd, output_prefix):
     command(["xcrun", "xctrace", "export", "--input", str(trace), "--toc", "--output", str(toc)], cwd,
             output_prefix.with_suffix(".toc.log"), timeout=60)
     pid = trace_target(toc)
-    for schema, output in (("time-profile", profile), ("os-signpost", signposts)):
+    exports = [("time-profile", profile), ("os-signpost", signposts)]
+    if scroll_all:
+        exports += [("hitches", output_prefix.with_suffix(".hitches.xml")),
+                    ("hitches-updates", output_prefix.with_suffix(".updates.xml"))]
+    for schema, output in exports:
         command(["xcrun", "xctrace", "export", "--input", str(trace), "--xpath",
                  "/trace-toc/run[@number='1']/data/table[@schema='%s']" % schema, "--output", str(output)], cwd,
                 output.with_suffix(".log"), timeout=180)
     result = profile_summary(profile, pid)
     result["uiSignposts"] = signpost_summary(signposts, scenario)
+    if scroll_all:
+        interval = scrolling_interval(signposts, pid)
+        result["scrollHitches"] = hitches_summary(output_prefix.with_suffix(".hitches.xml"),
+                                                output_prefix.with_suffix(".updates.xml"), pid, interval)
     return result
+
+
+def require_unlocked_console(repo):
+    state = command(["ioreg", "-n", "Root", "-d1"], repo)
+    if '"IOConsoleLocked" = No' not in state:
+        raise RuntimeError("UI measurements require an unlocked console")
 
 
 def power(repo):
@@ -269,6 +350,7 @@ def run(args):
     base_sha = command(["git", "rev-parse", "origin/dev^{commit}"], repo)
     xcode = command(["xcodebuild", "-version"], repo)
     trace_version = command(["xcrun", "xctrace", "version"], repo)
+    require_unlocked_console(repo)
     initial_power = power(repo)
     out = args.out.resolve()
     out.mkdir(parents=True, exist_ok=False)
@@ -342,16 +424,18 @@ def run(args):
                         launch = ["xcrun", "xctrace", "record", "--template", "Time Profiler", "--instrument", "os_signpost", "--output", str(trace), "--target-stdout", str(stdout), "--env", "BEEPBAR_UI_FIXTURE_TEMP_ROOT=" + str(fixture_parent), "--launch", "--"] + launch
                         if args.scroll_all:
                             launch[launch.index("--launch"):launch.index("--launch")] = ["--instrument", "Hitches", "--env", "BEEPBAR_UI_SCROLL_ALL=1"]
+                    require_unlocked_console(repo)
                     if power(repo) != initial_power:
                         raise RuntimeError("power source changed")
                     print("%s %s" % (scenario, name), flush=True)
                     started = time.time()
                     command(launch, source, scenario_out / (name + ".log"), timeout=1900 if scenario == "idle" else 180, env=fixture_env)
                     series["commands"].append({"argv": launch, "elapsedSeconds": time.time() - started, "exit": 0})
+                    require_unlocked_console(repo)
                     # A final idle run must not make a series valid after switching to battery.
                     validate_power_source(initial_power, power(repo))
                     if scenario != "idle":
-                        series["commands"][-1]["trace"] = validate_trace(trace, scenario, source, scenario_out / name)
+                        series["commands"][-1]["trace"] = validate_trace(trace, scenario, source, scenario_out / name, args.scroll_all)
                         validate_power_source(initial_power, power(repo))
                     sample = validate_sample(json.loads(report.read_text()), scenario, args.scroll_all)
                     if not warmup:

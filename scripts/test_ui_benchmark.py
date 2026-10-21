@@ -32,6 +32,14 @@ def sample(scenario="courses-100"):
 
 
 class ReportValidationTests(unittest.TestCase):
+    def test_locked_or_unknown_console_is_rejected(self):
+        for output in ('"IOConsoleLocked" = Yes', ""):
+            with mock.patch.object(driver, "command", return_value=output):
+                with self.assertRaisesRegex(RuntimeError, "unlocked console"):
+                    driver.require_unlocked_console(Path("."))
+        with mock.patch.object(driver, "command", return_value='"IOConsoleLocked" = No'):
+            driver.require_unlocked_console(Path("."))
+
     def test_scroll_summary_preserves_each_runs_worst_sample(self):
         values = [sample("activity-15000") for _ in range(5)]
         for index, value in enumerate(values):
@@ -161,6 +169,71 @@ class ReportValidationTests(unittest.TestCase):
                 path.write_text(bad)
                 with self.assertRaisesRegex(ValueError, "main-thread CPU samples"):
                     driver.profile_summary(path, "7")
+
+    def test_scroll_interval_requires_exact_target_begin_and_end(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "signposts.xml"
+            begin = ('<row><event-time id="1">1000000000</event-time><process id="2"><pid>7</pid></process>'
+                     '<event-type id="3">Begin</event-type><os-signpost-identifier id="4">1</os-signpost-identifier>'
+                     '<signpost-name id="5">ui.fixtureActivityScroll</signpost-name>'
+                     '<subsystem id="6">io.github.tvaccari.beepbar.performance</subsystem><category id="7">ui</category></row>')
+            end = ('<row><event-time id="8">2000000000</event-time><process ref="2"/><event-type id="9">End</event-type>'
+                   '<os-signpost-identifier ref="4"/><signpost-name ref="5"/><subsystem ref="6"/><category ref="7"/></row>')
+            xml = '<trace-query-result><node>' + begin + end + '</node></trace-query-result>'
+            path.write_text(xml)
+            self.assertEqual(driver.scrolling_interval(path, "7"), (1000000000, 2000000000))
+            for bad in (xml.replace('<pid>7</pid>', '<pid>8</pid>'), xml.replace(end, ''),
+                        xml.replace(end, end + end), xml.replace('2000000000', '500000000'),
+                        xml.replace('>End<', '>Begin<')):
+                path.write_text(bad)
+                with self.assertRaises(ValueError):
+                    driver.scrolling_interval(path, "7")
+
+    def test_hitches_require_target_updates_and_filter_scroll_interval(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary); hitches = root / "hitches.xml"; updates = root / "updates.xml"
+            def xml(schema, rows):
+                return '<trace-query-result><node><schema name="' + schema + '"/>' + rows + '</node></trace-query-result>'
+            first = ('<row><start-time id="1">1200000000</start-time><duration id="2">17000000</duration>'
+                     '<process id="3"><pid>7</pid></process></row>')
+            second = ('<row><start-time id="4">1800000000</start-time><duration ref="2"/><process ref="3"/></row>')
+            outside = ('<row><start-time>2100000000</start-time><duration>99000000</duration><process ref="3"/></row>')
+            other = ('<row><start-time>1500000000</start-time><duration>88000000</duration><process><pid>8</pid></process></row>')
+            valid_updates = xml("hitches-updates", first + second)
+            updates.write_text(valid_updates)
+            hitches.write_text(xml("hitches", first + second + outside + other))
+            result = driver.hitches_summary(hitches, updates, "7", (1000000000, 2000000000))
+            self.assertEqual(result["fixtureUpdatesDuringScroll"], 2)
+            self.assertEqual(result["hitchDurationsMilliseconds"], [17.0, 17.0])
+            self.assertEqual(result["totalHitchMilliseconds"], 34.0)
+            hitches.write_text(xml("hitches", ""))
+            self.assertEqual(driver.hitches_summary(hitches, updates, "7", (1000000000, 2000000000))["fixtureHitchesDuringScroll"], 0)
+            for bad in (xml("hitches-updates", ""), valid_updates.replace('<pid>7</pid>', '<pid>8</pid>'),
+                        valid_updates.replace('1200000000', '2200000000').replace('1800000000', '2800000000'),
+                        valid_updates.replace('17000000', '-1'), valid_updates.replace('hitches-updates', 'unrelated')):
+                updates.write_text(bad)
+                with self.assertRaises(ValueError):
+                    driver.hitches_summary(hitches, updates, "7", (1000000000, 2000000000))
+            updates.write_text(valid_updates)
+            hitches.write_text(xml("unrelated", ""))
+            with self.assertRaisesRegex(ValueError, "schema"):
+                driver.hitches_summary(hitches, updates, "7", (1000000000, 2000000000))
+
+    def test_hitches_clip_overlap_at_both_scroll_boundaries(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary); hitches = root / "hitches.xml"; updates = root / "updates.xml"
+            def xml(schema, timings):
+                rows = ''.join('<row><start-time>%d</start-time><duration>%d</duration><process><pid>7</pid></process></row>' % pair for pair in timings)
+                return '<trace-query-result><node><schema name="' + schema + '"/>' + rows + '</node></trace-query-result>'
+            updates.write_text(xml("hitches-updates", [(1200000000, 1000000)]))
+            hitches.write_text(xml("hitches", [(990000000, 50000000), (1990000000, 50000000),
+                                               (950000000, 50000000), (2000000000, 50000000)]))
+            result = driver.hitches_summary(hitches, updates, "7", (1000000000, 2000000000))
+            self.assertEqual(result["fixtureHitchesDuringScroll"], 2)
+            self.assertEqual(result["hitchDurationsMilliseconds"], [40.0, 10.0])
+            self.assertEqual(result["totalHitchMilliseconds"], 50.0)
+            self.assertEqual(result["maximumHitchMilliseconds"], 40.0)
+            self.assertEqual(result["hitchDurationScope"], "overlap clipped to scroll interval")
 
     def test_trace_requires_ui_markers_for_the_requested_content(self):
         with tempfile.TemporaryDirectory() as temporary:

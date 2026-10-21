@@ -32,6 +32,21 @@ def sample(scenario="courses-100"):
 
 
 class ReportValidationTests(unittest.TestCase):
+    def test_scroll_samples_must_be_complete_and_finite(self):
+        value = sample("activity-15000")
+        with self.assertRaises(ValueError):
+            driver.validate_sample(value, "activity-15000", scroll_all=True)
+        value["scrollWorkMilliseconds"] = [1.0] * 240
+        value["scrollDeliveryMilliseconds"] = [16.67] * 239
+        driver.validate_sample(value, "activity-15000", scroll_all=True)
+        for key in ("scrollWorkMilliseconds", "scrollDeliveryMilliseconds"):
+            original = value[key][:]
+            for invalid in (original[:-1], original + [1], [float("nan")] * len(original), [-1] * len(original)):
+                value[key] = invalid
+                with self.assertRaises(ValueError):
+                    driver.validate_sample(value, "activity-15000", scroll_all=True)
+            value[key] = original
+
     def test_key_window_cannot_replace_populated_content(self):
         value = sample("activity-15000")
         value["cycles"][0]["contentMilliseconds"] = {"activity": 1.0}

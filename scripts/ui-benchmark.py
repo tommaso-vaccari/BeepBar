@@ -88,7 +88,7 @@ def finite(value):
     return type(value) in (int, float) and math.isfinite(value) and value >= 0
 
 
-def validate_sample(sample, scenario):
+def validate_sample(sample, scenario, scroll_all=False):
     """Refuse missing/invalid samples instead of reporting a success from an empty window."""
     if sample.get("schemaVersion") != 1 or sample.get("scenario") != scenario or sample.get("valid") is not True or sample.get("error") is not None:
         raise ValueError("invalid fixture report for " + scenario)
@@ -118,6 +118,11 @@ def validate_sample(sample, scenario):
             if not isinstance(sample.get(side), dict) or not all(finite(sample[side].get(key)) for key in
                 ("footprintBytes", "cpuNanoseconds", "diskBytesWritten", "logicalBytesWritten", "interruptWakeups", "idleWakeups")):
                 raise ValueError("missing idle counters")
+    if scroll_all:
+        for key, count in (("scrollWorkMilliseconds", 240), ("scrollDeliveryMilliseconds", 239)):
+            values = sample.get(key)
+            if not isinstance(values, list) or len(values) != count or not all(finite(value) for value in values):
+                raise ValueError("missing or invalid scrolling samples")
     return sample
 
 
@@ -344,7 +349,7 @@ def run(args):
                     if scenario != "idle":
                         series["commands"][-1]["trace"] = validate_trace(trace, scenario, source, scenario_out / name)
                         validate_power_source(initial_power, power(repo))
-                    sample = validate_sample(json.loads(report.read_text()), scenario)
+                    sample = validate_sample(json.loads(report.read_text()), scenario, args.scroll_all)
                     if not warmup:
                         samples.append(sample)
                 results[scenario] = samples

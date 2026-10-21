@@ -320,7 +320,8 @@ private struct ActivityFileRow<Title: View, Icon: View>: View {
         VStack(alignment: .leading, spacing: 2) {
             Button { open(false) } label: {
                 HStack(spacing: 8) {
-                    Label { title } icon: { icon }
+                    icon.accessibilityHidden(true)
+                    title
                     Spacer(minLength: 8)
                     Label(action.title, systemImage: action.systemImage)
                         .font(.caption)

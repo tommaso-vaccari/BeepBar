@@ -150,7 +150,10 @@ or completion invalidates the run. This establishes construction reachability; i
 prove viewport visibility, accessibility or real action behavior.
 
 `--unprofiled` produces a diagnostic series without Instruments to quantify profiling overhead
-on the same source revision and corpus. Its report explicitly records missing trace/frame
+on the same source revision and corpus. Revisions before `68c5af9` emit `ui.fixtureActivityScroll`
+around a different interval, so the profiled driver rejects their traces. For before/after work
+with such a revision, run both refs unprofiled. The jump to the last row is callback 120 in every
+sample array. Its report explicitly records missing trace/frame
 evidence; do not combine it with a profiled series or present it as compositor validation.
 
 The report preserves synchronous scroll callback work and display-link delivery intervals

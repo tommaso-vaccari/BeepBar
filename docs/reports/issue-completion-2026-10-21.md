@@ -102,7 +102,7 @@ Main exceeds the 250 ms window target at its maximum. Against main, the candidat
 about 2.9× faster and shows the expanded content about 4× faster; most of this came from the
 work already integrated in dev. Against base dev, opening is unchanged within noise.
 
-**Decision.** The candidate cuts the jump frame by about 22% and continuous work by about 20%.
+**Decision.** The candidate cuts the jump frame by 18–23% and continuous work by about 20%.
 It does not meet the 16 ms main-thread budget: the jump to the last row still reaches
 16.8–17.9 ms unprofiled. That jump is a real user flow (End key, dragging the scroller), so it is
 not excluded. The remaining cost is SwiftUI construction of one viewport of rows. #99 stays
@@ -110,8 +110,9 @@ open. Further reduction needs either cheaper rows, for example an AppKit-backed 
 product decision on this residual. This report does not claim that either outcome has been
 achieved.
 
-Enabled interactive rows are not measured: `--scroll-all` disables the rows so that scrolling
-cannot trigger real actions. Manual scrolling and actions remain required.
+Enabled interactive rows are not measured. The fixture disables all of its controls in every
+scenario, so hover tracking and pointer-style costs are excluded and the jump numbers may
+understate the cost of enabled rows. Manual scrolling and actions remain required.
 
 ## Tooling #222
 

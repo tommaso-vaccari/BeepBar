@@ -170,6 +170,9 @@ private struct CourseActivityCard: View {
                 let page = ActivityRowLayout.page(for: course, visible: visibleRows)
                 LazyVStack(alignment: .leading, spacing: 7) {
                     ForEach(page.rows) { row in
+                        // Intrinsic height (#99) spares the lazy stack a second sizing pass for each
+                        // newly visible row. Part of the row changes that cut the jump-to-last-row
+                        // frame from ~22 to ~17 ms; measured with --scroll-all, not unit-testable.
                         activityRow(row)
                             .fixedSize(horizontal: false, vertical: true)
                             .uiContentReady(.expandedActivity, enabled: row.id == page.rows.first?.id)
@@ -319,6 +322,9 @@ private struct ActivityFileRow<Title: View, Icon: View>: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 2) {
             Button { open(false) } label: {
+                // A flat HStack instead of `Label`, and a fixed-size hint, keep each row's layout
+                // cheap when a viewport of rows is built at once (#99: the jump frame fell from
+                // ~22 to ~17 ms). The icon is hidden from VoiceOver so the label stays the name.
                 HStack(spacing: 8) {
                     icon.accessibilityHidden(true)
                     title

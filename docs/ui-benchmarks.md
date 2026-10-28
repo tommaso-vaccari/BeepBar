@@ -147,7 +147,8 @@ reveals the complete synthetic corpus before measurement, rather than clicking t
 button. It performs 240 display-link callbacks with normal 48-point steps, a jump to the last
 row and a return to the top. Missing scroll movement, last-row construction, callback samples
 or completion invalidates the run. This establishes construction reachability; it does not
-prove viewport visibility, accessibility or real action behavior.
+prove viewport visibility, accessibility or real action behavior. The fixture disables all controls, so the
+measured rows exclude hover tracking and pointer-style costs of enabled rows.
 
 `--unprofiled` produces a diagnostic series without Instruments to quantify profiling overhead
 on the same source revision and corpus. Revisions before `68c5af9` emit `ui.fixtureActivityScroll`

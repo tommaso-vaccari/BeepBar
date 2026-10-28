@@ -3,6 +3,7 @@
 import copy
 import importlib.util
 from pathlib import Path
+import plistlib
 import tempfile
 import unittest
 from unittest import mock
@@ -56,12 +57,20 @@ class ReportValidationTests(unittest.TestCase):
                     self.assertNotIn(metric, result)
 
     def test_locked_or_unknown_console_is_rejected(self):
-        for output in ('"IOConsoleLocked" = Yes', ""):
+        def registry(root):
+            # `ioreg -a` prints a bare root dict; older output may wrap it in an array.
+            return plistlib.dumps(root).decode()
+        # Locked, unknown, unparsable, and a locked console whose nested session says unlocked.
+        for output in (registry({"IOConsoleLocked": True}), registry({}), "", "not a plist",
+                       registry({"IOConsoleLocked": True,
+                                 "IOConsoleUsers": [{"IOConsoleLocked": False}]})):
             with mock.patch.object(driver, "command", return_value=output):
                 with self.assertRaisesRegex(RuntimeError, "unlocked console"):
                     driver.require_unlocked_console(Path("."))
-        with mock.patch.object(driver, "command", return_value='"IOConsoleLocked" = No'):
-            driver.require_unlocked_console(Path("."))
+        for output in (registry({"IOConsoleLocked": False}),
+                       plistlib.dumps([{"IOConsoleLocked": False}]).decode()):
+            with mock.patch.object(driver, "command", return_value=output):
+                driver.require_unlocked_console(Path("."))
 
     def test_scroll_summary_preserves_each_runs_worst_sample(self):
         values = [sample("activity-15000") for _ in range(5)]

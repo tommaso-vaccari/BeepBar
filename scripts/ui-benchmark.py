@@ -336,8 +336,15 @@ def validate_trace(trace, scenario, cwd, output_prefix, scroll_all=False):
 
 
 def require_unlocked_console(repo):
-    state = command(["ioreg", "-n", "Root", "-d1"], repo)
-    if '"IOConsoleLocked" = No' not in state:
+    # Read only the root IORegistry key (as plist): a substring match could also hit a nested
+    # per-session entry while the active console is locked (fast user switching).
+    state = command(["ioreg", "-n", "Root", "-d1", "-a"], repo)
+    try:
+        roots = plistlib.loads(state.encode())
+    except Exception:
+        roots = None
+    root = roots[0] if isinstance(roots, list) and roots else roots
+    if not isinstance(root, dict) or root.get("IOConsoleLocked") is not False:
         raise RuntimeError("UI measurements require an unlocked console")
 
 

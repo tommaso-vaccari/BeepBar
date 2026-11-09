@@ -49,6 +49,33 @@ extension RecordingPlayerPolicy {
     }
 }
 
+/// The enhanced-audio switch in the player's title bar, next to the speed menu: the same choice
+/// as the Audio menu's main item, always in sight. Pure, like `AudioMenuPresentation`.
+struct AudioButtonPresentation: Equatable {
+    /// Lit: the lecture plays through the filter.
+    let isOn: Bool
+    /// What a click asks for; nil: shown disabled (no ffmpeg).
+    let action: PlayerAudioAction?
+    /// What hovering shows: the switch's name and state, how to get ffmpeg, or why it failed.
+    let toolTip: String
+}
+
+extension RecordingPlayerPolicy {
+    /// The title-bar switch for `state`, in the current language; nil hides it (no lecture, or
+    /// no account the lecture's state could belong to).
+    static func audioButton(_ state: AudioEnhancementState?) -> AudioButtonPresentation? {
+        guard let state, let menu = audioMenu(state) else { return nil }
+        let toolTip: String
+        switch state {
+        case .needsFFmpeg: toolTip = menu.main.title
+        case .off: toolTip = tr("Audio migliorato: spento. Fai clic per ridurre il rumore dell'aula e far risaltare la voce.", "Enhanced audio: off. Click to reduce classroom noise and bring the voice forward.")
+        case .on: toolTip = tr("Audio migliorato: acceso. Fai clic per tornare all'audio originale.", "Enhanced audio: on. Click to go back to the original audio.")
+        case .failed(let message): toolTip = message.text
+        }
+        return AudioButtonPresentation(isOn: menu.main.checked, action: menu.main.action, toolTip: toolTip)
+    }
+}
+
 /// Why a live session stopped serving, as it reports it before answering the player with an
 /// error (`LiveAudioPipeline`), so the controller knows what the player's failure means.
 enum LiveAudioFailure: Equatable, Sendable {

@@ -206,6 +206,9 @@ enum RecordingPlayerError: Error {
     private(set) var player: AVPlayer?
     /// The speed menu in the title bar; internal so tests can drive it.
     private(set) var speedPopUp: NSPopUpButton?
+    /// The enhanced-audio switch beside `speedPopUp` (`RecordingPlayerPolicy.audioButton`),
+    /// hidden while `audioState` is nil.
+    private(set) var audioButton: NSButton?
     /// Whether the current item reached `.readyToPlay`: decides which failure phase is reported.
     private(set) var isCurrentItemReady = false
     /// Whether the start of playback is settled: the item is ready and the `startAt` seek, if
@@ -291,6 +294,9 @@ enum RecordingPlayerError: Error {
     private weak var videoHost: NSView?
     /// The menu items' targets: an item holds its target weakly.
     private var menuActions: [PlayerMenuAction] = []
+    /// The audio switch's target, kept apart from `menuActions`, which a menu rebuild empties:
+    /// `NSButton.target` is weak, so the switch would go dead after a language switch.
+    private var audioActions: [PlayerMenuAction] = []
     /// The Audio menu's state for the lecture on screen (`showAudioEnhancement`); nil hides it.
     private(set) var audioState: AudioEnhancementState?
     var onAudioAction: ((String, PlayerAudioAction) -> Void)?
@@ -546,6 +552,7 @@ enum RecordingPlayerError: Error {
             self.window = nil
             playerView = nil
             speedPopUp = nil
+            audioButton = nil
         }
         window.close()
     }
@@ -607,6 +614,7 @@ enum RecordingPlayerError: Error {
                 self.window = nil
                 self.playerView = nil
                 self.speedPopUp = nil
+                self.audioButton = nil
             }
         }
     }
@@ -1022,7 +1030,7 @@ enum RecordingPlayerError: Error {
             guard let self, let window, self.window === window else { return }
             self.handleZoomInput(input)
         }
-        window.addTitlebarAccessoryViewController(makeSpeedAccessory())
+        window.addTitlebarAccessoryViewController(makeSpeedAccessory(for: window))
         if let frameAutosaveName {
             if !window.setFrameUsingName(frameAutosaveName) { window.center() }
             window.setFrameAutosaveName(frameAutosaveName)
@@ -1157,10 +1165,14 @@ enum RecordingPlayerError: Error {
         artwork = nil
     }
 
-    /// The speed menu at the trailing end of the title bar: always visible, it shows the current
-    /// speed and lists the keyboard shortcuts, whether or not `AVPlayerView`'s own controls offer
-    /// a speed menu in this macOS version.
-    private func makeSpeedAccessory() -> NSTitlebarAccessoryViewController {
+    /// The trailing end of the title bar: the enhanced-audio switch (shown only while the lecture
+    /// has an Audio state) and the speed menu, always visible, which shows the current speed and
+    /// lists the keyboard shortcuts, whether or not `AVPlayerView`'s own controls offer a speed
+    /// menu in this macOS version. In the title bar rather than over the video: AVKit's control bar
+    /// takes no extra buttons, and an overlay would collide with it (and with full screen's).
+    /// `window` is passed in because `self.window` is set only after the accessory is built: the
+    /// switch's action checks it is still this window's.
+    private func makeSpeedAccessory(for window: NSWindow) -> NSTitlebarAccessoryViewController {
         let popUp = NSPopUpButton(frame: NSRect(x: 0, y: 0, width: 72, height: 22), pullsDown: true)
         popUp.bezelStyle = .accessoryBarAction
         popUp.controlSize = .small
@@ -1169,13 +1181,57 @@ enum RecordingPlayerError: Error {
         popUp.refusesFirstResponder = true
         popUp.autoenablesItems = false
         speedPopUp = popUp
-        let container = NSView(frame: NSRect(x: 0, y: 0, width: 80, height: 22))
-        popUp.frame.origin = NSPoint(x: 0, y: 0)
+
+        let toggle = PlayerMenuAction { [weak self, weak window] in
+            guard let self, let window, self.window === window else { return }
+            self.audioButtonClicked()
+        }
+        audioActions = [toggle]
+        let button = NSButton(frame: NSRect(x: 0, y: 0, width: 30, height: 22))
+        button.setButtonType(.pushOnPushOff)
+        button.bezelStyle = .accessoryBarAction
+        button.controlSize = .small
+        button.image = NSImage(systemSymbolName: "waveform", accessibilityDescription: tr("Audio migliorato", "Enhanced audio"))
+        button.imagePosition = .imageOnly
+        button.refusesFirstResponder = true
+        button.target = toggle
+        button.action = #selector(PlayerMenuAction.invoke(_:))
+        button.setAccessibilityLabel(tr("Audio migliorato", "Enhanced audio"))
+        button.isHidden = true
+        audioButton = button
+
+        let container = NSView(frame: NSRect(x: 0, y: 0, width: Self.accessoryWidth(showingAudio: false), height: 22))
+        container.addSubview(button)
         container.addSubview(popUp)
         let accessory = NSTitlebarAccessoryViewController()
         accessory.layoutAttribute = .trailing
         accessory.view = container
+        layOutAccessory()
         return accessory
+    }
+
+    /// The accessory's width: the speed menu alone, or with the audio switch before it.
+    private static func accessoryWidth(showingAudio: Bool) -> CGFloat { showingAudio ? 114 : 80 }
+
+    /// Places the switch and the speed menu for the switch's visibility, so a hidden switch
+    /// leaves no gap before the speed menu.
+    private func layOutAccessory() {
+        guard let popUp = speedPopUp, let button = audioButton, let container = popUp.superview else { return }
+        let showing = !button.isHidden
+        let width = Self.accessoryWidth(showingAudio: showing)
+        if container.frame.width != width { container.setFrameSize(NSSize(width: width, height: container.frame.height)) }
+        button.frame.origin = NSPoint(x: 0, y: 0)
+        popUp.frame.origin = NSPoint(x: showing ? 34 : 0, y: 0)
+    }
+
+    /// The switch was clicked: what it does is decided from `audioState` now, not from how it
+    /// looked. AppKit already flipped its look; it is set back from the state at once, and again
+    /// when the controller reports the new state, so it never shows a choice that wasn't applied.
+    func audioButtonClicked() {
+        let action = RecordingPlayerPolicy.audioButton(audioState)?.action
+        updateAudioItems()
+        guard isOpen, let action else { return }
+        onAudioAction?(recordingID, action)
     }
 
     /// Rebuilds the speed menu's items in the current language (so a language switch shows at the
@@ -1252,8 +1308,20 @@ enum RecordingPlayerError: Error {
         static let detail = 9_004
     }
 
-    /// The Audio items' titles and states for `audioState`, updated in place, no rebuild.
+    /// The Audio items' titles and states for `audioState`, updated in place, no rebuild; the
+    /// title-bar switch too.
     private func updateAudioItems() {
+        if let button = audioButton {
+            let presentation = RecordingPlayerPolicy.audioButton(audioState)
+            let hidden = presentation == nil
+            button.state = presentation?.isOn == true ? .on : .off
+            button.isEnabled = presentation?.action != nil
+            button.toolTip = presentation?.toolTip
+            if button.isHidden != hidden {
+                button.isHidden = hidden
+                layOutAccessory()
+            }
+        }
         guard let menu = speedPopUp?.menu else { return }
         let presentation = RecordingPlayerPolicy.audioMenu(audioState)
         for tag in [AudioMenuTag.separator, AudioMenuTag.header] {
@@ -1373,6 +1441,7 @@ enum RecordingPlayerError: Error {
         playerView?.setValue(nil, forKey: "player")
         player = nil
         menuActions = []
+        audioActions = []
         // Nothing of the lecture survives the window: no fetch, no picture, no record, no
         // remote commands.
         cancelArtwork()

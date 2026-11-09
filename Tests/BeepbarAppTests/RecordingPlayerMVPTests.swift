@@ -405,6 +405,61 @@ struct RecordingPlayerMVPTests {
         controller.close()
     }
 
+    /// The enhanced-audio switch in the title bar, beside the speed menu: hidden until the lecture
+    /// has an Audio state; lit only while on; a click asks for the opposite of the current state
+    /// and, until the controller answers, shows the state it had rather than AppKit's flip;
+    /// disabled without ffmpeg (a click asks nothing). Guards against a switch that shows a
+    /// choice that wasn't applied, sends the same choice twice, or goes dead after the menu is
+    /// rebuilt.
+    @Test func theTitleBarSwitchTogglesEnhancedAudio() async throws {
+        let defaults = PlayerTestDefaults.throwaway()
+        defer { defaults.discard() }
+        let controller = makeController(defaults: defaults)
+        try await playReady(controller)
+        var asked: [PlayerAudioAction] = []
+        controller.onAudioAction = { _, action in asked.append(action) }
+        let button = try #require(controller.audioButton)
+        let popUp = try #require(controller.speedPopUp)
+        #expect(button.isHidden)
+        #expect(popUp.frame.minX == 0, "a hidden switch left a gap")
+        #expect(button.superview === popUp.superview)
+
+        controller.showAudioEnhancement(.off, recordingID: controller.recordingID)
+        #expect(!button.isHidden)
+        #expect(button.isEnabled)
+        #expect(button.state == .off)
+        #expect(popUp.frame.minX > button.frame.maxX, "the switch overlaps the speed menu")
+        button.performClick(nil)
+        try await Self.waitUntil { asked.count == 1 }
+        #expect(asked == [.useEnhanced(true)])
+        #expect(button.state == .off, "the switch showed a choice the controller hadn't applied")
+
+        controller.showAudioEnhancement(.on, recordingID: controller.recordingID)
+        #expect(button.state == .on)
+        #expect(button.toolTip?.isEmpty == false)
+        button.performClick(nil)
+        try await Self.waitUntil { asked.count == 2 }
+        #expect(asked.last == .useEnhanced(false))
+        #expect(button.state == .on)
+
+        controller.showAudioEnhancement(.needsFFmpeg, recordingID: controller.recordingID)
+        #expect(!button.isEnabled)
+        #expect(button.toolTip?.contains("brew install ffmpeg") == true)
+        controller.audioButtonClicked()
+        await Self.settle()
+        #expect(asked.count == 2, "a disabled switch asked for something")
+
+        // A new lecture rebuilds the menu: the switch still works, and starts hidden.
+        try await playReady(controller)
+        controller.showAudioEnhancement(.off, recordingID: controller.recordingID)
+        try #require(controller.audioButton).performClick(nil)
+        try await Self.waitUntil { asked.count == 3 }
+        controller.showAudioEnhancement(nil, recordingID: controller.recordingID)
+        #expect(try #require(controller.audioButton).isHidden)
+        #expect(popUp.frame.minX == 0)
+        controller.close()
+    }
+
     /// Every view the window gets has the compact controls: inline style (the bar docked at the
     /// bottom edge, not the large floating panel over the lecture) and no frame stepping, sharing,
     /// full-screen or timecode button, AVKit's pinch off; also the view built for a Play after the

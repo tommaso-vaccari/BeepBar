@@ -4565,4 +4565,21 @@ struct AudioMenuPresentationTests {
         #expect(failed.detail?.title == "motivo")
         #expect(failed.detail?.action == nil)
     }
+
+    /// The title-bar switch makes the same choice as the menu's main item in every state, lit only
+    /// when on, with a hover text for each (the failure's reason, how to get ffmpeg).
+    @Test func theTitleBarSwitchMatchesTheMenu() throws {
+        #expect(RecordingPlayerPolicy.audioButton(nil) == nil)
+        let states: [AudioEnhancementState] = [.needsFFmpeg, .off, .on, .failed(BilingualText("motivo", "reason"))]
+        for state in states {
+            let button = try #require(RecordingPlayerPolicy.audioButton(state))
+            let menu = try #require(RecordingPlayerPolicy.audioMenu(state))
+            #expect(button.action == menu.main.action, "\(state)")
+            #expect(button.isOn == (state == .on), "\(state)")
+            #expect(!button.toolTip.isEmpty)
+        }
+        #expect(RecordingPlayerPolicy.audioButton(.failed(BilingualText("motivo", "reason")))?.toolTip == "motivo")
+        #expect(RecordingPlayerPolicy.audioButton(.needsFFmpeg)?.toolTip.contains("brew install ffmpeg") == true)
+        #expect(RecordingPlayerPolicy.audioButton(.off)?.toolTip != RecordingPlayerPolicy.audioButton(.on)?.toolTip)
+    }
 }

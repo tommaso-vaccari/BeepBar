@@ -8,7 +8,7 @@ import Foundation
 // public HLS sample: the tap was attached and received 0 frames while the item played), so there
 // is no native way to filter what AVPlayer plays. Instead the app serves AVPlayer a playlist of
 // its own on 127.0.0.1; each 30-second segment is fetched from Webex as its byte range, the
-// video copied as is and only the audio filtered (`filterChain`), a fraction of a second of
+// video copied as is and only the audio filtered (`isolatedChain` or `filterChain`), a fraction of a second of
 // work per segment. With the switch off the player plays Webex's stream directly.
 //
 // Why segments and not a whole copy (the first version, replaced on 2026-11-09): a copy of a
@@ -22,6 +22,12 @@ import Foundation
 //
 // ffmpeg isn't bundled (licence, size and signing of a third-party binary): BeepBar only looks for
 // it where package managers install it, and says how to get it when it isn't there.
+//
+// Voice isolation (added 2026-11-09): where macOS has Apple's voice-isolation audio unit, each
+// segment's audio goes through it between two ffmpeg runs (`isolationDecodeArguments`,
+// `AppleVoiceIsolator`, `isolatedEncodeArguments`): it removes steady noise, hum and much of the
+// room's echo far better than ffmpeg's filters, with no model to download. Without it,
+// `segmentArguments` filters with `filterChain` alone, as before.
 //
 // Everything here is pure, so Swift Testing covers it without running ffmpeg.
 
@@ -37,7 +43,8 @@ public enum AudioEnhancement {
     }
 
     /// The audio filters, in order, for a lecture recorded in a university classroom (one teacher,
-    /// a room microphone, students talking in the background):
+    /// a room microphone, students talking in the background), used where Apple's voice
+    /// isolation isn't available (`isolatedChain` otherwise):
     /// - `highpass` / `lowpass`: cut rumble (ventilation, desk knocks, mains hum) below 90 Hz and
     ///   hiss above 10 kHz, outside the voice;
     /// - `afftdn`: spectral noise reduction that follows the room's steady noise (`tn`), moderate
@@ -65,6 +72,70 @@ public enum AudioEnhancement {
     /// voices as loud as the teacher can't be separated without a neural model; `arnndn` needs a
     /// model file ffmpeg doesn't ship.
     public static let filterChain = "highpass=f=90,lowpass=f=10000,afftdn=nr=15:nf=-50:tn=1,equalizer=f=250:t=q:w=1:g=-2,equalizer=f=3000:t=q:w=1.4:g=3,dynaudnorm=f=500:g=31:p=0.7:m=3,agate=threshold=0.035:ratio=4:range=0.12:attack=5:release=300:knee=4,afftdn=nr=6:nf=-50:tn=1,volume=8dB,alimiter=limit=0.8:level=disabled"
+
+    /// What follows Apple's voice isolation (`isolatedEncodeArguments`), in order:
+    /// - `highpass` / `lowpass` and the two `equalizer`s, as in `filterChain`: rumble and hiss
+    ///   out, −2 dB of lecture-hall boom around 250 Hz, +3 dB of consonants around 3 kHz;
+    /// - `speechnorm`: raises each stretch of speech towards full level, at most 6x, so a teacher
+    ///   who walks away from the microphone stays almost as loud as one beside it. Rejected in
+    ///   `filterChain`, where it raised the room noise too; after isolation there is none left;
+    /// - `agate`: as in `filterChain`, lowers what stays well below the teacher in a pause;
+    /// - `alimiter`: peaks held near −2 dBFS, so the AAC encoder never clips; `latency=1` takes
+    ///   back its 5 ms look-ahead, which would otherwise move the voice 240 samples late.
+    ///
+    /// Chosen on 2026-11-09 against `filterChain` on a synthetic classroom built from separate
+    /// tracks (a teacher with room echo who moves away for 12 s, three students talking further
+    /// back, pink noise and mains hum, a 6 s pause in the lecture), macOS 27, ffmpeg 9.0.2:
+    /// background left in the pause −115 dB below the teacher with steady noise only (−38 dB
+    /// with `filterChain`), the distant teacher 2.9 dB below the near one (4.7 dB), the teacher's
+    /// spectrum 10.4 dB from the dry voice in ⅓-octave bands (14.0 dB). Students' voices are
+    /// speech too: neither chain lowers them more than about 1 dB relative to the teacher.
+    public static let isolatedChain = "highpass=f=90,lowpass=f=10000,equalizer=f=250:t=q:w=1:g=-2,equalizer=f=3000:t=q:w=1.4:g=3,speechnorm=e=6:r=0.0005:l=1,agate=threshold=0.035:ratio=4:range=0.12:attack=5:release=300:knee=4,alimiter=limit=0.8:level=disabled:latency=1"
+
+    /// The sample rate the audio is isolated at: the lecture's own (Webex records 48 kHz), and
+    /// the one `AppleVoiceIsolator`'s delay is measured for.
+    public static let isolationSampleRate = 48000
+
+    /// The sample on the lecture's clock where audio starting at `seconds` begins.
+    public static func samplePosition(_ seconds: Double) -> Int { Int((seconds * Double(isolationSampleRate)).rounded()) }
+
+    /// ffmpeg's command that decodes the audio context to a mono WAV for voice isolation, its
+    /// first sample exactly at `firstSample` on the lecture's clock: `aresample`'s `first_pts`
+    /// pads or trims to it, because a WAV keeps no timestamps and `isolatedEncodeArguments`
+    /// puts the isolated audio back by that position alone. Measured on a synthetic Webex
+    /// lecture: decoded, passed through unchanged and encoded back, the segment's audio is
+    /// sample-identical to `segmentArguments` with no filter.
+    public static func isolationDecodeArguments(audio: String, firstSample: Int, output: String) -> [String] {
+        [
+            "-hide_banner", "-nostdin", "-nostats", "-loglevel", "error",
+            "-protocol_whitelist", protocolWhitelist,
+            "-copyts", "-i", audio,
+            "-map", "0:a:0",
+            "-af", "aresample=\(isolationSampleRate):async=1:first_pts=\(firstSample),aformat=sample_fmts=flt:channel_layouts=mono",
+            "-c:a", "pcm_f32le", "-f", "wav", "-y", output,
+        ]
+    }
+
+    /// ffmpeg's command for one segment from its isolated audio: like `segmentArguments`, the
+    /// video copied and the audio trimmed to `start..<end` on the lecture's clock, but the audio
+    /// read from `isolated` (the WAV `isolationDecodeArguments` made, after isolation), placed
+    /// back at `firstSample` (`-itsoffset`), and filtered with `isolatedChain`.
+    public static func isolatedEncodeArguments(video: String, isolated: String, firstSample: Int, start: Double, end: Double, output: String) -> [String] {
+        [
+            "-hide_banner", "-nostdin", "-nostats", "-loglevel", "error",
+            "-protocol_whitelist", protocolWhitelist,
+            "-copyts",
+            "-i", video,
+            "-itsoffset", seconds(Double(firstSample) / Double(isolationSampleRate)),
+            "-i", isolated,
+            "-map", "0:v:0?", "-map", "1:a:0",
+            "-c:v", "copy",
+            "-af", isolatedChain + ",atrim=start=\(seconds(start)):end=\(seconds(end))",
+            "-c:a", "aac", "-b:a", "192k", "-ar", "48000",
+            "-muxdelay", "0", "-muxpreload", "0",
+            "-f", "mpegts", "-y", output,
+        ]
+    }
 
     /// A Webex lecture as its playlist describes it: one fragmented MP4 (`file`), its init
     /// section and its segments, each a byte range of that file with its length in seconds.

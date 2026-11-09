@@ -6,7 +6,8 @@ import os
 
 // Enhanced audio while the lecture plays (`AudioEnhancement`): a local HTTP server that AVPlayer
 // plays instead of Webex, and the pipeline behind it that fetches each 30-second segment's bytes,
-// filters its audio with ffmpeg and serves it as MPEG-TS.
+// filters its audio (Apple's voice isolation between two ffmpeg runs, or ffmpeg alone where the
+// Mac lacks it) and serves it as MPEG-TS.
 //
 // Bounds (principles 3 and 6): one session at a time, alive only while enhanced audio is on for
 // the lecture on screen; at most `LoopbackHTTPServer.maximumConnections` connections; segments
@@ -24,11 +25,12 @@ import os
 
     init(stream: URL, ffmpeg: URL, onFailure: @escaping @MainActor (LiveAudioFailure) -> Void,
          fetcher: LiveAudioFetching = URLSessionLiveAudioFetcher(), runner: LiveAudioProcessRunning = FFmpegRunner(),
+         isolator: LiveAudioVoiceIsolating? = AppleVoiceIsolator.preferred(),
          parent: URL = LiveAudioSession.defaultParent) throws {
         let token = Self.makeToken()
         let folder = parent.appendingPathComponent(token, isDirectory: true)
         let pipeline = LiveAudioPipeline(stream: stream, ffmpeg: ffmpeg, folder: folder, parent: parent, fetcher: fetcher, runner: runner,
-                                         report: { failure in await MainActor.run { onFailure(failure) } })
+                                         isolator: isolator, report: { failure in await MainActor.run { onFailure(failure) } })
         let prefix = "/\(token)/"
         server = try LoopbackHTTPServer { path in
             guard path.hasPrefix(prefix) else { return .notFound }
@@ -267,7 +269,9 @@ enum LiveAudioProcesses {
 ///
 /// For segment `i` it fetches that segment's bytes and the next one's (and keeps the previous
 /// one when it was just played), measures where each one's audio starts (`probeArguments`),
-/// then runs ffmpeg once (`segmentArguments`). A request also starts the following segment, so
+/// then makes the segment: with `isolator`, ffmpeg decodes the audio context to a WAV
+/// (`isolationDecodeArguments`), the isolator cleans it, and ffmpeg encodes the segment from it
+/// (`isolatedEncodeArguments`); without, ffmpeg runs once (`segmentArguments`). A request also starts the following segment, so
 /// it is usually ready before AVPlayer asks. A request far from the last one is a seek: work
 /// for the position left behind is cancelled (`keptSegments`).
 ///
@@ -283,6 +287,7 @@ actor LiveAudioPipeline {
     private let parent: URL
     private let fetcher: LiveAudioFetching
     private let runner: LiveAudioProcessRunning
+    private let isolator: LiveAudioVoiceIsolating?
     private let report: @Sendable (LiveAudioFailure) async -> Void
 
     private var lectureTask: Task<(AudioEnhancement.ByteRangeLecture, URL), Error>?
@@ -293,13 +298,14 @@ actor LiveAudioPipeline {
     private var reported = false
 
     init(stream: URL, ffmpeg: URL, folder: URL, parent: URL, fetcher: LiveAudioFetching, runner: LiveAudioProcessRunning,
-         report: @escaping @Sendable (LiveAudioFailure) async -> Void) {
+         isolator: LiveAudioVoiceIsolating? = nil, report: @escaping @Sendable (LiveAudioFailure) async -> Void) {
         self.stream = stream
         self.ffmpeg = ffmpeg
         self.folder = folder
         self.parent = parent
         self.fetcher = fetcher
         self.runner = runner
+        self.isolator = isolator
         self.report = report
     }
 
@@ -399,7 +405,26 @@ actor LiveAudioPipeline {
         let output = folder.appendingPathComponent("out\(index).ts")
         let video = AudioEnhancement.concatInput([initFile.path, files[index]!.path])
         let audio = AudioEnhancement.concatInput([initFile.path] + context.map { files[$0]!.path })
-        try await runner.run(ffmpeg, AudioEnhancement.segmentArguments(video: video, audio: audio, start: start, end: end, output: output.path))
+        if let isolator {
+            // The context's audio starts where its first fragment's does; the WAVs keep no
+            // timestamps, so that sample is what puts the isolated audio back on the clock.
+            let firstSample = AudioEnhancement.samplePosition(try await audioStart(context.lowerBound, in: lecture, initFile: initFile))
+            let decoded = folder.appendingPathComponent("decoded\(index).wav")
+            let isolated = folder.appendingPathComponent("isolated\(index).wav")
+            defer {
+                try? FileManager.default.removeItem(at: decoded)
+                try? FileManager.default.removeItem(at: isolated)
+            }
+            try await runner.run(ffmpeg, AudioEnhancement.isolationDecodeArguments(audio: audio, firstSample: firstSample, output: decoded.path))
+            try Task.checkCancellation()
+            try await isolator.isolate(decoded, to: isolated)
+            try? FileManager.default.removeItem(at: decoded)
+            try Task.checkCancellation()
+            try await runner.run(ffmpeg, AudioEnhancement.isolatedEncodeArguments(video: video, isolated: isolated.path, firstSample: firstSample,
+                                                                                  start: start, end: end, output: output.path))
+        } else {
+            try await runner.run(ffmpeg, AudioEnhancement.segmentArguments(video: video, audio: audio, start: start, end: end, output: output.path))
+        }
         try Task.checkCancellation()
         let data = try Data(contentsOf: output)
         try? FileManager.default.removeItem(at: output)

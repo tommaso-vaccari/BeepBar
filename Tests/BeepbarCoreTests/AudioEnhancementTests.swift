@@ -175,6 +175,59 @@ struct AudioEnhancementTests {
         #expect(AudioEnhancement.concatInput(["/i", "/c"]) == "concat:/i|/c")
     }
 
+    /// After voice isolation the chain has no noise reduction left to do (isolation did it) and
+    /// levels speech with `speechnorm`, which `filterChain` couldn't use because it raised the
+    /// room noise with the voice: equalizers first, then the leveller, the gate on its output,
+    /// the limiter last so nothing after it can clip. Guards against a chain that filters the
+    /// noise twice (a hollow voice) or levels after the gate (pauses raised again).
+    @Test func theIsolatedChainLevelsSpeechAfterTheEqualizers() {
+        let filters = AudioEnhancement.isolatedChain.split(separator: ",").map { $0.split(separator: "=").first.map(String.init) ?? "" }
+        #expect(filters == ["highpass", "lowpass", "equalizer", "equalizer", "speechnorm", "agate", "alimiter"])
+        #expect(!AudioEnhancement.isolatedChain.contains("afftdn"))
+        #expect(AudioEnhancement.isolatedChain.contains("speechnorm=e=6:r=0.0005:l=1"))
+        #expect(AudioEnhancement.isolatedChain.hasSuffix("alimiter=limit=0.8:level=disabled:latency=1"), "the limiter's look-ahead must be taken back")
+        #expect(AudioEnhancement.samplePosition(8.021333) == 385024)
+        #expect(AudioEnhancement.samplePosition(0) == 0)
+    }
+
+    /// The isolated path's two ffmpeg runs. Decoding: the audio context alone, on the lecture's
+    /// clock (`-copyts` before the input), padded or trimmed to start exactly at `firstSample`
+    /// (a WAV keeps no timestamps), mono float at the isolation rate, local files only.
+    /// Encoding: the video copied from this segment, the isolated WAV put back at that same
+    /// sample (`-itsoffset` before its input, where ffmpeg applies it), filtered with
+    /// `isolatedChain` and trimmed to the segment's span. Guards against audio shifted from the
+    /// picture or across a join, and against ffmpeg reaching the network.
+    @Test func anIsolatedSegmentIsPutBackOnTheLecturesClock() {
+        let decode = AudioEnhancement.isolationDecodeArguments(audio: "concat:/i|/p|/c|/n", firstSample: 385024, output: "/d.wav")
+        func value(_ args: [String], after flag: String) -> String? { args.firstIndex(of: flag).map { args[$0 + 1] } }
+        #expect(value(decode, after: "-i") == "concat:/i|/p|/c|/n")
+        #expect(decode.firstIndex(of: "-copyts")! < decode.firstIndex(of: "-i")!)
+        #expect(value(decode, after: "-map") == "0:a:0")
+        #expect(value(decode, after: "-af") == "aresample=48000:async=1:first_pts=385024,aformat=sample_fmts=flt:channel_layouts=mono")
+        #expect(value(decode, after: "-c:a") == "pcm_f32le")
+        #expect(value(decode, after: "-f") == "wav")
+        #expect(value(decode, after: "-protocol_whitelist") == "file,concat")
+        #expect(decode.contains("-nostdin"))
+        #expect(decode.last == "/d.wav")
+
+        let encode = AudioEnhancement.isolatedEncodeArguments(video: "concat:/i|/c", isolated: "/x.wav", firstSample: 385024, start: 30.010667, end: 60.005333, output: "/o.ts")
+        let inputs = encode.indices.filter { encode[$0] == "-i" }
+        #expect(inputs.map { encode[$0 + 1] } == ["concat:/i|/c", "/x.wav"])
+        #expect(encode.firstIndex(of: "-copyts")! < inputs[0])
+        let offset = encode.firstIndex(of: "-itsoffset")!
+        #expect(encode[offset + 1] == "8.021333")
+        #expect(inputs[0] < offset && offset < inputs[1], "-itsoffset applies to the input right after it")
+        #expect(encode.indices.filter { encode[$0] == "-map" }.map { encode[$0 + 1] } == ["0:v:0?", "1:a:0"])
+        #expect(value(encode, after: "-c:v") == "copy")
+        #expect(value(encode, after: "-af") == AudioEnhancement.isolatedChain + ",atrim=start=30.010667:end=60.005333")
+        #expect(value(encode, after: "-c:a") == "aac")
+        #expect(value(encode, after: "-ar") == "48000")
+        #expect(value(encode, after: "-muxdelay") == "0")
+        #expect(value(encode, after: "-f") == "mpegts")
+        #expect(value(encode, after: "-protocol_whitelist") == "file,concat")
+        #expect(encode.last == "/o.ts")
+    }
+
     /// The next segment always feeds the filter (the normalizer looks ahead: without it a join
     /// jumped by up to 3.5 dB); the previous one only when it is already here, so the first
     /// segment after a seek starts sooner. The last segment ends at its start plus its length,

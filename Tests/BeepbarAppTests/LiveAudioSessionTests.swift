@@ -30,6 +30,19 @@ private final class DiskFetcher: LiveAudioFetching, @unchecked Sendable {
     func close() {}
 }
 
+/// An isolation that always fails, recording the format of the audio it was given.
+private final class FailingIsolator: LiveAudioVoiceIsolating, @unchecked Sendable {
+    private let lock = NSLock()
+    private var seen: [AVAudioFormat] = []
+    var formats: [AVAudioFormat] { lock.withLock { seen } }
+    struct Failure: Error {}
+    func isolate(_ input: URL, to output: URL) async throws {
+        let format = try AVAudioFile(forReading: input).fileFormat
+        lock.withLock { seen.append(format) }
+        throw Failure()
+    }
+}
+
 /// The live filter end to end, with the student's real ffmpeg on a 12-second synthetic lecture
 /// laid out as Webex's (one fragmented MP4 sliced by byte ranges): skipped where no ffmpeg is
 /// installed. Proves what the unit tests can't: that ffmpeg accepts the arguments, the local
@@ -41,15 +54,19 @@ struct LiveAudioSessionTests {
     private let folder = FileManager.default.temporaryDirectory.appendingPathComponent("live-audio-\(UUID().uuidString)", isDirectory: true)
     private static let address = URL(string: "https://media.example.test/rec/out.m3u8")!
 
-    /// Makes the synthetic lecture: 3 segments of 4 s, a tone and a test picture.
-    private func makeLecture() throws -> DiskFetcher {
+    /// Makes the synthetic lecture: 3 segments of 4 s, a test picture, and a tone or, with
+    /// `speaking`, a synthetic teacher (`AudioTestSignals.speech`).
+    private func makeLecture(speaking: Bool = false) throws -> DiskFetcher {
         try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+        let ffmpeg = try #require(AudioEnhancement.locateFFmpeg())
+        let audio: [String] = speaking
+            ? ["-i", try AudioTestSignals.speech(seconds: 12, in: folder, ffmpeg: ffmpeg).path, "-t", "12"]
+            : ["-f", "lavfi", "-i", "sine=frequency=440:sample_rate=48000", "-t", "12"]
         let process = Process()
-        process.executableURL = AudioEnhancement.locateFFmpeg()
+        process.executableURL = ffmpeg
         process.currentDirectoryURL = folder
         process.arguments = ["-nostdin", "-loglevel", "error", "-y",
-                             "-f", "lavfi", "-i", "testsrc=size=160x90:rate=25",
-                             "-f", "lavfi", "-i", "sine=frequency=440:sample_rate=48000", "-t", "12",
+                             "-f", "lavfi", "-i", "testsrc=size=160x90:rate=25"] + audio + [
                              "-c:v", "libx264", "-preset", "ultrafast", "-g", "25", "-c:a", "aac", "-ar", "48000",
                              "-f", "hls", "-hls_time", "4", "-hls_segment_type", "fmp4", "-hls_flags", "single_file",
                              "-hls_playlist_type", "vod", "out.m3u8"]
@@ -154,6 +171,70 @@ struct LiveAudioSessionTests {
         defer { session.stop() }
         #expect(try await get(session.playlistURL).1 == 502)
         #expect(failures == [.unavailable])
+    }
+
+    /// The whole path with Apple's isolation on a speaking teacher: the voice in the second
+    /// segment, served after isolation, sits on the same samples of the lecture's clock as in
+    /// Webex's own file (within 2 ms), and isn't lost. Guards against the isolation's hidden
+    /// delay left in, and against the decoded WAV or the encoded segment misplaced on the
+    /// clock (`first_pts`, `-itsoffset`), any of which would put the voice behind the picture
+    /// and repeat or cut words at the joins, and the limiter's 5 ms look-ahead (240 samples).
+    @Test(.enabled(if: AppleVoiceIsolator.preferred() != nil && AudioTestSignals.canSpeak, "needs voice isolation and say"))
+    func anIsolatedSegmentKeepsTheLecturesClock() async throws {
+        defer { try? FileManager.default.removeItem(at: folder) }
+        let fetcher = try makeLecture(speaking: true)
+        let ffmpeg = try #require(AudioEnhancement.locateFFmpeg())
+        var failures: [LiveAudioFailure] = []
+        let session = try LiveAudioSession(stream: Self.address, ffmpeg: ffmpeg, onFailure: { failures.append($0) }, fetcher: fetcher,
+                                           isolator: try #require(AppleVoiceIsolator.preferred()), parent: folder.appendingPathComponent("sessions"))
+        defer { session.stop() }
+        _ = try await get(session.playlistURL)
+        let (segment, status) = try await get(session.playlistURL.deletingLastPathComponent().appendingPathComponent(AudioEnhancement.segmentName(1)))
+        #expect(status == 200)
+        let served = folder.appendingPathComponent("served.ts")
+        try segment.write(to: served)
+        // Both decoded onto the lecture's clock: silence up to the first sample's timestamp.
+        func onTheClock(_ input: URL, _ name: String) throws -> [Float] {
+            let output = folder.appendingPathComponent(name)
+            try AudioTestSignals.run(ffmpeg, ["-nostdin", "-loglevel", "error", "-y", "-copyts", "-i", input.path, "-map", "0:a:0",
+                                              "-af", "aresample=48000:async=1:first_pts=0", "-ac", "1", "-c:a", "pcm_f32le", output.path], in: folder)
+            return try AudioTestSignals.samples(output)
+        }
+        let lecture = try onTheClock(fetcher.playlist, "lecture.wav")
+        let isolated = try onTheClock(served, "served.wav")
+        // The second segment's middle, away from its edges: 4.5–7.5 s.
+        let span = 216000..<360000
+        try #require(lecture.count >= span.upperBound && isolated.count >= span.upperBound)
+        let delay = AudioTestSignals.delay(of: Array(isolated[span]), against: Array(lecture[span]), limit: 9600)
+        #expect(abs(delay) <= 96, "the voice moved by \(delay) samples")
+        #expect(AudioTestSignals.level(isolated[span]) > AudioTestSignals.level(lecture[span]) - 12, "the voice was lost")
+        #expect(failures.isEmpty)
+    }
+
+    /// Without isolation (a Mac without the unit) ffmpeg filters alone, as before; an isolation
+    /// that fails is reported as `.unavailable`, so the lecture goes back to its own stream,
+    /// and gets the decoded audio as the isolator expects it (mono, 48 kHz). Guards against a
+    /// Mac without the unit losing enhanced audio, and a failing isolator playing silence.
+    @Test func withoutOrWithAFailingIsolation() async throws {
+        defer { try? FileManager.default.removeItem(at: folder) }
+        let fetcher = try makeLecture()
+        let ffmpeg = try #require(AudioEnhancement.locateFFmpeg())
+        let plain = try LiveAudioSession(stream: Self.address, ffmpeg: ffmpeg, onFailure: { _ in }, fetcher: fetcher,
+                                         isolator: nil, parent: folder.appendingPathComponent("plain"))
+        let (segment, status) = try await get(plain.playlistURL.deletingLastPathComponent().appendingPathComponent(AudioEnhancement.segmentName(0)))
+        plain.stop()
+        #expect(status == 200)
+        #expect(segment.first == 0x47)
+
+        let failing = FailingIsolator()
+        var failures: [LiveAudioFailure] = []
+        let session = try LiveAudioSession(stream: Self.address, ffmpeg: ffmpeg, onFailure: { failures.append($0) }, fetcher: fetcher,
+                                           isolator: failing, parent: folder.appendingPathComponent("failing"))
+        defer { session.stop() }
+        #expect(try await get(session.playlistURL.deletingLastPathComponent().appendingPathComponent(AudioEnhancement.segmentName(0))).1 == 502)
+        #expect(failures == [.unavailable])
+        let format = try #require(failing.formats.first)
+        #expect(format.channelCount == 1 && format.sampleRate == 48000)
     }
 
     /// After `stop` nothing answers: the port is closed.

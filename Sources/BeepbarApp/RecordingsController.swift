@@ -2642,32 +2642,35 @@ struct RecordingsListing: Equatable {
 
     private func playerFailed(id: String, failure: RecordingPlaybackFailure) {
         guard isEnabled, let recording = nowPlaying[id] else { return }
-        // The lecture was playing through the filter. Only a failure of the filter's own (not
-        // an expired Webex address, nor Webex or the connection failing for now) turns enhanced
-        // audio off for the lecture, and the menu then says it didn't work.
-        // - Mid-lecture, the filter's own failure continues from Webex's stream at the same
-        //   place, without a recovery (which would rebuild the same failing filter) and without
-        //   using up the lecture's one fresh stream; Webex's goes to the usual recovery, as it
-        //   would without the filter (a fresh stream, filtered anew).
-        // - Before the lecture was ever ready, either way it opens on Webex's stream from where
-        //   it was going to start: the usual path there is the browser, which a passing network
-        //   error on the filter's side doesn't deserve. If that stream fails too, it is no longer
-        //   filtered and takes the usual path then, so this never loops.
+        // The lecture was playing through the filter; what its session reports decides
+        // (`AudioEnhancer.reportedFailure`, cleared when a request succeeded since):
+        // - an expired address (refused): the usual path, as without the filter (a fresh
+        //   stream mid-lecture, filtered anew; before ready, replaying the dead address would
+        //   only fail again, found in review);
+        // - Webex or the connection failing for now: mid-lecture, the usual recovery; before
+        //   the lecture was ever ready, Webex's own stream from where it was going to start,
+        //   since the usual path there is the browser, which a passing error doesn't deserve;
+        // - the filter's own failure: Webex's stream at the same place (from the start before
+        //   ready), and enhanced audio is marked as not working for the lecture. No recovery,
+        //   which would rebuild the same failing filter and use up the lecture's fresh stream;
+        // - nothing reported (AVPlayer gave up while the pipeline still waited, say on a slow
+        //   fetch): Webex's stream the same way, without the mark, since the filter may not be
+        //   at fault (found in review), nor a recovery, since the stream may be.
+        // A stream started here is no longer filtered: if it fails too, it takes the usual
+        // path, so this never loops.
         if enhancedAudioInUse, let lecture = audioLecture, lecture.recordingID == id, let enhancer = audioEnhancer {
             let reported = enhancer.reportedFailure
-            let filtersFault = reported != .streamRefused && reported != .network
             enhancer.stop()
             enhancedAudioInUse = false
+            let position: Double?
             switch failure {
-            case .duringPlayback where !filtersFault:
-                break
-            case .duringPlayback(_, let position):
-                enhancer.markFailed(lecture.key)
-                startPlayer(lecture.stream, for: recording, startAt: position, enhanced: false)
-                return
-            case .beforeReady:
-                if filtersFault { enhancer.markFailed(lecture.key) }
-                startPlayer(lecture.stream, for: recording, startAt: enhancedStartAt, enhanced: false)
+            case .duringPlayback(_, let at): position = at
+            case .beforeReady: position = nil
+            }
+            let usualPath = reported == .streamRefused || (reported == .network && position != nil)
+            if !usualPath {
+                if reported == .unavailable { enhancer.markFailed(lecture.key) }
+                startPlayer(lecture.stream, for: recording, startAt: position ?? enhancedStartAt, enhanced: false)
                 return
             }
         }

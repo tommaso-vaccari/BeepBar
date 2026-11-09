@@ -296,10 +296,10 @@ import BeepbarCore
     static let address = URL(string: "http://127.0.0.1:1/token/index.m3u8")!
     let stream: URL
     let ffmpeg: URL
-    let onFailure: @MainActor (LiveAudioFailure) -> Void
+    let onFailure: @MainActor (LiveAudioFailure?) -> Void
     private(set) var stops = 0
     var playlistURL: URL { Self.address }
-    init(stream: URL, ffmpeg: URL, onFailure: @escaping @MainActor (LiveAudioFailure) -> Void) {
+    init(stream: URL, ffmpeg: URL, onFailure: @escaping @MainActor (LiveAudioFailure?) -> Void) {
         self.stream = stream
         self.ffmpeg = ffmpeg
         self.onFailure = onFailure
@@ -2424,13 +2424,14 @@ struct RecordingsControllerTests {
         controller.turnOff()
     }
 
-    /// Webex or the connection failing (or the address expired) before the lecture was ever
-    /// ready: it opens on Webex's stream from the same start, enhanced audio isn't marked as
-    /// failed, no browser opens, and the next Play filters again. Guards against a passing
-    /// network error turning the filter off for the lecture or sending the student to the
-    /// browser (found in review).
-    @Test(arguments: [LiveAudioFailure.network, .streamRefused])
-    func aPassingFailureBeforeReadyKeepsEnhancedAudio(report: LiveAudioFailure) async throws {
+    /// Webex or the connection failing before the lecture was ever ready, or AVPlayer giving
+    /// up with nothing reported (or after a success cleared an earlier report): it opens on
+    /// Webex's stream from the same start, enhanced audio isn't marked as failed, no browser
+    /// opens, and the next Play filters again. Guards against a passing network error, or a
+    /// slow fetch the filter isn't to blame for, turning the filter off for the lecture or
+    /// sending the student to the browser (found in review).
+    @Test(arguments: [[LiveAudioFailure?.some(.network)], [], [.unavailable, nil]])
+    func aPassingFailureBeforeReadyKeepsEnhancedAudio(reports: [LiveAudioFailure?]) async throws {
         defer { cleanUp() }
         world.ffmpeg = fakeFFmpegPath
         defaults.set(true, forKey: RecordingsController.prefersEnhancedAudioKey)
@@ -2440,7 +2441,7 @@ struct RecordingsControllerTests {
         controller.play(lecture)
         await settle("lecture playing") { world.player.plays.last?.recordingID == lecture.id }
         let start = world.player.plays.last?.startAt
-        world.liveSessions.last?.onFailure(report)
+        for report in reports { world.liveSessions.last?.onFailure(report) }
         world.player.failBeforeReady()
         #expect(world.player.plays.last?.url == stream(lecture.id).url)
         #expect(world.player.plays.last?.startAt == start)
@@ -2448,6 +2449,61 @@ struct RecordingsControllerTests {
         await drainTasks()
         #expect(world.opened.isEmpty, "the browser opened")
         let sessions = world.liveSessions.count
+        _ = await playing(controller, "other")
+        _ = await playing(controller, lecture.id)
+        #expect(world.liveSessions.count == sessions + 2, "the next Play didn't filter")
+        controller.turnOff()
+    }
+
+    /// Webex refusing the filter's address before the lecture was ever ready (it expired) takes
+    /// the usual path for a lecture that never opened, the browser, rather than Webex's stream,
+    /// which is the same dead address; enhanced audio isn't marked as failed. Guards against a
+    /// replay of the refused address failing again in front of the student (found in review).
+    @Test func aRefusalBeforeReadyTakesTheUsualPath() async throws {
+        defer { cleanUp() }
+        world.ffmpeg = fakeFFmpegPath
+        defaults.set(true, forKey: RecordingsController.prefersEnhancedAudioKey)
+        let controller = await readyController()
+        let lecture = recording("audio")
+        browser.streamResults[lecture.id] = [.success(stream(lecture.id))]
+        browser.playbackResults[lecture.id] = .success(playerLink(lecture.id))
+        controller.play(lecture)
+        await settle("lecture playing") { world.player.plays.last?.recordingID == lecture.id }
+        let plays = world.player.plays.count
+        let session = try #require(world.liveSessions.last)
+        session.onFailure(.streamRefused)
+        world.player.failBeforeReady()
+        #expect(session.isStopped)
+        await settle("the browser opened") { world.opened == [playerLink(lecture.id)] }
+        #expect(world.player.plays.count == plays, "the refused address was played again")
+        #expect({ if case .failed = world.player.audioState { false } else { true } }(), "marked as failed")
+        controller.turnOff()
+    }
+
+    /// AVPlayer giving up mid-lecture with nothing reported, or after a success cleared an
+    /// earlier report: the lecture goes on from Webex's stream at the same place, with no
+    /// recovery and no failure shown, and the next Play filters again. Guards against a stale
+    /// network error sending a later, unrelated failure into a recovery, and a failure the
+    /// filter isn't known to cause turning it off for the lecture (found in review).
+    @Test(arguments: [[LiveAudioFailure?](), [.network, nil], [.unavailable, nil], [.streamRefused, nil]])
+    func anUnexplainedFailureMidLectureKeepsEnhancedAudio(reports: [LiveAudioFailure?]) async throws {
+        defer { cleanUp() }
+        world.ffmpeg = fakeFFmpegPath
+        let controller = await readyController()
+        let lecture = await playing(controller, "audio")
+        world.player.chooseAudio(.useEnhanced(true))
+        let session = try #require(world.liveSessions.last)
+        for report in reports { session.onFailure(report) }
+        world.player.failDuringPlayback(at: 900)
+        #expect(session.isStopped)
+        #expect(world.player.plays.last?.url == stream(lecture.id).url)
+        #expect(world.player.plays.last?.startAt == 900)
+        #expect({ if case .failed = world.player.audioState { false } else { true } }(), "marked as failed")
+        await drainTasks()
+        #expect(browser.streamCalls == ["stream \(lecture.id)"], "a recovery was used")
+        #expect(world.opened.isEmpty)
+        let sessions = world.liveSessions.count
+        browser.streamResults[lecture.id] = [.success(stream(lecture.id))]
         _ = await playing(controller, "other")
         _ = await playing(controller, lecture.id)
         #expect(world.liveSessions.count == sessions + 2, "the next Play didn't filter")

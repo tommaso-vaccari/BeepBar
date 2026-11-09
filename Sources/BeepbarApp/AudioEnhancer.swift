@@ -116,14 +116,15 @@ enum LiveAudioFailure: Equatable, Sendable {
     /// Called on the main actor whenever a lecture's state changes, with its key (`copyKey`).
     var onChange: ((String) -> Void)?
 
-    typealias MakeSession = @MainActor (_ stream: URL, _ ffmpeg: URL, _ onFailure: @escaping @MainActor (LiveAudioFailure) -> Void) throws -> LiveAudioStreaming
+    typealias MakeSession = @MainActor (_ stream: URL, _ ffmpeg: URL, _ onFailure: @escaping @MainActor (LiveAudioFailure?) -> Void) throws -> LiveAudioStreaming
 
     private let locateFFmpeg: () -> URL?
     private let makeSession: MakeSession
     private var session: (key: String, id: Int, streaming: LiveAudioStreaming)?
     private var sessionCount = 0
-    /// What the running session reported last before failing the player, if anything. A
-    /// refusal stays once heard: an expired address never works again, whatever fails after.
+    /// The running session's current failure: the last one reported, nil when none was or a
+    /// request has succeeded since (the failure passed). A refusal stays over later failures,
+    /// whatever fails after an expired address; only a success clears it.
     private(set) var reportedFailure: LiveAudioFailure?
     /// Lectures whose filter failed, until the student turns it on again.
     private var failures: [String: BilingualText] = [:]
@@ -180,7 +181,7 @@ enum LiveAudioFailure: Equatable, Sendable {
         let id = sessionCount
         do {
             let streaming = try makeSession(stream, ffmpeg) { [weak self] failure in
-                guard let self, self.session?.id == id, self.reportedFailure != .streamRefused else { return }
+                guard let self, self.session?.id == id, failure == nil || self.reportedFailure != .streamRefused else { return }
                 self.reportedFailure = failure
             }
             session = (key, id, streaming)

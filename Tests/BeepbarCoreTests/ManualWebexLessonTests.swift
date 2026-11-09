@@ -133,6 +133,22 @@ struct ManualWebexLessonTests {
         #expect(WebexPlayerLink.isLoader(loader))
     }
 
+    /// Each form `canonical` builds (loader, uuid playback page, other playback path) is one the
+    /// playback policy accepts, so a stored lesson still plays. Guards against a rebuilt link
+    /// the player refuses, which would open nothing (found in review).
+    @Test(arguments: [
+        ("https://politecnicomilano.webex.com/ldr.php?x=1&RCID=abc123", "https://politecnicomilano.webex.com/ldr.php?RCID=abc123"),
+        ("https://politecnicomilano.webex.com/recordingservice/sites/politecnicomilano/recording/playback/0123456789abcdef0123456789abcdef/?t=1",
+         "https://politecnicomilano.webex.com/recordingservice/sites/politecnicomilano/recording/playback/0123456789abcdef0123456789abcdef"),
+        ("https://politecnicomilano.webex.com/recordingservice/recording/playback/abc_123/?t=1",
+         "https://politecnicomilano.webex.com/recordingservice/recording/playback/abc_123"),
+    ])
+    func everyCanonicalLinkStillPlays(link: String, expected: String) throws {
+        let canonical = try #require(ManualWebexLesson.canonical(URL(string: link)!))
+        #expect(canonical.absoluteString == expected)
+        #expect(RecmanURLPolicy.playbackURL(canonical) != nil, "\(canonical) is refused")
+    }
+
     /// One recording pasted again with other parameters or a trailing slash is a duplicate, also
     /// against a lesson an earlier build stored with its query as pasted, which stays as it was on
     /// disk. Guards against the same lesson appearing twice in the Watchlist.

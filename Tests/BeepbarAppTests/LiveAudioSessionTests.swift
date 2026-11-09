@@ -112,7 +112,7 @@ struct LiveAudioSessionTests {
         let fetcher = try makeLecture()
         var failures: [LiveAudioFailure] = []
         let session = try LiveAudioSession(stream: Self.address, ffmpeg: try #require(AudioEnhancement.locateFFmpeg()),
-                                           onFailure: { failures.append($0) }, fetcher: fetcher, parent: folder.appendingPathComponent("sessions"))
+                                           onFailure: { if let failure = $0 { failures.append(failure) } }, fetcher: fetcher, parent: folder.appendingPathComponent("sessions"))
         defer { session.stop() }
         #expect(session.playlistURL.host == "127.0.0.1")
 
@@ -175,7 +175,7 @@ struct LiveAudioSessionTests {
         let fetcher = DiskFetcher(playlist: lecture.playlist, media: lecture.media, refuse: true)
         var failures: [LiveAudioFailure] = []
         let session = try LiveAudioSession(stream: Self.address, ffmpeg: try #require(AudioEnhancement.locateFFmpeg()),
-                                           onFailure: { failures.append($0) }, fetcher: fetcher, parent: folder.appendingPathComponent("sessions"))
+                                           onFailure: { if let failure = $0 { failures.append(failure) } }, fetcher: fetcher, parent: folder.appendingPathComponent("sessions"))
         defer { session.stop() }
         #expect(try await get(session.playlistURL).1 == 502)
         #expect(failures == [.streamRefused])
@@ -189,7 +189,7 @@ struct LiveAudioSessionTests {
         try "#EXTM3U\n#EXTINF:4,\nseg1.ts\n#EXT-X-ENDLIST\n".write(to: lecture.playlist, atomically: true, encoding: .utf8)
         var failures: [LiveAudioFailure] = []
         let session = try LiveAudioSession(stream: Self.address, ffmpeg: try #require(AudioEnhancement.locateFFmpeg()),
-                                           onFailure: { failures.append($0) }, fetcher: lecture, parent: folder.appendingPathComponent("sessions"))
+                                           onFailure: { if let failure = $0 { failures.append(failure) } }, fetcher: lecture, parent: folder.appendingPathComponent("sessions"))
         defer { session.stop() }
         #expect(try await get(session.playlistURL).1 == 502)
         #expect(failures == [.unavailable])
@@ -211,7 +211,7 @@ struct LiveAudioSessionTests {
         let fetcher = try makeLecture(speaking: true, audioFormat: audioFormat, startingAt: startingAt)
         let ffmpeg = try #require(AudioEnhancement.locateFFmpeg())
         var failures: [LiveAudioFailure] = []
-        let session = try LiveAudioSession(stream: Self.address, ffmpeg: ffmpeg, onFailure: { failures.append($0) }, fetcher: fetcher,
+        let session = try LiveAudioSession(stream: Self.address, ffmpeg: ffmpeg, onFailure: { if let failure = $0 { failures.append(failure) } }, fetcher: fetcher,
                                            isolator: try #require(AppleVoiceIsolator.preferred()), parent: folder.appendingPathComponent("sessions"))
         defer { session.stop() }
         _ = try await get(session.playlistURL)
@@ -259,7 +259,7 @@ struct LiveAudioSessionTests {
 
         let failing = FailingIsolator()
         var failures: [LiveAudioFailure] = []
-        let session = try LiveAudioSession(stream: Self.address, ffmpeg: ffmpeg, onFailure: { failures.append($0) }, fetcher: fetcher,
+        let session = try LiveAudioSession(stream: Self.address, ffmpeg: ffmpeg, onFailure: { if let failure = $0 { failures.append(failure) } }, fetcher: fetcher,
                                            isolator: failing, parent: folder.appendingPathComponent("failing"))
         defer { session.stop() }
         #expect(try await get(session.playlistURL.deletingLastPathComponent().appendingPathComponent(AudioEnhancement.segmentName(0))).1 == 502)

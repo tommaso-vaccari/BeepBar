@@ -142,6 +142,10 @@ public struct ManualWebexLesson: Codable, Equatable, Sendable, Identifiable {
     /// key `ManualWebexLessons.add` compares, applied to stored links too, so a lesson saved
     /// before this form existed (query kept as pasted) still refuses its duplicate without being
     /// rewritten on disk. Nil for a link the policy refuses.
+    /// Deliberately not merged: a uuid in other letter case, or the same `RCID` under two loader
+    /// paths. Whether Webex treats them as one recording is not known (never checked on real
+    /// data), and a wrong merge would refuse a different lesson as a duplicate; at worst the
+    /// student sees the same lesson twice and removes one.
     static func canonical(_ url: URL) -> URL? {
         guard RecmanURLPolicy.playbackURL(url) != nil, let components = WebexSite.safeComponents(url) else { return nil }
         var rebuilt = URLComponents()

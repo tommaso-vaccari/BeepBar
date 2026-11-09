@@ -40,6 +40,18 @@ struct RecordingsStudyState: Codable, Equatable {
         }
     }
 
+    /// What the Watchlist lists: the bookmarks plus the lessons added with a Webex link, each
+    /// as a `Bookmark` of its synthetic row, filtered and sorted like `visibleBookmarks`. A manual
+    /// lesson without a course label shows `fallbackCourseName` ("Link Webex", resolved by the
+    /// caller in the current language), which search matches too.
+    nonisolated func watchlistEntries(manual: ManualWebexLessons, fallbackCourseName: String, query: String) -> [Bookmark] {
+        var combined = self
+        combined.bookmarks += manual.lessons.map {
+            Bookmark(recording: $0.recording, courseName: $0.courseName.isEmpty ? fallbackCourseName : $0.courseName)
+        }
+        return combined.visibleBookmarks(query: query)
+    }
+
     /// Only a complete, successful listing can mark an old bookmark unavailable. Never delete it.
     nonisolated mutating func reconcile(_ recordings: [RecmanRecording], for key: RecmanCourseKey) {
         let current = Dictionary(recordings.map { (Self.identity($0), $0) }, uniquingKeysWith: { first, _ in first })

@@ -2014,6 +2014,120 @@ struct RecordingsControllerTests {
         controller.turnOff()
     }
 
+    // MARK: Lessons added by their Webex link
+
+    private let manualLink = "https://politecnicomilano.webex.com/recordingservice/sites/politecnicomilano/recording/0123456789abcdef0123456789abcdef/playback"
+    private let manualPlayer = URL(string: "https://politecnicomilano.webex.com/recordingservice/sites/politecnicomilano/recording/playback/0123456789abcdef0123456789abcdef")!
+
+    /// A lesson added by its link is saved under the account's own key before it shows, comes
+    /// back after a restart without any archive request, and is never seen by another account.
+    /// Guards against a manual lesson living only in memory, or leaking across accounts.
+    @Test func aManualLessonPersistsPerAccountWithoutArchiveRequests() async throws {
+        defer { cleanUp() }
+        let controller = await readyController()
+        let calls = browser.calls
+        let lesson = try controller.addManualLesson(link: "  \(manualLink) ", title: "Guest lecture", courseName: "").get()
+        #expect(lesson.link == manualPlayer)
+        #expect(controller.manualLessons.lessons == [lesson])
+        #expect(defaults.data(forKey: RecordingsController.manualLessonsKey(owner: 42)) != nil)
+        #expect(controller.study.bookmarks.isEmpty, "a manual lesson must not become a study bookmark")
+        let entries = controller.study.watchlistEntries(manual: controller.manualLessons, fallbackCourseName: "Link Webex", query: "")
+        #expect(entries.map(\.recording) == [lesson.recording])
+        #expect(entries.first?.courseName == "Link Webex")
+        #expect(controller.study.watchlistEntries(manual: controller.manualLessons, fallbackCourseName: "Link Webex", query: "guest").count == 1)
+        #expect(browser.calls == calls, "adding a lesson must not reach Polimi")
+
+        let restored = makeController(useDefault: true)
+        restored.pageAppeared()
+        #expect(restored.manualLessons.lessons == [lesson])
+        #expect(restored.listings.isEmpty)
+        restored.turnOff()
+
+        world.owner = 99
+        let otherAccount = makeController(useDefault: true)
+        otherAccount.pageAppeared()
+        #expect(otherAccount.manualLessons.lessons.isEmpty)
+        #expect(otherAccount.addManualLesson(link: manualLink, title: "", courseName: "").isSuccess)
+        #expect(defaults.data(forKey: RecordingsController.manualLessonsKey(owner: 42)) != nil)
+        otherAccount.turnOff()
+        controller.turnOff()
+    }
+
+    /// Refused links and duplicates write nothing, and say why; without a known account nothing
+    /// is written at all.
+    @Test func refusedManualLessonsWriteNothing() async {
+        defer { cleanUp() }
+        let controller = await readyController()
+        #expect(controller.addManualLesson(link: "https://example.com/video", title: "", courseName: "").failure == .invalidLink)
+        #expect(defaults.data(forKey: RecordingsController.manualLessonsKey(owner: 42)) == nil)
+        #expect(controller.addManualLesson(link: manualLink, title: "", courseName: "").isSuccess)
+        #expect(controller.addManualLesson(link: manualPlayer.absoluteString, title: "", courseName: "").failure == .duplicate)
+        #expect(controller.manualLessons.lessons.count == 1)
+        controller.turnOff()
+
+        world.owner = nil
+        let signedOut = makeController(useDefault: true)
+        signedOut.pageAppeared()
+        #expect(signedOut.addManualLesson(link: manualLink, title: "", courseName: "").failure == .notEditable)
+        signedOut.turnOff()
+    }
+
+    /// Unreadable saved lessons are reported and never overwritten: adding is refused and the
+    /// original bytes stay.
+    @Test func unreadableManualLessonsAreKept() async {
+        defer { cleanUp() }
+        let garbage = Data("not a property list".utf8)
+        defaults.set(garbage, forKey: RecordingsController.manualLessonsKey(owner: 42))
+        let controller = await readyController()
+        controller.pageAppeared()
+        #expect(controller.studyProblem != nil)
+        #expect(!controller.canAddManualLesson)
+        #expect(controller.addManualLesson(link: manualLink, title: "", courseName: "").failure == .notEditable)
+        #expect(defaults.data(forKey: RecordingsController.manualLessonsKey(owner: 42)) == garbage)
+        controller.turnOff()
+    }
+
+    /// The bookmark of a manual lesson removes the lesson (it has no course to be found in
+    /// again), and "Forget study data" erases manual lessons with the rest of the watchlist.
+    @Test func removingAndForgettingManualLessons() async throws {
+        defer { cleanUp() }
+        let controller = await readyController()
+        let first = try controller.addManualLesson(link: manualLink, title: "", courseName: "").get()
+        controller.toggleWatchlist(first.recording, courseName: "")
+        #expect(controller.manualLessons.lessons.isEmpty)
+        #expect(controller.study.bookmarks.isEmpty, "the toggle must not bookmark a manual row")
+        _ = try controller.addManualLesson(link: manualLink, title: "", courseName: "").get()
+        controller.forgetStudyData()
+        await controller.settleSessionFile()
+        #expect(controller.manualLessons.lessons.isEmpty)
+        #expect(defaults.data(forKey: RecordingsController.manualLessonsKey(owner: 42)) == nil)
+        controller.turnOff()
+    }
+
+    /// Play of a manual lesson goes straight to the stream of its own link; when native playback
+    /// isn't available, the browser opens that link, never an archive lookup. Copy link answers
+    /// from the lesson itself too. Guards the controller's `playerLink` short-circuit: without it
+    /// the fallback asks the archive (`playbackURL(for:)`), which has no row for this lesson.
+    @Test func aManualLessonPlaysAndFallsBackToItsOwnLink() async throws {
+        defer { cleanUp() }
+        let controller = await readyController()
+        let lesson = try controller.addManualLesson(link: manualLink, title: "", courseName: "").get()
+        browser.streamResults[lesson.id] = [.success(stream(lesson.id))]
+        controller.play(lesson.recording)
+        await settle("lecture playing") { world.player.plays.count == 1 }
+        #expect(browser.streamCalls == ["stream \(lesson.id)"])
+        world.player.pause(at: 321)
+        #expect(try storedResumePoints()?.position(for: RecordingsStudyState.identity(lesson.recording)) == 321)
+
+        controller.play(lesson.recording)
+        await settle("browser fallback") { world.opened.contains(manualPlayer) }
+        #expect(browser.playCalls.isEmpty, "the archive was asked for a manual lesson")
+        controller.copyLink(lesson.recording)
+        await settle("copied") { world.copied.contains(manualPlayer) }
+        #expect(browser.playCalls.isEmpty)
+        controller.turnOff()
+    }
+
     /// Reading novelties, copying and playing never add or remove personal bookmarks.
     @Test func playbackCopyAndBaselineNeverChangeBookmarks() async {
         defer { cleanUp() }
@@ -4098,4 +4212,9 @@ struct RecordingsAccountTests {
         return (controller, token)
     }
 
+}
+
+private extension Result {
+    var isSuccess: Bool { if case .success = self { true } else { false } }
+    var failure: Failure? { if case .failure(let error) = self { error } else { nil } }
 }

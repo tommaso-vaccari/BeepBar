@@ -567,6 +567,16 @@ struct RecordingsListing: Equatable {
     private var studyUnreadable = false
     nonisolated static func studyKey(owner: Int) -> String { "io.github.tvaccari.beepbar.recordings-study.v1.\(owner)" }
 
+    /// Lessons the student added to the Watchlist with a Webex link (`ManualWebexLesson`), owned
+    /// by the same account as `study` and loaded, isolated and forgotten with it. A key of their
+    /// own, not a field of `study`: a rollback to an older BeepBar re-encodes `study` without the
+    /// fields it doesn't know, but never touches a key it doesn't know.
+    @Published private(set) var manualLessons = ManualWebexLessons()
+    /// The saved manual lessons couldn't be decoded: they are shown as none and never
+    /// overwritten, like an unreadable `study`.
+    private var manualLessonsUnreadable = false
+    nonisolated static func manualLessonsKey(owner: Int) -> String { "io.github.tvaccari.beepbar.recordings-manual.v1.\(owner)" }
+
     /// Account isolation applies even when there is no saved Polimi session to invalidate.
     private func loadStudy() {
         let owner = isEnabled ? ownerUserID() : nil
@@ -576,6 +586,15 @@ struct RecordingsListing: Equatable {
         study = RecordingsStudyState()
         studyProblem = nil
         studyUnreadable = false
+        manualLessons = ManualWebexLessons()
+        manualLessonsUnreadable = false
+        if let owner, let data = defaults.data(forKey: Self.manualLessonsKey(owner: owner)) {
+            do { manualLessons = try PropertyListDecoder().decode(ManualWebexLessons.self, from: data) }
+            catch {
+                manualLessonsUnreadable = true
+                studyProblem = BilingualText("Le lezioni aggiunte con un link Webex non sono leggibili. I dati originali sono stati conservati.", "The lessons added with a Webex link couldn't be read. The original data has been preserved.")
+            }
+        }
         guard let owner, let data = defaults.data(forKey: Self.studyKey(owner: owner)) else { return }
         do { study = try PropertyListDecoder().decode(RecordingsStudyState.self, from: data) }
         catch {
@@ -611,6 +630,7 @@ struct RecordingsListing: Equatable {
         forgetSeen()
         forgetResumePoints()
         defaults.removeObject(forKey: Self.studyKey(owner: owner))
+        defaults.removeObject(forKey: Self.manualLessonsKey(owner: owner))
         studyLoaded = false
         loadStudy()
         listings.removeAll()
@@ -621,7 +641,70 @@ struct RecordingsListing: Equatable {
 
     var canEditStudy: Bool { isEnabled && studyOwner != nil && !studyUnreadable }
 
+    /// Whether a lesson can be added with a Webex link now: the account is known and neither
+    /// the study state nor the saved manual lessons are unreadable.
+    var canAddManualLesson: Bool { canEditStudy && !manualLessonsUnreadable }
+
+    /// Why a Webex link wasn't added, for the sheet that asked.
+    enum ManualLessonFailure: Error, Equatable {
+        case invalidLink, duplicate, notEditable, saveFailed
+
+        var message: BilingualText {
+            switch self {
+            case .invalidLink: BilingualText("Incolla il link di una registrazione Webex del Politecnico (politecnicomilano.webex.com).", "Paste the link of a Politecnico Webex recording (politecnicomilano.webex.com).")
+            case .duplicate: BilingualText("Questa lezione è già nella watchlist.", "This lesson is already in your watchlist.")
+            case .notEditable: BilingualText("La watchlist non si può modificare ora. Accedi con il tuo account WeBeep e riprova.", "The watchlist can't be changed right now. Sign in with your WeBeep account and try again.")
+            case .saveFailed: BilingualText("Non è stato possibile salvare la lezione. Riprova.", "Couldn't save the lesson. Try again.")
+            }
+        }
+    }
+
+    /// Adds a lesson by its Webex link (`ManualWebexLessons.add`), saved before it is published,
+    /// so what the Watchlist shows is what is on disk. Checks the account at the point of action:
+    /// a lesson is never written under another account's key.
+    @discardableResult
+    func addManualLesson(link: String, title: String, courseName: String) -> Result<ManualWebexLesson, ManualLessonFailure> {
+        loadStudy()
+        guard canAddManualLesson, let owner = studyOwner, owner == ownerUserID() else { return .failure(.notEditable) }
+        var updated = manualLessons
+        let lesson: ManualWebexLesson
+        do { lesson = try updated.add(link: link, title: title, courseName: courseName) }
+        catch ManualWebexLessons.AddError.duplicate { return .failure(.duplicate) }
+        catch { return .failure(.invalidLink) }
+        guard saveManualLessons(updated, owner: owner) else { return .failure(.saveFailed) }
+        return .success(lesson)
+    }
+
+    /// Writes `updated` under `owner`'s key and publishes it; false (nothing published) when it
+    /// couldn't be encoded.
+    private func saveManualLessons(_ updated: ManualWebexLessons, owner: Int) -> Bool {
+        do {
+            let data = try PropertyListEncoder().encode(updated)
+            defaults.set(data, forKey: Self.manualLessonsKey(owner: owner))
+            manualLessons = updated
+            return true
+        } catch {
+            return false
+        }
+    }
+
+    /// Removing a manual lesson's bookmark forgets the lesson: it has no course to be found in
+    /// again. Same account checks as `addManualLesson`.
+    private func removeManualLesson(id: String) {
+        loadStudy()
+        guard canAddManualLesson, let owner = studyOwner, owner == ownerUserID(), manualLessons.contains(id: id) else { return }
+        var updated = manualLessons
+        updated.remove(id: id)
+        if !saveManualLessons(updated, owner: owner) {
+            studyProblem = BilingualText("Non è stato possibile salvare la watchlist. Riprova.", "Couldn't save the watchlist. Try again.")
+        }
+    }
+
     func toggleWatchlist(_ recording: RecmanRecording, courseName: String) {
+        if ManualWebexLesson.isManual(recording) {
+            removeManualLesson(id: recording.id)
+            return
+        }
         updateStudy { state in
             if state.contains(recording) { state.bookmarks.removeAll { $0.id == RecordingsStudyState.identity(recording) } }
             else { state.bookmarks.append(.init(recording: recording, courseName: courseName)) }
@@ -1539,6 +1622,8 @@ struct RecordingsListing: Equatable {
     /// The Webex player link of a recording, from memory when it was found before.
     private func playerLink(for recording: RecmanRecording, browser: RecmanBrowsing, found: URL? = nil) async throws -> URL {
         if let found { return found }
+        // A lesson added by its Webex link has no archive row to look up: its link is the player.
+        if let manual = ManualWebexLesson.playerLink(for: recording) { return manual }
         if let cached = playbackURLs[recording.id] { return cached }
         return try await browser.playbackURL(for: recording)
     }

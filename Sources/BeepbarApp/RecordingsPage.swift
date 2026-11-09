@@ -805,14 +805,22 @@ private struct WatchlistRecordings: View {
     /// the bookmarks or the search change, not on every publication of the controller.
     @State private var shownCache = DerivedValueCache<ShownInputs, [RecordingsStudyState.Bookmark]>()
 
+    @State private var addingLesson = false
+
     private struct ShownInputs: Equatable {
         let bookmarks: [RecordingsStudyState.Bookmark]
+        let manual: ManualWebexLessons
+        /// The language the fallback course label was resolved in: a switch must redo it.
+        let language: AppLanguage
         let query: String
     }
 
     private var shown: [RecordingsStudyState.Bookmark] {
         let study = recordings.study
-        return shownCache.value(for: ShownInputs(bookmarks: study.bookmarks, query: query)) { study.visibleBookmarks(query: $0.query) }
+        let inputs = ShownInputs(bookmarks: study.bookmarks, manual: recordings.manualLessons, language: AppLanguage.current, query: query)
+        return shownCache.value(for: inputs) {
+            study.watchlistEntries(manual: $0.manual, fallbackCourseName: tr("Link Webex", "Webex link"), query: $0.query)
+        }
     }
 
     private var listings: [RecordingsListing] {
@@ -842,6 +850,11 @@ private struct WatchlistRecordings: View {
                     .textFieldStyle(.roundedBorder)
                     .frame(minWidth: 120, maxWidth: 280)
                 Spacer(minLength: 0)
+                Button { addingLesson = true } label: { Image(systemName: "plus") }
+                    .buttonStyle(.borderless)
+                    .help(tr("Aggiungi una lezione con un link Webex", "Add a lesson with a Webex link"))
+                    .accessibilityLabel(tr("Aggiungi una lezione con un link Webex", "Add a lesson with a Webex link"))
+                    .disabled(!recordings.canAddManualLesson)
                 Button(action: refresh) {
                     ZStack {
                         Image(systemName: "arrow.clockwise").opacity(isLoading ? 0 : 1)
@@ -904,18 +917,68 @@ private struct WatchlistRecordings: View {
                 }
             }
         }
+        .sheet(isPresented: $addingLesson) {
+            AddWebexLessonSheet { link, title, course in
+                recordings.addManualLesson(link: link, title: title, courseName: course).map { _ in () }
+            }
+        }
     }
 
     @ViewBuilder private var empty: some View {
-        if recordings.study.bookmarks.isEmpty {
+        if recordings.study.bookmarks.isEmpty && recordings.manualLessons.lessons.isEmpty {
             ContentUnavailableView {
                 Label(tr("La watchlist è vuota", "Your watchlist is empty"), systemImage: "bookmark")
             } description: {
-                Text(tr("Scegli un corso e usa il segnalibro accanto a una lezione per aggiungerla qui.", "Choose a course and bookmark a lesson to add it here."))
+                Text(tr("Scegli un corso e usa il segnalibro accanto a una lezione per aggiungerla qui, oppure aggiungi una lezione con il suo link Webex (+).", "Choose a course and bookmark a lesson to add it here, or add a lesson by its Webex link (+)."))
             }
         } else {
             ContentUnavailableView.search(text: query)
         }
+    }
+}
+
+/// The form behind the Watchlist's "+": a Webex link, an optional title and course label.
+/// `add` saves and answers; the sheet closes only on success, so a refused link stays in the
+/// field with the reason under it.
+struct AddWebexLessonSheet: View {
+    let add: (_ link: String, _ title: String, _ course: String) -> Result<Void, RecordingsController.ManualLessonFailure>
+    @Environment(\.dismiss) private var dismiss
+    @State private var link = ""
+    @State private var title = ""
+    @State private var course = ""
+    @State private var problem: BilingualText?
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 14) {
+            Text(tr("Aggiungi una lezione Webex", "Add a Webex lesson")).font(.headline)
+            Text(tr("Incolla il link della registrazione Webex. La lezione resta nella watchlist finché non la rimuovi.", "Paste the Webex recording link. The lesson stays in your watchlist until you remove it."))
+                .font(.callout).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
+            Form {
+                TextField(tr("Link Webex", "Webex link"), text: $link, prompt: Text(verbatim: "https://politecnicomilano.webex.com/…"))
+                TextField(tr("Titolo (facoltativo)", "Title (optional)"), text: $title)
+                TextField(tr("Corso (facoltativo)", "Course (optional)"), text: $course)
+            }
+            .formStyle(.columns)
+            if let problem {
+                Label(problem.text, systemImage: "exclamationmark.triangle").foregroundStyle(.orange).font(.callout)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+            HStack {
+                Spacer()
+                Button(tr("Annulla", "Cancel"), role: .cancel) { dismiss() }.keyboardShortcut(.cancelAction)
+                Button(tr("Aggiungi", "Add")) {
+                    switch add(link, title, course) {
+                    case .success: dismiss()
+                    case .failure(let failure): problem = failure.message
+                    }
+                }
+                .keyboardShortcut(.defaultAction)
+                .disabled(link.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+            }
+        }
+        .padding(20)
+        .frame(width: 440)
+        .onChange(of: link) { problem = nil }
     }
 }
 
@@ -1159,6 +1222,7 @@ struct RecordingRow: View, Equatable {
         }
         let when = recording.recordedAt.formatted(style)
         let length = RecordingsPresentation.minutes(recording.duration).map { RecordingsPresentation.durationText(minutes: $0) } ?? recording.duration
-        return "\(when) · \(length)"
+        // A lesson added by its Webex link has no archive duration: only the date it was added.
+        return length.isEmpty ? when : "\(when) · \(length)"
     }
 }

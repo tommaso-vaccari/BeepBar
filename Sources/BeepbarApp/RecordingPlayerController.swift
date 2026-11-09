@@ -65,11 +65,7 @@ import OSLog
 
 /// One choice in the player's Audio menu (`RecordingPlaying.onAudioAction`).
 enum PlayerAudioAction: Equatable, Sendable {
-    /// "Crea versione con audio migliorato" (or "Riprova" after a failure).
-    case create
-    /// Stop making the copy.
-    case cancel
-    /// Play the enhanced copy (true) or the original stream (false) from the same position.
+    /// Play through the local filter (true) or Webex's stream (false) from the same position.
     case useEnhanced(Bool)
 }
 
@@ -1223,8 +1219,8 @@ enum RecordingPlayerError: Error {
     }
 
     /// The Audio section of the title-bar menu (`audioState`): a separator, a header, the main
-    /// item (create, progress, the enhanced-audio switch) and a detail item (cancel, or why the
-    /// last attempt failed). Tagged so `updateAudioItems` finds them; hidden while the state is nil.
+    /// item (the enhanced-audio switch, or how to get ffmpeg) and a detail item (why the last
+    /// attempt failed). Tagged so `updateAudioItems` finds them; hidden while the state is nil.
     private func addAudioItems(to menu: NSMenu) {
         let separator = NSMenuItem.separator()
         separator.tag = AudioMenuTag.separator
@@ -1256,8 +1252,7 @@ enum RecordingPlayerError: Error {
         static let detail = 9_004
     }
 
-    /// The Audio items' titles and states for `audioState`; a whole-percent progress update
-    /// changes one title, no rebuild.
+    /// The Audio items' titles and states for `audioState`, updated in place, no rebuild.
     private func updateAudioItems() {
         guard let menu = speedPopUp?.menu else { return }
         let presentation = RecordingPlayerPolicy.audioMenu(audioState)

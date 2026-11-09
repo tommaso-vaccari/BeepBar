@@ -283,6 +283,25 @@ import BeepbarCore
     var currentPosition: TimeInterval? { current?.position }
 }
 
+/// A stand-in live filter (`LiveAudioSession`): records the stream and ffmpeg it was given and
+/// whether it was stopped, and lets a test report a failure as the real pipeline does before it
+/// answers the player with an error.
+@MainActor final class FakeLiveAudio: LiveAudioStreaming {
+    static let address = URL(string: "http://127.0.0.1:1/token/index.m3u8")!
+    let stream: URL
+    let ffmpeg: URL
+    let onFailure: @MainActor (LiveAudioFailure) -> Void
+    private(set) var stops = 0
+    var playlistURL: URL { Self.address }
+    init(stream: URL, ffmpeg: URL, onFailure: @escaping @MainActor (LiveAudioFailure) -> Void) {
+        self.stream = stream
+        self.ffmpeg = ffmpeg
+        self.onFailure = onFailure
+    }
+    func stop() { stops += 1 }
+    var isStopped: Bool { stops > 0 }
+}
+
 /// Settings that record every write, to prove that a visit with nothing new writes nothing.
 class CountingDefaults: UserDefaults, @unchecked Sendable {
     private(set) var writes: [String] = []
@@ -420,10 +439,10 @@ final class SessionFileProbe: @unchecked Sendable {
 @MainActor final class RecordingsWorld {
     /// The ffmpeg the audio enhancer finds; nil: none installed.
     var ffmpeg: URL?
-    /// What the enhancer gives ffmpeg for a stream (`AudioEnhancer.resolveInput` in the app,
-    /// which fetches the playlist): the stream itself unless a test says otherwise, so no test
-    /// reaches the network.
-    var resolveInput: @Sendable (URL) async -> URL = { $0 }
+    /// The live filters the enhancer started, in order (`FakeLiveAudio`): no server, no ffmpeg.
+    var liveSessions: [FakeLiveAudio] = []
+    /// Whether starting a live filter throws, as when no local port can be had.
+    var liveSessionFails = false
     var owner: Int? = 42
     var polimi = true
     var now = Date(timeIntervalSince1970: 1_790_000_000)
@@ -485,8 +504,6 @@ struct RecordingsControllerTests {
         return RecordingsSessionStore { folder }
     }
     private var sessionFile: URL { folder.appendingPathComponent(RecordingsSessionStore.fileName) }
-    /// Where this test's enhanced copies go (`AudioEnhancer`): inside the throwaway folder.
-    private var enhancedFolder: URL { folder.appendingPathComponent("EnhancedAudio", isDirectory: true) }
 
     private func makeController(useDefault: Bool = false, listingCapacity: Int = RecordingsController.listingCapacity, playbackURLCapacity: Int = RecordingsController.playbackURLCapacity) -> RecordingsController {
         if !useDefault && defaults.object(forKey: RecordingsController.enabledKey) == nil {
@@ -513,10 +530,13 @@ struct RecordingsControllerTests {
             copy: { world.copied.append($0) },
             now: { MainActor.assumeIsolated { world.now } },
             makePlayer: { world.playersMade += 1; return world.player },
-            makeAudioEnhancer: { AudioEnhancer(locateFFmpeg: { world.ffmpeg }, directory: { self.enhancedFolder }, resolveInput: { stream in
-                let resolve = await world.resolveInput
-                return await resolve(stream)
-            }) },
+            makeAudioEnhancer: { AudioEnhancer(locateFFmpeg: { world.ffmpeg }, makeSession: { stream, ffmpeg, onFailure in
+                struct NoPort: Error {}
+                if world.liveSessionFails { throw NoPort() }
+                let session = FakeLiveAudio(stream: stream, ffmpeg: ffmpeg, onFailure: onFailure)
+                world.liveSessions.append(session)
+                return session
+            }, legacyCopies: nil) },
             courses: { world.courses },
             fetchProfileEmail: {
                 world.profileEmailCalls += 1
@@ -2161,32 +2181,7 @@ struct RecordingsControllerTests {
 
     // MARK: Enhanced audio
 
-    /// A stand-in ffmpeg: a real executable the enhancer runs with `Process`, which records its
-    /// arguments, reports progress like ffmpeg's `-progress pipe:1`, writes the output named by its
-    /// last argument and then `ending` (a shell line: `exit 0`, `exit 1`, `exec sleep 30`).
-    private func fakeFFmpeg(_ ending: String) throws -> URL {
-        try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
-        let script = folder.appendingPathComponent("ffmpeg-\(UUID().uuidString)")
-        let args = folder.appendingPathComponent("ffmpeg-args.txt").path
-        try """
-        #!/bin/sh
-        printf '%s\\n' "$@" > '\(args)'
-        for a; do out="$a"; done
-        echo "out_time_us=3000000000"
-        printf 'enhanced' > "$out"
-        \(ending)
-        """.write(to: script, atomically: true, encoding: .utf8)
-        try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: script.path)
-        return script
-    }
-
-    private func ffmpegArguments() -> [String] {
-        ((try? String(contentsOf: folder.appendingPathComponent("ffmpeg-args.txt"), encoding: .utf8)) ?? "").split(separator: "\n").map(String.init)
-    }
-
-    private func enhancedFiles() -> [String] {
-        ((try? FileManager.default.contentsOfDirectory(atPath: enhancedFolder.path)) ?? []).sorted()
-    }
+    private let fakeFFmpegPath = URL(fileURLWithPath: "/opt/homebrew/bin/ffmpeg")
 
     private func playing(_ controller: RecordingsController, _ id: String) async -> RecmanRecording {
         let lecture = recording(id)
@@ -2196,232 +2191,260 @@ struct RecordingsControllerTests {
         return lecture
     }
 
-    /// The main path: "Crea versione con audio migliorato" runs ffmpeg on the lecture's own
-    /// stream with the voice filters, the copy appears whole (no partial file left), and the
-    /// switch plays the copy and then the stream again, each from where the student was, the same
-    /// lecture throughout (resume point and watch session continue). Guards against a copy made
-    /// from the wrong address, a switch that restarts the lecture, and a half-written copy.
-    @Test func aCopyIsMadeAndThePlayerSwitchesAtTheSamePosition() async throws {
+    /// The main path: "Audio migliorato" starts a live filter on the lecture's own stream with
+    /// the ffmpeg found, and the player switches to the filter's local address at the same
+    /// position, still playing, the same lecture (resume point and watch session continue);
+    /// turned off, the filter stops and the player is back on Webex's stream where the student
+    /// was, paused if they had paused. Guards against a filter fed the wrong address, a switch
+    /// that restarts the lecture or resumes a paused one, a filter left running after "off",
+    /// and a new stream asked of Webex for a mere switch.
+    @Test func theSwitchFiltersLiveAtTheSamePosition() async throws {
         defer { cleanUp() }
-        world.ffmpeg = try fakeFFmpeg("exit 0")
+        world.ffmpeg = fakeFFmpegPath
         let controller = await readyController()
         let lecture = await playing(controller, "audio")
-        #expect(world.player.audioState == .idle)
-
-        world.player.chooseAudio(.create)
-        await settle("copy ready") { world.player.audioState == .ready(inUse: false) }
-        let arguments = ffmpegArguments()
-        #expect(arguments.contains(stream(lecture.id).url.absoluteString))
-        #expect(arguments.contains(AudioEnhancement.filterChain))
-        #expect(arguments.last?.hasSuffix(AudioEnhancement.partialSuffix) == true, "ffmpeg wrote the final name directly")
-        let key = AudioEnhancer.copyKey(owner: 42, identity: RecordingsStudyState.identity(lecture))
-        #expect(enhancedFiles() == [key + AudioEnhancement.copySuffix])
-        let copy = enhancedFolder.appendingPathComponent(key + AudioEnhancement.copySuffix)
-        #expect(try String(contentsOf: copy, encoding: .utf8) == "enhanced")
+        #expect(world.player.audioState == .off)
+        #expect(world.liveSessions.isEmpty, "a filter started before the student asked")
 
         world.player.move(to: 1_234)
         world.player.chooseAudio(.useEnhanced(true))
-        let onCopy = try world.player.play(world.player.plays.count - 1)
-        #expect(onCopy.url.standardizedFileURL == copy.standardizedFileURL)
-        #expect(onCopy.startAt == 1_234)
-        #expect(onCopy.recordingID == lecture.id)
-        #expect(world.player.audioState == .ready(inUse: true))
+        let session = try #require(world.liveSessions.last)
+        #expect(world.liveSessions.count == 1)
+        #expect(session.stream == stream(lecture.id).url)
+        #expect(session.ffmpeg == fakeFFmpegPath)
+        let filtered = try world.player.play(world.player.plays.count - 1)
+        #expect(filtered.url == FakeLiveAudio.address)
+        #expect(filtered.startAt == 1_234)
+        #expect(filtered.recordingID == lecture.id)
+        #expect(world.player.audioState == .on)
         #expect(world.player.isPlaying)
+        #expect(defaults.bool(forKey: RecordingsController.prefersEnhancedAudioKey))
         #expect(try storedResumePoints()?.position(for: RecordingsStudyState.identity(lecture)) == 1_234)
 
         world.player.pause(at: 2_000)
         world.player.chooseAudio(.useEnhanced(false))
+        #expect(session.isStopped, "the filter kept running after it was turned off")
         let back = try world.player.play(world.player.plays.count - 1)
         #expect(back.url == stream(lecture.id).url)
         #expect(back.startAt == 2_000)
-        #expect(world.player.audioState == .ready(inUse: false))
+        #expect(world.player.audioState == .off)
         #expect(!world.player.isPlaying, "a paused lecture started playing when the audio changed")
+        #expect(!defaults.bool(forKey: RecordingsController.prefersEnhancedAudioKey))
         #expect(browser.streamCalls == ["stream \(lecture.id)"], "switching asked Webex for a new stream")
+
+        // The same choice twice does nothing: no second filter, no replay.
+        let plays = world.player.plays.count
+        world.player.chooseAudio(.useEnhanced(false))
+        #expect(world.player.plays.count == plays)
         controller.turnOff()
     }
 
-    /// A copy left on is what the next Play of that lecture starts on; turned off, the stream.
-    /// A lecture without a copy plays its stream either way.
-    @Test func aLaterPlayStartsOnTheCopyWhenLeftOn() async throws {
+    /// Left on, enhanced audio is what every later Play starts on, each lecture with its own
+    /// new filter (the previous one stopped); turned off, the next Play is Webex's stream with no
+    /// filter at all. Guards against a preference that isn't kept, a filter of the previous
+    /// lecture left running, and a filter started while the student has it off.
+    @Test func aLaterPlayStartsFilteredWhenLeftOn() async throws {
         defer { cleanUp() }
-        world.ffmpeg = try fakeFFmpeg("exit 0")
+        world.ffmpeg = fakeFFmpegPath
         let controller = await readyController()
-        let lecture = await playing(controller, "audio")
-        world.player.chooseAudio(.create)
-        await settle("copy ready") { world.player.audioState == .ready(inUse: false) }
+        _ = await playing(controller, "audio")
         world.player.chooseAudio(.useEnhanced(true))
-        #expect(defaults.bool(forKey: RecordingsController.prefersEnhancedAudioKey))
+        let first = try #require(world.liveSessions.last)
 
         let other = await playing(controller, "other")
-        #expect(world.player.plays.last?.url == stream(other.id).url)
-        #expect(world.player.audioState == .idle)
-        _ = await playing(controller, lecture.id)
-        #expect(world.player.plays.last?.url.isFileURL == true, "the copy left on wasn't used")
-        #expect(world.player.audioState == .ready(inUse: true))
+        #expect(first.isStopped, "the previous lecture's filter outlived it")
+        let second = try #require(world.liveSessions.last)
+        #expect(world.liveSessions.count == 2)
+        #expect(second.stream == stream(other.id).url)
+        #expect(world.player.plays.last?.url == FakeLiveAudio.address)
+        #expect(world.player.audioState == .on)
+
         world.player.chooseAudio(.useEnhanced(false))
+        #expect(second.isStopped)
+        let again = await playing(controller, "audio")
+        #expect(world.liveSessions.count == 2, "a filter started with enhanced audio off")
+        #expect(world.player.plays.last?.url == stream(again.id).url)
+        #expect(world.player.audioState == .off)
+        controller.turnOff()
+    }
+
+    /// The filter failing on its own (not Webex's layout, ffmpeg failing) mid-lecture: the
+    /// lecture goes on from Webex's stream at the same place, with no recovery (no new stream
+    /// asked of the archive), and the menu says it didn't work; a later Play of that lecture
+    /// doesn't try the filter again, though the preference stays on; choosing it again does.
+    /// Guards against a failing filter replayed in a loop and a recovery spent on it.
+    @Test func aFailingFilterFallsBackToTheStreamWithoutALoop() async throws {
+        defer { cleanUp() }
+        world.ffmpeg = fakeFFmpegPath
+        let controller = await readyController()
+        let lecture = await playing(controller, "audio")
+        world.player.chooseAudio(.useEnhanced(true))
+        let session = try #require(world.liveSessions.last)
+        let plays = world.player.plays.count
+
+        session.onFailure(.unavailable)
+        world.player.failDuringPlayback(at: 600)
+        #expect(session.isStopped)
+        #expect(world.player.plays.count == plays + 1)
+        #expect(world.player.plays.last?.url == stream(lecture.id).url)
+        #expect(world.player.plays.last?.startAt == 600)
+        guard case .failed(let message) = world.player.audioState else {
+            Issue.record("the menu doesn't say the filter failed: \(String(describing: world.player.audioState))")
+            return
+        }
+        #expect(message.text.contains("audio originale"))
+        await drainTasks()
+        #expect(browser.streamCalls == ["stream \(lecture.id)"], "the filter's failure used a recovery")
+        #expect(world.player.problems.isEmpty)
+
         _ = await playing(controller, "other")
         _ = await playing(controller, lecture.id)
-        #expect(world.player.plays.last?.url == stream(lecture.id).url)
-        controller.turnOff()
-    }
-
-    /// ffmpeg failing, or the student cancelling, leaves no file behind (the partial copy is
-    /// deleted) and the menu offers to try again; nothing switches. Guards against a partial copy
-    /// that a later Play would take for a finished one.
-    @Test func aFailedOrCancelledCopyLeavesNothing() async throws {
-        defer { cleanUp() }
-        world.ffmpeg = try fakeFFmpeg("exit 1")
-        let controller = await readyController()
-        _ = await playing(controller, "audio")
-        world.player.chooseAudio(.create)
-        await settle("failure shown") { if case .failed = world.player.audioState { true } else { false } }
-        #expect(enhancedFiles().isEmpty)
+        #expect(world.player.plays.last?.url == stream(lecture.id).url, "the failed filter was tried again on its own")
+        #expect(defaults.bool(forKey: RecordingsController.prefersEnhancedAudioKey))
+        let sessions = world.liveSessions.count
         world.player.chooseAudio(.useEnhanced(true))
-        #expect(world.player.plays.count == 1, "a failed copy was played")
-
-        world.ffmpeg = try fakeFFmpeg("exec sleep 30")
-        world.player.chooseAudio(.create)
-        await settle("copy underway") { if case .processing = world.player.audioState { true } else { false } }
-        world.player.chooseAudio(.cancel)
-        await settle("cancelled") { world.player.audioState == .idle }
-        #expect(enhancedFiles().isEmpty)
+        #expect(world.liveSessions.count == sessions + 1)
+        #expect(world.player.audioState == .on)
         controller.turnOff()
     }
 
-    /// ffmpeg reads what the input step found (the single Webex file behind the playlist), not
-    /// the playlist: guards against the stall where ffmpeg's HLS reader never got past 0% on a
-    /// byte-range playlist. The player keeps playing the stream itself.
-    @Test func ffmpegReadsTheResolvedFile() async throws {
+    /// The filter failing before the lecture ever played (the window closes itself): the lecture
+    /// opens again on Webex's stream from where it was going to start, not from the beginning.
+    @Test func aFilterFailingBeforeReadyPlaysTheStreamFromTheSameStart() async throws {
         defer { cleanUp() }
-        world.ffmpeg = try fakeFFmpeg("exit 0")
-        let file = URL(string: "https://media.example.test/merge_0_1.mp4")!
-        world.resolveInput = { _ in file }
+        world.ffmpeg = fakeFFmpegPath
+        defaults.set(true, forKey: RecordingsController.prefersEnhancedAudioKey)
+        let controller = await readyController()
+        let lecture = recording("audio")
+        browser.streamResults[lecture.id] = [.success(stream(lecture.id))]
+        controller.play(lecture)
+        await settle("lecture playing") { world.player.plays.last?.recordingID == lecture.id }
+        #expect(world.player.plays.last?.url == FakeLiveAudio.address)
+        let start = world.player.plays.last?.startAt
+        world.liveSessions.last?.onFailure(.unavailable)
+        world.player.failBeforeReady()
+        #expect(world.player.plays.last?.url == stream(lecture.id).url)
+        #expect(world.player.plays.last?.startAt == start)
+        #expect(world.player.isOpen)
+        controller.turnOff()
+    }
+
+    /// Webex refusing the filter's address mid-lecture (it expired) is the usual recovery: a fresh
+    /// stream from the archive, filtered anew since the student left it on; the menu shows no
+    /// failure. Guards against an expiry taken for a broken filter, which would turn enhanced
+    /// audio off for the lecture.
+    @Test func anExpiredStreamIsRecoveredAndFilteredAgain() async throws {
+        defer { cleanUp() }
+        world.ffmpeg = fakeFFmpegPath
         let controller = await readyController()
         let lecture = await playing(controller, "audio")
-        world.player.chooseAudio(.create)
-        await settle("copy ready") { world.player.audioState == .ready(inUse: false) }
-        let arguments = ffmpegArguments()
-        #expect(arguments.contains(file.absoluteString))
-        #expect(!arguments.contains(stream(lecture.id).url.absoluteString), "ffmpeg was given the playlist")
-        #expect(world.player.plays.last?.url == stream(lecture.id).url)
+        world.player.chooseAudio(.useEnhanced(true))
+        let session = try #require(world.liveSessions.last)
+        let fresh = RecordingStream(url: URL(string: "https://media.example.test/fresh/\(lecture.id).m3u8")!, title: nil, duration: nil)
+        browser.streamResults[lecture.id] = [.success(fresh)]
+
+        session.onFailure(.streamRefused)
+        world.player.failDuringPlayback(at: 900)
+        await settle("recovered") { world.liveSessions.count == 2 }
+        #expect(session.isStopped)
+        #expect(world.liveSessions.last?.stream == fresh.url)
+        #expect(world.player.plays.last?.url == FakeLiveAudio.address)
+        #expect(world.player.plays.last?.startAt == 900)
+        #expect(world.player.audioState == .on)
+        #expect(browser.streamCalls.count == 2)
         controller.turnOff()
     }
 
-    /// Cancelling while the input is still being found ends the job at once and never starts
-    /// ffmpeg; the menu offers to create the copy again. Guards against an ffmpeg launched after
-    /// the student cancelled, which would download the whole lecture unasked.
-    @Test func cancellingBeforeFFmpegStartsRunsNothing() async throws {
+    /// A filter that can't start (no local port): the lecture stays on its stream, nothing
+    /// replays, and the menu says enhanced audio didn't work.
+    @Test func aFilterThatCantStartLeavesTheStreamPlaying() async throws {
         defer { cleanUp() }
-        world.ffmpeg = try fakeFFmpeg("exit 0")
-        world.resolveInput = { stream in
-            try? await Task.sleep(for: .milliseconds(300))
-            return stream
-        }
+        world.ffmpeg = fakeFFmpegPath
+        world.liveSessionFails = true
         let controller = await readyController()
         _ = await playing(controller, "audio")
-        world.player.chooseAudio(.create)
-        #expect({ if case .processing = world.player.audioState { true } else { false } }())
-        world.player.chooseAudio(.cancel)
-        #expect(world.player.audioState == .idle)
-        try await Task.sleep(for: .milliseconds(600))
-        await drainTasks()
-        #expect(ffmpegArguments().isEmpty, "ffmpeg ran after the cancel")
-        #expect(world.player.audioState == .idle)
-        #expect(enhancedFiles().isEmpty)
+        let plays = world.player.plays.count
+        world.player.chooseAudio(.useEnhanced(true))
+        #expect(world.player.plays.count == plays)
+        #expect({ if case .failed = world.player.audioState { true } else { false } }())
+        #expect(!defaults.bool(forKey: RecordingsController.prefersEnhancedAudioKey))
         controller.turnOff()
     }
 
-    /// The percentage follows the player's measured length, not Webex's `duration` hint, whose
-    /// unit is unconfirmed (on a real lecture it looked like milliseconds): guards against the
-    /// copy reading 0% from start to end. Pressed before the player reported a length, the copy
-    /// switches to the measured one as soon as it arrives.
-    @Test func thePercentageUsesThePlayersLength() async throws {
-        defer { cleanUp() }
-        world.ffmpeg = try fakeFFmpeg("exec sleep 30")
-        let controller = await readyController()
-        for measuredFirst in [true, false] {
-            let lecture = recording(measuredFirst ? "ms1" : "ms2")
-            browser.streamResults[lecture.id] = [.success(RecordingStream(url: stream(lecture.id).url, title: nil, duration: 6_000_000))]
-            controller.play(lecture)
-            await settle("lecture playing") { world.player.plays.last?.recordingID == lecture.id }
-            if measuredFirst { world.player.tick(at: 10) }
-            world.player.chooseAudio(.create)
-            // The fake ffmpeg reports 3000 s written; the player's length is 6000 s.
-            if !measuredFirst {
-                // With the hint alone, 3000 of "6,000,000" seconds: the menu stays at 0%.
-                await settle("copy underway") { if case .processing = world.player.audioState { true } else { false } }
-                try await Task.sleep(for: .milliseconds(300))
-                #expect(world.player.audioState == .processing(fraction: 0))
-                world.player.tick(at: 10)
-            }
-            await settle("half done") { world.player.audioState == .processing(fraction: 0.5) }
-            world.player.chooseAudio(.cancel)
-            await settle("cancelled") { world.player.audioState == .idle }
-        }
-        controller.turnOff()
-    }
-
-    /// Without ffmpeg the menu says how to get it, and choosing anything runs nothing.
+    /// Without ffmpeg the menu says how to get it, choosing it starts nothing, and a preference
+    /// left on plays the stream.
     @Test func withoutFFmpegTheMenuSaysHowToGetIt() async {
         defer { cleanUp() }
+        defaults.set(true, forKey: RecordingsController.prefersEnhancedAudioKey)
         let controller = await readyController()
-        _ = await playing(controller, "audio")
+        let lecture = await playing(controller, "audio")
+        #expect(world.player.plays.last?.url == stream(lecture.id).url)
         #expect(world.player.audioState == .needsFFmpeg)
-        world.player.chooseAudio(.create)
+        world.player.chooseAudio(.useEnhanced(true))
         await drainTasks()
         #expect(world.player.audioState == .needsFFmpeg)
-        #expect(enhancedFiles().isEmpty)
+        #expect(world.liveSessions.isEmpty)
         controller.turnOff()
     }
 
-    /// Copies belong to the account: another account never finds one, "forget study data"
-    /// deletes them, and an account change stops a copy underway.
-    @Test func copiesStayWithTheirAccount() async throws {
+    /// Closing the window, an account change and "forget study data" stop the filter: nothing
+    /// keeps fetching or running for a lecture no one is listening to, or for an account gone.
+    @Test func theFilterEndsWithTheLectureAndTheAccount() async throws {
         defer { cleanUp() }
-        world.ffmpeg = try fakeFFmpeg("exit 0")
+        world.ffmpeg = fakeFFmpegPath
         let controller = await readyController()
-        let lecture = await playing(controller, "audio")
-        world.player.chooseAudio(.create)
-        await settle("copy ready") { world.player.audioState == .ready(inUse: false) }
-        #expect(AudioEnhancer.copyKey(owner: 42, identity: RecordingsStudyState.identity(lecture)) != AudioEnhancer.copyKey(owner: 99, identity: RecordingsStudyState.identity(lecture)))
+        _ = await playing(controller, "audio")
+        world.player.chooseAudio(.useEnhanced(true))
+        let closed = try #require(world.liveSessions.last)
+        world.player.close()
+        #expect(closed.isStopped, "the filter outlived the window")
+
+        _ = await playing(controller, "second")
+        let forgotten = try #require(world.liveSessions.last)
+        #expect(forgotten !== closed)
         controller.forgetStudyData()
-        #expect(enhancedFiles().isEmpty)
+        #expect(forgotten.isStopped, "the filter outlived forget study data")
+
+        _ = await playing(controller, "third")
+        let switched = try #require(world.liveSessions.last)
+        #expect(switched !== forgotten)
         controller.turnOff()
+        #expect(switched.isStopped, "the filter outlived the feature being turned off")
     }
 
     /// A choice made in the menu of a lecture no longer on screen does nothing: the menu of the
     /// new lecture is not the old one's.
     @Test func aStaleAudioChoiceIsIgnored() async throws {
         defer { cleanUp() }
-        world.ffmpeg = try fakeFFmpeg("exit 0")
+        world.ffmpeg = fakeFFmpegPath
         let controller = await readyController()
         let first = await playing(controller, "first")
         _ = await playing(controller, "second")
-        world.player.onAudioAction?(first.id, .create)
+        let plays = world.player.plays.count
+        world.player.onAudioAction?(first.id, .useEnhanced(true))
         await drainTasks()
-        #expect(ffmpegArguments().isEmpty)
-        #expect(enhancedFiles().isEmpty)
+        #expect(world.liveSessions.isEmpty)
+        #expect(world.player.plays.count == plays)
         controller.turnOff()
     }
 
-    /// The copy itself failing to play (a damaged file) deletes it, and the recovery plays the
-    /// stream instead of the same file again.
-    @Test func aDamagedCopyFallsBackToTheStream() async throws {
+    /// A failure reported by a filter already replaced (a late report from the previous
+    /// lecture's) isn't taken for the current one's: an expiry of the new stream still recovers.
+    @Test func aStaleFilterReportIsIgnored() async throws {
         defer { cleanUp() }
-        world.ffmpeg = try fakeFFmpeg("exit 0")
+        world.ffmpeg = fakeFFmpegPath
         let controller = await readyController()
-        let lecture = await playing(controller, "audio")
-        world.player.chooseAudio(.create)
-        await settle("copy ready") { world.player.audioState == .ready(inUse: false) }
+        _ = await playing(controller, "first")
         world.player.chooseAudio(.useEnhanced(true))
-        browser.streamResults[lecture.id] = [.success(stream(lecture.id))]
-        let plays = world.player.plays.count
-        world.player.failDuringPlayback(at: 600)
-        await settle("recovered") { world.player.plays.count == plays + 1 }
-        #expect(world.player.plays.last?.url == stream(lecture.id).url)
-        #expect(world.player.plays.last?.startAt == 600)
-        #expect(enhancedFiles().isEmpty)
-        #expect(world.player.audioState == .idle)
+        let old = try #require(world.liveSessions.last)
+        let second = await playing(controller, "second")
+        let current = try #require(world.liveSessions.last)
+        old.onFailure(.unavailable)
+        current.onFailure(.streamRefused)
+        browser.streamResults[second.id] = [.success(stream(second.id))]
+        world.player.failDuringPlayback(at: 300)
+        await settle("recovered") { world.liveSessions.count == 3 }
+        #expect(world.player.audioState == .on)
         controller.turnOff()
     }
 
@@ -4516,29 +4539,28 @@ private extension Result {
     var failure: Failure? { if case .failure(let error) = self { error } else { nil } }
 }
 
-/// What the player's Audio menu shows and does in each state of a lecture's enhanced copy.
+/// What the player's Audio menu shows and does in each state of a lecture's enhanced audio.
 @MainActor
 struct AudioMenuPresentationTests {
-    /// Every state has its own item and action; a disabled line never acts.
+    /// Every state has its own item and action; a disabled line never acts; only "on" is
+    /// checked, and a failure keeps the switch offered with the reason beneath it.
     @Test func eachStateShowsItsChoice() throws {
         #expect(RecordingPlayerPolicy.audioMenu(nil) == nil)
         let missing = try #require(RecordingPlayerPolicy.audioMenu(.needsFFmpeg))
         #expect(missing.main.action == nil)
         #expect(missing.main.title.contains("brew install ffmpeg"))
-        #expect(RecordingPlayerPolicy.audioMenu(.idle)?.main.action == .create)
-        let working = try #require(RecordingPlayerPolicy.audioMenu(.processing(fraction: 0.42)))
-        #expect(working.main.action == nil)
-        #expect(working.main.title.contains("42%"))
-        #expect(working.detail?.action == .cancel)
-        #expect(RecordingPlayerPolicy.audioMenu(.processing(fraction: nil))?.main.title.contains("%") == false)
-        let off = try #require(RecordingPlayerPolicy.audioMenu(.ready(inUse: false)))
+        #expect(missing.detail == nil)
+        let off = try #require(RecordingPlayerPolicy.audioMenu(.off))
         #expect(off.main.action == .useEnhanced(true))
         #expect(!off.main.checked)
-        let on = try #require(RecordingPlayerPolicy.audioMenu(.ready(inUse: true)))
+        #expect(off.detail == nil)
+        let on = try #require(RecordingPlayerPolicy.audioMenu(.on))
         #expect(on.main.action == .useEnhanced(false))
         #expect(on.main.checked)
+        #expect(on.main.title == off.main.title)
         let failed = try #require(RecordingPlayerPolicy.audioMenu(.failed(BilingualText("motivo", "reason"))))
-        #expect(failed.main.action == .create)
+        #expect(failed.main.action == .useEnhanced(true))
+        #expect(!failed.main.checked)
         #expect(failed.detail?.title == "motivo")
         #expect(failed.detail?.action == nil)
     }

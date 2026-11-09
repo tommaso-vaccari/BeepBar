@@ -1,14 +1,24 @@
 import Foundation
 
-// "Audio migliorato": a copy of a lecture with cleaner, steadier speech, made by the student's
-// own ffmpeg (Homebrew or MacPorts), on request, one lecture at a time.
+// "Audio migliorato": a lecture's audio with cleaner, steadier speech, filtered while it plays by
+// the student's own ffmpeg (Homebrew or MacPorts).
 //
-// Why a copy and not a live filter: the lecture is an HLS stream, and AVFoundation never hands an
+// Why ffmpeg and a local server: the lecture is an HLS stream, and AVFoundation never hands an
 // HLS item's audio to an `MTAudioProcessingTap` (probed on macOS 27 on 2026-11-09 against Apple's
 // public HLS sample: the tap was attached and received 0 frames while the item played), so there
-// is no native way to filter what AVPlayer plays. ffmpeg reads the stream once, copies the video
-// as is and re-encodes only the audio through `filterChain`; the player then switches between the
-// stream and the copy at the same position, in either direction, whenever the student chooses.
+// is no native way to filter what AVPlayer plays. Instead the app serves AVPlayer a playlist of
+// its own on 127.0.0.1; each 30-second segment is fetched from Webex as its byte range, the
+// video copied as is and only the audio filtered (`filterChain`), a fraction of a second of
+// work per segment. With the switch off the player plays Webex's stream directly.
+//
+// Why segments and not a whole copy (the first version, replaced on 2026-11-09): a copy of a
+// 2.5-hour lecture took about five minutes and 950 MB before the student heard anything.
+//
+// Seamless joins: each segment's audio is filtered with the previous and next segments around
+// it (`segmentArguments`), so the normalizer and the noise estimate see the same signal on both
+// sides of a join, and is then trimmed to exactly its own span on the lecture's clock
+// (`-copyts`, `atrim`). Measured on a synthetic lecture: level difference across a join 0.3–0.8
+// dB median, the same as inside a segment; without the following segment, up to 3.5 dB.
 //
 // ffmpeg isn't bundled (licence, size and signing of a third-party binary): BeepBar only looks for
 // it where package managers install it, and says how to get it when it isn't there.
@@ -56,50 +66,57 @@ public enum AudioEnhancement {
     /// model file ffmpeg doesn't ship.
     public static let filterChain = "highpass=f=90,lowpass=f=10000,afftdn=nr=15:nf=-50:tn=1,equalizer=f=250:t=q:w=1:g=-2,equalizer=f=3000:t=q:w=1.4:g=3,dynaudnorm=f=500:g=31:p=0.7:m=3,agate=threshold=0.035:ratio=4:range=0.12:attack=5:release=300:knee=4,afftdn=nr=6:nf=-50:tn=1,volume=8dB,alimiter=limit=0.8:level=disabled"
 
-    /// The protocols ffmpeg may open while reading the stream: the network ones HLS over https
-    /// needs. Not `file`, so a playlist can't make ffmpeg read a local file into the copy.
-    public static let protocolWhitelist = "https,tls,tcp,crypto"
-
-    /// ffmpeg's command line, without the executable. `input` is the stream (short-lived, tied to
-    /// the student's sign-in: never logged); `output` the partial file, renamed by the caller only
-    /// after a clean exit. Progress goes to stdout as `key=value` lines (`progressSeconds`);
-    /// stdin is closed so ffmpeg never waits for a key.
-    public static func arguments(input: URL, output: URL) -> [String] {
-        [
-            "-hide_banner", "-nostdin", "-nostats", "-loglevel", "error",
-            "-protocol_whitelist", protocolWhitelist,
-            "-i", input.absoluteString,
-            // The first video track if there is one (a voice-only recording has none), and the
-            // first audio track, which must exist.
-            "-map", "0:v:0?", "-map", "0:a:0",
-            "-c:v", "copy",
-            "-af", filterChain,
-            // 192 kb/s at 48 kHz: the filtered audio is encoded once more, so it gets a rate well
-            // above the stream's own (typically 64–128 kb/s), which keeps that generation
-            // inaudible. ffmpeg's own AAC encoder, present in every build.
-            "-c:a", "aac", "-b:a", "192k", "-ar", "48000",
-            "-movflags", "+faststart",
-            "-progress", "pipe:1",
-            "-f", "mp4", "-y", output.path,
-        ]
+    /// A Webex lecture as its playlist describes it: one fragmented MP4 (`file`), its init
+    /// section and its segments, each a byte range of that file with its length in seconds.
+    public struct ByteRangeLecture: Equatable, Sendable {
+        public struct Span: Equatable, Sendable {
+            public let offset: Int64
+            public let length: Int64
+            public init(offset: Int64, length: Int64) {
+                self.offset = offset
+                self.length = length
+            }
+            /// The HTTP `Range` header value for these bytes.
+            public var rangeHeader: String { "bytes=\(offset)-\(offset + length - 1)" }
+        }
+        public struct Segment: Equatable, Sendable {
+            public let span: Span
+            public let duration: Double
+            public init(span: Span, duration: Double) {
+                self.span = span
+                self.duration = duration
+            }
+        }
+        public let file: URL
+        public let initSection: Span
+        public let segments: [Segment]
     }
 
-    /// The one media file a playlist cuts into byte ranges, when that is all it is, or nil.
+    /// The largest segment accepted, in bytes: a 30-second segment of a lecture is 2–4 MB, so
+    /// anything this big is not one, and fetching it would cost the student's data plan.
+    public static let maximumSegmentBytes: Int64 = 64 * 1024 * 1024
+
+    /// The lecture behind `playlist` when it is the Webex layout, or nil.
     ///
-    /// Why: Webex serves each recording as a single fragmented MP4 that the playlist slices with
-    /// `EXT-X-BYTERANGE`. ffmpeg's HLS reader handles that badly: on a real 2.5-hour lecture
-    /// (2026-11-09) it wrote the first 30 seconds, then kept requesting the same range,
-    /// downloading hundreds of megabytes a minute without writing anything more, and the copy
-    /// never got past 0%. Read as the plain file it is, the same lecture streams through in
-    /// order. AVPlayer still plays the playlist: only ffmpeg's input changes.
-    ///
-    /// Only a media playlist whose init section (`EXT-X-MAP`) and every segment resolve to the
-    /// same URL qualifies; a master playlist, several files, or encryption (`EXT-X-KEY` other
-    /// than `NONE`, which needs the playlist's keys) keep the playlist as ffmpeg's input.
-    public static func singleMediaFile(playlist: String, at playlistURL: URL) -> URL? {
+    /// Webex serves each recording as a single fragmented MP4 that the playlist slices with
+    /// `EXT-X-BYTERANGE`, its init section in `EXT-X-MAP`. Only that qualifies: a master
+    /// playlist, several files, segments without a byte range, encryption (`EXT-X-KEY` other than
+    /// `NONE`), a non-https file or an implausible size keep enhanced audio unavailable, and the
+    /// player falls back to the stream. A byte range without `@offset` follows the previous one
+    /// (RFC 8216 §4.3.2.2).
+    public static func byteRangeLecture(playlist: String, at playlistURL: URL) -> ByteRangeLecture? {
         guard playlist.hasPrefix("#EXTM3U") else { return nil }
-        var resources = Set<URL>()
-        var segments = 0
+        var file: URL?
+        var initSection: ByteRangeLecture.Span?
+        var segments: [ByteRangeLecture.Segment] = []
+        var duration: Double?
+        var range: ByteRangeLecture.Span?
+        var nextOffset: Int64?
+        func same(_ url: URL) -> Bool {
+            if let file { return file == url }
+            file = url
+            return true
+        }
         for raw in playlist.split(whereSeparator: \.isNewline) {
             let line = raw.trimmingCharacters(in: .whitespaces)
             if line.isEmpty { continue }
@@ -107,17 +124,38 @@ public enum AudioEnhancement {
                 if line.hasPrefix("#EXT-X-STREAM-INF") || line.hasPrefix("#EXT-X-MEDIA:") { return nil }
                 if line.hasPrefix("#EXT-X-KEY"), !line.contains("METHOD=NONE") { return nil }
                 if line.hasPrefix("#EXT-X-MAP:") {
-                    guard let uri = quotedAttribute("URI", in: line), let url = URL(string: uri, relativeTo: playlistURL)?.absoluteURL else { return nil }
-                    resources.insert(url)
+                    guard initSection == nil, let uri = quotedAttribute("URI", in: line),
+                          let url = URL(string: uri, relativeTo: playlistURL)?.absoluteURL, same(url),
+                          let spec = quotedAttribute("BYTERANGE", in: line), let span = span(spec, after: nil) else { return nil }
+                    initSection = span
+                } else if line.hasPrefix("#EXTINF:") {
+                    let value = line.dropFirst("#EXTINF:".count).split(separator: ",", maxSplits: 1, omittingEmptySubsequences: false).first ?? ""
+                    guard let seconds = Double(value.trimmingCharacters(in: .whitespaces)), seconds > 0, seconds.isFinite else { return nil }
+                    duration = seconds
+                } else if line.hasPrefix("#EXT-X-BYTERANGE:") {
+                    guard let span = span(String(line.dropFirst("#EXT-X-BYTERANGE:".count)), after: nextOffset) else { return nil }
+                    range = span
                 }
                 continue
             }
-            guard let url = URL(string: line, relativeTo: playlistURL)?.absoluteURL else { return nil }
-            resources.insert(url)
-            segments += 1
+            guard let url = URL(string: line, relativeTo: playlistURL)?.absoluteURL, same(url),
+                  let seconds = duration, let span = range, span.length <= maximumSegmentBytes else { return nil }
+            segments.append(.init(span: span, duration: seconds))
+            nextOffset = span.offset + span.length
+            duration = nil
+            range = nil
         }
-        guard segments > 0, resources.count == 1, let file = resources.first, file.scheme == "https" else { return nil }
-        return file
+        guard let file, file.scheme == "https", let initSection, initSection.length <= maximumSegmentBytes, !segments.isEmpty else { return nil }
+        return ByteRangeLecture(file: file, initSection: initSection, segments: segments)
+    }
+
+    /// `length[@offset]`; without an offset, `after` (the previous range's end), or nil.
+    private static func span(_ spec: String, after: Int64?) -> ByteRangeLecture.Span? {
+        let parts = spec.trimmingCharacters(in: .whitespaces).split(separator: "@", omittingEmptySubsequences: false)
+        guard (1...2).contains(parts.count), let length = Int64(parts[0]), length > 0 else { return nil }
+        let offset = parts.count == 2 ? Int64(parts[1]) : after
+        guard let offset, offset >= 0 else { return nil }
+        return .init(offset: offset, length: length)
     }
 
     private static func quotedAttribute(_ name: String, in line: String) -> String? {
@@ -127,48 +165,119 @@ public enum AudioEnhancement {
         return String(rest[..<end])
     }
 
-    /// The media time ffmpeg has written, in seconds, from one `-progress` line, or nil for any
-    /// other line. ffmpeg writes `out_time_us` and, under a misleading name, `out_time_ms`, both
-    /// in microseconds; `N/A` (before the first packet) is nil.
-    public static func progressSeconds(line: String) -> TimeInterval? {
-        let parts = line.trimmingCharacters(in: .whitespacesAndNewlines).split(separator: "=", maxSplits: 1).map(String.init)
-        guard parts.count == 2, parts[0] == "out_time_us" || parts[0] == "out_time_ms", let micros = Int64(parts[1]), micros >= 0 else { return nil }
-        return TimeInterval(micros) / 1_000_000
-    }
-
-    /// The fraction done, 0…1, or nil when the lecture's length is unknown.
-    public static func fraction(written: TimeInterval, duration: TimeInterval?) -> Double? {
-        guard let duration, duration > 0, duration.isFinite else { return nil }
-        return min(max(written / duration, 0), 1)
-    }
-
-    /// How many enhanced copies are kept. A lecture's copy is about the size of the stream (the
-    /// video is copied): a few hundred megabytes. The oldest-used beyond this go first.
-    public static let keptCopies = 3
-
-    /// One file in the copies' folder.
-    public struct CachedCopy: Equatable, Sendable {
-        public let name: String
-        public let lastUsed: Date
-        public init(name: String, lastUsed: Date) {
-            self.name = name
-            self.lastUsed = lastUsed
+    /// The playlist AVPlayer gets from the local server: the lecture's segments, same lengths,
+    /// named `segmentName(_:)` relative to the playlist, as MPEG-TS (version 3: no byte ranges,
+    /// no init section), complete (`ENDLIST`), so AVPlayer can seek anywhere at once.
+    public static func proxyPlaylist(_ lecture: ByteRangeLecture) -> String {
+        let target = Int((lecture.segments.map(\.duration).max() ?? 1).rounded(.up))
+        var lines = ["#EXTM3U", "#EXT-X-VERSION:3", "#EXT-X-TARGETDURATION:\(target)", "#EXT-X-MEDIA-SEQUENCE:0", "#EXT-X-PLAYLIST-TYPE:VOD"]
+        for (index, segment) in lecture.segments.enumerated() {
+            lines.append("#EXTINF:\(String(format: "%.6f", segment.duration)),")
+            lines.append(segmentName(index))
         }
+        lines.append("#EXT-X-ENDLIST")
+        return lines.joined(separator: "\n") + "\n"
     }
 
-    /// The files to delete before a new copy is started, so the folder never holds more than
-    /// `keptCopies` finished copies including the new one: every leftover partial file (a quit or
-    /// a crash mid-way), then the least recently used copies. `keeping` (the lecture being
-    /// enhanced, or playing) is never chosen.
-    public static func evictions(_ files: [CachedCopy], keeping: Set<String> = [], limit: Int = keptCopies) -> [String] {
-        let partials = files.filter { $0.name.hasSuffix(partialSuffix) && !keeping.contains($0.name) }.map(\.name)
-        let finished = files.filter { $0.name.hasSuffix(copySuffix) && !$0.name.hasSuffix(partialSuffix) }
-        let kept = finished.filter { keeping.contains($0.name) }
-        let candidates = finished.filter { !keeping.contains($0.name) }.sorted { $0.lastUsed > $1.lastUsed }
-        let room = max(limit - 1 - kept.count, 0)
-        return partials + candidates.dropFirst(room).map(\.name)
+    public static let playlistName = "index.m3u8"
+    public static func segmentName(_ index: Int) -> String { "seg\(index).ts" }
+
+    /// The segment index a request names (`seg12.ts`), or nil for anything else.
+    public static func segmentIndex(_ name: String) -> Int? {
+        guard name.hasPrefix("seg"), name.hasSuffix(".ts") else { return nil }
+        let digits = name.dropFirst(3).dropLast(3)
+        guard !digits.isEmpty, digits.allSatisfy(\.isASCII), digits.allSatisfy(\.isNumber), digits.count < 8 else { return nil }
+        return Int(digits)
     }
 
-    public static let copySuffix = ".mp4"
-    public static let partialSuffix = ".partial.mp4"
+    /// The protocols ffmpeg may open: only the local files the app wrote and their
+    /// concatenation. Never the network: the app fetches every byte itself, bounded, so ffmpeg
+    /// can't be led by a file's contents to read anything else.
+    public static let protocolWhitelist = "file,concat"
+
+    /// ffmpeg reading `files` (absolute paths, the init section first) as one MP4.
+    public static func concatInput(_ files: [String]) -> String { "concat:" + files.joined(separator: "|") }
+
+    /// ffmpeg's command that reports where a fragment's audio starts on the lecture's clock: its
+    /// first audio packet, copied (no decoding, ~25 ms), written as `framecrc` to `output`
+    /// (`firstPacketSeconds`). `-copyts` keeps the timestamps the segments are trimmed on.
+    public static func probeArguments(input: String, output: String) -> [String] {
+        [
+            "-hide_banner", "-nostdin", "-nostats", "-loglevel", "error",
+            "-protocol_whitelist", protocolWhitelist,
+            "-copyts", "-i", input,
+            "-map", "0:a:0", "-c", "copy", "-frames:a", "1",
+            "-f", "framecrc", "-y", output,
+        ]
+    }
+
+    /// The first packet's time in seconds from a `framecrc` report: its `#tb 0: 1/48000` line
+    /// and the first packet line (`0, pts, dts, duration, size, crc`). Nil when either is missing.
+    public static func firstPacketSeconds(framecrc: String) -> Double? {
+        var timebase: (Double, Double)?
+        for raw in framecrc.split(whereSeparator: \.isNewline) {
+            let line = raw.trimmingCharacters(in: .whitespaces)
+            if line.hasPrefix("#tb 0:") {
+                let fraction = line.dropFirst("#tb 0:".count).trimmingCharacters(in: .whitespaces).split(separator: "/")
+                guard fraction.count == 2, let num = Double(fraction[0]), let den = Double(fraction[1]), num > 0, den > 0 else { return nil }
+                timebase = (num, den)
+            } else if !line.hasPrefix("#") {
+                let fields = line.split(separator: ",").map { $0.trimmingCharacters(in: .whitespaces) }
+                guard fields.count >= 3, fields[0] == "0", let (num, den) = timebase, let pts = Double(fields[1]) else { return nil }
+                return pts * num / den
+            }
+        }
+        return nil
+    }
+
+    /// ffmpeg's command for one segment, without the executable.
+    /// - `video`: the init section and this segment, read for the video, copied as is;
+    /// - `audio`: the init section and this segment with its neighbours (`audioContext`), read
+    ///   for the audio, filtered, then trimmed to `start..<end`: where this segment's audio
+    ///   starts and the next one's starts (`firstPacketSeconds`), or, for the last segment,
+    ///   its start plus its playlist length, so its audio doesn't run past the video;
+    /// - `-copyts`: both keep the lecture's own clock, so the segments line up end to end;
+    /// - MPEG-TS out, no mux delay (that would shift every segment by 0.7 s).
+    /// 192 kb/s at 48 kHz: the filtered audio is encoded once more, so it gets a rate well above
+    /// the stream's own (typically 64–128 kb/s), which keeps that generation inaudible. ffmpeg's
+    /// own AAC encoder, present in every build.
+    public static func segmentArguments(video: String, audio: String, start: Double, end: Double, output: String) -> [String] {
+        [
+            "-hide_banner", "-nostdin", "-nostats", "-loglevel", "error",
+            "-protocol_whitelist", protocolWhitelist,
+            "-copyts",
+            "-i", video,
+            "-i", audio,
+            // The first video track if there is one (a voice-only recording has none), and the
+            // first audio track, which must exist.
+            "-map", "0:v:0?", "-map", "1:a:0",
+            "-c:v", "copy",
+            "-af", filterChain + ",atrim=start=\(seconds(start)):end=\(seconds(end))",
+            "-c:a", "aac", "-b:a", "192k", "-ar", "48000",
+            "-muxdelay", "0", "-muxpreload", "0",
+            "-f", "mpegts", "-y", output,
+        ]
+    }
+
+    private static func seconds(_ value: Double) -> String { String(format: "%.6f", value) }
+
+    /// The segments whose audio goes into segment `index`'s filter: the next one always (the
+    /// normalizer looks ahead, and without it a join jumped by up to 3.5 dB), the previous one
+    /// only when `hasPrevious` (already fetched: the segment just played), so the first segment
+    /// after a seek needs one fetch less and starts sooner.
+    public static func audioContext(for index: Int, count: Int, hasPrevious: Bool) -> ClosedRange<Int> {
+        let first = hasPrevious && index > 0 ? index - 1 : index
+        let last = min(index + 1, count - 1)
+        return first...max(first, last)
+    }
+
+    /// Where segment `index`'s audio ends on the lecture's clock: the next segment's start, or,
+    /// for the last one, its own start plus its playlist length.
+    public static func audioEnd(index: Int, start: Double, nextStart: Double?, lecture: ByteRangeLecture) -> Double {
+        nextStart ?? start + lecture.segments[index].duration
+    }
+
+    /// Which segments a request for `index` keeps, cached or underway: the ones around it.
+    /// Anything else belongs to a position the student left (a seek), and its work is stopped.
+    public static func keptSegments(around index: Int) -> ClosedRange<Int> { max(0, index - 2)...(index + 2) }
 }

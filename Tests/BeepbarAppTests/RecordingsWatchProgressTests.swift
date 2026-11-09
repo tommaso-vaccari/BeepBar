@@ -1272,4 +1272,94 @@ struct RecordingsWatchProgressTests {
         #expect(try storedEntry("r\(count)") != nil)
         controller.turnOff()
     }
+
+    // MARK: Lessons added by their Webex link
+
+    private let manualLink = "https://politecnicomilano.webex.com/recordingservice/sites/politecnicomilano/recording/0123456789abcdef0123456789abcdef/playback"
+
+    /// What `recording`'s row shows, read as the page reads it.
+    private func row(_ recording: RecmanRecording, in controller: RecordingsController) -> RecordingsPresentation.WatchRow {
+        RecordingsPresentation.WatchValues(controller.watchProgress, canEdit: controller.canEditProgress).row(for: recording)
+    }
+
+    /// The sidebar's Watchlist count includes lessons added by link, not only bookmarks:
+    /// a Watchlist holding one of each reads 2. Guards against the count of bookmarks alone
+    /// (the reported "0" beside a Watchlist of added lessons).
+    @Test func theWatchlistCountIncludesAddedLessons() async throws {
+        defer { cleanUp() }
+        let controller = await listedController()
+        #expect(controller.watchlistCount == 0)
+        _ = try controller.addManualLesson(link: manualLink, title: "Guest", courseName: "").get()
+        #expect(controller.watchlistCount == 1)
+        let recording = try #require(controller.listing(for: course)?.recordings?.first)
+        controller.toggleWatchlist(recording, courseName: "Synthetic")
+        #expect(controller.watchlistCount == 2)
+    }
+
+    /// A lesson added by its link gets the bar and the checkbox an archive lecture has: known
+    /// (0 %) as soon as it is added, moved by ticks in memory only, saved at a pause, ticked and
+    /// un-ticked by the student, and all of it back after a restart. Saved with the lessons,
+    /// never in the store's course-keyed table (no progress write reaches the history actor).
+    /// Guards against the row staying "unknown" (no bar, no checkbox, the reported bug), a
+    /// checkpoint or tick dropped for want of a course key, a write on every tick, and progress
+    /// that lives only in memory.
+    @Test func aManualLessonShowsAndKeepsItsProgress() async throws {
+        defer { cleanUp() }
+        let controller = await listedController()
+        let storeWrites = gates.calls
+        let lesson = try controller.addManualLesson(link: manualLink, title: "Guest", courseName: "").get()
+        #expect(row(lesson.recording, in: controller) == RecordingsPresentation.WatchRow(known: true, fraction: 0, completed: false, pending: false, canEdit: true))
+
+        await play(lesson.id, on: controller, lesson.recording)
+        let saved = try #require(defaults.data(forKey: RecordingsController.manualLessonsKey(owner: 42)))
+        defaults.resetWrites()
+        world.player.tick(at: 1_500)
+        #expect(row(lesson.recording, in: controller).barValue == 0.25)
+        #expect(defaults.writes.isEmpty, "a tick must not write: \(defaults.writes)")
+        #expect(defaults.data(forKey: RecordingsController.manualLessonsKey(owner: 42)) == saved)
+        world.player.pause(at: 3_000)
+        #expect(controller.manualLessons.lesson(id: lesson.id)?.progress?.furthest == 0.5)
+        #expect(row(lesson.recording, in: controller).barValue == 0.5)
+        world.player.close()
+        #expect(controller.manualLessons.lesson(id: lesson.id)?.progress?.isCompleted == false, "closed at 50 %: not done")
+
+        controller.setDone(lesson.recording, true)
+        #expect(row(lesson.recording, in: controller).isOn)
+        #expect(!controller.watchProgress.isPending(lesson.recording), "the checkbox must not stay disabled")
+        await controller.settleWatchProgress()
+        #expect(gates.calls == storeWrites, "a manual lesson's progress must stay out of the course-keyed store")
+        controller.turnOff(preservingResumePoints: true)
+
+        defaults.set(true, forKey: RecordingsController.enabledKey)
+        let restored = makeController()
+        restored.pageAppeared()
+        #expect(row(lesson.recording, in: restored) == RecordingsPresentation.WatchRow(known: true, fraction: 0.5, completed: true, pending: false, canEdit: true))
+        restored.setDone(lesson.recording, false)
+        let unticked = try #require(restored.manualLessons.lesson(id: lesson.id)?.progress)
+        #expect(!unticked.isCompleted && unticked.autoCompletionBlocked && unticked.furthest == 0.5)
+        restored.turnOff()
+    }
+
+    /// Another account sees neither the lesson nor its progress: the rows' identities become
+    /// known only for the lessons' owner. Guards against publishing manual progress for whoever
+    /// is signed in, or keeping it across an account change.
+    @Test func manualProgressStaysWithItsAccount() async throws {
+        defer { cleanUp() }
+        let controller = await listedController()
+        let lesson = try controller.addManualLesson(link: manualLink, title: "", courseName: "").get()
+        controller.setDone(lesson.recording, true)
+        #expect(row(lesson.recording, in: controller).isOn)
+
+        world.owner = 99
+        controller.webBeepAccountChanged(to: 99)
+        #expect(!row(lesson.recording, in: controller).checkboxVisible, "the old account's mark is still on screen")
+        #expect(controller.manualLessons.lessons.isEmpty)
+        controller.setDone(lesson.recording, false)
+        world.owner = 42
+        let back = makeController()
+        back.pageAppeared()
+        #expect(back.manualLessons.lesson(id: lesson.id)?.progress?.isCompleted == true, "another account changed this account's lesson")
+        back.turnOff()
+        controller.turnOff()
+    }
 }

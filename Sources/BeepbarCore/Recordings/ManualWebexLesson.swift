@@ -24,6 +24,14 @@ public struct ManualWebexLesson: Codable, Equatable, Sendable, Identifiable {
     /// The Webex player link, as `normalizedLink` accepted it.
     public let link: URL
     public let addedAt: Date
+    /// The lesson's length in seconds, as Webex's stream answer gave it at a Play; nil until
+    /// then. Shown as the row's length and used for the hours left, like Recman's minutes.
+    public var durationSeconds: Double?
+    /// How much of it was watched, and whether it is done: the same entry and rules
+    /// (`RecordingWatchProgress`) as an archive lecture's, kept here because the store's
+    /// `progress` table is keyed by course (`RecmanCourseKey`), which a manual lesson has none of.
+    /// Nil while untouched.
+    public var progress: RecordingWatchEntry?
 
     /// The course code of every manual lesson's `recording`: deliberately not six digits.
     public static let courseCode = "manual"
@@ -39,11 +47,51 @@ public struct ManualWebexLesson: Codable, Equatable, Sendable, Identifiable {
         self.addedAt = addedAt
     }
 
+    /// `durationSeconds` and `progress` were added after the first lessons were saved (by a
+    /// build that never shipped, 2026-11-09): absent, they decode as nil. Each is decoded on
+    /// its own and a damaged one reads as nil, so it costs that lesson's length or progress,
+    /// never every lesson (an undecodable list is shown as none, `manualLessonsUnreadable`).
+    /// A rollback to that build drops both fields at its next save; the lessons stay.
+    public init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        id = try container.decode(String.self, forKey: .id)
+        title = try container.decode(String.self, forKey: .title)
+        courseName = try container.decode(String.self, forKey: .courseName)
+        link = try container.decode(URL.self, forKey: .link)
+        addedAt = try container.decode(Date.self, forKey: .addedAt)
+        durationSeconds = (try? container.decodeIfPresent(Double.self, forKey: .durationSeconds)).flatMap { $0 }.flatMap(Self.plausibleDuration)
+        progress = (try? container.decodeIfPresent(RecordingWatchEntry.self, forKey: .progress)).flatMap { $0 }
+    }
+
     /// The row the Watchlist and the player work with. `kind` "Webex" is what an untitled lesson
-    /// shows (`RecmanPresentation.title`); the duration is unknown until the player reads it.
+    /// shows (`RecmanPresentation.title`). The duration is Recman's form ("97 min",
+    /// `RecmanRecording.minutes`) once a Play has read it, empty until then.
     public var recording: RecmanRecording {
-        RecmanRecording(id: id, courseCode: Self.courseCode, academicYear: 0, title: title, recordedAt: addedAt,
-                        kind: "Webex", duration: "", size: nil, previewURL: link)
+        let minutes = durationSeconds.map { Int(($0 / 60).rounded()) }
+        return RecmanRecording(id: id, courseCode: Self.courseCode, academicYear: 0, title: title, recordedAt: addedAt,
+                               kind: "Webex", duration: minutes.map { "\($0) min" } ?? "", size: nil, previewURL: link)
+    }
+
+    /// What a Play learned from Webex's answer: its title when the student gave none, and the
+    /// length. A title the student typed is never replaced. Returns whether anything changed.
+    @discardableResult
+    public mutating func learn(title streamTitle: String?, duration: Double?) -> Bool {
+        var changed = false
+        if title.isEmpty, let streamTitle, case let cleaned = Self.cleaned(streamTitle), !cleaned.isEmpty {
+            title = cleaned
+            changed = true
+        }
+        if let duration = duration.flatMap(Self.plausibleDuration), duration != durationSeconds {
+            durationSeconds = duration
+            changed = true
+        }
+        return changed
+    }
+
+    /// A length taken at face value: finite, positive, at most a day
+    /// (`RecmanRecording.maxPlausibleMinutes`); anything else is an unknown length.
+    static func plausibleDuration(_ seconds: Double) -> Double? {
+        seconds.isFinite && seconds > 0 && seconds <= Double(RecmanRecording.maxPlausibleMinutes * 60) ? seconds : nil
     }
 
     /// Whether `recording` is a manual lesson's row whose link is still one BeepBar follows.
@@ -122,5 +170,18 @@ public struct ManualWebexLessons: Codable, Equatable, Sendable {
 
     public func contains(id: String) -> Bool {
         lessons.contains { $0.id == id }
+    }
+
+    /// The lesson `id`, nil when it isn't in the list.
+    public func lesson(id: String) -> ManualWebexLesson? {
+        lessons.first { $0.id == id }
+    }
+
+    /// Replaces the lesson with the same id; false when it isn't in the list (removed meanwhile).
+    @discardableResult
+    public mutating func replace(_ lesson: ManualWebexLesson) -> Bool {
+        guard let index = lessons.firstIndex(where: { $0.id == lesson.id }) else { return false }
+        lessons[index] = lesson
+        return true
     }
 }

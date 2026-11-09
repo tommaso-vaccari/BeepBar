@@ -599,6 +599,11 @@ struct RecordingsListing: Equatable {
     private var manualLessonsUnreadable = false
     nonisolated static func manualLessonsKey(owner: Int) -> String { "io.github.tvaccari.beepbar.recordings-manual.v1.\(owner)" }
 
+    /// The sidebar's count beside "Watchlist": everything the Watchlist lists, bookmarks and
+    /// lessons added by link (`watchlistEntries` shows both). It counted bookmarks only, so a
+    /// Watchlist of added lessons read "0" (2026-11-09).
+    var watchlistCount: Int { study.bookmarks.count + manualLessons.lessons.count }
+
     /// Account isolation applies even when there is no saved Polimi session to invalidate.
     private func loadStudy() {
         let owner = isEnabled ? ownerUserID() : nil
@@ -617,6 +622,7 @@ struct RecordingsListing: Equatable {
                 studyProblem = BilingualText("Le lezioni aggiunte con un link Webex non sono leggibili. I dati originali sono stati conservati.", "The lessons added with a Webex link couldn't be read. The original data has been preserved.")
             }
         }
+        publishManualProgress()
         guard let owner, let data = defaults.data(forKey: Self.studyKey(owner: owner)) else { return }
         do { study = try PropertyListDecoder().decode(RecordingsStudyState.self, from: data) }
         catch {
@@ -706,6 +712,7 @@ struct RecordingsListing: Equatable {
             let data = try PropertyListEncoder().encode(updated)
             defaults.set(data, forKey: Self.manualLessonsKey(owner: owner))
             manualLessons = updated
+            publishManualProgress()
             return true
         } catch {
             return false
@@ -722,6 +729,76 @@ struct RecordingsListing: Equatable {
         if !saveManualLessons(updated, owner: owner) {
             studyProblem = BilingualText("Non è stato possibile salvare la watchlist. Riprova.", "Couldn't save the watchlist. Try again.")
         }
+    }
+
+    /// The account the manual lessons on screen belong to, when it may also write them now:
+    /// the lessons' owner (`studyOwner`), still the connected WeBeep account, and the one
+    /// watch progress is written for (`resumeOwner`). Checked at the point of every write.
+    private var manualLessonsWriter: Int? {
+        guard canAddManualLesson, let owner = studyOwner, owner == ownerUserID(), owner == resumeOwner() else { return nil }
+        return owner
+    }
+
+    /// Puts the manual lessons' saved progress in the window's model (`watchProgress`), so
+    /// their rows show a bar and a checkbox like an archive lecture's. Their identities become
+    /// known only for the account that owns them (`manualLessonsWriter`). Called whenever the
+    /// lessons or the model change wholesale: loaded, saved, or the model reset.
+    private func publishManualProgress() {
+        guard manualLessonsWriter != nil, !manualLessons.lessons.isEmpty else { return }
+        var entries: [String: RecordingWatchEntry] = [:]
+        let identities = manualLessons.lessons.map { lesson -> String in
+            let identity = RecordingsStudyState.identity(lesson.recording)
+            entries[identity] = lesson.progress
+            return identity
+        }
+        watchProgress.setEntries(entries, for: identities)
+    }
+
+    /// Forgets the window's progress model, then puts back the manual lessons' (which belong to
+    /// the account `studyOwner` still names; another account's were dropped by `loadStudy`).
+    private func resetWatchProgress() {
+        watchProgress.reset()
+        publishManualProgress()
+    }
+
+    /// A progress event on a manual lesson: the same rules as the store's
+    /// (`RecordingWatchProgress.applyCheckpoint` / `setManual`), saved with the lessons, at once
+    /// rather than on the store's write chain (they are a separate key, which nothing else
+    /// writes). Like the store, nothing is written when nothing changes, and never on a tick:
+    /// only checkpoints and the checkbox reach here. The lesson stays out of everything keyed by
+    /// course (summaries, the menu bar, acknowledgements).
+    private func applyManualProgress(_ event: RecordingProgressEvent, to recording: RecmanRecording, owner: Int) {
+        let identity = RecordingsStudyState.identity(recording)
+        let isTick = if case .manual = event { true } else { false }
+        defer { if isTick { watchProgress.setPending(false, for: identity) } }
+        guard let writer = manualLessonsWriter, writer == owner, var lesson = manualLessons.lesson(id: recording.id) else { return }
+        // An ended session's position now lives in the entry: as in `commitProgress`.
+        if case .checkpoint(_, true) = event, sessions[recording.id] == nil { watchProgress.setLive(nil, for: identity) }
+        let new: RecordingWatchEntry?
+        switch event {
+        case .checkpoint(let session, let closes): new = RecordingWatchProgress.applyCheckpoint(lesson.progress, session: session, closes: closes)
+        case .manual(let done): new = RecordingWatchProgress.setManual(lesson.progress, done: done)
+        }
+        guard let new else { return }
+        lesson.progress = new
+        var updated = manualLessons
+        updated.replace(lesson)
+        guard saveManualLessons(updated, owner: owner) else {
+            if isTick { studyProblem = BilingualText("Non è stato possibile salvare la watchlist. Riprova.", "Couldn't save the watchlist. Try again.") }
+            log.error("Couldn't save a manual lesson's progress")
+            return
+        }
+    }
+
+    /// What a Play of a manual lesson learned from Webex (`ManualWebexLesson.learn`): its title
+    /// when the student gave none, and its length, saved so the row shows both from now on.
+    /// Only from a fresh stream answer, and only for the account that owns the lesson.
+    private func learnManualDetails(of recording: RecmanRecording, from stream: RecordingStream) {
+        guard ManualWebexLesson.isManual(recording), let owner = manualLessonsWriter,
+              var lesson = manualLessons.lesson(id: recording.id), lesson.learn(title: stream.title, duration: stream.duration) else { return }
+        var updated = manualLessons
+        updated.replace(lesson)
+        if !saveManualLessons(updated, owner: owner) { log.error("Couldn't save what a Play learned of a manual lesson") }
     }
 
     func toggleWatchlist(_ recording: RecmanRecording, courseName: String) {
@@ -880,7 +957,7 @@ struct RecordingsListing: Equatable {
             forgetEmailOptOut()
             discardSessionFile()
         } else {
-            watchProgress.reset()
+            resetWatchProgress()
         }
         if isEnabled { access = .needsSignIn(nil) }
     }
@@ -1305,7 +1382,7 @@ struct RecordingsListing: Equatable {
     /// in `commitProgress`), and the persisted menu summary.
     private func forgetSeen() {
         for key in listings.keys { listings[key]?.seenIDs = nil }
-        watchProgress.reset()
+        resetWatchProgress()
         sessions = [:]
         unsavedCheckpoints = [:]
         untickCounts = [:]
@@ -1816,6 +1893,7 @@ struct RecordingsListing: Equatable {
         if let enhanced {
             enhancedAudioInUse = enhanced
         } else {
+            learnManualDetails(of: recording, from: stream)
             // A new stream: whatever filtered the previous one reads an address now replaced.
             audioEnhancer?.stop()
             enhancedAudioInUse = false
@@ -2219,8 +2297,9 @@ struct RecordingsListing: Equatable {
     /// queued behind the un-tick must already carry the reset session.
     func setDone(_ recording: RecmanRecording, _ done: Bool) {
         // The key first: a recording without a valid course key can't be written, and must not
-        // leave its checkbox pending forever.
-        guard let owner = resumeOwner(), Self.courseKey(of: recording) != nil else { return }
+        // leave its checkbox pending forever. A manual lesson has none and is saved with the
+        // lessons instead (`applyManualProgress`, which clears the pending state itself).
+        guard let owner = resumeOwner(), Self.courseKey(of: recording) != nil || ManualWebexLesson.isManual(recording) else { return }
         let identity = RecordingsStudyState.identity(recording)
         guard !watchProgress.pending.contains(identity) else { return }
         if !done {
@@ -2314,7 +2393,10 @@ struct RecordingsListing: Equatable {
     /// must reach the old (invalidated) actor and be refused, never the next namespace. The
     /// owner travels with the event too and is checked again at commit (`isCurrentIdentity`).
     private func enqueueProgress(_ event: RecordingProgressEvent, for recording: RecmanRecording, owner: Int, serial: Int?, untickEpoch: Int) {
-        guard let key = Self.courseKey(of: recording) else { return }
+        guard let key = Self.courseKey(of: recording) else {
+            if ManualWebexLesson.isManual(recording) { applyManualProgress(event, to: recording, owner: owner) }
+            return
+        }
         let history = seenHistory
         let reset = historyResetTask
         let previous = progressChain

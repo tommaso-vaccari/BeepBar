@@ -2179,6 +2179,36 @@ struct RecordingsControllerTests {
         controller.turnOff()
     }
 
+    /// The student only pastes the link: the first Play names an untitled lesson after Webex's
+    /// recording and gives it its length, saved, so the row reads them from then on (also after
+    /// a restart). A title the student typed stays. Guards against a lesson that stays "Webex"
+    /// with no length forever, and against Webex's name overwriting the student's.
+    @Test func aPlayNamesAnUntitledLessonAndGivesItsLength() async throws {
+        defer { cleanUp() }
+        let controller = await readyController()
+        let lesson = try controller.addManualLesson(link: manualLink, title: "", courseName: "").get()
+        browser.streamResults[lesson.id] = [.success(stream(lesson.id))]
+        controller.play(lesson.recording)
+        await settle("lecture playing") { world.player.plays.count == 1 }
+        let learned = try #require(controller.manualLessons.lesson(id: lesson.id))
+        #expect(learned.title == "Webex \(lesson.id)")
+        #expect(learned.recording.duration == "100 min")
+        #expect(RecordingsStudyState.identity(learned.recording) == RecordingsStudyState.identity(lesson.recording))
+        let restored = makeController(useDefault: true)
+        restored.pageAppeared()
+        #expect(restored.manualLessons.lesson(id: lesson.id) == learned)
+        restored.turnOff()
+
+        let typedLink = manualLink.replacingOccurrences(of: "0123456789abcdef0123456789abcdef", with: "fedcba9876543210fedcba9876543210")
+        let typed = try controller.addManualLesson(link: typedLink, title: "Guest lecture", courseName: "").get()
+        browser.streamResults[typed.id] = [.success(stream(typed.id))]
+        controller.play(typed.recording)
+        await settle("second lecture playing") { world.player.plays.count == 2 }
+        #expect(controller.manualLessons.lesson(id: typed.id)?.title == "Guest lecture")
+        #expect(controller.manualLessons.lesson(id: typed.id)?.recording.minutes == 100)
+        controller.turnOff()
+    }
+
     // MARK: Enhanced audio
 
     private let fakeFFmpegPath = URL(fileURLWithPath: "/opt/homebrew/bin/ffmpeg")

@@ -81,4 +81,41 @@ struct AudioEnhancementTests {
         #expect(Set(AudioEnhancement.evictions(files, keeping: ["a.mp4"], limit: 3)) == ["b.mp4", "d.partial.mp4"])
         #expect(AudioEnhancement.evictions([], keeping: [], limit: 3).isEmpty)
     }
+
+    /// The Webex layout: one fragmented MP4 sliced by byte ranges, with its init section, gives
+    /// that file, resolved against the playlist's address (its query is the playlist's own).
+    /// Anything else (a master playlist, several files, encryption, not a playlist, no segments)
+    /// keeps the playlist. Guards against handing ffmpeg a wrong or partial input.
+    @Test func aByteRangePlaylistResolvesToItsFile() {
+        let playlistURL = URL(string: "https://cdn.example.test/rec/abc/playlist.m3u8?token=t")!
+        let webex = """
+        #EXTM3U
+        #EXT-X-TARGETDURATION:30
+        #EXT-X-VERSION:6
+        #EXT-X-MEDIA-SEQUENCE:1
+        #EXT-X-INDEPENDENT-SEGMENTS
+        #EXT-X-MAP:URI="merge_0_9.mp4",BYTERANGE="1438@0"
+        #EXTINF:30
+        #EXT-X-BYTERANGE:3174988@5614
+        merge_0_9.mp4
+        #EXTINF:30
+        #EXT-X-BYTERANGE:2349354@3180602
+        merge_0_9.mp4
+        #EXT-X-ENDLIST
+        """
+        #expect(AudioEnhancement.singleMediaFile(playlist: webex, at: playlistURL) == URL(string: "https://cdn.example.test/rec/abc/merge_0_9.mp4"))
+        let crlf = webex.replacingOccurrences(of: "\n", with: "\r\n")
+        #expect(AudioEnhancement.singleMediaFile(playlist: crlf, at: playlistURL) == URL(string: "https://cdn.example.test/rec/abc/merge_0_9.mp4"))
+
+        let segmented = "#EXTM3U\n#EXTINF:10\nseg1.ts\n#EXTINF:10\nseg2.ts\n"
+        let otherInit = webex.replacingOccurrences(of: "URI=\"merge_0_9.mp4\"", with: "URI=\"init.mp4\"")
+        let master = "#EXTM3U\n#EXT-X-STREAM-INF:BANDWIDTH=800000\nmerge_0_9.mp4\n"
+        let encrypted = webex.replacingOccurrences(of: "#EXT-X-INDEPENDENT-SEGMENTS", with: "#EXT-X-KEY:METHOD=AES-128,URI=\"key\"")
+        let insecure = webex.replacingOccurrences(of: "merge_0_9.mp4", with: "http://cdn.example.test/merge_0_9.mp4")
+        for playlist in [segmented, otherInit, master, encrypted, insecure, "#EXTM3U\n#EXT-X-ENDLIST\n", "<html>merge_0_9.mp4</html>"] {
+            #expect(AudioEnhancement.singleMediaFile(playlist: playlist, at: playlistURL) == nil)
+        }
+        let clearKey = webex.replacingOccurrences(of: "#EXT-X-INDEPENDENT-SEGMENTS", with: "#EXT-X-KEY:METHOD=NONE")
+        #expect(AudioEnhancement.singleMediaFile(playlist: clearKey, at: playlistURL) != nil)
+    }
 }

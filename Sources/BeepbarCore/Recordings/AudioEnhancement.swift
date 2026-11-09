@@ -84,6 +84,49 @@ public enum AudioEnhancement {
         ]
     }
 
+    /// The one media file a playlist cuts into byte ranges, when that is all it is, or nil.
+    ///
+    /// Why: Webex serves each recording as a single fragmented MP4 that the playlist slices with
+    /// `EXT-X-BYTERANGE`. ffmpeg's HLS reader handles that badly: on a real 2.5-hour lecture
+    /// (2026-11-09) it wrote the first 30 seconds, then kept requesting the same range,
+    /// downloading hundreds of megabytes a minute without writing anything more, and the copy
+    /// never got past 0%. Read as the plain file it is, the same lecture streams through in
+    /// order. AVPlayer still plays the playlist: only ffmpeg's input changes.
+    ///
+    /// Only a media playlist whose init section (`EXT-X-MAP`) and every segment resolve to the
+    /// same URL qualifies; a master playlist, several files, or encryption (`EXT-X-KEY` other
+    /// than `NONE`, which needs the playlist's keys) keep the playlist as ffmpeg's input.
+    public static func singleMediaFile(playlist: String, at playlistURL: URL) -> URL? {
+        guard playlist.hasPrefix("#EXTM3U") else { return nil }
+        var resources = Set<URL>()
+        var segments = 0
+        for raw in playlist.split(whereSeparator: \.isNewline) {
+            let line = raw.trimmingCharacters(in: .whitespaces)
+            if line.isEmpty { continue }
+            if line.hasPrefix("#") {
+                if line.hasPrefix("#EXT-X-STREAM-INF") || line.hasPrefix("#EXT-X-MEDIA:") { return nil }
+                if line.hasPrefix("#EXT-X-KEY"), !line.contains("METHOD=NONE") { return nil }
+                if line.hasPrefix("#EXT-X-MAP:") {
+                    guard let uri = quotedAttribute("URI", in: line), let url = URL(string: uri, relativeTo: playlistURL)?.absoluteURL else { return nil }
+                    resources.insert(url)
+                }
+                continue
+            }
+            guard let url = URL(string: line, relativeTo: playlistURL)?.absoluteURL else { return nil }
+            resources.insert(url)
+            segments += 1
+        }
+        guard segments > 0, resources.count == 1, let file = resources.first, file.scheme == "https" else { return nil }
+        return file
+    }
+
+    private static func quotedAttribute(_ name: String, in line: String) -> String? {
+        guard let start = line.range(of: name + "=\"") else { return nil }
+        let rest = line[start.upperBound...]
+        guard let end = rest.firstIndex(of: "\"") else { return nil }
+        return String(rest[..<end])
+    }
+
     /// The media time ffmpeg has written, in seconds, from one `-progress` line, or nil for any
     /// other line. ffmpeg writes `out_time_us` and, under a misleading name, `out_time_ms`, both
     /// in microseconds; `N/A` (before the first packet) is nil.

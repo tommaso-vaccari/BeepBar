@@ -81,16 +81,20 @@ extension RecordingPlayerPolicy {
     private let directory: () -> URL
     private let fileManager: FileManager
     private let makeProcess: () -> Process
+    private let resolveInput: @Sendable (URL) async -> URL
 
+    /// A copy underway. It first finds what ffmpeg should read (`resolving`, a short playlist
+    /// fetch, `process` still nil), then runs ffmpeg (`process` set, `resolving` nil).
     private struct Job {
         let key: String
-        let process: Process
+        var process: Process?
+        var resolving: Task<Void, Never>?
         let partial: URL
         let final: URL
         let duration: TimeInterval?
         var fraction: Double?
         var cancelled = false
-        let terminationObserver: NSObjectProtocol
+        var terminationObserver: NSObjectProtocol?
     }
     private var job: Job?
     /// The last failure per key, until the next attempt.
@@ -99,11 +103,42 @@ extension RecordingPlayerPolicy {
     init(locateFFmpeg: @escaping () -> URL? = { AudioEnhancement.locateFFmpeg() },
          directory: @escaping () -> URL = AudioEnhancer.defaultDirectory,
          fileManager: FileManager = .default,
-         makeProcess: @escaping () -> Process = { Process() }) {
+         makeProcess: @escaping () -> Process = { Process() },
+         resolveInput: @escaping @Sendable (URL) async -> URL = AudioEnhancer.resolveInput) {
         self.locateFFmpeg = locateFFmpeg
         self.directory = directory
         self.fileManager = fileManager
         self.makeProcess = makeProcess
+        self.resolveInput = resolveInput
+    }
+
+    /// What ffmpeg reads for `stream`: the single file behind a byte-range playlist
+    /// (`AudioEnhancement.singleMediaFile`, the Webex case), otherwise the playlist itself. Any
+    /// failure here (network, an unexpected answer) falls back to the playlist, which is what
+    /// ffmpeg read before: this step can make a copy faster, never fail one.
+    ///
+    /// Bounded: an ephemeral session (no cookies or cache written), 15 s, at most 4 MB of
+    /// playlist (a 2.5-hour lecture's is about 40 KB). The address is never logged.
+    nonisolated static func resolveInput(_ stream: URL) async -> URL {
+        guard stream.scheme == "https" else { return stream }
+        let configuration = URLSessionConfiguration.ephemeral
+        configuration.timeoutIntervalForRequest = 15
+        configuration.timeoutIntervalForResource = 15
+        let session = URLSession(configuration: configuration)
+        defer { session.finishTasksAndInvalidate() }
+        let limit = 4 * 1024 * 1024
+        guard let (bytes, response) = try? await session.bytes(from: stream),
+              let http = response as? HTTPURLResponse, http.statusCode == 200,
+              response.expectedContentLength <= Int64(limit) else { return stream }
+        var data = Data()
+        do {
+            for try await byte in bytes {
+                data.append(byte)
+                if data.count > limit { return stream }
+            }
+        } catch { return stream }
+        guard let text = String(data: data, encoding: .utf8) else { return stream }
+        return AudioEnhancement.singleMediaFile(playlist: text, at: response.url ?? stream) ?? stream
     }
 
     /// `~/Library/Caches/<bundle id>/EnhancedAudio`: a cache, since every copy can be made again
@@ -161,9 +196,24 @@ extension RecordingPlayerPolicy {
             fail(key, BilingualText("Non è stato possibile preparare la cartella per l'audio migliorato.", "Couldn't prepare the folder for enhanced audio."))
             return
         }
+        let resolving = Task { @MainActor [weak self, resolveInput] in
+            let input = await resolveInput(stream)
+            guard !Task.isCancelled else { return }
+            self?.launch(key: key, ffmpeg: ffmpeg, input: input)
+        }
+        job = Job(key: key, process: nil, resolving: resolving, partial: partial, final: final, duration: duration, fraction: duration == nil ? nil : 0)
+        Self.log.notice("Enhanced audio started")
+        onChange?(key)
+    }
+
+    /// Second step of `start`: runs ffmpeg on `input` for the job still waiting on it.
+    private func launch(key: String, ffmpeg: URL, input: URL) {
+        guard var current = job, current.key == key, current.process == nil, !current.cancelled else { return }
+        current.resolving = nil
+        let partial = current.partial
         let process = makeProcess()
         process.executableURL = ffmpeg
-        process.arguments = AudioEnhancement.arguments(input: stream, output: partial)
+        process.arguments = AudioEnhancement.arguments(input: input, output: partial)
         process.standardInput = FileHandle.nullDevice
         // stderr is discarded on purpose: ffmpeg's errors repeat the input address, which carries
         // the student's sign-in. Only the exit status is kept.
@@ -189,35 +239,43 @@ extension RecordingPlayerPolicy {
             try process.run()
         } catch {
             output.fileHandleForReading.readabilityHandler = nil
+            job = nil
             fail(key, BilingualText("Non è stato possibile avviare ffmpeg.", "Couldn't start ffmpeg."))
             return
         }
         let pid = process.processIdentifier
         // Synchronous on the posting thread (queue nil): one kill, nothing else.
-        let observer = NotificationCenter.default.addObserver(forName: NSApplication.willTerminateNotification, object: nil, queue: nil) { _ in
+        current.terminationObserver = NotificationCenter.default.addObserver(forName: NSApplication.willTerminateNotification, object: nil, queue: nil) { _ in
             kill(pid, SIGTERM)
         }
-        job = Job(key: key, process: process, partial: partial, final: final, duration: duration, fraction: duration == nil ? nil : 0, terminationObserver: observer)
-        Self.log.notice("Enhanced audio started")
-        onChange?(key)
+        current.process = process
+        job = current
     }
 
     /// Stops the running job, if any; its partial file is removed when ffmpeg has exited.
     func cancel() {
         guard var current = job, !current.cancelled else { return }
+        guard let process = current.process else {
+            // Still finding the input: nothing written yet, so the job just ends here.
+            current.resolving?.cancel()
+            job = nil
+            onChange?(current.key)
+            return
+        }
         current.cancelled = true
         job = current
-        current.process.terminate()
+        process.terminate()
     }
 
     /// Cancels the job and deletes every copy: "Forget this account's study data", or the
     /// account going away.
     func removeAll() {
         if let current = job {
-            NotificationCenter.default.removeObserver(current.terminationObserver)
-            current.process.terminationHandler = nil
-            (current.process.standardOutput as? Pipe)?.fileHandleForReading.readabilityHandler = nil
-            current.process.terminate()
+            current.resolving?.cancel()
+            if let observer = current.terminationObserver { NotificationCenter.default.removeObserver(observer) }
+            current.process?.terminationHandler = nil
+            (current.process?.standardOutput as? Pipe)?.fileHandleForReading.readabilityHandler = nil
+            current.process?.terminate()
             job = nil
             onChange?(current.key)
         }
@@ -249,8 +307,8 @@ extension RecordingPlayerPolicy {
     private func finished(key: String, status: Int32, reason: Process.TerminationReason) {
         guard let current = job, current.key == key else { return }
         job = nil
-        NotificationCenter.default.removeObserver(current.terminationObserver)
-        (current.process.standardOutput as? Pipe)?.fileHandleForReading.readabilityHandler = nil
+        if let observer = current.terminationObserver { NotificationCenter.default.removeObserver(observer) }
+        (current.process?.standardOutput as? Pipe)?.fileHandleForReading.readabilityHandler = nil
         if current.cancelled || reason != .exit || status != 0 {
             try? fileManager.removeItem(at: current.partial)
             if !current.cancelled {

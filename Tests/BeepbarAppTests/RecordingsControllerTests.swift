@@ -420,6 +420,10 @@ final class SessionFileProbe: @unchecked Sendable {
 @MainActor final class RecordingsWorld {
     /// The ffmpeg the audio enhancer finds; nil: none installed.
     var ffmpeg: URL?
+    /// What the enhancer gives ffmpeg for a stream (`AudioEnhancer.resolveInput` in the app,
+    /// which fetches the playlist): the stream itself unless a test says otherwise, so no test
+    /// reaches the network.
+    var resolveInput: @Sendable (URL) async -> URL = { $0 }
     var owner: Int? = 42
     var polimi = true
     var now = Date(timeIntervalSince1970: 1_790_000_000)
@@ -509,7 +513,10 @@ struct RecordingsControllerTests {
             copy: { world.copied.append($0) },
             now: { MainActor.assumeIsolated { world.now } },
             makePlayer: { world.playersMade += 1; return world.player },
-            makeAudioEnhancer: { AudioEnhancer(locateFFmpeg: { world.ffmpeg }, directory: { self.enhancedFolder }) },
+            makeAudioEnhancer: { AudioEnhancer(locateFFmpeg: { world.ffmpeg }, directory: { self.enhancedFolder }, resolveInput: { stream in
+                let resolve = await world.resolveInput
+                return await resolve(stream)
+            }) },
             courses: { world.courses },
             fetchProfileEmail: {
                 world.profileEmailCalls += 1
@@ -2277,6 +2284,49 @@ struct RecordingsControllerTests {
         await settle("copy underway") { if case .processing = world.player.audioState { true } else { false } }
         world.player.chooseAudio(.cancel)
         await settle("cancelled") { world.player.audioState == .idle }
+        #expect(enhancedFiles().isEmpty)
+        controller.turnOff()
+    }
+
+    /// ffmpeg reads what the input step found (the single Webex file behind the playlist), not
+    /// the playlist: guards against the stall where ffmpeg's HLS reader never got past 0% on a
+    /// byte-range playlist. The player keeps playing the stream itself.
+    @Test func ffmpegReadsTheResolvedFile() async throws {
+        defer { cleanUp() }
+        world.ffmpeg = try fakeFFmpeg("exit 0")
+        let file = URL(string: "https://media.example.test/merge_0_1.mp4")!
+        world.resolveInput = { _ in file }
+        let controller = await readyController()
+        let lecture = await playing(controller, "audio")
+        world.player.chooseAudio(.create)
+        await settle("copy ready") { world.player.audioState == .ready(inUse: false) }
+        let arguments = ffmpegArguments()
+        #expect(arguments.contains(file.absoluteString))
+        #expect(!arguments.contains(stream(lecture.id).url.absoluteString), "ffmpeg was given the playlist")
+        #expect(world.player.plays.last?.url == stream(lecture.id).url)
+        controller.turnOff()
+    }
+
+    /// Cancelling while the input is still being found ends the job at once and never starts
+    /// ffmpeg; the menu offers to create the copy again. Guards against an ffmpeg launched after
+    /// the student cancelled, which would download the whole lecture unasked.
+    @Test func cancellingBeforeFFmpegStartsRunsNothing() async throws {
+        defer { cleanUp() }
+        world.ffmpeg = try fakeFFmpeg("exit 0")
+        world.resolveInput = { stream in
+            try? await Task.sleep(for: .milliseconds(300))
+            return stream
+        }
+        let controller = await readyController()
+        _ = await playing(controller, "audio")
+        world.player.chooseAudio(.create)
+        #expect({ if case .processing = world.player.audioState { true } else { false } }())
+        world.player.chooseAudio(.cancel)
+        #expect(world.player.audioState == .idle)
+        try await Task.sleep(for: .milliseconds(600))
+        await drainTasks()
+        #expect(ffmpegArguments().isEmpty, "ffmpeg ran after the cancel")
+        #expect(world.player.audioState == .idle)
         #expect(enhancedFiles().isEmpty)
         controller.turnOff()
     }

@@ -133,17 +133,29 @@ Branch `feature/watchlist-manual-webex-audio`, base `origin/dev` `7ad62a2`. Non 
 
 **Misure (audio migliorato).** `BEEPBAR_MEASURE_AUDIO=1 swift test --skip-build --filter LiveAudioMeasurements` (procedura in `docs/benchmarks.md`, «Enhanced audio»), lezione sintetica di 6 minuti letta da disco (niente rete). Cinque esecuzioni per commit, alternate, stessa macchina: Apple M5, 32 GB, alimentazione da rete. Mediana / p95 (con 5 campioni il p95 è il massimo). Confronto `ee6b81d` (prima della cache dei tratti) → `b86e938` (cache; a HEAD il codice audio differisce solo in due commenti). Al commit di base il file di misura è stato copiato e adattato alla vecchia firma `isolate(_:to:)`, solo per la misura.
 
-| Con isolamento della voce | `ee6b81d` | `b86e938` |
-|---|---|---|
-| Primo segmento (seg0) | 1100 / 1103 ms | 1057 / 1064 ms |
-| Salto avanti (seg8) | 1096 / 1101 ms | 1049 / 1056 ms |
-| Ritorno a una parte ascoltata (seg1) | 1105 / 1113 ms | 356 / 358 ms |
-| Tempo totale di isolamento | 6628 / 6634 ms (8 run) | 5834 / 5860 ms (10 run, più corti) |
-| CPU BeepBar / ffmpeg | 6,69 / 4,42 s | 5,89 / 4,36 s |
-| Memoria di picco | 84 / 85 MB | 100 / 100 MB |
-| Dopo lo stop | 0 file, 0 processi | 0 file, 0 processi |
+| Con isolamento della voce | `ee6b81d` | `b86e938` | `784194e` |
+|---|---|---|---|
+| Primo segmento (seg0) | 1100 / 1103 ms | 1057 / 1064 ms | 1066 / 1082 ms |
+| Salto avanti (seg8) | 1096 / 1101 ms | 1049 / 1056 ms | 1045 / 1049 ms |
+| Ritorno a una parte ascoltata (seg1) | 1105 / 1113 ms | 356 / 358 ms | 352 / 355 ms |
+| Tempo totale di isolamento | 6628 / 6634 ms (8 run) | 5834 / 5860 ms (10 run, più corti) | 5851 / 5893 ms (10 run) |
+| CPU BeepBar / ffmpeg | 6,69 / 4,42 s | 5,89 / 4,36 s | 5,91 / 4,37 s |
+| Memoria di picco | 84 / 85 MB | 100 / 100 MB | 99 / 100 MB |
+| Dopo lo stop | 0 file, 0 processi | 0 file, 0 processi | 0 file, 0 processi |
 
 Senza isolamento (solo ffmpeg) i due commit coincidono: seg0 609 / 612 contro 608 / 610 ms, salto avanti 642 / 660 contro 643 / 661 ms.
+
+La colonna `784194e` (correzioni della revisione) è stata misurata dopo, in cinque esecuzioni consecutive non alternate con le altre, sulla stessa macchina; senza isolamento: seg0 608 / 611 ms, salto avanti 644 / 647 ms. Le correzioni non cambiano i tempi.
+
+**Revisione e verifiche.** La revisione indipendente ha trovato solo P1 e P2, corretti in `2a5ba87`, `21dc917` e `784194e`:
+- un tratto sostituito poteva essere cancellato mentre una codifica lo leggeva;
+- un passo fallito restava in memoria e non veniva ritentato;
+- un salto poteva cancellare frammenti ancora letti;
+- errori di rete e 5xx spegnevano l’audio migliorato;
+- chiudere prima dell’avvio lasciava il filtro attivo;
+- link uguali con parametri diversi non erano doppioni.
+
+Ogni correzione ha un test che fallisce senza di essa: 18 mutazioni, tutte rilevate, eseguite in un worktree usa e getta. La suite `LiveAudioPipelineTests` usa Webex, ffmpeg e isolamento finti, quindi gira nel gate anche senza ffmpeg. I test con ffmpeg reale restano su richiesta. `scripts/quit-probe.sh` su `784194e`: menu-legacy e menu-dispatch si bloccano come previsto, menu e external escono (quattro modalità ok). Il percorso di uscita non è cambiato: l’audio migliorato termina ffmpeg dall’osservatore `willTerminate`, senza lavoro in `prepareForTermination`.
 
 **Regressioni e limiti.** La memoria di picco con isolamento sale di ~16 MB (84 → 100 MB) e resta lì dopo lo stop, come al commit di base resta a 84 MB: il modello della voce resta caricato nel processo. Non è una crescita per sessione, ma non è stato misurato su più lezioni consecutive. Le attese sono lavoro locale: la rete verso Webex non è misurata. I confronti base-dev → HEAD e main → HEAD non si applicano all’audio migliorato, che non esiste né su `dev` né su `main`: non misurati. Lezioni da link e indicatori non toccano i budget misurati (nessuna scrittura al tick, nessun lavoro per riga), coperti da test e non da benchmark. Il riferimento di AGENTS.override.md è un M2 8 GB: queste misure sono state prese su un M5 32 GB e non sono confrontabili con misure su quella macchina.
 

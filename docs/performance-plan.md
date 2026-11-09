@@ -133,21 +133,21 @@ Branch `feature/watchlist-manual-webex-audio`, base `origin/dev` `7ad62a2`. Non 
 
 **Misure (audio migliorato).** `BEEPBAR_MEASURE_AUDIO=1 swift test --skip-build --filter LiveAudioMeasurements` (procedura in `docs/benchmarks.md`, «Enhanced audio»), lezione sintetica di 6 minuti letta da disco (niente rete). Cinque esecuzioni per commit, alternate, stessa macchina: Apple M5, 32 GB, alimentazione da rete. Mediana / p95 (con 5 campioni il p95 è il massimo). Confronto `ee6b81d` (prima della cache dei tratti) → `b86e938` (cache; a HEAD il codice audio differisce solo in due commenti). Al commit di base il file di misura è stato copiato e adattato alla vecchia firma `isolate(_:to:)`, solo per la misura.
 
-| Con isolamento della voce | `ee6b81d` | `b86e938` | `784194e` |
-|---|---|---|---|
-| Primo segmento (seg0) | 1100 / 1103 ms | 1057 / 1064 ms | 1066 / 1082 ms |
-| Salto avanti (seg8) | 1096 / 1101 ms | 1049 / 1056 ms | 1045 / 1049 ms |
-| Ritorno a una parte ascoltata (seg1) | 1105 / 1113 ms | 356 / 358 ms | 352 / 355 ms |
-| Tempo totale di isolamento | 6628 / 6634 ms (8 run) | 5834 / 5860 ms (10 run, più corti) | 5851 / 5893 ms (10 run) |
-| CPU BeepBar / ffmpeg | 6,69 / 4,42 s | 5,89 / 4,36 s | 5,91 / 4,37 s |
-| Memoria di picco | 84 / 85 MB | 100 / 100 MB | 99 / 100 MB |
-| Dopo lo stop | 0 file, 0 processi | 0 file, 0 processi | 0 file, 0 processi |
+| Con isolamento della voce | `ee6b81d` | `b86e938` | `784194e` | `5cb7957` |
+|---|---|---|---|---|
+| Primo segmento (seg0) | 1100 / 1103 ms | 1057 / 1064 ms | 1066 / 1082 ms | 1061 / 1068 ms |
+| Salto avanti (seg8) | 1096 / 1101 ms | 1049 / 1056 ms | 1045 / 1049 ms | 1052 / 1055 ms |
+| Ritorno a una parte ascoltata (seg1) | 1105 / 1113 ms | 356 / 358 ms | 352 / 355 ms | 356 / 359 ms |
+| Tempo totale di isolamento | 6628 / 6634 ms (8 run) | 5834 / 5860 ms (10 run, più corti) | 5851 / 5893 ms (10 run) | 5841 / 5862 ms (10 run) |
+| CPU BeepBar / ffmpeg | 6,69 / 4,42 s | 5,89 / 4,36 s | 5,91 / 4,37 s | 5,90 / 4,37 s |
+| Memoria di picco | 84 / 85 MB | 100 / 100 MB | 99 / 100 MB | 99 / 99 MB |
+| Dopo lo stop | 0 file, 0 processi | 0 file, 0 processi | 0 file, 0 processi | 0 file, 0 processi |
 
 Senza isolamento (solo ffmpeg) i due commit coincidono: seg0 609 / 612 contro 608 / 610 ms, salto avanti 642 / 660 contro 643 / 661 ms.
 
-La colonna `784194e` (correzioni della revisione) è stata misurata dopo, in cinque esecuzioni consecutive non alternate con le altre, sulla stessa macchina; senza isolamento: seg0 608 / 611 ms, salto avanti 644 / 647 ms. Le correzioni non cambiano i tempi.
+La colonna `784194e` (correzioni della revisione) è stata misurata dopo, in cinque esecuzioni consecutive non alternate con le altre, sulla stessa macchina; senza isolamento: seg0 608 / 611 ms, salto avanti 644 / 647 ms. Le correzioni non cambiano i tempi. La colonna `5cb7957` (seconda tornata, sotto) è misurata allo stesso modo, cinque esecuzioni consecutive; senza isolamento: seg0 608 / 611 ms, salto avanti 642 / 643 ms. Neanche queste correzioni cambiano i tempi.
 
-**Revisione e verifiche.** La revisione indipendente ha trovato solo P1 e P2, corretti in `2a5ba87`, `21dc917` e `784194e`:
+**Revisione e verifiche.** La revisione indipendente ha trovato solo P1 e P2, corretti in `2a5ba87`, `21dc917` e `784194e` (la seconda tornata, sotto, in `5cb7957`):
 - un tratto sostituito poteva essere cancellato mentre una codifica lo leggeva;
 - un passo fallito restava in memoria e non veniva ritentato;
 - un salto poteva cancellare frammenti ancora letti;
@@ -155,7 +155,15 @@ La colonna `784194e` (correzioni della revisione) è stata misurata dopo, in cin
 - chiudere prima dell’avvio lasciava il filtro attivo;
 - link uguali con parametri diversi non erano doppioni.
 
-Ogni correzione ha un test che fallisce senza di essa: 18 mutazioni, tutte rilevate, eseguite in un worktree usa e getta. La suite `LiveAudioPipelineTests` usa Webex, ffmpeg e isolamento finti, quindi gira nel gate anche senza ffmpeg. I test con ffmpeg reale restano su richiesta. `scripts/quit-probe.sh` su `784194e`: menu-legacy e menu-dispatch si bloccano come previsto, menu e external escono (quattro modalità ok). Il percorso di uscita non è cambiato: l’audio migliorato termina ffmpeg dall’osservatore `willTerminate`, senza lavoro in `prepareForTermination`.
+Ogni correzione ha un test che fallisce senza di essa: 18 mutazioni, tutte rilevate, eseguite in un worktree usa e getta. La suite `LiveAudioPipelineTests` usa Webex, ffmpeg e isolamento finti, quindi gira nel gate anche senza ffmpeg. I test con ffmpeg reale restano su richiesta.
+
+La suite completa su `dee4903` ha però fallito una volta (`aStepFailingOnceIsTriedAgain`, passo «probe»), e sotto carico (8 processi `yes`, 25 esecuzioni di `LiveAudioPipelineTests`, `RecordingsControllerTests` e `ManualWebexLessonTests`) falliva in 25 esecuzioni su 25. Non era solo il test. Cause e correzioni, in `5cb7957`:
+- *test*: il passo fatto fallire serviva anche al segmento 0, quindi l’esito dipendeva da quale richiesta lo eseguiva per prima; ora i passi del segmento richiesto e quelli del segmento preparato in anticipo hanno test separati. Il test sul tratto sostituito aspettava il file su disco invece della sua registrazione (`keptPiece`), e il finto ffmpeg contava come file mancanti anche le esecuzioni annullate, che `FFmpegRunner` riporta come annullamento;
+- *codice*: due isolamenti dello stesso frammento con contorni diversi si sostituivano nella contabilità, quindi lo stop non terminava il primo (ora sono indicizzati per esecuzione); due esecuzioni dello stesso passo scrivevano lo stesso file (ora ogni esecuzione ha un nome numerato, `runFile`); un frammento si scrive in modo atomico, così chi lo legge non ne vede uno a metà; una richiesta che trova fallito un lavoro avviato prima (dal segmento preparato in anticipo) lo rifà una volta invece di rispondere con l’errore vecchio; una richiesta abbandonata dal lettore dopo un salto non ricostruisce più il suo segmento, il successivo e i loro isolamenti (il server locale non vede chiudersi la connessione, quindi la richiesta riprova solo se il suo segmento è ancora vicino all’ultima arrivata; trovato dalle nostre mutazioni, non dalla revisione); il primo successo dopo un errore lo cancella (`report(nil)`), così un errore di rete già superato non manda in ripresa un guasto successivo. Il lettore distingue ora anche il caso senza errore segnalato: audio di Webex nello stesso punto, senza ripresa e senza segnare il filtro come guasto; prima dell’avvio un indirizzo scaduto segue la via consueta (il browser) e un errore di rete apre l’audio di Webex.
+
+Dopo le correzioni lo stesso ciclo sotto carico: 0 esecuzioni fallite su 25, e la suite completa passa a macchina scarica (su `dee4903`, con la macchina occupata dalle mutazioni, era fallito una volta `WebexSignInWebViewTests`, che misura un tempo reale; a macchina scarica passa). Mutazioni su `5cb7957`, nel worktree usa e getta: 29, tutte rilevate. Le 15 precedenti ancora applicabili più 14 nuove: isolamenti per esecuzione, nomi numerati, nuovo tentativo del lavoro avviato prima, `report(nil)`, il caso senza errore segnalato, il rifiuto e l’errore di rete prima dell’avvio, il link canonico, il tratto già coperto, l’annullamento al salto, la richiesta abbandonata, il nuovo tentativo della richiesta più recente e l’ordine d’arrivo delle richieste. Le due ultime sono state rilevate in 5 esecuzioni su 5.
+
+`scripts/quit-probe.sh` su `784194e`: menu-legacy e menu-dispatch si bloccano come previsto, menu e external escono (quattro modalità ok). Il percorso di uscita non è cambiato: l’audio migliorato termina ffmpeg dall’osservatore `willTerminate`, senza lavoro in `prepareForTermination`.
 
 **Regressioni e limiti.** La memoria di picco con isolamento sale di ~16 MB (84 → 100 MB) e resta lì dopo lo stop, come al commit di base resta a 84 MB: il modello della voce resta caricato nel processo. Non è una crescita per sessione, ma non è stato misurato su più lezioni consecutive. Le attese sono lavoro locale: la rete verso Webex non è misurata. I confronti base-dev → HEAD e main → HEAD non si applicano all’audio migliorato, che non esiste né su `dev` né su `main`: non misurati. Lezioni da link e indicatori non toccano i budget misurati (nessuna scrittura al tick, nessun lavoro per riga), coperti da test e non da benchmark. Il riferimento di AGENTS.override.md è un M2 8 GB: queste misure sono state prese su un M5 32 GB e non sono confrontabili con misure su quella macchina.
 

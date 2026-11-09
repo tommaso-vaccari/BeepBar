@@ -99,44 +99,62 @@ public enum AudioEnhancement {
     /// The sample on the lecture's clock where audio starting at `seconds` begins.
     public static func samplePosition(_ seconds: Double) -> Int { Int((seconds * Double(isolationSampleRate)).rounded()) }
 
-    /// ffmpeg's command that decodes the audio context to a mono WAV for voice isolation, its
-    /// first sample exactly at `firstSample` on the lecture's clock: `aresample`'s `first_pts`
-    /// pads or trims to it, because a WAV keeps no timestamps and `isolatedEncodeArguments`
-    /// puts the isolated audio back by that position alone. Measured on a synthetic Webex
-    /// lecture: decoded, passed through unchanged and encoded back, the segment's audio is
-    /// sample-identical to `segmentArguments` with no filter.
+    /// How much audio before and after a fragment its isolation is given, in samples at
+    /// `isolationSampleRate`. The voice model carries state from what it heard before and looks
+    /// a little ahead, so a fragment isolated on its own differs from the same stretch isolated
+    /// within the whole lecture near its edges: by −25 dB in its first second with no lead-in,
+    /// −16 dB in its last with nothing after it. With 4 s before and 0.5 s after it was
+    /// sample-identical (difference −185 dB), measured on 2026-11-09 (macOS 27, high-quality
+    /// model, 60 s of speech with pink noise). That is what lets each fragment be isolated once
+    /// and the pieces joined with no seam (`LiveAudioPipeline`).
+    public static let isolationLead = 4 * isolationSampleRate
+    public static let isolationTail = isolationSampleRate / 2
+
+    /// ffmpeg's command that decodes audio to a mono 48 kHz WAV for voice isolation. Its input
+    /// starts at `firstSample` on the lecture's clock; the WAV holds the samples from `from` to
+    /// `to` (to the end when nil) on that same clock. `aresample`'s `first_pts` pads or trims
+    /// to `firstSample` exactly, because a WAV keeps no timestamps and the caller places the
+    /// isolated audio back by position alone; `atrim` then counts samples from there. Measured
+    /// on a synthetic Webex lecture: decoded, passed through unchanged and encoded back, the
+    /// segment's audio is sample-identical to `segmentArguments` with no filter.
     ///
     /// Two `aresample`s, in this order: the first converts to 48 kHz, the second places the first
     /// sample. A single `aresample=48000:first_pts=N` compares N with timestamps still counted at
     /// the source's rate, so a 44.1 kHz lecture's audio looked 8% earlier than it is and was
     /// trimmed: a few minutes in, the whole context, and the segments came out with no audio
     /// (a student heard nothing with enhanced audio on, 2026-11-09).
-    public static func isolationDecodeArguments(audio: String, firstSample: Int, output: String) -> [String] {
-        [
+    public static func isolationDecodeArguments(audio: String, firstSample: Int, from: Int, to: Int?, output: String) -> [String] {
+        let trim = "atrim=start_sample=\(from - firstSample)" + (to.map { ":end_sample=\($0 - firstSample)" } ?? "")
+        return [
             "-hide_banner", "-nostdin", "-nostats", "-loglevel", "error",
             "-protocol_whitelist", protocolWhitelist,
             "-copyts", "-i", audio,
             "-map", "0:a:0",
-            "-af", "aresample=\(isolationSampleRate),aresample=async=1:first_pts=\(firstSample),aformat=sample_fmts=flt:channel_layouts=mono",
+            "-af", "aresample=\(isolationSampleRate),aresample=async=1:first_pts=\(firstSample),\(trim),aformat=sample_fmts=flt:channel_layouts=mono",
             "-c:a", "pcm_f32le", "-f", "wav", "-y", output,
         ]
     }
 
-    /// ffmpeg's command for one segment from its isolated audio: like `segmentArguments`, the
-    /// video copied and the audio trimmed to `start..<end` on the lecture's clock, but the audio
-    /// read from `isolated` (the WAV `isolationDecodeArguments` made, after isolation), placed
-    /// back at `firstSample` (`-itsoffset`), and filtered with `isolatedChain`.
-    public static func isolatedEncodeArguments(video: String, isolated: String, firstSample: Int, start: Double, end: Double, output: String) -> [String] {
+    /// ffmpeg's command for one segment from isolated audio: like `segmentArguments`, the video
+    /// copied and the audio trimmed to `start..<end` on the lecture's clock, but the audio read
+    /// from `isolated`, consecutive pieces of raw isolated voice (16-bit, mono, 48 kHz, no
+    /// header, so ffmpeg's `concat:` joins them sample by sample) whose first sample is
+    /// `firstSample`, and filtered with `isolatedChain`.
+    ///
+    /// `asetpts` places the samples on the clock by count, exactly. Not `-itsoffset`: for raw
+    /// input ffmpeg left it out of the timestamps the filters see, so the trim fell outside the
+    /// audio and every segment came out with an empty audio track (seen in testing, ffmpeg 9.0.2).
+    public static func isolatedEncodeArguments(video: String, isolated: [String], firstSample: Int, start: Double, end: Double, output: String) -> [String] {
         [
             "-hide_banner", "-nostdin", "-nostats", "-loglevel", "error",
             "-protocol_whitelist", protocolWhitelist,
             "-copyts",
             "-i", video,
-            "-itsoffset", seconds(Double(firstSample) / Double(isolationSampleRate)),
-            "-i", isolated,
+            "-f", "s16le", "-ar", "\(isolationSampleRate)", "-ac", "1",
+            "-i", concatInput(isolated),
             "-map", "0:v:0?", "-map", "1:a:0",
             "-c:v", "copy",
-            "-af", isolatedChain + ",atrim=start=\(seconds(start)):end=\(seconds(end))",
+            "-af", "asetpts=(N+\(firstSample))/SR/TB," + isolatedChain + ",atrim=start=\(seconds(start)):end=\(seconds(end))",
             "-c:a", "aac", "-b:a", "192k", "-ar", "48000",
             "-muxdelay", "0", "-muxpreload", "0",
             "-f", "mpegts", "-y", output,

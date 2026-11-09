@@ -269,11 +269,24 @@ enum LiveAudioProcesses {
 ///
 /// For segment `i` it fetches that segment's bytes and the next one's (and keeps the previous
 /// one when it was just played), measures where each one's audio starts (`probeArguments`),
-/// then makes the segment: with `isolator`, ffmpeg decodes the audio context to a WAV
-/// (`isolationDecodeArguments`), the isolator cleans it, and ffmpeg encodes the segment from it
-/// (`isolatedEncodeArguments`); without, ffmpeg runs once (`segmentArguments`). A request also starts the following segment, so
-/// it is usually ready before AVPlayer asks. A request far from the last one is a seek: work
-/// for the position left behind is cancelled (`keptSegments`).
+/// then makes the segment. Without `isolator`, ffmpeg runs once (`segmentArguments`). With it,
+/// the segment is made from isolated pieces (`IsolatedPiece`): each fragment's audio is
+/// isolated once, with up to 4 s of the previous fragment before it and 0.5 s of the next after
+/// it (`AudioEnhancement.isolationLead`), which makes the pieces join sample-identically to the
+/// whole lecture isolated in one go; ffmpeg then encodes the segment from its own piece and its
+/// neighbours' (`isolatedEncodeArguments`). Before pieces, each segment isolated 60–90 s of
+/// audio, so every stretch went through isolation 2–3 times (~850 ms a segment, measured on
+/// 2026-11-09 with Webex's 30-second segments).
+///
+/// Pieces stay on disk, up to `keptPieces`, after the segments around the position are
+/// dropped: going back to a part already heard makes the segment again without isolating it.
+/// The segment asked for (`urgent`) never waits for a fragment beyond the next: its next piece
+/// may then lack its 0.5 s after, which only matters near that piece's end, and that piece is
+/// isolated again, complete, when its own segment is made.
+///
+/// A request also starts the following segment, so it is usually ready before AVPlayer asks.
+/// A request far from the last one is a seek: work for the position left behind is cancelled
+/// (`keptSegments`).
 ///
 /// Failure: the first real failure is reported (`report`) before the request answers with an
 /// error, so the controller knows why the player failed when it hears of it. Cancellations are
@@ -294,6 +307,16 @@ actor LiveAudioPipeline {
     private var fragments: [Int: Task<URL, Error>] = [:]
     private var starts: [Int: Task<Double, Error>] = [:]
     private var outputs: [Int: Task<Data, Error>] = [:]
+    /// Isolations underway, with what they were given; and finished pieces, least recently
+    /// used first in `piecesUsed`.
+    private var isolating: [Int: (task: Task<IsolatedPiece, Error>, hasLead: Bool, hasTail: Bool)] = [:]
+    private var pieces: [Int: IsolatedPiece] = [:]
+    private var piecesUsed: [Int] = []
+    /// Pieces replaced or dropped while an encode may still be reading them: deleted once no
+    /// encode is running (`retire`). Deleting at once made a segment's ffmpeg fail when the
+    /// complete piece replaced the urgent one it was joining (seen in testing).
+    private var encoding = 0
+    private var retired: [URL] = []
     private var stopped = false
     private var reported = false
 
@@ -324,8 +347,8 @@ actor LiveAudioPipeline {
             // Retried once when the work it waited on was cancelled by an earlier request's seek
             // logic rather than by this request.
             for _ in 0..<2 {
-                let task = self.output(index, count: lecture.segments.count)
-                if index + 1 < lecture.segments.count { _ = self.output(index + 1, count: lecture.segments.count) }
+                let task = self.output(index, count: lecture.segments.count, urgent: true)
+                if index + 1 < lecture.segments.count { _ = self.output(index + 1, count: lecture.segments.count, urgent: false) }
                 do {
                     return try await task.value
                 } catch let error where Self.isCancellation(error) {
@@ -344,9 +367,12 @@ actor LiveAudioPipeline {
         for task in fragments.values { task.cancel() }
         for task in starts.values { task.cancel() }
         for task in outputs.values { task.cancel() }
+        for entry in isolating.values { entry.task.cancel() }
         fragments = [:]
         starts = [:]
         outputs = [:]
+        isolating = [:]
+        pieces = [:]
         fetcher.close()
         try? FileManager.default.removeItem(at: folder)
     }
@@ -382,53 +408,187 @@ actor LiveAudioPipeline {
         if folder.path.contains("|") { throw LiveAudioFetchError.unexpected }
     }
 
-    private func output(_ index: Int, count: Int) -> Task<Data, Error> {
+    /// `urgent`: the segment AVPlayer asked for, rather than the one made ahead of it.
+    private func output(_ index: Int, count: Int, urgent: Bool) -> Task<Data, Error> {
         if let existing = outputs[index] { return existing }
         // The previous segment counts when it is fetched or being made: then its bytes are (or
         // will be) here anyway.
         let hasPrevious = fragments[index - 1] != nil || outputs[index - 1] != nil
-        let task = Task { try await self.produce(index, count: count, hasPrevious: hasPrevious) }
+        let task = Task { try await self.produce(index, count: count, hasPrevious: hasPrevious, urgent: urgent) }
         outputs[index] = task
         return task
     }
 
-    private func produce(_ index: Int, count: Int, hasPrevious: Bool) async throws -> Data {
+    private func produce(_ index: Int, count: Int, hasPrevious: Bool, urgent: Bool) async throws -> Data {
         let (lecture, initFile) = try await lecture()
+        if isolator != nil { return try await produceIsolated(index, count: count, urgent: urgent, in: lecture, initFile: initFile) }
         let context = AudioEnhancement.audioContext(for: index, count: count, hasPrevious: hasPrevious)
         // All fetches start before any is awaited, so they run side by side.
         for k in context { _ = fragment(k, in: lecture) }
         var files: [Int: URL] = [:]
         for k in context { files[k] = try await fragmentFile(k, in: lecture) }
-        let start = try await audioStart(index, in: lecture, initFile: initFile)
-        let nextStart = index + 1 < count ? try await audioStart(index + 1, in: lecture, initFile: initFile) : nil
-        let end = AudioEnhancement.audioEnd(index: index, start: start, nextStart: nextStart, lecture: lecture)
+        let (start, end) = try await span(index, count: count, in: lecture, initFile: initFile)
         let output = folder.appendingPathComponent("out\(index).ts")
         let video = AudioEnhancement.concatInput([initFile.path, files[index]!.path])
         let audio = AudioEnhancement.concatInput([initFile.path] + context.map { files[$0]!.path })
-        if let isolator {
-            // The context's audio starts where its first fragment's does; the WAVs keep no
-            // timestamps, so that sample is what puts the isolated audio back on the clock.
-            let firstSample = AudioEnhancement.samplePosition(try await audioStart(context.lowerBound, in: lecture, initFile: initFile))
-            let decoded = folder.appendingPathComponent("decoded\(index).wav")
-            let isolated = folder.appendingPathComponent("isolated\(index).wav")
-            defer {
-                try? FileManager.default.removeItem(at: decoded)
-                try? FileManager.default.removeItem(at: isolated)
-            }
-            try await runner.run(ffmpeg, AudioEnhancement.isolationDecodeArguments(audio: audio, firstSample: firstSample, output: decoded.path))
-            try Task.checkCancellation()
-            try await isolator.isolate(decoded, to: isolated)
-            try? FileManager.default.removeItem(at: decoded)
-            try Task.checkCancellation()
-            try await runner.run(ffmpeg, AudioEnhancement.isolatedEncodeArguments(video: video, isolated: isolated.path, firstSample: firstSample,
-                                                                                  start: start, end: end, output: output.path))
-        } else {
-            try await runner.run(ffmpeg, AudioEnhancement.segmentArguments(video: video, audio: audio, start: start, end: end, output: output.path))
-        }
+        try await runner.run(ffmpeg, AudioEnhancement.segmentArguments(video: video, audio: audio, start: start, end: end, output: output.path))
+        return try finish(output)
+    }
+
+    /// A segment from isolated pieces: its own (complete), the next one's (complete unless
+    /// `urgent`), the previous one's when it is on disk already; never isolation of its own.
+    private func produceIsolated(_ index: Int, count: Int, urgent: Bool, in lecture: AudioEnhancement.ByteRangeLecture, initFile: URL) async throws -> Data {
+        // This fragment is fetched now, so the next piece gets its lead-in from it (`piece`).
+        _ = fragment(index, in: lecture)
+        // Both isolations start before either is awaited, so they run side by side.
+        let own = piece(index, count: count, tail: true, in: lecture, initFile: initFile)
+        let next = index + 1 < count ? piece(index + 1, count: count, tail: !urgent, in: lecture, initFile: initFile) : nil
+        let made = try await own.value
+        let madeNext = try await next?.value
+        let (start, end) = try await span(index, count: count, in: lecture, initFile: initFile)
+        let output = folder.appendingPathComponent("out\(index).ts")
+        let video = AudioEnhancement.concatInput([initFile.path, try await fragmentFile(index, in: lecture).path])
+        // No await from choosing the pieces to counting the encode. Until then a piece made
+        // with more around it can replace the one just made, and `store` deletes the one it
+        // doesn't keep: so each is taken from `pieces` now (`kept`), and after
+        // `encoding += 1` those in `used` stay on disk however they are replaced (`retire`).
+        let current = kept(made)
+        let following = madeNext.map(kept)
+        // The previous piece ends where this one starts unless a sample or so of rounding
+        // (`isolate`); one further off would move this segment's voice, so it is left out.
+        let previous = pieces[index - 1].flatMap { abs($0.end - current.start) <= 2 ? $0 : nil }
+        let used = [previous, current, following].compactMap { $0 }
+        // A piece dropped from `pieces` meanwhile (stop, or 40 more isolated) is gone: a 502,
+        // which AVPlayer asks again, rather than an encode without its voice.
+        guard used.allSatisfy({ FileManager.default.fileExists(atPath: $0.file.path) }) else { throw PipelineError.stopped }
+        for piece in used { touch(piece.index) }
+        encoding += 1
+        defer { encoding -= 1; retire() }
+        try await runner.run(ffmpeg, AudioEnhancement.isolatedEncodeArguments(video: video, isolated: used.map(\.file.path), firstSample: used[0].start,
+                                                                              start: start, end: end, output: output.path))
+        return try finish(output)
+    }
+
+    /// The piece to use in place of `made`: the one `pieces` keeps for that fragment, which
+    /// stays on disk, unless it was made with less around it (then `made` is still current).
+    private func kept(_ made: IsolatedPiece) -> IsolatedPiece {
+        guard let kept = pieces[made.index], kept.hasLead || !made.hasLead, kept.hasTail || !made.hasTail else { return made }
+        return kept
+    }
+
+    /// Where segment `index`'s audio starts and ends on the lecture's clock.
+    private func span(_ index: Int, count: Int, in lecture: AudioEnhancement.ByteRangeLecture, initFile: URL) async throws -> (Double, Double) {
+        let start = try await audioStart(index, in: lecture, initFile: initFile)
+        let nextStart = index + 1 < count ? try await audioStart(index + 1, in: lecture, initFile: initFile) : nil
+        return (start, AudioEnhancement.audioEnd(index: index, start: start, nextStart: nextStart, lecture: lecture))
+    }
+
+    private func finish(_ output: URL) throws -> Data {
         try Task.checkCancellation()
         let data = try Data(contentsOf: output)
         try? FileManager.default.removeItem(at: output)
         return data
+    }
+
+    // MARK: Isolated pieces
+
+    /// Fragment `k`'s isolated voice, on disk: raw 16-bit mono 48 kHz samples from `start` on
+    /// the lecture's clock to `end`, the next fragment's start (or the lecture's end).
+    /// `hasLead`: isolated with the previous fragment's last 4 s before it; `hasTail`: with the
+    /// next fragment's first 0.5 s after it (or none exists). Without either, the piece differs
+    /// from the whole lecture's isolation near that edge (`AudioEnhancement.isolationLead`).
+    struct IsolatedPiece: Sendable {
+        let index: Int
+        let file: URL
+        let start: Int
+        let end: Int
+        let hasLead: Bool
+        let hasTail: Bool
+    }
+
+    /// How many pieces stay on disk: 20 minutes of Webex's 30-second fragments, about 115 MB
+    /// (2.9 MB each), in the session's folder, which goes when the player closes.
+    static let keptPieces = 40
+
+    /// Fragment `k`'s piece: on disk, underway, or started now. With a lead-in whenever the
+    /// previous fragment is fetched or being fetched already (a seek doesn't fetch it just for
+    /// this), and with what follows it when `tail` asks (fetching the next fragment). A piece
+    /// made with less than is now wanted isn't used: it is isolated again.
+    private func piece(_ k: Int, count: Int, tail: Bool, in lecture: AudioEnhancement.ByteRangeLecture, initFile: URL) -> Task<IsolatedPiece, Error> {
+        let lead = k > 0 && fragments[k - 1] != nil
+        let tail = tail && k + 1 < count
+        func serves(_ hasLead: Bool, _ hasTail: Bool) -> Bool { (hasLead || !lead) && (hasTail || !tail) }
+        if let done = pieces[k], serves(done.hasLead, done.hasTail) { return Task { done } }
+        if let underway = isolating[k], serves(underway.hasLead, underway.hasTail) { return underway.task }
+        let task = Task { () throws -> IsolatedPiece in
+            try await self.isolate(k, count: count, lead: lead, tail: tail, in: lecture, initFile: initFile)
+        }
+        isolating[k] = (task, lead, tail)
+        return task
+    }
+
+    private func isolate(_ k: Int, count: Int, lead: Bool, tail: Bool, in lecture: AudioEnhancement.ByteRangeLecture, initFile: URL) async throws -> IsolatedPiece {
+        guard let isolator else { throw PipelineError.stopped }
+        let first = lead ? k - 1 : k
+        let last = tail ? k + 1 : k
+        for j in first...last { _ = fragment(j, in: lecture) }
+        var files: [URL] = []
+        for j in first...last { files.append(try await fragmentFile(j, in: lecture)) }
+        // The decoded audio starts where its first fragment's does; the WAV keeps no
+        // timestamps, so these positions are what put the isolated voice back on the clock.
+        let firstSample = AudioEnhancement.samplePosition(try await audioStart(first, in: lecture, initFile: initFile))
+        let start = AudioEnhancement.samplePosition(try await audioStart(k, in: lecture, initFile: initFile))
+        let from = max(firstSample, start - (lead ? AudioEnhancement.isolationLead : 0))
+        // With a tail the piece ends exactly where the next fragment starts. Without, at the end
+        // of this fragment's own audio: the same sample, give or take one of resampling, and
+        // the next fragment isn't fetched just to know it.
+        let next = tail ? AudioEnhancement.samplePosition(try await audioStart(k + 1, in: lecture, initFile: initFile)) : nil
+        let flags = (lead ? "l" : "") + (tail ? "t" : "")
+        let decoded = folder.appendingPathComponent("decoded\(k)\(flags).wav")
+        let file = folder.appendingPathComponent("piece\(k)\(flags).raw")
+        defer { try? FileManager.default.removeItem(at: decoded) }
+        try await runner.run(ffmpeg, AudioEnhancement.isolationDecodeArguments(audio: AudioEnhancement.concatInput([initFile.path] + files.map(\.path)),
+                                                                               firstSample: firstSample, from: from,
+                                                                               to: next.map { $0 + AudioEnhancement.isolationTail }, output: decoded.path))
+        try Task.checkCancellation()
+        try await isolator.isolate(decoded, from: start - from, count: next.map { $0 - start }, to: file)
+        try Task.checkCancellation()
+        let bytes = (try? FileManager.default.attributesOfItem(atPath: file.path)[.size] as? Int) ?? 0
+        let piece = IsolatedPiece(index: k, file: file, start: start, end: start + bytes / 2, hasLead: lead, hasTail: tail || k + 1 == count)
+        store(piece)
+        return piece
+    }
+
+    /// Keeps `piece` unless the one on disk was made with more around it; forgets the
+    /// isolation that made it; drops the least recently used pieces beyond `keptPieces`.
+    private func store(_ piece: IsolatedPiece) {
+        if isolating[piece.index]?.hasLead == piece.hasLead, isolating[piece.index]?.hasTail == piece.hasTail { isolating[piece.index] = nil }
+        if stopped { return }
+        if let kept = pieces[piece.index], (kept.hasLead && !piece.hasLead) || (kept.hasTail && !piece.hasTail) {
+            // The caller that asked for this one still uses it.
+            retire(piece.file)
+            return
+        }
+        if let replaced = pieces[piece.index], replaced.file != piece.file { retire(replaced.file) }
+        pieces[piece.index] = piece
+        touch(piece.index)
+        while pieces.count > Self.keptPieces, let oldest = piecesUsed.first {
+            piecesUsed.removeFirst()
+            if let dropped = pieces.removeValue(forKey: oldest) { retire(dropped.file) }
+        }
+    }
+
+    /// Deletes `file`, and those set aside before it, as soon as no encode is running.
+    private func retire(_ file: URL? = nil) {
+        if let file { retired.append(file) }
+        guard encoding == 0 else { return }
+        for file in retired { try? FileManager.default.removeItem(at: file) }
+        retired = []
+    }
+
+    private func touch(_ k: Int) {
+        piecesUsed.removeAll { $0 == k }
+        if pieces[k] != nil { piecesUsed.append(k) }
     }
 
     private func fragment(_ k: Int, in lecture: AudioEnhancement.ByteRangeLecture) -> Task<URL, Error> {
@@ -482,6 +642,8 @@ actor LiveAudioPipeline {
         let keptFragments = kept.lowerBound...(kept.upperBound + 1)
         for (k, task) in outputs where !kept.contains(k) { task.cancel(); outputs[k] = nil }
         for (k, task) in starts where !keptFragments.contains(k) { task.cancel(); starts[k] = nil }
+        // Finished pieces stay (`keptPieces`); isolations for the position left behind stop.
+        for (k, entry) in isolating where !keptFragments.contains(k) { entry.task.cancel(); isolating[k] = nil }
         for (k, task) in fragments where !keptFragments.contains(k) {
             task.cancel()
             fragments[k] = nil

@@ -36,10 +36,28 @@ private final class FailingIsolator: LiveAudioVoiceIsolating, @unchecked Sendabl
     private var seen: [AVAudioFormat] = []
     var formats: [AVAudioFormat] { lock.withLock { seen } }
     struct Failure: Error {}
-    func isolate(_ input: URL, to output: URL) async throws {
+    func isolate(_ input: URL, from first: Int, count: Int?, to output: URL) async throws {
         let format = try AVAudioFile(forReading: input).fileFormat
         lock.withLock { seen.append(format) }
         throw Failure()
+    }
+}
+
+/// An isolation that passes the audio through unchanged, as `AppleVoiceIsolator` writes it
+/// (raw 16-bit, the samples asked for), and records each call: the decoded file's name (which
+/// says the fragment), its length, and the stretch kept. Lets the pipeline's bookkeeping be
+/// tested on any Mac, quickly.
+private final class RecordingIsolator: LiveAudioVoiceIsolating, @unchecked Sendable {
+    struct Call { let name: String; let length: Int; let first: Int; let count: Int? }
+    private let lock = NSLock()
+    private var made: [Call] = []
+    var calls: [Call] { lock.withLock { made } }
+    func isolate(_ input: URL, from first: Int, count: Int?, to output: URL) async throws {
+        let samples = try AudioTestSignals.samples(input)
+        lock.withLock { made.append(Call(name: input.lastPathComponent, length: samples.count, first: first, count: count)) }
+        let kept = samples[first..<min(samples.count, first + (count ?? samples.count))]
+        let raw = kept.map { Int16((max(-1, min(1, $0)) * 32767).rounded()).littleEndian }
+        try raw.withUnsafeBytes { try Data($0).write(to: output) }
     }
 }
 
@@ -58,19 +76,21 @@ struct LiveAudioSessionTests {
     /// `speaking`, a synthetic teacher (`AudioTestSignals.speech`).
     /// `audioFormat` and `startingAt` vary what Webex's file may hold: audio at 44.1 kHz in
     /// stereo, and a clock that doesn't start at zero.
-    private func makeLecture(speaking: Bool = false, audioFormat: [String] = ["-ar", "48000"], startingAt: Int = 0) throws -> DiskFetcher {
+    /// `seconds` and `segment` make a longer lecture for the tests that move around in it.
+    private func makeLecture(speaking: Bool = false, audioFormat: [String] = ["-ar", "48000"], startingAt: Int = 0,
+                             seconds: Int = 12, segment: Int = 4) throws -> DiskFetcher {
         try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
         let ffmpeg = try #require(AudioEnhancement.locateFFmpeg())
         let audio: [String] = speaking
-            ? ["-i", try AudioTestSignals.speech(seconds: 12, in: folder, ffmpeg: ffmpeg).path, "-t", "12"]
-            : ["-f", "lavfi", "-i", "sine=frequency=440:sample_rate=48000", "-t", "12"]
+            ? ["-i", try AudioTestSignals.speech(seconds: seconds, in: folder, ffmpeg: ffmpeg).path, "-t", "\(seconds)"]
+            : ["-f", "lavfi", "-i", "sine=frequency=440:sample_rate=48000", "-t", "\(seconds)"]
         let process = Process()
         process.executableURL = ffmpeg
         process.currentDirectoryURL = folder
         process.arguments = ["-nostdin", "-loglevel", "error", "-y",
                              "-f", "lavfi", "-i", "testsrc=size=160x90:rate=25"] + audio + [
                              "-c:v", "libx264", "-preset", "ultrafast", "-g", "25", "-c:a", "aac"] + audioFormat + [
-                             "-output_ts_offset", "\(startingAt)", "-f", "hls", "-hls_time", "4", "-hls_segment_type", "fmp4", "-hls_flags", "single_file",
+                             "-output_ts_offset", "\(startingAt)", "-f", "hls", "-hls_time", "\(segment)", "-hls_segment_type", "fmp4", "-hls_flags", "single_file",
                              "-hls_playlist_type", "vod", "out.m3u8"]
         try process.run()
         process.waitUntilExit()
@@ -195,26 +215,30 @@ struct LiveAudioSessionTests {
                                            isolator: try #require(AppleVoiceIsolator.preferred()), parent: folder.appendingPathComponent("sessions"))
         defer { session.stop() }
         _ = try await get(session.playlistURL)
-        let (segment, status) = try await get(session.playlistURL.deletingLastPathComponent().appendingPathComponent(AudioEnhancement.segmentName(1)))
-        #expect(status == 200)
-        let served = folder.appendingPathComponent("served.ts")
+        let lecture = try AudioTestSignals.samples(folder.appendingPathComponent("speech.wav"))
+        // Each shape a segment is made from: the first (no piece before it), the middle (pieces
+        // on both sides), the last (none after it).
+        for index in 0..<3 {
+        let (segment, status) = try await get(session.playlistURL.deletingLastPathComponent().appendingPathComponent(AudioEnhancement.segmentName(index)))
+        try #require(status == 200, "segment \(index): \(String(decoding: segment.prefix(200), as: UTF8.self)), failures \(failures)")
+        let served = folder.appendingPathComponent("served\(index).ts")
         try segment.write(to: served)
         // The reference is the synthetic teacher before Webex's encoding (its sample 0 is the
         // lecture's start), not a decode of the lecture: a plain decode keeps the encoder's
         // priming and lands one AAC frame late. Both lectures start after zero because at zero
         // ffmpeg moves the priming frame to 0 and the voice itself one frame later. The served segment (48 kHz, its timestamps on
         // the lecture's clock) is placed on the same samples, silence before it.
-        let lecture = try AudioTestSignals.samples(folder.appendingPathComponent("speech.wav"))
-        let placed = folder.appendingPathComponent("served.wav")
+        let placed = folder.appendingPathComponent("served\(index).wav")
         try AudioTestSignals.run(ffmpeg, ["-nostdin", "-loglevel", "error", "-y", "-copyts", "-i", served.path, "-map", "0:a:0", "-ac", "1",
                                           "-af", "aresample=async=1:first_pts=\(startingAt * 48000)", "-c:a", "pcm_f32le", placed.path], in: folder)
         let isolated = try AudioTestSignals.samples(placed)
-        // The second segment's middle, away from its edges: 4.5–7.5 s.
-        let span = 216000..<360000
+        // The segment's middle, away from its edges: 0.5–3.5 s into it.
+        let span = (index * 192000 + 24000)..<(index * 192000 + 168000)
         try #require(lecture.count >= span.upperBound && isolated.count >= span.upperBound)
         let delay = AudioTestSignals.delay(of: Array(isolated[span]), against: Array(lecture[span]), limit: 9600)
-        #expect(abs(delay) <= 96, "the voice moved by \(delay) samples")
-        #expect(AudioTestSignals.level(isolated[span]) > AudioTestSignals.level(lecture[span]) - 12, "the voice was lost")
+        #expect(abs(delay) <= 96, "segment \(index): the voice moved by \(delay) samples")
+        #expect(AudioTestSignals.level(isolated[span]) > AudioTestSignals.level(lecture[span]) - 12, "segment \(index): the voice was lost")
+        }
         #expect(failures.isEmpty)
     }
 
@@ -242,6 +266,76 @@ struct LiveAudioSessionTests {
         #expect(failures == [.unavailable])
         let format = try #require(failing.formats.first)
         #expect(format.channelCount == 1 && format.sampleRate == 48000)
+    }
+
+    /// Played through in order, each fragment of the lecture goes through isolation once, with
+    /// the previous fragment's last 4 s before it and the next one's first 0.5 s after (so its
+    /// joins match the whole lecture isolated at once), plus once more for the fragment after
+    /// the first, which the first segment asks for urgently without what follows it. Before the
+    /// pieces, each segment isolated its whole 2–3 fragment context: about 2.5 times the
+    /// lecture. Guards against that cost coming back and against pieces isolated without their
+    /// surroundings.
+    @Test func playedInOrderEachFragmentIsIsolatedOnce() async throws {
+        defer { try? FileManager.default.removeItem(at: folder) }
+        let fetcher = try makeLecture(seconds: 48, segment: 8)
+        let isolator = RecordingIsolator()
+        let session = try LiveAudioSession(stream: Self.address, ffmpeg: try #require(AudioEnhancement.locateFFmpeg()), onFailure: { _ in },
+                                           fetcher: fetcher, isolator: isolator, parent: folder.appendingPathComponent("sessions"))
+        defer { session.stop() }
+        _ = try await get(session.playlistURL)
+        for index in 0..<6 {
+            #expect(try await get(session.playlistURL.deletingLastPathComponent().appendingPathComponent(AudioEnhancement.segmentName(index))).1 == 200)
+        }
+        let calls = isolator.calls
+        let lectureSamples = 48 * 48000
+        let isolated = calls.reduce(0) { $0 + $1.length }
+        #expect(isolated <= lectureSamples + 6 * (AudioEnhancement.isolationLead + AudioEnhancement.isolationTail) + 8 * 48000,
+                "\(isolated) samples isolated for a \(lectureSamples)-sample lecture")
+        // Every fragment's complete piece: with its surroundings, cut where the next starts.
+        for k in 0..<6 {
+            let complete = calls.filter { $0.name.hasPrefix("decoded\(k)") && ($0.name.contains("t") || k == 5) }
+            #expect(complete.count == 1, "fragment \(k) isolated completely \(complete.count) times")
+            guard let call = complete.first else { continue }
+            #expect(call.first == (k == 0 ? 0 : AudioEnhancement.isolationLead), "fragment \(k) had \(call.first) samples before it")
+            if k < 5 { #expect(call.length - call.first - (call.count ?? 0) == AudioEnhancement.isolationTail, "fragment \(k): wrong tail") }
+        }
+    }
+
+    /// Going back to a part already heard, after a seek far away dropped its segments, makes
+    /// them again from the pieces kept on disk without isolating anything again; stopping
+    /// removes the pieces. Guards against the cache being dropped with the segments (each seek
+    /// back would cost a second of isolation again) and against pieces left behind.
+    @Test func goingBackToAPartHeardDoesNotIsolateItAgain() async throws {
+        defer { try? FileManager.default.removeItem(at: folder) }
+        let fetcher = try makeLecture(seconds: 48, segment: 8)
+        let isolator = RecordingIsolator()
+        let sessions = folder.appendingPathComponent("sessions")
+        let session = try LiveAudioSession(stream: Self.address, ffmpeg: try #require(AudioEnhancement.locateFFmpeg()), onFailure: { _ in },
+                                           fetcher: fetcher, isolator: isolator, parent: sessions)
+        _ = try await get(session.playlistURL)
+        func segment(_ index: Int) async throws -> Data {
+            let (data, status) = try await get(session.playlistURL.deletingLastPathComponent().appendingPathComponent(AudioEnhancement.segmentName(index)))
+            #expect(status == 200 && data.first == 0x47, "segment \(index)")
+            return data
+        }
+        let first = try await segment(0)
+        _ = try await segment(1)
+        // The prefetched segment 2 too, so nothing for 0–2 is still underway.
+        _ = try await segment(2)
+        _ = try await segment(5)
+        let before = isolator.calls.count
+        let again = try await segment(0)
+        #expect(isolator.calls.count == before, "isolated again: \(isolator.calls.dropFirst(before).map(\.name))")
+        #expect(again == first, "made again from the same pieces, the segment should be the same")
+        session.stop()
+        // The pipeline stops on its own actor: its folder goes a moment later.
+        var left: [String] = []
+        for _ in 0..<40 {
+            left = ((try? FileManager.default.subpathsOfDirectory(atPath: sessions.path)) ?? []).filter { $0.hasSuffix(".raw") }
+            if left.isEmpty { break }
+            try await Task.sleep(for: .milliseconds(50))
+        }
+        #expect(left.isEmpty, "pieces left after stop: \(left)")
     }
 
     /// After `stop` nothing answers: the port is closed.

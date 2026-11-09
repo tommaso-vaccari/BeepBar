@@ -190,40 +190,47 @@ struct AudioEnhancementTests {
         #expect(AudioEnhancement.samplePosition(0) == 0)
     }
 
-    /// The isolated path's two ffmpeg runs. Decoding: the audio context alone, on the lecture's
-    /// clock (`-copyts` before the input), padded or trimmed to start exactly at `firstSample`
-    /// (a WAV keeps no timestamps), mono float at the isolation rate, local files only.
-    /// Encoding: the video copied from this segment, the isolated WAV put back at that same
-    /// sample (`-itsoffset` before its input, where ffmpeg applies it), filtered with
-    /// `isolatedChain` and trimmed to the segment's span. Guards against audio shifted from the
-    /// picture or across a join, and against ffmpeg reaching the network.
+    /// The isolated path's two ffmpeg runs. Decoding: the audio alone, on the lecture's clock
+    /// (`-copyts` before the input), padded or trimmed to start exactly at `firstSample` (a WAV
+    /// keeps no timestamps), then cut to `from..<to` counted from there, mono float at the
+    /// isolation rate, local files only; with no `to`, to the end. Encoding: the video copied
+    /// from this segment, the raw isolated pieces joined (their format declared before their
+    /// input) and put back at their first sample by count (`asetpts`; `-itsoffset` left raw
+    /// audio off the clock), filtered with `isolatedChain` and trimmed to the segment's span. Guards
+    /// against audio shifted from the picture or across a join, a piece cut at the wrong
+    /// sample, and ffmpeg reaching the network.
     @Test func anIsolatedSegmentIsPutBackOnTheLecturesClock() {
-        let decode = AudioEnhancement.isolationDecodeArguments(audio: "concat:/i|/p|/c|/n", firstSample: 385024, output: "/d.wav")
+        let decode = AudioEnhancement.isolationDecodeArguments(audio: "concat:/i|/p|/c|/n", firstSample: 385024, from: 433024, to: 1_897_024, output: "/d.wav")
         func value(_ args: [String], after flag: String) -> String? { args.firstIndex(of: flag).map { args[$0 + 1] } }
         #expect(value(decode, after: "-i") == "concat:/i|/p|/c|/n")
         #expect(decode.firstIndex(of: "-copyts")! < decode.firstIndex(of: "-i")!)
         #expect(value(decode, after: "-map") == "0:a:0")
-        #expect(value(decode, after: "-af") == "aresample=48000,aresample=async=1:first_pts=385024,aformat=sample_fmts=flt:channel_layouts=mono")
+        #expect(value(decode, after: "-af") == "aresample=48000,aresample=async=1:first_pts=385024,atrim=start_sample=48000:end_sample=1512000,aformat=sample_fmts=flt:channel_layouts=mono")
         #expect(value(decode, after: "-c:a") == "pcm_f32le")
         #expect(value(decode, after: "-f") == "wav")
         #expect(value(decode, after: "-protocol_whitelist") == "file,concat")
         #expect(decode.contains("-nostdin"))
         #expect(decode.last == "/d.wav")
+        let toTheEnd = AudioEnhancement.isolationDecodeArguments(audio: "/a", firstSample: 100, from: 100, to: nil, output: "/d.wav")
+        #expect(value(toTheEnd, after: "-af") == "aresample=48000,aresample=async=1:first_pts=100,atrim=start_sample=0,aformat=sample_fmts=flt:channel_layouts=mono")
 
-        let encode = AudioEnhancement.isolatedEncodeArguments(video: "concat:/i|/c", isolated: "/x.wav", firstSample: 385024, start: 30.010667, end: 60.005333, output: "/o.ts")
+        let encode = AudioEnhancement.isolatedEncodeArguments(video: "concat:/i|/c", isolated: ["/p.raw", "/c.raw", "/n.raw"], firstSample: 385024,
+                                                              start: 30.010667, end: 60.005333, output: "/o.ts")
         let inputs = encode.indices.filter { encode[$0] == "-i" }
-        #expect(inputs.map { encode[$0 + 1] } == ["concat:/i|/c", "/x.wav"])
+        #expect(inputs.map { encode[$0 + 1] } == ["concat:/i|/c", "concat:/p.raw|/c.raw|/n.raw"])
         #expect(encode.firstIndex(of: "-copyts")! < inputs[0])
-        let offset = encode.firstIndex(of: "-itsoffset")!
-        #expect(encode[offset + 1] == "8.021333")
-        #expect(inputs[0] < offset && offset < inputs[1], "-itsoffset applies to the input right after it")
+        let raw = Array(encode[inputs[0]..<inputs[1]])
+        #expect(value(raw, after: "-f") == "s16le" && value(raw, after: "-ar") == "48000" && value(raw, after: "-ac") == "1",
+                "the pieces have no header: their format is declared before their input")
         #expect(encode.indices.filter { encode[$0] == "-map" }.map { encode[$0 + 1] } == ["0:v:0?", "1:a:0"])
         #expect(value(encode, after: "-c:v") == "copy")
-        #expect(value(encode, after: "-af") == AudioEnhancement.isolatedChain + ",atrim=start=30.010667:end=60.005333")
+        #expect(value(encode, after: "-af") == "asetpts=(N+385024)/SR/TB," + AudioEnhancement.isolatedChain + ",atrim=start=30.010667:end=60.005333")
+        #expect(!encode.contains("-itsoffset"))
         #expect(value(encode, after: "-c:a") == "aac")
-        #expect(value(encode, after: "-ar") == "48000")
+        let output = Array(encode[inputs[1]...])
+        #expect(value(output, after: "-ar") == "48000")
+        #expect(value(output, after: "-f") == "mpegts")
         #expect(value(encode, after: "-muxdelay") == "0")
-        #expect(value(encode, after: "-f") == "mpegts")
         #expect(value(encode, after: "-protocol_whitelist") == "file,concat")
         #expect(encode.last == "/o.ts")
     }

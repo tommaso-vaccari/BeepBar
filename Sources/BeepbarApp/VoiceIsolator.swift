@@ -2,11 +2,14 @@ import AVFoundation
 import AudioToolbox
 import BeepbarCore
 
-/// Runs one segment's audio through voice isolation: reads the mono WAV at `input`, writes the
-/// isolated audio to `output`, same length and the same clock. Throws `CancellationError` when
-/// the calling task is cancelled.
+/// Runs audio through voice isolation: reads the mono 48 kHz WAV at `input` and writes to
+/// `output` its isolated samples from `first`, `count` of them (to the end when nil), on the
+/// input's own clock, as raw 16-bit little-endian mono (`AudioEnhancement.
+/// isolatedEncodeArguments` joins such pieces). The samples around the kept range are what the
+/// voice model hears before and after it (`AudioEnhancement.isolationLead`). Throws
+/// `CancellationError` when the calling task is cancelled.
 protocol LiveAudioVoiceIsolating: Sendable {
-    func isolate(_ input: URL, to output: URL) async throws
+    func isolate(_ input: URL, from first: Int, count: Int?, to output: URL) async throws
 }
 
 /// Apple's voice isolation (`AUSoundIsolation`, the audio unit behind FaceTime's Voice
@@ -58,18 +61,23 @@ struct AppleVoiceIsolator: LiveAudioVoiceIsolating {
     /// A nonisolated async function: the second of rendering runs on the shared pool, neither
     /// on the main actor nor on `LiveAudioPipeline` (no default actor isolation is set in
     /// either build), so seeks and `stop()` aren't held up by it.
-    func isolate(_ input: URL, to output: URL) async throws {
-        try Self.render(input: input, output: output, model: model)
+    func isolate(_ input: URL, from first: Int, count: Int?, to output: URL) async throws {
+        try Self.render(input: input, first: first, count: count, output: output, model: model)
     }
 
     /// The offline render: a player node reads the file into the unit, the engine renders in
-    /// 4096-frame blocks straight to `output` (memory independent of the segment's length), the
-    /// first `model.delay` samples are dropped and the unit's tail rendered after the file ends.
-    /// Checks for cancellation between blocks: a 90-second context renders in about a second.
-    private static func render(input: URL, output: URL, model: Model) throws {
+    /// 4096-frame blocks straight to `output` (memory independent of the audio's length), the
+    /// first `model.delay` samples and those before `first` are dropped, and the unit's tail
+    /// rendered after the file ends. Checks for cancellation between blocks: a 30-second
+    /// fragment renders in about a third of a second.
+    ///
+    /// 16-bit output, clamped to full scale: half the disk of float for the pieces a lecture
+    /// keeps (`LiveAudioPipeline`), 96 dB of range, and isolated speech stays below full scale.
+    private static func render(input: URL, first: Int, count: Int?, output: URL, model: Model) throws {
         let source = try AVAudioFile(forReading: input)
         let format = source.processingFormat
-        guard format.channelCount == 1, Int(format.sampleRate) == AudioEnhancement.isolationSampleRate else { throw IsolationError.unsupportedInput }
+        guard format.channelCount == 1, Int(format.sampleRate) == AudioEnhancement.isolationSampleRate,
+              first >= 0, first <= source.length, (count ?? 0) >= 0 else { throw IsolationError.unsupportedInput }
         let engine = AVAudioEngine()
         let player = AVAudioPlayerNode()
         let effect = AVAudioUnitEffect(audioComponentDescription: component)
@@ -88,34 +96,33 @@ struct AppleVoiceIsolator: LiveAudioVoiceIsolating {
         player.scheduleFile(source, at: nil)
         player.play()
 
-        let destination = try AVAudioFile(forWriting: output, settings: format.settings, commonFormat: .pcmFormatFloat32, interleaved: false)
+        guard FileManager.default.createFile(atPath: output.path, contents: nil) else { throw IsolationError.renderFailed }
+        let destination = try FileHandle(forWritingTo: output)
+        defer { try? destination.close() }
         guard let buffer = AVAudioPCMBuffer(pcmFormat: engine.manualRenderingFormat, frameCapacity: engine.manualRenderingMaximumFrameCount) else { throw IsolationError.renderFailed }
-        let delay = AVAudioFramePosition(model.delay)
-        let total = source.length + delay
-        var toDrop = delay
-        // Exactly the input's length: the engine may round the last block up.
-        var toWrite = source.length
-        while engine.manualRenderingSampleTime < total, toWrite > 0 {
+        let wanted = AVAudioFramePosition(min(count ?? Int.max, Int(source.length) - first))
+        // The unit's output at `delay + first` is the input's sample `first`.
+        let skip = AVAudioFramePosition(model.delay + first)
+        let total = skip + wanted
+        var rendered: AVAudioFramePosition = 0
+        var written: AVAudioFramePosition = 0
+        var samples = [Int16](repeating: 0, count: Int(buffer.frameCapacity))
+        while rendered < total, written < wanted {
             try Task.checkCancellation()
-            let frames = AVAudioFrameCount(min(total - engine.manualRenderingSampleTime, AVAudioFramePosition(buffer.frameCapacity)))
+            let frames = AVAudioFrameCount(min(total - rendered, AVAudioFramePosition(buffer.frameCapacity)))
             guard try engine.renderOffline(frames, to: buffer) == .success else { throw IsolationError.renderFailed }
-            if toDrop >= AVAudioFramePosition(buffer.frameLength) {
-                toDrop -= AVAudioFramePosition(buffer.frameLength)
-                continue
+            let blockStart = rendered
+            rendered += AVAudioFramePosition(buffer.frameLength)
+            // The part of this block past `skip`, up to what is still wanted.
+            let from = max(0, skip - blockStart)
+            let to = min(AVAudioFramePosition(buffer.frameLength), from + (wanted - written))
+            guard to > from else { continue }
+            let block = buffer.floatChannelData![0]
+            for i in 0..<Int(to - from) {
+                samples[i] = Int16((max(-1, min(1, block[Int(from) + i])) * 32767).rounded()).littleEndian
             }
-            if toDrop > 0 {
-                // Shift the block's kept part to its start: AVAudioFile writes from frame 0.
-                let keep = Int(buffer.frameLength) - Int(toDrop)
-                let samples = buffer.floatChannelData![0]
-                samples.update(from: samples + Int(toDrop), count: keep)
-                buffer.frameLength = AVAudioFrameCount(keep)
-                toDrop = 0
-            }
-            buffer.frameLength = AVAudioFrameCount(min(AVAudioFramePosition(buffer.frameLength), toWrite))
-            toWrite -= AVAudioFramePosition(buffer.frameLength)
-            try destination.write(from: buffer)
+            try samples.withUnsafeBytes { try destination.write(contentsOf: UnsafeRawBufferPointer(rebasing: $0[0..<(Int(to - from) * 2)])) }
+            written += to - from
         }
-        // Before macOS 15 the file is closed when `destination` goes out of scope, here too.
-        if #available(macOS 15, *) { destination.close() }
     }
 }

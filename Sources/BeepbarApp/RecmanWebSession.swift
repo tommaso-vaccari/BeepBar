@@ -227,6 +227,13 @@ struct RecmanStreamFailure: Error {
     }
 
     func playbackURL(for recording: RecmanRecording) async throws -> URL {
+        // A lesson added by its Webex link (`ManualWebexLesson`) is its own player link: no
+        // archive session is needed (so no operation interrupts the running one), and one whose
+        // link the policy now refuses is never followed.
+        if ManualWebexLesson.isManual(recording) {
+            guard let link = ManualWebexLesson.playerLink(for: recording) else { throw RecmanBrowserError.playbackUnavailable }
+            return link
+        }
         let operation = beginOperation()
         guard RecmanURLPolicy.previewTransferID(recording.previewURL) == recording.id else { throw RecmanBrowserError.playbackUnavailable }
         // The preview link works only inside a live Recman session.

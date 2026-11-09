@@ -48,6 +48,30 @@ import OSLog
     /// regular app and finds a lecture open when it is done; see
     /// `RecordingPlayerController.adoptPolicyToRestore`.
     func adoptPolicyToRestore(_ policy: NSApplication.ActivationPolicy)
+    /// What the student chose in the window's Audio menu (`PlayerAudioAction`), with the
+    /// `recordingID` of the lecture on screen when they chose it. Delivered on the main actor.
+    var onAudioAction: ((String, PlayerAudioAction) -> Void)? { get set }
+    /// Called once when the window closes (`close()` or its close button), with the
+    /// `recordingID` it showed, whether or not its lecture was ever ready: unlike the `.closed`
+    /// checkpoint, which needs a position worth reporting. What lives only as long as the
+    /// window (the enhanced-audio filter) ends here.
+    var onClose: ((String) -> Void)? { get set }
+    /// Shows `state` in the Audio menu while `recordingID` is the lecture on screen; nil hides
+    /// the section (no account to keep a copy under). Ignored for any other lecture, so a late
+    /// update of a replaced lecture never shows on the next one.
+    func showAudioEnhancement(_ state: AudioEnhancementState?, recordingID: String)
+    /// Where the lecture on screen is, in seconds (a seek in flight counts as landed), or nil
+    /// when nothing is open: where a switch between the stream and the enhanced copy resumes.
+    var playbackPosition: TimeInterval? { get }
+    /// Whether the lecture on screen is playing (or about to, once its resume lands) rather
+    /// than paused: a switch keeps it that way.
+    var isPlaying: Bool { get }
+}
+
+/// One choice in the player's Audio menu (`RecordingPlaying.onAudioAction`).
+enum PlayerAudioAction: Equatable, Sendable {
+    /// Play through the local filter (true) or Webex's stream (false) from the same position.
+    case useEnhanced(Bool)
 }
 
 /// One report of where the student stopped in a lecture (`RecordingPlaying.onPositionCheckpoint`).
@@ -187,6 +211,9 @@ enum RecordingPlayerError: Error {
     private(set) var player: AVPlayer?
     /// The speed menu in the title bar; internal so tests can drive it.
     private(set) var speedPopUp: NSPopUpButton?
+    /// The enhanced-audio switch beside `speedPopUp` (`RecordingPlayerPolicy.audioButton`),
+    /// hidden while `audioState` is nil.
+    private(set) var audioButton: NSButton?
     /// Whether the current item reached `.readyToPlay`: decides which failure phase is reported.
     private(set) var isCurrentItemReady = false
     /// Whether the start of playback is settled: the item is ready and the `startAt` seek, if
@@ -272,6 +299,14 @@ enum RecordingPlayerError: Error {
     private weak var videoHost: NSView?
     /// The menu items' targets: an item holds its target weakly.
     private var menuActions: [PlayerMenuAction] = []
+    /// The audio switch's target, kept apart from `menuActions`, which a menu rebuild empties:
+    /// `NSButton.target` is weak, so the switch would go dead after a language switch.
+    private var audioActions: [PlayerMenuAction] = []
+    /// The Audio menu's state for the lecture on screen (`showAudioEnhancement`); nil hides it.
+    private(set) var audioState: AudioEnhancementState?
+    var onAudioAction: ((String, PlayerAudioAction) -> Void)?
+    /// See `RecordingPlaying.onClose`.
+    var onClose: ((String) -> Void)?
     /// The policy BeepBar had before the player promoted it to `.regular`; nil when the player
     /// did not change it.
     private var policyToRestore: NSApplication.ActivationPolicy?
@@ -396,7 +431,11 @@ enum RecordingPlayerError: Error {
         generation += 1
         // A different lecture starts at fit; the same one (a recovery, Play again) keeps the
         // student's zoom, like its position.
-        if recordingID != self.recordingID { applyZoom(.fit) }
+        // The Audio menu belongs to one lecture: the caller sets it again right after `play`.
+        if recordingID != self.recordingID {
+            applyZoom(.fit)
+            audioState = nil
+        }
         self.recordingID = recordingID
         failureReported = false
         isCurrentItemReady = false
@@ -515,11 +554,15 @@ enum RecordingPlayerError: Error {
         let window = self.window
         stopPlayback()
         guard let window else { return }
+        // Before `window.close()`: `windowWillClose` then no longer sees its window (nil
+        // below), so this is the one report.
+        onClose?(recordingID)
         Self.release(window)
         if self.window === window {
             self.window = nil
             playerView = nil
             speedPopUp = nil
+            audioButton = nil
         }
         window.close()
     }
@@ -530,6 +573,25 @@ enum RecordingPlayerError: Error {
         // itself must leave the Dock before it is ordered front.
         if window.isMiniaturized { window.deminiaturize(nil) }
         present(window)
+    }
+
+    func showAudioEnhancement(_ state: AudioEnhancementState?, recordingID: String) {
+        guard isOpen, recordingID == self.recordingID else { return }
+        audioState = state
+        updateAudioItems()
+    }
+
+    var playbackPosition: TimeInterval? {
+        guard let player else { return nil }
+        // During a resume the player still sits at 0: the position it is going to is the one.
+        if isResuming, let pendingStartAt { return pendingStartAt }
+        return reportedPosition(of: player)
+    }
+
+    var isPlaying: Bool {
+        guard let player else { return false }
+        if isResuming { return playWhenSettled }
+        return player.timeControlStatus != .paused
     }
 
     func showProblem(_ message: String) {
@@ -546,6 +608,7 @@ enum RecordingPlayerError: Error {
         checkpointIfMeaningful(.closed)
         // Playback stops now: no sound may outlive the window.
         stopPlayback()
+        onClose?(recordingID)
         // Synchronously, so a Play in the meantime can give the name to its new window: AppKit
         // refuses a name another live window still holds. The frame was saved on the last move
         // or resize, so nothing is lost.
@@ -562,6 +625,7 @@ enum RecordingPlayerError: Error {
                 self.window = nil
                 self.playerView = nil
                 self.speedPopUp = nil
+                self.audioButton = nil
             }
         }
     }
@@ -977,7 +1041,7 @@ enum RecordingPlayerError: Error {
             guard let self, let window, self.window === window else { return }
             self.handleZoomInput(input)
         }
-        window.addTitlebarAccessoryViewController(makeSpeedAccessory())
+        window.addTitlebarAccessoryViewController(makeSpeedAccessory(for: window))
         if let frameAutosaveName {
             if !window.setFrameUsingName(frameAutosaveName) { window.center() }
             window.setFrameAutosaveName(frameAutosaveName)
@@ -1112,10 +1176,14 @@ enum RecordingPlayerError: Error {
         artwork = nil
     }
 
-    /// The speed menu at the trailing end of the title bar: always visible, it shows the current
-    /// speed and lists the keyboard shortcuts, whether or not `AVPlayerView`'s own controls offer
-    /// a speed menu in this macOS version.
-    private func makeSpeedAccessory() -> NSTitlebarAccessoryViewController {
+    /// The trailing end of the title bar: the enhanced-audio switch (shown only while the lecture
+    /// has an Audio state) and the speed menu, always visible, which shows the current speed and
+    /// lists the keyboard shortcuts, whether or not `AVPlayerView`'s own controls offer a speed
+    /// menu in this macOS version. In the title bar rather than over the video: AVKit's control bar
+    /// takes no extra buttons, and an overlay would collide with it (and with full screen's).
+    /// `window` is passed in because `self.window` is set only after the accessory is built: the
+    /// switch's action checks it is still this window's.
+    private func makeSpeedAccessory(for window: NSWindow) -> NSTitlebarAccessoryViewController {
         let popUp = NSPopUpButton(frame: NSRect(x: 0, y: 0, width: 72, height: 22), pullsDown: true)
         popUp.bezelStyle = .accessoryBarAction
         popUp.controlSize = .small
@@ -1124,13 +1192,57 @@ enum RecordingPlayerError: Error {
         popUp.refusesFirstResponder = true
         popUp.autoenablesItems = false
         speedPopUp = popUp
-        let container = NSView(frame: NSRect(x: 0, y: 0, width: 80, height: 22))
-        popUp.frame.origin = NSPoint(x: 0, y: 0)
+
+        let toggle = PlayerMenuAction { [weak self, weak window] in
+            guard let self, let window, self.window === window else { return }
+            self.audioButtonClicked()
+        }
+        audioActions = [toggle]
+        let button = NSButton(frame: NSRect(x: 0, y: 0, width: 30, height: 22))
+        button.setButtonType(.pushOnPushOff)
+        button.bezelStyle = .accessoryBarAction
+        button.controlSize = .small
+        button.image = NSImage(systemSymbolName: "waveform", accessibilityDescription: tr("Audio migliorato", "Enhanced audio"))
+        button.imagePosition = .imageOnly
+        button.refusesFirstResponder = true
+        button.target = toggle
+        button.action = #selector(PlayerMenuAction.invoke(_:))
+        button.setAccessibilityLabel(tr("Audio migliorato", "Enhanced audio"))
+        button.isHidden = true
+        audioButton = button
+
+        let container = NSView(frame: NSRect(x: 0, y: 0, width: Self.accessoryWidth(showingAudio: false), height: 22))
+        container.addSubview(button)
         container.addSubview(popUp)
         let accessory = NSTitlebarAccessoryViewController()
         accessory.layoutAttribute = .trailing
         accessory.view = container
+        layOutAccessory()
         return accessory
+    }
+
+    /// The accessory's width: the speed menu alone, or with the audio switch before it.
+    private static func accessoryWidth(showingAudio: Bool) -> CGFloat { showingAudio ? 114 : 80 }
+
+    /// Places the switch and the speed menu for the switch's visibility, so a hidden switch
+    /// leaves no gap before the speed menu.
+    private func layOutAccessory() {
+        guard let popUp = speedPopUp, let button = audioButton, let container = popUp.superview else { return }
+        let showing = !button.isHidden
+        let width = Self.accessoryWidth(showingAudio: showing)
+        if container.frame.width != width { container.setFrameSize(NSSize(width: width, height: container.frame.height)) }
+        button.frame.origin = NSPoint(x: 0, y: 0)
+        popUp.frame.origin = NSPoint(x: showing ? 34 : 0, y: 0)
+    }
+
+    /// The switch was clicked: what it does is decided from `audioState` now, not from how it
+    /// looked. AppKit already flipped its look; it is set back from the state at once, and again
+    /// when the controller reports the new state, so it never shows a choice that wasn't applied.
+    func audioButtonClicked() {
+        let action = RecordingPlayerPolicy.audioButton(audioState)?.action
+        updateAudioItems()
+        guard isOpen, let action else { return }
+        onAudioAction?(recordingID, action)
     }
 
     /// Rebuilds the speed menu's items in the current language (so a language switch shows at the
@@ -1158,6 +1270,7 @@ enum RecordingPlayerError: Error {
             item.representedObject = NSNumber(value: speed)
             menu.addItem(item)
         }
+        addAudioItems(to: menu)
         menu.addItem(.separator())
         let shortcutsHeader = NSMenuItem(title: tr("Scorciatoie da tastiera", "Keyboard shortcuts"), action: nil, keyEquivalent: "")
         shortcutsHeader.isEnabled = false
@@ -1170,6 +1283,82 @@ enum RecordingPlayerError: Error {
         }
         popUp.toolTip = ([tr("Velocità di riproduzione", "Playback speed")] + help.map { "\($0.keys): \($0.action)" }).joined(separator: "\n")
         popUp.setAccessibilityLabel(tr("Velocità di riproduzione", "Playback speed"))
+    }
+
+    /// The Audio section of the title-bar menu (`audioState`): a separator, a header, the main
+    /// item (the enhanced-audio switch, or how to get ffmpeg) and a detail item (why the last
+    /// attempt failed). Tagged so `updateAudioItems` finds them; hidden while the state is nil.
+    private func addAudioItems(to menu: NSMenu) {
+        let separator = NSMenuItem.separator()
+        separator.tag = AudioMenuTag.separator
+        menu.addItem(separator)
+        let header = NSMenuItem(title: tr("Audio", "Audio"), action: nil, keyEquivalent: "")
+        header.isEnabled = false
+        header.tag = AudioMenuTag.header
+        menu.addItem(header)
+        for tag in [AudioMenuTag.main, AudioMenuTag.detail] {
+            let window = self.window
+            let action = PlayerMenuAction { [weak self, weak window] in
+                guard let self, let window, self.window === window else { return }
+                self.audioItemChosen(tag)
+            }
+            menuActions.append(action)
+            let item = NSMenuItem(title: "", action: #selector(PlayerMenuAction.invoke(_:)), keyEquivalent: "")
+            item.target = action
+            item.tag = tag
+            menu.addItem(item)
+        }
+        updateAudioItems()
+    }
+
+    /// Tags of the Audio section's items: distinct from 0, the tag of every other item.
+    enum AudioMenuTag {
+        static let separator = 9_001
+        static let header = 9_002
+        static let main = 9_003
+        static let detail = 9_004
+    }
+
+    /// The Audio items' titles and states for `audioState`, updated in place, no rebuild; the
+    /// title-bar switch too.
+    private func updateAudioItems() {
+        if let button = audioButton {
+            let presentation = RecordingPlayerPolicy.audioButton(audioState)
+            let hidden = presentation == nil
+            button.state = presentation?.isOn == true ? .on : .off
+            button.isEnabled = presentation?.action != nil
+            button.toolTip = presentation?.toolTip
+            if button.isHidden != hidden {
+                button.isHidden = hidden
+                layOutAccessory()
+            }
+        }
+        guard let menu = speedPopUp?.menu else { return }
+        let presentation = RecordingPlayerPolicy.audioMenu(audioState)
+        for tag in [AudioMenuTag.separator, AudioMenuTag.header] {
+            menu.item(withTag: tag)?.isHidden = presentation == nil
+        }
+        if let main = menu.item(withTag: AudioMenuTag.main) {
+            main.isHidden = presentation == nil
+            main.title = presentation?.main.title ?? ""
+            main.isEnabled = presentation?.main.action != nil
+            main.state = presentation?.main.checked == true ? .on : .off
+        }
+        if let detail = menu.item(withTag: AudioMenuTag.detail) {
+            detail.isHidden = presentation?.detail == nil
+            detail.title = presentation?.detail?.title ?? ""
+            detail.isEnabled = presentation?.detail?.action != nil
+            detail.state = .off
+        }
+    }
+
+    /// An Audio item was clicked: what it does is decided from the state at the time of the
+    /// click, never from the title it was built with.
+    func audioItemChosen(_ tag: Int) {
+        guard isOpen, let presentation = RecordingPlayerPolicy.audioMenu(audioState) else { return }
+        let action = tag == AudioMenuTag.main ? presentation.main.action : presentation.detail?.action
+        guard let action else { return }
+        onAudioAction?(recordingID, action)
     }
 
     /// Shows the applied speed in the title-bar menu and gives `AVPlayerView` the speeds the item
@@ -1263,6 +1452,7 @@ enum RecordingPlayerError: Error {
         playerView?.setValue(nil, forKey: "player")
         player = nil
         menuActions = []
+        audioActions = []
         // Nothing of the lecture survives the window: no fetch, no picture, no record, no
         // remote commands.
         cancelArtwork()

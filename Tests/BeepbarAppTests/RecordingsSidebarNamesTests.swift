@@ -116,23 +116,37 @@ struct RecordingsSidebarNamesTests {
         #expect(name("AN2", cleaned: "ANALISI 2 (sezione B)", raw: "058167 - ANALISI 2 (sezione B) [2026-27]") == "AN2 (sezione B)")
     }
 
-    // MARK: Orange marker
+    // MARK: Lectures left to watch
 
-    /// The marker shows only when something is left; unknown claims nothing, finished and empty
-    /// courses show nothing. `next` is irrelevant (old data has counts without it).
-    @Test func theMarkerShowsOnlyWhenKnownAndNotAllDone() {
-        #expect(RecordingsPresentation.hasLecturesToWatch(summary: summary(done: 3, total: 10)))
-        #expect(RecordingsPresentation.hasLecturesToWatch(summary: summary(done: 0, total: 1)))
-        #expect(!RecordingsPresentation.hasLecturesToWatch(summary: summary(done: 10, total: 10)))
-        #expect(!RecordingsPresentation.hasLecturesToWatch(summary: summary(done: 0, total: 0)))
-        #expect(!RecordingsPresentation.hasLecturesToWatch(summary: nil))
+    /// The lectures left are said only when something is left; an unknown summary claims
+    /// nothing, finished and empty courses say nothing. `next` is irrelevant (old data has
+    /// counts without it). Mutation: drop the `done < total` guard and "0 da guardare" appears.
+    @Test func theLecturesLeftAreSaidOnlyWhenKnownAndNotAllDone() {
+        #expect(RecordingsPresentation.lecturesToWatchText(summary: summary(done: 7, total: 10)) == BilingualText("3 da guardare", "3 to watch"))
+        #expect(RecordingsPresentation.lecturesToWatchText(summary: summary(done: 0, total: 1)) == BilingualText("1 da guardare", "1 to watch"))
+        #expect(RecordingsPresentation.lecturesToWatchText(summary: summary(done: 10, total: 10)) == nil)
+        #expect(RecordingsPresentation.lecturesToWatchText(summary: summary(done: 0, total: 0)) == nil)
+        #expect(RecordingsPresentation.lecturesToWatchText(summary: nil) == nil)
     }
 
-    /// VoiceOver reads the label and the number left in both languages.
-    @Test func theMarkerSpeaksInBothLanguages() {
-        #expect(RecordingsPresentation.lecturesToWatchLabel == BilingualText("Lezioni da guardare", "Lectures to watch"))
-        let value = RecordingsPresentation.lecturesToWatchValue(summary(done: 7, total: 10))
-        #expect(value.italian == "3 da guardare")
-        #expect(value.english == "3 left")
+    /// The subtitle joins the recording count and the lectures left; with no listing loaded
+    /// the lectures left show alone, and with neither the row keeps a blank line (its height).
+    /// Guards against the summary being dropped from the subtitle once the orange dot went.
+    @Test func theSubtitleCarriesTheLecturesLeft() {
+        let listing = RecordingsListing(recordings: [])
+        #expect(RecordingsPresentation.courseSubtitle(for: listing, summary: summary(done: 1, total: 4)) == "Nessuna registrazione · 3 da guardare")
+        #expect(RecordingsPresentation.courseSubtitle(for: nil, summary: summary(done: 1, total: 4)) == "3 da guardare")
+        #expect(RecordingsPresentation.courseSubtitle(for: listing, summary: summary(done: 4, total: 4)) == "Nessuna registrazione")
+        #expect(RecordingsPresentation.courseSubtitle(for: nil, summary: nil) == " ")
+    }
+
+    /// The new-lectures badge stays readable on the selected row, whose background is the
+    /// accent colour: there the badge is white with an accent number. Mutation: return the
+    /// same colours for both and the selected badge vanishes into the row (only "1" shows).
+    @Test func theNewBadgeInvertsOnTheSelectedRow() {
+        let normal = RecordingsPresentation.newCountColors(onSelectedRow: false)
+        let selected = RecordingsPresentation.newCountColors(onSelectedRow: true)
+        #expect(normal.fill == .accentColor && normal.text == .white)
+        #expect(selected.fill == .white && selected.text == .accentColor)
     }
 }

@@ -97,7 +97,7 @@ Branch `fix/recordings-signin-recovery`, base dev `0c9d033`. Il retry dopo una s
 **Cosa cambia e quale principio tocca.**
 - *Freschezza (5)*: gli elenchi delle registrazioni dei corsi selezionati si aggiornano a ogni sync, in un lavoro separato (`RecordingsSyncPolicy`, fuori da `syncTask`): «Esci» non lo attende (percorso di uscita invariato, da riprovare con `scripts/quit-probe.sh` prima della release), nessun timer nuovo (l’automatico gira nell’attività in background esistente), stesse pause del sync che lo provoca, intervallo di 300 s rispettato dall’automatico e ignorato da «Sincronizza ora». Nessun controllo è diradato.
 - *Costo proporzionale (4) e quiete (3)*: con Registrazioni spenta, account non Polimi, nessun account, sessione Polimi scaduta o elenchi già freschi non c’è rete né browser e il controller non viene creato; il riepilogo è scritto solo se cambia; l’avanzamento su disco solo a pausa, chiusura o sostituzione e solo se cambia; durante la riproduzione un aggiornamento in memoria circa ogni 30 s di lezione, senza timer in pausa o a lettore chiuso. Il costo atteso verso Polimi è al massimo un ingresso SSO più alcune pagine (stimate da una a tre) per corso e per intervallo di sync: **stima delle sessioni di sviluppo, non misurata** (vedi sotto).
-- *Risposta immediata (2)*: il menu legge riepiloghi già salvati (UserDefaults, per account) all’avvio, senza rete né controller; il pallino arancione della barra laterale si calcola dagli stessi dati.
+- *Risposta immediata (2)*: il menu legge riepiloghi già salvati (UserDefaults, per account) all’avvio, senza rete né controller; le lezioni rimaste nel sottotitolo dei corsi della barra laterale (prima un pallino arancione, PR #236) si calcolano dagli stessi dati.
 - *Risorse limitate (6)*: nessun tetto al numero di corsi oltre ai tempi massimi di passo (30 s per pagina, 10 s per script) e a un’operazione del browser per volta; il menu mostra al massimo 10 righe; l’immagine del corso ha limiti di 2 MB, 10 s e 512 px, resta in memoria e viene rilasciata alla chiusura.
 - *Stato veritiero (7) e identità (8)*: un aggiornamento fallito o parziale conserva elenco e stato visto precedenti (baseline #106); un risultato di un’identità passata viene scartato; avanzamento (tabella `progress` nel file dello stato «visto», creata senza migrazione, ignorata dalle versioni precedenti) e riepilogo (`recordings-watch-summary.v1`) sono per account e rimossi con disconnessione, cambio di account o disattivazione; il riepilogo ha campi opzionali letti in modo tollerante, così build diverse non perdono i riepiloghi. Tutte le lezioni partono da 0% dopo l’aggiornamento (decisione: nessuna migrazione).
 - *Quit/AppKit*: le righe cliccabili del menu mantengono il salto `Task { @MainActor }` (regole di AGENTS.md, #30/#31); la riproduzione dal menu non tocca `prepareForTermination`. Coperto da test dedicati (`RecordingsMenuBarTests`, `RecordingsMenuPlayTests`); la prova con AppKit reale (`scripts/quit-probe.sh`) va rieseguita prima della release.
@@ -120,6 +120,54 @@ Branch `fix/recordings-signin-recovery`, base dev `0c9d033`. Il retry dopo una s
 - Confronti **base dev → HEAD** e **main → HEAD** con `scripts/benchmark.sh compare` (regola della sezione «Risultati obbligatori nelle PR»): **non eseguiti**. Nessun beneficio temporale è rivendicato; nessuna affermazione di reattività dell’app intera sulla base dei test strutturali sopra.
 
 **Prossimo passo.** La prova live autorizzata è conclusa: un corso, una pagina, nessun retry. Non ripeterla per evitare traffico superfluo. Benchmark UI `recordings-1000`, `scripts/quit-probe.sh` e `otool -L` sul Release completati; restano le prove manuali della PR e l’osservazione idle di 30 minuti sulla copia installata dopo la release. Scaling, cicli ripetuti e idle restano **non misurati**; nessun beneficio app-wide rivendicato.
+
+### Registrazioni: lezioni da link Webex, audio migliorato e indicatori (issue #235, PR #236, 2026-11-09)
+
+Branch `feature/watchlist-manual-webex-audio`, base `origin/dev` `7ad62a2`. Non integrata: una PR aperta non è lavoro integrato.
+
+**Cosa cambia e quale principio tocca.**
+- *Dati dell’utente (1) e identità (8)*: le lezioni aggiunte con un link stanno in una chiave UserDefaults per account (`recordings-manual.v1.<owner>`), che una versione precedente non tocca; un elenco illeggibile non viene mai sovrascritto. Il loro avanzamento sta nella lezione (la tabella `progress` è per corso) e si cancella con lo storico, per ogni account (`forgetManualProgress`); le lezioni restano.
+- *Quiete (3) e costo proporzionale (4)*: l’avanzamento delle lezioni da link si scrive solo a checkpoint e spunte, mai al tick (test `aManualLessonShowsAndKeepsItsProgress`). L’audio migliorato non esiste finché non lo si accende: niente server, processo o file a riposo; chiude server, ffmpeg e cartella alla chiusura della lezione, e i processi all’uscita (osservatore `willTerminate`, nessun lavoro aggiunto al percorso di uscita).
+- *Risorse limitate (6)*: l’audio migliorato tiene su disco al più 40 tratti isolati per lezione e cancella un tratto solo quando nessuna codifica lo usa.
+- *Risposta immediata (2)*: la barra laterale legge le lezioni rimaste dai riepiloghi salvati come faceva il pallino; nessun lavoro in più per riga.
+
+**Misure (audio migliorato).** `BEEPBAR_MEASURE_AUDIO=1 swift test --skip-build --filter LiveAudioMeasurements` (procedura in `docs/benchmarks.md`, «Enhanced audio»), lezione sintetica di 6 minuti letta da disco (niente rete). Cinque esecuzioni per commit, alternate, stessa macchina: Apple M5, 32 GB, alimentazione da rete. Mediana / p95 (con 5 campioni il p95 è il massimo). Confronto `ee6b81d` (prima della cache dei tratti) → `b86e938` (cache; a HEAD il codice audio differisce solo in due commenti). Al commit di base il file di misura è stato copiato e adattato alla vecchia firma `isolate(_:to:)`, solo per la misura.
+
+| Con isolamento della voce | `ee6b81d` | `b86e938` | `784194e` | `5cb7957` |
+|---|---|---|---|---|
+| Primo segmento (seg0) | 1100 / 1103 ms | 1057 / 1064 ms | 1066 / 1082 ms | 1061 / 1068 ms |
+| Salto avanti (seg8) | 1096 / 1101 ms | 1049 / 1056 ms | 1045 / 1049 ms | 1052 / 1055 ms |
+| Ritorno a una parte ascoltata (seg1) | 1105 / 1113 ms | 356 / 358 ms | 352 / 355 ms | 356 / 359 ms |
+| Tempo totale di isolamento | 6628 / 6634 ms (8 run) | 5834 / 5860 ms (10 run, più corti) | 5851 / 5893 ms (10 run) | 5841 / 5862 ms (10 run) |
+| CPU BeepBar / ffmpeg | 6,69 / 4,42 s | 5,89 / 4,36 s | 5,91 / 4,37 s | 5,90 / 4,37 s |
+| Memoria di picco | 84 / 85 MB | 100 / 100 MB | 99 / 100 MB | 99 / 99 MB |
+| Dopo lo stop | 0 file, 0 processi | 0 file, 0 processi | 0 file, 0 processi | 0 file, 0 processi |
+
+Senza isolamento (solo ffmpeg) i due commit coincidono: seg0 609 / 612 contro 608 / 610 ms, salto avanti 642 / 660 contro 643 / 661 ms.
+
+La colonna `784194e` (correzioni della revisione) è stata misurata dopo, in cinque esecuzioni consecutive non alternate con le altre, sulla stessa macchina; senza isolamento: seg0 608 / 611 ms, salto avanti 644 / 647 ms. Le correzioni non cambiano i tempi. La colonna `5cb7957` (seconda tornata, sotto) è misurata allo stesso modo, cinque esecuzioni consecutive; senza isolamento: seg0 608 / 611 ms, salto avanti 642 / 643 ms. Neanche queste correzioni cambiano i tempi.
+
+**Revisione e verifiche.** La revisione indipendente ha trovato solo P1 e P2, corretti in `2a5ba87`, `21dc917` e `784194e` (la seconda tornata, sotto, in `5cb7957`):
+- un tratto sostituito poteva essere cancellato mentre una codifica lo leggeva;
+- un passo fallito restava in memoria e non veniva ritentato;
+- un salto poteva cancellare frammenti ancora letti;
+- errori di rete e 5xx spegnevano l’audio migliorato;
+- chiudere prima dell’avvio lasciava il filtro attivo;
+- link uguali con parametri diversi non erano doppioni.
+
+Ogni correzione ha un test che fallisce senza di essa: 18 mutazioni, tutte rilevate, eseguite in un worktree usa e getta. La suite `LiveAudioPipelineTests` usa Webex, ffmpeg e isolamento finti, quindi gira nel gate anche senza ffmpeg. I test con ffmpeg reale restano su richiesta.
+
+La suite completa su `dee4903` ha però fallito una volta (`aStepFailingOnceIsTriedAgain`, passo «probe»), e sotto carico (8 processi `yes`, 25 esecuzioni di `LiveAudioPipelineTests`, `RecordingsControllerTests` e `ManualWebexLessonTests`) falliva in 25 esecuzioni su 25. Non era solo il test. Cause e correzioni, in `5cb7957`:
+- *test*: il passo fatto fallire serviva anche al segmento 0, quindi l’esito dipendeva da quale richiesta lo eseguiva per prima; ora i passi del segmento richiesto e quelli del segmento preparato in anticipo hanno test separati. Il test sul tratto sostituito aspettava il file su disco invece della sua registrazione (`keptPiece`), e il finto ffmpeg contava come file mancanti anche le esecuzioni annullate, che `FFmpegRunner` riporta come annullamento;
+- *codice*: due isolamenti dello stesso frammento con contorni diversi si sostituivano nella contabilità, quindi lo stop non terminava il primo (ora sono indicizzati per esecuzione); due esecuzioni dello stesso passo scrivevano lo stesso file (ora ogni esecuzione ha un nome numerato, `runFile`); un frammento si scrive in modo atomico, così chi lo legge non ne vede uno a metà; una richiesta che trova fallito un lavoro avviato prima (dal segmento preparato in anticipo) lo rifà una volta invece di rispondere con l’errore vecchio; una richiesta abbandonata dal lettore dopo un salto non ricostruisce più il suo segmento, il successivo e i loro isolamenti (il server locale non vede chiudersi la connessione, quindi la richiesta riprova solo se il suo segmento è ancora vicino all’ultima arrivata; trovato dalle nostre mutazioni, non dalla revisione); il primo successo dopo un errore lo cancella (`report(nil)`), così un errore di rete già superato non manda in ripresa un guasto successivo. Il lettore distingue ora anche il caso senza errore segnalato: audio di Webex nello stesso punto, senza ripresa e senza segnare il filtro come guasto; prima dell’avvio un indirizzo scaduto segue la via consueta (il browser) e un errore di rete apre l’audio di Webex.
+
+Dopo le correzioni lo stesso ciclo sotto carico: 0 esecuzioni fallite su 25, e la suite completa passa a macchina scarica (su `dee4903`, con la macchina occupata dalle mutazioni, era fallito una volta `WebexSignInWebViewTests`, che misura un tempo reale; a macchina scarica passa). Mutazioni su `5cb7957`, nel worktree usa e getta: 29, tutte rilevate. Le 15 precedenti ancora applicabili più 14 nuove: isolamenti per esecuzione, nomi numerati, nuovo tentativo del lavoro avviato prima, `report(nil)`, il caso senza errore segnalato, il rifiuto e l’errore di rete prima dell’avvio, il link canonico, il tratto già coperto, l’annullamento al salto, la richiesta abbandonata, il nuovo tentativo della richiesta più recente e l’ordine d’arrivo delle richieste. Le due ultime sono state rilevate in 5 esecuzioni su 5.
+
+`scripts/quit-probe.sh` su `784194e`: menu-legacy e menu-dispatch si bloccano come previsto, menu e external escono (quattro modalità ok). Il percorso di uscita non è cambiato: l’audio migliorato termina ffmpeg dall’osservatore `willTerminate`, senza lavoro in `prepareForTermination`.
+
+**Regressioni e limiti.** La memoria di picco con isolamento sale di ~16 MB (84 → 100 MB) e resta lì dopo lo stop, come al commit di base resta a 84 MB: il modello della voce resta caricato nel processo. Non è una crescita per sessione, ma non è stato misurato su più lezioni consecutive. Le attese sono lavoro locale: la rete verso Webex non è misurata. I confronti base-dev → HEAD e main → HEAD non si applicano all’audio migliorato, che non esiste né su `dev` né su `main`: non misurati. Lezioni da link e indicatori non toccano i budget misurati (nessuna scrittura al tick, nessun lavoro per riga), coperti da test e non da benchmark. Il riferimento di AGENTS.override.md è un M2 8 GB: queste misure sono state prese su un M5 32 GB e non sono confrontabili con misure su quella macchina.
+
+**Decisione.** La cache entra in questa PR anche se AGENTS.md chiede una correzione per PR di prestazioni: ottimizza codice che esiste solo su questo branch, e senza di essa ogni ritorno indietro rifaceva l’isolamento.
 
 ## Review e battle testing obbligatori
 

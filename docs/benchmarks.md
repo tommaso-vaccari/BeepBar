@@ -298,3 +298,16 @@ D07's opt-in fixture and single-command scenario runner are documented in
 [UI benchmarks](ui-benchmarks.md). It hosts the actual pages with synthetic dependencies and
 reports window key separately from populated-content readiness. Its timings and traces must
 not be confused with the Core comparison harness or production launch/scheduler evidence.
+
+## Enhanced audio (live filter)
+
+Measure the local work of enhanced audio on a synthetic lecture, without the app, the network or an account:
+
+```sh
+BEEPBAR_MEASURE_AUDIO=1 swift test --filter LiveAudioMeasurements
+```
+
+It needs ffmpeg where BeepBar looks for it (`/opt/homebrew/bin`, `/usr/local/bin`, `/opt/local/bin`) and the system speech synthesizer; without either, or without the variable, the suite is skipped, so it never slows the regular `swift test`. The lecture is six minutes laid out as Webex's (one fragmented MP4, 30-second segments, 720p, 44.1 kHz stereo voice), made once in the temporary folder and read from disk, so network time is left out. Each variant (`isolation=true` with Apple's voice isolation, `isolation=false` with ffmpeg only) asks for segments as the player would: the first (`seg0`), the next two, a seek ahead (`seg8`) and a seek back to a part already heard (`seg1`). It prints the wait for each, the time spent in each step (`decode`, `isolate`, `encode`, `probe`, with counts), the CPU of BeepBar and of ffmpeg, the memory footprint before, at peak and after stop, and fails if stopping leaves a file or a child process behind.
+
+Report five runs per commit, interleaved and on the same machine and power source, with median and p95 of each wait. A commit older than the harness needs the file copied in and, if an API changed, a measurement-only adaptation recorded with the numbers. After stop the footprint stays at its peak while isolation is used: the voice model stays loaded in the process (the same at the commit before the piece cache), which is not a leak per session.
+

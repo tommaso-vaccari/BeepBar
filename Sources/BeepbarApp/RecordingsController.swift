@@ -255,6 +255,26 @@ struct RecordingsListing: Equatable {
     private var nowPlaying: [String: RecmanRecording] = [:]
     /// The lecture last handed to the player, for recoveries that outlive a newer Play.
     private var currentLectureID: String?
+
+    // MARK: Enhanced audio state ("Audio migliorato", see `AudioEnhancement`)
+
+    private let makeAudioEnhancer: @MainActor () -> AudioEnhancer
+    /// Created by the first lecture that reaches the player with a known account, never earlier.
+    private var audioEnhancer: AudioEnhancer?
+    /// The lecture on screen, its key (`AudioEnhancer.copyKey`) and its original stream: what
+    /// the filter reads and what "Audio migliorato" off goes back to. Nil when no account owns
+    /// it (`resumeOwner`), after close and on identity change.
+    private var audioLecture: (recordingID: String, key: String, stream: RecordingStream)?
+    /// Whether the player is playing `audioLecture` through the local filter rather than
+    /// Webex's stream.
+    private var enhancedAudioInUse = false
+    /// Where the filtered play started, for a filter that fails before anything played (the
+    /// player then reports no position).
+    private var enhancedStartAt: TimeInterval?
+    /// Whether the student last left "Audio migliorato" on: every lecture then starts filtered.
+    /// One switch for all lectures, saved like the speed.
+    nonisolated static let prefersEnhancedAudioKey = "io.github.tvaccari.beepbar.recordings-enhanced-audio"
+
     private var playbackIntent = 0
     /// Lectures already given their one fresh stream since the student pressed Play.
     private var recoveredLectures: Set<String> = []
@@ -500,12 +520,14 @@ struct RecordingsListing: Equatable {
         },
         now: @escaping () -> Date = Date.init,
         makePlayer: @escaping @MainActor () -> RecordingPlaying = { RecordingPlayerController() },
+        makeAudioEnhancer: @escaping @MainActor () -> AudioEnhancer = { AudioEnhancer() },
         courses: @escaping @MainActor () -> [RemoteCourseSummary] = { [] },
         fetchProfileEmail: @escaping @MainActor () async -> String? = { nil },
         listingCapacity: Int = RecordingsController.listingCapacity,
         playbackURLCapacity: Int = RecordingsController.playbackURLCapacity
     ) {
         self.makePlayer = makePlayer
+        self.makeAudioEnhancer = makeAudioEnhancer
         self.courses = courses
         self.fetchProfileEmail = fetchProfileEmail
         listings = BoundedCache(capacity: listingCapacity)
@@ -567,6 +589,37 @@ struct RecordingsListing: Equatable {
     private var studyUnreadable = false
     nonisolated static func studyKey(owner: Int) -> String { "io.github.tvaccari.beepbar.recordings-study.v1.\(owner)" }
 
+    /// Lessons the student added to the Watchlist with a Webex link (`ManualWebexLesson`), owned
+    /// by the same account as `study` and loaded, isolated and forgotten with it. A key of their
+    /// own, not a field of `study`: a rollback to an older BeepBar re-encodes `study` without the
+    /// fields it doesn't know, but never touches a key it doesn't know.
+    @Published private(set) var manualLessons = ManualWebexLessons()
+    /// The saved manual lessons couldn't be decoded: they are shown as none and never
+    /// overwritten, like an unreadable `study`.
+    private var manualLessonsUnreadable = false
+    nonisolated static let manualLessonsKeyPrefix = "io.github.tvaccari.beepbar.recordings-manual.v1."
+    nonisolated static func manualLessonsKey(owner: Int) -> String { manualLessonsKeyPrefix + String(owner) }
+
+    /// Forgets the watch progress saved inside every account's lessons added by link, keeping
+    /// the lessons. That progress lives in the lesson (`ManualWebexLesson.progress`), not in the
+    /// history whose namespace `forgetSeen` rotates, so without this it would survive turning
+    /// Recordings off, a disconnect and an account change, where the specification removes
+    /// progress. Every account, like that rotation. A list that can't be decoded is left as it
+    /// is (never overwritten); a list without progress isn't written.
+    nonisolated static func forgetManualProgress(in defaults: UserDefaults) {
+        for key in defaults.dictionaryRepresentation().keys where key.hasPrefix(manualLessonsKeyPrefix) {
+            guard let data = defaults.data(forKey: key), let stored = try? PropertyListDecoder().decode(ManualWebexLessons.self, from: data) else { continue }
+            let forgotten = stored.forgettingProgress()
+            guard forgotten != stored, let encoded = try? PropertyListEncoder().encode(forgotten) else { continue }
+            defaults.set(encoded, forKey: key)
+        }
+    }
+
+    /// The sidebar's count beside "Watchlist": everything the Watchlist lists, bookmarks and
+    /// lessons added by link (`watchlistEntries` shows both). It counted bookmarks only, so a
+    /// Watchlist of added lessons read "0" (2026-11-09).
+    var watchlistCount: Int { study.bookmarks.count + manualLessons.lessons.count }
+
     /// Account isolation applies even when there is no saved Polimi session to invalidate.
     private func loadStudy() {
         let owner = isEnabled ? ownerUserID() : nil
@@ -576,6 +629,16 @@ struct RecordingsListing: Equatable {
         study = RecordingsStudyState()
         studyProblem = nil
         studyUnreadable = false
+        manualLessons = ManualWebexLessons()
+        manualLessonsUnreadable = false
+        if let owner, let data = defaults.data(forKey: Self.manualLessonsKey(owner: owner)) {
+            do { manualLessons = try PropertyListDecoder().decode(ManualWebexLessons.self, from: data) }
+            catch {
+                manualLessonsUnreadable = true
+                studyProblem = BilingualText("Le lezioni aggiunte con un link Webex non sono leggibili. I dati originali sono stati conservati.", "The lessons added with a Webex link couldn't be read. The original data has been preserved.")
+            }
+        }
+        publishManualProgress()
         guard let owner, let data = defaults.data(forKey: Self.studyKey(owner: owner)) else { return }
         do { study = try PropertyListDecoder().decode(RecordingsStudyState.self, from: data) }
         catch {
@@ -611,6 +674,10 @@ struct RecordingsListing: Equatable {
         forgetSeen()
         forgetResumePoints()
         defaults.removeObject(forKey: Self.studyKey(owner: owner))
+        defaults.removeObject(forKey: Self.manualLessonsKey(owner: owner))
+        // What enhanced audio remembers about this account's lectures. Never created just for
+        // this: an enhancer that was never needed remembers nothing.
+        audioEnhancer?.removeAll()
         studyLoaded = false
         loadStudy()
         listings.removeAll()
@@ -621,7 +688,141 @@ struct RecordingsListing: Equatable {
 
     var canEditStudy: Bool { isEnabled && studyOwner != nil && !studyUnreadable }
 
+    /// Whether a lesson can be added with a Webex link now: the account is known and neither
+    /// the study state nor the saved manual lessons are unreadable.
+    var canAddManualLesson: Bool { canEditStudy && !manualLessonsUnreadable }
+
+    /// Why a Webex link wasn't added, for the sheet that asked.
+    enum ManualLessonFailure: Error, Equatable {
+        case invalidLink, duplicate, notEditable, saveFailed
+
+        var message: BilingualText {
+            switch self {
+            case .invalidLink: BilingualText("Incolla il link di una registrazione Webex del Politecnico (politecnicomilano.webex.com).", "Paste the link of a Politecnico Webex recording (politecnicomilano.webex.com).")
+            case .duplicate: BilingualText("Questa lezione è già nella watchlist.", "This lesson is already in your watchlist.")
+            case .notEditable: BilingualText("La watchlist non si può modificare ora. Accedi con il tuo account WeBeep e riprova.", "The watchlist can't be changed right now. Sign in with your WeBeep account and try again.")
+            case .saveFailed: BilingualText("Non è stato possibile salvare la lezione. Riprova.", "Couldn't save the lesson. Try again.")
+            }
+        }
+    }
+
+    /// Adds a lesson by its Webex link (`ManualWebexLessons.add`), saved before it is published,
+    /// so what the Watchlist shows is what is on disk. Checks the account at the point of action:
+    /// a lesson is never written under another account's key.
+    @discardableResult
+    func addManualLesson(link: String, title: String, courseName: String) -> Result<ManualWebexLesson, ManualLessonFailure> {
+        loadStudy()
+        guard canAddManualLesson, let owner = studyOwner, owner == ownerUserID() else { return .failure(.notEditable) }
+        var updated = manualLessons
+        let lesson: ManualWebexLesson
+        do { lesson = try updated.add(link: link, title: title, courseName: courseName) }
+        catch ManualWebexLessons.AddError.duplicate { return .failure(.duplicate) }
+        catch { return .failure(.invalidLink) }
+        guard saveManualLessons(updated, owner: owner) else { return .failure(.saveFailed) }
+        return .success(lesson)
+    }
+
+    /// Writes `updated` under `owner`'s key and publishes it; false (nothing published) when it
+    /// couldn't be encoded.
+    private func saveManualLessons(_ updated: ManualWebexLessons, owner: Int) -> Bool {
+        do {
+            let data = try PropertyListEncoder().encode(updated)
+            defaults.set(data, forKey: Self.manualLessonsKey(owner: owner))
+            manualLessons = updated
+            publishManualProgress()
+            return true
+        } catch {
+            return false
+        }
+    }
+
+    /// Removing a manual lesson's bookmark forgets the lesson: it has no course to be found in
+    /// again. Same account checks as `addManualLesson`.
+    private func removeManualLesson(id: String) {
+        loadStudy()
+        guard canAddManualLesson, let owner = studyOwner, owner == ownerUserID(), manualLessons.contains(id: id) else { return }
+        var updated = manualLessons
+        updated.remove(id: id)
+        if !saveManualLessons(updated, owner: owner) {
+            studyProblem = BilingualText("Non è stato possibile salvare la watchlist. Riprova.", "Couldn't save the watchlist. Try again.")
+        }
+    }
+
+    /// The account the manual lessons on screen belong to, when it may also write them now:
+    /// the lessons' owner (`studyOwner`), still the connected WeBeep account, and the one
+    /// watch progress is written for (`resumeOwner`). Checked at the point of every write.
+    private var manualLessonsWriter: Int? {
+        guard canAddManualLesson, let owner = studyOwner, owner == ownerUserID(), owner == resumeOwner() else { return nil }
+        return owner
+    }
+
+    /// Puts the manual lessons' saved progress in the window's model (`watchProgress`), so
+    /// their rows show a bar and a checkbox like an archive lecture's. Their identities become
+    /// known only for the account that owns them (`manualLessonsWriter`). Called whenever the
+    /// lessons or the model change wholesale: loaded, saved, or the model reset.
+    private func publishManualProgress() {
+        guard manualLessonsWriter != nil, !manualLessons.lessons.isEmpty else { return }
+        var entries: [String: RecordingWatchEntry] = [:]
+        let identities = manualLessons.lessons.map { lesson -> String in
+            let identity = RecordingsStudyState.identity(lesson.recording)
+            entries[identity] = lesson.progress
+            return identity
+        }
+        watchProgress.setEntries(entries, for: identities)
+    }
+
+    /// Forgets the window's progress model, then puts back the manual lessons' (which belong to
+    /// the account `studyOwner` still names; another account's were dropped by `loadStudy`).
+    private func resetWatchProgress() {
+        watchProgress.reset()
+        publishManualProgress()
+    }
+
+    /// A progress event on a manual lesson: the same rules as the store's
+    /// (`RecordingWatchProgress.applyCheckpoint` / `setManual`), saved with the lessons, at once
+    /// rather than on the store's write chain (they are a separate key, which nothing else
+    /// writes). Like the store, nothing is written when nothing changes, and never on a tick:
+    /// only checkpoints and the checkbox reach here. The lesson stays out of everything keyed by
+    /// course (summaries, the menu bar, acknowledgements).
+    private func applyManualProgress(_ event: RecordingProgressEvent, to recording: RecmanRecording, owner: Int) {
+        let identity = RecordingsStudyState.identity(recording)
+        let isTick = if case .manual = event { true } else { false }
+        defer { if isTick { watchProgress.setPending(false, for: identity) } }
+        guard let writer = manualLessonsWriter, writer == owner, var lesson = manualLessons.lesson(id: recording.id) else { return }
+        // An ended session's position now lives in the entry: as in `commitProgress`.
+        if case .checkpoint(_, true) = event, sessions[recording.id] == nil { watchProgress.setLive(nil, for: identity) }
+        let new: RecordingWatchEntry?
+        switch event {
+        case .checkpoint(let session, let closes): new = RecordingWatchProgress.applyCheckpoint(lesson.progress, session: session, closes: closes)
+        case .manual(let done): new = RecordingWatchProgress.setManual(lesson.progress, done: done)
+        }
+        guard let new else { return }
+        lesson.progress = new
+        var updated = manualLessons
+        updated.replace(lesson)
+        guard saveManualLessons(updated, owner: owner) else {
+            if isTick { studyProblem = BilingualText("Non è stato possibile salvare la watchlist. Riprova.", "Couldn't save the watchlist. Try again.") }
+            log.error("Couldn't save a manual lesson's progress")
+            return
+        }
+    }
+
+    /// What a Play of a manual lesson learned from Webex (`ManualWebexLesson.learn`): its title
+    /// when the student gave none, and its length, saved so the row shows both from now on.
+    /// Only from a fresh stream answer, and only for the account that owns the lesson.
+    private func learnManualDetails(of recording: RecmanRecording, from stream: RecordingStream) {
+        guard ManualWebexLesson.isManual(recording), let owner = manualLessonsWriter,
+              var lesson = manualLessons.lesson(id: recording.id), lesson.learn(title: stream.title, duration: stream.duration) else { return }
+        var updated = manualLessons
+        updated.replace(lesson)
+        if !saveManualLessons(updated, owner: owner) { log.error("Couldn't save what a Play learned of a manual lesson") }
+    }
+
     func toggleWatchlist(_ recording: RecmanRecording, courseName: String) {
+        if ManualWebexLesson.isManual(recording) {
+            removeManualLesson(id: recording.id)
+            return
+        }
         updateStudy { state in
             if state.contains(recording) { state.bookmarks.removeAll { $0.id == RecordingsStudyState.identity(recording) } }
             else { state.bookmarks.append(.init(recording: recording, courseName: courseName)) }
@@ -677,6 +878,8 @@ struct RecordingsListing: Equatable {
         forgetSeen()
         if !preservingResumePoints { forgetResumePoints() }
         forgetEmailOptOut()
+        // The filter reads this account's stream: it stops with it, and its memory goes.
+        audioEnhancer?.removeAll()
         studyLoaded = false
         loadStudy()
         defaults.removeObject(forKey: Self.enabledKey)
@@ -771,7 +974,7 @@ struct RecordingsListing: Equatable {
             forgetEmailOptOut()
             discardSessionFile()
         } else {
-            watchProgress.reset()
+            resetWatchProgress()
         }
         if isEnabled { access = .needsSignIn(nil) }
     }
@@ -1190,13 +1393,18 @@ struct RecordingsListing: Equatable {
         for key in [Self.acknowledgedKey, Self.baselinedKey] where defaults.object(forKey: key) != nil { defaults.removeObject(forKey: key) }
     }
 
-    /// Forgets the account's history: seen state and watch progress (which share the namespace),
+    /// Forgets the account's history: seen state and watch progress (which share the namespace,
+    /// and the progress of lessons added by link, `forgetManualProgress`),
     /// the window's progress model, the playing sessions, the progress writes still queued (their
     /// actor is invalidated below, so they are refused, and a late commit fails the identity check
     /// in `commitProgress`), and the persisted menu summary.
     private func forgetSeen() {
         for key in listings.keys { listings[key]?.seenIDs = nil }
-        watchProgress.reset()
+        // Before the reset below, which publishes the lessons' (now empty) progress.
+        Self.forgetManualProgress(in: defaults)
+        let forgotten = manualLessons.forgettingProgress()
+        if forgotten != manualLessons { manualLessons = forgotten }
+        resetWatchProgress()
         sessions = [:]
         unsavedCheckpoints = [:]
         untickCounts = [:]
@@ -1539,6 +1747,8 @@ struct RecordingsListing: Equatable {
     /// The Webex player link of a recording, from memory when it was found before.
     private func playerLink(for recording: RecmanRecording, browser: RecmanBrowsing, found: URL? = nil) async throws -> URL {
         if let found { return found }
+        // A lesson added by its Webex link has no archive row to look up: its link is the player.
+        if let manual = ManualWebexLesson.playerLink(for: recording) { return manual }
         if let cached = playbackURLs[recording.id] { return cached }
         return try await browser.playbackURL(for: recording)
     }
@@ -1694,7 +1904,34 @@ struct RecordingsListing: Equatable {
 
     /// Hands the stream to the player, creating it on first use. The title is the archive's own
     /// (already on the page), not Webex's; the stream address is never logged.
-    private func startPlayer(_ stream: RecordingStream, for recording: RecmanRecording, startAt: TimeInterval?) {
+    ///
+    /// `enhanced` is the switch to or from the local filter (`audioActionChosen`): `stream` is
+    /// then the filter's address or the original, and the original stays the one remembered.
+    /// Any other call is a stream from Webex (a Play, a recovery), which becomes the lecture's
+    /// original; it plays through a new filter instead when the student left "Audio migliorato"
+    /// on and the filter hasn't failed for this lecture (so a failing filter can't loop).
+    private func startPlayer(_ stream: RecordingStream, for recording: RecmanRecording, startAt: TimeInterval?, enhanced: Bool? = nil) {
+        var played = stream
+        if let enhanced {
+            enhancedAudioInUse = enhanced
+        } else {
+            learnManualDetails(of: recording, from: stream)
+            // A new stream: whatever filtered the previous one reads an address now replaced.
+            audioEnhancer?.stop()
+            enhancedAudioInUse = false
+            if let owner = resumeOwner() {
+                let key = AudioEnhancer.copyKey(owner: owner, identity: RecordingsStudyState.identity(recording))
+                audioLecture = (recording.id, key, stream)
+                let enhancer = currentAudioEnhancer()
+                if defaults.bool(forKey: Self.prefersEnhancedAudioKey), enhancer.canStart(key), let url = enhancer.start(key: key, stream: stream.url) {
+                    played = RecordingStream(url: url, title: stream.title, duration: stream.duration)
+                    enhancedAudioInUse = true
+                }
+            } else {
+                audioLecture = nil
+            }
+        }
+        enhancedStartAt = startAt
         let player = currentPlayer()
         // Before the call: the lecture this one replaces reports its position inside `play`.
         nowPlaying[recording.id] = recording
@@ -1704,8 +1941,9 @@ struct RecordingsListing: Equatable {
         pendingPlayID = recording.id
         let metadata = playbackMetadata(for: recording, stream: stream)
         playbackMetadata = (recording.id, metadata)
-        player.play(stream.url, title: recording.title.isEmpty ? (stream.title ?? "") : recording.title, cookies: [], startAt: startAt, recordingID: recording.id, metadata: metadata)
+        player.play(played.url, title: recording.title.isEmpty ? (stream.title ?? "") : recording.title, cookies: [], startAt: startAt, recordingID: recording.id, metadata: metadata)
         pendingPlayID = nil
+        publishAudioState()
         nowPlaying = nowPlaying.filter { $0.key == recording.id }
         recoveredLectures = recoveredLectures.intersection(nowPlaying.keys)
         startWatchSession(for: recording, at: startAt ?? 0, streamDuration: stream.duration)
@@ -1752,6 +1990,12 @@ struct RecordingsListing: Equatable {
         player.onFailure = { [weak self] id, failure in
             self?.playerFailed(id: id, failure: failure)
         }
+        player.onAudioAction = { [weak self] id, action in
+            self?.audioActionChosen(id: id, action: action)
+        }
+        player.onClose = { [weak self] id in
+            self?.playerClosed(id: id)
+        }
         self.player = player
         return player
     }
@@ -1782,9 +2026,76 @@ struct RecordingsListing: Equatable {
         // (`aMenuCourseNeverPlayedDoesNotSurviveAnAccountChange`).
         playbackMetadata = nil
         menuPlayCourse = nil
+        // The filter reads the going account's stream; its lecture is no one's now, and what
+        // it remembers (lectures where it failed) goes with the account.
+        audioEnhancer?.removeAll()
+        audioLecture = nil
+        enhancedAudioInUse = false
         // The sessions belong to the account going away; `forgetSeen` clears the rest.
         sessions = [:]
         if !preservingResumePoints { player?.close() }
+    }
+
+    // MARK: Enhanced audio
+
+    /// The player window closed with `id` on screen. No window, no listener: the filter ends
+    /// with the lecture, even one closed before it was ready, which sends no `.closed`
+    /// checkpoint (its server, ffmpeg runs and files outlived the window, found in review).
+    private func playerClosed(id: String) {
+        guard currentLectureID == id else { return }
+        audioEnhancer?.stop()
+        enhancedAudioInUse = false
+    }
+
+    private func currentAudioEnhancer() -> AudioEnhancer {
+        if let audioEnhancer { return audioEnhancer }
+        let enhancer = makeAudioEnhancer()
+        enhancer.onChange = { [weak self] key in
+            guard let self, self.audioLecture?.key == key else { return }
+            self.publishAudioState()
+        }
+        audioEnhancer = enhancer
+        return enhancer
+    }
+
+    /// Tells the player what its Audio menu shows for the lecture on screen.
+    private func publishAudioState() {
+        guard let player, let id = currentLectureID else { return }
+        guard let lecture = audioLecture, lecture.recordingID == id, resumeOwner() != nil else {
+            player.showAudioEnhancement(nil, recordingID: id)
+            return
+        }
+        player.showAudioEnhancement(currentAudioEnhancer().state(for: lecture.key, inUse: enhancedAudioInUse), recordingID: id)
+    }
+
+    /// The student's choice in the player's Audio menu, for the lecture `id` that was on screen.
+    /// Checked again here (the point of action): the lecture may have changed meanwhile, or the
+    /// account gone. Either way the lecture continues from the same position, playing or paused
+    /// as it was: on, through a new local filter; off, from Webex's stream directly, with no
+    /// filter left running.
+    private func audioActionChosen(id: String, action: PlayerAudioAction) {
+        guard isEnabled, let lecture = audioLecture, lecture.recordingID == id, currentLectureID == id,
+              let recording = nowPlaying[id], resumeOwner() != nil else { return }
+        let enhancer = currentAudioEnhancer()
+        guard case .useEnhanced(let on) = action, on != enhancedAudioInUse, let player, player.isOpen else { return }
+        let target: RecordingStream
+        if on {
+            guard let url = enhancer.start(key: lecture.key, stream: lecture.stream.url) else {
+                publishAudioState()
+                return
+            }
+            target = RecordingStream(url: url, title: lecture.stream.title, duration: lecture.stream.duration)
+        } else {
+            enhancer.stop()
+            target = lecture.stream
+        }
+        defaults.set(on, forKey: Self.prefersEnhancedAudioKey)
+        let position = player.playbackPosition
+        let wasPlaying = player.isPlaying
+        // Same lecture, same id: the player keeps its zoom, the position is reported as a
+        // replacement checkpoint and the watch session continues.
+        startPlayer(target, for: recording, startAt: position, enhanced: on)
+        if !wasPlaying { player.pause() }
     }
 
     // MARK: Where you stopped
@@ -1820,7 +2131,9 @@ struct RecordingsListing: Equatable {
     /// same report is a watch-progress checkpoint (`recordWatchCheckpoint`).
     private func playerCheckpoint(_ checkpoint: RecordingCheckpoint) {
         let id = checkpoint.id
-        if checkpoint.reason == .closed, currentLectureID == id { playbackIntent += 1 }
+        if checkpoint.reason == .closed, currentLectureID == id {
+            playbackIntent += 1
+        }
         // The lecture left the player: its Now Playing metadata is no longer a recovery's to reuse.
         // A defensive duplicate of the `recoveredLectures` condition in `playbackMetadata(for:stream:)`
         // (a fresh Play removes the lecture from that set first); it only frees the stored value.
@@ -2016,8 +2329,9 @@ struct RecordingsListing: Equatable {
     /// queued behind the un-tick must already carry the reset session.
     func setDone(_ recording: RecmanRecording, _ done: Bool) {
         // The key first: a recording without a valid course key can't be written, and must not
-        // leave its checkbox pending forever.
-        guard let owner = resumeOwner(), Self.courseKey(of: recording) != nil else { return }
+        // leave its checkbox pending forever. A manual lesson has none and is saved with the
+        // lessons instead (`applyManualProgress`, which clears the pending state itself).
+        guard let owner = resumeOwner(), Self.courseKey(of: recording) != nil || ManualWebexLesson.isManual(recording) else { return }
         let identity = RecordingsStudyState.identity(recording)
         guard !watchProgress.pending.contains(identity) else { return }
         if !done {
@@ -2111,7 +2425,10 @@ struct RecordingsListing: Equatable {
     /// must reach the old (invalidated) actor and be refused, never the next namespace. The
     /// owner travels with the event too and is checked again at commit (`isCurrentIdentity`).
     private func enqueueProgress(_ event: RecordingProgressEvent, for recording: RecmanRecording, owner: Int, serial: Int?, untickEpoch: Int) {
-        guard let key = Self.courseKey(of: recording) else { return }
+        guard let key = Self.courseKey(of: recording) else {
+            if ManualWebexLesson.isManual(recording) { applyManualProgress(event, to: recording, owner: owner) }
+            return
+        }
         let history = seenHistory
         let reset = historyResetTask
         let previous = progressChain
@@ -2325,6 +2642,38 @@ struct RecordingsListing: Equatable {
 
     private func playerFailed(id: String, failure: RecordingPlaybackFailure) {
         guard isEnabled, let recording = nowPlaying[id] else { return }
+        // The lecture was playing through the filter; what its session reports decides
+        // (`AudioEnhancer.reportedFailure`, cleared when a request succeeded since):
+        // - an expired address (refused): the usual path, as without the filter (a fresh
+        //   stream mid-lecture, filtered anew; before ready, replaying the dead address would
+        //   only fail again, found in review);
+        // - Webex or the connection failing for now: mid-lecture, the usual recovery; before
+        //   the lecture was ever ready, Webex's own stream from where it was going to start,
+        //   since the usual path there is the browser, which a passing error doesn't deserve;
+        // - the filter's own failure: Webex's stream at the same place (from the start before
+        //   ready), and enhanced audio is marked as not working for the lecture. No recovery,
+        //   which would rebuild the same failing filter and use up the lecture's fresh stream;
+        // - nothing reported (AVPlayer gave up while the pipeline still waited, say on a slow
+        //   fetch): Webex's stream the same way, without the mark, since the filter may not be
+        //   at fault (found in review), nor a recovery, since the stream may be.
+        // A stream started here is no longer filtered: if it fails too, it takes the usual
+        // path, so this never loops.
+        if enhancedAudioInUse, let lecture = audioLecture, lecture.recordingID == id, let enhancer = audioEnhancer {
+            let reported = enhancer.reportedFailure
+            enhancer.stop()
+            enhancedAudioInUse = false
+            let position: Double?
+            switch failure {
+            case .duringPlayback(_, let at): position = at
+            case .beforeReady: position = nil
+            }
+            let usualPath = reported == .streamRefused || (reported == .network && position != nil)
+            if !usualPath {
+                if reported == .unavailable { enhancer.markFailed(lecture.key) }
+                startPlayer(lecture.stream, for: recording, startAt: position ?? enhancedStartAt, enhanced: false)
+                return
+            }
+        }
         if case .beforeReady = failure { endWatchSessionBeforeReady(id) }
         // A recovery of this item is already queued or running: it resolves this failure too.
         // Resuming the paused window re-arms the player's report (#197), so the dead item can

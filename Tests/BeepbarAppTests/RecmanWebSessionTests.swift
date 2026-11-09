@@ -47,6 +47,20 @@ struct RecmanWebSessionTests {
         #expect(restored.cookies.first { $0.name == "__Host-shib_idp_session" }?.domain == "shibidp.polimi.it")
     }
 
+    /// A lesson added by its Webex link is its own player link: answered without a web view or an
+    /// archive session (the browser is never even opened), and one whose stored link fails the
+    /// policy is refused instead of followed. Without the manual branch, the transfer-id check
+    /// refuses every manual lesson and Play can never reach Webex.
+    @Test func aManualLessonIsItsOwnPlayerLink() async throws {
+        let session = RecmanWebSession()
+        let link = URL(string: "https://politecnicomilano.webex.com/recordingservice/sites/politecnicomilano/recording/playback/0123456789abcdef0123456789abcdef")!
+        let lesson = ManualWebexLesson(title: "", courseName: "", link: link, addedAt: now)
+        #expect(try await session.playbackURL(for: lesson.recording) == link)
+        #expect(session.isOpen == false)
+        let tampered = ManualWebexLesson(title: "", courseName: "", link: URL(string: "https://evil.example/ldr.php?RCID=a")!, addedAt: now)
+        await #expect(throws: RecmanBrowserError.playbackUnavailable) { try await session.playbackURL(for: tampered.recording) }
+    }
+
     /// Opening starts from an empty browser and closing drops it: turning the feature off, or
     /// another account signing in, leaves no Polimi session behind in memory.
     @Test func openStartsEmptyAndCloseForgetsEverything() async throws {

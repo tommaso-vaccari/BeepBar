@@ -43,6 +43,12 @@ struct AppleVoiceIsolator: LiveAudioVoiceIsolating {
 
     let model: Model
 
+    /// How much of the unit's output is isolated voice, in percent (`kAUSoundIsolationParam_
+    /// WetDryMixPercent`): 100 is the isolated voice alone, which is what the app uses. Other
+    /// values exist for `AudioQualityMeasurements`, which compares them; the unit's dry path is
+    /// only usable if it is delay-aligned with the wet one, which that suite measures.
+    var wetDryMix: Double = 100
+
     static let component = AudioComponentDescription(
         componentType: kAudioUnitType_Effect, componentSubType: kAudioUnitSubType_AUSoundIsolation,
         componentManufacturer: kAudioUnitManufacturer_Apple, componentFlags: 0, componentFlagsMask: 0)
@@ -62,7 +68,7 @@ struct AppleVoiceIsolator: LiveAudioVoiceIsolating {
     /// on the main actor nor on `LiveAudioPipeline` (no default actor isolation is set in
     /// either build), so seeks and `stop()` aren't held up by it.
     func isolate(_ input: URL, from first: Int, count: Int?, to output: URL) async throws {
-        try Self.render(input: input, first: first, count: count, output: output, model: model)
+        try Self.render(input: input, first: first, count: count, output: output, model: model, wetDryMix: wetDryMix)
     }
 
     /// The offline render: a player node reads the file into the unit, the engine renders in
@@ -73,7 +79,7 @@ struct AppleVoiceIsolator: LiveAudioVoiceIsolating {
     ///
     /// 16-bit output, clamped to full scale: half the disk of float for the pieces a lecture
     /// keeps (`LiveAudioPipeline`), 96 dB of range, and isolated speech stays below full scale.
-    private static func render(input: URL, first: Int, count: Int?, output: URL, model: Model) throws {
+    private static func render(input: URL, first: Int, count: Int?, output: URL, model: Model, wetDryMix: Double) throws {
         let source = try AVAudioFile(forReading: input)
         let format = source.processingFormat
         guard format.channelCount == 1, Int(format.sampleRate) == AudioEnhancement.isolationSampleRate,
@@ -89,7 +95,7 @@ struct AppleVoiceIsolator: LiveAudioVoiceIsolating {
         // The standard model is the unit's default, and on macOS 14 the parameter's only value:
         // set only to ask for the high-quality one.
         guard model == .standard || AudioUnitSetParameter(effect.audioUnit, kAUSoundIsolationParam_SoundToIsolate, kAudioUnitScope_Global, 0, model.soundType, 0) == noErr,
-              AudioUnitSetParameter(effect.audioUnit, kAUSoundIsolationParam_WetDryMixPercent, kAudioUnitScope_Global, 0, 100, 0) == noErr
+              AudioUnitSetParameter(effect.audioUnit, kAUSoundIsolationParam_WetDryMixPercent, kAudioUnitScope_Global, 0, AudioUnitParameterValue(wetDryMix), 0) == noErr
         else { throw IsolationError.renderFailed }
         try engine.start()
         defer { engine.stop() }

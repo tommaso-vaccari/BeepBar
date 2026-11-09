@@ -311,3 +311,33 @@ It needs ffmpeg where BeepBar looks for it (`/opt/homebrew/bin`, `/usr/local/bin
 
 Report five runs per commit, interleaved and on the same machine and power source, with median and p95 of each wait. A commit older than the harness needs the file copied in and, if an API changed, a measurement-only adaptation recorded with the numbers. After stop the footprint stays at its peak while isolation is used: the voice model stays loaded in the process (the same at the commit before the piece cache), which is not a leak per session.
 
+### Enhanced audio quality
+
+Measure what the filter chain does to the teacher's voice at any distance from the microphone, on a synthetic classroom (macOS `say` voices and ffmpeg noise, generated on the spot; no real lecture):
+
+```sh
+BEEPBAR_MEASURE_AUDIO_QUALITY=1 swift test --filter AudioQualityMeasurements
+```
+
+Same requirements as above (ffmpeg, `say`); without the variable the suite is skipped. It takes about ten minutes in a debug build. Tests: `matrix` (the table and summary), `joins` (segment seams), `wetDryAlignment` (whether the unit's dry path lines up with its wet one) and `abRenders` (listening files).
+
+The scene is built from separate stems at 48 kHz mono: a teacher (nine sentences, one every 10 s, 5 s or more of pause after each; speech regions at −22 dBFS RMS at gain 0), students (another voice, continuous) and steady noise (pink noise with a 100 Hz hum). The matrix is teacher gain 0, −10, −20, −30 dB × students none, −20, −30 dB × noise −35, −50 dB (students and noise relative to the teacher, so the whole scene moves with the gain), plus a moving teacher (0 → −20 → 0 dB every 15 s, background fixed). Each cell goes through a front (`raw`: none; `iso100`: Apple voice isolation, the real unit; `iso85`: 85% wet, only with `BEEPBAR_AUDIO_WETDRY=1`) and then each candidate chain, defined in the suite, read as `isolatedEncodeArguments` reads it. `current` is `AudioEnhancement.isolatedChain` verbatim; `isolation-only` is the front alone, to tell the unit's effect from the chain's.
+
+Environment:
+
+- `BEEPBAR_AUDIO_ONLY=C1,C2`: only those candidates (and `current`, `isolation-only`).
+- `BEEPBAR_AUDIO_QUICK=1`: only students −20 and noise −35, to iterate.
+- `BEEPBAR_AUDIO_WETDRY=1`: add the 85% wet front.
+- `BEEPBAR_AUDIO_AB_OUT=<folder>`: `abRenders` writes `<scene>__original.wav`, `<scene>__current.wav` and one file per candidate for three scenes (near teacher, far teacher, moving teacher). With `BEEPBAR_AUDIO_EXCERPT=<audio or video file>` it renders the same set from that file's first audio track (180 s at most) as `excerpt__*.wav`. That file is private: it is read in place, never copied into the repository, and its name and contents are not printed.
+
+What the output means (all in dB; lower is better unless noted):
+
+- **spread**: the teacher's speech level out, max − min across the four gains with the same students and noise. The input spread is 30 dB; a chain that levels scores near 0. **near−far** is the same for the moving teacher (input 20 dB).
+- **gap Δ**: (speech level − pause level) out minus the same in, over the static cells (min and median). Negative means the background was raised relative to the teacher ("noise remains"); higher is cleaner.
+- **soft loss** (mean, and the worst 5th percentile over the four gains): on the teacher alone, how much more the soft frames (20 ms frames 12–30 dB under the 95th percentile of speech) lose than the loud ones (top 12 dB), out aligned to in by cross-correlation. Closer to 0 is better; negative means word endings and soft consonants are being cut. **ending** is the same over the last 300 ms of each sentence. `isolation-only` shows how much of it is the Apple unit's.
+- **pump**: standard deviation of the per-frame gain over the loud frames; a steady chain scores near 0.
+- **loudness** (median speech RMS, dBFS), **max peak** (the test fails above −1.9 dBFS, except `isolation-only`, which has no limiter) and **delay** (samples, out against in).
+- **JOIN** (`joins`): a 90 s scene filtered whole and in three 30 s pieces with ±30 s of context, trimmed and joined as the player's segments are; the level difference between the two in 100 ms frames within 1 s of each join, median and max, and the same in the middle of a piece for comparison.
+
+Run it on the commit that changes a chain and on `dev`, interleaved, on the same machine; report the summary lines and the join lines. It measures chains on synthetic speech only: the ear (`abRenders`) and a real excerpt decide what it cannot.
+

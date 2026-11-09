@@ -95,3 +95,59 @@ enum AudioTestSignals {
         return ((coarse - 8)...(coarse + 8)).max { correlation($0, step: 1) < correlation($1, step: 1) }!
     }
 }
+
+/// Helpers for `AudioQualityMeasurements`: levels over regions and frames, statistics, and the
+/// raw 16-bit pieces the enhanced-audio filter step reads.
+extension AudioTestSignals {
+    /// 48 kHz, the rate every synthetic signal here is made at.
+    static let sampleRate = 48000
+
+    /// RMS level, in dB re full scale, of the samples inside `ranges` taken together.
+    static func level(_ x: [Float], over ranges: [Range<Int>]) -> Double {
+        var energy = 0.0
+        var count = 0
+        for range in ranges {
+            let r = max(0, range.lowerBound)..<min(x.count, range.upperBound)
+            guard r.lowerBound < r.upperBound else { continue }
+            for i in r { energy += Double(x[i]) * Double(x[i]) }
+            count += r.count
+        }
+        return 10 * log10(energy / Double(max(count, 1)) + 1e-20)
+    }
+
+    /// The level of each consecutive `frame`-sample block of `x[range]` that fits whole.
+    static func frameLevels(_ x: [Float], frame: Int, in range: Range<Int>) -> [Double] {
+        stride(from: range.lowerBound, to: range.upperBound - frame + 1, by: frame).map { level(x[$0..<($0 + frame)]) }
+    }
+
+    /// The highest absolute sample, in dB re full scale.
+    static func peak(_ x: [Float]) -> Double { 20 * log10(Double(x.reduce(0) { max($0, abs($1)) }) + 1e-10) }
+
+    /// The `p` quantile (0...1) of `values`, linearly interpolated; NaN when empty.
+    static func percentile(_ values: [Double], _ p: Double) -> Double {
+        guard !values.isEmpty else { return .nan }
+        let sorted = values.sorted()
+        let position = p * Double(sorted.count - 1)
+        let low = Int(position.rounded(.down)), high = Int(position.rounded(.up))
+        return sorted[low] + (sorted[high] - sorted[low]) * (position - Double(low))
+    }
+
+    static func mean(_ values: [Double]) -> Double { values.isEmpty ? .nan : values.reduce(0, +) / Double(values.count) }
+
+    static func standardDeviation(_ values: [Double]) -> Double {
+        guard values.count > 1 else { return .nan }
+        let m = mean(values)
+        return (values.reduce(0) { $0 + ($1 - m) * ($1 - m) } / Double(values.count)).squareRoot()
+    }
+
+    /// `samples` as raw 16-bit little-endian mono, clamped to full scale: what the enhanced
+    /// audio's filter step reads (`AudioEnhancement.isolatedEncodeArguments`).
+    static func writeRaw16(_ samples: [Float], to url: URL) throws {
+        var data = Data(capacity: samples.count * 2)
+        for s in samples {
+            var v = Int16((max(-1, min(1, s)) * 32767).rounded()).littleEndian
+            withUnsafeBytes(of: &v) { data.append(contentsOf: $0) }
+        }
+        try data.write(to: url)
+    }
+}

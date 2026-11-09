@@ -177,6 +177,13 @@ public struct ManualWebexLessons: Codable, Equatable, Sendable {
         lessons.first { $0.id == id }
     }
 
+    /// The same lessons with their watch progress forgotten; titles and lengths stay. What
+    /// forgetting the account's history does to lessons added by link (the Watchlist itself
+    /// survives it, its progress does not).
+    public func forgettingProgress() -> ManualWebexLessons {
+        ManualWebexLessons(lessons: lessons.map { var lesson = $0; lesson.progress = nil; return lesson })
+    }
+
     /// Replaces the lesson with the same id; false when it isn't in the list (removed meanwhile).
     @discardableResult
     public mutating func replace(_ lesson: ManualWebexLesson) -> Bool {

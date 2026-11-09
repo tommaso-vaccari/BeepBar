@@ -1328,21 +1328,62 @@ struct RecordingsWatchProgressTests {
         #expect(!controller.watchProgress.isPending(lesson.recording), "the checkbox must not stay disabled")
         await controller.settleWatchProgress()
         #expect(gates.calls == storeWrites, "a manual lesson's progress must stay out of the course-keyed store")
-        controller.turnOff(preservingResumePoints: true)
 
-        defaults.set(true, forKey: RecordingsController.enabledKey)
         let restored = makeController()
         restored.pageAppeared()
         #expect(row(lesson.recording, in: restored) == RecordingsPresentation.WatchRow(known: true, fraction: 0.5, completed: true, pending: false, canEdit: true))
         restored.setDone(lesson.recording, false)
         let unticked = try #require(restored.manualLessons.lesson(id: lesson.id)?.progress)
         #expect(!unticked.isCompleted && unticked.autoCompletionBlocked && unticked.furthest == 0.5)
-        restored.turnOff()
+
+        // Turning Recordings off removes progress (the specification), this lesson's too; the
+        // lesson stays in the Watchlist like the bookmarks.
+        restored.turnOff(preservingResumePoints: true)
+        #expect(restored.manualLessons.lesson(id: lesson.id)?.progress == nil)
+        defaults.set(true, forKey: RecordingsController.enabledKey)
+        let again = makeController()
+        again.pageAppeared()
+        #expect(again.manualLessons.lesson(id: lesson.id)?.progress == nil, "turning off left the lesson's progress on disk")
+        #expect(row(lesson.recording, in: again) == RecordingsPresentation.WatchRow(known: true, fraction: 0, completed: false, pending: false, canEdit: true))
+        again.turnOff()
+        controller.turnOff()
+    }
+
+    /// Forgetting the history clears the progress inside every account's lessons added by
+    /// link, as the history it mirrors is cleared for every account, and leaves alone what
+    /// it can't read and lists with no progress (no write). Mutation: clear only the current
+    /// account's key, or rewrite unchanged lists, and this fails.
+    @Test func forgettingManualProgressCoversEveryAccount() throws {
+        defer { cleanUp() }
+        var mine = ManualWebexLessons()
+        var lesson = try mine.add(link: manualLink, title: "Mine", courseName: "")
+        lesson.progress = RecordingWatchEntry(furthest: 0.5, completed: .manual)
+        _ = lesson.learn(title: nil, duration: 5_400)
+        mine.replace(lesson)
+        let theirs = mine
+        let untouched = mine.forgettingProgress()
+        defaults.set(try PropertyListEncoder().encode(mine), forKey: RecordingsController.manualLessonsKey(owner: 42))
+        defaults.set(try PropertyListEncoder().encode(theirs), forKey: RecordingsController.manualLessonsKey(owner: 99))
+        defaults.set(try PropertyListEncoder().encode(untouched), forKey: RecordingsController.manualLessonsKey(owner: 7))
+        defaults.set(Data([1, 2, 3]), forKey: RecordingsController.manualLessonsKey(owner: 8))
+        defaults.resetWrites()
+
+        RecordingsController.forgetManualProgress(in: defaults)
+        for owner in [42, 99] {
+            let data = try #require(defaults.data(forKey: RecordingsController.manualLessonsKey(owner: owner)))
+            let stored = try PropertyListDecoder().decode(ManualWebexLessons.self, from: data)
+            #expect(stored.lessons.count == 1 && stored.lessons[0].progress == nil, "account \(owner) kept its progress")
+            #expect(stored.lessons[0].durationSeconds == 5_400 && stored.lessons[0].title == "Mine", "the lesson itself must stay")
+        }
+        #expect(defaults.data(forKey: RecordingsController.manualLessonsKey(owner: 8)) == Data([1, 2, 3]))
+        #expect(Set(defaults.writes) == [RecordingsController.manualLessonsKey(owner: 42), RecordingsController.manualLessonsKey(owner: 99)])
     }
 
     /// Another account sees neither the lesson nor its progress: the rows' identities become
-    /// known only for the lessons' owner. Guards against publishing manual progress for whoever
-    /// is signed in, or keeping it across an account change.
+    /// known only for the lessons' owner. The account change also removes the progress (as it
+    /// does every account's history) but keeps the lesson. Guards against publishing manual
+    /// progress for whoever is signed in, another account writing it, or keeping it across an
+    /// account change.
     @Test func manualProgressStaysWithItsAccount() async throws {
         defer { cleanUp() }
         let controller = await listedController()
@@ -1358,7 +1399,8 @@ struct RecordingsWatchProgressTests {
         world.owner = 42
         let back = makeController()
         back.pageAppeared()
-        #expect(back.manualLessons.lesson(id: lesson.id)?.progress?.isCompleted == true, "another account changed this account's lesson")
+        let kept = try #require(back.manualLessons.lesson(id: lesson.id), "the account change removed the lesson")
+        #expect(kept.progress == nil, "kept across the account change, or written by another account: \(String(describing: kept.progress))")
         back.turnOff()
         controller.turnOff()
     }

@@ -343,6 +343,7 @@ final class MemoryCountingDefaults: CountingDefaults, @unchecked Sendable {
         recordWrite(key)
     }
     override func object(forKey key: String) -> Any? { values[key] }
+    override func dictionaryRepresentation() -> [String: Any] { values }
     override func string(forKey key: String) -> String? { values[key] as? String }
     override func stringArray(forKey key: String) -> [String]? { values[key] as? [String] }
     override func data(forKey key: String) -> Data? { values[key] as? Data }
@@ -977,6 +978,33 @@ struct RecordingsControllerTests {
         #expect(world.browsersMade == 0)
         #expect(try store.load() == nil)
         #expect(defaults.object(forKey: RecordingsController.acknowledgedKey) == nil)
+    }
+
+    /// Dropping that session forgets the history, and with it the progress inside this
+    /// account's lessons added by link, on disk and in memory: nothing reloads the lessons on
+    /// this path, so a stale copy in memory would be shown and written back by the next save.
+    /// Mutation: clear only the saved copy (not `manualLessons`) and the row keeps its mark.
+    @Test func droppingAnotherAccountsSessionForgetsAddedLessonsProgress() async throws {
+        defer { cleanUp() }
+        var lessons = ManualWebexLessons()
+        var lesson = try lessons.add(link: "https://politecnicomilano.webex.com/recordingservice/sites/politecnicomilano/recording/playback/0123456789abcdef0123456789abcdef", title: "Guest", courseName: "")
+        lesson.progress = RecordingWatchEntry(furthest: 0.5, completed: .manual)
+        lessons.replace(lesson)
+        defaults.set(try PropertyListEncoder().encode(lessons), forKey: RecordingsController.manualLessonsKey(owner: 42))
+        try saveSession(owner: 7)
+        defaults.set(true, forKey: RecordingsController.enabledKey)
+        browser.listResults[course.courseCode] = .failure(RecmanBrowserError.needsSignIn)
+        let controller = makeController()
+        controller.pageAppeared()
+        #expect(controller.manualLessons.lesson(id: lesson.id)?.progress != nil, "the lesson's progress must load before the session is read")
+        controller.refresh([course], selected: course)
+        await settle("asks for the sign-in") { controller.access == .needsSignIn(nil) }
+        await controller.settleSessionFile()
+        #expect(controller.manualLessons.lesson(id: lesson.id)?.progress == nil, "a stale copy stayed in memory")
+        let row = RecordingsPresentation.WatchValues(controller.watchProgress, canEdit: true).row(for: lesson.recording)
+        #expect(row.known && row.fraction == 0 && !row.completed, "the row still shows the forgotten progress: \(row)")
+        let saved = try #require(defaults.data(forKey: RecordingsController.manualLessonsKey(owner: 42)))
+        #expect(try PropertyListDecoder().decode(ManualWebexLessons.self, from: saved).lesson(id: lesson.id)?.progress == nil)
     }
 
     /// Before WeBeep answers (an offline launch) the account is unknown: the saved session is used,

@@ -597,7 +597,23 @@ struct RecordingsListing: Equatable {
     /// The saved manual lessons couldn't be decoded: they are shown as none and never
     /// overwritten, like an unreadable `study`.
     private var manualLessonsUnreadable = false
-    nonisolated static func manualLessonsKey(owner: Int) -> String { "io.github.tvaccari.beepbar.recordings-manual.v1.\(owner)" }
+    nonisolated static let manualLessonsKeyPrefix = "io.github.tvaccari.beepbar.recordings-manual.v1."
+    nonisolated static func manualLessonsKey(owner: Int) -> String { manualLessonsKeyPrefix + String(owner) }
+
+    /// Forgets the watch progress saved inside every account's lessons added by link, keeping
+    /// the lessons. That progress lives in the lesson (`ManualWebexLesson.progress`), not in the
+    /// history whose namespace `forgetSeen` rotates, so without this it would survive turning
+    /// Recordings off, a disconnect and an account change, where the specification removes
+    /// progress. Every account, like that rotation. A list that can't be decoded is left as it
+    /// is (never overwritten); a list without progress isn't written.
+    nonisolated static func forgetManualProgress(in defaults: UserDefaults) {
+        for key in defaults.dictionaryRepresentation().keys where key.hasPrefix(manualLessonsKeyPrefix) {
+            guard let data = defaults.data(forKey: key), let stored = try? PropertyListDecoder().decode(ManualWebexLessons.self, from: data) else { continue }
+            let forgotten = stored.forgettingProgress()
+            guard forgotten != stored, let encoded = try? PropertyListEncoder().encode(forgotten) else { continue }
+            defaults.set(encoded, forKey: key)
+        }
+    }
 
     /// The sidebar's count beside "Watchlist": everything the Watchlist lists, bookmarks and
     /// lessons added by link (`watchlistEntries` shows both). It counted bookmarks only, so a
@@ -1376,12 +1392,17 @@ struct RecordingsListing: Equatable {
         for key in [Self.acknowledgedKey, Self.baselinedKey] where defaults.object(forKey: key) != nil { defaults.removeObject(forKey: key) }
     }
 
-    /// Forgets the account's history: seen state and watch progress (which share the namespace),
+    /// Forgets the account's history: seen state and watch progress (which share the namespace,
+    /// and the progress of lessons added by link, `forgetManualProgress`),
     /// the window's progress model, the playing sessions, the progress writes still queued (their
     /// actor is invalidated below, so they are refused, and a late commit fails the identity check
     /// in `commitProgress`), and the persisted menu summary.
     private func forgetSeen() {
         for key in listings.keys { listings[key]?.seenIDs = nil }
+        // Before the reset below, which publishes the lessons' (now empty) progress.
+        Self.forgetManualProgress(in: defaults)
+        let forgotten = manualLessons.forgettingProgress()
+        if forgotten != manualLessons { manualLessons = forgotten }
         resetWatchProgress()
         sessions = [:]
         unsavedCheckpoints = [:]

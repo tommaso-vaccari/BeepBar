@@ -48,6 +48,29 @@ import OSLog
     /// regular app and finds a lecture open when it is done; see
     /// `RecordingPlayerController.adoptPolicyToRestore`.
     func adoptPolicyToRestore(_ policy: NSApplication.ActivationPolicy)
+    /// What the student chose in the window's Audio menu (`PlayerAudioAction`), with the
+    /// `recordingID` of the lecture on screen when they chose it. Delivered on the main actor.
+    var onAudioAction: ((String, PlayerAudioAction) -> Void)? { get set }
+    /// Shows `state` in the Audio menu while `recordingID` is the lecture on screen; nil hides
+    /// the section (no account to keep a copy under). Ignored for any other lecture, so a late
+    /// update of a replaced lecture never shows on the next one.
+    func showAudioEnhancement(_ state: AudioEnhancementState?, recordingID: String)
+    /// Where the lecture on screen is, in seconds (a seek in flight counts as landed), or nil
+    /// when nothing is open: where a switch between the stream and the enhanced copy resumes.
+    var playbackPosition: TimeInterval? { get }
+    /// Whether the lecture on screen is playing (or about to, once its resume lands) rather
+    /// than paused: a switch keeps it that way.
+    var isPlaying: Bool { get }
+}
+
+/// One choice in the player's Audio menu (`RecordingPlaying.onAudioAction`).
+enum PlayerAudioAction: Equatable, Sendable {
+    /// "Crea versione con audio migliorato" (or "Riprova" after a failure).
+    case create
+    /// Stop making the copy.
+    case cancel
+    /// Play the enhanced copy (true) or the original stream (false) from the same position.
+    case useEnhanced(Bool)
 }
 
 /// One report of where the student stopped in a lecture (`RecordingPlaying.onPositionCheckpoint`).
@@ -272,6 +295,9 @@ enum RecordingPlayerError: Error {
     private weak var videoHost: NSView?
     /// The menu items' targets: an item holds its target weakly.
     private var menuActions: [PlayerMenuAction] = []
+    /// The Audio menu's state for the lecture on screen (`showAudioEnhancement`); nil hides it.
+    private(set) var audioState: AudioEnhancementState?
+    var onAudioAction: ((String, PlayerAudioAction) -> Void)?
     /// The policy BeepBar had before the player promoted it to `.regular`; nil when the player
     /// did not change it.
     private var policyToRestore: NSApplication.ActivationPolicy?
@@ -396,7 +422,11 @@ enum RecordingPlayerError: Error {
         generation += 1
         // A different lecture starts at fit; the same one (a recovery, Play again) keeps the
         // student's zoom, like its position.
-        if recordingID != self.recordingID { applyZoom(.fit) }
+        // The Audio menu belongs to one lecture: the caller sets it again right after `play`.
+        if recordingID != self.recordingID {
+            applyZoom(.fit)
+            audioState = nil
+        }
         self.recordingID = recordingID
         failureReported = false
         isCurrentItemReady = false
@@ -530,6 +560,25 @@ enum RecordingPlayerError: Error {
         // itself must leave the Dock before it is ordered front.
         if window.isMiniaturized { window.deminiaturize(nil) }
         present(window)
+    }
+
+    func showAudioEnhancement(_ state: AudioEnhancementState?, recordingID: String) {
+        guard isOpen, recordingID == self.recordingID else { return }
+        audioState = state
+        updateAudioItems()
+    }
+
+    var playbackPosition: TimeInterval? {
+        guard let player else { return nil }
+        // During a resume the player still sits at 0: the position it is going to is the one.
+        if isResuming, let pendingStartAt { return pendingStartAt }
+        return reportedPosition(of: player)
+    }
+
+    var isPlaying: Bool {
+        guard let player else { return false }
+        if isResuming { return playWhenSettled }
+        return player.timeControlStatus != .paused
     }
 
     func showProblem(_ message: String) {
@@ -1158,6 +1207,7 @@ enum RecordingPlayerError: Error {
             item.representedObject = NSNumber(value: speed)
             menu.addItem(item)
         }
+        addAudioItems(to: menu)
         menu.addItem(.separator())
         let shortcutsHeader = NSMenuItem(title: tr("Scorciatoie da tastiera", "Keyboard shortcuts"), action: nil, keyEquivalent: "")
         shortcutsHeader.isEnabled = false
@@ -1170,6 +1220,71 @@ enum RecordingPlayerError: Error {
         }
         popUp.toolTip = ([tr("Velocità di riproduzione", "Playback speed")] + help.map { "\($0.keys): \($0.action)" }).joined(separator: "\n")
         popUp.setAccessibilityLabel(tr("Velocità di riproduzione", "Playback speed"))
+    }
+
+    /// The Audio section of the title-bar menu (`audioState`): a separator, a header, the main
+    /// item (create, progress, the enhanced-audio switch) and a detail item (cancel, or why the
+    /// last attempt failed). Tagged so `updateAudioItems` finds them; hidden while the state is nil.
+    private func addAudioItems(to menu: NSMenu) {
+        let separator = NSMenuItem.separator()
+        separator.tag = AudioMenuTag.separator
+        menu.addItem(separator)
+        let header = NSMenuItem(title: tr("Audio", "Audio"), action: nil, keyEquivalent: "")
+        header.isEnabled = false
+        header.tag = AudioMenuTag.header
+        menu.addItem(header)
+        for tag in [AudioMenuTag.main, AudioMenuTag.detail] {
+            let window = self.window
+            let action = PlayerMenuAction { [weak self, weak window] in
+                guard let self, let window, self.window === window else { return }
+                self.audioItemChosen(tag)
+            }
+            menuActions.append(action)
+            let item = NSMenuItem(title: "", action: #selector(PlayerMenuAction.invoke(_:)), keyEquivalent: "")
+            item.target = action
+            item.tag = tag
+            menu.addItem(item)
+        }
+        updateAudioItems()
+    }
+
+    /// Tags of the Audio section's items: distinct from 0, the tag of every other item.
+    enum AudioMenuTag {
+        static let separator = 9_001
+        static let header = 9_002
+        static let main = 9_003
+        static let detail = 9_004
+    }
+
+    /// The Audio items' titles and states for `audioState`; a whole-percent progress update
+    /// changes one title, no rebuild.
+    private func updateAudioItems() {
+        guard let menu = speedPopUp?.menu else { return }
+        let presentation = RecordingPlayerPolicy.audioMenu(audioState)
+        for tag in [AudioMenuTag.separator, AudioMenuTag.header] {
+            menu.item(withTag: tag)?.isHidden = presentation == nil
+        }
+        if let main = menu.item(withTag: AudioMenuTag.main) {
+            main.isHidden = presentation == nil
+            main.title = presentation?.main.title ?? ""
+            main.isEnabled = presentation?.main.action != nil
+            main.state = presentation?.main.checked == true ? .on : .off
+        }
+        if let detail = menu.item(withTag: AudioMenuTag.detail) {
+            detail.isHidden = presentation?.detail == nil
+            detail.title = presentation?.detail?.title ?? ""
+            detail.isEnabled = presentation?.detail?.action != nil
+            detail.state = .off
+        }
+    }
+
+    /// An Audio item was clicked: what it does is decided from the state at the time of the
+    /// click, never from the title it was built with.
+    func audioItemChosen(_ tag: Int) {
+        guard isOpen, let presentation = RecordingPlayerPolicy.audioMenu(audioState) else { return }
+        let action = tag == AudioMenuTag.main ? presentation.main.action : presentation.detail?.action
+        guard let action else { return }
+        onAudioAction?(recordingID, action)
     }
 
     /// Shows the applied speed in the title-bar menu and gives `AVPlayerView` the speeds the item

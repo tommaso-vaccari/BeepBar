@@ -255,6 +255,25 @@ struct RecordingsListing: Equatable {
     private var nowPlaying: [String: RecmanRecording] = [:]
     /// The lecture last handed to the player, for recoveries that outlive a newer Play.
     private var currentLectureID: String?
+
+    // MARK: Enhanced audio state ("Audio migliorato", see `AudioEnhancement`)
+
+    private let makeAudioEnhancer: @MainActor () -> AudioEnhancer
+    /// Created by the first lecture that reaches the player with a known account, never earlier.
+    private var audioEnhancer: AudioEnhancer?
+    /// The lecture on screen, its copy's key (`AudioEnhancer.copyKey`) and its original stream:
+    /// what a copy is made from and what "Audio migliorato" off goes back to. Nil when no
+    /// account owns it (`resumeOwner`), after close and on identity change.
+    private var audioLecture: (recordingID: String, key: String, stream: RecordingStream)?
+    /// Whether the player is playing `audioLecture`'s enhanced copy rather than its stream.
+    private var enhancedAudioInUse = false
+    /// The lecture's length as the player last reported it, for the copy's progress when the
+    /// stream's own metadata didn't say.
+    private var audioDuration: TimeInterval?
+    /// Whether the student last left "Audio migliorato" on: a lecture with a copy then starts
+    /// on it. One switch for all lectures, saved like the speed.
+    nonisolated static let prefersEnhancedAudioKey = "io.github.tvaccari.beepbar.recordings-enhanced-audio"
+
     private var playbackIntent = 0
     /// Lectures already given their one fresh stream since the student pressed Play.
     private var recoveredLectures: Set<String> = []
@@ -500,12 +519,14 @@ struct RecordingsListing: Equatable {
         },
         now: @escaping () -> Date = Date.init,
         makePlayer: @escaping @MainActor () -> RecordingPlaying = { RecordingPlayerController() },
+        makeAudioEnhancer: @escaping @MainActor () -> AudioEnhancer = { AudioEnhancer() },
         courses: @escaping @MainActor () -> [RemoteCourseSummary] = { [] },
         fetchProfileEmail: @escaping @MainActor () async -> String? = { nil },
         listingCapacity: Int = RecordingsController.listingCapacity,
         playbackURLCapacity: Int = RecordingsController.playbackURLCapacity
     ) {
         self.makePlayer = makePlayer
+        self.makeAudioEnhancer = makeAudioEnhancer
         self.courses = courses
         self.fetchProfileEmail = fetchProfileEmail
         listings = BoundedCache(capacity: listingCapacity)
@@ -631,6 +652,8 @@ struct RecordingsListing: Equatable {
         forgetResumePoints()
         defaults.removeObject(forKey: Self.studyKey(owner: owner))
         defaults.removeObject(forKey: Self.manualLessonsKey(owner: owner))
+        // Copies of what this account watched: a cache, but personal.
+        currentAudioEnhancer().removeAll()
         studyLoaded = false
         loadStudy()
         listings.removeAll()
@@ -760,6 +783,8 @@ struct RecordingsListing: Equatable {
         forgetSeen()
         if !preservingResumePoints { forgetResumePoints() }
         forgetEmailOptOut()
+        // The copies were made from this account's sign-in: they go with it (and with the switch).
+        currentAudioEnhancer().removeAll()
         studyLoaded = false
         loadStudy()
         defaults.removeObject(forKey: Self.enabledKey)
@@ -1779,7 +1804,33 @@ struct RecordingsListing: Equatable {
 
     /// Hands the stream to the player, creating it on first use. The title is the archive's own
     /// (already on the page), not Webex's; the stream address is never logged.
-    private func startPlayer(_ stream: RecordingStream, for recording: RecmanRecording, startAt: TimeInterval?) {
+    ///
+    /// `enhanced` is the switch to or from the enhanced copy (`switchAudio`): `stream` is then
+    /// the copy or the original, and the original stays the one remembered. Any other call is a
+    /// stream from Webex (a Play, a recovery), which becomes the lecture's original; it plays the
+    /// copy instead when one exists and the student left "Audio migliorato" on.
+    private func startPlayer(_ stream: RecordingStream, for recording: RecmanRecording, startAt: TimeInterval?, enhanced: Bool? = nil) {
+        var played = stream
+        if let enhanced {
+            enhancedAudioInUse = enhanced
+        } else {
+            audioDuration = nil
+            if let owner = resumeOwner() {
+                let key = AudioEnhancer.copyKey(owner: owner, identity: RecordingsStudyState.identity(recording))
+                audioLecture = (recording.id, key, stream)
+                let enhancer = currentAudioEnhancer()
+                if defaults.bool(forKey: Self.prefersEnhancedAudioKey), let copy = enhancer.copy(for: key) {
+                    played = RecordingStream(url: copy, title: stream.title, duration: stream.duration)
+                    enhancer.touch(key)
+                    enhancedAudioInUse = true
+                } else {
+                    enhancedAudioInUse = false
+                }
+            } else {
+                audioLecture = nil
+                enhancedAudioInUse = false
+            }
+        }
         let player = currentPlayer()
         // Before the call: the lecture this one replaces reports its position inside `play`.
         nowPlaying[recording.id] = recording
@@ -1789,8 +1840,9 @@ struct RecordingsListing: Equatable {
         pendingPlayID = recording.id
         let metadata = playbackMetadata(for: recording, stream: stream)
         playbackMetadata = (recording.id, metadata)
-        player.play(stream.url, title: recording.title.isEmpty ? (stream.title ?? "") : recording.title, cookies: [], startAt: startAt, recordingID: recording.id, metadata: metadata)
+        player.play(played.url, title: recording.title.isEmpty ? (stream.title ?? "") : recording.title, cookies: [], startAt: startAt, recordingID: recording.id, metadata: metadata)
         pendingPlayID = nil
+        publishAudioState()
         nowPlaying = nowPlaying.filter { $0.key == recording.id }
         recoveredLectures = recoveredLectures.intersection(nowPlaying.keys)
         startWatchSession(for: recording, at: startAt ?? 0, streamDuration: stream.duration)
@@ -1837,6 +1889,9 @@ struct RecordingsListing: Equatable {
         player.onFailure = { [weak self] id, failure in
             self?.playerFailed(id: id, failure: failure)
         }
+        player.onAudioAction = { [weak self] id, action in
+            self?.audioActionChosen(id: id, action: action)
+        }
         self.player = player
         return player
     }
@@ -1867,9 +1922,71 @@ struct RecordingsListing: Equatable {
         // (`aMenuCourseNeverPlayedDoesNotSurviveAnAccountChange`).
         playbackMetadata = nil
         menuPlayCourse = nil
+        // The copy being made reads the going account's stream; its lecture is no one's now.
+        audioEnhancer?.cancel()
+        audioLecture = nil
+        enhancedAudioInUse = false
         // The sessions belong to the account going away; `forgetSeen` clears the rest.
         sessions = [:]
         if !preservingResumePoints { player?.close() }
+    }
+
+    // MARK: Enhanced audio
+
+    private func currentAudioEnhancer() -> AudioEnhancer {
+        if let audioEnhancer { return audioEnhancer }
+        let enhancer = makeAudioEnhancer()
+        enhancer.onChange = { [weak self] key in
+            guard let self, self.audioLecture?.key == key else { return }
+            self.publishAudioState()
+        }
+        audioEnhancer = enhancer
+        return enhancer
+    }
+
+    /// Tells the player what its Audio menu shows for the lecture on screen.
+    private func publishAudioState() {
+        guard let player, let id = currentLectureID else { return }
+        guard let lecture = audioLecture, lecture.recordingID == id, resumeOwner() != nil else {
+            player.showAudioEnhancement(nil, recordingID: id)
+            return
+        }
+        player.showAudioEnhancement(currentAudioEnhancer().state(for: lecture.key, inUse: enhancedAudioInUse), recordingID: id)
+    }
+
+    /// The student's choice in the player's Audio menu, for the lecture `id` that was on screen.
+    /// Checked again here (the point of action): the lecture may have changed meanwhile, or the
+    /// account gone.
+    private func audioActionChosen(id: String, action: PlayerAudioAction) {
+        guard isEnabled, let lecture = audioLecture, lecture.recordingID == id, currentLectureID == id,
+              let recording = nowPlaying[id], resumeOwner() != nil else { return }
+        let enhancer = currentAudioEnhancer()
+        switch action {
+        case .create:
+            enhancer.start(key: lecture.key, stream: lecture.stream.url, duration: lecture.stream.duration ?? audioDuration)
+        case .cancel:
+            enhancer.cancel()
+        case .useEnhanced(let on):
+            guard on != enhancedAudioInUse, let player, player.isOpen else { return }
+            let target: RecordingStream
+            if on {
+                guard let copy = enhancer.copy(for: lecture.key) else {
+                    publishAudioState()
+                    return
+                }
+                enhancer.touch(lecture.key)
+                target = RecordingStream(url: copy, title: lecture.stream.title, duration: lecture.stream.duration)
+            } else {
+                target = lecture.stream
+            }
+            defaults.set(on, forKey: Self.prefersEnhancedAudioKey)
+            let position = player.playbackPosition
+            let wasPlaying = player.isPlaying
+            // Same lecture, same id: the player keeps its zoom, the position is reported as a
+            // replacement checkpoint and the watch session continues.
+            startPlayer(target, for: recording, startAt: position, enhanced: on)
+            if !wasPlaying { player.pause() }
+        }
     }
 
     // MARK: Where you stopped
@@ -2035,6 +2152,7 @@ struct RecordingsListing: Equatable {
     /// course's live summary; never a write, never `watchSummaries` (the menu changes at
     /// checkpoints only). Refused for a lecture no longer playing or an unknown account.
     private func playerProgress(id: String, position: TimeInterval, duration: TimeInterval?) {
+        if audioLecture?.recordingID == id, let duration { audioDuration = duration }
         guard let recording = nowPlaying[id], resumeOwner() != nil,
               let fraction = RecordingWatchProgress.fraction(position: position, playerDuration: duration, archiveMinutes: recording.minutes) else { return }
         var session = sessions[id] ?? newSession(for: recording, start: nil)
@@ -2410,6 +2528,12 @@ struct RecordingsListing: Equatable {
 
     private func playerFailed(id: String, failure: RecordingPlaybackFailure) {
         guard isEnabled, let recording = nowPlaying[id] else { return }
+        // The enhanced copy itself failed (a damaged file): it goes, so the recovery below plays
+        // the stream instead of the same file again.
+        if enhancedAudioInUse, let lecture = audioLecture, lecture.recordingID == id {
+            enhancedAudioInUse = false
+            audioEnhancer?.discard(lecture.key)
+        }
         if case .beforeReady = failure { endWatchSessionBeforeReady(id) }
         // A recovery of this item is already queued or running: it resolves this failure too.
         // Resuming the paused window re-arms the player's report (#197), so the dead item can

@@ -115,10 +115,13 @@ public struct ManualWebexLesson: Codable, Equatable, Sendable, Identifiable {
     /// `webappng`, the path of Webex's newer web app, which is what the address bar shows when a
     /// student opens a recording there (a valid link was refused before, 2026-11-09). Only that
     /// exact shape and a 32-hex uuid are rewritten; anything else is refused rather than guessed.
+    /// The result is `canonical`: rebuilt from the recording id alone, so whatever else the
+    /// address bar carried (tracking parameters, a fragment, a trailing slash) is neither stored
+    /// nor handed back by "Copy link", and two pastes of one recording compare equal.
     public static func normalizedLink(_ text: String) -> URL? {
         let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty, !trimmed.contains(where: \.isWhitespace), let url = URL(string: trimmed) else { return nil }
-        if let accepted = RecmanURLPolicy.playbackURL(url) { return accepted }
+        if let accepted = RecmanURLPolicy.playbackURL(url) { return canonical(accepted) }
         guard var components = WebexSite.safeComponents(url), components.host == WebexSite.host else { return nil }
         let segments = components.percentEncodedPath.split(separator: "/", omittingEmptySubsequences: false).map(String.init)
         var trimmedSegments = segments
@@ -128,8 +131,34 @@ public struct ManualWebexLesson: Codable, Equatable, Sendable, Identifiable {
               trimmedSegments[5].range(of: WebexPlayerLink.uuidPattern, options: .regularExpression) != nil else { return nil }
         components.percentEncodedPath = "/recordingservice/sites/\(WebexSite.name)/recording/playback/\(trimmedSegments[5])"
         components.fragment = nil
-        guard let rewritten = components.url else { return nil }
-        return RecmanURLPolicy.playbackURL(rewritten)
+        guard let rewritten = components.url, let accepted = RecmanURLPolicy.playbackURL(rewritten) else { return nil }
+        return canonical(accepted)
+    }
+
+    /// The one form of a link `RecmanURLPolicy.playbackURL` accepted, built from its recording id:
+    /// `ldr.php` keeps its path and only `RCID`; a playback page with a Webex uuid becomes
+    /// `/recordingservice/sites/<site>/recording/playback/<uuid>`; any other accepted playback
+    /// path keeps its path without a trailing slash. No query (but `RCID`), no fragment. Also the
+    /// key `ManualWebexLessons.add` compares, applied to stored links too, so a lesson saved
+    /// before this form existed (query kept as pasted) still refuses its duplicate without being
+    /// rewritten on disk. Nil for a link the policy refuses.
+    static func canonical(_ url: URL) -> URL? {
+        guard RecmanURLPolicy.playbackURL(url) != nil, let components = WebexSite.safeComponents(url) else { return nil }
+        var rebuilt = URLComponents()
+        rebuilt.scheme = "https"
+        rebuilt.host = WebexSite.host
+        if WebexPlayerLink.isLoader(url) {
+            guard let id = components.queryItems?.first(where: { $0.name == "RCID" })?.value else { return nil }
+            rebuilt.path = components.path
+            rebuilt.queryItems = [URLQueryItem(name: "RCID", value: id)]
+        } else if let page = WebexPlayerLink.playbackPage(fromPlayerURL: url) {
+            rebuilt.percentEncodedPath = "/recordingservice/sites/\(WebexSite.name)/recording/playback/\(page.uuid)"
+        } else {
+            var path = components.percentEncodedPath
+            if path.hasSuffix("/") { path.removeLast() }
+            rebuilt.percentEncodedPath = path
+        }
+        return rebuilt.url
     }
 
     /// The first path segment of the share forms `normalizedLink` rewrites.
@@ -153,12 +182,14 @@ public struct ManualWebexLessons: Codable, Equatable, Sendable {
         case duplicate
     }
 
-    /// Adds the lesson at `text`, or says why not. Duplicates compare the normalized link, so the
-    /// share form and the playback form of one recording are the same lesson.
+    /// Adds the lesson at `text`, or says why not. Duplicates compare canonical links
+    /// (`ManualWebexLesson.canonical`) on both sides, so the share form, the playback form and a
+    /// copy with other parameters of one recording are the same lesson, including against a
+    /// lesson stored by an earlier build with its query as pasted.
     @discardableResult
     public mutating func add(link text: String, title: String, courseName: String, now: Date = Date()) throws -> ManualWebexLesson {
         guard let link = ManualWebexLesson.normalizedLink(text) else { throw AddError.invalidLink }
-        guard !lessons.contains(where: { $0.link == link }) else { throw AddError.duplicate }
+        guard !lessons.contains(where: { ManualWebexLesson.canonical($0.link) == link }) else { throw AddError.duplicate }
         let lesson = ManualWebexLesson(title: title, courseName: courseName, link: link, addedAt: now)
         lessons.append(lesson)
         return lesson

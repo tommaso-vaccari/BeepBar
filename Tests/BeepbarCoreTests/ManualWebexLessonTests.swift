@@ -118,6 +118,40 @@ struct ManualWebexLessonTests {
         #expect(lessons.lessons.count == 1)
     }
 
+    /// Only the recording id survives a paste: the address bar's parameters, fragment and trailing
+    /// slash are neither stored nor given back by "Copy link", and `RCID` is the one query item an
+    /// `ldr.php` link keeps. Guards against storing whatever the browser appended (review of #235).
+    @Test func theStoredLinkCarriesOnlyTheRecordingID() throws {
+        let page = try #require(ManualWebexLesson.normalizedLink(
+            "https://politecnicomilano.webex.com/recordingservice/sites/politecnicomilano/recording/playback/\(uuid)/?from=mail&t=10#x"))
+        #expect(page.absoluteString == "https://politecnicomilano.webex.com/recordingservice/sites/politecnicomilano/recording/playback/\(uuid)")
+        let share = try #require(ManualWebexLesson.normalizedLink(
+            "https://politecnicomilano.webex.com/webappng/sites/politecnicomilano/recording/\(uuid)/playback?from=share"))
+        #expect(share == page)
+        let loader = try #require(ManualWebexLesson.normalizedLink("https://politecnicomilano.webex.com/politecnicomilano/ldr.php?utm=x&RCID=abc123#t"))
+        #expect(loader.absoluteString == "https://politecnicomilano.webex.com/politecnicomilano/ldr.php?RCID=abc123")
+        #expect(WebexPlayerLink.isLoader(loader))
+    }
+
+    /// One recording pasted again with other parameters or a trailing slash is a duplicate, also
+    /// against a lesson an earlier build stored with its query as pasted, which stays as it was on
+    /// disk. Guards against the same lesson appearing twice in the Watchlist.
+    @Test func aRecordingWithOtherParametersIsADuplicate() throws {
+        var lessons = ManualWebexLessons()
+        try lessons.add(link: "https://politecnicomilano.webex.com/recordingservice/sites/politecnicomilano/recording/playback/\(uuid)", title: "", courseName: "")
+        #expect(throws: ManualWebexLessons.AddError.duplicate) {
+            try lessons.add(link: "https://politecnicomilano.webex.com/recordingservice/sites/politecnicomilano/recording/playback/\(uuid)/?from=mail", title: "", courseName: "")
+        }
+        let stored = URL(string: "https://politecnicomilano.webex.com/politecnicomilano/ldr.php?RCID=abc123&from=mail")!
+        var older = ManualWebexLessons(lessons: [ManualWebexLesson(title: "", courseName: "", link: stored, addedAt: .now)])
+        #expect(throws: ManualWebexLessons.AddError.duplicate) {
+            try older.add(link: "https://politecnicomilano.webex.com/politecnicomilano/ldr.php?RCID=abc123", title: "", courseName: "")
+        }
+        #expect(older.lessons.map(\.link) == [stored])
+        try older.add(link: "https://politecnicomilano.webex.com/politecnicomilano/ldr.php?RCID=abc124", title: "", courseName: "")
+        #expect(older.lessons.count == 2)
+    }
+
     /// Titles and labels are trimmed and bounded, so a pasted page can't bloat the settings file;
     /// each lesson gets its own id; removal is by id only.
     @Test func textIsBoundedAndIdsAreUnique() throws {

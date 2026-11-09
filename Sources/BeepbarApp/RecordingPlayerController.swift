@@ -51,6 +51,11 @@ import OSLog
     /// What the student chose in the window's Audio menu (`PlayerAudioAction`), with the
     /// `recordingID` of the lecture on screen when they chose it. Delivered on the main actor.
     var onAudioAction: ((String, PlayerAudioAction) -> Void)? { get set }
+    /// Called once when the window closes (`close()` or its close button), with the
+    /// `recordingID` it showed, whether or not its lecture was ever ready: unlike the `.closed`
+    /// checkpoint, which needs a position worth reporting. What lives only as long as the
+    /// window (the enhanced-audio filter) ends here.
+    var onClose: ((String) -> Void)? { get set }
     /// Shows `state` in the Audio menu while `recordingID` is the lecture on screen; nil hides
     /// the section (no account to keep a copy under). Ignored for any other lecture, so a late
     /// update of a replaced lecture never shows on the next one.
@@ -300,6 +305,8 @@ enum RecordingPlayerError: Error {
     /// The Audio menu's state for the lecture on screen (`showAudioEnhancement`); nil hides it.
     private(set) var audioState: AudioEnhancementState?
     var onAudioAction: ((String, PlayerAudioAction) -> Void)?
+    /// See `RecordingPlaying.onClose`.
+    var onClose: ((String) -> Void)?
     /// The policy BeepBar had before the player promoted it to `.regular`; nil when the player
     /// did not change it.
     private var policyToRestore: NSApplication.ActivationPolicy?
@@ -547,6 +554,9 @@ enum RecordingPlayerError: Error {
         let window = self.window
         stopPlayback()
         guard let window else { return }
+        // Before `window.close()`: `windowWillClose` then no longer sees its window (nil
+        // below), so this is the one report.
+        onClose?(recordingID)
         Self.release(window)
         if self.window === window {
             self.window = nil
@@ -598,6 +608,7 @@ enum RecordingPlayerError: Error {
         checkpointIfMeaningful(.closed)
         // Playback stops now: no sound may outlive the window.
         stopPlayback()
+        onClose?(recordingID)
         // Synchronously, so a Play in the meantime can give the name to its new window: AppKit
         // refuses a name another live window still holds. The frame was saved on the last move
         // or resize, so nothing is lost.

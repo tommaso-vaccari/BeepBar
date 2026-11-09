@@ -28,7 +28,9 @@ import os
          isolator: LiveAudioVoiceIsolating? = AppleVoiceIsolator.preferred(),
          parent: URL = LiveAudioSession.defaultParent) throws {
         let token = Self.makeToken()
-        let folder = parent.appendingPathComponent(token, isDirectory: true)
+        // A name of its own, not the token: the folder's path is in every ffmpeg's arguments,
+        // which other processes can read, and the token is what opens the server.
+        let folder = parent.appendingPathComponent(Self.makeToken(), isDirectory: true)
         let pipeline = LiveAudioPipeline(stream: stream, ffmpeg: ffmpeg, folder: folder, parent: parent, fetcher: fetcher, runner: runner,
                                          isolator: isolator, report: { failure in await MainActor.run { onFailure(failure) } })
         let prefix = "/\(token)/"
@@ -87,6 +89,8 @@ protocol LiveAudioFetching: Sendable {
 enum LiveAudioFetchError: Error, Equatable {
     /// Webex refused the address (expired or gone).
     case refused(Int)
+    /// Webex answered 5xx or 429: a passing trouble on its side, not the filter's.
+    case unavailableNow(Int)
     /// Any other answer: an unexpected status, a range not honoured, too much data.
     case unexpected
 }
@@ -114,6 +118,7 @@ struct URLSessionLiveAudioFetcher: LiveAudioFetching {
         let (bytes, response) = try await session.bytes(for: request)
         guard let http = response as? HTTPURLResponse else { throw LiveAudioFetchError.unexpected }
         if [401, 403, 404, 410].contains(http.statusCode) { throw LiveAudioFetchError.refused(http.statusCode) }
+        if http.statusCode == 429 || (500...599).contains(http.statusCode) { throw LiveAudioFetchError.unavailableNow(http.statusCode) }
         let limit: Int64
         if let range {
             // A 200 would be the whole 1 GB file: refused before reading any of it.
@@ -288,9 +293,11 @@ enum LiveAudioProcesses {
 /// A request far from the last one is a seek: work for the position left behind is cancelled
 /// (`keptSegments`).
 ///
-/// Failure: the first real failure is reported (`report`) before the request answers with an
-/// error, so the controller knows why the player failed when it hears of it. Cancellations are
-/// never failures.
+/// Failure: every real failure is reported (`report`, classified by `failure(for:)`) before the
+/// request answers with an error, so the controller knows why the player failed when it hears
+/// of it. Cancellations are never failures. Work that failed is forgotten (`outputs`,
+/// `fragments`, `starts`, `isolating`, `lectureTask`), so AVPlayer's next request tries again
+/// instead of getting the same error for the rest of the lecture.
 actor LiveAudioPipeline {
     enum PipelineError: Error { case notFound, stopped }
 
@@ -307,18 +314,23 @@ actor LiveAudioPipeline {
     private var fragments: [Int: Task<URL, Error>] = [:]
     private var starts: [Int: Task<Double, Error>] = [:]
     private var outputs: [Int: Task<Data, Error>] = [:]
-    /// Isolations underway, with what they were given; and finished pieces, least recently
-    /// used first in `piecesUsed`.
-    private var isolating: [Int: (task: Task<IsolatedPiece, Error>, hasLead: Bool, hasTail: Bool)] = [:]
+    /// Isolations underway, with what they were given and a serial (so a late end of one that
+    /// was cancelled never forgets its replacement); and finished pieces, least recently used
+    /// first in `piecesUsed`.
+    private var isolating: [Int: (task: Task<IsolatedPiece, Error>, hasLead: Bool, hasTail: Bool, serial: Int)] = [:]
+    private var isolations = 0
     private var pieces: [Int: IsolatedPiece] = [:]
     private var piecesUsed: [Int] = []
-    /// Pieces replaced or dropped while an encode may still be reading them: deleted once no
-    /// encode is running (`retire`). Deleting at once made a segment's ffmpeg fail when the
-    /// complete piece replaced the urgent one it was joining (seen in testing).
-    private var encoding = 0
+    /// Pieces replaced or dropped while a segment is being made: deleted once none is
+    /// (`retire`). A segment holds the pieces it awaited from the moment they finish, across
+    /// several awaits, until its encode ends; deleting one meanwhile made the segment fail
+    /// (an encode's ffmpeg reading a deleted piece, seen in testing; and a seek forward then a
+    /// step back, found in review). So the count covers the whole of `produceIsolated`.
+    private var producing = 0
     private var retired: [URL] = []
     private var stopped = false
-    private var reported = false
+    /// The kind of the last failure logged, so a run of the same failure logs once.
+    private var lastLogged: LiveAudioFailure?
 
     init(stream: URL, ffmpeg: URL, folder: URL, parent: URL, fetcher: LiveAudioFetching, runner: LiveAudioProcessRunning,
          isolator: LiveAudioVoiceIsolating? = nil, report: @escaping @Sendable (LiveAudioFailure) async -> Void) {
@@ -354,6 +366,10 @@ actor LiveAudioPipeline {
                 } catch let error where Self.isCancellation(error) {
                     try self.checkRunning()
                     if self.outputs[index] == task { self.outputs[index] = nil }
+                } catch {
+                    // Not kept: AVPlayer asks again, and that request makes the segment anew.
+                    if self.outputs[index] == task { self.outputs[index] = nil }
+                    throw error
                 }
             }
             throw CancellationError()
@@ -379,22 +395,31 @@ actor LiveAudioPipeline {
 
     // MARK: Steps
 
-    /// The lecture's layout and its init section's file, fetched once.
+    /// The lecture's layout and its init section's file, fetched once (again after a failure).
     private func lecture() async throws -> (AudioEnhancement.ByteRangeLecture, URL) {
         try checkRunning()
-        if let lectureTask { return try await lectureTask.value }
-        let task = Task { () throws -> (AudioEnhancement.ByteRangeLecture, URL) in
-            let (data, url) = try await self.fetcher.fetch(self.stream, range: nil)
-            guard let text = String(data: data, encoding: .utf8),
-                  let lecture = AudioEnhancement.byteRangeLecture(playlist: text, at: url) else { throw LiveAudioFetchError.unexpected }
-            try await self.prepareFolder()
-            let (bytes, _) = try await self.fetcher.fetch(lecture.file, range: lecture.initSection)
-            let file = self.folder.appendingPathComponent("init.mp4")
-            try bytes.write(to: file)
-            return (lecture, file)
+        let task: Task<(AudioEnhancement.ByteRangeLecture, URL), Error>
+        if let lectureTask {
+            task = lectureTask
+        } else {
+            task = Task { () throws -> (AudioEnhancement.ByteRangeLecture, URL) in
+                let (data, url) = try await self.fetcher.fetch(self.stream, range: nil)
+                guard let text = String(data: data, encoding: .utf8),
+                      let lecture = AudioEnhancement.byteRangeLecture(playlist: text, at: url) else { throw LiveAudioFetchError.unexpected }
+                try self.prepareFolder()
+                let (bytes, _) = try await self.fetcher.fetch(lecture.file, range: lecture.initSection)
+                let file = self.folder.appendingPathComponent("init.mp4")
+                try bytes.write(to: file)
+                return (lecture, file)
+            }
+            lectureTask = task
         }
-        lectureTask = task
-        return try await task.value
+        do {
+            return try await task.value
+        } catch {
+            if lectureTask == task { lectureTask = nil }
+            throw error
+        }
     }
 
     /// A fresh, private folder for this session; earlier sessions' leftovers (a crash) go.
@@ -438,6 +463,9 @@ actor LiveAudioPipeline {
     /// A segment from isolated pieces: its own (complete), the next one's (complete unless
     /// `urgent`), the previous one's when it is on disk already; never isolation of its own.
     private func produceIsolated(_ index: Int, count: Int, urgent: Bool, in lecture: AudioEnhancement.ByteRangeLecture, initFile: URL) async throws -> Data {
+        // Before any await: from here until the encode ends, no piece is deleted (`retire`).
+        producing += 1
+        defer { producing -= 1; retire() }
         // This fragment is fetched now, so the next piece gets its lead-in from it (`piece`).
         _ = fragment(index, in: lecture)
         // Both isolations start before either is awaited, so they run side by side.
@@ -448,31 +476,27 @@ actor LiveAudioPipeline {
         let (start, end) = try await span(index, count: count, in: lecture, initFile: initFile)
         let output = folder.appendingPathComponent("out\(index).ts")
         let video = AudioEnhancement.concatInput([initFile.path, try await fragmentFile(index, in: lecture).path])
-        // No await from choosing the pieces to counting the encode. Until then a piece made
-        // with more around it can replace the one just made, and `store` deletes the one it
-        // doesn't keep: so each is taken from `pieces` now (`kept`), and after
-        // `encoding += 1` those in `used` stay on disk however they are replaced (`retire`).
+        // A piece made with at least as much around it may have replaced the one awaited
+        // meanwhile (`store`): the better one is used. Either stays on disk until this segment
+        // is made (`producing`).
         let current = kept(made)
         let following = madeNext.map(kept)
         // The previous piece ends where this one starts unless a sample or so of rounding
         // (`isolate`); one further off would move this segment's voice, so it is left out.
         let previous = pieces[index - 1].flatMap { abs($0.end - current.start) <= 2 ? $0 : nil }
         let used = [previous, current, following].compactMap { $0 }
-        // A piece dropped from `pieces` meanwhile (stop, or 40 more isolated) is gone: a 502,
-        // which AVPlayer asks again, rather than an encode without its voice.
+        // Only `stop` removes a piece under a segment being made: its folder is gone.
         guard used.allSatisfy({ FileManager.default.fileExists(atPath: $0.file.path) }) else { throw PipelineError.stopped }
         for piece in used { touch(piece.index) }
-        encoding += 1
-        defer { encoding -= 1; retire() }
         try await runner.run(ffmpeg, AudioEnhancement.isolatedEncodeArguments(video: video, isolated: used.map(\.file.path), firstSample: used[0].start,
                                                                               start: start, end: end, output: output.path))
         return try finish(output)
     }
 
-    /// The piece to use in place of `made`: the one `pieces` keeps for that fragment, which
-    /// stays on disk, unless it was made with less around it (then `made` is still current).
+    /// The piece to use in place of `made`: the one `pieces` keeps for that fragment when it
+    /// has everything `made` has (`covers`), else `made`.
     private func kept(_ made: IsolatedPiece) -> IsolatedPiece {
-        guard let kept = pieces[made.index], kept.hasLead || !made.hasLead, kept.hasTail || !made.hasTail else { return made }
+        guard let kept = pieces[made.index], kept.covers(made) else { return made }
         return kept
     }
 
@@ -504,6 +528,12 @@ actor LiveAudioPipeline {
         let end: Int
         let hasLead: Bool
         let hasTail: Bool
+
+        /// Whether this piece has everything `other` has around it: then it can stand in for
+        /// `other`. The one relation `store` and `kept` share; when they disagreed, `store`
+        /// deleted a piece `kept` then chose (a seek forward then a step back failed the
+        /// segment for good, found in review).
+        func covers(_ other: IsolatedPiece) -> Bool { (hasLead || !other.hasLead) && (hasTail || !other.hasTail) }
     }
 
     /// How many pieces stay on disk: 20 minutes of Webex's 30-second fragments, about 115 MB
@@ -520,14 +550,26 @@ actor LiveAudioPipeline {
         func serves(_ hasLead: Bool, _ hasTail: Bool) -> Bool { (hasLead || !lead) && (hasTail || !tail) }
         if let done = pieces[k], serves(done.hasLead, done.hasTail) { return Task { done } }
         if let underway = isolating[k], serves(underway.hasLead, underway.hasTail) { return underway.task }
+        isolations += 1
+        let serial = isolations
         let task = Task { () throws -> IsolatedPiece in
-            try await self.isolate(k, count: count, lead: lead, tail: tail, in: lecture, initFile: initFile)
+            do {
+                return try await self.isolate(k, count: count, lead: lead, tail: tail, serial: serial, in: lecture, initFile: initFile)
+            } catch {
+                // Not kept underway: the next request for this piece isolates it anew.
+                self.forgetIsolation(k, serial: serial)
+                throw error
+            }
         }
-        isolating[k] = (task, lead, tail)
+        isolating[k] = (task, lead, tail, serial)
         return task
     }
 
-    private func isolate(_ k: Int, count: Int, lead: Bool, tail: Bool, in lecture: AudioEnhancement.ByteRangeLecture, initFile: URL) async throws -> IsolatedPiece {
+    private func forgetIsolation(_ k: Int, serial: Int) {
+        if isolating[k]?.serial == serial { isolating[k] = nil }
+    }
+
+    private func isolate(_ k: Int, count: Int, lead: Bool, tail: Bool, serial: Int, in lecture: AudioEnhancement.ByteRangeLecture, initFile: URL) async throws -> IsolatedPiece {
         guard let isolator else { throw PipelineError.stopped }
         let first = lead ? k - 1 : k
         let last = tail ? k + 1 : k
@@ -555,18 +597,20 @@ actor LiveAudioPipeline {
         try Task.checkCancellation()
         let bytes = (try? FileManager.default.attributesOfItem(atPath: file.path)[.size] as? Int) ?? 0
         let piece = IsolatedPiece(index: k, file: file, start: start, end: start + bytes / 2, hasLead: lead, hasTail: tail || k + 1 == count)
+        forgetIsolation(k, serial: serial)
         store(piece)
         return piece
     }
 
-    /// Keeps `piece` unless the one on disk was made with more around it; forgets the
-    /// isolation that made it; drops the least recently used pieces beyond `keptPieces`.
+    /// Keeps `piece` unless the one on disk has everything it has (`covers`), which callers
+    /// then use instead (`kept`); drops the least recently used pieces beyond `keptPieces`.
+    /// Pieces made with different surroundings, neither covering the other, keep the newest.
     private func store(_ piece: IsolatedPiece) {
-        if isolating[piece.index]?.hasLead == piece.hasLead, isolating[piece.index]?.hasTail == piece.hasTail { isolating[piece.index] = nil }
         if stopped { return }
-        if let kept = pieces[piece.index], (kept.hasLead && !piece.hasLead) || (kept.hasTail && !piece.hasTail) {
-            // The caller that asked for this one still uses it.
-            retire(piece.file)
+        if let kept = pieces[piece.index], kept.covers(piece) {
+            // Same surroundings, same file name: that file is the one kept.
+            if kept.file != piece.file { retire(piece.file) }
+            touch(piece.index)
             return
         }
         if let replaced = pieces[piece.index], replaced.file != piece.file { retire(replaced.file) }
@@ -578,10 +622,10 @@ actor LiveAudioPipeline {
         }
     }
 
-    /// Deletes `file`, and those set aside before it, as soon as no encode is running.
+    /// Deletes `file`, and those set aside before it, as soon as no segment is being made.
     private func retire(_ file: URL? = nil) {
         if let file { retired.append(file) }
-        guard encoding == 0 else { return }
+        guard producing == 0 else { return }
         for file in retired { try? FileManager.default.removeItem(at: file) }
         retired = []
     }
@@ -605,10 +649,14 @@ actor LiveAudioPipeline {
         return task
     }
 
+    /// Where fragment `k`'s audio starts, probed once (again after a failure).
     private func audioStart(_ k: Int, in lecture: AudioEnhancement.ByteRangeLecture, initFile: URL) async throws -> Double {
-        if starts[k] == nil {
+        let task: Task<Double, Error>
+        if let existing = starts[k] {
+            task = existing
+        } else {
             let probe = folder.appendingPathComponent("probe\(k).txt")
-            starts[k] = Task { () throws -> Double in
+            task = Task { () throws -> Double in
                 let file = try await self.fragmentFile(k, in: lecture)
                 try await self.runner.run(self.ffmpeg, AudioEnhancement.probeArguments(input: AudioEnhancement.concatInput([initFile.path, file.path]), output: probe.path))
                 defer { try? FileManager.default.removeItem(at: probe) }
@@ -616,8 +664,14 @@ actor LiveAudioPipeline {
                       let seconds = AudioEnhancement.firstPacketSeconds(framecrc: text) else { throw FFmpegExitError() }
                 return seconds
             }
+            starts[k] = task
         }
-        return try await starts[k]!.value
+        do {
+            return try await task.value
+        } catch {
+            if starts[k] == task { starts[k] = nil }
+            throw error
+        }
     }
 
     /// A fragment's file, fetching it again once if its earlier fetch was cancelled by a seek.
@@ -630,6 +684,10 @@ actor LiveAudioPipeline {
                 try Task.checkCancellation()
                 try checkRunning()
                 if fragments[k] == task { fragments[k] = nil }
+            } catch {
+                // Not kept: the next request fetches it again.
+                if fragments[k] == task { fragments[k] = nil }
+                throw error
             }
         }
         throw CancellationError()
@@ -639,11 +697,21 @@ actor LiveAudioPipeline {
     private func keep(around index: Int) {
         let kept = AudioEnhancement.keptSegments(around: index)
         // One more fragment ahead than outputs: the last kept output reads the one after it.
-        let keptFragments = kept.lowerBound...(kept.upperBound + 1)
+        let around = kept.lowerBound...(kept.upperBound + 1)
         for (k, task) in outputs where !kept.contains(k) { task.cancel(); outputs[k] = nil }
-        for (k, task) in starts where !keptFragments.contains(k) { task.cancel(); starts[k] = nil }
         // Finished pieces stay (`keptPieces`); isolations for the position left behind stop.
-        for (k, entry) in isolating where !keptFragments.contains(k) { entry.task.cancel(); isolating[k] = nil }
+        for (k, entry) in isolating where !around.contains(k) { entry.task.cancel(); isolating[k] = nil }
+        // The work that stays also reads its neighbours: a segment its previous fragment
+        // (without pieces, `audioContext`) and its next, an isolation its lead and tail.
+        // Deleting one of those under it failed its ffmpeg, which looked like the filter
+        // failing and turned enhanced audio off (found in review).
+        var keptFragments = Set(around)
+        for k in outputs.keys { keptFragments.formUnion([k - 1, k + 1]) }
+        for (k, entry) in isolating {
+            if entry.hasLead { keptFragments.insert(k - 1) }
+            if entry.hasTail { keptFragments.insert(k + 1) }
+        }
+        for (k, task) in starts where !keptFragments.contains(k) { task.cancel(); starts[k] = nil }
         for (k, task) in fragments where !keptFragments.contains(k) {
             task.cancel()
             fragments[k] = nil
@@ -655,22 +723,36 @@ actor LiveAudioPipeline {
         if stopped { throw PipelineError.stopped }
     }
 
-    /// Runs `body`, reporting its first real failure before rethrowing it.
+    /// Runs `body`, reporting a real failure before rethrowing it. Each one is reported (the
+    /// controller keeps what decides, `AudioEnhancer.reportedFailure`); a run of the same kind
+    /// is logged once.
     private func reporting<T: Sendable>(_ body: () async throws -> T) async throws -> T {
         do {
             return try await body()
         } catch {
             if stopped || Self.isCancellation(error) { throw error }
             if case PipelineError.notFound = error { throw error }
-            if !reported {
-                reported = true
-                let failure: LiveAudioFailure
-                if case LiveAudioFetchError.refused = error { failure = .streamRefused } else { failure = .unavailable }
+            let failure = Self.failure(for: error)
+            if failure != lastLogged {
+                lastLogged = failure
                 Logger(subsystem: "io.github.tvaccari.beepbar", category: "AudioEnhancer")
-                    .error("Enhanced audio failed kind=\(failure == .streamRefused ? "refused" : "unavailable", privacy: .public)")
-                await report(failure)
+                    .error("Enhanced audio failed kind=\(String(describing: failure), privacy: .public)")
             }
+            await report(failure)
             throw error
+        }
+    }
+
+    /// What a failure means for the lecture: Webex refusing its address (expired), Webex or
+    /// the connection failing for now (a `URLError`, a 5xx or 429), or the filter's own
+    /// failure (anything else: the layout, ffmpeg, the disk). Only the last turns enhanced
+    /// audio off; the others go to the usual recovery, as without the filter.
+    nonisolated static func failure(for error: Error) -> LiveAudioFailure {
+        switch error {
+        case LiveAudioFetchError.refused: return .streamRefused
+        case LiveAudioFetchError.unavailableNow: return .network
+        case is URLError: return .network
+        default: return .unavailable
         }
     }
 
@@ -745,15 +827,17 @@ final class LoopbackHTTPServer: @unchecked Sendable {
 
     /// Stops listening and ends every open connection. Idempotent.
     func stop() {
-        let open = state.withLock { state -> Set<Int32>? in
-            guard !state.stopped else { return nil }
+        let stopping = state.withLock { state -> Bool in
+            guard !state.stopped else { return false }
             state.stopped = true
-            return state.connections
+            // Unblocks their reads and writes; each connection closes its own descriptor. Under
+            // the lock `finish` closes them under: a descriptor read here and shut down after
+            // releasing it could by then be closed and reused by another socket of the app.
+            for fd in state.connections { shutdown(fd, SHUT_RDWR) }
+            return true
         }
-        guard let open else { return }
+        guard stopping else { return }
         source.cancel()
-        // Unblocks their reads and writes; each connection closes its own descriptor.
-        state.withLock { _ in for fd in open { shutdown(fd, SHUT_RDWR) } }
     }
 
     private func acceptPending() {

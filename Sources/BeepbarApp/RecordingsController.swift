@@ -675,8 +675,9 @@ struct RecordingsListing: Equatable {
         forgetResumePoints()
         defaults.removeObject(forKey: Self.studyKey(owner: owner))
         defaults.removeObject(forKey: Self.manualLessonsKey(owner: owner))
-        // What enhanced audio remembers about this account's lectures.
-        currentAudioEnhancer().removeAll()
+        // What enhanced audio remembers about this account's lectures. Never created just for
+        // this: an enhancer that was never needed remembers nothing.
+        audioEnhancer?.removeAll()
         studyLoaded = false
         loadStudy()
         listings.removeAll()
@@ -878,7 +879,7 @@ struct RecordingsListing: Equatable {
         if !preservingResumePoints { forgetResumePoints() }
         forgetEmailOptOut()
         // The filter reads this account's stream: it stops with it, and its memory goes.
-        currentAudioEnhancer().removeAll()
+        audioEnhancer?.removeAll()
         studyLoaded = false
         loadStudy()
         defaults.removeObject(forKey: Self.enabledKey)
@@ -1992,6 +1993,9 @@ struct RecordingsListing: Equatable {
         player.onAudioAction = { [weak self] id, action in
             self?.audioActionChosen(id: id, action: action)
         }
+        player.onClose = { [weak self] id in
+            self?.playerClosed(id: id)
+        }
         self.player = player
         return player
     }
@@ -2022,8 +2026,9 @@ struct RecordingsListing: Equatable {
         // (`aMenuCourseNeverPlayedDoesNotSurviveAnAccountChange`).
         playbackMetadata = nil
         menuPlayCourse = nil
-        // The filter reads the going account's stream; its lecture is no one's now.
-        audioEnhancer?.stop()
+        // The filter reads the going account's stream; its lecture is no one's now, and what
+        // it remembers (lectures where it failed) goes with the account.
+        audioEnhancer?.removeAll()
         audioLecture = nil
         enhancedAudioInUse = false
         // The sessions belong to the account going away; `forgetSeen` clears the rest.
@@ -2032,6 +2037,15 @@ struct RecordingsListing: Equatable {
     }
 
     // MARK: Enhanced audio
+
+    /// The player window closed with `id` on screen. No window, no listener: the filter ends
+    /// with the lecture, even one closed before it was ready, which sends no `.closed`
+    /// checkpoint (its server, ffmpeg runs and files outlived the window, found in review).
+    private func playerClosed(id: String) {
+        guard currentLectureID == id else { return }
+        audioEnhancer?.stop()
+        enhancedAudioInUse = false
+    }
 
     private func currentAudioEnhancer() -> AudioEnhancer {
         if let audioEnhancer { return audioEnhancer }
@@ -2119,9 +2133,6 @@ struct RecordingsListing: Equatable {
         let id = checkpoint.id
         if checkpoint.reason == .closed, currentLectureID == id {
             playbackIntent += 1
-            // No window, no listener: the filter ends with the lecture.
-            audioEnhancer?.stop()
-            enhancedAudioInUse = false
         }
         // The lecture left the player: its Now Playing metadata is no longer a recovery's to reuse.
         // A defensive duplicate of the `recoveredLectures` condition in `playbackMetadata(for:stream:)`
@@ -2631,24 +2642,31 @@ struct RecordingsListing: Equatable {
 
     private func playerFailed(id: String, failure: RecordingPlaybackFailure) {
         guard isEnabled, let recording = nowPlaying[id] else { return }
-        // The lecture was playing through the filter. Only an expired Webex address mid-lecture
-        // goes to the usual recovery (a fresh stream, filtered anew); any other failure is the
-        // filter's own: the lecture continues from Webex's stream at the same place, without a
-        // recovery (which would rebuild the same failing filter) and without using up the
-        // lecture's one fresh stream. The menu then says enhanced audio didn't work.
+        // The lecture was playing through the filter. Only a failure of the filter's own (not
+        // an expired Webex address, nor Webex or the connection failing for now) turns enhanced
+        // audio off for the lecture, and the menu then says it didn't work.
+        // - Mid-lecture, the filter's own failure continues from Webex's stream at the same
+        //   place, without a recovery (which would rebuild the same failing filter) and without
+        //   using up the lecture's one fresh stream; Webex's goes to the usual recovery, as it
+        //   would without the filter (a fresh stream, filtered anew).
+        // - Before the lecture was ever ready, either way it opens on Webex's stream from where
+        //   it was going to start: the usual path there is the browser, which a passing network
+        //   error on the filter's side doesn't deserve. If that stream fails too, it is no longer
+        //   filtered and takes the usual path then, so this never loops.
         if enhancedAudioInUse, let lecture = audioLecture, lecture.recordingID == id, let enhancer = audioEnhancer {
             let reported = enhancer.reportedFailure
+            let filtersFault = reported != .streamRefused && reported != .network
             enhancer.stop()
             enhancedAudioInUse = false
             switch failure {
-            case .duringPlayback where reported == .streamRefused:
+            case .duringPlayback where !filtersFault:
                 break
             case .duringPlayback(_, let position):
                 enhancer.markFailed(lecture.key)
                 startPlayer(lecture.stream, for: recording, startAt: position, enhanced: false)
                 return
             case .beforeReady:
-                enhancer.markFailed(lecture.key)
+                if filtersFault { enhancer.markFailed(lecture.key) }
                 startPlayer(lecture.stream, for: recording, startAt: enhancedStartAt, enhanced: false)
                 return
             }

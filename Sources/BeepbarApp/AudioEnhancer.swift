@@ -82,6 +82,10 @@ enum LiveAudioFailure: Equatable, Sendable {
     /// Webex refused the lecture's address (401/403/404/410): it expired. A fresh stream from the
     /// archive fixes it, so the usual recovery runs and the filter is rebuilt from the new address.
     case streamRefused
+    /// Webex or the connection failed for now (offline, a timeout, a 5xx): not the filter's
+    /// fault. The usual recovery runs, as it would without the filter, and the filter is
+    /// rebuilt from the fresh stream; enhanced audio isn't turned off.
+    case network
     /// Anything else: not the Webex layout, ffmpeg failing, a range not honoured, the disk. The
     /// lecture goes back to its own stream; retrying would fail the same way.
     case unavailable
@@ -118,7 +122,8 @@ enum LiveAudioFailure: Equatable, Sendable {
     private let makeSession: MakeSession
     private var session: (key: String, id: Int, streaming: LiveAudioStreaming)?
     private var sessionCount = 0
-    /// What the running session reported before failing the player, if anything.
+    /// What the running session reported last before failing the player, if anything. A
+    /// refusal stays once heard: an expired address never works again, whatever fails after.
     private(set) var reportedFailure: LiveAudioFailure?
     /// Lectures whose filter failed, until the student turns it on again.
     private var failures: [String: BilingualText] = [:]
@@ -175,7 +180,7 @@ enum LiveAudioFailure: Equatable, Sendable {
         let id = sessionCount
         do {
             let streaming = try makeSession(stream, ffmpeg) { [weak self] failure in
-                guard let self, self.session?.id == id else { return }
+                guard let self, self.session?.id == id, self.reportedFailure != .streamRefused else { return }
                 self.reportedFailure = failure
             }
             session = (key, id, streaming)
@@ -206,8 +211,9 @@ enum LiveAudioFailure: Equatable, Sendable {
         onChange?(key)
     }
 
-    /// Stops the session and forgets every failure: "Forget this account's study data", or the
-    /// account going away.
+    /// Stops the session and forgets every failure: "Forget this account's study data", the
+    /// feature turned off, or the account going away (disconnect, university or account change).
+    /// Called only on an enhancer that exists: one never needed has nothing to forget.
     func removeAll() {
         stop()
         failures.removeAll()

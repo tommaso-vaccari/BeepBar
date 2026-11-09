@@ -215,10 +215,16 @@ import BeepbarCore
 
     func close() {
         closes += 1
-        report(.closed)
+        // The real player reports a position only for a lecture that got ready.
+        if isReady { report(.closed) }
+        if isOpen, let id = current?.id { onClose?(id) }
         isOpen = false
         current = nil
     }
+    var onClose: ((String) -> Void)?
+    /// False models a lecture still loading: no checkpoint on close, as the real player sends
+    /// none before its item is ready; `onClose` still comes.
+    var isReady = true
 
     func adoptPolicyToRestore(_ policy: NSApplication.ActivationPolicy) { adoptedPolicies.append(policy) }
 
@@ -459,6 +465,8 @@ final class SessionFileProbe: @unchecked Sendable {
     /// The native player, a fake that never touches AVFoundation, and how many were made.
     let player = FakeRecordingPlayer()
     var playersMade = 0
+    /// How many audio enhancers the controller created: one only when a lecture needs it.
+    var enhancersMade = 0
     /// The WeBeep course list the controller reads when a lecture starts (Now Playing metadata).
     var courses: [RemoteCourseSummary] = []
     /// What the WeBeep profile answers for the user's email (nil: the profile has none, or it
@@ -531,7 +539,7 @@ struct RecordingsControllerTests {
             copy: { world.copied.append($0) },
             now: { MainActor.assumeIsolated { world.now } },
             makePlayer: { world.playersMade += 1; return world.player },
-            makeAudioEnhancer: { AudioEnhancer(locateFFmpeg: { world.ffmpeg }, makeSession: { stream, ffmpeg, onFailure in
+            makeAudioEnhancer: { world.enhancersMade += 1; return AudioEnhancer(locateFFmpeg: { world.ffmpeg }, makeSession: { stream, ffmpeg, onFailure in
                 struct NoPort: Error {}
                 if world.liveSessionFails { throw NoPort() }
                 let session = FakeLiveAudio(stream: stream, ffmpeg: ffmpeg, onFailure: onFailure)
@@ -2387,11 +2395,14 @@ struct RecordingsControllerTests {
         controller.turnOff()
     }
 
-    /// Webex refusing the filter's address mid-lecture (it expired) is the usual recovery: a fresh
-    /// stream from the archive, filtered anew since the student left it on; the menu shows no
-    /// failure. Guards against an expiry taken for a broken filter, which would turn enhanced
-    /// audio off for the lecture.
-    @Test func anExpiredStreamIsRecoveredAndFilteredAgain() async throws {
+    /// Webex refusing the filter's address mid-lecture (it expired), or Webex or the connection
+    /// failing for now, is the usual recovery: a fresh stream from the archive, filtered anew
+    /// since the student left it on; the menu shows no failure. A refusal stays the reason
+    /// whatever the filter reports after it (the address is dead either way). Guards against a
+    /// Wi-Fi drop or an expiry taken for a broken filter, which turned enhanced audio off for
+    /// the lecture with a wrong message (found in review).
+    @Test(arguments: [[LiveAudioFailure.streamRefused], [.network], [.streamRefused, .unavailable], [.unavailable, .network]])
+    func aPassingOrExpiredStreamIsRecoveredAndFilteredAgain(reports: [LiveAudioFailure]) async throws {
         defer { cleanUp() }
         world.ffmpeg = fakeFFmpegPath
         let controller = await readyController()
@@ -2401,7 +2412,7 @@ struct RecordingsControllerTests {
         let fresh = RecordingStream(url: URL(string: "https://media.example.test/fresh/\(lecture.id).m3u8")!, title: nil, duration: nil)
         browser.streamResults[lecture.id] = [.success(fresh)]
 
-        session.onFailure(.streamRefused)
+        for report in reports { session.onFailure(report) }
         world.player.failDuringPlayback(at: 900)
         await settle("recovered") { world.liveSessions.count == 2 }
         #expect(session.isStopped)
@@ -2410,6 +2421,87 @@ struct RecordingsControllerTests {
         #expect(world.player.plays.last?.startAt == 900)
         #expect(world.player.audioState == .on)
         #expect(browser.streamCalls.count == 2)
+        controller.turnOff()
+    }
+
+    /// Webex or the connection failing (or the address expired) before the lecture was ever
+    /// ready: it opens on Webex's stream from the same start, enhanced audio isn't marked as
+    /// failed, no browser opens, and the next Play filters again. Guards against a passing
+    /// network error turning the filter off for the lecture or sending the student to the
+    /// browser (found in review).
+    @Test(arguments: [LiveAudioFailure.network, .streamRefused])
+    func aPassingFailureBeforeReadyKeepsEnhancedAudio(report: LiveAudioFailure) async throws {
+        defer { cleanUp() }
+        world.ffmpeg = fakeFFmpegPath
+        defaults.set(true, forKey: RecordingsController.prefersEnhancedAudioKey)
+        let controller = await readyController()
+        let lecture = recording("audio")
+        browser.streamResults[lecture.id] = [.success(stream(lecture.id)), .success(stream(lecture.id))]
+        controller.play(lecture)
+        await settle("lecture playing") { world.player.plays.last?.recordingID == lecture.id }
+        let start = world.player.plays.last?.startAt
+        world.liveSessions.last?.onFailure(report)
+        world.player.failBeforeReady()
+        #expect(world.player.plays.last?.url == stream(lecture.id).url)
+        #expect(world.player.plays.last?.startAt == start)
+        #expect(world.player.audioState == .off, "marked as failed: \(String(describing: world.player.audioState))")
+        await drainTasks()
+        #expect(world.opened.isEmpty, "the browser opened")
+        let sessions = world.liveSessions.count
+        _ = await playing(controller, "other")
+        _ = await playing(controller, lecture.id)
+        #expect(world.liveSessions.count == sessions + 2, "the next Play didn't filter")
+        controller.turnOff()
+    }
+
+    /// Closing the window while the lecture is still loading stops the filter: the real player
+    /// sends no `.closed` checkpoint then, only `onClose`. Guards against the local server,
+    /// ffmpeg runs and files outliving a window closed during the first second (found in
+    /// review).
+    @Test func closingBeforeReadyStopsTheFilter() async throws {
+        defer { cleanUp() }
+        world.ffmpeg = fakeFFmpegPath
+        defaults.set(true, forKey: RecordingsController.prefersEnhancedAudioKey)
+        let controller = await readyController()
+        world.player.isReady = false
+        let lecture = recording("audio")
+        browser.streamResults[lecture.id] = [.success(stream(lecture.id))]
+        controller.play(lecture)
+        await settle("lecture playing") { world.player.plays.last?.recordingID == lecture.id }
+        let session = try #require(world.liveSessions.last)
+        world.player.close()
+        #expect(session.isStopped, "the filter outlived a window closed before ready")
+        controller.turnOff()
+    }
+
+    /// Where the filter failed is forgotten with the account: after another account and back,
+    /// the same lecture filters again. An enhancer is never created just to forget: "forget
+    /// study data" and turning off without a lecture played create none. Guards against
+    /// failures outliving an account change (the spec promises they go), and the legacy
+    /// cleanup started by a turn-off that never needed enhanced audio (found in review).
+    @Test func failuresGoWithTheAccountAndNoEnhancerIsMadeToForget() async throws {
+        defer { cleanUp() }
+        world.ffmpeg = fakeFFmpegPath
+        defaults.set(true, forKey: RecordingsController.prefersEnhancedAudioKey)
+        browser.streamResults["audio"] = [.success(stream("audio")), .success(stream("audio"))]
+        let controller = await readyController()
+        controller.forgetStudyData()
+        #expect(world.enhancersMade == 0)
+        controller.play(recording("audio"))
+        await settle("filtered") { world.liveSessions.count == 1 }
+        world.liveSessions.last?.onFailure(.unavailable)
+        world.player.failDuringPlayback(at: 60)
+        #expect({ if case .failed = world.player.audioState { true } else { false } }())
+
+        world.owner = 9
+        controller.webBeepAccountChanged(to: 9)
+        world.owner = 42
+        controller.webBeepAccountChanged(to: 42)
+        controller.signIn()
+        await settle("signed in again") { controller.access == .ready }
+        controller.play(recording("audio"))
+        await settle("playing again") { world.player.plays.last?.recordingID == "audio" && world.player.isOpen }
+        #expect(world.liveSessions.count == 2, "the failure outlived the account change")
         controller.turnOff()
     }
 

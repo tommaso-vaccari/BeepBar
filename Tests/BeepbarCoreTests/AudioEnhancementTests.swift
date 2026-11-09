@@ -34,13 +34,20 @@ struct AudioEnhancementTests {
         #expect(args.contains("-nostdin"))
         #expect(args.last == output.path)
         #expect(!AudioEnhancement.protocolWhitelist.split(separator: ",").contains("file"))
-        for filter in ["highpass", "afftdn", "equalizer", "dynaudnorm", "alimiter"] {
+        for filter in ["highpass", "afftdn", "equalizer", "dynaudnorm", "agate", "volume", "alimiter"] {
             #expect(AudioEnhancement.filterChain.contains(filter))
         }
-        // Two denoise passes: the second removes the room noise the normalizer raised.
+        // Classroom order: the gate comes after the normalizer, so whatever the normalizer raised
+        // in a pause (background voices) is pushed down again; the final gain and the limiter
+        // come last, so the gate's threshold isn't moved by the gain and nothing after the
+        // limiter can clip. The normalizer stays gentle (at most 3x), since a strong one raised
+        // the chatter above the teacher on a real recording.
         let filters = AudioEnhancement.filterChain.split(separator: ",").map { $0.split(separator: "=").first.map(String.init) ?? "" }
         #expect(filters.filter { $0 == "afftdn" }.count == 2)
-        #expect(filters.firstIndex(of: "dynaudnorm")! < filters.lastIndex(of: "afftdn")!)
+        #expect(filters.firstIndex(of: "dynaudnorm")! < filters.firstIndex(of: "agate")!)
+        #expect(filters.firstIndex(of: "agate")! < filters.firstIndex(of: "volume")!)
+        #expect(filters.suffix(1) == ["alimiter"])
+        #expect(AudioEnhancement.filterChain.contains("dynaudnorm=f=500:g=31:p=0.7:m=3"))
     }
 
     /// Both microsecond keys are read; anything else, N/A and negatives are not progress.

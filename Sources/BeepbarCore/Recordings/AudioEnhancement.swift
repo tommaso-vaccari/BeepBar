@@ -26,27 +26,35 @@ public enum AudioEnhancement {
         ffmpegCandidates.first(where: isExecutable).map { URL(fileURLWithPath: $0) }
     }
 
-    /// The audio filters, in order, for a lecture recorded by a room microphone:
-    /// - `highpass` / `lowpass`: cut rumble (ventilation, desk knocks, mains hum) below 80 Hz and
-    ///   hiss above 12 kHz, outside the voice;
-    /// - `afftdn`: spectral noise reduction that follows the room's steady noise (`tn`), mild
-    ///   (12 dB) so the voice doesn't turn metallic;
+    /// The audio filters, in order, for a lecture recorded in a university classroom (one teacher,
+    /// a room microphone, students talking in the background):
+    /// - `highpass` / `lowpass`: cut rumble (ventilation, desk knocks, mains hum) below 90 Hz and
+    ///   hiss above 10 kHz, outside the voice;
+    /// - `afftdn`: spectral noise reduction that follows the room's steady noise (`tn`), moderate
+    ///   (15 dB) so the voice doesn't turn metallic;
     /// - `equalizer` ×2: −2 dB around 250 Hz (the boom of a lecture hall) and +3 dB around
     ///   3 kHz, where consonants make speech intelligible;
-    /// - `dynaudnorm`: evens out the volume over a few seconds, so a teacher walking away from the
-    ///   microphone stays as loud as one next to it, without pumping on pauses;
-    /// - a second, gentler `afftdn`: the normalizer also raises the room noise in the pauses, and
-    ///   this pass removes it there;
-    /// - `alimiter`: keeps the boosted peaks from clipping.
+    /// - `dynaudnorm`: evens out the volume slowly (half-second frames, at most 3x gain), so a
+    ///   teacher walking away from the microphone gets closer to one next to it. Kept gentle on
+    ///   purpose: a strong normalizer raises whatever is loudest in a pause, and in a classroom
+    ///   that is the students' voices;
+    /// - `agate`: lowers by about 18 dB what stays well below the teacher (background voices,
+    ///   chatter in the pauses), with a 300 ms release so word endings aren't cut;
+    /// - a second, gentler `afftdn`: removes the noise left between words;
+    /// - `volume` then `alimiter`: brings the whole lecture up to a comfortable level (about
+    ///   −18 LUFS) with peaks held near −2 dBFS, so the AAC encoder never clips.
     ///
-    /// Chosen on 2026-11-09 with ffmpeg 9.0.2 against synthetic speech (macOS `say`) mixed with
-    /// brown noise and 50 Hz hum, a quiet and a loud half: against the single-pass chain it
-    /// replaced, the same speed (~70x real time on an M2) and quiet/loud balance (−17.6/−16.5
-    /// LUFS from −27.4/−15.7), with the noise floor in the pauses far lower and clean speech's
-    /// level unchanged. Rejected there: `loudnorm` with a stronger normalizer (pauses got
-    /// noisier), a gate (no better than the second pass), `anlmdn` (3x slower, no gain),
-    /// `arnndn` (needs a model file ffmpeg doesn't ship).
-    public static let filterChain = "highpass=f=80,lowpass=f=12000,afftdn=nr=12:nf=-40:tn=1,equalizer=f=250:t=q:w=1:g=-2,equalizer=f=3000:t=q:w=1.4:g=3,dynaudnorm=f=250:g=15:p=0.9:m=12,afftdn=nr=8:nf=-45:tn=1,alimiter=limit=0.95"
+    /// Chosen on 2026-11-09 with ffmpeg 9.0.2 on a real 2.5-hour classroom recording (three
+    /// 60 s excerpts: lecture, quiet speech, continuous background chatter), measured with
+    /// `ebur128` and 100 ms RMS frames. The previous chain (`dynaudnorm` with 12x gain, no gate)
+    /// raised the background 6.7 dB more than the teacher, so the chatter students complained
+    /// about got louder; this one raises the teacher by ~8.5 dB and leaves the background 5–12 dB
+    /// lower relative to them, at ~300x real time on an M2. Rejected there: `speechnorm`
+    /// (pumping, wider loudness range on quiet speech), a gentler gate (background unchanged
+    /// relative to speech), no final gain (lecture left at −25 LUFS, too quiet). Background
+    /// voices as loud as the teacher can't be separated without a neural model; `arnndn` needs a
+    /// model file ffmpeg doesn't ship.
+    public static let filterChain = "highpass=f=90,lowpass=f=10000,afftdn=nr=15:nf=-50:tn=1,equalizer=f=250:t=q:w=1:g=-2,equalizer=f=3000:t=q:w=1.4:g=3,dynaudnorm=f=500:g=31:p=0.7:m=3,agate=threshold=0.035:ratio=4:range=0.12:attack=5:release=300:knee=4,afftdn=nr=6:nf=-50:tn=1,volume=8dB,alimiter=limit=0.8:level=disabled"
 
     /// The protocols ffmpeg may open while reading the stream: the network ones HLS over https
     /// needs. Not `file`, so a playlist can't make ffmpeg read a local file into the copy.

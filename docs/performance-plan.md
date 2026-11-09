@@ -121,6 +121,34 @@ Branch `fix/recordings-signin-recovery`, base dev `0c9d033`. Il retry dopo una s
 
 **Prossimo passo.** La prova live autorizzata è conclusa: un corso, una pagina, nessun retry. Non ripeterla per evitare traffico superfluo. Benchmark UI `recordings-1000`, `scripts/quit-probe.sh` e `otool -L` sul Release completati; restano le prove manuali della PR e l’osservazione idle di 30 minuti sulla copia installata dopo la release. Scaling, cicli ripetuti e idle restano **non misurati**; nessun beneficio app-wide rivendicato.
 
+### Registrazioni: lezioni da link Webex, audio migliorato e indicatori (issue #235, PR #TBD, 2026-11-09)
+
+Branch `feature/watchlist-manual-webex-audio`, base `origin/dev` `7ad62a2`. Non integrata: una PR aperta non è lavoro integrato.
+
+**Cosa cambia e quale principio tocca.**
+- *Dati dell’utente (1) e identità (8)*: le lezioni aggiunte con un link stanno in una chiave UserDefaults per account (`recordings-manual.v1.<owner>`), che una versione precedente non tocca; un elenco illeggibile non viene mai sovrascritto. Il loro avanzamento sta nella lezione (la tabella `progress` è per corso) e si cancella con lo storico, per ogni account (`forgetManualProgress`); le lezioni restano.
+- *Quiete (3) e costo proporzionale (4)*: l’avanzamento delle lezioni da link si scrive solo a checkpoint e spunte, mai al tick (test `aManualLessonShowsAndKeepsItsProgress`). L’audio migliorato non esiste finché non lo si accende: niente server, processo o file a riposo; chiude server, ffmpeg e cartella alla chiusura della lezione, e i processi all’uscita (osservatore `willTerminate`, nessun lavoro aggiunto al percorso di uscita).
+- *Risorse limitate (6)*: l’audio migliorato tiene su disco al più 40 tratti isolati per lezione e cancella un tratto solo quando nessuna codifica lo usa.
+- *Risposta immediata (2)*: la barra laterale legge le lezioni rimaste dai riepiloghi salvati come faceva il pallino; nessun lavoro in più per riga.
+
+**Misure (audio migliorato).** `BEEPBAR_MEASURE_AUDIO=1 swift test --skip-build --filter LiveAudioMeasurements` (procedura in `docs/benchmarks.md`, «Enhanced audio»), lezione sintetica di 6 minuti letta da disco (niente rete). Cinque esecuzioni per commit, alternate, stessa macchina: Apple M5, 32 GB, alimentazione da rete. Mediana / p95 (con 5 campioni il p95 è il massimo). Confronto `ee6b81d` (prima della cache dei tratti) → `b86e938` (cache; a HEAD il codice audio differisce solo in due commenti). Al commit di base il file di misura è stato copiato e adattato alla vecchia firma `isolate(_:to:)`, solo per la misura.
+
+| Con isolamento della voce | `ee6b81d` | `b86e938` |
+|---|---|---|
+| Primo segmento (seg0) | 1100 / 1103 ms | 1057 / 1064 ms |
+| Salto avanti (seg8) | 1096 / 1101 ms | 1049 / 1056 ms |
+| Ritorno a una parte ascoltata (seg1) | 1105 / 1113 ms | 356 / 358 ms |
+| Tempo totale di isolamento | 6628 / 6634 ms (8 run) | 5834 / 5860 ms (10 run, più corti) |
+| CPU BeepBar / ffmpeg | 6,69 / 4,42 s | 5,89 / 4,36 s |
+| Memoria di picco | 84 / 85 MB | 100 / 100 MB |
+| Dopo lo stop | 0 file, 0 processi | 0 file, 0 processi |
+
+Senza isolamento (solo ffmpeg) i due commit coincidono: seg0 609 / 612 contro 608 / 610 ms, salto avanti 642 / 660 contro 643 / 661 ms.
+
+**Regressioni e limiti.** La memoria di picco con isolamento sale di ~16 MB (84 → 100 MB) e resta lì dopo lo stop, come al commit di base resta a 84 MB: il modello della voce resta caricato nel processo. Non è una crescita per sessione, ma non è stato misurato su più lezioni consecutive. Le attese sono lavoro locale: la rete verso Webex non è misurata. I confronti base-dev → HEAD e main → HEAD non si applicano all’audio migliorato, che non esiste né su `dev` né su `main`: non misurati. Lezioni da link e indicatori non toccano i budget misurati (nessuna scrittura al tick, nessun lavoro per riga), coperti da test e non da benchmark. Il riferimento di AGENTS.override.md è un M2 8 GB: queste misure sono state prese su un M5 32 GB e non sono confrontabili con misure su quella macchina.
+
+**Decisione.** La cache entra in questa PR anche se AGENTS.md chiede una correzione per PR di prestazioni: ottimizza codice che esiste solo su questo branch, e senza di essa ogni ritorno indietro rifaceva l’isolamento.
+
 ## Review e battle testing obbligatori
 
 1. Un reviewer senior indipendente, che non ha scritto la modifica, esamina l’intero diff contro i principi qui definiti e le specifiche IT/EN. Per lavoro affidato ad agenti usare un subagente indipendente; il responsabile della modifica non può autocertificare la review.

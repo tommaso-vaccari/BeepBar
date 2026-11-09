@@ -1963,7 +1963,10 @@ struct RecordingsListing: Equatable {
         let enhancer = currentAudioEnhancer()
         switch action {
         case .create:
-            enhancer.start(key: lecture.key, stream: lecture.stream.url, duration: lecture.stream.duration ?? audioDuration)
+            // The player's measured length first: Webex's own `duration` hint is in an unconfirmed
+            // unit (on a real lecture it looked like milliseconds, 9071640 for 2.5 hours), which
+            // kept the percentage at 0% for the whole copy.
+            enhancer.start(key: lecture.key, stream: lecture.stream.url, duration: audioDuration ?? lecture.stream.duration)
         case .cancel:
             enhancer.cancel()
         case .useEnhanced(let on):
@@ -2152,7 +2155,11 @@ struct RecordingsListing: Equatable {
     /// course's live summary; never a write, never `watchSummaries` (the menu changes at
     /// checkpoints only). Refused for a lecture no longer playing or an unknown account.
     private func playerProgress(id: String, position: TimeInterval, duration: TimeInterval?) {
-        if audioLecture?.recordingID == id, let duration { audioDuration = duration }
+        if let lecture = audioLecture, lecture.recordingID == id, let duration, duration != audioDuration {
+            audioDuration = duration
+            // A copy started before the player knew the length gets the measured one.
+            audioEnhancer?.updateDuration(duration, for: lecture.key)
+        }
         guard let recording = nowPlaying[id], resumeOwner() != nil,
               let fraction = RecordingWatchProgress.fraction(position: position, playerDuration: duration, archiveMinutes: recording.minutes) else { return }
         var session = sessions[id] ?? newSession(for: recording, start: nil)

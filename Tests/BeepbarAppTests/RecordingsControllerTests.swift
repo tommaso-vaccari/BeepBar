@@ -2331,6 +2331,36 @@ struct RecordingsControllerTests {
         controller.turnOff()
     }
 
+    /// The percentage follows the player's measured length, not Webex's `duration` hint, whose
+    /// unit is unconfirmed (on a real lecture it looked like milliseconds): guards against the
+    /// copy reading 0% from start to end. Pressed before the player reported a length, the copy
+    /// switches to the measured one as soon as it arrives.
+    @Test func thePercentageUsesThePlayersLength() async throws {
+        defer { cleanUp() }
+        world.ffmpeg = try fakeFFmpeg("exec sleep 30")
+        let controller = await readyController()
+        for measuredFirst in [true, false] {
+            let lecture = recording(measuredFirst ? "ms1" : "ms2")
+            browser.streamResults[lecture.id] = [.success(RecordingStream(url: stream(lecture.id).url, title: nil, duration: 6_000_000))]
+            controller.play(lecture)
+            await settle("lecture playing") { world.player.plays.last?.recordingID == lecture.id }
+            if measuredFirst { world.player.tick(at: 10) }
+            world.player.chooseAudio(.create)
+            // The fake ffmpeg reports 3000 s written; the player's length is 6000 s.
+            if !measuredFirst {
+                // With the hint alone, 3000 of "6,000,000" seconds: the menu stays at 0%.
+                await settle("copy underway") { if case .processing = world.player.audioState { true } else { false } }
+                try await Task.sleep(for: .milliseconds(300))
+                #expect(world.player.audioState == .processing(fraction: 0))
+                world.player.tick(at: 10)
+            }
+            await settle("half done") { world.player.audioState == .processing(fraction: 0.5) }
+            world.player.chooseAudio(.cancel)
+            await settle("cancelled") { world.player.audioState == .idle }
+        }
+        controller.turnOff()
+    }
+
     /// Without ffmpeg the menu says how to get it, and choosing anything runs nothing.
     @Test func withoutFFmpegTheMenuSaysHowToGetIt() async {
         defer { cleanUp() }

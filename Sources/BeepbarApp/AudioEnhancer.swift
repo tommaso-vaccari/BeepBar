@@ -91,8 +91,10 @@ extension RecordingPlayerPolicy {
         var resolving: Task<Void, Never>?
         let partial: URL
         let final: URL
-        let duration: TimeInterval?
+        var duration: TimeInterval?
         var fraction: Double?
+        /// Seconds of the lecture ffmpeg has written so far, nil before its first report.
+        var written: TimeInterval?
         var cancelled = false
         var terminationObserver: NSObjectProtocol?
     }
@@ -252,6 +254,18 @@ extension RecordingPlayerPolicy {
         job = current
     }
 
+    /// Replaces the length the percentage of `key`'s running copy is computed from: the player
+    /// measured it after the copy started. Redraws the menu only when the shown percent changes.
+    func updateDuration(_ duration: TimeInterval, for key: String) {
+        guard var current = job, current.key == key, !current.cancelled, current.duration != duration else { return }
+        let fraction = AudioEnhancement.fraction(written: current.written ?? 0, duration: duration)
+        current.duration = duration
+        let changed = current.fraction.map { Int($0 * 100) } != fraction.map { Int($0 * 100) }
+        current.fraction = fraction
+        job = current
+        if changed { onChange?(key) }
+    }
+
     /// Stops the running job, if any; its partial file is removed when ffmpeg has exited.
     func cancel() {
         guard var current = job, !current.cancelled else { return }
@@ -296,11 +310,13 @@ extension RecordingPlayerPolicy {
 
     private func progressed(key: String, seconds: TimeInterval) {
         guard var current = job, current.key == key, !current.cancelled else { return }
+        current.written = seconds
         let fraction = AudioEnhancement.fraction(written: seconds, duration: current.duration)
-        // A redraw of the menu per whole percent at most.
-        if let old = current.fraction, let fraction, Int(old * 100) == Int(fraction * 100) { return }
+        let old = current.fraction
         current.fraction = fraction
         job = current
+        // A redraw of the menu per whole percent at most.
+        if let old, let fraction, Int(old * 100) == Int(fraction * 100) { return }
         onChange?(key)
     }
 

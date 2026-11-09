@@ -62,9 +62,11 @@ public struct ManualWebexLesson: Codable, Equatable, Sendable, Identifiable {
     /// The player link in `text`, or nil when it isn't a link to a recording on Polimi's Webex
     /// site. Surrounding whitespace (a copied line) is ignored. Accepted as `RecmanURLPolicy`
     /// accepts it (`ldr.php?RCID=…`, `/recordingservice/…/recording/playback/<id>`), plus the share
-    /// form `/recordingservice/sites/<site>/recording/<uuid>/playback`, rewritten to the playback
-    /// form the stream resolver reads (`WebexPlayerLink.playbackPage`). Only that exact shape and a
-    /// 32-hex uuid are rewritten; anything else is refused rather than guessed.
+    /// form `/<app>/sites/<site>/recording/<uuid>/playback`, rewritten to the playback form the
+    /// stream resolver reads (`WebexPlayerLink.playbackPage`). `<app>` is `recordingservice` or
+    /// `webappng`, the path of Webex's newer web app, which is what the address bar shows when a
+    /// student opens a recording there (a valid link was refused before, 2026-11-09). Only that
+    /// exact shape and a 32-hex uuid are rewritten; anything else is refused rather than guessed.
     public static func normalizedLink(_ text: String) -> URL? {
         let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty, !trimmed.contains(where: \.isWhitespace), let url = URL(string: trimmed) else { return nil }
@@ -73,7 +75,7 @@ public struct ManualWebexLesson: Codable, Equatable, Sendable, Identifiable {
         let segments = components.percentEncodedPath.split(separator: "/", omittingEmptySubsequences: false).map(String.init)
         var trimmedSegments = segments
         if trimmedSegments.last == "" { trimmedSegments.removeLast() }
-        guard trimmedSegments.count == 7, trimmedSegments[0] == "", trimmedSegments[1] == "recordingservice", trimmedSegments[2] == "sites",
+        guard trimmedSegments.count == 7, trimmedSegments[0] == "", shareApps.contains(trimmedSegments[1]), trimmedSegments[2] == "sites",
               trimmedSegments[3] == WebexSite.name, trimmedSegments[4] == "recording", trimmedSegments[6] == "playback",
               trimmedSegments[5].range(of: WebexPlayerLink.uuidPattern, options: .regularExpression) != nil else { return nil }
         components.percentEncodedPath = "/recordingservice/sites/\(WebexSite.name)/recording/playback/\(trimmedSegments[5])"
@@ -81,6 +83,9 @@ public struct ManualWebexLesson: Codable, Equatable, Sendable, Identifiable {
         guard let rewritten = components.url else { return nil }
         return RecmanURLPolicy.playbackURL(rewritten)
     }
+
+    /// The first path segment of the share forms `normalizedLink` rewrites.
+    static let shareApps: Set<String> = ["recordingservice", "webappng"]
 
     static func cleaned(_ text: String) -> String {
         String(text.trimmingCharacters(in: .whitespacesAndNewlines).prefix(maxTextLength))

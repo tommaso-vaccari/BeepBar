@@ -27,6 +27,16 @@ struct ManualWebexLessonTests {
         #expect(WebexPlayerLink.playbackPage(fromPlayerURL: link)?.uuid == uuid)
     }
 
+    /// The address Webex's newer web app shows for a recording (`/webappng/…`, as a student
+    /// pasted it on 2026-11-09, uuid replaced by a synthetic one) becomes the same playback form.
+    /// Guards against refusing the link most students will copy from their browser.
+    @Test func acceptsTheWebAppAddress() throws {
+        let copied = "https://politecnicomilano.webex.com/webappng/sites/politecnicomilano/recording/\(uuid)/playback"
+        let link = try #require(ManualWebexLesson.normalizedLink(copied))
+        #expect(link.absoluteString == "https://politecnicomilano.webex.com/recordingservice/sites/politecnicomilano/recording/playback/\(uuid)")
+        #expect(WebexPlayerLink.playbackPage(fromPlayerURL: link)?.uuid == uuid)
+    }
+
     /// The share form (`/recording/<uuid>/playback`) becomes the playback form the resolver
     /// reads; without the rewrite it would be refused, since `RecmanURLPolicy` doesn't know it.
     @Test func rewritesTheShareFormToThePlaybackForm() throws {
@@ -54,6 +64,9 @@ struct ManualWebexLessonTests {
         "https://politecnicomilano.webex.com/meet/someone",
         "https://politecnicomilano.webex.com/recordingservice/sites/politecnicomilano/recording/0123456789ABCDEF0123456789ABCDEF/playback",
         "https://politecnicomilano.webex.com/recordingservice/sites/othersite/recording/0123456789abcdef0123456789abcdef/playback",
+        "https://politecnicomilano.webex.com/webappng/sites/othersite/recording/0123456789abcdef0123456789abcdef/playback",
+        "https://politecnicomilano.webex.com/otherapp/sites/politecnicomilano/recording/0123456789abcdef0123456789abcdef/playback",
+        "https://politecnicomilano.webex.com/webappng/sites/politecnicomilano/recording/0123456789abcdef0123456789abcd/playback",
         "https://politecnicomilano.webex.com/recordingservice/sites/politecnicomilano/recording/..%2F/playback",
         "https://politecnicomilano.webex.com/politecnicomilano/ldr.php?RCID=abc https://evil.example",
     ])

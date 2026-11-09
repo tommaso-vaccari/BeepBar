@@ -4,7 +4,12 @@ cd "$(dirname "$0")/.."
 
 xcodebuild -version
 swift --version
-test "$(xcrun --sdk macosx --show-sdk-version)" = "27.0"
+# The GitHub runner (`xcode-27`) has the 27.0 SDK; local machines updated to Xcode 27.2 must still
+# pass the same gate. Any other SDK fails, so a toolchain change is a deliberate edit here.
+case "$(xcrun --sdk macosx --show-sdk-version)" in
+    27.0|27.2) ;;
+    *) echo "Unsupported macOS SDK $(xcrun --sdk macosx --show-sdk-version)" >&2; exit 1 ;;
+esac
 python3 scripts/test_benchmark_compare.py
 python3 scripts/test_ui_benchmark.py
 bash scripts/test-linux-core-tests.sh

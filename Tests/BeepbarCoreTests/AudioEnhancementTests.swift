@@ -26,6 +26,8 @@ struct AudioEnhancementTests {
         #expect(value(after: "-c:v") == "copy")
         #expect(value(after: "-af") == AudioEnhancement.filterChain)
         #expect(value(after: "-c:a") == "aac")
+        #expect(value(after: "-b:a") == "192k")
+        #expect(value(after: "-ar") == "48000")
         #expect(value(after: "-protocol_whitelist") == "https,tls,tcp,crypto")
         #expect(value(after: "-progress") == "pipe:1")
         #expect(value(after: "-f") == "mp4")
@@ -35,6 +37,10 @@ struct AudioEnhancementTests {
         for filter in ["highpass", "afftdn", "equalizer", "dynaudnorm", "alimiter"] {
             #expect(AudioEnhancement.filterChain.contains(filter))
         }
+        // Two denoise passes: the second removes the room noise the normalizer raised.
+        let filters = AudioEnhancement.filterChain.split(separator: ",").map { $0.split(separator: "=").first.map(String.init) ?? "" }
+        #expect(filters.filter { $0 == "afftdn" }.count == 2)
+        #expect(filters.firstIndex(of: "dynaudnorm")! < filters.lastIndex(of: "afftdn")!)
     }
 
     /// Both microsecond keys are read; anything else, N/A and negatives are not progress.

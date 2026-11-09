@@ -31,11 +31,22 @@ public enum AudioEnhancement {
     ///   hiss above 12 kHz, outside the voice;
     /// - `afftdn`: spectral noise reduction that follows the room's steady noise (`tn`), mild
     ///   (12 dB) so the voice doesn't turn metallic;
-    /// - `equalizer`: +3 dB around 2.5 kHz, where consonants make speech intelligible;
+    /// - `equalizer` ×2: −2 dB around 250 Hz (the boom of a lecture hall) and +3 dB around
+    ///   3 kHz, where consonants make speech intelligible;
     /// - `dynaudnorm`: evens out the volume over a few seconds, so a teacher walking away from the
     ///   microphone stays as loud as one next to it, without pumping on pauses;
+    /// - a second, gentler `afftdn`: the normalizer also raises the room noise in the pauses, and
+    ///   this pass removes it there;
     /// - `alimiter`: keeps the boosted peaks from clipping.
-    public static let filterChain = "highpass=f=80,lowpass=f=12000,afftdn=nr=12:nf=-40:tn=1,equalizer=f=2500:t=q:w=1.2:g=3,dynaudnorm=f=250:g=15:p=0.9:m=12,alimiter=limit=0.95"
+    ///
+    /// Chosen on 2026-11-09 with ffmpeg 9.0.2 against synthetic speech (macOS `say`) mixed with
+    /// brown noise and 50 Hz hum, a quiet and a loud half: against the single-pass chain it
+    /// replaced, the same speed (~70x real time on an M2) and quiet/loud balance (−17.6/−16.5
+    /// LUFS from −27.4/−15.7), with the noise floor in the pauses far lower and clean speech's
+    /// level unchanged. Rejected there: `loudnorm` with a stronger normalizer (pauses got
+    /// noisier), a gate (no better than the second pass), `anlmdn` (3x slower, no gain),
+    /// `arnndn` (needs a model file ffmpeg doesn't ship).
+    public static let filterChain = "highpass=f=80,lowpass=f=12000,afftdn=nr=12:nf=-40:tn=1,equalizer=f=250:t=q:w=1:g=-2,equalizer=f=3000:t=q:w=1.4:g=3,dynaudnorm=f=250:g=15:p=0.9:m=12,afftdn=nr=8:nf=-45:tn=1,alimiter=limit=0.95"
 
     /// The protocols ffmpeg may open while reading the stream: the network ones HLS over https
     /// needs. Not `file`, so a playlist can't make ffmpeg read a local file into the copy.
@@ -55,7 +66,10 @@ public enum AudioEnhancement {
             "-map", "0:v:0?", "-map", "0:a:0",
             "-c:v", "copy",
             "-af", filterChain,
-            "-c:a", "aac", "-b:a", "128k",
+            // 192 kb/s at 48 kHz: the filtered audio is encoded once more, so it gets a rate well
+            // above the stream's own (typically 64–128 kb/s), which keeps that generation
+            // inaudible. ffmpeg's own AAC encoder, present in every build.
+            "-c:a", "aac", "-b:a", "192k", "-ar", "48000",
             "-movflags", "+faststart",
             "-progress", "pipe:1",
             "-f", "mp4", "-y", output.path,

@@ -66,7 +66,7 @@ public enum AudioEnhancement {
     /// `ebur128` and 100 ms RMS frames. The previous chain (`dynaudnorm` with 12x gain, no gate)
     /// raised the background 6.7 dB more than the teacher, so the chatter students complained
     /// about got louder; this one raises the teacher by ~8.5 dB and leaves the background 5–12 dB
-    /// lower relative to them, at ~300x real time on an M2. Rejected there: `speechnorm`
+    /// lower relative to them, at ~300x real time on an Apple M5. Rejected there: `speechnorm`
     /// (pumping, wider loudness range on quiet speech), a gentler gate (background unchanged
     /// relative to speech), no final gain (lecture left at −25 LUFS, too quiet). Background
     /// voices as loud as the teacher can't be separated without a neural model; `arnndn` needs a

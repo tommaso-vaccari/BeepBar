@@ -2,6 +2,15 @@
 
 ## Unreleased
 
+### New
+
+- Add a lesson to the Watchlist by pasting its Webex link with the “+” button, for recordings the archive doesn't list. The link copied from the Webex web app's address bar works too. Leave the title empty and the first Play fills in Webex's title and the length; the lesson then shows its progress bar and the “Fatta” (“Done”) checkbox like the others.
+- “Audio migliorato” (“Enhanced audio”) in the player's title bar reduces classroom noise and brings the teacher's voice forward while the lecture plays, using Apple's voice isolation. It needs ffmpeg on your Mac (`brew install ffmpeg`); without it the switch says how to get it. With it on, a lecture takes about a second to start and after each jump to a part not heard yet; if it stops working, the lecture carries on with its original audio.
+
+### Improved
+
+- The Recordings sidebar is tidier: the orange dot is gone, and under each course's name you now read how many lectures are left, for example “30 registrazioni · 3 da guardare”. The only badge left counts new recordings, and it stays readable on the selected course. The number beside “Watchlist” now counts the lessons added by link too.
+
 ## 2026-10-19
 
 ### Release highlights

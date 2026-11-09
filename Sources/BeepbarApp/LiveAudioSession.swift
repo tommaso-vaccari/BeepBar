@@ -151,7 +151,7 @@ struct FFmpegExitError: Error {}
 /// repeat file paths; only the exit status matters). Killed on cancellation, after
 /// `timeLimit`, and when BeepBar quits (`LiveAudioProcesses`).
 struct FFmpegRunner: LiveAudioProcessRunning {
-    /// A segment takes 0.3–0.7 s on an M2; a minute means ffmpeg is stuck.
+    /// A segment takes 0.3–0.7 s on an Apple M5; a minute means ffmpeg is stuck.
     var timeLimit: TimeInterval = 60
 
     func run(_ executable: URL, _ arguments: [String]) async throws {

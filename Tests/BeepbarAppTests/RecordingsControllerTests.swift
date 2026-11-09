@@ -2387,8 +2387,9 @@ struct RecordingsControllerTests {
         controller.turnOff()
     }
 
-    /// Closing the window, an account change and "forget study data" stop the filter: nothing
-    /// keeps fetching or running for a lecture no one is listening to, or for an account gone.
+    /// Closing the window, "forget study data" and turning Recordings off stop the filter:
+    /// nothing keeps fetching or running for a lecture no one is listening to, or for an account
+    /// whose data is gone.
     @Test func theFilterEndsWithTheLectureAndTheAccount() async throws {
         defer { cleanUp() }
         world.ffmpeg = fakeFFmpegPath

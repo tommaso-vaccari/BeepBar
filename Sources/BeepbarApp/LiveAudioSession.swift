@@ -23,9 +23,9 @@ import os
     private var stopped = false
 
     init(stream: URL, ffmpeg: URL, onFailure: @escaping @MainActor (LiveAudioFailure) -> Void,
-         fetcher: LiveAudioFetching = URLSessionLiveAudioFetcher(), runner: LiveAudioProcessRunning = FFmpegRunner()) throws {
+         fetcher: LiveAudioFetching = URLSessionLiveAudioFetcher(), runner: LiveAudioProcessRunning = FFmpegRunner(),
+         parent: URL = LiveAudioSession.defaultParent) throws {
         let token = Self.makeToken()
-        let parent = FileManager.default.temporaryDirectory.appendingPathComponent("Beepbar-LiveAudio", isDirectory: true)
         let folder = parent.appendingPathComponent(token, isDirectory: true)
         let pipeline = LiveAudioPipeline(stream: stream, ffmpeg: ffmpeg, folder: folder, parent: parent, fetcher: fetcher, runner: runner,
                                          report: { failure in await MainActor.run { onFailure(failure) } })
@@ -55,6 +55,13 @@ import os
         server.stop()
         let pipeline = pipeline
         Task.detached { await pipeline.stop() }
+    }
+
+    /// Where sessions keep their fragments, one folder each; a new session clears the others'
+    /// leftovers here. Tests pass their own: the app isn't sandboxed, so a test run would
+    /// otherwise share this folder with the installed app and delete a lecture it is playing.
+    nonisolated static var defaultParent: URL {
+        FileManager.default.temporaryDirectory.appendingPathComponent("Beepbar-LiveAudio", isDirectory: true)
     }
 
     /// 128 random bits, hex: the secret part of every path.

@@ -34,10 +34,9 @@ private final class DiskFetcher: LiveAudioFetching, @unchecked Sendable {
 /// laid out as Webex's (one fragmented MP4 sliced by byte ranges): skipped where no ffmpeg is
 /// installed. Proves what the unit tests can't: that ffmpeg accepts the arguments, the local
 /// server answers AVFoundation, and the filtered segments line up into the lecture's length.
-/// Serialized: a session removes leftover sibling folders of earlier sessions (the app runs one at
-/// a time), so two running in parallel would delete each other's files.
+/// Each test keeps its sessions in its own throwaway folder, never the installed app's.
 @MainActor
-@Suite(.serialized, .enabled(if: AudioEnhancement.locateFFmpeg() != nil, "needs ffmpeg"))
+@Suite(.enabled(if: AudioEnhancement.locateFFmpeg() != nil, "needs ffmpeg"))
 struct LiveAudioSessionTests {
     private let folder = FileManager.default.temporaryDirectory.appendingPathComponent("live-audio-\(UUID().uuidString)", isDirectory: true)
     private static let address = URL(string: "https://media.example.test/rec/out.m3u8")!
@@ -74,7 +73,7 @@ struct LiveAudioSessionTests {
         let fetcher = try makeLecture()
         var failures: [LiveAudioFailure] = []
         let session = try LiveAudioSession(stream: Self.address, ffmpeg: try #require(AudioEnhancement.locateFFmpeg()),
-                                           onFailure: { failures.append($0) }, fetcher: fetcher)
+                                           onFailure: { failures.append($0) }, fetcher: fetcher, parent: folder.appendingPathComponent("sessions"))
         defer { session.stop() }
         #expect(session.playlistURL.host == "127.0.0.1")
 
@@ -112,7 +111,7 @@ struct LiveAudioSessionTests {
         defer { try? FileManager.default.removeItem(at: folder) }
         let fetcher = try makeLecture()
         let session = try LiveAudioSession(stream: Self.address, ffmpeg: try #require(AudioEnhancement.locateFFmpeg()),
-                                           onFailure: { _ in }, fetcher: fetcher)
+                                           onFailure: { _ in }, fetcher: fetcher, parent: folder.appendingPathComponent("sessions"))
         defer { session.stop() }
         let item = AVPlayerItem(url: session.playlistURL)
         let player = AVPlayer(playerItem: item)
@@ -137,7 +136,7 @@ struct LiveAudioSessionTests {
         let fetcher = DiskFetcher(playlist: lecture.playlist, media: lecture.media, refuse: true)
         var failures: [LiveAudioFailure] = []
         let session = try LiveAudioSession(stream: Self.address, ffmpeg: try #require(AudioEnhancement.locateFFmpeg()),
-                                           onFailure: { failures.append($0) }, fetcher: fetcher)
+                                           onFailure: { failures.append($0) }, fetcher: fetcher, parent: folder.appendingPathComponent("sessions"))
         defer { session.stop() }
         #expect(try await get(session.playlistURL).1 == 502)
         #expect(failures == [.streamRefused])
@@ -151,7 +150,7 @@ struct LiveAudioSessionTests {
         try "#EXTM3U\n#EXTINF:4,\nseg1.ts\n#EXT-X-ENDLIST\n".write(to: lecture.playlist, atomically: true, encoding: .utf8)
         var failures: [LiveAudioFailure] = []
         let session = try LiveAudioSession(stream: Self.address, ffmpeg: try #require(AudioEnhancement.locateFFmpeg()),
-                                           onFailure: { failures.append($0) }, fetcher: lecture)
+                                           onFailure: { failures.append($0) }, fetcher: lecture, parent: folder.appendingPathComponent("sessions"))
         defer { session.stop() }
         #expect(try await get(session.playlistURL).1 == 502)
         #expect(failures == [.unavailable])
@@ -162,7 +161,7 @@ struct LiveAudioSessionTests {
         defer { try? FileManager.default.removeItem(at: folder) }
         let fetcher = try makeLecture()
         let session = try LiveAudioSession(stream: Self.address, ffmpeg: try #require(AudioEnhancement.locateFFmpeg()),
-                                           onFailure: { _ in }, fetcher: fetcher)
+                                           onFailure: { _ in }, fetcher: fetcher, parent: folder.appendingPathComponent("sessions"))
         session.stop()
         session.stop()
         await #expect(throws: (any Error).self) { _ = try await get(session.playlistURL) }

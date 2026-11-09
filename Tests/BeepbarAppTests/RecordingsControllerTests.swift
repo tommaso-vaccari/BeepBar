@@ -4361,6 +4361,14 @@ struct RecordingsControllerTests {
     }
 }
 
+/// Reads a `Result` in an `#expect`. Above the account-controller suite, so the isolated seen
+/// fixture (`scripts/recordings-seen-isolated-tests.py`), which keeps only this part of the
+/// file, still has it.
+private extension Result {
+    var isSuccess: Bool { if case .success = self { true } else { false } }
+    var failure: Failure? { if case .failure(let error) = self { error } else { nil } }
+}
+
 /// Recordings through the real account controller: disconnecting, switching university and a
 /// different WeBeep account all delete the Polimi session, even one saved in an earlier launch.
 @MainActor
@@ -4591,11 +4599,6 @@ struct RecordingsAccountTests {
         return (controller, token)
     }
 
-}
-
-private extension Result {
-    var isSuccess: Bool { if case .success = self { true } else { false } }
-    var failure: Failure? { if case .failure(let error) = self { error } else { nil } }
 }
 
 /// What the player's Audio menu shows and does in each state of a lecture's enhanced audio.

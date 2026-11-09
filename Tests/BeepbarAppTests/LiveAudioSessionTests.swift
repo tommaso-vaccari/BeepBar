@@ -56,7 +56,9 @@ struct LiveAudioSessionTests {
 
     /// Makes the synthetic lecture: 3 segments of 4 s, a test picture, and a tone or, with
     /// `speaking`, a synthetic teacher (`AudioTestSignals.speech`).
-    private func makeLecture(speaking: Bool = false) throws -> DiskFetcher {
+    /// `audioFormat` and `startingAt` vary what Webex's file may hold: audio at 44.1 kHz in
+    /// stereo, and a clock that doesn't start at zero.
+    private func makeLecture(speaking: Bool = false, audioFormat: [String] = ["-ar", "48000"], startingAt: Int = 0) throws -> DiskFetcher {
         try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
         let ffmpeg = try #require(AudioEnhancement.locateFFmpeg())
         let audio: [String] = speaking
@@ -67,8 +69,8 @@ struct LiveAudioSessionTests {
         process.currentDirectoryURL = folder
         process.arguments = ["-nostdin", "-loglevel", "error", "-y",
                              "-f", "lavfi", "-i", "testsrc=size=160x90:rate=25"] + audio + [
-                             "-c:v", "libx264", "-preset", "ultrafast", "-g", "25", "-c:a", "aac", "-ar", "48000",
-                             "-f", "hls", "-hls_time", "4", "-hls_segment_type", "fmp4", "-hls_flags", "single_file",
+                             "-c:v", "libx264", "-preset", "ultrafast", "-g", "25", "-c:a", "aac"] + audioFormat + [
+                             "-output_ts_offset", "\(startingAt)", "-f", "hls", "-hls_time", "4", "-hls_segment_type", "fmp4", "-hls_flags", "single_file",
                              "-hls_playlist_type", "vod", "out.m3u8"]
         try process.run()
         process.waitUntilExit()
@@ -179,10 +181,14 @@ struct LiveAudioSessionTests {
     /// delay left in, and against the decoded WAV or the encoded segment misplaced on the
     /// clock (`first_pts`, `-itsoffset`), any of which would put the voice behind the picture
     /// and repeat or cut words at the joins, and the limiter's 5 ms look-ahead (240 samples).
-    @Test(.enabled(if: AppleVoiceIsolator.preferred() != nil && AudioTestSignals.canSpeak, "needs voice isolation and say"))
-    func anIsolatedSegmentKeepsTheLecturesClock() async throws {
+    /// Also on a lecture recorded at 44.1 kHz in stereo whose clock starts at 10 minutes: there
+    /// the decode once placed the first sample by 44.1 kHz timestamps, trimmed the whole context
+    /// and served segments with no audio at all (heard as silence, 2026-11-09).
+    @Test(.enabled(if: AppleVoiceIsolator.preferred() != nil && AudioTestSignals.canSpeak, "needs voice isolation and say"),
+          arguments: [(["-ar", "48000"], 60), (["-ar", "44100", "-ac", "2"], 600)])
+    func anIsolatedSegmentKeepsTheLecturesClock(audioFormat: [String], startingAt: Int) async throws {
         defer { try? FileManager.default.removeItem(at: folder) }
-        let fetcher = try makeLecture(speaking: true)
+        let fetcher = try makeLecture(speaking: true, audioFormat: audioFormat, startingAt: startingAt)
         let ffmpeg = try #require(AudioEnhancement.locateFFmpeg())
         var failures: [LiveAudioFailure] = []
         let session = try LiveAudioSession(stream: Self.address, ffmpeg: ffmpeg, onFailure: { failures.append($0) }, fetcher: fetcher,
@@ -193,15 +199,16 @@ struct LiveAudioSessionTests {
         #expect(status == 200)
         let served = folder.appendingPathComponent("served.ts")
         try segment.write(to: served)
-        // Both decoded onto the lecture's clock: silence up to the first sample's timestamp.
-        func onTheClock(_ input: URL, _ name: String) throws -> [Float] {
-            let output = folder.appendingPathComponent(name)
-            try AudioTestSignals.run(ffmpeg, ["-nostdin", "-loglevel", "error", "-y", "-copyts", "-i", input.path, "-map", "0:a:0",
-                                              "-af", "aresample=48000:async=1:first_pts=0", "-ac", "1", "-c:a", "pcm_f32le", output.path], in: folder)
-            return try AudioTestSignals.samples(output)
-        }
-        let lecture = try onTheClock(fetcher.playlist, "lecture.wav")
-        let isolated = try onTheClock(served, "served.wav")
+        // The reference is the synthetic teacher before Webex's encoding (its sample 0 is the
+        // lecture's start), not a decode of the lecture: a plain decode keeps the encoder's
+        // priming and lands one AAC frame late. Both lectures start after zero because at zero
+        // ffmpeg moves the priming frame to 0 and the voice itself one frame later. The served segment (48 kHz, its timestamps on
+        // the lecture's clock) is placed on the same samples, silence before it.
+        let lecture = try AudioTestSignals.samples(folder.appendingPathComponent("speech.wav"))
+        let placed = folder.appendingPathComponent("served.wav")
+        try AudioTestSignals.run(ffmpeg, ["-nostdin", "-loglevel", "error", "-y", "-copyts", "-i", served.path, "-map", "0:a:0", "-ac", "1",
+                                          "-af", "aresample=async=1:first_pts=\(startingAt * 48000)", "-c:a", "pcm_f32le", placed.path], in: folder)
+        let isolated = try AudioTestSignals.samples(placed)
         // The second segment's middle, away from its edges: 4.5–7.5 s.
         let span = 216000..<360000
         try #require(lecture.count >= span.upperBound && isolated.count >= span.upperBound)

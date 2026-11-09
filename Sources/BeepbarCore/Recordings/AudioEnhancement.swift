@@ -92,7 +92,7 @@ public enum AudioEnhancement {
     /// speech too: neither chain lowers them more than about 1 dB relative to the teacher.
     public static let isolatedChain = "highpass=f=90,lowpass=f=10000,equalizer=f=250:t=q:w=1:g=-2,equalizer=f=3000:t=q:w=1.4:g=3,speechnorm=e=6:r=0.0005:l=1,agate=threshold=0.035:ratio=4:range=0.12:attack=5:release=300:knee=4,alimiter=limit=0.8:level=disabled:latency=1"
 
-    /// The sample rate the audio is isolated at: the lecture's own (Webex records 48 kHz), and
+    /// The sample rate the audio is isolated at, whatever the lecture's own (48 or 44.1 kHz):
     /// the one `AppleVoiceIsolator`'s delay is measured for.
     public static let isolationSampleRate = 48000
 
@@ -105,13 +105,19 @@ public enum AudioEnhancement {
     /// puts the isolated audio back by that position alone. Measured on a synthetic Webex
     /// lecture: decoded, passed through unchanged and encoded back, the segment's audio is
     /// sample-identical to `segmentArguments` with no filter.
+    ///
+    /// Two `aresample`s, in this order: the first converts to 48 kHz, the second places the first
+    /// sample. A single `aresample=48000:first_pts=N` compares N with timestamps still counted at
+    /// the source's rate, so a 44.1 kHz lecture's audio looked 8% earlier than it is and was
+    /// trimmed: a few minutes in, the whole context, and the segments came out with no audio
+    /// (a student heard nothing with enhanced audio on, 2026-11-09).
     public static func isolationDecodeArguments(audio: String, firstSample: Int, output: String) -> [String] {
         [
             "-hide_banner", "-nostdin", "-nostats", "-loglevel", "error",
             "-protocol_whitelist", protocolWhitelist,
             "-copyts", "-i", audio,
             "-map", "0:a:0",
-            "-af", "aresample=\(isolationSampleRate):async=1:first_pts=\(firstSample),aformat=sample_fmts=flt:channel_layouts=mono",
+            "-af", "aresample=\(isolationSampleRate),aresample=async=1:first_pts=\(firstSample),aformat=sample_fmts=flt:channel_layouts=mono",
             "-c:a", "pcm_f32le", "-f", "wav", "-y", output,
         ]
     }

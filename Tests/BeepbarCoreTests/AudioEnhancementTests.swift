@@ -203,7 +203,7 @@ struct AudioEnhancementTests {
         #expect(value(decode, after: "-i") == "concat:/i|/p|/c|/n")
         #expect(decode.firstIndex(of: "-copyts")! < decode.firstIndex(of: "-i")!)
         #expect(value(decode, after: "-map") == "0:a:0")
-        #expect(value(decode, after: "-af") == "aresample=48000:async=1:first_pts=385024,aformat=sample_fmts=flt:channel_layouts=mono")
+        #expect(value(decode, after: "-af") == "aresample=48000,aresample=async=1:first_pts=385024,aformat=sample_fmts=flt:channel_layouts=mono")
         #expect(value(decode, after: "-c:a") == "pcm_f32le")
         #expect(value(decode, after: "-f") == "wav")
         #expect(value(decode, after: "-protocol_whitelist") == "file,concat")

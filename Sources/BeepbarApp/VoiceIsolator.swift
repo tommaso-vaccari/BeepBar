@@ -55,6 +55,9 @@ struct AppleVoiceIsolator: LiveAudioVoiceIsolating {
 
     enum IsolationError: Error { case unsupportedInput, renderFailed }
 
+    /// A nonisolated async function: the second of rendering runs on the shared pool, neither
+    /// on the main actor nor on `LiveAudioPipeline` (no default actor isolation is set in
+    /// either build), so seeks and `stop()` aren't held up by it.
     func isolate(_ input: URL, to output: URL) async throws {
         try Self.render(input: input, output: output, model: model)
     }
@@ -75,7 +78,9 @@ struct AppleVoiceIsolator: LiveAudioVoiceIsolating {
         engine.connect(player, to: effect, format: format)
         engine.connect(effect, to: engine.mainMixerNode, format: format)
         try engine.enableManualRenderingMode(.offline, format: format, maximumFrameCount: 4096)
-        guard AudioUnitSetParameter(effect.audioUnit, kAUSoundIsolationParam_SoundToIsolate, kAudioUnitScope_Global, 0, model.soundType, 0) == noErr,
+        // The standard model is the unit's default, and on macOS 14 the parameter's only value:
+        // set only to ask for the high-quality one.
+        guard model == .standard || AudioUnitSetParameter(effect.audioUnit, kAUSoundIsolationParam_SoundToIsolate, kAudioUnitScope_Global, 0, model.soundType, 0) == noErr,
               AudioUnitSetParameter(effect.audioUnit, kAUSoundIsolationParam_WetDryMixPercent, kAudioUnitScope_Global, 0, 100, 0) == noErr
         else { throw IsolationError.renderFailed }
         try engine.start()

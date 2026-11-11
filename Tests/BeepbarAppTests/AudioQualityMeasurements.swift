@@ -55,9 +55,9 @@ struct AudioQualityMeasurements {
 
     /// What `AudioEnhancement.isolatedChain` begins with, kept by every candidate: rumble and
     /// hiss filters and the two speech equalizers.
-    private static let prefix = "highpass=f=90,lowpass=f=10000,equalizer=f=250:t=q:w=1:g=-2,equalizer=f=3000:t=q:w=1.4:g=3"
+    static let prefix = "highpass=f=90,lowpass=f=10000,equalizer=f=250:t=q:w=1:g=-2,equalizer=f=3000:t=q:w=1.4:g=3"
     /// Where every chain ends: a limiter that keeps peaks at −1.9 dBFS and adds no delay.
-    private static let limiter = "alimiter=limit=0.8:level=disabled:latency=1"
+    static let limiter = "alimiter=limit=0.8:level=disabled:latency=1"
 
     /// The candidates. `current` is production, verbatim; the rest are strings defined here, never
     /// in production code, until one is chosen.
@@ -421,7 +421,7 @@ struct AudioQualityMeasurements {
 
     // MARK: Metrics
 
-    private static func f(_ x: Double, _ digits: Int = 1) -> String { x.isNaN ? "n/a" : String(format: "%.\(digits)f", x) }
+    static func f(_ x: Double, _ digits: Int = 1) -> String { x.isNaN ? "n/a" : String(format: "%.\(digits)f", x) }
     private static func pad(_ s: String, _ n: Int) -> String { s.count >= n ? s : s + String(repeating: " ", count: n - s.count) }
 
     /// Frame-by-frame gain of `out` over `input` (dB) on the frames of `speech` that fit whole.

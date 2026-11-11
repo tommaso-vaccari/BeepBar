@@ -85,8 +85,22 @@ enum RecordingsPresentation {
     /// The new-lectures badge a sidebar row shows (#238): none on the course whose list is open,
     /// whose new lectures keep their dots in the list and become read when the student leaves it
     /// (`RecordingsController.leaveOpenCourse`). The Watchlist being open counts as no course.
-    nonisolated static func sidebarNewCount(_ count: Int, rowCourseID: Int64, openCourseID: Int64?) -> Int {
-        rowCourseID == openCourseID ? 0 : count
+    /// Compared by archive key, not WeBeep course id: two synced courses with the same code and
+    /// year share one listing, so they are open (and left) together.
+    nonisolated static func sidebarNewCount(_ count: Int, rowKey: RecmanCourseKey, openKey: RecmanCourseKey?) -> Int {
+        rowKey == openKey ? 0 : count
+    }
+
+    /// Whether the page shows its two panes (sidebar and course or Watchlist) rather than the
+    /// full-page sign-in. Without a session the saved Watchlist is still worth showing; with
+    /// none, there is nothing to show but the invitation to sign in. The course pane is on screen
+    /// only in the two panes, which is what makes a course "open" for #238.
+    nonisolated static func showsBrowser(access: RecordingsAccess, hasBookmarks: Bool) -> Bool {
+        switch access {
+        case .ready: true
+        case .signingIn, .needsSignIn: hasBookmarks
+        case .off: false
+        }
     }
 
     /// What the course pane shows below its header and toolbar (#237). Every case draws
@@ -396,12 +410,7 @@ struct RecordingsPage: View {
 
     var body: some View {
         Group {
-            switch recordings.access {
-            case .ready: browser
-            case .signingIn, .needsSignIn:
-                if !recordings.study.bookmarks.isEmpty { browser } else { signIn }
-            case .off: signIn
-            }
+            if showsBrowser { browser } else { signIn }
         }
         .onAppear {
             authentication.seedWatchSummariesIfNeeded()
@@ -411,13 +420,20 @@ struct RecordingsPage: View {
         .onDisappear { recordings.pageDisappeared() }
         .onChange(of: keys) { refresh() }
         .onChange(of: destination) { refresh() }
+        // The course becomes open (#238) when the panes replace the sign-in screen, and stops
+        // being open when the sign-in screen replaces them.
+        .onChange(of: showsBrowser) { refresh() }
         .onChange(of: recordings.study.bookmarks.map(\.id)) { refresh() }
     }
 
     private func refresh(force: Bool = false) {
         let savedKeys = recordings.study.bookmarks.compactMap { RecmanCourseKey(courseCode: $0.recording.courseCode, academicYear: $0.recording.academicYear) }
         let requested = destination == .watchlist ? Array(Set(keys + savedKeys)).sorted { ($0.academicYear, $0.courseCode) < ($1.academicYear, $1.courseCode) } : keys
-        recordings.refresh(requested, selected: destination == .watchlist ? nil : selectedEntry?.key, force: force)
+        recordings.refresh(requested, selected: destination == .watchlist ? nil : selectedEntry?.key, force: force, showing: showsBrowser)
+    }
+
+    private var showsBrowser: Bool {
+        RecordingsPresentation.showsBrowser(access: recordings.access, hasBookmarks: !recordings.study.bookmarks.isEmpty)
     }
 
     // MARK: Sign-in
@@ -514,8 +530,8 @@ struct RecordingsPage: View {
                 ForEach(model.searchable) { entry in
                     let summary = authentication.watchSummaries[entry.key]
                     CourseRow(name: entry.sidebarName, key: entry.key, subtitle: RecordingsPresentation.courseSubtitle(for: recordings.listing(for: entry.key), summary: summary),
-                              newCount: RecordingsPresentation.sidebarNewCount(recordings.newCount(for: entry.key), rowCourseID: entry.course.id,
-                                                                               openCourseID: destination == .watchlist ? nil : selectedCourseID))
+                              newCount: RecordingsPresentation.sidebarNewCount(recordings.newCount(for: entry.key), rowKey: entry.key,
+                                                                               openKey: destination == .watchlist ? nil : selectedEntry?.key))
                         .equatable()
                         .tag(RecordingsDestination.course(entry.course.id))
                 }
@@ -791,7 +807,7 @@ private struct CourseRecordings: View {
             ContentUnavailableView {
                 Label(tr("Accedi con Polimi per vedere le lezioni", "Sign in with Polimi to see the lessons"), systemImage: "person.badge.key")
             } description: {
-                Text(tr("BeepBar non ha ancora un elenco salvato per questo corso.", "BeepBar has no saved list for this course yet."))
+                Text(tr("BeepBar non ha ancora un elenco di questo corso.", "BeepBar doesn't have this course's list yet."))
             } actions: {
                 if recordings.access == .signingIn {
                     ProgressView().controlSize(.small)

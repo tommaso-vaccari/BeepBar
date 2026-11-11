@@ -1135,13 +1135,19 @@ struct RecordingsListing: Equatable {
     /// Brings the page's courses up to date: `selected` first, then the others, which only feed
     /// their badges. A course loaded in the last few minutes is skipped unless `force` (the
     /// refresh button), so moving around the page doesn't keep asking Polimi.
-    func refresh(_ keys: [RecmanCourseKey], selected: RecmanCourseKey?, force: Bool = false) {
+    ///
+    /// `showing` is false while the page shows only the sign-in screen (no session and an empty
+    /// Watchlist, `RecordingsPresentation.showsBrowser`): `selected` is then still loaded first
+    /// after a sign-in, but its list is not on screen, so it is not the open course and leaving
+    /// the page acknowledges nothing (#238 review).
+    func refresh(_ keys: [RecmanCourseKey], selected: RecmanCourseKey?, force: Bool = false, showing: Bool = true) {
         guard isEnabled, visiblePages > 0 else { return }
         pageKeys = keys
         selectedKey = selected
-        if openCourse != selected {
+        let shown = showing ? selected : nil
+        if openCourse != shown {
             leaveOpenCourse()
-            openCourse = selected
+            openCourse = shown
         }
         // What the page shows is never evicted, so going back to one of its courses is immediate.
         // Compared first: `listings` is published, and an unchanged page must not redraw.

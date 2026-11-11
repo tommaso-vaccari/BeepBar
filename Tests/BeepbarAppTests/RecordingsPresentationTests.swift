@@ -218,11 +218,30 @@ extension RecordingsPresentationTests {
     /// Guards #238: the sidebar hides the new-lectures badge of the course whose list is open
     /// (its dots stay in the list until the student leaves it) and of no other course; with the
     /// Watchlist open every badge shows. Mutation: return `count` always and the open case fails.
-    @Test func sidebarHidesTheBadgeOfTheOpenCourseOnly() {
-        #expect(RecordingsPresentation.sidebarNewCount(3, rowCourseID: 1, openCourseID: 1) == 0)
-        #expect(RecordingsPresentation.sidebarNewCount(3, rowCourseID: 2, openCourseID: 1) == 3)
-        #expect(RecordingsPresentation.sidebarNewCount(3, rowCourseID: 1, openCourseID: nil) == 3)
-        #expect(RecordingsPresentation.sidebarNewCount(0, rowCourseID: 2, openCourseID: 1) == 0)
+    @Test func sidebarHidesTheBadgeOfTheOpenCourseOnly() throws {
+        let open = try #require(RecmanCourseKey(courseCode: "058167", academicYear: 2026))
+        let other = try #require(RecmanCourseKey(courseCode: "052499", academicYear: 2026))
+        let sameCodeOtherYear = try #require(RecmanCourseKey(courseCode: "058167", academicYear: 2025))
+        #expect(RecordingsPresentation.sidebarNewCount(3, rowKey: open, openKey: open) == 0)
+        #expect(RecordingsPresentation.sidebarNewCount(3, rowKey: other, openKey: open) == 3)
+        #expect(RecordingsPresentation.sidebarNewCount(3, rowKey: sameCodeOtherYear, openKey: open) == 3)
+        #expect(RecordingsPresentation.sidebarNewCount(3, rowKey: open, openKey: nil) == 3)
+        #expect(RecordingsPresentation.sidebarNewCount(0, rowKey: other, openKey: open) == 0)
+    }
+
+    /// Guards the #238 review's P0 from the page side: with no Polimi session and an empty
+    /// Watchlist the page is the full sign-in screen, so no course pane (and no open course) is
+    /// on screen; a saved Watchlist keeps the panes. Mutation: return true for `.needsSignIn`
+    /// and the hidden course would be "left", acknowledging recordings nobody saw.
+    @Test func thePanesShowOnlyWithASessionOrASavedWatchlist() {
+        typealias P = RecordingsPresentation
+        #expect(P.showsBrowser(access: .ready, hasBookmarks: false))
+        #expect(P.showsBrowser(access: .ready, hasBookmarks: true))
+        #expect(!P.showsBrowser(access: .needsSignIn(nil), hasBookmarks: false))
+        #expect(!P.showsBrowser(access: .signingIn, hasBookmarks: false))
+        #expect(P.showsBrowser(access: .needsSignIn(.unavailable), hasBookmarks: true))
+        #expect(P.showsBrowser(access: .signingIn, hasBookmarks: true))
+        #expect(!P.showsBrowser(access: .off, hasBookmarks: true))
     }
 
     /// Guards #237: no combination leaves the course pane empty. Without a Polimi session and

@@ -1672,6 +1672,89 @@ struct RecordingsControllerTests {
         #expect(!relaunched.isNew(recording("c")), "leaving the course must be saved, not only shown")
     }
 
+    /// Lists `course` (baseline "a"), then "c" while the course is not open: one new recording
+    /// waiting, and nothing acknowledged yet.
+    private func controllerWithANewRecording() async -> RecordingsController {
+        browser.listResults[course.courseCode] = .success([recording("a")])
+        let controller = await readyController()
+        controller.refresh([course], selected: nil)
+        await settle("baseline") { controller.listing(for: course)?.recordings != nil }
+        browser.listResults[course.courseCode] = .success([recording("c", daysAgo: 0), recording("a")])
+        controller.refresh([course], selected: nil, force: true)
+        await settle("new recording") { controller.newCount(for: course) == 1 }
+        return controller
+    }
+
+    /// Guards the #238 review's P0: with no session and an empty Watchlist the page is the
+    /// full sign-in screen and passes `showing: false`; the remembered course is still asked
+    /// for first, but it is not on screen, so closing the window acknowledges nothing.
+    /// Mutation: ignore `showing` and the close acknowledges "c", which nobody saw.
+    @Test func aCourseHiddenBehindTheSignInScreenIsNotLeft() async {
+        defer { cleanUp() }
+        let controller = await controllerWithANewRecording()
+        controller.refresh([course], selected: course, showing: false)
+        controller.windowClosed()
+        await drainTasks()
+        #expect(world.historyAcknowledgementsStarted == 0)
+        #expect(controller.newCount(for: course) == 1)
+    }
+
+    /// Guards #238: a language switch rebuilds the page (it disappears and appears in the same
+    /// turn), which is not leaving the course: its dots stay. Mutation: call `leaveOpenCourse()`
+    /// in `pageDisappeared` before the deferred visibility check and "c" is acknowledged.
+    @Test func aLanguageSwitchIsNotLeavingTheCourse() async {
+        defer { cleanUp() }
+        let controller = await controllerWithANewRecording()
+        controller.refresh([course], selected: course)
+        controller.pageDisappeared()
+        controller.pageAppeared()
+        controller.refresh([course], selected: course)
+        await drainTasks()
+        #expect(world.historyAcknowledgementsStarted == 0)
+        #expect(controller.isNew(recording("c")))
+    }
+
+    /// Guards #238's isolation rule: an acknowledgement started by leaving a course, still
+    /// waiting for its write when the WeBeep account changes, never clears the next account's
+    /// dots; and a course open across the account change acknowledges nothing when left.
+    /// Mutation: drop the identity check before `history.acknowledge` and the held write lands
+    /// after the change; acknowledge a course open across the change and a second write starts.
+    @Test func leavingAcrossAnAccountChangeTouchesNothingOfTheNextAccount() async {
+        defer { cleanUp() }
+        let controller = await controllerWithANewRecording()
+        controller.refresh([course], selected: course)
+        let gate = FakeRecmanBrowser.Gate()
+        defer { gate.release() }
+        world.historyAcknowledgeGate = gate
+        controller.refresh([course], selected: nil)
+        await settle("leave acknowledgement held") { gate.isWaiting }
+
+        world.owner = 8
+        controller.webBeepAccountChanged(to: 8)
+        #expect(controller.listings.isEmpty)
+        // History I/O is serial: the reset behind the account change waits for the held write,
+        // so it is released here, after the change and before the next account's history exists.
+        gate.release()
+        await drainTasks()
+        controller.signIn()
+        await settle("next account signed in") { controller.access == .ready }
+        browser.listResults[course.courseCode] = .success([recording("a")])
+        controller.refresh([course], selected: course)
+        await settle("next account baseline") { controller.listing(for: course)?.seenIDs == ["a"] }
+        browser.listResults[course.courseCode] = .success([recording("c", daysAgo: 0), recording("a")])
+        controller.refresh([course], selected: course, force: true)
+        await settle("next account's new recording") { controller.newCount(for: course) == 1 }
+
+        await drainTasks()
+        #expect(controller.isNew(recording("c")), "the old account's late acknowledgement reached the next account's history")
+        world.owner = 9
+        controller.webBeepAccountChanged(to: 9)
+        controller.refresh([course], selected: nil)
+        controller.windowClosed()
+        await drainTasks()
+        #expect(world.historyAcknowledgementsStarted == 1, "only the held acknowledgement of the first account ever started")
+    }
+
     /// Guards #238's cost rule: opening a course with nothing new and leaving it starts no
     /// acknowledgement, and a refresh of the same course (a bookmark added, the course list
     /// republished) is not leaving it. Mutation: drop `newCount > 0` together with

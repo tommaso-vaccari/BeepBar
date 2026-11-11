@@ -67,10 +67,17 @@ struct KeypointLeveler: Sendable {
         var samples: [Float]
         var visible: Range<Int>
         var end: Int?
-        init(_ samples: [Float], visible: Range<Int>? = nil, end: Int? = nil) {
+        /// A piece with no history (the lecture's start, or after a seek): a keypoint whose
+        /// window reaches before `visible` is measured on the visible part of it alone, and the
+        /// keypoint at the piece's first sample on the `window` seconds *after* it (the whole
+        /// piece exists before it is encoded), so the gain is right from the first sample
+        /// instead of neutral. Without it such keypoints are `unknown` (neutral gain).
+        var bootstrap: Bool
+        init(_ samples: [Float], visible: Range<Int>? = nil, end: Int? = nil, bootstrap: Bool = false) {
             self.samples = samples
             self.visible = visible ?? 0..<samples.count
             self.end = end
+            self.bootstrap = bootstrap
         }
     }
 
@@ -100,17 +107,29 @@ struct KeypointLeveler: Sendable {
             let frames = Int(leveler.window * Double(KeypointLeveler.rate)) / KeypointLeveler.frameLength
             var levels: [Double] = []
             var existing = 0
+            // Bootstrap: the keypoint at the piece's first sample looks forward, as if the
+            // window ended `window` seconds later.
+            let forward = audio.bootstrap && t == audio.visible.lowerBound
+            let anchor = forward ? t + frames * KeypointLeveler.frameLength : t
             for i in 0..<frames {
-                let hi = t - i * KeypointLeveler.frameLength, lo = hi - KeypointLeveler.frameLength
+                let hi = anchor - i * KeypointLeveler.frameLength, lo = hi - KeypointLeveler.frameLength
                 if lo < 0 { break }
-                existing += 1
-                guard lo >= audio.visible.lowerBound, hi <= audio.visible.upperBound else { return .unknown }
+                if audio.bootstrap {
+                    // Frames the piece does not have are left out; too few and it is unknown.
+                    guard lo >= audio.visible.lowerBound else { break }
+                    if hi > audio.visible.upperBound { continue }
+                    existing += 1
+                } else {
+                    existing += 1
+                    guard lo >= audio.visible.lowerBound, hi <= audio.visible.upperBound else { return .unknown }
+                }
                 var energy = 0.0
                 audio.samples.withUnsafeBufferPointer { p in
                     for j in lo..<hi { energy += Double(p[j]) * Double(p[j]) }
                 }
                 levels.append(max(-120, 10 * log10(energy / Double(KeypointLeveler.frameLength) + 1e-20)))
             }
+            if audio.bootstrap && existing < 8 { return .unknown }
             let voiced = levels.filter { $0 > leveler.silenceFloor }
             guard existing > 0, Double(voiced.count) / Double(existing) >= leveler.minVoiced else { return .hold }
             let level = AudioTestSignals.percentile(voiced, leveler.percentile)

@@ -1736,9 +1736,11 @@ struct RecordingsControllerTests {
         // so it is released here, after the change and before the next account's history exists.
         gate.release()
         await drainTasks()
+        // Before the sign-in, which reloads the page's courses by itself: the next account's
+        // baseline must be "a" alone, whichever listing runs first.
+        browser.listResults[course.courseCode] = .success([recording("a")])
         controller.signIn()
         await settle("next account signed in") { controller.access == .ready }
-        browser.listResults[course.courseCode] = .success([recording("a")])
         controller.refresh([course], selected: course)
         await settle("next account baseline") { controller.listing(for: course)?.seenIDs == ["a"] }
         browser.listResults[course.courseCode] = .success([recording("c", daysAgo: 0), recording("a")])

@@ -343,3 +343,16 @@ What the output means (all in dB; lower is better unless noted):
 
 Run it on the commit that changes a chain and on `dev`, interleaved, on the same machine; report the summary lines and the join lines. It measures chains on synthetic speech only: the ear (`abRenders`) and a real excerpt decide what it cannot.
 
+### Enhanced audio: keypoint leveler (round 2)
+
+`KeypointLevelerMeasurements` (on demand, same `BEEPBAR_MEASURE_AUDIO_QUALITY=1` gate; plain `swift test` skips it) prototypes candidate G as pure functions (`KeypointLeveler`, test target only) and renders it on **local** recordings. Real lectures are private: they are read from a temporary location, never copied into the repository, and only an index is printed.
+
+Variables: `BEEPBAR_AUDIO_LEVELER_EXCERPTS` (comma-separated files, first 180 s used), `BEEPBAR_AUDIO_LEVELER_CACHE` (folder keeping the slow isolation between runs, outside the repository), `BEEPBAR_AUDIO_LEVELER_LABELS`, `BEEPBAR_AUDIO_LEVELER_BEST` (variant written as `new`), `BEEPBAR_AUDIO_AB_OUT` (listening files), `BEEPBAR_AUDIO_LEVELER_LECTURE` (a whole lecture), `BEEPBAR_AUDIO_LEVELER_INVARIANCE` (`<excerpt>:<dB>,...`).
+
+Select a test with `swift test --skip-build --filter "KeypointLevelerMeasurements/<name>"`:
+- `tune`: compressor settings after the leveler, aiming at -18..-16 LUFS.
+- `renders`: per excerpt, G and its variants (no ceiling, spacing 5, percentile 95, target -23, hold 3, leveling after the EQ, ceiling headroom 10 and 14 dB, gentle expanders) against `current` and `isolation-only`: `LEV` (LUFS/LRA, speech level in/out, limiter worst, peak, ending metric), `HISS` (non-speech residue after the chain, absolute and relative to speech), `CEIL` (share of instants where the ceiling acts) and `JUMP` (limiter reduction after the largest level rise). Writes `original`, `current`, `new` and `original-loud` listening files.
+- `levelInvariance`: isolation of a signal vs isolation of the same signal scaled by a pre-gain and scaled back (`INV`, plus the ending metric of each against the other).
+- `transients`: a synthetic scene with door, knock, scrape, clicks and cough bursts in pauses and under speech (`TRANS`): what survives isolation, the keypoint gain with and without bursts, the hold rule on a bursts-only window, clipping.
+- `seams`: whether a piece rendered alone gets the whole lecture's gain curve, per lead and tail (`SEAM`), and how the hold rule chains across long silences for several `maxHold` bounds (`HOLD`).
+- `wholeLecture`: G alone over a whole lecture: gain curve summary and processing time (needs about 1.2 GB of memory for a 95 minute lecture).

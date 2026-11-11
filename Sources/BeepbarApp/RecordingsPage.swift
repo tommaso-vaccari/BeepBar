@@ -82,6 +82,41 @@ enum RecordingsPresentation {
         onSelectedRow ? (.accentColor, .white) : (.white, .accentColor)
     }
 
+    /// The new-lectures badge a sidebar row shows (#238): none on the course whose list is open,
+    /// whose new lectures keep their dots in the list and become read when the student leaves it
+    /// (`RecordingsController.leaveOpenCourse`). The Watchlist being open counts as no course.
+    nonisolated static func sidebarNewCount(_ count: Int, rowCourseID: Int64, openCourseID: Int64?) -> Int {
+        rowCourseID == openCourseID ? 0 : count
+    }
+
+    /// What the course pane shows below its header and toolbar (#237). Every case draws
+    /// something that fills the pane: an empty pane let the header float to mid-height.
+    enum CourseContent: Equatable {
+        /// The listing: its rows, "no recordings yet" or no search match.
+        case list
+        /// Asked, or about to be asked (the page enqueues on its next turn, or the saved
+        /// session is still being read).
+        case loading
+        /// No Polimi session and no list kept in memory: nothing can be loaded until sign-in.
+        case signIn
+        /// The sign-in is running.
+        case signingIn
+        /// Signed in, but the last request failed with nothing to show; its banner says why.
+        case unavailable
+    }
+
+    /// Chooses `CourseContent`. A list in memory always wins, signed in or not: its saved rows
+    /// are useful content even when they can't be refreshed.
+    nonisolated static func courseContent(hasList: Bool, isLoading: Bool, hasProblem: Bool, access: RecordingsAccess) -> CourseContent {
+        if hasList { return .list }
+        if isLoading { return .loading }
+        switch access {
+        case .off, .needsSignIn: return .signIn
+        case .signingIn: return .signingIn
+        case .ready: return hasProblem ? .unavailable : .loading
+        }
+    }
+
     /// VoiceOver's label of the sidebar badge counting new lectures: "1 nuova" / "3 nuove" (#195).
     static func newCountLabel(_ count: Int) -> BilingualText {
         BilingualText(italianCount(count, "nuova", "nuove"), "\(count) new")
@@ -479,7 +514,8 @@ struct RecordingsPage: View {
                 ForEach(model.searchable) { entry in
                     let summary = authentication.watchSummaries[entry.key]
                     CourseRow(name: entry.sidebarName, key: entry.key, subtitle: RecordingsPresentation.courseSubtitle(for: recordings.listing(for: entry.key), summary: summary),
-                              newCount: recordings.newCount(for: entry.key))
+                              newCount: RecordingsPresentation.sidebarNewCount(recordings.newCount(for: entry.key), rowCourseID: entry.course.id,
+                                                                               openCourseID: destination == .watchlist ? nil : selectedCourseID))
                         .equatable()
                         .tag(RecordingsDestination.course(entry.course.id))
                 }
@@ -674,12 +710,6 @@ private struct CourseRecordings: View {
                     .fixedSize()
                     .disabled(!action.enabled)
             }
-            if recordings.newCount(for: key) > 0 {
-                Button(tr("Segna novità come lette", "Mark new recordings as read")) { recordings.markSeen(key) }
-                    .buttonStyle(.borderless)
-                    .font(.callout)
-                    .fixedSize()
-            }
             Button(action: refresh) {
                 ZStack {
                     ProgressView().controlSize(.small).opacity(listing?.isLoading == true ? 1 : 0)
@@ -688,7 +718,9 @@ private struct CourseRecordings: View {
                 .frame(width: 24, height: 24)
             }
             .buttonStyle(.borderless)
-            .disabled(listing?.isLoading == true)
+            // Without a Polimi session a refresh can't load anything (#237); the sign-in is offered
+            // in the pane and in the banner above, as on the Watchlist.
+            .disabled(listing?.isLoading == true || recordings.access != .ready)
             .help(tr("Aggiorna le registrazioni", "Refresh the recordings"))
             .accessibilityLabel(tr("Aggiorna registrazioni", "Refresh recordings"))
         }
@@ -732,7 +764,10 @@ private struct CourseRecordings: View {
     }
 
     @ViewBuilder private var content: some View {
-        if let list = listing?.recordings {
+        switch RecordingsPresentation.courseContent(hasList: listing?.recordings != nil, isLoading: listing?.isLoading == true,
+                                                    hasProblem: listing?.problem != nil, access: recordings.access) {
+        case .list:
+            let list = listing?.recordings ?? []
             let model = derivedList(list)
             if list.isEmpty {
                 ContentUnavailableView {
@@ -745,12 +780,31 @@ private struct CourseRecordings: View {
             } else {
                 recordingList(model, numbers: summary(list).numbers)
             }
-        } else if listing?.isLoading == true {
+        case .loading:
             VStack(spacing: 10) {
                 ProgressView()
                 Text(tr("Cerco le registrazioni nell'archivio del Politecnico…", "Looking for recordings in Polimi's archive…"))
                     .font(.callout)
                     .foregroundStyle(.secondary)
+            }
+        case .signIn, .signingIn:
+            ContentUnavailableView {
+                Label(tr("Accedi con Polimi per vedere le lezioni", "Sign in with Polimi to see the lessons"), systemImage: "person.badge.key")
+            } description: {
+                Text(tr("BeepBar non ha ancora un elenco salvato per questo corso.", "BeepBar has no saved list for this course yet."))
+            } actions: {
+                if recordings.access == .signingIn {
+                    ProgressView().controlSize(.small)
+                } else {
+                    Button(tr("Accedi con Polimi", "Sign in with Polimi")) { recordings.signIn() }
+                        .buttonStyle(.borderedProminent)
+                }
+            }
+        case .unavailable:
+            ContentUnavailableView {
+                Label(tr("Elenco non disponibile", "List unavailable"), systemImage: "wifi.exclamationmark")
+            } description: {
+                Text(tr("Riprova con il pulsante di aggiornamento.", "Try again with the refresh button."))
             }
         }
     }

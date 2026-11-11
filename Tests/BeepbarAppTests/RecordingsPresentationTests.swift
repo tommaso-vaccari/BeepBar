@@ -214,4 +214,33 @@ extension RecordingsPresentationTests {
         let empty = try #require(searchField(in: host))
         #expect(abs(empty.convert(empty.bounds, to: host).minY - initial) < 1)
     }
+
+    /// Guards #238: the sidebar hides the new-lectures badge of the course whose list is open
+    /// (its dots stay in the list until the student leaves it) and of no other course; with the
+    /// Watchlist open every badge shows. Mutation: return `count` always and the open case fails.
+    @Test func sidebarHidesTheBadgeOfTheOpenCourseOnly() {
+        #expect(RecordingsPresentation.sidebarNewCount(3, rowCourseID: 1, openCourseID: 1) == 0)
+        #expect(RecordingsPresentation.sidebarNewCount(3, rowCourseID: 2, openCourseID: 1) == 3)
+        #expect(RecordingsPresentation.sidebarNewCount(3, rowCourseID: 1, openCourseID: nil) == 3)
+        #expect(RecordingsPresentation.sidebarNewCount(0, rowCourseID: 2, openCourseID: 1) == 0)
+    }
+
+    /// Guards #237: no combination leaves the course pane empty. Without a Polimi session and
+    /// without a list in memory it invites the sign-in (the case that drew nothing and let the
+    /// header float); a list in memory is shown in every access state; signed in, a failure with
+    /// nothing to show says so and a request about to start shows the spinner. Mutation: map
+    /// `.needsSignIn` to `.loading`, or check access before the list, and these fail.
+    @Test func courseContentNeverLeavesThePaneEmpty() {
+        typealias P = RecordingsPresentation
+        for access in [RecordingsAccess.off, .ready, .signingIn, .needsSignIn(nil), .needsSignIn(.unavailable)] {
+            #expect(P.courseContent(hasList: true, isLoading: false, hasProblem: true, access: access) == .list)
+            #expect(P.courseContent(hasList: false, isLoading: true, hasProblem: false, access: access) == .loading)
+        }
+        #expect(P.courseContent(hasList: false, isLoading: false, hasProblem: false, access: .needsSignIn(nil)) == .signIn)
+        #expect(P.courseContent(hasList: false, isLoading: false, hasProblem: true, access: .needsSignIn(.unavailable)) == .signIn)
+        #expect(P.courseContent(hasList: false, isLoading: false, hasProblem: false, access: .off) == .signIn)
+        #expect(P.courseContent(hasList: false, isLoading: false, hasProblem: false, access: .signingIn) == .signingIn)
+        #expect(P.courseContent(hasList: false, isLoading: false, hasProblem: true, access: .ready) == .unavailable)
+        #expect(P.courseContent(hasList: false, isLoading: false, hasProblem: false, access: .ready) == .loading)
+    }
 }

@@ -73,6 +73,21 @@ enum AudioTestSignals {
         }
     }
 
+    /// `samples` as a mono 48 kHz 16-bit WAV, clamped to full scale: for listening copies, a
+    /// quarter of the size of `writeWAV`'s float.
+    static func writeWAV16(_ samples: [Float], to url: URL) throws {
+        let format = try #require(AVAudioFormat(standardFormatWithSampleRate: 48000, channels: 1))
+        let buffer = try #require(AVAudioPCMBuffer(pcmFormat: format, frameCapacity: AVAudioFrameCount(samples.count)))
+        buffer.frameLength = AVAudioFrameCount(samples.count)
+        for (i, s) in samples.enumerated() { buffer.floatChannelData![0][i] = max(-1, min(1, s)) }
+        let settings: [String: Any] = [AVFormatIDKey: kAudioFormatLinearPCM, AVSampleRateKey: 48000, AVNumberOfChannelsKey: 1,
+                                       AVLinearPCMBitDepthKey: 16, AVLinearPCMIsFloatKey: false, AVLinearPCMIsBigEndianKey: false]
+        do {
+            let file = try AVAudioFile(forWriting: url, settings: settings, commonFormat: .pcmFormatFloat32, interleaved: false)
+            try file.write(from: buffer)
+        }
+    }
+
     static func level(_ x: ArraySlice<Float>) -> Double {
         let energy = x.reduce(0.0) { $0 + Double($1) * Double($1) } / Double(max(x.count, 1))
         return 10 * log10(energy + 1e-20)
@@ -102,7 +117,9 @@ extension AudioTestSignals {
     /// 48 kHz, the rate every synthetic signal here is made at.
     static let sampleRate = 48000
 
-    /// RMS level, in dB re full scale, of the samples inside `ranges` taken together.
+    /// RMS level, in dB re full scale, of the samples inside `ranges` taken together, floored at
+    /// −120 dBFS: digital silence (an isolated pause holding only steady noise) is a finite number,
+    /// not −200, so a "speech − pause" gap stays comparable between chains.
     static func level(_ x: [Float], over ranges: [Range<Int>]) -> Double {
         var energy = 0.0
         var count = 0
@@ -112,7 +129,7 @@ extension AudioTestSignals {
             for i in r { energy += Double(x[i]) * Double(x[i]) }
             count += r.count
         }
-        return 10 * log10(energy / Double(max(count, 1)) + 1e-20)
+        return max(-120, 10 * log10(energy / Double(max(count, 1)) + 1e-20))
     }
 
     /// The level of each consecutive `frame`-sample block of `x[range]` that fits whole.

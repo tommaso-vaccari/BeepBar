@@ -1339,7 +1339,14 @@ struct RecordingsListing: Equatable {
     /// student can still see which lectures are new; the sidebar hides its badge meanwhile
     /// (`RecordingsPresentation.sidebarNewCount`).
     /// - Only the list that was on screen, with its #106 seen snapshot: no snapshot (never
-    ///   listed, history unreadable, reset by an identity change) means nothing to acknowledge.
+    ///   listed, history unreadable, reset by an identity change or by forgetting the history)
+    ///   means `newCount` 0 and nothing to acknowledge. Today every reset of the seen state also
+    ///   empties `listings`, so a list without a snapshot can't be left; the guard keeps a future
+    ///   reset that kept the lists from acknowledging all of them (a silent baseline).
+    ///   `openCourse` itself survives a reset on
+    ///   purpose: the page stays on the course, and the next account's list shown there is read
+    ///   when left, as any other.
+    /// - The page switching to the full sign-in screen (`showing: false`) is leaving too.
     /// - Nothing new writes nothing (`newCount` 0 schedules nothing).
     /// - A late commit after logout or an account change is refused by `scheduleAcknowledge`.
     /// Quitting doesn't come through here: the quit path never waits for writes (AGENTS.md),
@@ -1438,8 +1445,6 @@ struct RecordingsListing: Equatable {
     /// in `commitProgress`), and the persisted menu summary.
     private func forgetSeen() {
         for key in listings.keys { listings[key]?.seenIDs = nil }
-        // The open course belonged to the forgotten history: leaving it later acknowledges nothing.
-        openCourse = nil
         // Before the reset below, which publishes the lessons' (now empty) progress.
         Self.forgetManualProgress(in: defaults)
         let forgotten = manualLessons.forgettingProgress()

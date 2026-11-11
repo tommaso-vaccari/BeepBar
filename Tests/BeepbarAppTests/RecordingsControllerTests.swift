@@ -1718,7 +1718,8 @@ struct RecordingsControllerTests {
     /// waiting for its write when the WeBeep account changes, never clears the next account's
     /// dots; and a course open across the account change acknowledges nothing when left.
     /// Mutation: drop the identity check before `history.acknowledge` and the held write lands
-    /// after the change; acknowledge a course open across the change and a second write starts.
+    /// after the change. The last part (a course open across a change, then left) holds because
+    /// the change removes the listings, so there is nothing new to acknowledge.
     @Test func leavingAcrossAnAccountChangeTouchesNothingOfTheNextAccount() async {
         defer { cleanUp() }
         let controller = await controllerWithANewRecording()
@@ -1755,6 +1756,18 @@ struct RecordingsControllerTests {
         controller.windowClosed()
         await drainTasks()
         #expect(world.historyAcknowledgementsStarted == 1, "only the held acknowledgement of the first account ever started")
+    }
+
+    /// Guards #238: when the session lapses with an empty Watchlist the page switches to the full
+    /// sign-in screen (`showing: false`), so the course is no longer on screen and its shown
+    /// list becomes read, as when leaving it any other way. Mutation: keep `openCourse` while
+    /// `showing` is false and nothing is acknowledged.
+    @Test func switchingToTheSignInScreenLeavesTheCourse() async {
+        defer { cleanUp() }
+        let controller = await controllerWithANewRecording()
+        controller.refresh([course], selected: course)
+        controller.refresh([course], selected: course, showing: false)
+        await settle("acknowledged when the sign-in screen replaced the course") { controller.newCount(for: course) == 0 }
     }
 
     /// Guards #238's cost rule: opening a course with nothing new and leaving it starts no

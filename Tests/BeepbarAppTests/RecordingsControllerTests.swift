@@ -1693,7 +1693,8 @@ struct RecordingsControllerTests {
     /// Guards #238: closing the window ends the open course. Recordings that arrive afterwards,
     /// while the page shows the Watchlist, were never on screen and stay new; only opening their
     /// course and leaving it reads them. Mutation: keep `openCourse` when the window closes and
-    /// the next refresh "leaves" the course, acknowledging a recording nobody saw.
+    /// the next refresh "leaves" the course, acknowledging a recording nobody saw; acknowledge
+    /// on opening and the dot is gone while the course is open.
     @Test func recordingsArrivingAfterLeavingStayNewUntilShown() async {
         defer { cleanUp() }
         browser.listResults[course.courseCode] = .success([recording("a")])
@@ -1711,7 +1712,12 @@ struct RecordingsControllerTests {
         #expect(controller.newCount(for: course) == 1)
         #expect(world.historyAcknowledgementsStarted == 0)
 
+        // Opening the course keeps the dot (the sidebar hides its badge instead): acknowledging
+        // on opening would leave the student no way to see which lectures are new.
         controller.refresh([course], selected: course)
+        await drainTasks()
+        #expect(controller.isNew(recording("c")))
+        #expect(world.historyAcknowledgementsStarted == 0)
         controller.refresh([course], selected: nil)
         await settle("read after being shown") { controller.newCount(for: course) == 0 }
     }

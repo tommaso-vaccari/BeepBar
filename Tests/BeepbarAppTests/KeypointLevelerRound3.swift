@@ -31,11 +31,19 @@ extension KeypointLevelerMeasurements {
         case "H2": return expander("0.25")
         case "H2-r04": return expander("0.4")
         case "H3": return spectral(12) + "," + expander("0.4")
+        // Round 3b: the specified variants hardly moved the residue, so these probe why. `F`: the
+        // spectral cleanup with a fixed floor (no tracking) and a deeper reduction; `L`: the
+        // expander with its threshold just above the measured residue (nf + 8 dB) and a deeper range.
+        case "F-nr20": return String(format: "afftdn=nr=20:nf=%.0f:tn=0", nf)
+        case "F-nr35": return String(format: "afftdn=nr=35:nf=%.0f:tn=0", nf)
+        case "L-r01": return String(format: "agate=threshold=%.5f:ratio=4:range=0.1:attack=5:release=250:knee=4:detection=rms", pow(10, (nf + 8) / 20))
+        case "L-r003": return String(format: "agate=threshold=%.5f:ratio=6:range=0.03:attack=5:release=250:knee=4:detection=rms", pow(10, (nf + 8) / 20))
+        case "FL": return String(format: "afftdn=nr=20:nf=%.0f:tn=0,", nf) + String(format: "agate=threshold=%.5f:ratio=4:range=0.1:attack=5:release=250:knee=4:detection=rms", pow(10, (nf + 8) / 20))
         default: return nil
         }
     }
 
-    static let cleanupNames = ["none", "H1-nr8", "H1-nr12", "H1-nr18", "H2", "H2-r04", "H3"]
+    static let cleanupNames = ["none", "H1-nr8", "H1-nr12", "H1-nr18", "H2", "H2-r04", "H3", "F-nr20", "F-nr35", "L-r01", "L-r003", "FL"]
 
     /// Compressors after the leveler for `limiterLoad`: the round-2 one and the faster ones.
     static let compressors3: [(String, Compressor)] = [
@@ -278,6 +286,34 @@ extension KeypointLevelerMeasurements {
             }
         }
         print("SEAM3 all | \(steps.count) seams | step max \(f(steps.max() ?? 0, 2)) p95 \(f(AudioTestSignals.percentile(steps, 0.95), 2)) median \(f(AudioTestSignals.percentile(steps, 0.5), 2)) dB | first 2 s deviation: plain max \(f(plainDeviations.max() ?? 0, 2)) p95 \(f(AudioTestSignals.percentile(plainDeviations, 0.95), 2)), eased max \(f(rampDeviations.max() ?? 0, 2)) p95 \(f(AudioTestSignals.percentile(rampDeviations, 0.95), 2)) | steepest eased slope max \(f(slopes.max() ?? 0, 2)) dB/s")
+    }
+
+    /// Forward play after a seek: piece N is bootstrapped (no history), piece N+1 follows with 12 s
+    /// of history taken from N's isolated audio. The step at the seam |last gain of N − first gain of
+    /// N+1| must be about 0 because N's last keypoint (at the seam, from its own last 12 s) is the
+    /// one N+1 starts from. Over every excerpt at the seams 30, 90 and 150 s (18 positions); also
+    /// the first 2 s of N+1 against the whole-file curve (exact history, so 0).
+    @Test func forwardSeams() async throws {
+        let files = Self.excerptFiles
+        guard !files.isEmpty else { return }
+        let path = try Path()
+        defer { path.remove() }
+        var steps: [Double] = []
+        for (i, file) in files.enumerated() {
+            let n = i + 1
+            let samples = try await Self.material(n, file, path: path).isolated
+            let whole = KeypointLeveler().curve(over: .init(samples, end: samples.count))
+            for seam in [30, 90, 150] {
+                let s = seam * rate
+                let previous = Self.pieceCurve(KeypointLeveler(), samples: samples, start: s - 30 * rate, history: 0)
+                let next = Self.pieceCurve(KeypointLeveler(), samples: samples, start: s, history: 12)
+                let step = abs(next.gainDB(at: s) - previous.gainDB(at: s - 1))
+                steps.append(step)
+                let drift = Self.gainErrors(next, whole, over: s..<(s + 2 * rate)).max
+                print("FWD \(n) | seam at \(seam) s | step \(f(step, 3)) dB | N+1 first 2 s vs whole-file \(f(drift, 3)) dB")
+            }
+        }
+        print("FWD all | \(steps.count) positions | step max \(f(steps.max() ?? 0, 3)) p95 \(f(AudioTestSignals.percentile(steps, 0.95), 3)) dB")
     }
 
     // MARK: D: ffmpeg-only fallback

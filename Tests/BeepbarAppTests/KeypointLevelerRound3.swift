@@ -54,7 +54,19 @@ extension KeypointLevelerMeasurements {
         ("K12", Compressor(threshold: 0.05, ratio: 5, makeup: 4.5, attack: 1, release: 150, knee: 6)),
         ("K13", Compressor(threshold: 0.08, ratio: 3, makeup: 3.8, attack: 25)),
         ("K14", Compressor(threshold: 0.08, ratio: 3, makeup: 3.0, attack: 25)),
+        // Ratio 2 rows aimed at lifting low-level material less: their makeup is a placeholder,
+        // `limiterLoad` calibrates it per excerpt so the integrated level matches K7's (±0.5 LU).
+        ("R2-a10", Compressor(threshold: 0.08, ratio: 2, makeup: 3.8, attack: 10)),
+        ("R2-a25", Compressor(threshold: 0.08, ratio: 2, makeup: 3.8, attack: 25)),
     ]
+
+    /// The share of 50 ms frames of `x` between −50 and −30 dBFS, in percent: how much low-level
+    /// material the chain left in (or lifted into) that band.
+    static func lowBandShare(_ x: [Float]) -> Double {
+        let levels = AudioTestSignals.frameLevels(x, frame: rate / 20, in: 0..<x.count)
+        guard !levels.isEmpty else { return 0 }
+        return 100 * Double(levels.filter { $0 >= -50 && $0 < -30 }.count) / Double(levels.count)
+    }
 
     // MARK: Residue metric
 
@@ -195,11 +207,21 @@ extension KeypointLevelerMeasurements {
             let isolated = try await Self.material(n, file, path: path).isolated
             let leveled = Self.leveled(isolated)
             let nf = Self.noiseFloor(isolated: isolated, leveled: leveled)
+            let reference = try Measurements.loudness(try Self.finish(leveled, cleanup: nil, compressor: Self.chosen, path: path).output, in: path).lufs
             let rows = try Self.parallel(Self.compressors3.count) { k -> String in
-                let r = try Self.finish(leveled, cleanup: Self.cleanupChain(cleanup, nf: nf), compressor: Self.compressors3[k].1, path: path)
+                var compressor = Self.compressors3[k].1
+                if Self.compressors3[k].0.hasPrefix("R2") {
+                    // Secant steps on the makeup (linear gain) until within 0.2 LU of K7's level.
+                    for _ in 0..<4 {
+                        let lufs = try Measurements.loudness(try Self.finish(leveled, cleanup: nil, compressor: compressor, path: path).output, in: path).lufs
+                        if abs(lufs - reference) < 0.2 { break }
+                        compressor.makeup *= pow(10, (reference - lufs) / 20)
+                    }
+                }
+                let r = try Self.finish(leveled, cleanup: Self.cleanupChain(cleanup, nf: nf), compressor: compressor, path: path)
                 let loud = try Measurements.loudness(r.output, in: path)
                 let l = Self.limiterReduction(r)
-                return "LOAD \(n) | \(cleanup) + \(Self.compressors3[k].0) | limiter p50 \(f(l.p50)) p99 \(f(l.p99)) max \(f(l.max)) dB | \(f(loud.lufs)) LUFS / \(f(loud.lra)) LU"
+                return "LOAD \(n) | \(cleanup) + \(Self.compressors3[k].0) (makeup \(f(compressor.makeup, 2))) | limiter p50 \(f(l.p50)) p99 \(f(l.p99)) max \(f(l.max)) dB | \(f(loud.lufs)) LUFS / \(f(loud.lra)) LU | frames -50..-30 dBFS \(f(Self.lowBandShare(r.output)))%"
             }
             rows.forEach { print($0) }
         }

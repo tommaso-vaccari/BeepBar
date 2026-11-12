@@ -58,6 +58,10 @@ extension KeypointLevelerMeasurements {
         // `limiterLoad` calibrates it per excerpt so the integrated level matches K7's (±0.5 LU).
         ("R2-a10", Compressor(threshold: 0.08, ratio: 2, makeup: 3.8, attack: 10)),
         ("R2-a25", Compressor(threshold: 0.08, ratio: 2, makeup: 3.8, attack: 25)),
+        // K11 and K9 with the makeup raised to reach K7's loudness (fixed makeup: the "R2" calibration does not apply).
+        ("K15", Compressor(threshold: 0.08, ratio: 3, makeup: 4.26, attack: 1, release: 100, knee: 6)),   // K11 +1.0 dB
+        ("K16", Compressor(threshold: 0.08, ratio: 3, makeup: 4.26, attack: 2)),                           // K9 +1.0 dB
+        ("K17", Compressor(threshold: 0.08, ratio: 3, makeup: 4.52, attack: 1, release: 100, knee: 6)),   // K11 +1.5 dB
     ]
 
     /// The share of 50 ms frames of `x` between −50 and −30 dBFS, in percent: how much low-level
@@ -353,6 +357,9 @@ extension KeypointLevelerMeasurements {
         defer { path.remove() }
         let front = "highpass=f=90,lowpass=f=10000,afftdn=nr=15:nf=-50:tn=1,equalizer=f=250:t=q:w=1:g=-2,equalizer=f=3000:t=q:w=1.4:g=3"
         let dynamic = "dynaudnorm=f=250:g=51:p=0.5:m=10:b=1,acompressor=threshold=0.125:ratio=3:attack=10:release=200:knee=4:makeup=1.5"
+        // Family D3: the same dynamic stage with a louder compressor (K11 + 1 dB makeup) and a higher gain cap `m`.
+        let dynamicM40 = "dynaudnorm=f=250:g=51:p=0.9:m=40:b=1,acompressor=threshold=0.08:ratio=3:attack=1:release=100:knee=6:makeup=4.26"
+        let dynamicM100 = "dynaudnorm=f=250:g=51:p=0.9:m=100:b=1,acompressor=threshold=0.08:ratio=3:attack=1:release=100:knee=6:makeup=4.26"
         for (i, file) in files.enumerated() {
             let n = i + 1
             let material = try await Self.material(n, file, path: path)
@@ -360,7 +367,7 @@ extension KeypointLevelerMeasurements {
             if !FileManager.default.fileExists(atPath: raw.path) { try AudioTestSignals.writeRaw16(material.isolated, to: raw) }
             let d1 = try #require(Measurements.all.first { $0.name == "D1-t0" })
             let d2 = try #require(Measurements.all.first { $0.name == "D1-m10" })
-            let names = ["current", "D1-t0", "D1-m10", "G (round 2)", "no isolation: filterChain", "no isolation: front + D"]
+            let names = ["current", "D1-t0", "D1-m10", "G (round 2)", "no isolation: filterChain", "no isolation: front + D", "D3-m40", "D3-m100", "no isolation: front + D3-m40", "no isolation: front + D3-m100"]
             let renderings = try Self.parallel(names.count) { k -> Rendering in
                 switch k {
                 case 0: return try Self.render(chain: AudioEnhancement.isolatedChain, pregain: nil, raw: raw, path: path)
@@ -370,8 +377,11 @@ extension KeypointLevelerMeasurements {
                 case 4:
                     let out = try Self.run(material.input, chain: AudioEnhancement.filterChain, in: path)
                     return Rendering(output: out, unlimited: out)
+                case 6, 7:
+                    let chain = [Measurements.prefix, k == 6 ? dynamicM40 : dynamicM100, Measurements.limiter].joined(separator: ",")
+                    return try Self.render(chain: chain, pregain: nil, raw: raw, path: path)
                 default:
-                    let chain = front + "," + dynamic
+                    let chain = front + "," + (k == 5 ? dynamic : k == 8 ? dynamicM40 : dynamicM100)
                     return Rendering(output: try Self.run(material.input, chain: chain + "," + Measurements.limiter, in: path), unlimited: try Self.run(material.input, chain: chain, in: path))
                 }
             }

@@ -1633,6 +1633,193 @@ struct RecordingsControllerTests {
         #expect(!acknowledgedRelaunch.isNew(recording("c")))
     }
 
+    /// The ways of leaving the course on screen (#238).
+    enum Leave: CaseIterable, Sendable { case watchlist, otherCourse, pageClosed, windowClosed }
+
+    /// Guards #238: a recording that arrives while its course is open keeps its dot for as long
+    /// as the course stays open (no acknowledgement is even started), and every way of leaving the
+    /// course makes it read durably, so a relaunch doesn't show it as new again. Mutation: drop
+    /// `leaveOpenCourse()` from `refresh`, `pageDisappeared` or `windowClosed` and the matching
+    /// case never settles; acknowledge on opening instead and the dot check fails.
+    @Test(arguments: Leave.allCases) func leavingTheOpenCourseMarksItsNewRecordingsRead(_ leave: Leave) async {
+        defer { cleanUp() }
+        browser.listResults[course.courseCode] = .success([recording("a")])
+        browser.listResults[other.courseCode] = .success([recording("o", other)])
+        let controller = await readyController()
+        controller.refresh([course, other], selected: course)
+        await settle("both listed") { controller.listing(for: course)?.recordings != nil && controller.listing(for: other)?.recordings != nil }
+
+        browser.listResults[course.courseCode] = .success([recording("c", daysAgo: 0), recording("a")])
+        controller.refresh([course, other], selected: course, force: true)
+        await settle("new recording while the course is open") { controller.newCount(for: course) == 1 }
+        await drainTasks()
+        #expect(controller.isNew(recording("c")), "the dot must stay while the course is open")
+        #expect(world.historyAcknowledgementsStarted == 0, "nothing is read before the student leaves the course")
+
+        switch leave {
+        case .watchlist: controller.refresh([course, other], selected: nil)
+        case .otherCourse: controller.refresh([course, other], selected: other)
+        case .pageClosed: controller.pageDisappeared()
+        case .windowClosed: controller.windowClosed()
+        }
+        await settle("acknowledged on leaving") { controller.newCount(for: course) == 0 }
+        #expect(!controller.isNew(recording("c")))
+
+        let relaunched = makeController()
+        relaunched.pageAppeared()
+        relaunched.refresh([course], selected: nil)
+        await settle("relaunch history loaded") { relaunched.listing(for: course)?.recordings != nil }
+        #expect(!relaunched.isNew(recording("c")), "leaving the course must be saved, not only shown")
+    }
+
+    /// Lists `course` (baseline "a"), then "c" while the course is not open: one new recording
+    /// waiting, and nothing acknowledged yet.
+    private func controllerWithANewRecording() async -> RecordingsController {
+        browser.listResults[course.courseCode] = .success([recording("a")])
+        let controller = await readyController()
+        controller.refresh([course], selected: nil)
+        await settle("baseline") { controller.listing(for: course)?.recordings != nil }
+        browser.listResults[course.courseCode] = .success([recording("c", daysAgo: 0), recording("a")])
+        controller.refresh([course], selected: nil, force: true)
+        await settle("new recording") { controller.newCount(for: course) == 1 }
+        return controller
+    }
+
+    /// Guards the #238 review's P0: with no session and an empty Watchlist the page is the
+    /// full sign-in screen and passes `showing: false`; the remembered course is still asked
+    /// for first, but it is not on screen, so closing the window acknowledges nothing.
+    /// Mutation: ignore `showing` and the close acknowledges "c", which nobody saw.
+    @Test func aCourseHiddenBehindTheSignInScreenIsNotLeft() async {
+        defer { cleanUp() }
+        let controller = await controllerWithANewRecording()
+        controller.refresh([course], selected: course, showing: false)
+        controller.windowClosed()
+        await drainTasks()
+        #expect(world.historyAcknowledgementsStarted == 0)
+        #expect(controller.newCount(for: course) == 1)
+    }
+
+    /// Guards #238: a language switch rebuilds the page (it disappears and appears in the same
+    /// turn), which is not leaving the course: its dots stay. Mutation: call `leaveOpenCourse()`
+    /// in `pageDisappeared` before the deferred visibility check and "c" is acknowledged.
+    @Test func aLanguageSwitchIsNotLeavingTheCourse() async {
+        defer { cleanUp() }
+        let controller = await controllerWithANewRecording()
+        controller.refresh([course], selected: course)
+        controller.pageDisappeared()
+        controller.pageAppeared()
+        controller.refresh([course], selected: course)
+        await drainTasks()
+        #expect(world.historyAcknowledgementsStarted == 0)
+        #expect(controller.isNew(recording("c")))
+    }
+
+    /// Guards #238's isolation rule: an acknowledgement started by leaving a course, still
+    /// waiting for its write when the WeBeep account changes, never clears the next account's
+    /// dots; and a course open across the account change acknowledges nothing when left.
+    /// Mutation: drop the identity check before `history.acknowledge` and the held write lands
+    /// after the change. The last part (a course open across a change, then left) holds because
+    /// the change removes the listings, so there is nothing new to acknowledge.
+    @Test func leavingAcrossAnAccountChangeTouchesNothingOfTheNextAccount() async {
+        defer { cleanUp() }
+        let controller = await controllerWithANewRecording()
+        controller.refresh([course], selected: course)
+        let gate = FakeRecmanBrowser.Gate()
+        defer { gate.release() }
+        world.historyAcknowledgeGate = gate
+        controller.refresh([course], selected: nil)
+        await settle("leave acknowledgement held") { gate.isWaiting }
+
+        world.owner = 8
+        controller.webBeepAccountChanged(to: 8)
+        #expect(controller.listings.isEmpty)
+        // History I/O is serial: the reset behind the account change waits for the held write,
+        // so it is released here, after the change and before the next account's history exists.
+        gate.release()
+        await drainTasks()
+        // Before the sign-in, which reloads the page's courses by itself: the next account's
+        // baseline must be "a" alone, whichever listing runs first.
+        browser.listResults[course.courseCode] = .success([recording("a")])
+        controller.signIn()
+        await settle("next account signed in") { controller.access == .ready }
+        controller.refresh([course], selected: course)
+        await settle("next account baseline") { controller.listing(for: course)?.seenIDs == ["a"] }
+        browser.listResults[course.courseCode] = .success([recording("c", daysAgo: 0), recording("a")])
+        controller.refresh([course], selected: course, force: true)
+        await settle("next account's new recording") { controller.newCount(for: course) == 1 }
+
+        await drainTasks()
+        #expect(controller.isNew(recording("c")), "the old account's late acknowledgement reached the next account's history")
+        world.owner = 9
+        controller.webBeepAccountChanged(to: 9)
+        controller.refresh([course], selected: nil)
+        controller.windowClosed()
+        await drainTasks()
+        #expect(world.historyAcknowledgementsStarted == 1, "only the held acknowledgement of the first account ever started")
+    }
+
+    /// Guards #238: when the session lapses with an empty Watchlist the page switches to the full
+    /// sign-in screen (`showing: false`), so the course is no longer on screen and its shown
+    /// list becomes read, as when leaving it any other way. Mutation: keep `openCourse` while
+    /// `showing` is false and nothing is acknowledged.
+    @Test func switchingToTheSignInScreenLeavesTheCourse() async {
+        defer { cleanUp() }
+        let controller = await controllerWithANewRecording()
+        controller.refresh([course], selected: course)
+        controller.refresh([course], selected: course, showing: false)
+        await settle("acknowledged when the sign-in screen replaced the course") { controller.newCount(for: course) == 0 }
+    }
+
+    /// Guards #238's cost rule: opening a course with nothing new and leaving it starts no
+    /// acknowledgement, and a refresh of the same course (a bookmark added, the course list
+    /// republished) is not leaving it. Mutation: drop `newCount > 0` together with
+    /// `scheduleAcknowledge`'s filter, or treat every refresh as leaving, and a write starts.
+    @Test func openingAndLeavingACourseWithNothingNewWritesNothing() async {
+        defer { cleanUp() }
+        browser.listResults[course.courseCode] = .success([recording("a"), recording("b")])
+        let controller = await readyController()
+        controller.refresh([course], selected: course)
+        await settle("listed") { controller.listing(for: course)?.recordings != nil }
+        controller.refresh([course], selected: course)
+        controller.refresh([course], selected: nil)
+        controller.windowClosed()
+        await drainTasks()
+        #expect(world.historyAcknowledgementsStarted == 0)
+        #expect(controller.newCount(for: course) == 0)
+    }
+
+    /// Guards #238: closing the window ends the open course. Recordings that arrive afterwards,
+    /// while the page shows the Watchlist, were never on screen and stay new; only opening their
+    /// course and leaving it reads them. Mutation: keep `openCourse` when the window closes and
+    /// the next refresh "leaves" the course, acknowledging a recording nobody saw; acknowledge
+    /// on opening and the dot is gone while the course is open.
+    @Test func recordingsArrivingAfterLeavingStayNewUntilShown() async {
+        defer { cleanUp() }
+        browser.listResults[course.courseCode] = .success([recording("a")])
+        let controller = await readyController()
+        controller.refresh([course], selected: course)
+        await settle("listed") { controller.listing(for: course)?.recordings != nil }
+        controller.windowClosed()
+
+        browser.listResults[course.courseCode] = .success([recording("c", daysAgo: 0), recording("a")])
+        controller.pageAppeared()
+        controller.refresh([course], selected: nil, force: true)
+        await settle("new recording listed for the badge") { controller.newCount(for: course) == 1 }
+        controller.refresh([course], selected: nil)
+        await drainTasks()
+        #expect(controller.newCount(for: course) == 1)
+        #expect(world.historyAcknowledgementsStarted == 0)
+
+        // Opening the course keeps the dot (the sidebar hides its badge instead): acknowledging
+        // on opening would leave the student no way to see which lectures are new.
+        controller.refresh([course], selected: course)
+        await drainTasks()
+        #expect(controller.isNew(recording("c")))
+        #expect(world.historyAcknowledgementsStarted == 0)
+        controller.refresh([course], selected: nil)
+        await settle("read after being shown") { controller.newCount(for: course) == 0 }
+    }
+
     /// Guards #106: first baseline, cumulative cross-course history, mark seen and restart
     /// must not rotate an old recording into New when the former global cap is exceeded.
     @Test func historyBeyondFiveThousandSurvivesOtherCoursesAndRelaunch() async {

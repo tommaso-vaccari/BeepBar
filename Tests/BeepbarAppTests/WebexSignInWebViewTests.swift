@@ -350,9 +350,15 @@ struct WebexSignInWebViewTests {
         #expect(await outcome(task) == "signed in")
     }
 
-    /// A transport that never answers, until cancelled.
-    final class HangingTransport: WebexHTTPTransport {
+    /// A Webex request that never answers. `requested` says when the Play reached it, so the
+    /// test interrupts a stream really waiting on Webex.
+    final class HangingTransport: WebexHTTPTransport, @unchecked Sendable {
+        private let lock = NSLock()
+        private var sent = false
+        var requested: Bool { lock.withLock { sent } }
+
         func send(_ request: URLRequest, limit: Int) async throws -> WebexHTTPResponse {
+            lock.withLock { sent = true }
             try await Task.sleep(for: .seconds(120))
             throw URLError(.timedOut)
         }
@@ -360,13 +366,20 @@ struct WebexSignInWebViewTests {
 
     /// `close()` and a newer operation end a Play waiting on Webex at once: the request is
     /// cancelled, not left to its timeout.
-    @Test(.timeLimit(.minutes(1))) func closingOrANewOperationEndsAStreamWaitingOnWebex() async throws {
+    @Test(.timeLimit(.minutes(2))) func closingOrANewOperationEndsAStreamWaitingOnWebex() async throws {
         for interruption in ["close", "newer operation"] {
             let session = RecmanWebSession()
-            session.webexTransport = HangingTransport()
+            let transport = HangingTransport()
+            session.webexTransport = transport
             await session.open(cookies: [])
             defer { session.close() }
             let task = Task { try await session.stream(player: URL(string: Self.page)!, email: nil) }
+            // Interrupted, and watched, only once the request is out. A fixed 200 ms wait was flaky
+            // in the full suite: the Play took up to 11.5 s (over 20 s under a parallel ffmpeg load)
+            // to get there, so the close landed while it was still reading WebKit's cookie store (a
+            // call nothing cancels) and the bound below measured WebKit's delay, not a stream
+            // waiting on Webex.
+            while !transport.requested { try await Task.sleep(for: .milliseconds(20)) }
             // If the wiring broke, the Play would wait out the transport: the watchdog cancels it
             // after 20 s so the suite doesn't hang, and says it did, which fails the test. A
             // wall-clock bound alone was flaky: CI's loaded runner took 5.6 s for a working close.
@@ -375,7 +388,6 @@ struct WebexSignInWebViewTests {
                 task.cancel()
                 return true
             }
-            try await Task.sleep(for: .milliseconds(200))
             let clock = ContinuousClock()
             let started = clock.now
             if interruption == "close" {

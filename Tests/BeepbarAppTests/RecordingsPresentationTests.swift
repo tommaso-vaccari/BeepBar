@@ -214,4 +214,52 @@ extension RecordingsPresentationTests {
         let empty = try #require(searchField(in: host))
         #expect(abs(empty.convert(empty.bounds, to: host).minY - initial) < 1)
     }
+
+    /// Guards #238: the sidebar hides the new-lectures badge of the course whose list is open
+    /// (its dots stay in the list until the student leaves it) and of no other course; with the
+    /// Watchlist open every badge shows. Mutation: return `count` always and the open case fails.
+    @Test func sidebarHidesTheBadgeOfTheOpenCourseOnly() throws {
+        let open = try #require(RecmanCourseKey(courseCode: "058167", academicYear: 2026))
+        let other = try #require(RecmanCourseKey(courseCode: "052499", academicYear: 2026))
+        let sameCodeOtherYear = try #require(RecmanCourseKey(courseCode: "058167", academicYear: 2025))
+        #expect(RecordingsPresentation.sidebarNewCount(3, rowKey: open, openKey: open) == 0)
+        #expect(RecordingsPresentation.sidebarNewCount(3, rowKey: other, openKey: open) == 3)
+        #expect(RecordingsPresentation.sidebarNewCount(3, rowKey: sameCodeOtherYear, openKey: open) == 3)
+        #expect(RecordingsPresentation.sidebarNewCount(3, rowKey: open, openKey: nil) == 3)
+        #expect(RecordingsPresentation.sidebarNewCount(0, rowKey: other, openKey: open) == 0)
+    }
+
+    /// Guards the #238 review's P0 from the page side: with no Polimi session and an empty
+    /// Watchlist the page is the full sign-in screen, so no course pane (and no open course) is
+    /// on screen; a saved Watchlist keeps the panes. Mutation: return true for `.needsSignIn`
+    /// and the hidden course would be "left", acknowledging recordings nobody saw.
+    @Test func thePanesShowOnlyWithASessionOrASavedWatchlist() {
+        typealias P = RecordingsPresentation
+        #expect(P.showsBrowser(access: .ready, hasBookmarks: false))
+        #expect(P.showsBrowser(access: .ready, hasBookmarks: true))
+        #expect(!P.showsBrowser(access: .needsSignIn(nil), hasBookmarks: false))
+        #expect(!P.showsBrowser(access: .signingIn, hasBookmarks: false))
+        #expect(P.showsBrowser(access: .needsSignIn(.unavailable), hasBookmarks: true))
+        #expect(P.showsBrowser(access: .signingIn, hasBookmarks: true))
+        #expect(!P.showsBrowser(access: .off, hasBookmarks: true))
+    }
+
+    /// Guards #237: no combination leaves the course pane empty. Without a Polimi session and
+    /// without a list in memory it invites the sign-in (the case that drew nothing and let the
+    /// header float); a list in memory is shown in every access state; signed in, a failure with
+    /// nothing to show says so and a request about to start shows the spinner. Mutation: map
+    /// `.needsSignIn` to `.loading`, or check access before the list, and these fail.
+    @Test func courseContentNeverLeavesThePaneEmpty() {
+        typealias P = RecordingsPresentation
+        for access in [RecordingsAccess.off, .ready, .signingIn, .needsSignIn(nil), .needsSignIn(.unavailable)] {
+            #expect(P.courseContent(hasList: true, isLoading: false, hasProblem: true, access: access) == .list)
+            #expect(P.courseContent(hasList: false, isLoading: true, hasProblem: false, access: access) == .loading)
+        }
+        #expect(P.courseContent(hasList: false, isLoading: false, hasProblem: false, access: .needsSignIn(nil)) == .signIn)
+        #expect(P.courseContent(hasList: false, isLoading: false, hasProblem: true, access: .needsSignIn(.unavailable)) == .signIn)
+        #expect(P.courseContent(hasList: false, isLoading: false, hasProblem: false, access: .off) == .signIn)
+        #expect(P.courseContent(hasList: false, isLoading: false, hasProblem: false, access: .signingIn) == .signingIn)
+        #expect(P.courseContent(hasList: false, isLoading: false, hasProblem: true, access: .ready) == .unavailable)
+        #expect(P.courseContent(hasList: false, isLoading: false, hasProblem: false, access: .ready) == .loading)
+    }
 }

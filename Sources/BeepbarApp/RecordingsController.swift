@@ -93,7 +93,8 @@ struct RecordingsListing: Equatable {
 ///   touches state again, so a late answer can't revive a turned-off feature or a closed page.
 ///
 /// "New" recordings: the first listing of a course marks everything in it as seen (its
-/// baseline), so only recordings published afterwards get the dot, until opened or marked seen.
+/// baseline), so only recordings published afterwards get the dot, until opened, marked done, or
+/// their course is left after being shown (`leaveOpenCourse`, #238).
 ///
 /// Native playback (#148). Play resolves the recording's stream through the same browser and
 /// plays it in BeepBar's own window; anything it can't do falls back to the default browser, as
@@ -476,6 +477,12 @@ struct RecordingsListing: Equatable {
     /// The courses the page last asked for, reloaded after a sign-in.
     private var pageKeys: [RecmanCourseKey] = []
     private var selectedKey: RecmanCourseKey?
+    /// The course whose list is on screen, for "leaving it marks its new recordings as read"
+    /// (#238). Unlike `selectedKey`, which stays as the page's last request while the page is
+    /// closed (a sign-in reloads it), this is cleared as soon as the student stops looking at
+    /// the course: otherwise recordings that arrive while the window is closed would be
+    /// acknowledged later without ever having been shown.
+    private var openCourse: RecmanCourseKey?
 
     // MARK: Sync refresh state
 
@@ -1038,6 +1045,8 @@ struct RecordingsListing: Equatable {
         visiblePages = max(0, visiblePages - 1)
         Task { @MainActor [weak self] in
             guard let self, self.visiblePages == 0 else { return }
+            // After the deferral: a language switch's disappear/appear is not leaving the course.
+            self.leaveOpenCourse()
             self.suspend()
         }
     }
@@ -1048,6 +1057,7 @@ struct RecordingsListing: Equatable {
     /// recovery still finding its stream finishes first).
     func windowClosed() {
         visiblePages = 0
+        leaveOpenCourse()
         suspend()
     }
 
@@ -1125,10 +1135,20 @@ struct RecordingsListing: Equatable {
     /// Brings the page's courses up to date: `selected` first, then the others, which only feed
     /// their badges. A course loaded in the last few minutes is skipped unless `force` (the
     /// refresh button), so moving around the page doesn't keep asking Polimi.
-    func refresh(_ keys: [RecmanCourseKey], selected: RecmanCourseKey?, force: Bool = false) {
+    ///
+    /// `showing` is false while the page shows only the sign-in screen (no session and an empty
+    /// Watchlist, `RecordingsPresentation.showsBrowser`): `selected` is then still loaded first
+    /// after a sign-in, but its list is not on screen, so it is not the open course and leaving
+    /// the page acknowledges nothing (#238 review).
+    func refresh(_ keys: [RecmanCourseKey], selected: RecmanCourseKey?, force: Bool = false, showing: Bool = true) {
         guard isEnabled, visiblePages > 0 else { return }
         pageKeys = keys
         selectedKey = selected
+        let shown = showing ? selected : nil
+        if openCourse != shown {
+            leaveOpenCourse()
+            openCourse = shown
+        }
         // What the page shows is never evicted, so going back to one of its courses is immediate.
         // Compared first: `listings` is published, and an unchanged page must not redraw.
         let onPage = Set(keys + [selected].compactMap { $0 })
@@ -1311,6 +1331,31 @@ struct RecordingsListing: Equatable {
     func newCount(for key: RecmanCourseKey) -> Int {
         guard let listing = listings[key], let seen = listing.seenIDs else { return 0 }
         return listing.recordings?.reduce(0) { $0 + (seen.contains($1.id) ? 0 : 1) } ?? 0
+    }
+
+    /// The student stopped looking at the open course (another course, the Watchlist, the page
+    /// or the window closed, #238): what it showed as new becomes read, durably, as the removed
+    /// "Segna novità come lette" button did. While the course is open its dots stay, so the
+    /// student can still see which lectures are new; the sidebar hides its badge meanwhile
+    /// (`RecordingsPresentation.sidebarNewCount`).
+    /// - Only the list that was on screen, with its #106 seen snapshot: no snapshot (never
+    ///   listed, history unreadable, reset by an identity change or by forgetting the history)
+    ///   means `newCount` 0 and nothing to acknowledge. Today every reset of the seen state also
+    ///   empties `listings`, so a list without a snapshot can't be left; the guard keeps a future
+    ///   reset that kept the lists from acknowledging all of them (a silent baseline).
+    ///   `openCourse` itself survives a reset on
+    ///   purpose: the page stays on the course, and the next account's list shown there is read
+    ///   when left, as any other.
+    /// - The page switching to the full sign-in screen (`showing: false`) is leaving too.
+    /// - Nothing new writes nothing (`newCount` 0 schedules nothing).
+    /// - A late commit after logout or an account change is refused by `scheduleAcknowledge`.
+    /// Quitting doesn't come through here: the quit path never waits for writes (AGENTS.md),
+    /// so a course left open at quit keeps its new recordings until it is opened and left again.
+    private func leaveOpenCourse() {
+        guard let key = openCourse else { return }
+        openCourse = nil
+        guard newCount(for: key) > 0 else { return }
+        markSeen(key)
     }
 
     /// Dots clear after the serialized worker commits their durable acknowledgement.

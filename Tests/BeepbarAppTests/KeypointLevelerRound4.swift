@@ -1,3 +1,4 @@
+import AVFoundation
 import Foundation
 import Testing
 import BeepbarCore
@@ -300,4 +301,234 @@ extension KeypointLevelerMeasurements {
             print("LISTEN4 \(n) | \(frontName) | new-levelled \(f(target)) LUFS, new-isolated \(f(try Measurements.loudness(isolatedRender.output, in: path).lufs)), original-loud \(f(try Measurements.loudness(loud, in: path).lufs))")
         }
     }
+
+    // MARK: D: whole-lecture profile of the keypoint gain in pauses
+
+    /// The detector variants of `lectureProfile`, on 400 ms frame levels (the keypoints' own
+    /// frames: spacing 10 s is 25 frames, so the frame grid is the keypoints' grid). Everything
+    /// else is `KeypointLeveler()`'s: window 12 s (30 frames), 90th percentile, target -20,
+    /// clamp -6...48, 15% voiced minimum, unbounded hold, bootstrap at the lecture's start.
+    /// - `ratio` (R): a frame counts as voiced only if isolated > -95 dBFS and isolated >= original - 10 dB
+    ///   (the isolator kept most of the frame's energy);
+    /// - `evidence` (E): a keypoint whose measured gain exceeds the previous resolved keypoint's by
+    ///   more than 6 dB needs 40% voiced frames in its window, else it holds.
+    struct Detector {
+        let name: String
+        var ratio = false
+        var evidence = false
+    }
+
+    static let detectors = [Detector(name: "BASE"), Detector(name: "R", ratio: true), Detector(name: "E", evidence: true), Detector(name: "RE", ratio: true, evidence: true)]
+
+    /// What one keypoint's window said under a detector.
+    struct KeypointRead {
+        var existing = 0
+        var voiced: [Int] = []        // frame indices that count as voiced
+        var share: Double { existing == 0 ? 0 : Double(voiced.count) / Double(existing) }
+        var measured: Double?         // the gain it measures (clamped), nil: fewer than 15% voiced
+    }
+
+    /// Keypoint `k`'s window, as `KeypointLeveler.Curve.compute` reads it with `bootstrap` on:
+    /// frames `25k - 30 ..< 25k` (those at or after frame 0), and for `k == 0` the 30 frames after it.
+    static func read(_ k: Int, iso: [Double], orig: [Double], detector: Detector) -> KeypointRead {
+        let hi = k == 0 ? 30 : 25 * k
+        let lo = max(0, hi - 30)
+        var r = KeypointRead()
+        for f in lo..<min(hi, iso.count) {
+            r.existing += 1
+            if iso[f] > -95 && (!detector.ratio || iso[f] >= orig[f] - 10) { r.voiced.append(f) }
+        }
+        if r.existing > 0, r.share >= 0.15 {
+            let level = AudioTestSignals.percentile(r.voiced.map { iso[$0] }, 0.9)
+            r.measured = max(-6, min(48, -20 - level))
+        }
+        return r
+    }
+
+    /// The resolved keypoint gains 0...`last` of a detector, in ascending order (a hold takes the
+    /// previous resolved gain; keypoint 0 holding is neutral, 0 dB), and which ones measured.
+    static func resolve(last: Int, iso: [Double], orig: [Double], detector: Detector) -> (gains: [Double], measured: [Bool], reads: [KeypointRead]) {
+        var gains: [Double] = [], measured: [Bool] = [], reads: [KeypointRead] = []
+        for k in 0...last {
+            let r = read(k, iso: iso, orig: orig, detector: detector)
+            var value = r.measured
+            if detector.evidence, let g = value, let previous = gains.last, g > previous + 6, r.share < 0.4 { value = nil }
+            gains.append(value ?? gains.last ?? 0)
+            measured.append(value != nil)
+            reads.append(r)
+        }
+        return (gains, measured, reads)
+    }
+
+    /// The gain (dB) at frame `f`'s centre: linear in dB between keypoints, the last one held past
+    /// the lecture's end (the `Curve`'s `end` rule).
+    static func frameGain(_ f: Int, gains: [Double]) -> Double {
+        let t = (Double(f) + 0.5) / 25
+        let k = Int(t.rounded(.down))
+        guard k + 1 < gains.count else { return gains[min(k, gains.count - 1)] }
+        return gains[k] + (gains[k + 1] - gains[k]) * (t - Double(k))
+    }
+
+    /// 400 ms frame levels of `x` (whole frames only), as `Curve` computes them.
+    static func level400(_ energy: Double) -> Double { max(-120, 10 * log10(energy / Double(KeypointLeveler.frameLength) + 1e-20)) }
+
+    static func levels400(_ x: [Float]) -> [Double] {
+        stride(from: 0, to: x.count - KeypointLeveler.frameLength + 1, by: KeypointLeveler.frameLength).map { lo in
+            var e = 0.0
+            for j in lo..<(lo + KeypointLeveler.frameLength) { e += Double(x[j]) * Double(x[j]) }
+            return level400(e)
+        }
+    }
+
+    /// The same, streamed from a float audio file (a lecture never sits in memory whole).
+    static func levels400(streaming url: URL) throws -> [Double] {
+        let file = try AVAudioFile(forReading: url)
+        let buffer = try #require(AVAudioPCMBuffer(pcmFormat: file.processingFormat, frameCapacity: 65536))
+        var out: [Double] = []
+        var energy = 0.0, count = 0
+        while file.framePosition < file.length {
+            try file.read(into: buffer)
+            if buffer.frameLength == 0 { break }
+            let p = buffer.floatChannelData![0]
+            for i in 0..<Int(buffer.frameLength) {
+                energy += Double(p[i]) * Double(p[i])
+                count += 1
+                if count == KeypointLeveler.frameLength { out.append(level400(energy)); energy = 0; count = 0 }
+            }
+        }
+        return out
+    }
+
+    /// The same, streamed from raw 16-bit little-endian mono (the isolator's output).
+    static func levels400(streamingRaw url: URL) throws -> [Double] {
+        let handle = try FileHandle(forReadingFrom: url)
+        defer { try? handle.close() }
+        var out: [Double] = []
+        var energy = 0.0, count = 0
+        while let data = try handle.read(upToCount: 1 << 20), !data.isEmpty {
+            data.withUnsafeBytes { bytes in
+                for i in stride(from: 0, to: data.count - 1, by: 2) {
+                    let s = Double(Int16(littleEndian: bytes.loadUnaligned(fromByteOffset: i, as: Int16.self))) / 32767
+                    energy += s * s
+                    count += 1
+                    if count == KeypointLeveler.frameLength { out.append(level400(energy)); energy = 0; count = 0 }
+                }
+            }
+        }
+        return out
+    }
+
+    static func stats(_ x: [Double], _ ps: [Double]) -> String { x.isEmpty ? "n/a" : ps.map { f(AudioTestSignals.percentile(x, $0)) }.joined(separator: "/") }
+    static func seconds(_ n: Int) -> String { f(Double(n) * 0.4, 0) }
+    static func mmss(_ seconds: Int) -> String { String(format: "%d:%02d", seconds / 60, seconds % 60) }
+
+    /// Prints the `PROF` and `KEY` rows of one lecture from its frame levels.
+    static func profile(lecture: Int, iso: [Double], orig: [Double]) {
+        let frames = min(iso.count, orig.count)
+        let iso = Array(iso[0..<frames]), orig = Array(orig[0..<frames])
+        let last = frames / 25
+        let ceiling = KeypointLeveler().target + (KeypointLeveler().ceilingHeadroom ?? 6)
+        let results = detectors.map { resolve(last: last, iso: iso, orig: orig, detector: $0) }
+        let baseVoiced = (0..<frames).map { iso[$0] > -95 }
+        // Speech spans: the 10 s between keypoints k and k+1 with at least 30% BASE-voiced frames.
+        var spans: [Range<Int>] = []
+        var inSpan = [Bool](repeating: false, count: frames)
+        for k in 0..<(frames / 25) {
+            let r = (25 * k)..<(25 * k + 25)
+            if Double(r.filter { baseVoiced[$0] }.count) >= 0.3 * 25 { spans.append(r); for f in r { inSpan[f] = true } }
+        }
+        let pause = (0..<frames).filter { iso[$0] < -95 }
+        let pauseNoisy = pause.filter { orig[$0] > -110 }
+        print("PROF \(lecture) | frames | \(f(Double(frames) * 0.4 / 60)) min | pause frames \(f(Double(pause.count) * 0.4 / 60)) min, of which original not digital silence \(f(Double(pauseNoisy.count) * 0.4 / 60)) min | speech spans \(spans.count) (\(seconds(spans.count * 25)) s) | original over pause frames p50/p90 \(stats(pause.map { orig[$0] }, [0.5, 0.9])), over the not-silent ones \(stats(pauseNoisy.map { orig[$0] }, [0.5, 0.9]))")
+        for (d, res) in zip(detectors, results) {
+            let g = res.gains
+            let measuredCount = res.measured.filter { $0 }.count
+            func out(_ f: Int) -> Double { orig[f] + min(frameGain(f, gains: g), ceiling - orig[f]) }
+            let levelled = pause.map(out)
+            let levelledNoisy = pauseNoisy.map(out)
+            let spanValues = spans.map { r in AudioTestSignals.percentile(r.filter { baseVoiced[$0] }.map(out), 0.9) }
+            let tooQuiet = spanValues.filter { $0 < -30 }.count
+            let isolatedPause = (0..<frames).filter { iso[$0] >= -95 && iso[$0] < -60 && !inSpan[$0] }
+            let isolatedOut = isolatedPause.map { iso[$0] + frameGain($0, gains: g) }
+            print("PROF \(lecture) | \(d.name) | keypoints \(g.count) (\(measuredCount) measured, \(g.count - measuredCount) held) gain p5/p50/p95/min/max \(stats(g, [0.05, 0.5, 0.95, 0, 1])) dB"
+                + " | LEVELLED ORIGINAL in pause frames: out p50/p90/p99/max \(stats(levelled, [0.5, 0.9, 0.99, 1])) dBFS, \(f(Double(pause.count) * 0.4 / 60)) min, above -35: \(seconds(levelled.filter { $0 > -35 }.count)) s, above -26: \(seconds(levelled.filter { $0 > -26 }.count)) s; where the original is not digital silence: p50/p90/p99/max \(stats(levelledNoisy, [0.5, 0.9, 0.99, 1])), above -35: \(seconds(levelledNoisy.filter { $0 > -35 }.count)) s, above -26: \(seconds(levelledNoisy.filter { $0 > -26 }.count)) s"
+                + " | SPEECH span p90 across \(spans.count) spans p5/p50/p95 \(stats(spanValues, [0.05, 0.5, 0.95])) dBFS, below -30: \(tooQuiet) spans (\(tooQuiet * 10) s)"
+                + " | ISOLATED in non-speech frames (-95..-60): \(isolatedPause.count) frames, out p50/p90/p99/max \(stats(isolatedOut, [0.5, 0.9, 0.99, 1])) dBFS, above -35: \(seconds(isolatedOut.filter { $0 > -35 }.count)) s")
+        }
+        // KEY rows (BASE): keypoints 10 dB or more away from the median of the 30 nearest measured
+        // keypoints on each side (excluding itself), the 60 largest deviations in time order.
+        let base = results[0], rVariant = detectors[1], eResult = results[2]
+        let measuredIndices = (0...last).filter { base.measured[$0] }
+        var rows: [(k: Int, deviation: Double, text: String)] = []
+        for k in 0...last {
+            let before = measuredIndices.filter { $0 < k }.suffix(30), after = measuredIndices.filter { $0 > k }.prefix(30)
+            let neighbours = (before + after).map { base.gains[$0] }
+            guard !neighbours.isEmpty else { continue }
+            let median = AudioTestSignals.percentile(neighbours, 0.5)
+            let deviation = base.gains[k] - median
+            guard abs(deviation) >= 10 else { continue }
+            let read = base.reads[k]
+            let isoVoiced = read.voiced.map { iso[$0] }, origVoiced = read.voiced.map { orig[$0] }
+            let passing = read.voiced.isEmpty ? Double.nan : Double(read.voiced.filter { iso[$0] >= orig[$0] - 10 }.count) / Double(read.voiced.count)
+            let rRead = Self.read(k, iso: iso, orig: orig, detector: rVariant)
+            let rGain = rRead.measured.map { f($0) } ?? "hold"
+            // E's rule on this keypoint alone, against E's own resolved previous gain.
+            var eGain = base.reads[k].measured.map { f($0) } ?? "hold"
+            if let g = base.reads[k].measured, k > 0, g > eResult.gains[k - 1] + 6, read.share < 0.4 { eGain = "hold" }
+            let w = max(0, (k == 0 ? 30 : 25 * k) - 30)..<min(frames, k == 0 ? 30 : 25 * k)
+            let silent = Double(w.filter { orig[$0] < -110 }.count) / Double(max(w.count, 1))
+            rows.append((k, abs(deviation), "KEY \(lecture) | \(mmss(k * 10)) | \(base.measured[k] ? "measured" : "held") gain \(f(base.gains[k])) dB vs median \(f(median)) | voiced \(f(read.share * 100, 0))% | isolated p90 \(stats(isoVoiced, [0.9])) original p90 \(stats(origVoiced, [0.9])) | frames passing R's ratio \(f(passing * 100, 0))% | R \(rGain) | E \(eGain) | original frames below -110 dBFS in window \(f(silent * 100, 0))%\(silent > 0.5 ? " (mostly digital silence)" : "")"))
+        }
+        print("KEY \(lecture) | \(rows.count) keypoints are 10 dB or more from the neighbouring median; showing \(min(rows.count, 60)) (largest deviations, in time order)")
+        for row in rows.sorted(by: { $0.deviation > $1.deviation }).prefix(60).sorted(by: { $0.k < $1.k }) { print(row.text) }
+    }
+
+    /// For each lecture in `BEEPBAR_AUDIO_LEVELER_LECTURES` (comma-separated; printed as lecture 1,
+    /// 2, 3 only): the keypoint gain under four detector variants, and what it does to pauses and
+    /// to speech, at 400 ms frame level (see `Detector`, `profile`). One lecture at a time; only
+    /// frame levels are kept (the audio is streamed), so memory stays small. First, as a check that
+    /// the frame-based BASE equals `KeypointLeveler.Curve`'s keypoints, it compares the two on the
+    /// first excerpt when excerpts are configured (`PROF check`).
+    @Test func lectureProfile() async throws {
+        let lectures = (ProcessInfo.processInfo.environment["BEEPBAR_AUDIO_LEVELER_LECTURES"] ?? "").split(separator: ",").map(String.init).filter { !$0.isEmpty }
+        guard !lectures.isEmpty else { return }
+        if let file = Self.excerptFiles.first {
+            let path = try Path()
+            defer { path.remove() }
+            let m = try await Self.material(1, file, path: path)
+            let iso = Self.levels400(m.isolated), orig = Self.levels400(m.input)
+            let curve = KeypointLeveler().curve(over: .init(m.isolated, end: m.isolated.count, bootstrap: true))
+            let last = m.isolated.count / (10 * rate)
+            let mine = Self.resolve(last: last, iso: iso, orig: orig, detector: Self.detectors[0]).gains
+            let worst = (0...last).map { abs(mine[$0] - curve.keypoint($0)) }.max() ?? 0
+            print("PROF check | frame-based BASE against KeypointLeveler.Curve on excerpt 1: \(last + 1) keypoints, largest difference \(f(worst, 4)) dB")
+        }
+        for (i, lecture) in lectures.enumerated() {
+            try await autoreleasepool_async {
+                let path = try Path()
+                defer { path.remove() }
+                let wav = path.folder.appendingPathComponent("lecture.wav")
+                let raw = path.folder.appendingPathComponent("lecture.raw")
+                let process = Process()
+                process.executableURL = path.ffmpeg
+                process.arguments = ["-nostdin", "-loglevel", "quiet", "-y", "-i", lecture, "-map", "0:a:0", "-vn", "-ar", "48000", "-ac", "1", "-c:a", "pcm_f32le", wav.path]
+                process.standardOutput = FileHandle.nullDevice
+                process.standardError = FileHandle.nullDevice
+                try process.run()
+                process.waitUntilExit()
+                try #require(process.terminationStatus == 0, "lecture \(i + 1) could not be read as audio")
+                let orig = try Self.levels400(streaming: wav)
+                var isolator = try #require(AppleVoiceIsolator.preferred())
+                isolator.wetDryMix = 100
+                try await isolator.isolate(wav, from: 0, count: nil, to: raw)
+                try? FileManager.default.removeItem(at: wav)
+                let iso = try Self.levels400(streamingRaw: raw)
+                try? FileManager.default.removeItem(at: raw)
+                Self.profile(lecture: i + 1, iso: iso, orig: orig)
+            }
+        }
+    }
 }
+
+/// Runs `body` (kept as a function so each lecture's temporaries are released before the next).
+private func autoreleasepool_async(_ body: () async throws -> Void) async throws { try await body() }

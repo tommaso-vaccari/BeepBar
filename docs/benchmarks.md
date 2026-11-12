@@ -356,3 +356,34 @@ Select a test with `swift test --skip-build --filter "KeypointLevelerMeasurement
 - `transients`: a synthetic scene with door, knock, scrape, clicks and cough bursts in pauses and under speech (`TRANS`): what survives isolation, the keypoint gain with and without bursts, the hold rule on a bursts-only window, clipping.
 - `seams`: whether a piece rendered alone gets the whole lecture's gain curve, per lead and tail (`SEAM`), and how the hold rule chains across long silences for several `maxHold` bounds (`HOLD`).
 - `wholeLecture`: G alone over a whole lecture: gain curve summary and processing time (needs about 1.2 GB of memory for a 95 minute lecture).
+
+### Enhanced audio: keypoint leveler (round 3)
+
+Same suite and gate (`KeypointLevelerRound3.swift`); the six excerpts are 180 s each from four private lectures and appear only as an index. Additional variables: `BEEPBAR_AUDIO_LEVELER_CLEANUP` (a `cleanupNames` entry, default `none`) and `BEEPBAR_AUDIO_LEVELER_COMPRESSOR` (a `compressors3` name, default `K7`).
+
+- `cleanup` (`CLEAN`): hiss stages after the leveler (`afftdn` and gentle expanders) against the leveler alone: speech level, residue between words and in pauses, loudness, ending metric.
+- `limiterLoad` (`LOAD`): each `compressors3` row after G: the limiter's reduction over 10 ms frames (median, 99th percentile, maximum), loudness and range, and the share of 50 ms frames between −50 and −30 dBFS (how much low-level material was lifted). The ratio 2 rows have their makeup calibrated per excerpt to the round-2 loudness.
+- `pieces` and `forwardSeams` (`PIECE`, `FWD`): the gain curve of a piece rendered alone against the whole lecture's, with and without the previous piece's 12 s of history, and the step at each seam when playing forward after a seek.
+- `fallback` (`FALL`): the chains that need no Swift leveler, on the isolated audio and on the original audio without isolation, against `current` and G.
+- `listening`: writes `<n>-<label>__original-loud|current|new-r2|new-r3.wav` to `BEEPBAR_AUDIO_AB_OUT`.
+
+Results (Apple M2, 8 GB, debug build, commit `ae299cd`; one run each, the chains are deterministic):
+
+- **Cleanup: none.** No `afftdn` or expander variant improved the residue without costing word endings; the isolator already leaves digital silence in the pauses. The `between-word` and `pause` figures track quiet speech and short noises rather than hiss, and on an excerpt whose level changes they count the quiet half's speech as pause: do not rank chains on them.
+- **Compressor: K17** (`threshold=0.08:ratio=3:attack=1:release=100:knee=6:makeup=4.52`), replacing round 2's K7 (`attack=10:release=200:knee=4:makeup=3.8`). Selection rule: limiter reduction p99 at most 3 dB, −18..−16 LUFS, least low-level lift.
+
+  | Excerpt | K7 LUFS | K7 limiter p99 / max (dB) | K7 low-level frames | K17 LUFS | K17 limiter p99 / max (dB) | K17 low-level frames |
+  |---|---|---|---|---|---|---|
+  | 1 quiet, steady | −17.3 | 1.8 / 5.9 | 16.5% | −16.9 | 1.0 / 3.5 | 14.4% |
+  | 2 loud, level change | −16.7 | 2.5 / 8.0 | 11.9% | −16.3 | 1.6 / 4.0 | 11.5% |
+  | 3 quiet body | −18.8 | 0.0 / 2.7 | 16.3% | −18.1 | 0.0 / 1.1 | 15.2% |
+  | 4 loud then quiet | −17.5 | 0.0 / 2.4 | 18.2% | −16.9 | 0.0 / 1.8 | 16.9% |
+  | 5 normal | −17.8 | 1.3 / 7.2 | 14.3% | −17.2 | 0.4 / 3.7 | 12.4% |
+  | 6 normal | −17.3 | 0.9 / 4.8 | 14.3% | −16.7 | 0.0 / 2.6 | 13.2% |
+
+  K17 is 0.4 to 0.7 LU louder with half the limiter's worst reduction and fewer low-level frames. Excerpt 3 ends 0.1 LU under the range. Rejected: a 25 ms attack and the ratio 2 rows (p99 3.9 to 4.4 dB on excerpt 2), ratio 4 and 5 with a low threshold (−21 to −23 LUFS). The loudness, range and peak (−1.94 dBFS, no clipped sample) of the twelve `new-r2` and `new-r3` renders were measured again with `ffmpeg`'s `ebur128` and match the suite's figures.
+- **`current` for reference:** −51.4 and −60.6 LUFS on the two quiet excerpts (near-silent), and a worst-10% ending loss of −5.2 to −18.7 dB on the excerpts where G loses −1.2 to −14.4 dB. Excerpt 6 loses about −40 dB with every chain on the isolated audio and none without isolation: that loss is the isolator's.
+- **Fallback without a Swift leveler:** `dynaudnorm=f=250:g=51:p=0.9:m=100:b=1` and the K15 compressor (K17 with `makeup=4.26`), no `speechnorm`, no gate. On the isolated audio: −16.5 to −18.0 LUFS on five excerpts and −20.5 on excerpt 3, endings within 2 dB of G. Without isolation, after the existing front filters: −15.3 to −18.9 LUFS, endings better than the production `filterChain` on the five measurable excerpts, but the noise in pauses rises with the speech (−19 to −34 dBFS). `m=10` (the first attempt) left −24 to −42 LUFS; `m=40` equals `m=100` on normal excerpts and leaves the quiet ones 3 to 4 LU lower. Not measured: a pause of several minutes without isolation, where `dynaudnorm` can raise room noise by up to 40 dB.
+- **Seams:** forward play after a seek has a 0.000 dB step with the previous piece's 12 s as history. A backward seek into a cached piece steps by 2.5 dB (median) and up to 40 dB across a level change; the fix (re-levelling a piece rendered without history once its predecessor is available) belongs to the production change. Ramps were dropped.
+
+Not established by these numbers: whether words sound whole, and whether short noises that survive isolation (a cough, a knock) are annoying once lifted with the voice. A person listening to the `listening` files decides both.

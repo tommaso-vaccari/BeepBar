@@ -45,8 +45,16 @@ import Foundation
 ///   silence with no memory, or the lecture's start), it is *unanchored*: the keypoint takes the
 ///   first keypoint after it that measures a gain, up to one `spacing` past the clip's end
 ///   (silence in front of speech is then leveled for the speech after it, which is what the
-///   listener will hear next); failing that the `known` gain nearest in index; failing that
-///   `neutral` (0 dB: the audio as it is, never a guess).
+///   listener will hear next); failing that the firm `known` gain nearest in index; failing
+///   that `neutral` (0 dB: the audio as it is, never a guess).
+/// - That last `neutral` is *provisional* (`Resolution.provisional`). The caller keeps it like
+///   any value, so it is never recomputed and a seam never has a step, but it anchors nothing:
+///   on a hold chain it is not a known value for the keypoints after it, and "unanchored" skips
+///   it. Without that, a lecture whose first stretch is longer than the look-ahead (about 37 s)
+///   in silence would hold its 0 dB through the silence that follows, even in a clip that
+///   contains the voice, and the gain would climb to the voice's only after the first words
+///   (a lecture at −60 dBFS started up to 40 dB too low). With it, the climb happens in the
+///   silence, from the first keypoint whose clip sees the voice.
 public struct VoiceLeveler: Sendable {
     public static let rate = 48_000
     /// 400 ms, the frame the level is measured on.
@@ -109,12 +117,36 @@ public struct VoiceLeveler: Sendable {
     /// What one keypoint's window says.
     private enum Measure { case gain(Double), hold, unmeasurable }
 
+    /// What `resolve` returns: the gain in dB of each requested keypoint, and which of them are
+    /// provisional (`neutral` because nothing in the clip or the memory said otherwise).
+    public struct Resolution: Sendable, Equatable {
+        public var gains: [Int: Double]
+        /// The keypoints in `gains` whose value is a provisional `neutral`: kept by the caller
+        /// like any other (never recomputed, so no step at a seam) but never an anchor for
+        /// another keypoint.
+        public var provisional: Set<Int>
+    }
+
     /// The gain in dB of each of `keypoints`, one value per keypoint, resolved by the rules in the
     /// type's documentation. `detector` is the audio the level is read from (for the isolated
     /// mode, the signal itself); `known` holds the keypoints already used, which are returned as
     /// they are. Keypoints measured on the way along a hold chain are not returned: the caller
-    /// stores only what it asked for, and so only what it will have used.
+    /// stores only what it asked for, and so only what it will have used. No keypoint is
+    /// provisional here; see `resolve`.
     public func gains(for keypoints: ClosedRange<Int>, detector: Clip, known: [Int: Double]) -> [Int: Double] {
+        resolve(for: keypoints, detector: detector, known: known, provisional: []).gains
+    }
+
+    /// `gains`, aware of provisional keypoints. A keypoint of `provisional` (a subset of `known`)
+    /// is a `neutral` the caller had to use because the lecture's first stretch showed no voice
+    /// yet. It is returned as it is when it is itself requested (so the value in use never
+    /// changes), but it does not anchor anything: on a hold chain it counts as known for no
+    /// keypoint after it, and "unanchored" does not take it as the nearest known. Otherwise a
+    /// lecture opening with a long silence would keep 0 dB at the first words, the gain then
+    /// climbing to the voice's over seconds of speech. The result marks a keypoint provisional
+    /// when it ends on the final `neutral` of the unanchored rule, or was provisional already.
+    /// Pure: the same arguments give the same result.
+    public func resolve(for keypoints: ClosedRange<Int>, detector: Clip, known: [Int: Double], provisional: Set<Int>) -> Resolution {
         var measures: [Int: Measure] = [:]
         func measure(_ k: Int) -> Measure {
             if let cached = measures[k] { return cached }
@@ -122,35 +154,43 @@ public struct VoiceLeveler: Sendable {
             measures[k] = result
             return result
         }
+        /// A known value that may anchor another keypoint.
+        func anchor(_ k: Int) -> Double? { provisional.contains(k) ? nil : known[k] }
         func usable(_ k: Int) -> Bool {
-            if known[k] != nil { return true }
+            if anchor(k) != nil { return true }
             if case .unmeasurable = measure(k) { return false }
             return true
         }
         // Where a keypoint's own value cannot be had: see "unanchored" in the type's docs.
-        func unanchored(_ k: Int) -> Double {
+        func unanchored(_ k: Int) -> (gain: Double, provisional: Bool) {
             var j = k + 1
             while time(of: j) <= detector.end + Int(step.rounded()) {
-                if case .gain(let g) = measure(j) { return g }
+                if case .gain(let g) = measure(j) { return (g, false) }
                 j += 1
             }
             // The nearest index, the earlier one on a tie (a gain already in use that came
             // before this one is what the listener heard last).
-            if let nearest = known.keys.min(by: { (abs($0 - k), $0) < (abs($1 - k), $1) }) { return known[nearest]! }
-            return neutral
+            let firm = known.keys.filter { !provisional.contains($0) }
+            if let nearest = firm.min(by: { (abs($0 - k), $0) < (abs($1 - k), $1) }) { return (known[nearest]!, false) }
+            return (neutral, true)
         }
-        func value(_ k: Int) -> Double {
+        func value(_ k: Int) -> (gain: Double, provisional: Bool) {
+            if let fixed = known[k] { return (fixed, provisional.contains(k)) }
             var j = k
             while true {
-                if let fixed = known[j] { return fixed }
-                if case .gain(let g) = measure(j) { return g }
+                if j < k, let fixed = anchor(j) { return (fixed, false) }
+                if case .gain(let g) = measure(j) { return (g, false) }
                 // Hold or unmeasurable: the previous keypoint's value, when there is one to use.
                 guard j > 0, usable(j - 1) else { return unanchored(k) }
                 j -= 1
             }
         }
-        var result: [Int: Double] = [:]
-        for k in keypoints { result[k] = value(k) }
+        var result = Resolution(gains: [:], provisional: [])
+        for k in keypoints {
+            let v = value(k)
+            result.gains[k] = v.gain
+            if v.provisional { result.provisional.insert(k) }
+        }
         return result
     }
 

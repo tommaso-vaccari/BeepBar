@@ -611,6 +611,34 @@ struct LiveAudioPipelineTests {
         await pipeline.stop()
     }
 
+    /// A lecture whose first four fragments (2 minutes) are silent for the isolator and whose voice,
+    /// quiet, starts at the fifth: the segment with the voice is levelled for it from the first
+    /// second (the original at −57 dBFS comes out near −20, +37 dB), and there is no step at its
+    /// boundary with the silent segment before it. Guards against the first segment's provisional
+    /// 0 dB held through the silence after it, so that the voice's segment starts near 0 dB and
+    /// climbs during the first words (before the correction: about +4 dB at that point), and
+    /// against a provisional value that changes when the next segment sees the voice.
+    @Test func aLongSilenceBeforeTheVoiceLevelsTheFirstSegmentWithVoice() async throws {
+        defer { try? FileManager.default.removeItem(at: parent) }
+        let ffmpeg = FakeFFmpeg(originalTone: 0.002)
+        let isolator = FakeIsolator(amplitude: { $0 >= 4 ? 0.002 : 0 })
+        let pipeline = pipeline(SyntheticWebex(fragments: 6), ffmpeg, isolator, kind: .levelled)
+        for index in 0...4 { _ = try await pipeline.segment(index) }
+        let three = try #require(ffmpeg.encode("out3.ts")), four = try #require(ffmpeg.encode("out4.ts"))
+        let originalRMS = 0.002 / 2.0.squareRoot()
+        func gain(_ encode: FakeFFmpeg.Encode, at second: Double) throws -> Double {
+            let sample = Int(second * 48000)
+            let rms = Self.rms(try #require(encode.levelled), (sample - 2400 - encode.firstSample)..<(sample + 2400 - encode.firstSample))
+            return 20 * log10(rms / originalRMS)
+        }
+        let seam = 120.0
+        let before = try gain(three, at: seam - 0.1), after = try gain(four, at: seam + 0.1)
+        #expect(abs(before - after) < 0.3, "\(before) dB before the boundary, \(after) dB after")
+        let first = try gain(four, at: seam + 1.0)
+        #expect(abs(first - 37) < 1.5, "\(first) dB one second into the voice, expected about +37")
+        await pipeline.stop()
+    }
+
     /// A piece replaced (or covered) is deleted with its original; nothing of it is left. Guards
     /// against originals left behind when their piece goes (350 MB for 40 pieces in `.levelled`).
     @Test func aCoveredPieceTakesItsOriginalWithIt() async throws {

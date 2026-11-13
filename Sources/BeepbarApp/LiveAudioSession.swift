@@ -360,8 +360,13 @@ actor LiveAudioPipeline {
     /// that share a keypoint render the same curve on both sides of their seam, whatever audio
     /// each saw and in whatever order they were made (a seek makes segment 3 before 2). Read and
     /// merged in `produceIsolated` with no `await` between, so concurrent segments cannot
-    /// interleave. It dies with the session (`stop`).
+    /// interleave. It dies with the session (`stop`). A value that is a provisional `neutral`
+    /// (`VoiceLeveler.Resolution`) is kept the same way, and so never changes either, but it is
+    /// listed in `provisionalKeypoints` and anchors no other keypoint: the climb to a voice that
+    /// follows a long opening silence happens in the silence.
     private var keypointGains: [Int: Double] = [:]
+    /// The keypoints of `keypointGains` that are provisional; written and cleared with it.
+    private var provisionalKeypoints: Set<Int> = []
 
     init(stream: URL, ffmpeg: URL, folder: URL, parent: URL, fetcher: LiveAudioFetching, runner: LiveAudioProcessRunning,
          isolator: LiveAudioVoiceIsolating? = nil, kind: AudioEnhancementKind = .isolated,
@@ -438,6 +443,7 @@ actor LiveAudioPipeline {
         isolating = [:]
         pieces = [:]
         keypointGains = [:]
+        provisionalKeypoints = []
         fetcher.close()
         try? FileManager.default.removeItem(at: folder)
     }
@@ -546,8 +552,12 @@ actor LiveAudioPipeline {
         // No `await` from here to the end of the merge: the memo is read and written in one
         // turn, so a segment made at the same time cannot decide a shared keypoint differently.
         let wanted = leveler.keypoints(covering: AudioEnhancement.samplePosition(start)..<AudioEnhancement.samplePosition(end))
-        let resolved = leveler.gains(for: wanted, detector: detector, known: keypointGains)
-        for (k, gain) in resolved where keypointGains[k] == nil { keypointGains[k] = gain }
+        let resolution = leveler.resolve(for: wanted, detector: detector, known: keypointGains, provisional: provisionalKeypoints)
+        let resolved = resolution.gains
+        for (k, gain) in resolved where keypointGains[k] == nil {
+            keypointGains[k] = gain
+            if resolution.provisional.contains(k) { provisionalKeypoints.insert(k) }
+        }
         // What `level` is handed: the keypoints this segment resolved, and every one already
         // used inside the clip, so its pre-roll gets the gains it was rendered with.
         var handed = resolved

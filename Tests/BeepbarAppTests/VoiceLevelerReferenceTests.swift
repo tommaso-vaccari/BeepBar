@@ -52,6 +52,84 @@ struct VoiceLevelerReferenceTests {
         return Array(out[(start - clipStart)..<(end - clipStart)])
     }
 
+    /// `render` with the session's provisional set (`VoiceLeveler.resolve`), as `produceIsolated`
+    /// uses it: a provisional `neutral` stays in the memo, never recomputed, and anchors nothing.
+    static func renderKeepingProvisional(_ signal: [Float], from start: Int, to end: Int, memo: inout [Int: Double], provisional: inout Set<Int>, withPrevious: Bool) -> [Float] {
+        let leveler = VoiceLeveler()
+        let clipStart = withPrevious ? max(0, start - AudioEnhancement.levelLead) : start
+        let clipEnd = min(signal.count, end + AudioEnhancement.levelTail)
+        let clip = VoiceLeveler.Clip(samples: Array(signal[clipStart..<clipEnd]), start: clipStart)
+        let resolution = leveler.resolve(for: leveler.keypoints(covering: start..<end), detector: clip, known: memo, provisional: provisional)
+        for (k, gain) in resolution.gains where memo[k] == nil {
+            memo[k] = gain
+            if resolution.provisional.contains(k) { provisional.insert(k) }
+        }
+        var handed = resolution.gains
+        for (k, gain) in memo where handed[k] == nil {
+            let t = Int((Double(k) * leveler.spacing * Double(VoiceLeveler.rate)).rounded())
+            if t >= clip.start && t <= clip.end { handed[k] = gain }
+        }
+        let out = leveler.level(clip, gains: handed)
+        return Array(out[(start - clipStart)..<(end - clipStart)])
+    }
+
+    /// A lecture recorded before it began: a long silence, then a voice at −60 dBFS. Rendered in
+    /// 30 s segments with the session's memo (including provisional keypoints), the gain applied
+    /// 1.8 s after the voice starts (inside its second burst) is the whole render's, +40 dB,
+    /// within 1 dB; the gain at every nonsilent sample is the whole render's within 1 dB; a
+    /// keypoint, once used, is never changed by a later segment; and at each segment boundary
+    /// that falls inside the voice the gain just before and just after differ by less than
+    /// 0.3 dB (`onset` 119 puts the 120 s boundary there). Guards against a first segment's
+    /// provisional 0 dB being held through the silence that follows, so that the first words of a
+    /// quiet lecture come out up to 40 dB too low and the gain climbs during them (before the
+    /// correction: about +7 dB at that instant), and against fixing that by recomputing a
+    /// keypoint, which would put a step at a seam.
+    @Test(arguments: [120.0, 119.0]) func aLongSilenceBeforeTheVoiceLevelsFromTheFirstWords(onset: Double) {
+        let lecture = Self.lecture([(onset, nil), (180 - onset, -60)])
+        let whole = lecture
+        var wholeMemo: [Int: Double] = [:]
+        let reference = Self.render(whole, from: 0, to: whole.count, memo: &wholeMemo, withPrevious: false)
+
+        var produced: [Float] = []
+        var memo: [Int: Double] = [:]
+        var provisional: Set<Int> = []
+        var start = 0
+        let length = Self.seconds(30)
+        while start < whole.count {
+            let end = min(whole.count, start + length)
+            let before = memo
+            produced += Self.renderKeepingProvisional(whole, from: start, to: end, memo: &memo, provisional: &provisional, withPrevious: start > 0)
+            for (k, gain) in before { #expect(memo[k] == gain, "keypoint \(k) changed after it was used") }
+            start = end
+        }
+        #expect(produced.count == whole.count)
+
+        func gain(_ out: [Float], _ at: Int) -> Double { 20 * log10(Double(out[at] / whole[at])) }
+        /// The nearest sample with a signal, searching in `direction`.
+        func nearest(_ from: Int, _ direction: Int) -> Int {
+            var i = from
+            while whole[i] == 0 { i += direction }
+            return i
+        }
+        let probe = nearest(Self.seconds(onset + 1.8), 1)
+        #expect(abs(gain(reference, probe) - 40) < 1, "the whole render: \(gain(reference, probe)) dB")
+        #expect(abs(gain(produced, probe) - gain(reference, probe)) < 1, "\(gain(produced, probe)) dB in segments, \(gain(reference, probe)) dB whole")
+
+        var worst = 0.0
+        for i in stride(from: Self.seconds(onset), to: whole.count, by: 97) where whole[i] != 0 {
+            worst = max(worst, abs(gain(produced, i) - gain(reference, i)))
+        }
+        #expect(worst < 1, "largest difference from the whole render \(worst) dB")
+
+        var checkedSeams = 0
+        for seam in stride(from: Self.seconds(30), to: whole.count, by: Self.seconds(30)) where seam > Self.seconds(onset) {
+            let a = nearest(seam - 1, -1), b = nearest(seam, 1)
+            #expect(abs(gain(produced, a) - gain(produced, b)) < 0.3, "step at \(seam / Self.rate) s")
+            checkedSeams += 1
+        }
+        #expect(checkedSeams >= 1)
+    }
+
     /// Forward play equals the whole lecture: cut into segments (30 s, and 29.7 s so their
     /// boundaries are off the 10 s keypoint grid), each rendered in order from its own clip with
     /// the carried memo, the output has the prototype's gain on every sample within 0.01 dB

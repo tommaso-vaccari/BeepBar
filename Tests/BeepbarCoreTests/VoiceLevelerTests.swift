@@ -187,6 +187,40 @@ struct VoiceLevelerTests {
         #expect(leveler.gains(for: 540...541, detector: clip, known: [0: 40, 539: 7.5]) == [540: 7.5, 541: 7.5])
     }
 
+    /// Provisional keypoints (`resolve`): a provisional `neutral` requested again comes back
+    /// unchanged and is still marked; it does not anchor a later keypoint in silence when a
+    /// voice follows in the clip (that one takes the voice's gain, not the 0 dB); with no voice
+    /// ahead and no firm known value the result is `neutral` and is marked provisional; a firm
+    /// known value anchors as before. Guards against a lecture that opens with a long silence
+    /// held at 0 dB through the silence before its first words (the gain then climbed to the
+    /// voice's during them), and against a provisional value being recomputed (a step at a seam).
+    @Test func aProvisionalKeypointAnchorsNothing() {
+        let leveler = VoiceLeveler()
+        // Silence, then speech at −40 dBFS (+20 dB) from 40 s: keypoint 5's window (38–50 s) has
+        // 10 s of voice, so keypoints 1...4 are silent holds and 5 measures.
+        let clip = VoiceLeveler.Clip(samples: Self.lecture([(40, nil), (30, -40)]), start: 0)
+        let known: [Int: Double] = [0: 0]
+
+        let again = leveler.resolve(for: 0...0, detector: clip, known: known, provisional: [0])
+        #expect(again.gains == [0: 0] && again.provisional == [0], "a provisional value requested again")
+
+        let provisionalAnchor = leveler.resolve(for: 1...2, detector: clip, known: known, provisional: [0])
+        #expect(abs(provisionalAnchor.gains[1]! - 20) < 2 && abs(provisionalAnchor.gains[2]! - 20) < 2, "\(provisionalAnchor.gains)")
+        #expect(provisionalAnchor.provisional.isEmpty)
+        // The same memory, firm: it anchors, as it always did.
+        let firm = leveler.resolve(for: 1...2, detector: clip, known: known, provisional: [])
+        #expect(firm.gains == [1: 0, 2: 0] && firm.provisional.isEmpty)
+        #expect(leveler.gains(for: 1...2, detector: clip, known: known) == firm.gains, "`gains` is `resolve` without provisional keypoints")
+
+        // No voice anywhere ahead, only a provisional value known: neutral again, provisional.
+        let silent = VoiceLeveler.Clip(samples: Self.speech(seconds: 60, dB: -40, silent: true), start: 0)
+        let none = leveler.resolve(for: 1...2, detector: silent, known: [0: 0], provisional: [0])
+        #expect(none.gains == [1: 0, 2: 0] && none.provisional == [1, 2], "\(none)")
+        // A firm known value elsewhere is what the unanchored rule takes, and it is not provisional.
+        let elsewhere = leveler.resolve(for: 1...1, detector: silent, known: [0: 0, 30: 9], provisional: [0])
+        #expect(elsewhere.gains == [1: 9] && elsewhere.provisional.isEmpty, "\(elsewhere)")
+    }
+
     // MARK: Applying
 
     /// A jump from −60 to −15 dBFS under a +40 dB keypoint gain (the gain was right for the

@@ -2728,12 +2728,14 @@ struct RecordingsControllerTests {
         let menu = try #require(RecordingPlayerPolicy.audioMenu(world.player.audioState))
         #expect(menu.items.map(\.checked) == [true, false, false], "Spento is not the one checked")
         #expect(menu.detail?.title == message.text)
+        await drainTasks()
 
         let sessions = world.liveSessions.count
         _ = await playing(controller, "other")
         #expect(world.liveSessions.count == sessions + 1, "the next lecture did not try the saved mode")
         #expect(world.liveSessions.last?.kind == .levelled)
         controller.turnOff()
+        await drainTasks()
     }
 
     /// The filter failing before the lecture ever played (the window closes itself): the lecture

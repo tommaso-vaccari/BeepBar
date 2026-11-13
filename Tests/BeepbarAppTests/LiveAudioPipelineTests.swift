@@ -202,7 +202,8 @@ private final class FakeIsolator: LiveAudioVoiceIsolating, @unchecked Sendable {
     /// real isolator does when it dies or is cancelled mid-write; `gates` also hold `"written-<name>"`,
     /// the moment after the output is on disk.
     /// With `oversized`, the output for that decoded file has that many samples whatever was asked
-    /// for: a piece long enough that the original's copy takes many blocks, so a test can end it midway.
+    /// for, as silence (a long tone would take seconds to build): a piece long enough that the
+    /// original's copy takes many blocks, so a test can end it midway.
     init(failOnce: Set<String> = [], failAfterWriting: Set<String> = [], amplitude: (@Sendable (Int) -> Float)? = nil, oversized: (name: String, samples: Int)? = nil) {
         failing = failOnce; failingAfterWriting = failAfterWriting; self.amplitude = amplitude; self.oversized = oversized
     }
@@ -223,7 +224,7 @@ private final class FakeIsolator: LiveAudioVoiceIsolating, @unchecked Sendable {
         }
         if lock.withLock({ failing.remove(name) != nil }) { throw Failure() }
         let length = oversized.flatMap { $0.name == name ? $0.samples : nil } ?? count ?? 30 * 48000
-        if let amplitude, let fragment = name.firstMatch(of: /decoded(\d+)/).flatMap({ Int($0.1) }) {
+        if let amplitude, oversized?.name != name, let fragment = name.firstMatch(of: /decoded(\d+)/).flatMap({ Int($0.1) }) {
             let samples = tone(amplitude(fragment), hz: 880, count: length).map { Int16(($0 * 32767).rounded()) }
             try samples.withUnsafeBufferPointer { Data(buffer: $0) }.write(to: output)
         } else {
@@ -568,7 +569,9 @@ struct LiveAudioPipelineTests {
         defer { try? FileManager.default.removeItem(at: parent) }
         let count = LiveAudioPipeline.keptPieces + 6
         let levelled = kind == .levelled
-        let ffmpeg = FakeFFmpeg(originalTone: levelled ? 0.01 : nil)
+        // One second of decoded audio (the original is then padded with silence): the files are
+        // what is counted, and 46 segments of a full-size tone would starve the other suites.
+        let ffmpeg = FakeFFmpeg(originalTone: levelled ? 0.01 : nil, decodeLimit: 48_000)
         var amplitude: (@Sendable (Int) -> Float)?
         if levelled { amplitude = { _ in 0.1 } }
         let pipeline = pipeline(SyntheticWebex(fragments: count), ffmpeg, FakeIsolator(amplitude: amplitude), kind: kind)

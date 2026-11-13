@@ -191,9 +191,15 @@ private final class FakeIsolator: LiveAudioVoiceIsolating, @unchecked Sendable {
     private var missing: [String] = []
     private var failing: Set<String>
     private let amplitude: (@Sendable (Int) -> Float)?
+    private var failingAfterWriting: Set<String>
     /// With `amplitude`, the isolated voice is a 880 Hz sine of the amplitude it gives for the
     /// fragment (the decoded file's name says which), instead of zeros.
-    init(failOnce: Set<String> = [], amplitude: (@Sendable (Int) -> Float)? = nil) { failing = failOnce; self.amplitude = amplitude }
+    /// `failAfterWriting` fails the first call for those decoded files after the output is written, as a
+    /// real isolator does when it dies or is cancelled mid-write; `gates` also hold `"written-<name>"`,
+    /// the moment after the output is on disk.
+    init(failOnce: Set<String> = [], failAfterWriting: Set<String> = [], amplitude: (@Sendable (Int) -> Float)? = nil) {
+        failing = failOnce; failingAfterWriting = failAfterWriting; self.amplitude = amplitude
+    }
     var calls: [String] { lock.withLock { made } }
     /// The decoded file each call was given, with its run number.
     var inputs: [URL] { lock.withLock { given } }
@@ -211,12 +217,14 @@ private final class FakeIsolator: LiveAudioVoiceIsolating, @unchecked Sendable {
         }
         if lock.withLock({ failing.remove(name) != nil }) { throw Failure() }
         let length = count ?? 30 * 48000
-        guard let amplitude, let fragment = name.firstMatch(of: /decoded(\d+)/).flatMap({ Int($0.1) }) else {
+        if let amplitude, let fragment = name.firstMatch(of: /decoded(\d+)/).flatMap({ Int($0.1) }) {
+            let samples = tone(amplitude(fragment), hz: 880, count: length).map { Int16(($0 * 32767).rounded()) }
+            try samples.withUnsafeBufferPointer { Data(buffer: $0) }.write(to: output)
+        } else {
             try Data(count: 2 * length).write(to: output)
-            return
         }
-        let samples = tone(amplitude(fragment), hz: 880, count: length).map { Int16(($0 * 32767).rounded()) }
-        try samples.withUnsafeBufferPointer { Data(buffer: $0) }.write(to: output)
+        if lock.withLock({ failingAfterWriting.remove(name) != nil }) { throw Failure() }
+        try await gates.pass("written-" + name)
     }
 }
 
@@ -400,6 +408,35 @@ struct LiveAudioPipelineTests {
         #expect(isolator.calls.filter { $0 == "decoded6t.wav" }.count == 1, "piece 6 was isolated again")
         #expect(!ffmpeg.hasFinished("out6.ts"))
         isolator.gates.release("decoded6t.wav")
+        await pipeline.stop()
+    }
+
+    /// An isolation that ends after its isolator wrote the piece but before the piece is stored
+    /// (cancelled by a seek away, or the isolator dying mid-write) leaves neither the piece nor an
+    /// original on disk, in both kinds. Guards against a leak of 2.9 MB (5.8 MB more in
+    /// `.levelled`) per abandoned isolation until the player closes.
+    @Test(arguments: [AudioEnhancementKind.isolated, .levelled])
+    func anIsolationEndedBeforeItsPieceIsStoredLeavesNoFile(kind: AudioEnhancementKind) async throws {
+        defer { try? FileManager.default.removeItem(at: parent) }
+        // Cancelled after the isolator wrote the file.
+        let ffmpeg = FakeFFmpeg(originalTone: 0.01)
+        let isolator = FakeIsolator(failAfterWriting: ["decoded0t.wav"], amplitude: { _ in 0.1 })
+        let pipeline = pipeline(SyntheticWebex(fragments: 40), ffmpeg, isolator, kind: kind)
+        // The isolator dying mid-write: segment 0 fails, and the piece it started is gone.
+        await #expect(throws: (any Error).self) { _ = try await pipeline.segment(0) }
+        #expect(!rawFiles("piece").contains { stem($0) == "piece0t.raw" }, "left by a failed isolator: \(rawFiles("piece"))")
+        #expect(!rawFiles("original").contains { stem($0) == "original0t.raw" })
+        _ = try await pipeline.segment(0)
+        isolator.gates.hold("written-decoded6t.wav")
+        let six = Task { try await pipeline.segment(6) }
+        try await eventually("piece 6 written and held") { isolator.gates.isWaiting("written-decoded6t.wav") }
+        #expect(rawFiles("piece").contains { stem($0) == "piece6t.raw" }, "the isolator's output is on disk while it waits")
+        #expect(try await pipeline.segment(20).first == 0x47)
+        try await eventually("piece 6's isolation ended") { !isolator.gates.isWaiting("written-decoded6t.wav") }
+        await #expect(throws: (any Error).self) { _ = try await six.value }
+        #expect(!rawFiles("piece").contains { stem($0) == "piece6t.raw" }, "left by a cancelled isolation: \(rawFiles("piece"))")
+        #expect(!rawFiles("original").contains { stem($0) == "original6t.raw" })
+        isolator.gates.release("written-decoded6t.wav")
         await pipeline.stop()
     }
 

@@ -674,6 +674,12 @@ actor LiveAudioPipeline {
                                                                                firstSample: firstSample, from: from,
                                                                                to: next.map { $0 + AudioEnhancement.isolationTail }, output: decoded.path))
         try Task.checkCancellation()
+        // From here until `store` takes the piece over, a throw (the isolator failing or cancelled
+        // mid-write, a cancellation right after it, a failing `writeOriginal`) must not leave the
+        // file behind: nothing else knows about it. Safe by construction: `runFile` names are
+        // unique per run, so this can only ever delete this run's own file, never another's.
+        var stored = false
+        defer { if !stored { try? FileManager.default.removeItem(at: file) } }
         try await isolator.isolate(decoded, from: start - from, count: next.map { $0 - start }, to: file)
         try Task.checkCancellation()
         let bytes = (try? FileManager.default.attributesOfItem(atPath: file.path)[.size] as? Int) ?? 0
@@ -693,6 +699,7 @@ actor LiveAudioPipeline {
         }
         let piece = IsolatedPiece(index: k, file: file, original: original, start: start, end: start + bytes / 2, hasLead: lead, hasTail: tail || k + 1 == count)
         isolating[serial] = nil
+        stored = true
         store(piece)
         return piece
     }

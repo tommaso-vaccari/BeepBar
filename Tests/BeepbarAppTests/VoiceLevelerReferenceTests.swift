@@ -32,6 +32,8 @@ struct VoiceLevelerReferenceTests {
 
     static let parts: [(Double, Double?)] = [(40, -50), (15, nil), (60, -25), (55, -45)]
     static let whole = lecture(parts)
+    /// The prototype's output on `whole`, made once for the arguments of the test that uses it.
+    static let wholeReference = KeypointLeveler().curve(over: KeypointLeveler.Audio(whole, bootstrap: true)).apply(to: 0..<whole.count)
 
     /// One segment the way `LiveAudioPipeline.produceIsolated` makes it: a clip of the last 22 s
     /// of the previous segment (when it exists), the segment, and the first 10.5 s of the next;
@@ -85,7 +87,9 @@ struct VoiceLevelerReferenceTests {
     /// correction: about +7 dB at that instant), and against fixing that by recomputing a
     /// keypoint, which would put a step at a seam.
     @Test(arguments: [120.0, 119.0]) func aLongSilenceBeforeTheVoiceLevelsFromTheFirstWords(onset: Double) {
-        let lecture = Self.lecture([(onset, nil), (180 - onset, -60)])
+        // The silence is zeros, not generated noise at −120 dB: a minute of samples through the
+        // generator costs seconds in a debug build and the silence's values are all zero anyway.
+        let lecture = [Float](repeating: 0, count: Self.seconds(onset)) + Self.lecture([(180 - onset, -60)])
         let whole = lecture
         var wholeMemo: [Int: Double] = [:]
         let reference = Self.render(whole, from: 0, to: whole.count, memo: &wholeMemo, withPrevious: false)
@@ -140,7 +144,7 @@ struct VoiceLevelerReferenceTests {
     @Test(arguments: [30.0, 29.7]) func forwardPlayEqualsTheWholeLecture(segment: Double) {
         let whole = Self.whole
         #expect(whole.count >= Self.seconds(150))
-        let reference = KeypointLeveler().curve(over: KeypointLeveler.Audio(whole, bootstrap: true)).apply(to: 0..<whole.count)
+        let reference = Self.wholeReference
 
         var produced: [Float] = []
         var memo: [Int: Double] = [:]

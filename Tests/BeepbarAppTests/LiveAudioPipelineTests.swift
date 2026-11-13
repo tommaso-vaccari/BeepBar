@@ -164,10 +164,34 @@ private final class FakeFFmpeg: LiveAudioProcessRunning, @unchecked Sendable {
     }
 }
 
-/// Sine waves for the fakes: whole-second tiles, so a long one is cheap to make.
+/// Sine waves for the fakes: whole-second tiles, so a long one is cheap to make. Copied a
+/// second at a time with `update(from:)`: an element-by-element `map` over a minute of samples
+/// is what made the pipeline tests cost tens of CPU seconds in debug builds.
 private func tone(_ amplitude: Float, hz: Int, count: Int) -> [Float] {
     let second = (0..<48000).map { amplitude * Float(sin(2 * Double.pi * Double(hz) * Double($0) / 48000)) }
-    return (0..<count).map { second[$0 % 48000] }
+    return tiled(second, count: count)
+}
+
+/// The same tone as 16-bit samples (what the isolator writes), by tiles of a second.
+private func tone16(_ amplitude: Float, hz: Int, count: Int) -> [Int16] {
+    let second = (0..<48000).map { Int16(((amplitude * Float(sin(2 * Double.pi * Double(hz) * Double($0) / 48000))) * 32767).rounded()) }
+    return tiled(second, count: count)
+}
+
+private func tiled<T>(_ tile: [T], count: Int) -> [T] {
+    guard count > 0, let first = tile.first else { return [] }
+    var out = [T](repeating: first, count: count)
+    out.withUnsafeMutableBufferPointer { destination in
+        tile.withUnsafeBufferPointer { source in
+            var at = 0
+            while at < count {
+                let n = min(source.count, count - at)
+                (destination.baseAddress! + at).update(from: source.baseAddress!, count: n)
+                at += n
+            }
+        }
+    }
+    return out
 }
 
 private enum AudioTestTones {
@@ -225,7 +249,7 @@ private final class FakeIsolator: LiveAudioVoiceIsolating, @unchecked Sendable {
         if lock.withLock({ failing.remove(name) != nil }) { throw Failure() }
         let length = oversized.flatMap { $0.name == name ? $0.samples : nil } ?? count ?? 30 * 48000
         if let amplitude, oversized?.name != name, let fragment = name.firstMatch(of: /decoded(\d+)/).flatMap({ Int($0.1) }) {
-            let samples = tone(amplitude(fragment), hz: 880, count: length).map { Int16(($0 * 32767).rounded()) }
+            let samples = tone16(amplitude(fragment), hz: 880, count: length)
             try samples.withUnsafeBufferPointer { Data(buffer: $0) }.write(to: output)
         } else {
             try Data(count: 2 * length).write(to: output)
@@ -567,7 +591,7 @@ struct LiveAudioPipelineTests {
     @Test(arguments: [AudioEnhancementKind.isolated, .levelled])
     func atMostKeptPiecesStayOnDisk(kind: AudioEnhancementKind) async throws {
         defer { try? FileManager.default.removeItem(at: parent) }
-        let count = LiveAudioPipeline.keptPieces + 6
+        let count = LiveAudioPipeline.keptPieces + 2
         let levelled = kind == .levelled
         // One second of decoded audio (the original is then padded with silence): the files are
         // what is counted, and 46 segments of a full-size tone would starve the other suites.

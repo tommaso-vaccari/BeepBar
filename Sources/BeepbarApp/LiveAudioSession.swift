@@ -772,11 +772,16 @@ actor LiveAudioPipeline {
         let data = try handle.read(upToCount: take * width) ?? Data()
         var samples = [Float](repeating: 0, count: take)
         let available = min(take, data.count / width)
+        // `while` loops on purpose: a segment converts millions of samples here and a `for` over a
+        // range costs ten times as much in a debug build, where the pipeline tests run.
         data.withUnsafeBytes { raw in
-            if float {
-                for i in 0..<available { samples[i] = raw.loadUnaligned(fromByteOffset: i * 4, as: Float.self) }
-            } else {
-                for i in 0..<available { samples[i] = Float(Int16(littleEndian: raw.loadUnaligned(fromByteOffset: i * 2, as: Int16.self))) / 32768 }
+            samples.withUnsafeMutableBufferPointer { out in
+                var i = 0
+                if float {
+                    while i < available { out[i] = raw.loadUnaligned(fromByteOffset: i * 4, as: Float.self); i += 1 }
+                } else {
+                    while i < available { out[i] = Float(Int16(littleEndian: raw.loadUnaligned(fromByteOffset: i * 2, as: Int16.self))) / 32768; i += 1 }
+                }
             }
         }
         return samples

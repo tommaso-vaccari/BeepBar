@@ -516,24 +516,32 @@ struct LiveAudioPipelineTests {
     @Test func levelledKindAppliesTheGainToTheOriginal() async throws {
         defer { try? FileManager.default.removeItem(at: parent) }
         let ffmpeg = FakeFFmpeg(originalTone: 0.01)
-        let pipeline = pipeline(SyntheticWebex(fragments: 4), ffmpeg, FakeIsolator(amplitude: { _ in 0.1 }), kind: .levelled)
+        let pipeline = pipeline(SyntheticWebex(fragments: 5), ffmpeg, FakeIsolator(amplitude: { _ in 0.1 }), kind: .levelled)
         _ = try await pipeline.segment(1)
-        let pieces = rawFiles("piece"), originals = rawFiles("original")
-        #expect(!pieces.isEmpty)
-        for piece in pieces {
-            let wanted = stem(piece).replacingOccurrences(of: "piece", with: "original")
-            let original = try #require(originals.first { stem($0) == wanted }, "\(piece) has no original")
-            #expect(size(original) == 2 * size(piece), "\(piece): \(size(piece)) bytes, \(original): \(size(original))")
+        // The pieces the pipeline keeps (it may still be making the next one in the background,
+        // so the folder's listing is not a stable thing to read).
+        var checked = 0
+        let folder = parent.appendingPathComponent("session")
+        for k in 0..<4 {
+            guard let flags = await pipeline.keptPiece(k) else { continue }
+            checked += 1
+            let suffix = "\(k)" + (flags.hasLead ? "l" : "") + (flags.hasTail ? "t" : "")
+            let pieceFile = try #require(rawFiles("piece").first { stem($0) == "piece\(suffix).raw" }, "piece \(suffix) is not on disk")
+            let originalFile = try #require(rawFiles("original").first { stem($0) == "original\(suffix).raw" }, "piece \(suffix) has no original")
+            let piece = (file: folder.appendingPathComponent(pieceFile), original: folder.appendingPathComponent(originalFile))
+            func bytes(_ url: URL) -> Int { (try? FileManager.default.attributesOfItem(atPath: url.path)[.size] as? Int) ?? 0 }
+            #expect(bytes(piece.original) == 2 * bytes(piece.file), "piece \(suffix): \(bytes(piece.file)) bytes, original: \(bytes(piece.original))")
             // The original is the decoded tone with no gap: `AVAudioFile.read` returns a few frames
             // short of what it is asked, and a copy that took that for the end left 11 silent samples
             // in every 65 536 (the sine of the fake has a lone exact zero at most every second).
-            let bytes = try Data(contentsOf: parent.appendingPathComponent("session").appendingPathComponent(original))
-            let values = bytes.withUnsafeBytes { Array($0.bindMemory(to: Float.self)) }
+            let values = try Data(contentsOf: piece.original).withUnsafeBytes { Array($0.bindMemory(to: Float.self)) }
             var run = 0, longest = 0
             for value in values { run = value == 0 ? run + 1 : 0; longest = max(longest, run) }
-            #expect(longest < 3, "\(original): \(longest) samples of silence in a row")
+            #expect(longest < 3, "piece \(suffix): \(longest) samples of silence in a row")
         }
-        #expect(rawFiles("levelled").isEmpty, "temporary file left: \(rawFiles("levelled"))")
+        #expect(checked >= 2, "the segment's piece and the next one are kept")
+        // Only this segment's own: the pipeline may already be making the next one in the background.
+        #expect(!rawFiles("levelled").contains { stem($0) == "levelled1.raw" }, "temporary file left: \(rawFiles("levelled"))")
         let data = try #require(ffmpeg.encode("out1.ts")?.levelled)
         // 100 ms in the middle of the segment, in a clip that starts at the previous fragment's end - 22 s at most.
         let middle = data.count / 4 / 2
@@ -582,7 +590,12 @@ struct LiveAudioPipelineTests {
         _ = await six.value
         try await eventually("the covered piece and its original deleted") { !pieceFiles.contains("piece6.raw") && !rawFiles("original").contains { stem($0) == "original6.raw" } }
         #expect(rawFiles("original").contains { stem($0) == "original6l.raw" })
-        #expect(rawFiles("original").count == rawFiles("piece").count, "an original without a piece or the other way round")
+        // No original outlives its piece. (The converse is not asserted: an isolation cancelled
+        // after its piece was written leaves that piece behind, as it did before originals existed.)
+        try await eventually("no original left without its piece") {
+            Set(rawFiles("original").map { stem($0).replacingOccurrences(of: "original", with: "") })
+                .isSubset(of: Set(rawFiles("piece").map { stem($0).replacingOccurrences(of: "piece", with: "") }))
+        }
         await pipeline.stop()
     }
 
@@ -594,7 +607,8 @@ struct LiveAudioPipelineTests {
         let pipeline = pipeline(SyntheticWebex(fragments: 3), ffmpeg, FakeIsolator(amplitude: { _ in 0.1 }), kind: .levelled)
         await #expect(throws: (any Error).self) { try await pipeline.segment(0) }
         #expect(ffmpeg.failedAll)
-        #expect(rawFiles("levelled").isEmpty, "left behind: \(rawFiles("levelled"))")
+        // The failed segment's own file (the pipeline may be making another one in the background).
+        #expect(!rawFiles("levelled").contains { stem($0) == "levelled0.raw" }, "left behind: \(rawFiles("levelled"))")
         await pipeline.stop()
     }
 

@@ -175,14 +175,28 @@ public struct VoiceLeveler: Sendable {
         var voiced: [Double] = []
         clip.samples.withUnsafeBufferPointer { p in
             for lo in starts {
-                var energy = 0.0
-                for j in (lo - clip.start)..<(lo - clip.start + frame) { energy += Double(p[j]) * Double(p[j]) }
+                let energy = Self.energy(p, from: lo - clip.start, count: frame)
                 let level = max(-120, 10 * log10(energy / Double(frame) + 1e-20))
                 if level > silenceFloor { voiced.append(level) }
             }
         }
         guard Double(voiced.count) / Double(starts.count) >= minVoiced else { return .hold }
         return .gain(max(minGain, min(maxGain, target - Self.percentile(voiced, percentile))))
+    }
+
+    /// The sum of squares of `count` samples from `from`. A `while` loop on purpose: it visits
+    /// every sample of a minute of audio, and a `for` over a range costs ten times as much in a
+    /// debug build, which is what the tests run (see the pipeline tests).
+    private static func energy(_ p: UnsafeBufferPointer<Float>, from: Int, count: Int) -> Double {
+        var energy = 0.0
+        var j = from
+        let end = from + count
+        while j < end {
+            let x = Double(p[j])
+            energy += x * x
+            j += 1
+        }
+        return energy
     }
 
     /// Linear-interpolated percentile of `values`, `p` in 0...1 (the definition the prototype was
@@ -237,9 +251,7 @@ public struct VoiceLeveler: Sendable {
         signal.samples.withUnsafeBufferPointer { p in
             for b in firstBlock..<max(firstBlock, endBlock) {
                 let from = b * block - signal.start
-                var energy = 0.0
-                for j in from..<(from + block) { energy += Double(p[j]) * Double(p[j]) }
-                energies[b - firstBlock] = energy
+                energies[b - firstBlock] = Self.energy(p, from: from, count: block)
             }
         }
         func localLevel(_ m: Int) -> Double {
@@ -257,7 +269,8 @@ public struct VoiceLeveler: Sendable {
         for m in firstInstant...lastInstant {
             var top = -120.0
             let at = m - (firstInstant - held + 1)
-            for j in 0..<held { top = max(top, levels[at - j]) }
+            var j = 0
+            while j < held { top = max(top, levels[at - j]); j += 1 }
             ceilings[m - firstInstant] = target + ceilingHeadroom - top
         }
 
@@ -275,14 +288,18 @@ public struct VoiceLeveler: Sendable {
                     let slope = (g1 - g0) / Double(t1 - t0)
                     let a = ceilings[m - firstInstant], b = ceilings[m + 1 - firstInstant]
                     let ceilingSlope = (b - a) / Double(block)
-                    for i in tau..<stop {
+                    // A `while` loop (`for` over a range costs ten times as much in a debug build).
+                    var i = tau
+                    while i < stop {
                         // Digital silence (what isolation leaves in pauses) stays silence: no gain
                         // to compute, and a pause is a large share of a lecture.
                         let x = input[i - signal.start]
-                        if x == 0 { continue }
-                        let key = g0 + slope * Double(i - t0)
-                        let cap = a + ceilingSlope * Double(i - m * block)
-                        output[i - signal.start] = x * Float(exp(min(key, cap) * decibelsToNeper))
+                        if x != 0 {
+                            let key = g0 + slope * Double(i - t0)
+                            let cap = a + ceilingSlope * Double(i - m * block)
+                            output[i - signal.start] = x * Float(exp(min(key, cap) * decibelsToNeper))
+                        }
+                        i += 1
                     }
                     tau = stop
                 }

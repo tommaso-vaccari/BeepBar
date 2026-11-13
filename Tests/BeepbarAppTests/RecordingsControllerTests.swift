@@ -2768,7 +2768,7 @@ struct RecordingsControllerTests {
         world.player.failBeforeReady()
         #expect(world.player.plays.last?.url == stream(lecture.id).url)
         #expect(world.player.plays.last?.startAt == start)
-        #expect(world.player.audioState == .off, "marked as failed: \(String(describing: world.player.audioState))")
+        #expect(world.player.audioState == .off(preferred: .isolated), "marked as failed: \(String(describing: world.player.audioState))")
         await drainTasks()
         #expect(world.opened.isEmpty, "the browser opened")
         let sessions = world.liveSessions.count

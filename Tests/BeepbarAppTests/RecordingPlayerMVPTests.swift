@@ -3,6 +3,7 @@ import AppKit
 import Foundation
 import os
 import Testing
+import BeepbarCore
 @testable import BeepbarApp
 
 // MARK: Test doubles

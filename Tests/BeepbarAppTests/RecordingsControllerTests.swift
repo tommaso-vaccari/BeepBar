@@ -2697,6 +2697,45 @@ struct RecordingsControllerTests {
         controller.turnOff()
     }
 
+    /// A mode that started and then failed on its lecture: from `.isolated` to `.levelled`, the
+    /// new session reports `.unavailable` and the player fails. The mode is saved the moment its
+    /// session started (as the old switch was), so the key says `levelled`; the menu checks
+    /// "Spento" and gives the reason; the next lecture starts a `.levelled` session again. This
+    /// is the case that `docs/sync-behavior` separates from a mode that cannot even start (the
+    /// choice then does not change). Guards against a failure after the start that quietly
+    /// restores the previous mode in the preferences, and a next lecture that forgets the choice.
+    @Test func aModeThatStartsThenFailsStaysSavedAndIsTriedOnTheNextLecture() async throws {
+        defer { cleanUp() }
+        world.ffmpeg = fakeFFmpegPath
+        let controller = await readyController()
+        let lecture = await playing(controller, "audio")
+        world.player.chooseAudio(.use(.isolated))
+        world.player.chooseAudio(.use(.levelled))
+        let session = try #require(world.liveSessions.last)
+        #expect(session.kind == .levelled)
+
+        session.onFailure(.unavailable)
+        world.player.failDuringPlayback(at: 300)
+        #expect(session.isStopped)
+        #expect(world.player.plays.last?.url == stream(lecture.id).url)
+        #expect(defaults.string(forKey: RecordingsController.enhancedAudioKindKey) == "levelled")
+        #expect(defaults.bool(forKey: RecordingsController.prefersEnhancedAudioKey))
+        guard case .failed(let message, let preferred) = world.player.audioState else {
+            Issue.record("the menu doesn't say it failed: \(String(describing: world.player.audioState))")
+            return
+        }
+        #expect(preferred == .levelled)
+        let menu = try #require(RecordingPlayerPolicy.audioMenu(world.player.audioState))
+        #expect(menu.items.map(\.checked) == [true, false, false], "Spento is not the one checked")
+        #expect(menu.detail?.title == message.text)
+
+        let sessions = world.liveSessions.count
+        _ = await playing(controller, "other")
+        #expect(world.liveSessions.count == sessions + 1, "the next lecture did not try the saved mode")
+        #expect(world.liveSessions.last?.kind == .levelled)
+        controller.turnOff()
+    }
+
     /// The filter failing before the lecture ever played (the window closes itself): the lecture
     /// opens again on Webex's stream from where it was going to start, not from the beginning.
     @Test func aFilterFailingBeforeReadyPlaysTheStreamFromTheSameStart() async throws {

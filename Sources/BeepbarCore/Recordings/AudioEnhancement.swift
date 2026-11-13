@@ -91,8 +91,14 @@ public enum AudioEnhancement {
     /// - `alimiter`: peaks held near −2 dBFS, so the AAC encoder never clips; `latency=1` takes
     ///   back its 5 ms look-ahead, which would otherwise move the voice 240 samples late.
     ///
-    /// No `speechnorm`, no gate, no `afftdn`. Measured on 2026-11-12 on six real excerpts:
-    /// −15.0 to −16.9 LUFS, limiter reduction p99 at most 1.6 dB. `afftdn` after the gain changed
+    /// No `speechnorm`, no gate, no `afftdn`. Measured on six real excerpts, per kind:
+    /// - `.isolated` (the gain applied to the isolated voice): −16.3 to −18.1 LUFS, limiter
+    ///   reduction p99 at most 1.6 dB (`docs/benchmarks.md`, "Enhanced audio: keypoint leveler
+    ///   (round 3)", compressor K17);
+    /// - `.levelled` (the gain detected on the isolated voice, applied to the original): −15.0 to
+    ///   −16.9 LUFS, limiter reduction p99 at most 1.4 dB (round 4, measured 2026-11-12).
+    ///
+    /// `afftdn` after the gain changed
     /// the noise in the pauses by nothing, and before the gain it cost word endings; the gate
     /// and `speechnorm` were what cut the voice in the chain this replaces.
     public static let levelledChain = "highpass=f=90,lowpass=f=10000,equalizer=f=250:t=q:w=1:g=-2,equalizer=f=3000:t=q:w=1.4:g=3,acompressor=threshold=0.08:ratio=3:attack=1:release=100:knee=6:makeup=4.52,alimiter=limit=0.8:level=disabled:latency=1"

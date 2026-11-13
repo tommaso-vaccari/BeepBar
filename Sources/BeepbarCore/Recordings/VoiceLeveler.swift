@@ -30,7 +30,13 @@ import Foundation
 ///   the keypoint) is measured on what is there when at least `minFrames` frames remain. With
 ///   fewer, the window looks *forward* from the clip's first sample instead (the audio the
 ///   render has is the audio after it), so the gain is right from the first sample and not
-///   neutral. With fewer than `minFrames` there too, the keypoint is unmeasurable.
+///   neutral. That bootstrap is only for a keypoint inside the clip or at most one `spacing`
+///   before its first sample: a keypoint further back is unmeasurable. Otherwise a hold chain
+///   starting in a clip that opens with silence would walk back keypoint by keypoint, each one
+///   "measurable" through the same forward window (hundreds of identical measures after a seek
+///   deep into a lecture, run on the actor), and end on a stale `known` gain from far back
+///   instead of the first measurable keypoint ahead. With fewer than `minFrames` forward too,
+///   the keypoint is unmeasurable.
 /// - A keypoint that is mostly silence (fewer than `minVoiced` of its frames voiced) *holds*:
 ///   it takes the previous keypoint's gain. A break must not be lifted into noise. The hold is
 ///   resolved recursively by the same rules (known first, then measured), for as long as the
@@ -148,8 +154,10 @@ public struct VoiceLeveler: Sendable {
         return result
     }
 
-    /// Keypoint `k`'s window on `clip`: the 30 frames ending at its position, or the 30 after the
-    /// clip's first sample (see the type's docs). Frame `i` is `[t − (i+1)F, t − iF)`.
+    /// Keypoint `k`'s window on `clip`: the 30 frames ending at its position, or, when fewer than
+    /// `minFrames` of those exist and the keypoint is not more than one `spacing` before the
+    /// clip's first sample, the 30 after that sample (see the type's docs: bounded work per call,
+    /// and no stale gain from far back). Frame `i` is `[t − (i+1)F, t − iF)`.
     private func measure(_ k: Int, in clip: Clip) -> Measure {
         let frame = Self.frameLength
         let frames = Int(window * Double(Self.rate)) / frame
@@ -163,6 +171,8 @@ public struct VoiceLeveler: Sendable {
             starts.append(lo)
         }
         if starts.count < Self.minFrames {
+            // The forward bootstrap is for the keypoints at the clip's start only.
+            guard t + Int(step.rounded()) >= clip.start else { return .unmeasurable }
             starts = []
             for j in 0..<frames {
                 let lo = clip.start + j * frame

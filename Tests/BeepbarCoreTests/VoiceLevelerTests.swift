@@ -168,6 +168,25 @@ struct VoiceLevelerTests {
         #expect(leveler.gains(for: 0...1, detector: silent, known: [:]) == [0: 3, 1: 3], "nothing to go on: neutral")
     }
 
+    /// A clip far into the lecture (keypoint 540) that opens with 15 s of silence: the keypoints in
+    /// that silence take the first keypoint ahead that measures (speech at −40 dBFS, +20), not
+    /// the stale `known` gain of the lecture's first minute (+40), and the work is bounded (the
+    /// forward bootstrap reaches at most one spacing before the clip, so the hold chain stops at
+    /// keypoint 538 instead of walking back 540 keypoints through the same forward window). With the
+    /// keypoint right before them known, the hold still takes it. Guards against a hold chain
+    /// that ends on a gain from minutes ago, and against unbounded work on the actor after a seek.
+    @Test func aSilentStartFarIntoTheLectureDoesNotReachBackToAStaleGain() {
+        let leveler = VoiceLeveler()
+        let start = 5400 * Self.rate
+        let clip = VoiceLeveler.Clip(samples: Self.lecture([(15, nil), (40, -40)]), start: start)
+        let gains = leveler.gains(for: 540...541, detector: clip, known: [0: 40])
+        #expect(abs(gains[540]! - 20) < 2, "\(gains[540]!)")
+        #expect(gains[541] == gains[540])
+        // A known keypoint immediately before still anchors the chain (539 is one spacing before
+        // the clip, within the bootstrap's reach; its own value is the known one).
+        #expect(leveler.gains(for: 540...541, detector: clip, known: [0: 40, 539: 7.5]) == [540: 7.5, 541: 7.5])
+    }
+
     // MARK: Applying
 
     /// A jump from −60 to −15 dBFS under a +40 dB keypoint gain (the gain was right for the

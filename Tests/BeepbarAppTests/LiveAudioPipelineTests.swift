@@ -448,8 +448,8 @@ struct LiveAudioPipelineTests {
     }
 
     /// An isolation ended while the original's copy is under way (a seek away, in `.levelled`)
-    /// leaves no `original` file: the half-written copy is deleted. The piece is made long (10
-    /// minutes of isolated output, 440 blocks of copy) and the seek comes as soon as the copy's
+    /// leaves no `original` file: the half-written copy is deleted. The piece is made long (200
+    /// seconds of isolated output, 147 blocks of copy) and the seek comes as soon as the copy's
     /// file exists, so it falls inside the copy. The two failure points the test above covers
     /// both precede the copy, so only this one can fail when the cleanup is removed. Guards
     /// against 5.8 MB per 30 s of audio, up to the whole lecture, left in the temporary folder
@@ -457,7 +457,7 @@ struct LiveAudioPipelineTests {
     @Test func anIsolationEndedWhileTheOriginalIsCopiedLeavesNoOriginal() async throws {
         defer { try? FileManager.default.removeItem(at: parent) }
         let ffmpeg = FakeFFmpeg(originalTone: 0.01)
-        let isolator = FakeIsolator(amplitude: { _ in 0.1 }, oversized: (name: "decoded6t.wav", samples: 28_800_000))
+        let isolator = FakeIsolator(amplitude: { _ in 0.1 }, oversized: (name: "decoded6t.wav", samples: 9_600_000))
         let pipeline = pipeline(SyntheticWebex(fragments: 40), ffmpeg, isolator, kind: .levelled)
         _ = try await pipeline.segment(0)
         let six = Task { try await pipeline.segment(6) }

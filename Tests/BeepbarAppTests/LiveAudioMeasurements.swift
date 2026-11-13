@@ -33,16 +33,18 @@ struct LiveAudioMeasurements {
         return folder
     }
 
-    @Test(arguments: [true, false])
-    func measure(isolation: Bool) async throws {
+    /// One run per variant: the isolated kind with Apple's voice isolation, the levelled kind
+    /// (which also isolates, then levels), and ffmpeg alone (`isolation: false`, no isolator).
+    @Test(arguments: [(true, AudioEnhancementKind.isolated), (true, .levelled), (false, .isolated)])
+    func measure(isolation: Bool, kind: AudioEnhancementKind) async throws {
         let lecture = try Self.lecture()
         let ffmpeg = try #require(AudioEnhancement.locateFFmpeg())
         let steps = Steps()
         let isolator: LiveAudioVoiceIsolating? = isolation ? TimedIsolator(inner: try #require(AppleVoiceIsolator.preferred()), steps: steps) : nil
-        let sessions = Self.folder.appendingPathComponent("sessions-\(isolation)")
+        let sessions = Self.folder.appendingPathComponent("sessions-\(isolation)-\(kind.rawValue)")
         let session = try LiveAudioSession(stream: Self.address, ffmpeg: ffmpeg, onFailure: { _ in },
                                            fetcher: DiskLecture(folder: lecture), runner: TimedRunner(steps: steps),
-                                           isolator: isolator, parent: sessions)
+                                           isolator: isolator, kind: kind, parent: sessions)
         let cpuBefore = (Self.cpu(RUSAGE_SELF), Self.cpu(RUSAGE_CHILDREN))
         let memoryBefore = Self.footprint()
         var peak = memoryBefore
@@ -65,7 +67,7 @@ struct LiveAudioMeasurements {
         try await Task.sleep(for: .seconds(1))
         let leftovers = (try? FileManager.default.contentsOfDirectory(atPath: sessions.path)) ?? []
         print("""
-        MEASURE isolation=\(isolation)
+        MEASURE isolation=\(isolation) kind=\(kind.rawValue)
           waits: \(waits.joined(separator: ", "))
           steps: \(steps.summary)
           cpu: beepbar \(String(format: "%.2f", cpu.0)) s, ffmpeg \(String(format: "%.2f", cpu.1)) s

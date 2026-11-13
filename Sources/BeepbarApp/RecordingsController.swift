@@ -1961,6 +1961,9 @@ struct RecordingsListing: Equatable {
         markOpened(recording)
     }
 
+    /// What `startPlayer` plays after a switch: the filter of `kind`, or nil, Webex's stream.
+    private struct AudioSwitch { let kind: AudioEnhancementKind? }
+
     /// Hands the stream to the player, creating it on first use. The title is the archive's own
     /// (already on the page), not Webex's; the stream address is never logged.
     ///
@@ -1969,9 +1972,6 @@ struct RecordingsListing: Equatable {
     /// Any other call is a stream from Webex (a Play, a recovery), which becomes the lecture's
     /// original; it plays through a new filter instead when the student left "Audio migliorato"
     /// on and the filter hasn't failed for this lecture (so a failing filter can't loop).
-    /// What `startPlayer` plays after a switch: the filter of `kind`, or nil, Webex's stream.
-    private struct AudioSwitch { let kind: AudioEnhancementKind? }
-
     private func startPlayer(_ stream: RecordingStream, for recording: RecmanRecording, startAt: TimeInterval?, enhanced: AudioSwitch? = nil) {
         var played = stream
         if let enhanced {

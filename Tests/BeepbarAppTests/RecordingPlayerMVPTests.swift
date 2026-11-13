@@ -493,7 +493,7 @@ struct RecordingPlayerMVPTests {
 
         controller.showAudioEnhancement(.on(.isolated), recordingID: controller.recordingID)
         #expect(button.state == .on)
-        #expect(button.toolTip?.isEmpty == false)
+        #expect(button.toolTip?.contains(AudioEnhancementKind.isolated.displayName) == true, "the tooltip does not name the mode")
         button.performClick(nil)
         try await Self.waitUntil { asked.count == 2 }
         #expect(asked.last == .use(nil))

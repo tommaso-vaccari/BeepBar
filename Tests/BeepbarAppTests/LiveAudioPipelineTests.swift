@@ -627,11 +627,12 @@ struct LiveAudioPipelineTests {
         _ = await six.value
         try await eventually("the covered piece and its original deleted") { !pieceFiles.contains("piece6.raw") && !rawFiles("original").contains { stem($0) == "original6.raw" } }
         #expect(rawFiles("original").contains { stem($0) == "original6l.raw" })
-        // No original outlives its piece. (The converse is not asserted: an isolation cancelled
-        // after its piece was written leaves that piece behind, as it did before originals existed.)
-        try await eventually("no original left without its piece") {
+        // The files on disk are exactly the pieces and their originals, one for one: no original
+        // outlives its piece, and no piece (an isolation cancelled before its piece was stored
+        // leaves none, `ff72404`) outlives its original.
+        try await eventually("originals and pieces match one for one") {
             Set(rawFiles("original").map { stem($0).replacingOccurrences(of: "original", with: "") })
-                .isSubset(of: Set(rawFiles("piece").map { stem($0).replacingOccurrences(of: "piece", with: "") }))
+                == Set(rawFiles("piece").map { stem($0).replacingOccurrences(of: "piece", with: "") })
         }
         await pipeline.stop()
     }

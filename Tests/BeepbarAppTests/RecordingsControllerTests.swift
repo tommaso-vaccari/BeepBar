@@ -2897,6 +2897,7 @@ struct RecordingsControllerTests {
         #expect(world.player.plays.count == plays)
         #expect({ if case .failed = world.player.audioState { true } else { false } }())
         #expect(!defaults.bool(forKey: RecordingsController.prefersEnhancedAudioKey))
+        #expect(defaults.string(forKey: RecordingsController.enhancedAudioKindKey) == nil, "a kind that never started was remembered")
         controller.turnOff()
     }
 
@@ -5084,10 +5085,6 @@ struct AudioMenuPresentationTests {
     @Test func eachStateShowsItsChoice() throws {
         #expect(RecordingPlayerPolicy.audioMenu(nil) == nil)
         let off = AudioEnhancementKind?.none, levelled = AudioEnhancementKind?.some(.levelled), isolated = AudioEnhancementKind?.some(.isolated)
-        func summary(_ state: AudioEnhancementState) throws -> [String] {
-            let menu = try #require(RecordingPlayerPolicy.audioMenu(state))
-            return menu.items.map { "\($0.checked ? "x" : "-")\($0.action == nil ? "disabled" : "\($0.action!)")" }
-        }
         let titles = try #require(RecordingPlayerPolicy.audioMenu(.off(preferred: .isolated))).items.map(\.title)
         #expect(titles == [tr("Spento", "Off"), tr("Voce livellata", "Levelled voice"), tr("Voce isolata", "Isolated voice")])
         #expect(RecordingPlayerPolicy.audioMenuHeader() == tr("Audio migliorato", "Enhanced audio"))

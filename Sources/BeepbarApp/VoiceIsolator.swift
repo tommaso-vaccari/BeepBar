@@ -87,9 +87,10 @@ struct AppleVoiceIsolator: LiveAudioVoiceIsolating {
         engine.connect(effect, to: engine.mainMixerNode, format: format)
         try engine.enableManualRenderingMode(.offline, format: format, maximumFrameCount: 4096)
         // The standard model is the unit's default, and on macOS 14 the parameter's only value:
-        // set only to ask for the high-quality one. The wet/dry mix is never set: the unit's
-        // default is 100% wet (the isolated voice alone), which is what the app uses.
-        guard model == .standard || AudioUnitSetParameter(effect.audioUnit, kAUSoundIsolationParam_SoundToIsolate, kAudioUnitScope_Global, 0, model.soundType, 0) == noErr
+        // set only to ask for the high-quality one. The wet/dry mix is set to 100% explicitly
+        // (the isolated voice alone), so what is heard never depends on the unit's default.
+        guard model == .standard || AudioUnitSetParameter(effect.audioUnit, kAUSoundIsolationParam_SoundToIsolate, kAudioUnitScope_Global, 0, model.soundType, 0) == noErr,
+              AudioUnitSetParameter(effect.audioUnit, kAUSoundIsolationParam_WetDryMixPercent, kAudioUnitScope_Global, 0, 100, 0) == noErr
         else { throw IsolationError.renderFailed }
         try engine.start()
         defer { engine.stop() }

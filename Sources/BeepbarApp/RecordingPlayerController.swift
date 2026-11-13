@@ -1367,7 +1367,7 @@ enum RecordingPlayerError: Error {
         guard isOpen, let presentation = RecordingPlayerPolicy.audioMenu(audioState) else { return }
         // The item already checked does nothing: it is where the lecture already is.
         let choice = AudioMenuTag.choices.firstIndex(of: tag).flatMap { presentation.items.indices.contains($0) ? presentation.items[$0] : nil }
-        guard let choice, choice.action != nil, !choice.checked, let action = choice.action else { return }
+        guard let choice, !choice.checked, let action = choice.action else { return }
         onAudioAction?(recordingID, action)
     }
 

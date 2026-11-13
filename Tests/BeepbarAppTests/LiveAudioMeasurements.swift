@@ -35,6 +35,13 @@ struct LiveAudioMeasurements {
 
     /// One run per variant: the isolated kind with Apple's voice isolation, the levelled kind
     /// (which also isolates, then levels), and ffmpeg alone (`isolation: false`, no isolator).
+    /// The segments asked for, in order: by default the short sequence the documented timings
+    /// were measured with; with `BEEPBAR_MEASURE_AUDIO_SEGMENTS=all`, the twelve of the whole
+    /// synthetic lecture, to see whether memory stops growing after the first segments.
+    private static var requests: [Int] {
+        ProcessInfo.processInfo.environment["BEEPBAR_MEASURE_AUDIO_SEGMENTS"] == "all" ? Array(0...11) : [0, 1, 2, 8, 1]
+    }
+
     @Test(arguments: [(true, AudioEnhancementKind.isolated), (true, .levelled), (false, .isolated)])
     func measure(isolation: Bool, kind: AudioEnhancementKind) async throws {
         let lecture = try Self.lecture()
@@ -51,14 +58,15 @@ struct LiveAudioMeasurements {
         _ = try await URLSession.shared.data(from: session.playlistURL)
         var waits: [String] = []
         // As the player asks: the first three in order, a seek ahead, a seek back to heard audio.
-        for index in [0, 1, 2, 8, 1] {
+        for index in Self.requests {
             let clock = ContinuousClock.now
             let (data, response) = try await URLSession.shared.data(from: session.playlistURL.deletingLastPathComponent()
                 .appendingPathComponent(AudioEnhancement.segmentName(index)))
             try #require((response as? HTTPURLResponse)?.statusCode == 200 && !data.isEmpty)
             let wait = ContinuousClock.now - clock
-            waits.append("seg\(index) \(Self.ms(wait))")
-            peak = max(peak, Self.footprint())
+            let footprint = Self.footprint()
+            waits.append("seg\(index) \(Self.ms(wait)) \(footprint / 1_048_576) MB")
+            peak = max(peak, footprint)
             // The player plays a while before asking for the next one: lets prefetch finish.
             try await Task.sleep(for: .seconds(3))
         }

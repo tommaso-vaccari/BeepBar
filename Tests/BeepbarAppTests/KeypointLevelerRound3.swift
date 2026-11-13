@@ -370,7 +370,7 @@ extension KeypointLevelerMeasurements {
             let names = ["current", "D1-t0", "D1-m10", "G (round 2)", "no isolation: filterChain", "no isolation: front + D", "D3-m40", "D3-m100", "no isolation: front + D3-m40", "no isolation: front + D3-m100"]
             let renderings = try Self.parallel(names.count) { k -> Rendering in
                 switch k {
-                case 0: return try Self.render(chain: AudioEnhancement.isolatedChain, pregain: nil, raw: raw, path: path)
+                case 0: return try Self.render(chain: AudioQualityMeasurements.chainBeforeLeveler, pregain: nil, raw: raw, path: path)
                 case 1: return try Self.render(chain: d1.chain, pregain: nil, raw: raw, path: path)
                 case 2: return try Self.render(chain: d2.chain, pregain: nil, raw: raw, path: path)
                 case 3: return try Self.render(Self.variants[0], isolated: material.isolated, path: path)
@@ -416,7 +416,7 @@ extension KeypointLevelerMeasurements {
             let material = try await Self.material(n, file, path: path)
             let raw = path.folder.appendingPathComponent("src-\(n)-iso100.raw")
             if !FileManager.default.fileExists(atPath: raw.path) { try AudioTestSignals.writeRaw16(material.isolated, to: raw) }
-            let current = try Self.render(chain: AudioEnhancement.isolatedChain, pregain: nil, raw: raw, path: path)
+            let current = try Self.render(chain: AudioQualityMeasurements.chainBeforeLeveler, pregain: nil, raw: raw, path: path)
             let r2 = try Self.render(Self.variants[0], isolated: material.isolated, path: path)
             let leveled = Self.leveled(material.isolated)
             let nf = Self.noiseFloor(isolated: material.isolated, leveled: leveled)

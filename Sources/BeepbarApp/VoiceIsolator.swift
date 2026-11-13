@@ -4,8 +4,8 @@ import BeepbarCore
 
 /// Runs audio through voice isolation: reads the mono 48 kHz WAV at `input` and writes to
 /// `output` its isolated samples from `first`, `count` of them (to the end when nil), on the
-/// input's own clock, as raw 16-bit little-endian mono (`AudioEnhancement.
-/// isolatedEncodeArguments` joins such pieces). The samples around the kept range are what the
+/// input's own clock, as raw 16-bit little-endian mono (the pieces `LiveAudioPipeline` levels
+/// with `VoiceLeveler` before `AudioEnhancement.levelledEncodeArguments`). The samples around the kept range are what the
 /// voice model hears before and after it (`AudioEnhancement.isolationLead`). Throws
 /// `CancellationError` when the calling task is cancelled.
 protocol LiveAudioVoiceIsolating: Sendable {
@@ -15,8 +15,8 @@ protocol LiveAudioVoiceIsolating: Sendable {
 /// Apple's voice isolation (`AUSoundIsolation`, the audio unit behind FaceTime's Voice
 /// Isolation), run offline on a file: it keeps the voice and removes steady noise, hum and much
 /// of the room's echo, with nothing to download. On a synthetic classroom (`AudioEnhancement.
-/// isolatedChain` has the numbers) it removed steady noise by about 45 dB, against about 15 dB
-/// for ffmpeg's `afftdn`. What it keeps: other people's voices (voice too), and a steady tone
+/// isolatedChain` had the numbers, before the leveler) it removed steady noise by about 45 dB,
+/// against about 15 dB for ffmpeg's `afftdn`. What it keeps: other people's voices (voice too), and a steady tone
 /// as loud as speech (a 100 Hz hum at −27 dB came through unchanged; at −42 dB it went).
 ///
 /// The unit's delay: it answers 0 to `kAudioUnitProperty_Latency`, yet its output comes later
@@ -43,12 +43,6 @@ struct AppleVoiceIsolator: LiveAudioVoiceIsolating {
 
     let model: Model
 
-    /// How much of the unit's output is isolated voice, in percent (`kAUSoundIsolationParam_
-    /// WetDryMixPercent`): 100 is the isolated voice alone, which is what the app uses. Other
-    /// values exist for `AudioQualityMeasurements`, which compares them; the unit's dry path is
-    /// only usable if it is delay-aligned with the wet one, which that suite measures.
-    var wetDryMix: Double = 100
-
     static let component = AudioComponentDescription(
         componentType: kAudioUnitType_Effect, componentSubType: kAudioUnitSubType_AUSoundIsolation,
         componentManufacturer: kAudioUnitManufacturer_Apple, componentFlags: 0, componentFlagsMask: 0)
@@ -68,7 +62,7 @@ struct AppleVoiceIsolator: LiveAudioVoiceIsolating {
     /// on the main actor nor on `LiveAudioPipeline` (no default actor isolation is set in
     /// either build), so seeks and `stop()` aren't held up by it.
     func isolate(_ input: URL, from first: Int, count: Int?, to output: URL) async throws {
-        try Self.render(input: input, first: first, count: count, output: output, model: model, wetDryMix: wetDryMix)
+        try Self.render(input: input, first: first, count: count, output: output, model: model)
     }
 
     /// The offline render: a player node reads the file into the unit, the engine renders in
@@ -79,7 +73,7 @@ struct AppleVoiceIsolator: LiveAudioVoiceIsolating {
     ///
     /// 16-bit output, clamped to full scale: half the disk of float for the pieces a lecture
     /// keeps (`LiveAudioPipeline`), 96 dB of range, and isolated speech stays below full scale.
-    private static func render(input: URL, first: Int, count: Int?, output: URL, model: Model, wetDryMix: Double) throws {
+    private static func render(input: URL, first: Int, count: Int?, output: URL, model: Model) throws {
         let source = try AVAudioFile(forReading: input)
         let format = source.processingFormat
         guard format.channelCount == 1, Int(format.sampleRate) == AudioEnhancement.isolationSampleRate,
@@ -93,9 +87,9 @@ struct AppleVoiceIsolator: LiveAudioVoiceIsolating {
         engine.connect(effect, to: engine.mainMixerNode, format: format)
         try engine.enableManualRenderingMode(.offline, format: format, maximumFrameCount: 4096)
         // The standard model is the unit's default, and on macOS 14 the parameter's only value:
-        // set only to ask for the high-quality one.
-        guard model == .standard || AudioUnitSetParameter(effect.audioUnit, kAUSoundIsolationParam_SoundToIsolate, kAudioUnitScope_Global, 0, model.soundType, 0) == noErr,
-              AudioUnitSetParameter(effect.audioUnit, kAUSoundIsolationParam_WetDryMixPercent, kAudioUnitScope_Global, 0, AudioUnitParameterValue(wetDryMix), 0) == noErr
+        // set only to ask for the high-quality one. The wet/dry mix is never set: the unit's
+        // default is 100% wet (the isolated voice alone), which is what the app uses.
+        guard model == .standard || AudioUnitSetParameter(effect.audioUnit, kAUSoundIsolationParam_SoundToIsolate, kAudioUnitScope_Global, 0, model.soundType, 0) == noErr
         else { throw IsolationError.renderFailed }
         try engine.start()
         defer { engine.stop() }

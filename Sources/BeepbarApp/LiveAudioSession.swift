@@ -1,4 +1,5 @@
 import AppKit
+import AVFoundation
 import BeepbarCore
 import Darwin
 import OSLog
@@ -27,13 +28,14 @@ import os
     init(stream: URL, ffmpeg: URL, onFailure: @escaping @MainActor (LiveAudioFailure?) -> Void,
          fetcher: LiveAudioFetching = URLSessionLiveAudioFetcher(), runner: LiveAudioProcessRunning = FFmpegRunner(),
          isolator: LiveAudioVoiceIsolating? = AppleVoiceIsolator.preferred(),
+         kind: AudioEnhancementKind = .isolated,
          parent: URL = LiveAudioSession.defaultParent) throws {
         let token = Self.makeToken()
         // A name of its own, not the token: the folder's path is in every ffmpeg's arguments,
         // which other processes can read, and the token is what opens the server.
         let folder = parent.appendingPathComponent(Self.makeToken(), isDirectory: true)
         let pipeline = LiveAudioPipeline(stream: stream, ffmpeg: ffmpeg, folder: folder, parent: parent, fetcher: fetcher, runner: runner,
-                                         isolator: isolator, report: { failure in await MainActor.run { onFailure(failure) } })
+                                         isolator: isolator, kind: kind, report: { failure in await MainActor.run { onFailure(failure) } })
         let prefix = "/\(token)/"
         server = try LoopbackHTTPServer { path in
             guard path.hasPrefix(prefix) else { return .notFound }
@@ -275,14 +277,23 @@ enum LiveAudioProcesses {
 ///
 /// For segment `i` it fetches that segment's bytes and the next one's (and keeps the previous
 /// one when it was just played), measures where each one's audio starts (`probeArguments`),
-/// then makes the segment. Without `isolator`, ffmpeg runs once (`segmentArguments`). With it,
-/// the segment is made from isolated pieces (`IsolatedPiece`): each fragment's audio is
-/// isolated once, with up to 4 s of the previous fragment before it and 0.5 s of the next after
-/// it (`AudioEnhancement.isolationLead`), which makes the pieces join sample-identically to the
-/// whole lecture isolated in one go; ffmpeg then encodes the segment from its own piece and its
-/// neighbours' (`isolatedEncodeArguments`). Before pieces, each segment isolated 60–90 s of
-/// audio, so every stretch went through isolation 2–3 times (~850 ms a segment, measured on
-/// 2026-11-09 with Webex's 30-second segments).
+/// then makes the segment. Without `isolator`, ffmpeg runs once (`segmentArguments`, whatever
+/// the `kind`). With it, the segment is made from isolated pieces (`IsolatedPiece`): each
+/// fragment's audio is isolated once, with up to 4 s of the previous fragment before it and
+/// 0.5 s of the next after it (`AudioEnhancement.isolationLead`), which makes the pieces join
+/// sample-identically to the whole lecture isolated in one go. In `.levelled` the piece also
+/// keeps the fragment's original decoded audio (`original`), as float.
+///
+/// The segment is then levelled (`VoiceLeveler`) and encoded: the last `levelLead` samples of
+/// the previous piece, the whole current one and the first `levelTail` of the next make a clip;
+/// the gain is *detected* on the isolated voice and *applied* to the isolated voice (`.isolated`)
+/// or to the original audio (`.levelled`); the levelled float samples go to a file that
+/// ffmpeg encodes with `levelledChain` (`levelledEncodeArguments`). The gains are keypoints
+/// every 10 s on the lecture's clock, and `keypointGains` keeps each one the first time a
+/// segment uses it: a segment made after a seek, or again, renders the same curve on both
+/// sides of its seams as the lecture played from the start would. Before pieces, each segment
+/// isolated 60–90 s of audio, so every stretch went through isolation 2–3 times (~850 ms a
+/// segment, measured on 2026-11-09 with Webex's 30-second segments).
 ///
 /// Pieces stay on disk, up to `keptPieces`, after the segments around the position are
 /// dropped: going back to a part already heard makes the segment again without isolating it.
@@ -309,6 +320,8 @@ actor LiveAudioPipeline {
     private let fetcher: LiveAudioFetching
     private let runner: LiveAudioProcessRunning
     private let isolator: LiveAudioVoiceIsolating?
+    private let kind: AudioEnhancementKind
+    private let leveler = VoiceLeveler()
     /// A failure, or nil when a request succeeds after one was reported (`reporting`).
     private let report: @Sendable (LiveAudioFailure?) async -> Void
 
@@ -342,9 +355,17 @@ actor LiveAudioPipeline {
     /// The kind of the last failure logged, so a run of the same failure logs once; nil
     /// again once a request succeeds, which is then reported (`reporting`).
     private var lastLogged: LiveAudioFailure?
+    /// The session's sticky keypoint memo (`VoiceLeveler`): keypoint index to gain in dB. Invariant:
+    /// a keypoint's gain, once used by a segment, never changes for the session, so two segments
+    /// that share a keypoint render the same curve on both sides of their seam, whatever audio
+    /// each saw and in whatever order they were made (a seek makes segment 3 before 2). Read and
+    /// merged in `produceIsolated` with no `await` between, so concurrent segments cannot
+    /// interleave. It dies with the session (`stop`).
+    private var keypointGains: [Int: Double] = [:]
 
     init(stream: URL, ffmpeg: URL, folder: URL, parent: URL, fetcher: LiveAudioFetching, runner: LiveAudioProcessRunning,
-         isolator: LiveAudioVoiceIsolating? = nil, report: @escaping @Sendable (LiveAudioFailure?) async -> Void) {
+         isolator: LiveAudioVoiceIsolating? = nil, kind: AudioEnhancementKind = .isolated,
+         report: @escaping @Sendable (LiveAudioFailure?) async -> Void) {
         self.stream = stream
         self.ffmpeg = ffmpeg
         self.folder = folder
@@ -352,6 +373,7 @@ actor LiveAudioPipeline {
         self.fetcher = fetcher
         self.runner = runner
         self.isolator = isolator
+        self.kind = kind
         self.report = report
     }
 
@@ -415,6 +437,7 @@ actor LiveAudioPipeline {
         outputs = [:]
         isolating = [:]
         pieces = [:]
+        keypointGains = [:]
         fetcher.close()
         try? FileManager.default.removeItem(at: folder)
     }
@@ -512,9 +535,32 @@ actor LiveAudioPipeline {
         let previous = pieces[index - 1].flatMap { abs($0.end - current.start) <= 2 ? $0 : nil }
         let used = [previous, current, following].compactMap { $0 }
         // Only `stop` removes a piece under a segment being made: its folder is gone.
-        guard used.allSatisfy({ FileManager.default.fileExists(atPath: $0.file.path) }) else { throw PipelineError.stopped }
+        guard used.allSatisfy({ FileManager.default.fileExists(atPath: $0.file.path) && ($0.original.map { FileManager.default.fileExists(atPath: $0.path) } ?? true) })
+        else { throw PipelineError.stopped }
         for piece in used { touch(piece.index) }
-        try await runner.run(ffmpeg, AudioEnhancement.isolatedEncodeArguments(video: video, isolated: used.map(\.file.path), firstSample: used[0].start,
+        // Detector (the isolated voice) and signal (what is heard) clips, read off the actor. In
+        // `.isolated` they are the same samples, not copied.
+        let (detector, heard) = try await Self.loadClips(previous: previous, current: current, following: following, levelled: kind == .levelled)
+        try Task.checkCancellation()
+        let signal = heard ?? detector
+        // No `await` from here to the end of the merge: the memo is read and written in one
+        // turn, so a segment made at the same time cannot decide a shared keypoint differently.
+        let wanted = leveler.keypoints(covering: AudioEnhancement.samplePosition(start)..<AudioEnhancement.samplePosition(end))
+        let resolved = leveler.gains(for: wanted, detector: detector, known: keypointGains)
+        for (k, gain) in resolved where keypointGains[k] == nil { keypointGains[k] = gain }
+        // What `level` is handed: the keypoints this segment resolved, and every one already
+        // used inside the clip, so its pre-roll gets the gains it was rendered with.
+        var handed = resolved
+        let step = Double(VoiceLeveler.rate) * leveler.spacing
+        for (k, gain) in keypointGains where handed[k] == nil {
+            let t = Int((Double(k) * step).rounded())
+            if t >= detector.start && t <= detector.end { handed[k] = gain }
+        }
+        let levelled = runFile("levelled\(index)", "raw")
+        defer { try? FileManager.default.removeItem(at: levelled) }
+        try await Self.writeLevelled(leveler: leveler, signal: signal, gains: handed, to: levelled)
+        try Task.checkCancellation()
+        try await runner.run(ffmpeg, AudioEnhancement.levelledEncodeArguments(video: video, levelled: levelled.path, firstSample: detector.start,
                                                                               start: start, end: end, output: output.path))
         return try finish(output)
     }
@@ -554,9 +600,14 @@ actor LiveAudioPipeline {
     /// `hasLead`: isolated with the previous fragment's last 4 s before it; `hasTail`: with the
     /// next fragment's first 0.5 s after it (or none exists). Without either, the piece differs
     /// from the whole lecture's isolation near that edge (`AudioEnhancement.isolationLead`).
+    /// `original`: in `.levelled`, the same span `[start, end)` of the fragment's decoded audio,
+    /// before isolation, as raw 32-bit float mono 48 kHz with exactly as many samples as `file`
+    /// (float on purpose: a lecture at −60 dBFS keeps about 7 bits in 16-bit); nil otherwise.
+    /// Everything that deletes `file` deletes `original` (`retire`).
     struct IsolatedPiece: Sendable {
         let index: Int
         let file: URL
+        let original: URL?
         let start: Int
         let end: Int
         let hasLead: Bool
@@ -570,7 +621,8 @@ actor LiveAudioPipeline {
     }
 
     /// How many pieces stay on disk: 20 minutes of Webex's 30-second fragments, about 115 MB
-    /// (2.9 MB each), in the session's folder, which goes when the player closes.
+    /// isolated (2.9 MB each) and about 350 MB in `.levelled` (2.9 MB plus 5.8 MB of original
+    /// audio each), in the session's folder, which goes when the player closes.
     static let keptPieces = 40
 
     /// Fragment `k`'s piece: on disk, underway, or started now. With a lead-in whenever the
@@ -625,7 +677,21 @@ actor LiveAudioPipeline {
         try await isolator.isolate(decoded, from: start - from, count: next.map { $0 - start }, to: file)
         try Task.checkCancellation()
         let bytes = (try? FileManager.default.attributesOfItem(atPath: file.path)[.size] as? Int) ?? 0
-        let piece = IsolatedPiece(index: k, file: file, start: start, end: start + bytes / 2, hasLead: lead, hasTail: tail || k + 1 == count)
+        // The fragment's own span of the decoded audio, as float, before the WAV goes. As many
+        // samples as the isolated piece, padded or cut, so the two files line up by position.
+        var original: URL?
+        if kind == .levelled {
+            let url = runFile("original\(k)\(flags)", "raw")
+            do {
+                try await Self.writeOriginal(from: decoded, offset: start - from, count: bytes / 2, to: url)
+                try Task.checkCancellation()
+            } catch {
+                try? FileManager.default.removeItem(at: url)
+                throw error
+            }
+            original = url
+        }
+        let piece = IsolatedPiece(index: k, file: file, original: original, start: start, end: start + bytes / 2, hasLead: lead, hasTail: tail || k + 1 == count)
         isolating[serial] = nil
         store(piece)
         return piece
@@ -637,25 +703,130 @@ actor LiveAudioPipeline {
     private func store(_ piece: IsolatedPiece) {
         if stopped { return }
         if let kept = pieces[piece.index], kept.covers(piece) {
-            retire(piece.file)
+            retire(piece)
             touch(piece.index)
             return
         }
-        if let replaced = pieces[piece.index], replaced.file != piece.file { retire(replaced.file) }
+        if let replaced = pieces[piece.index], replaced.file != piece.file { retire(replaced) }
         pieces[piece.index] = piece
         touch(piece.index)
         while pieces.count > Self.keptPieces, let oldest = piecesUsed.first {
             piecesUsed.removeFirst()
-            if let dropped = pieces.removeValue(forKey: oldest) { retire(dropped.file) }
+            if let dropped = pieces.removeValue(forKey: oldest) { retire(dropped) }
         }
     }
 
-    /// Deletes `file`, and those set aside before it, as soon as no segment is being made.
-    private func retire(_ file: URL? = nil) {
-        if let file { retired.append(file) }
+    /// Sets `piece`'s files aside (`retire()`): both of them, or the original audio would stay
+    /// on disk, 5.8 MB a piece, until the player closes.
+    private func retire(_ piece: IsolatedPiece) {
+        retired.append(piece.file)
+        if let original = piece.original { retired.append(original) }
+        retire()
+    }
+
+    /// Deletes the files set aside, as soon as no segment is being made.
+    private func retire() {
         guard producing == 0 else { return }
         for file in retired { try? FileManager.default.removeItem(at: file) }
         retired = []
+    }
+
+    // MARK: Levelling helpers
+
+    /// The detector clip (the isolated voice) and, in `.levelled`, the signal clip (the original
+    /// audio) for one segment: the last `levelLead` samples of `previous`, all of `current` and
+    /// the first `levelTail` of `following`, as floats, positioned on the lecture's clock from
+    /// `current`'s start (the previous piece ends within a sample or two of it, `produceIsolated`).
+    /// Nonisolated and async: the reading and converting of a minute of audio runs on the
+    /// shared pool, not on the actor that serves seeks.
+    private nonisolated static func loadClips(previous: IsolatedPiece?, current: IsolatedPiece, following: IsolatedPiece?,
+                                              levelled: Bool) async throws -> (detector: VoiceLeveler.Clip, signal: VoiceLeveler.Clip?) {
+        let before = previous.map { min(AudioEnhancement.levelLead, $0.end - $0.start) } ?? 0
+        let after = following.map { min(AudioEnhancement.levelTail, $0.end - $0.start) } ?? 0
+        var parts: [(piece: IsolatedPiece, skip: Int, take: Int)] = []
+        if let previous { parts.append((previous, previous.end - previous.start - before, before)) }
+        parts.append((current, 0, current.end - current.start))
+        if let following { parts.append((following, 0, after)) }
+        func read(_ file: (IsolatedPiece) -> URL?, float: Bool) throws -> VoiceLeveler.Clip {
+            var samples: [Float] = []
+            samples.reserveCapacity(before + (current.end - current.start) + after)
+            for part in parts {
+                try Task.checkCancellation()
+                guard let url = file(part.piece) else { throw PipelineError.stopped }
+                samples += try readRaw(url, float: float, skip: part.skip, take: part.take)
+            }
+            return VoiceLeveler.Clip(samples: samples, start: current.start - before)
+        }
+        let detector = try read({ $0.file }, float: false)
+        guard levelled else { return (detector, nil) }
+        return (detector, try read({ $0.original }, float: true))
+    }
+
+    /// `take` samples of a raw mono file after `skip` samples, as floats: 16-bit (÷ 32768) or
+    /// 32-bit float. A file shorter than asked is padded with silence, so positions never shift.
+    private nonisolated static func readRaw(_ url: URL, float: Bool, skip: Int, take: Int) throws -> [Float] {
+        let width = float ? 4 : 2
+        let handle = try FileHandle(forReadingFrom: url)
+        defer { try? handle.close() }
+        try handle.seek(toOffset: UInt64(skip * width))
+        let data = try handle.read(upToCount: take * width) ?? Data()
+        var samples = [Float](repeating: 0, count: take)
+        let available = min(take, data.count / width)
+        data.withUnsafeBytes { raw in
+            if float {
+                for i in 0..<available { samples[i] = raw.loadUnaligned(fromByteOffset: i * 4, as: Float.self) }
+            } else {
+                for i in 0..<available { samples[i] = Float(Int16(littleEndian: raw.loadUnaligned(fromByteOffset: i * 2, as: Int16.self))) / 32768 }
+            }
+        }
+        return samples
+    }
+
+    /// Writes `count` samples of the decoded WAV from sample `offset` as raw float mono (what
+    /// `original` is), padding with silence or cutting so it has exactly `count`. In blocks:
+    /// memory does not depend on the fragment's length. Throws `CancellationError`.
+    private nonisolated static func writeOriginal(from decoded: URL, offset: Int, count: Int, to output: URL) async throws {
+        let source = try AVAudioFile(forReading: decoded)
+        guard FileManager.default.createFile(atPath: output.path, contents: nil) else { throw LiveAudioFetchError.unexpected }
+        let destination = try FileHandle(forWritingTo: output)
+        defer { try? destination.close() }
+        let block = 65_536
+        guard let buffer = AVAudioPCMBuffer(pcmFormat: source.processingFormat, frameCapacity: AVAudioFrameCount(block)) else { throw LiveAudioFetchError.unexpected }
+        var done = 0
+        while done < count {
+            try Task.checkCancellation()
+            let wanted = min(block, count - done)
+            let position = offset + done
+            var samples = [Float](repeating: 0, count: wanted)
+            // `read` may return fewer frames than asked without being at the end (AVAudioFile gives
+            // 65 525 of 65 536 on a float WAV, 11 samples short every block): read on until the
+            // block is full or the file ends, or each block would carry a gap of silence in the
+            // original that the gain then multiplies, a click every 1.4 s of a fragment's audio.
+            if position >= 0, position < Int(source.length) {
+                source.framePosition = AVAudioFramePosition(position)
+                var got = 0
+                while got < wanted {
+                    try Task.checkCancellation()
+                    try source.read(into: buffer, frameCount: AVAudioFrameCount(wanted - got))
+                    let frames = Int(buffer.frameLength)
+                    guard frames > 0 else { break }
+                    if let channel = buffer.floatChannelData?[0] {
+                        for i in 0..<frames { samples[got + i] = channel[i] }
+                    }
+                    got += frames
+                }
+            }
+            try destination.write(contentsOf: samples.withUnsafeBytes { Data($0) })
+            done += wanted
+        }
+    }
+
+    /// `leveler.level` over `signal` with `gains`, written as raw float to `output`. Nonisolated
+    /// and async: a minute of audio is a few million samples, never on the actor.
+    private nonisolated static func writeLevelled(leveler: VoiceLeveler, signal: VoiceLeveler.Clip, gains: [Int: Double], to output: URL) async throws {
+        let levelled = leveler.level(signal, gains: gains)
+        try Task.checkCancellation()
+        try levelled.withUnsafeBytes { try Data($0).write(to: output) }
     }
 
     /// What fragment `k`'s kept piece was made with, nil when none is kept: for tests, which

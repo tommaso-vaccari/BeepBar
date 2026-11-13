@@ -518,8 +518,7 @@ extension KeypointLevelerMeasurements {
                 process.waitUntilExit()
                 try #require(process.terminationStatus == 0, "lecture \(i + 1) could not be read as audio")
                 let orig = try Self.levels400(streaming: wav)
-                var isolator = try #require(AppleVoiceIsolator.preferred())
-                isolator.wetDryMix = 100
+                let isolator = try #require(AppleVoiceIsolator.preferred())
                 try await isolator.isolate(wav, from: 0, count: nil, to: raw)
                 try? FileManager.default.removeItem(at: wav)
                 let iso = try Self.levels400(streamingRaw: raw)

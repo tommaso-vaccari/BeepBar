@@ -8,8 +8,8 @@ import Foundation
 // public HLS sample: the tap was attached and received 0 frames while the item played), so there
 // is no native way to filter what AVPlayer plays. Instead the app serves AVPlayer a playlist of
 // its own on 127.0.0.1; each 30-second segment is fetched from Webex as its byte range, the
-// video copied as is and only the audio filtered (`isolatedChain` or `filterChain`), a fraction of a second of
-// work per segment. With the switch off the player plays Webex's stream directly.
+// video copied as is and only the audio filtered (`VoiceLeveler` then `levelledChain`, or `filterChain`), a fraction of a
+// second of work per segment. With the switch off the player plays Webex's stream directly.
 //
 // Why segments and not a whole copy (the first version, replaced on 2026-11-09): a copy of a
 // 2.5-hour lecture took about five minutes and 950 MB before the student heard anything.
@@ -25,11 +25,20 @@ import Foundation
 //
 // Voice isolation (added 2026-11-09): where macOS has Apple's voice-isolation audio unit, each
 // segment's audio goes through it between two ffmpeg runs (`isolationDecodeArguments`,
-// `AppleVoiceIsolator`, `isolatedEncodeArguments`): it removes steady noise, hum and much of the
+// `AppleVoiceIsolator`, `VoiceLeveler`, `levelledEncodeArguments`): it removes steady noise, hum and much of the
 // room's echo far better than ffmpeg's filters, with no model to download. Without it,
 // `segmentArguments` filters with `filterChain` alone, as before.
 //
 // Everything here is pure, so Swift Testing covers it without running ffmpeg.
+
+/// The two ways the leveled audio is made, both through `VoiceLeveler` and `levelledChain`.
+public enum AudioEnhancementKind: String, Sendable, CaseIterable {
+    /// The original audio, levelled with gains detected on the isolated voice: for lectures where
+    /// isolation eats the words, which are then heard as recorded (levelled, EQ'd, compressed).
+    case levelled
+    /// Apple's voice isolation, levelled: the isolated voice is what is heard.
+    case isolated
+}
 
 public enum AudioEnhancement {
     /// Where Homebrew (Apple silicon, Intel) and MacPorts install ffmpeg, in that order. A fixed
@@ -44,7 +53,7 @@ public enum AudioEnhancement {
 
     /// The audio filters, in order, for a lecture recorded in a university classroom (one teacher,
     /// a room microphone, students talking in the background), used where Apple's voice
-    /// isolation isn't available (`isolatedChain` otherwise):
+    /// isolation isn't available (`levelledChain` otherwise):
     /// - `highpass` / `lowpass`: cut rumble (ventilation, desk knocks, mains hum) below 90 Hz and
     ///   hiss above 10 kHz, outside the voice;
     /// - `afftdn`: spectral noise reduction that follows the room's steady noise (`tn`), moderate
@@ -73,24 +82,20 @@ public enum AudioEnhancement {
     /// model file ffmpeg doesn't ship.
     public static let filterChain = "highpass=f=90,lowpass=f=10000,afftdn=nr=15:nf=-50:tn=1,equalizer=f=250:t=q:w=1:g=-2,equalizer=f=3000:t=q:w=1.4:g=3,dynaudnorm=f=500:g=31:p=0.7:m=3,agate=threshold=0.035:ratio=4:range=0.12:attack=5:release=300:knee=4,afftdn=nr=6:nf=-50:tn=1,volume=8dB,alimiter=limit=0.8:level=disabled"
 
-    /// What follows Apple's voice isolation (`isolatedEncodeArguments`), in order:
+    /// What follows `VoiceLeveler` in both kinds of enhanced audio (`AudioEnhancementKind`), in order:
     /// - `highpass` / `lowpass` and the two `equalizer`s, as in `filterChain`: rumble and hiss
     ///   out, −2 dB of lecture-hall boom around 250 Hz, +3 dB of consonants around 3 kHz;
-    /// - `speechnorm`: raises each stretch of speech towards full level, at most 6x, so a teacher
-    ///   who walks away from the microphone stays almost as loud as one beside it. Rejected in
-    ///   `filterChain`, where it raised the room noise too; after isolation there is none left;
-    /// - `agate`: as in `filterChain`, lowers what stays well below the teacher in a pause;
+    /// - `acompressor`: a gentle 3:1 above −22 dBFS (threshold 0.08), 1 ms attack, 100 ms
+    ///   release, soft knee, with 4.52 dB of make-up, so what the leveler brought to the target
+    ///   is also even within a sentence;
     /// - `alimiter`: peaks held near −2 dBFS, so the AAC encoder never clips; `latency=1` takes
     ///   back its 5 ms look-ahead, which would otherwise move the voice 240 samples late.
     ///
-    /// Chosen on 2026-11-09 against `filterChain` on a synthetic classroom built from separate
-    /// tracks (a teacher with room echo who moves away for 12 s, three students talking further
-    /// back, pink noise and mains hum, a 6 s pause in the lecture), macOS 27, ffmpeg 9.0.2:
-    /// background left in the pause −115 dB below the teacher with steady noise only (−38 dB
-    /// with `filterChain`), the distant teacher 2.9 dB below the near one (4.7 dB), the teacher's
-    /// spectrum 10.4 dB from the dry voice in ⅓-octave bands (14.0 dB). Students' voices are
-    /// speech too: neither chain lowers them more than about 1 dB relative to the teacher.
-    public static let isolatedChain = "highpass=f=90,lowpass=f=10000,equalizer=f=250:t=q:w=1:g=-2,equalizer=f=3000:t=q:w=1.4:g=3,speechnorm=e=6:r=0.0005:l=1,agate=threshold=0.035:ratio=4:range=0.12:attack=5:release=300:knee=4,alimiter=limit=0.8:level=disabled:latency=1"
+    /// No `speechnorm`, no gate, no `afftdn`. Measured on 2026-11-12 on six real excerpts:
+    /// −15.0 to −16.9 LUFS, limiter reduction p99 at most 1.6 dB. `afftdn` after the gain changed
+    /// the noise in the pauses by nothing, and before the gain it cost word endings; the gate
+    /// and `speechnorm` were what cut the voice in the chain this replaces.
+    public static let levelledChain = "highpass=f=90,lowpass=f=10000,equalizer=f=250:t=q:w=1:g=-2,equalizer=f=3000:t=q:w=1.4:g=3,acompressor=threshold=0.08:ratio=3:attack=1:release=100:knee=6:makeup=4.52,alimiter=limit=0.8:level=disabled:latency=1"
 
     /// The sample rate the audio is isolated at, whatever the lecture's own (48 or 44.1 kHz):
     /// the one `AppleVoiceIsolator`'s delay is measured for.
@@ -109,6 +114,14 @@ public enum AudioEnhancement {
     /// and the pieces joined with no seam (`LiveAudioPipeline`).
     public static let isolationLead = 4 * isolationSampleRate
     public static let isolationTail = isolationSampleRate / 2
+
+    /// How much audio before a segment its levelling reads, in samples: the first keypoint it
+    /// uses may be up to one `spacing` (10 s) before the segment's start, and its window reaches
+    /// 12 s before that (`VoiceLeveler`).
+    public static let levelLead = 22 * isolationSampleRate
+    /// How much after: the closing keypoint is up to one `spacing` past the segment's end, and
+    /// the ceiling looks 0.2 s ahead of a sample (10.5 s in all).
+    public static let levelTail = isolationSampleRate * 21 / 2
 
     /// ffmpeg's command that decodes audio to a mono 48 kHz WAV for voice isolation. Its input
     /// starts at `firstSample` on the lecture's clock; the WAV holds the samples from `from` to
@@ -135,26 +148,26 @@ public enum AudioEnhancement {
         ]
     }
 
-    /// ffmpeg's command for one segment from isolated audio: like `segmentArguments`, the video
+    /// ffmpeg's command for one segment from levelled audio: like `segmentArguments`, the video
     /// copied and the audio trimmed to `start..<end` on the lecture's clock, but the audio read
-    /// from `isolated`, consecutive pieces of raw isolated voice (16-bit, mono, 48 kHz, no
-    /// header, so ffmpeg's `concat:` joins them sample by sample) whose first sample is
-    /// `firstSample`, and filtered with `isolatedChain`.
+    /// from `levelled`, one raw file (32-bit float, mono, 48 kHz, no header: what `VoiceLeveler`
+    /// produced, never a `concat:`) whose first sample is `firstSample`, and filtered with
+    /// `levelledChain`.
     ///
     /// `asetpts` places the samples on the clock by count, exactly. Not `-itsoffset`: for raw
     /// input ffmpeg left it out of the timestamps the filters see, so the trim fell outside the
     /// audio and every segment came out with an empty audio track (seen in testing, ffmpeg 9.0.2).
-    public static func isolatedEncodeArguments(video: String, isolated: [String], firstSample: Int, start: Double, end: Double, output: String) -> [String] {
+    public static func levelledEncodeArguments(video: String, levelled: String, firstSample: Int, start: Double, end: Double, output: String) -> [String] {
         [
             "-hide_banner", "-nostdin", "-nostats", "-loglevel", "error",
             "-protocol_whitelist", protocolWhitelist,
             "-copyts",
             "-i", video,
-            "-f", "s16le", "-ar", "\(isolationSampleRate)", "-ac", "1",
-            "-i", concatInput(isolated),
+            "-f", "f32le", "-ar", "\(isolationSampleRate)", "-ac", "1",
+            "-i", levelled,
             "-map", "0:v:0?", "-map", "1:a:0",
             "-c:v", "copy",
-            "-af", "asetpts=(N+\(firstSample))/SR/TB," + isolatedChain + ",atrim=start=\(seconds(start)):end=\(seconds(end))",
+            "-af", "asetpts=(N+\(firstSample))/SR/TB," + levelledChain + ",atrim=start=\(seconds(start)):end=\(seconds(end))",
             "-c:a", "aac", "-b:a", "192k", "-ar", "48000",
             "-muxdelay", "0", "-muxpreload", "0",
             "-f", "mpegts", "-y", output,

@@ -321,7 +321,7 @@ struct KeypointLevelerMeasurements {
             let names = ["current", "isolation-only", "E2-t0"] + Self.variants.map(\.name)
             let renderings = try Self.parallel(names.count) { k -> Rendering in
                 switch names[k] {
-                case "current": return try Self.render(chain: AudioEnhancement.isolatedChain, pregain: nil, raw: raw, path: path)
+                case "current": return try Self.render(chain: AudioQualityMeasurements.chainBeforeLeveler, pregain: nil, raw: raw, path: path)
                 case "isolation-only": return try Self.render(chain: "anull", pregain: nil, raw: raw, path: path)
                 case "E2-t0": return try Self.render(chain: e2.chain, pregain: gain, raw: raw, path: path)
                 default: return try Self.render(Self.variants[k - 3], isolated: material.isolated, path: path)
@@ -623,8 +623,7 @@ struct KeypointLevelerMeasurements {
         process.waitUntilExit()
         try #require(process.terminationStatus == 0, "the lecture could not be read as audio")
         print("WHOLE decode \(lap()) s")
-        var isolator = try #require(AppleVoiceIsolator.preferred())
-        isolator.wetDryMix = 100
+        let isolator = try #require(AppleVoiceIsolator.preferred())
         try await isolator.isolate(wav, from: 0, count: nil, to: raw)
         try? FileManager.default.removeItem(at: wav)
         print("WHOLE isolation \(lap()) s")

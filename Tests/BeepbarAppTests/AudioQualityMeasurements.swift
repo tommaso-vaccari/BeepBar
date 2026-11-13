@@ -8,17 +8,16 @@ import BeepbarCore
 /// `BEEPBAR_MEASURE_AUDIO_QUALITY=1 swift test --filter AudioQualityMeasurements`
 /// (`docs/benchmarks.md`, "Enhanced audio quality"). Synthetic audio only, made on the spot.
 ///
-/// Why it exists: `AudioEnhancement.isolatedChain` ends in `speechnorm` and an `agate` whose
+/// Why it exists: the chain shipped before the leveler (`chainBeforeLeveler`) ends in `speechnorm` and an `agate` whose
 /// threshold is a fixed absolute level, so what a student hears depends on how loud the teacher
 /// was recorded: a close teacher leaves the background voices raised, a distant one has word
 /// endings and soft consonants cut. The suite builds a classroom from separate stems with known
 /// speech and pause regions, scales the whole scene (and, in one case, only the teacher) and
 /// reports, per processing path, what each filter chain does to level, pauses and soft speech.
 ///
-/// A processing path is `front` then `chain`: `front` is Apple's voice isolation (100% or a
-/// wet/dry mix) or nothing (so the chain's own effect is separate from the unit's), `chain` is
+/// A processing path is `front` then `chain`: `front` is Apple's voice isolation (always 100% wet) or nothing (so the chain's own effect is separate from the unit's), `chain` is
 /// the ffmpeg filter the candidate defines, fed the unit's raw 16-bit output the way
-/// `isolatedEncodeArguments` feeds it, but written as float WAV (no video, no AAC).
+/// `levelledEncodeArguments` feeds it, but written as float WAV (no video, no AAC).
 ///
 /// Environment:
 /// - `BEEPBAR_AUDIO_ONLY=name,name`: run only those candidates (plus `current` and `isolation-only`), to iterate.
@@ -33,7 +32,7 @@ import BeepbarCore
 struct AudioQualityMeasurements {
     // MARK: Candidates
 
-    /// A filter chain under test: what follows the voice-isolation step in `isolatedEncodeArguments`.
+    /// A filter chain under test: what follows the voice-isolation step in `levelledEncodeArguments`.
     struct Candidate: Sendable {
         let name: String
         let chain: String
@@ -53,7 +52,11 @@ struct AudioQualityMeasurements {
         static let ceiling = 50.0
     }
 
-    /// What `AudioEnhancement.isolatedChain` begins with, kept by every candidate: rumble and
+    /// The chain shipped before the leveler: `AudioEnhancement.isolatedChain` as it was, kept here as
+    /// the "current" reference every candidate is compared with.
+    static let chainBeforeLeveler = "highpass=f=90,lowpass=f=10000,equalizer=f=250:t=q:w=1:g=-2,equalizer=f=3000:t=q:w=1.4:g=3,speechnorm=e=6:r=0.0005:l=1,agate=threshold=0.035:ratio=4:range=0.12:attack=5:release=300:knee=4,alimiter=limit=0.8:level=disabled:latency=1"
+
+    /// What `chainBeforeLeveler` begins with, kept by every candidate: rumble and
     /// hiss filters and the two speech equalizers.
     static let prefix = "highpass=f=90,lowpass=f=10000,equalizer=f=250:t=q:w=1:g=-2,equalizer=f=3000:t=q:w=1.4:g=3"
     /// Where every chain ends: a limiter that keeps peaks at −1.9 dBFS and adds no delay.
@@ -78,7 +81,7 @@ struct AudioQualityMeasurements {
         let compressor = "acompressor=threshold=0.125:ratio=3:attack=10:release=200:knee=4:makeup=1.5"
         func chain(_ parts: String...) -> String { ([prefix] + parts + [limiter]).joined(separator: ",") }
         let all = [
-            Candidate(name: "current", chain: AudioEnhancement.isolatedChain),
+            Candidate(name: "current", chain: Self.chainBeforeLeveler),
             Candidate(name: "isolation-only", chain: "anull"),
             Candidate(name: "C1", chain: chain(leveler(g: 51, m: 50), expander("0.02"))),
             Candidate(name: "C2", chain: chain(leveler(g: 51, m: 50))),
@@ -323,8 +326,6 @@ struct AudioQualityMeasurements {
         let wet: Double?
         static let none = Front(name: "raw", wet: nil)
         static let isolated = Front(name: "iso100", wet: 100)
-        static let wet90 = Front(name: "iso90", wet: 90)
-        static let wetDry = Front(name: "iso85", wet: 85)
     }
 
     /// Runs the path in a folder of its own, removed with it.
@@ -347,8 +348,7 @@ struct AudioQualityMeasurements {
             // Always rewritten: this file is shared by every scene of a test, and reusing a
             // previous scene's would isolate the wrong audio (the second `joins` scene did).
             try AudioTestSignals.writeWAV(mix, to: wav)
-            guard var isolator = AppleVoiceIsolator.preferred() else { throw MeasurementError.isolationUnavailable }
-            isolator.wetDryMix = wet
+            guard let isolator = AppleVoiceIsolator.preferred() else { throw MeasurementError.isolationUnavailable }
             try await isolator.isolate(wav, from: 0, count: nil, to: raw)
             return raw
         }
@@ -376,7 +376,7 @@ struct AudioQualityMeasurements {
             return try filter(raw, chain: String(format: "volume=%.2fdB,", dB) + candidate.chain)
         }
 
-        /// ffmpeg with `chain` over `raw`, as `isolatedEncodeArguments` reads it, to a float WAV.
+        /// ffmpeg with `chain` over `raw`, as `levelledEncodeArguments` reads it, to a float WAV.
         func filter(_ raw: URL, chain: String) throws -> [Float] {
             let out = folder.appendingPathComponent("out-\(UUID().uuidString).wav")
             defer { try? FileManager.default.removeItem(at: out) }
@@ -387,13 +387,10 @@ struct AudioQualityMeasurements {
         }
     }
 
-    /// The fronts to run: no isolation, and with the unit 100%, 90% and 85% wet. The wet/dry
-    /// mix is a main hypothesis (the unit may swallow word endings of far, reverberant speech
-    /// and a little dry signal restores them); it is only meaningful because `wetDryAlignment`
-    /// finds the dry path delay-aligned.
+    /// The fronts to run: no isolation, and with the unit (100% wet, the only mix the app uses).
     private static var fronts: [Front] {
         guard AppleVoiceIsolator.preferred() != nil else { return [.none] }
-        return [.none, .isolated, .wet90, .wetDry]
+        return [.none, .isolated]
     }
 
     final class ConcurrentResults<T>: @unchecked Sendable {
@@ -707,35 +704,6 @@ struct AudioQualityMeasurements {
         }
     }
 
-    /// Whether the unit's dry path is delay-aligned with its wet path, which a wet/dry mix needs:
-    /// `AppleVoiceIsolator` drops `model.delay` samples from the start, so if the dry signal is
-    /// not delayed by the same amount, mixing the two gives comb filtering. Renders clean
-    /// speech at 100% and at 0% wet, lines each up with the input, and prints the shifts (in
-    /// samples, positive = later than the input after the compensation). Passes whatever it finds:
-    /// the finding decides whether `iso90` and `iso85` mean anything: with a misaligned dry path they
-    /// would be comb filters.
-    @Test func wetDryAlignment() async throws {
-        try #require(AppleVoiceIsolator.preferred() != nil, "needs voice isolation")
-        let path = try Path()
-        defer { path.remove() }
-        let room = Self.classroom
-        let input = Array(room.teacher[0..<(25 * AudioTestSignals.sampleRate)])
-        let wav = path.folder.appendingPathComponent("clean.wav")
-        try AudioTestSignals.writeWAV(input, to: wav)
-        var models: [AppleVoiceIsolator.Model] = [.standard]
-        if #available(macOS 15, *) { models.append(.highQuality) }
-        for model in models {
-            for wet in [100.0, 50.0, 0.0] {
-                let raw = path.folder.appendingPathComponent("w\(Int(wet))-\(model).raw")
-                try await AppleVoiceIsolator(model: model, wetDryMix: wet).isolate(wav, from: 0, count: nil, to: raw)
-                let out = try AudioTestSignals.rawSamples(raw)
-                let delay = AudioTestSignals.delay(of: Array(out[0..<(8 * AudioTestSignals.sampleRate)]), against: Array(input[0..<(8 * AudioTestSignals.sampleRate)]), limit: 9600)
-                // A comb shows as a notch pattern; the level change against the input says how much was removed.
-                print("WETDRY model=\(model) wet=\(Int(wet))% shift=\(delay) samples, level change \(Self.f(AudioTestSignals.level(out[...]) - AudioTestSignals.level(input[...]))) dB")
-            }
-        }
-    }
-
     /// Seamless joins (the header of `AudioEnhancement.swift`): in production each 30 s segment
     /// (Webex's length: `docs/benchmarks.md`, and the 2–4 MB limit in `AudioEnhancement`) is filtered with its neighbours as context
     /// and then trimmed (`AudioEnhancement.audioContext`: the next segment always, the previous
@@ -922,7 +890,7 @@ struct AudioQualityMeasurements {
             process.waitUntilExit()
             #expect(process.terminationStatus == 0, "excerpt \(n + 1) could not be read as audio")
             if process.terminationStatus == 0 {
-                let fronts: [Front] = AppleVoiceIsolator.preferred() != nil ? [.none, .isolated, .wetDry] : [.none]
+                let fronts: [Front] = AppleVoiceIsolator.preferred() != nil ? [.none, .isolated] : [.none]
                 try await render("excerpt\(n + 1)", try AudioTestSignals.samples(wav), fronts: fronts, measure: true)
             }
         }

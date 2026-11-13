@@ -175,28 +175,39 @@ struct AudioEnhancementTests {
         #expect(AudioEnhancement.concatInput(["/i", "/c"]) == "concat:/i|/c")
     }
 
-    /// After voice isolation the chain has no noise reduction left to do (isolation did it) and
-    /// levels speech with `speechnorm`, which `filterChain` couldn't use because it raised the
-    /// room noise with the voice: equalizers first, then the leveller, the gate on its output,
-    /// the limiter last so nothing after it can clip. Guards against a chain that filters the
-    /// noise twice (a hollow voice) or levels after the gate (pauses raised again).
-    @Test func theIsolatedChainLevelsSpeechAfterTheEqualizers() {
-        let filters = AudioEnhancement.isolatedChain.split(separator: ",").map { $0.split(separator: "=").first.map(String.init) ?? "" }
-        #expect(filters == ["highpass", "lowpass", "equalizer", "equalizer", "speechnorm", "agate", "alimiter"])
-        #expect(!AudioEnhancement.isolatedChain.contains("afftdn"))
-        #expect(AudioEnhancement.isolatedChain.contains("speechnorm=e=6:r=0.0005:l=1"))
-        #expect(AudioEnhancement.isolatedChain.hasSuffix("alimiter=limit=0.8:level=disabled:latency=1"), "the limiter's look-ahead must be taken back")
+    /// What follows `VoiceLeveler` is EQ, a gentle compressor and the limiter: no `speechnorm` and
+    /// no gate (they cut word endings), no `afftdn` (it changed nothing after the gain and cost
+    /// word endings before it); the limiter last so nothing after it can clip, with its
+    /// look-ahead taken back. Guards against the old chain coming back, which cut the voice, and
+    /// a limiter that shifts the audio 240 samples late.
+    @Test func theLevelledChainIsEqualizerCompressorLimiter() {
+        let filters = AudioEnhancement.levelledChain.split(separator: ",").map { $0.split(separator: "=").first.map(String.init) ?? "" }
+        #expect(filters == ["highpass", "lowpass", "equalizer", "equalizer", "acompressor", "alimiter"])
+        for removed in ["speechnorm", "agate", "afftdn"] { #expect(!AudioEnhancement.levelledChain.contains(removed)) }
+        #expect(AudioEnhancement.levelledChain.contains("acompressor=threshold=0.08:ratio=3:attack=1:release=100:knee=6:makeup=4.52"))
+        #expect(AudioEnhancement.levelledChain.hasSuffix("alimiter=limit=0.8:level=disabled:latency=1"), "the limiter's look-ahead must be taken back")
         #expect(AudioEnhancement.samplePosition(8.021333) == 385024)
         #expect(AudioEnhancement.samplePosition(0) == 0)
+    }
+
+    /// How far a segment's levelling reads around it: 22 s before (12 s window before a keypoint
+    /// up to 10 s before the segment) and 10.5 s after (a keypoint up to 10 s past its end plus
+    /// the ceiling's look-ahead). Guards against a lead that no longer covers the leveler's
+    /// window, which would make a segment's gain differ from the lecture's.
+    @Test func theLevellingLeadAndTailCoverTheLevelersReach() {
+        let leveler = VoiceLeveler()
+        #expect(AudioEnhancement.levelLead == Int((leveler.window + leveler.spacing) * Double(AudioEnhancement.isolationSampleRate)))
+        #expect(AudioEnhancement.levelTail == Int((leveler.spacing + 0.5) * Double(AudioEnhancement.isolationSampleRate)))
+        #expect(AudioEnhancementKind.allCases == [.levelled, .isolated])
     }
 
     /// The isolated path's two ffmpeg runs. Decoding: the audio alone, on the lecture's clock
     /// (`-copyts` before the input), padded or trimmed to start exactly at `firstSample` (a WAV
     /// keeps no timestamps), then cut to `from..<to` counted from there, mono float at the
     /// isolation rate, local files only; with no `to`, to the end. Encoding: the video copied
-    /// from this segment, the raw isolated pieces joined (their format declared before their
+    /// from this segment, the one raw float file of levelled audio (its format declared before its
     /// input) and put back at their first sample by count (`asetpts`; `-itsoffset` left raw
-    /// audio off the clock), filtered with `isolatedChain` and trimmed to the segment's span. Guards
+    /// audio off the clock), filtered with `levelledChain` and trimmed to the segment's span. Guards
     /// against audio shifted from the picture or across a join, a piece cut at the wrong
     /// sample, and ffmpeg reaching the network.
     @Test func anIsolatedSegmentIsPutBackOnTheLecturesClock() {
@@ -214,17 +225,17 @@ struct AudioEnhancementTests {
         let toTheEnd = AudioEnhancement.isolationDecodeArguments(audio: "/a", firstSample: 100, from: 100, to: nil, output: "/d.wav")
         #expect(value(toTheEnd, after: "-af") == "aresample=48000,aresample=async=1:first_pts=100,atrim=start_sample=0,aformat=sample_fmts=flt:channel_layouts=mono")
 
-        let encode = AudioEnhancement.isolatedEncodeArguments(video: "concat:/i|/c", isolated: ["/p.raw", "/c.raw", "/n.raw"], firstSample: 385024,
+        let encode = AudioEnhancement.levelledEncodeArguments(video: "concat:/i|/c", levelled: "/l.raw", firstSample: 385024,
                                                               start: 30.010667, end: 60.005333, output: "/o.ts")
         let inputs = encode.indices.filter { encode[$0] == "-i" }
-        #expect(inputs.map { encode[$0 + 1] } == ["concat:/i|/c", "concat:/p.raw|/c.raw|/n.raw"])
+        #expect(inputs.map { encode[$0 + 1] } == ["concat:/i|/c", "/l.raw"], "one plain file, no concat")
         #expect(encode.firstIndex(of: "-copyts")! < inputs[0])
         let raw = Array(encode[inputs[0]..<inputs[1]])
-        #expect(value(raw, after: "-f") == "s16le" && value(raw, after: "-ar") == "48000" && value(raw, after: "-ac") == "1",
-                "the pieces have no header: their format is declared before their input")
+        #expect(value(raw, after: "-f") == "f32le" && value(raw, after: "-ar") == "48000" && value(raw, after: "-ac") == "1",
+                "the file has no header: its format is declared before its input")
         #expect(encode.indices.filter { encode[$0] == "-map" }.map { encode[$0 + 1] } == ["0:v:0?", "1:a:0"])
         #expect(value(encode, after: "-c:v") == "copy")
-        #expect(value(encode, after: "-af") == "asetpts=(N+385024)/SR/TB," + AudioEnhancement.isolatedChain + ",atrim=start=30.010667:end=60.005333")
+        #expect(value(encode, after: "-af") == "asetpts=(N+385024)/SR/TB," + AudioEnhancement.levelledChain + ",atrim=start=30.010667:end=60.005333")
         #expect(!encode.contains("-itsoffset"))
         #expect(value(encode, after: "-c:a") == "aac")
         let output = Array(encode[inputs[1]...])

@@ -158,7 +158,7 @@ extension AudioTestSignals {
     }
 
     /// `samples` as raw 16-bit little-endian mono, clamped to full scale: what the enhanced
-    /// audio's filter step reads (`AudioEnhancement.isolatedEncodeArguments`).
+    /// audio's filter step reads (`AudioEnhancement.levelledEncodeArguments`).
     static func writeRaw16(_ samples: [Float], to url: URL) throws {
         var data = Data(capacity: samples.count * 2)
         for s in samples {

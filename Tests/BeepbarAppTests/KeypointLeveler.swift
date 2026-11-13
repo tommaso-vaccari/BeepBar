@@ -1,8 +1,11 @@
 import Foundation
 
 /// Candidate "G", the keypoint leveler: a gain that follows the lecture's own speech level over
-/// tens of seconds, in pure functions of the PCM (so it can move out of the test target when a
-/// design is chosen). Prototype for measurement only: nothing in production uses it.
+/// tens of seconds, in pure functions of the PCM. This file is the prototype the design was
+/// measured with. Production is `VoiceLeveler` in `BeepbarCore`, a rewrite whose rules for what a
+/// render cannot see differ (no `maxHold`, no `bootstrap`, no `unknown`: `known` keypoints and
+/// hold chains instead); this file is kept, unchanged in behaviour, as the reference those
+/// measurements were made with, and `VoiceLevelerReferenceTests` checks the two agree.
 ///
 /// Why it exists: the dynaudnorm/speechnorm family needs an absolute threshold or a bounded
 /// gain, and real lectures are recorded 20 to 62 dB apart (some are −60 dBFS) and sometimes

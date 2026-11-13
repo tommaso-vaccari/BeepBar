@@ -199,6 +199,9 @@ struct AudioEnhancementTests {
         #expect(AudioEnhancement.levelLead == Int((leveler.window + leveler.spacing) * Double(AudioEnhancement.isolationSampleRate)))
         #expect(AudioEnhancement.levelTail == Int((leveler.spacing + 0.5) * Double(AudioEnhancement.isolationSampleRate)))
         #expect(AudioEnhancementKind.allCases == [.levelled, .isolated])
+        // The pipeline mixes the two units (the lead and tail are counted in samples of the
+        // isolation rate but the leveler reads them at its own): they must be the same rate.
+        #expect(VoiceLeveler.rate == AudioEnhancement.isolationSampleRate)
     }
 
     /// The isolated path's two ffmpeg runs. Decoding: the audio alone, on the lecture's clock

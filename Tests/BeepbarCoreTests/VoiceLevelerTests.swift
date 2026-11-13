@@ -304,19 +304,8 @@ struct VoiceLevelerTests {
         #expect(leveler.keypoints(covering: Self.seconds(29.7)..<Self.seconds(59.7)) == 2...6)
     }
 
-    /// Speed: a 62 s clip levels in well under 100 ms in a release build (the encode of a
-    /// segment waits for it). Not measured in debug builds, which are an order of magnitude
-    /// slower. Guards against a per-sample dictionary or recomputed ceiling creeping back.
-    @Test func aMinuteLevelsFast() {
-        #if !DEBUG
-        let leveler = VoiceLeveler()
-        let clip = VoiceLeveler.Clip(samples: Self.speech(seconds: 62, dB: -40), start: 0)
-        let gains = leveler.gains(for: 0...7, detector: clip, known: [:])
-        let begin = ContinuousClock.now
-        _ = leveler.level(clip, gains: gains)
-        #expect(ContinuousClock.now - begin < .milliseconds(100))
-        #endif
-    }
+    // Speed is not tested here (a time limit is empty in a debug build and flaky under load):
+    // `LiveAudioMeasurements.aMinuteOfLevellingTakesMilliseconds` measures it on demand.
 }
 
 /// Percentile with the definition the leveler uses, for the tests.

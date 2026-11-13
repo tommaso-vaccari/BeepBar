@@ -115,7 +115,11 @@ extension RecordingPlayerPolicy {
                 "Audio migliorato: \(kind.displayName). Fai clic per tornare all'audio originale.",
                 "Enhanced audio: \(kind.displayName). Click to go back to the original audio."))
         case .failed(let message, let preferred):
-            return AudioButtonPresentation(isOn: false, action: .use(preferred), toolTip: message.text)
+            // The click retries `preferred`, so the tooltip says so after the reason; built here, at use
+            // time, so that it follows a language switch like `message` does.
+            return AudioButtonPresentation(isOn: false, action: .use(preferred), toolTip: message.text + " " + tr(
+                "Fai clic per riprovare con «\(preferred.displayName)».",
+                "Click to try \u{201C}\(preferred.displayName)\u{201D} again."))
         }
     }
 }
@@ -170,7 +174,7 @@ enum LiveAudioFailure: Equatable, Sendable {
     /// request has succeeded since (the failure passed). A refusal stays over later failures,
     /// whatever fails after an expired address; only a success clears it.
     private(set) var reportedFailure: LiveAudioFailure?
-    /// Lectures whose filter failed, until the student turns it on again.
+    /// Lectures whose filter failed, until a mode is chosen again.
     private var failures: [String: BilingualText] = [:]
 
     init(locateFFmpeg: @escaping () -> URL? = { AudioEnhancement.locateFFmpeg() },

@@ -85,6 +85,30 @@ struct LiveAudioMeasurements {
         #expect(leftovers.isEmpty)
     }
 
+    /// The cost of `VoiceLeveler` on a 62 s clip (a 30 s segment with its lead and tail), which
+    /// every segment waits for: `gains` (the keypoints, run on the pipeline actor, so it blocks
+    /// the seeks it serves) and `level` (the samples, off the actor), five repetitions each,
+    /// median and max in ms. A time limit in the gate would be empty in a debug build and flaky
+    /// under load, so it is measured here. Prints; asserts nothing about time.
+    @Test func aMinuteOfLevellingTakesMilliseconds() {
+        let leveler = VoiceLeveler()
+        let clip = VoiceLeveler.Clip(samples: VoiceLevelerReferenceTests.lecture([(62, -40)]), start: 0)
+        var gainTimes: [Double] = [], levelTimes: [Double] = []
+        for _ in 0..<5 {
+            let clock = ContinuousClock()
+            var gains: [Int: Double] = [:]
+            let a = clock.measure { gains = leveler.gains(for: 0...7, detector: clip, known: [:]) }
+            let b = clock.measure { _ = leveler.level(clip, gains: gains) }
+            gainTimes.append(Self.seconds(a) * 1000)
+            levelTimes.append(Self.seconds(b) * 1000)
+        }
+        func summary(_ values: [Double]) -> String { "median \(String(format: "%.1f", values.sorted()[2])) ms, max \(String(format: "%.1f", values.max()!)) ms" }
+        print("LEVELLING 62 s clip, 5 runs: gains \(summary(gainTimes)); level \(summary(levelTimes))")
+        #expect(!gainTimes.isEmpty)
+    }
+
+    private static func seconds(_ d: Duration) -> Double { Double(d.components.seconds) + Double(d.components.attoseconds) / 1e18 }
+
     /// This process's children (ffmpeg, here) still running.
     private static func children() -> Int {
         let process = Process()

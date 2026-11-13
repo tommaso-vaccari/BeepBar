@@ -829,7 +829,12 @@ actor LiveAudioPipeline {
                 var got = 0
                 while got < wanted {
                     try Task.checkCancellation()
-                    try source.read(into: buffer, frameCount: AVAudioFrameCount(wanted - got))
+                    // `read` at the end of the file throws (eofErr, -39) instead of returning no
+                    // frames, so never ask for more than is left: a decode shorter than
+                    // `offset + count` (the last fragment) is padded with silence, not failed.
+                    let left = Int(source.length - source.framePosition)
+                    guard left > 0 else { break }
+                    try source.read(into: buffer, frameCount: AVAudioFrameCount(min(wanted - got, left)))
                     let frames = Int(buffer.frameLength)
                     guard frames > 0 else { break }
                     if let channel = buffer.floatChannelData?[0] {

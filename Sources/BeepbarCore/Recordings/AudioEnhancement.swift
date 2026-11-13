@@ -9,7 +9,7 @@ import Foundation
 // is no native way to filter what AVPlayer plays. Instead the app serves AVPlayer a playlist of
 // its own on 127.0.0.1; each 30-second segment is fetched from Webex as its byte range, the
 // video copied as is and only the audio filtered (`VoiceLeveler` then `levelledChain`, or `filterChain`), a fraction of a
-// second of work per segment. With the switch off the player plays Webex's stream directly.
+// second of work per segment. With enhanced audio off the player plays Webex's stream directly.
 //
 // Why segments and not a whole copy (the first version, replaced on 2026-11-09): a copy of a
 // 2.5-hour lecture took about five minutes and 950 MB before the student heard anything.

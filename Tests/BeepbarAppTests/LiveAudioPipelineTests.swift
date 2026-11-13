@@ -111,7 +111,10 @@ private final class FakeFFmpeg: LiveAudioProcessRunning, @unchecked Sendable {
     private var finished: [String] = []
     private var encoded: [String: Encode] = [:]
     private let originalTone: Float?
-    init(failOnce: Set<String> = [], originalTone: Float? = nil) { failing = failOnce; self.originalTone = originalTone }
+    /// With `decodeLimit` a decode writes at most that many samples: a WAV shorter than the
+    /// span the isolated piece covers, as the last fragment's can be.
+    private let decodeLimit: Int?
+    init(failOnce: Set<String> = [], originalTone: Float? = nil, decodeLimit: Int? = nil) { failing = failOnce; self.originalTone = originalTone; self.decodeLimit = decodeLimit }
     /// One encode: its arguments, the bytes of the raw float input it read and the sample
     /// position the filter puts that input at.
     struct Encode { let arguments: [String]; let levelled: Data?; let firstSample: Int }
@@ -153,7 +156,7 @@ private final class FakeFFmpeg: LiveAudioProcessRunning, @unchecked Sendable {
         } else if let amplitude = originalTone, let trim = arguments.first(where: { $0.contains("atrim=start_sample=") }) {
             // The decode: as long as the trim keeps (a fragment and its lead-in when it has no end).
             let numbers = trim.matches(of: /_sample=(\d+)/).compactMap { Int($0.1) }
-            let length = numbers.count > 1 ? numbers[1] - numbers[0] : (numbers[0] > 0 ? 34 : 30) * 48000
+            let length = min(decodeLimit ?? .max, numbers.count > 1 ? numbers[1] - numbers[0] : (numbers[0] > 0 ? 34 : 30) * 48000)
             try AudioTestTones.floatWAV(tone(amplitude, hz: 440, count: length)).write(to: output)
         } else {
             try Data(count: 64).write(to: output)
@@ -192,13 +195,16 @@ private final class FakeIsolator: LiveAudioVoiceIsolating, @unchecked Sendable {
     private var failing: Set<String>
     private let amplitude: (@Sendable (Int) -> Float)?
     private var failingAfterWriting: Set<String>
+    private let oversized: (name: String, samples: Int)?
     /// With `amplitude`, the isolated voice is a 880 Hz sine of the amplitude it gives for the
     /// fragment (the decoded file's name says which), instead of zeros.
     /// `failAfterWriting` fails the first call for those decoded files after the output is written, as a
     /// real isolator does when it dies or is cancelled mid-write; `gates` also hold `"written-<name>"`,
     /// the moment after the output is on disk.
-    init(failOnce: Set<String> = [], failAfterWriting: Set<String> = [], amplitude: (@Sendable (Int) -> Float)? = nil) {
-        failing = failOnce; failingAfterWriting = failAfterWriting; self.amplitude = amplitude
+    /// With `oversized`, the output for that decoded file has that many samples whatever was asked
+    /// for: a piece long enough that the original's copy takes many blocks, so a test can end it midway.
+    init(failOnce: Set<String> = [], failAfterWriting: Set<String> = [], amplitude: (@Sendable (Int) -> Float)? = nil, oversized: (name: String, samples: Int)? = nil) {
+        failing = failOnce; failingAfterWriting = failAfterWriting; self.amplitude = amplitude; self.oversized = oversized
     }
     var calls: [String] { lock.withLock { made } }
     /// The decoded file each call was given, with its run number.
@@ -216,7 +222,7 @@ private final class FakeIsolator: LiveAudioVoiceIsolating, @unchecked Sendable {
             throw Failure()
         }
         if lock.withLock({ failing.remove(name) != nil }) { throw Failure() }
-        let length = count ?? 30 * 48000
+        let length = oversized.flatMap { $0.name == name ? $0.samples : nil } ?? count ?? 30 * 48000
         if let amplitude, let fragment = name.firstMatch(of: /decoded(\d+)/).flatMap({ Int($0.1) }) {
             let samples = tone(amplitude(fragment), hz: 880, count: length).map { Int16(($0 * 32767).rounded()) }
             try samples.withUnsafeBufferPointer { Data(buffer: $0) }.write(to: output)
@@ -440,6 +446,50 @@ struct LiveAudioPipelineTests {
         await pipeline.stop()
     }
 
+    /// An isolation ended while the original's copy is under way (a seek away, in `.levelled`)
+    /// leaves no `original` file: the half-written copy is deleted. The piece is made long (10
+    /// minutes of isolated output, 440 blocks of copy) and the seek comes as soon as the copy's
+    /// file exists, so it falls inside the copy. The two failure points the test above covers
+    /// both precede the copy, so only this one can fail when the cleanup is removed. Guards
+    /// against 5.8 MB per 30 s of audio, up to the whole lecture, left in the temporary folder
+    /// by every seek that arrives while an original is being written.
+    @Test func anIsolationEndedWhileTheOriginalIsCopiedLeavesNoOriginal() async throws {
+        defer { try? FileManager.default.removeItem(at: parent) }
+        let ffmpeg = FakeFFmpeg(originalTone: 0.01)
+        let isolator = FakeIsolator(amplitude: { _ in 0.1 }, oversized: (name: "decoded6t.wav", samples: 28_800_000))
+        let pipeline = pipeline(SyntheticWebex(fragments: 40), ffmpeg, isolator, kind: .levelled)
+        _ = try await pipeline.segment(0)
+        let six = Task { try await pipeline.segment(6) }
+        try await eventually("the original of piece 6 being written") { rawFiles("original").contains { stem($0) == "original6t.raw" } }
+        #expect(try await pipeline.segment(20).first == 0x47)
+        await #expect(throws: (any Error).self) { _ = try await six.value }
+        try await eventually("the half-written original deleted") { !rawFiles("original").contains { stem($0) == "original6t.raw" } }
+        #expect(!rawFiles("piece").contains { stem($0) == "piece6t.raw" })
+        await pipeline.stop()
+    }
+
+    /// A decoded WAV shorter than the piece (the last fragment's can be) gives an original of
+    /// exactly the piece's length: the samples there are, then silence. `AVAudioFile.read`
+    /// throws `eofErr` at the end of the file instead of returning no frames, so asking for
+    /// more than is left used to fail the segment and, in `.levelled`, turn the lecture's
+    /// enhanced audio off. Guards against that, and against the original being shorter than the
+    /// piece (the gain and the audio drifting apart).
+    @Test func aDecodeShorterThanThePieceIsPaddedWithSilence() async throws {
+        defer { try? FileManager.default.removeItem(at: parent) }
+        let shortBy = 40_000
+        let pipeline = pipeline(SyntheticWebex(fragments: 4), FakeFFmpeg(originalTone: 0.1, decodeLimit: shortBy), FakeIsolator(amplitude: { _ in 0.1 }), kind: .levelled)
+        _ = try await pipeline.segment(0)
+        let name = try #require(rawFiles("original").first { stem($0) == "original0t.raw" })
+        let data = try #require(FileManager.default.contents(atPath: parent.appendingPathComponent("session").appendingPathComponent(name).path))
+        let pieceSamples = size(try #require(rawFiles("piece").first { stem($0) == "piece0t.raw" })) / 2
+        #expect(pieceSamples > shortBy)
+        #expect(data.count == pieceSamples * 4, "\(data.count) bytes for \(pieceSamples) samples")
+        let samples = data.withUnsafeBytes { Array($0.bindMemory(to: Float.self)) }
+        #expect(Self.rms(data, 0..<shortBy) > 0.05, "the decoded samples are there")
+        #expect(samples[shortBy...].allSatisfy { $0 == 0 }, "then silence")
+        await pipeline.stop()
+    }
+
     /// A request that arrived first but waited on the playlist, far from the next one, seeks
     /// late: it cancels the work of the request that arrived after it, which is where the
     /// player now is and so is made again. Guards against the latest request answered with a
@@ -509,14 +559,35 @@ struct LiveAudioPipelineTests {
 
     /// Played straight through, a lecture keeps at most `keptPieces` pieces on disk, the most
     /// recent ones. Guards against a lecture filling the temporary folder (2.9 MB a piece).
-    @Test func atMostKeptPiecesStayOnDisk() async throws {
+    ///
+    /// In `.levelled` each kept piece's original is kept with it and goes with it, one to one:
+    /// guards against an eviction that retires the piece file and leaves the original (5.8 MB a
+    /// piece, kept until the player closes).
+    @Test(arguments: [AudioEnhancementKind.isolated, .levelled])
+    func atMostKeptPiecesStayOnDisk(kind: AudioEnhancementKind) async throws {
         defer { try? FileManager.default.removeItem(at: parent) }
         let count = LiveAudioPipeline.keptPieces + 6
-        let pipeline = pipeline(SyntheticWebex(fragments: count), FakeFFmpeg(), FakeIsolator())
-        for index in 0..<count { #expect(try await pipeline.segment(index).first == 0x47, "segment \(index)") }
+        let levelled = kind == .levelled
+        let ffmpeg = FakeFFmpeg(originalTone: levelled ? 0.01 : nil)
+        var amplitude: (@Sendable (Int) -> Float)?
+        if levelled { amplitude = { _ in 0.1 } }
+        let pipeline = pipeline(SyntheticWebex(fragments: count), ffmpeg, FakeIsolator(amplitude: amplitude), kind: kind)
+        for index in 0..<count {
+            let served = try await pipeline.segment(index)
+            #expect(served.first == 0x47, "segment \(index)")
+        }
         try await eventually("only the kept pieces left") { pieceFiles.count == LiveAudioPipeline.keptPieces }
         #expect(pieceFiles.contains { $0.hasPrefix("piece\(count - 1)") })
         #expect(!pieceFiles.contains { $0.hasPrefix("piece0") })
+        if levelled {
+            try await eventually("the originals of the kept pieces only") {
+                let originals: Set<String> = Set(rawFiles("original").map { stem($0) })
+                let expected: Set<String> = Set(pieceFiles.map { "original" + String($0.dropFirst("piece".count)) })
+                return originals.count == LiveAudioPipeline.keptPieces && originals == expected
+            }
+        } else {
+            #expect(rawFiles("original").isEmpty)
+        }
         await pipeline.stop()
     }
 

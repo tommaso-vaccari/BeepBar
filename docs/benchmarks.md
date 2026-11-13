@@ -307,7 +307,7 @@ Measure the local work of enhanced audio on a synthetic lecture, without the app
 BEEPBAR_MEASURE_AUDIO=1 swift test --filter LiveAudioMeasurements
 ```
 
-It needs ffmpeg where BeepBar looks for it (`/opt/homebrew/bin`, `/usr/local/bin`, `/opt/local/bin`) and the system speech synthesizer; without either, or without the variable, the suite is skipped, so it never slows the regular `swift test`. The lecture is six minutes laid out as Webex's (one fragmented MP4, 30-second segments, 720p, 44.1 kHz stereo voice), made once in the temporary folder and read from disk, so network time is left out. Each variant (`isolation=true` with Apple's voice isolation, `isolation=false` with ffmpeg only) asks for segments as the player would: the first (`seg0`), the next two, a seek ahead (`seg8`) and a seek back to a part already heard (`seg1`). It prints the wait for each, the time spent in each step (`decode`, `isolate`, `encode`, `probe`, with counts), the CPU of BeepBar and of ffmpeg, the memory footprint before, at peak and after stop, and fails if stopping leaves a file or a child process behind.
+It needs ffmpeg where BeepBar looks for it (`/opt/homebrew/bin`, `/usr/local/bin`, `/opt/local/bin`) and the system speech synthesizer; without either, or without the variable, the suite is skipped, so it never slows the regular `swift test`. The lecture is six minutes laid out as Webex's (one fragmented MP4, 30-second segments, 720p, 44.1 kHz stereo voice), made once in the temporary folder and read from disk, so network time is left out. Each variant (`isolation=true kind=isolated` and `isolation=true kind=levelled` with Apple's voice isolation, `isolation=false` with ffmpeg only) asks for segments as the player would: the first (`seg0`), the next two, a seek ahead (`seg8`) and a seek back to a part already heard (`seg1`). It prints the wait for each, the time spent in each step (`decode`, `isolate`, `encode`, `probe`, with counts), the CPU of BeepBar and of ffmpeg, the memory footprint before, at peak and after stop, and fails if stopping leaves a file or a child process behind.
 
 Report five runs per commit, interleaved and on the same machine and power source, with median and p95 of each wait. A commit older than the harness needs the file copied in and, if an API changed, a measurement-only adaptation recorded with the numbers. After stop the footprint stays at its peak while isolation is used: the voice model stays loaded in the process (the same at the commit before the piece cache), which is not a leak per session.
 
@@ -367,7 +367,7 @@ Same suite and gate (`KeypointLevelerRound3.swift`); the six excerpts are 180 s 
 - `fallback` (`FALL`): the chains that need no Swift leveler, on the isolated audio and on the original audio without isolation, against `current` and G.
 - `listening`: writes `<n>-<label>__original-loud|current|new-r2|new-r3.wav` to `BEEPBAR_AUDIO_AB_OUT`.
 
-Results (Apple M2, 8 GB, debug build, commit `ae299cd`; one run each, the chains are deterministic):
+Results (Apple M5, 32 GB, debug build, commit `ae299cd`; one run each, the chains are deterministic):
 
 - **Cleanup: none.** No `afftdn` or expander variant improved the residue without costing word endings; the isolator already leaves digital silence in the pauses. The `between-word` and `pause` figures track quiet speech and short noises rather than hiss, and on an excerpt whose level changes they count the quiet half's speech as pause: do not rank chains on them.
 - **Compressor: K17** (`threshold=0.08:ratio=3:attack=1:release=100:knee=6:makeup=4.52`), replacing round 2's K7 (`attack=10:release=200:knee=4:makeup=3.8`). Selection rule: limiter reduction p99 at most 3 dB, −18..−16 LUFS, least low-level lift.
@@ -387,3 +387,52 @@ Results (Apple M2, 8 GB, debug build, commit `ae299cd`; one run each, the chains
 - **Seams:** forward play after a seek has a 0.000 dB step with the previous piece's 12 s as history. A backward seek into a cached piece steps by 2.5 dB (median) and up to 40 dB across a level change; the fix (re-levelling a piece rendered without history once its predecessor is available) belongs to the production change. Ramps were dropped.
 
 Not established by these numbers: whether words sound whole, and whether short noises that survive isolation (a cough, a knock) are annoying once lifted with the voice. A person listening to the `listening` files decides both.
+
+### Enhanced audio: "Voce livellata" (round 4)
+
+Same suite and gate (`KeypointLevelerRound4.swift`); the six excerpts are the round-3 ones and three whole lectures (91 to 104 minutes) appear only as an index. Question: can a mode without Apple's isolation in what is heard follow the voice's level without lifting the room?
+
+S ("sidechain"): the isolated audio is only a detector. Its keypoint gains (the same leveler as G) are applied to the original audio, under the local ceiling computed on the original, then a front end, K17 and the limiter. Fronts: S-a and S-c put `afftdn` before the equalizers, S-b is the production front (high-pass, low-pass, the two equalizers), S-d cleans the original before the gain.
+
+- `sidechain` (`SIDE`): the four S fronts against G with K17 and against the round-3 chain without isolation (`front + D3-m100`, `dynaudnorm` with `m=100`), per excerpt. Columns as `limiterLoad` and `fallback`, plus `pause noise`: the RMS of the output over the stretches where the isolated audio is silent.
+- `longPause` (`PAUSE`): a composite with 180 s of the excerpt's own room noise in the middle, to see what each chain does to a pause of minutes.
+- `lectureProfile` (`PROF`, `KEY`): over a whole lecture, the keypoint gains and the level of the levelled original in pause frames and in speech spans, for the plain detector (`BASE`: a frame is voiced above −95 dBFS, a window is measured with at least 15% voiced frames) and three stricter ones (`R`, `E`, `RE`).
+- `listening4`: writes `<n>-<label>__original-loud|new-isolated|new-levelled.wav` to `BEEPBAR_AUDIO_AB_OUT`.
+
+Results (Apple M5, 32 GB, debug build, commits `d74ede4` and `a3ebdb5`; one run each, the chains are deterministic):
+
+- **"Voce livellata" is S-b.** Against G with K17 (what "Voce isolata" plays):
+
+  | Excerpt | G LUFS | G limiter p99 / max (dB) | G endings, worst 10% (dB) | G pause noise (dBFS) | S-b LUFS | S-b limiter p99 / max (dB) | S-b endings, worst 10% (dB) | S-b pause noise (dBFS) |
+  |---|---|---|---|---|---|---|---|---|
+  | 1 quiet, steady | −16.9 | 1.0 / 3.5 | −1.1 | −55.3 | −16.8 | 0.7 / 3.5 | −1.0 | −38.9 |
+  | 2 loud, level change | −16.3 | 1.6 / 4.0 | −3.7 | −57.8 | −16.3 | 1.4 / 4.5 | −0.3 | −35.0 |
+  | 3 quiet body | −18.1 | 0.0 / 1.1 | n/a | −48.2 | −16.9 | 0.0 / 2.5 | n/a | −25.2 |
+  | 4 loud then quiet | −16.9 | 0.0 / 1.8 | −2.4 | −70.2 | −16.8 | 0.0 / 7.3 | −1.8 | −24.7 |
+  | 5 normal | −17.2 | 0.4 / 3.7 | −13.0 | −93.0 | −15.8 | 0.6 / 3.8 | 0.6 | −39.3 |
+  | 6 normal | −16.7 | 0.0 / 2.6 | −37.3 | −88.0 | −15.0 | 0.4 / 3.0 | 1.2 | −33.1 |
+
+  S-b keeps the word endings that isolation itself removes on excerpts 5 and 6 (nothing after the isolator restores them), at the price of the room in the pauses: 17 to 55 dB more than G. The limiter reaches 7.3 dB once on excerpt 4 (p99 0.0).
+- **Rejected fronts.** `afftdn` before the equalizers (S-a, S-c) changes the pause noise by at most 2 dB and costs endings on excerpt 2 (worst 10% −6.5 dB against −0.3). Cleaning before the gain (S-d) lowers the pause noise by 7 dB on excerpt 1 only, with the same loss of endings.
+- **Rejected: `dynaudnorm` without isolation.** It follows whatever is loudest, so in a long pause of a normal-level lecture it raises the room by 42 dB (excerpt 5: −70.3 to −28.3 dBFS), where S-b holds its gain because the detector hears silence (−58.2 dBFS). Its endings on excerpt 2 are also worse (−6.8 dB).
+- **A long pause can still raise the gain.** In the composite of excerpt 2 the isolated room noise is not silent, the detector reads it as voice and the gain goes from 2.6 to 46.6 dB during the pause (pause at −18 dBFS). Over whole lectures this is rare: the levelled original in pause frames stays at p90 −46.7, −29.4 and −46.0 dBFS on the three lectures, above −26 dBFS for 2 s, 60 s and 4 s of 22, 42 and 10 minutes of pauses.
+- **The detector stays plain.** The stricter detectors change those figures little (lecture 2 with `RE`: p90 −31.5 dBFS, 37 s above −26) and lose speech: six 10-second speech spans end below −30 dBFS on lecture 2, none with `BASE`.
+- **Known limit.** Lecture 2 has speech near −64 dBFS and about 14 dB between voice and room: its gain is 44.5 dB (median), so the room in its pauses plays at about −33 dBFS (median) in "Voce livellata", above −35 dBFS for 27 of 42 minutes of pauses. "Voce isolata" is the mode for such a lecture.
+
+Not established by these numbers: which mode a listener prefers on a given lecture. A person listening to the `listening4` files decides.
+
+### Enhanced audio: production leveler
+
+`VoiceLeveler` (Core) replaces the prototype in the pipeline; the prototype stays in the test target as the reference these rounds measured. `VoiceLevelerReferenceTests` proves that a lecture played forward in 30-second segments, each levelled from its own clip with the session's keypoint memo, equals the prototype over the whole lecture (within 0.01 dB of gain), and that a segment made after a seek leaves no step at its seams.
+
+Preparation time per part, with the harness of "Enhanced audio (live filter)" above (`BEEPBAR_MEASURE_AUDIO=1 swift test --skip-build --filter LiveAudioMeasurements` after `swift build --build-tests`; Apple M5, 32 GB, debug build, AC power; five runs per commit, interleaved; `dev` is `46bd452`, the branch `a0129e9`). Wait in ms, median / p95 (with five runs the p95 is the maximum):
+
+| Variant | First part (`seg0`) | Seek ahead (`seg8`) | Back to a part already heard (`seg1`) |
+|---|---|---|---|
+| `dev`, isolation (the chain this replaces) | 1096 / 1203 | 1055 / 1084 | 344 / 347 |
+| branch, `.isolated` | 1176 / 1180 | 1161 / 1163 | 438 / 441 |
+| branch, `.levelled` | 1253 / 1257 | 1289 / 1304 | 473 / 480 |
+| `dev`, ffmpeg only | 614 / 630 | 637 / 641 | 644 / 648 |
+| branch, ffmpeg only | 614 / 619 | 636 / 638 | 638 / 660 |
+
+Against `dev`, a part not heard yet waits 80 to 110 ms more in `.isolated` and 160 to 235 ms more in `.levelled` (which also decodes and keeps the original audio); a part already heard waits about 95 and 130 ms more, because the pieces stay raw on disk and each segment is levelled when it is encoded. The path without isolation is unchanged. Not measured: a Release build, a machine with less memory, and `main` (enhanced audio has never been released, so there is no released behaviour to compare with).

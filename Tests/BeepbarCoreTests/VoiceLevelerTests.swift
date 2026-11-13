@@ -86,6 +86,20 @@ struct VoiceLevelerTests {
         #expect(Set(gains.keys) == Set(0...5), "only the requested keypoints come back")
     }
 
+    /// A window is a pause when fewer than 15% of its frames are voiced, not only when none is: a
+    /// cough or a word in 12 s of silence does not set the gain. 1.6 s of speech in the window
+    /// (4 frames of 30) holds the previous gain; 4 s (about 10) is measured. Guards against a
+    /// hold that waits for exact silence, which lifted a stray noise by up to 48 dB.
+    @Test func aWindowWithTooFewVoicedFramesHolds() {
+        let leveler = VoiceLeveler()
+        let few = VoiceLeveler.Clip(samples: Self.lecture([(18, -50), (1.6, -30), (10.4, nil)]), start: 0)
+        let gainsFew = leveler.gains(for: 2...3, detector: few, known: [:])
+        #expect(gainsFew[3] == gainsFew[2], "4 voiced frames of 30 hold")
+        let enough = VoiceLeveler.Clip(samples: Self.lecture([(18, -50), (4, -30), (8, nil)]), start: 0)
+        let gainsEnough = leveler.gains(for: 2...3, detector: enough, known: [:])
+        #expect(abs(gainsEnough[3]! - 10) < 2, "about 10 voiced frames of 30 are measured: \(gainsEnough[3]!)")
+    }
+
     /// A keypoint in `known` is returned as it is, whatever the audio says, and the others are
     /// still measured. This is what makes two segments that share a keypoint agree at their
     /// seam. Guards against recomputing a keypoint (a seam that steps by the difference between

@@ -13,6 +13,31 @@ private func eventually(_ what: String, _ condition: () async -> Bool) async thr
     throw CancellationError()
 }
 
+/// A one-shot event a test awaits without polling: `wait()` returns once `fire()` has been
+/// called, whether before or after.
+private final class Signal: @unchecked Sendable {
+    private let lock = NSLock()
+    private var fired = false
+    private var waiters: [CheckedContinuation<Void, Never>] = []
+    func fire() {
+        let toResume = lock.withLock { () -> [CheckedContinuation<Void, Never>] in
+            fired = true
+            defer { waiters = [] }
+            return waiters
+        }
+        toResume.forEach { $0.resume() }
+    }
+    func wait() async {
+        await withCheckedContinuation { continuation in
+            let already = lock.withLock { () -> Bool in
+                if !fired { waiters.append(continuation) }
+                return fired
+            }
+            if already { continuation.resume() }
+        }
+    }
+}
+
 /// The name a file of one run has without its run number (`runFile`): `decoded6l-12.wav` is
 /// `decoded6l.wav`, the name tests hold, fail and look for.
 private func stem(_ name: String) -> String {
@@ -219,17 +244,13 @@ private final class FakeIsolator: LiveAudioVoiceIsolating, @unchecked Sendable {
     private var failing: Set<String>
     private let amplitude: (@Sendable (Int) -> Float)?
     private var failingAfterWriting: Set<String>
-    private let oversized: (name: String, samples: Int)?
     /// With `amplitude`, the isolated voice is a 880 Hz sine of the amplitude it gives for the
     /// fragment (the decoded file's name says which), instead of zeros.
     /// `failAfterWriting` fails the first call for those decoded files after the output is written, as a
     /// real isolator does when it dies or is cancelled mid-write; `gates` also hold `"written-<name>"`,
     /// the moment after the output is on disk.
-    /// With `oversized`, the output for that decoded file has that many samples whatever was asked
-    /// for, as silence (a long tone would take seconds to build): a piece long enough that the
-    /// original's copy takes many blocks, so a test can end it midway.
-    init(failOnce: Set<String> = [], failAfterWriting: Set<String> = [], amplitude: (@Sendable (Int) -> Float)? = nil, oversized: (name: String, samples: Int)? = nil) {
-        failing = failOnce; failingAfterWriting = failAfterWriting; self.amplitude = amplitude; self.oversized = oversized
+    init(failOnce: Set<String> = [], failAfterWriting: Set<String> = [], amplitude: (@Sendable (Int) -> Float)? = nil) {
+        failing = failOnce; failingAfterWriting = failAfterWriting; self.amplitude = amplitude
     }
     var calls: [String] { lock.withLock { made } }
     /// The decoded file each call was given, with its run number.
@@ -247,8 +268,8 @@ private final class FakeIsolator: LiveAudioVoiceIsolating, @unchecked Sendable {
             throw Failure()
         }
         if lock.withLock({ failing.remove(name) != nil }) { throw Failure() }
-        let length = oversized.flatMap { $0.name == name ? $0.samples : nil } ?? count ?? 30 * 48000
-        if let amplitude, oversized?.name != name, let fragment = name.firstMatch(of: /decoded(\d+)/).flatMap({ Int($0.1) }) {
+        let length = count ?? 30 * 48000
+        if let amplitude, let fragment = name.firstMatch(of: /decoded(\d+)/).flatMap({ Int($0.1) }) {
             let samples = tone16(amplitude(fragment), hz: 880, count: length)
             try samples.withUnsafeBufferPointer { Data(buffer: $0) }.write(to: output)
         } else {
@@ -472,28 +493,44 @@ struct LiveAudioPipelineTests {
     }
 
     /// An isolation ended while the original's copy is under way (a seek away, in `.levelled`)
-    /// leaves no `original` file: the half-written copy is deleted. The piece is made long (200
-    /// seconds of isolated output, 147 blocks of 65 536 samples) and the seek comes as soon as
-    /// the copy's file exists, so it falls inside the copy. Only the first 25 or so blocks read
-    /// the decoded WAV (it holds about 34 s of tone); the others write zeros, which is cheap. The
-    /// window is the copy's own duration, not a gate: when the copy was made a block move it
-    /// ended before the seek arrived and this test failed every time (a gate inside the copy is
-    /// tracked in issue #243). The two failure points the test above covers
+    /// leaves no `original` file: the half-written copy is deleted. The copy is stopped at its
+    /// first block boundary by the pipeline's test checkpoint (`originalCheckpoint`), which
+    /// waits there until its task is cancelled, so the order is forced, not raced: copy stopped
+    /// midway (the test asserts the file is there and holds exactly one block), then the seek
+    /// to segment 20 cancels isolation 6 inside the copy, then the cleanup runs. It no longer
+    /// depends on how long the copy takes (it failed when the copy was made a block move that
+    /// ended before the seek arrived: issue #243). The two failure points the test above covers
     /// both precede the copy, so only this one can fail when the cleanup is removed. Guards
     /// against 5.8 MB per 30 s of audio, up to the whole lecture, left in the temporary folder
     /// by every seek that arrives while an original is being written.
-    @Test func anIsolationEndedWhileTheOriginalIsCopiedLeavesNoOriginal() async throws {
+    @Test(.timeLimit(.minutes(1))) func anIsolationEndedWhileTheOriginalIsCopiedLeavesNoOriginal() async throws {
         defer { try? FileManager.default.removeItem(at: parent) }
         let ffmpeg = FakeFFmpeg(originalTone: 0.01)
-        let isolator = FakeIsolator(amplitude: { _ in 0.1 }, oversized: (name: "decoded6t.wav", samples: 9_600_000))
+        let isolator = FakeIsolator(amplitude: { _ in 0.1 })
         let pipeline = pipeline(SyntheticWebex(fragments: 40), ffmpeg, isolator, kind: .levelled)
+        // Stops the copy of piece 6's original after its first block, until its task is
+        // cancelled: the wait ends only that way, so the seek below is what ends it. Other
+        // pieces' copies (the prefetched neighbours, segment 20's) are not held.
+        let stopped = Signal()
+        await pipeline.setOriginalCheckpointForTesting { output, blocks in
+            guard blocks == 1, stem(output.lastPathComponent) == "original6t.raw" else { return }
+            stopped.fire()
+            try await Task.sleep(for: .seconds(86_400))
+        }
         _ = try await pipeline.segment(0)
         let six = Task { try await pipeline.segment(6) }
-        try await eventually("the original of piece 6 being written") { rawFiles("original").contains { stem($0) == "original6t.raw" } }
+        await stopped.wait()
+        // The copy is under way and cut short: the file is there with exactly the one block.
+        let original = try #require(rawFiles("original").first { stem($0) == "original6t.raw" }, "the copy stopped before its file existed")
+        #expect(size(original) == 65_536 * 4, "the copy was not stopped after its first block")
+        #expect(rawFiles("piece").contains { stem($0) == "piece6t.raw" })
         #expect(try await pipeline.segment(20).first == 0x47)
         await #expect(throws: (any Error).self) { _ = try await six.value }
-        try await eventually("the half-written original deleted") { !rawFiles("original").contains { stem($0) == "original6t.raw" } }
-        #expect(!rawFiles("piece").contains { stem($0) == "piece6t.raw" })
+        // `six` may throw before the cancelled isolation has finished unwinding, so the cleanup
+        // is waited for (an external event: it has no signal of its own).
+        try await eventually("the half-written original and its piece deleted") {
+            !rawFiles("original").contains { stem($0) == "original6t.raw" } && !rawFiles("piece").contains { stem($0) == "piece6t.raw" }
+        }
         await pipeline.stop()
     }
 

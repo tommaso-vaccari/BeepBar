@@ -367,6 +367,14 @@ actor LiveAudioPipeline {
     private var keypointGains: [Int: Double] = [:]
     /// The keypoints of `keypointGains` that are provisional; written and cleared with it.
     private var provisionalKeypoints: Set<Int> = []
+    /// Test seam: awaited by `writeOriginal` after each block of an original's copy is written,
+    /// with the file being written and the number of blocks written so far, so a test can stop
+    /// a copy at a block boundary and end the isolation there (a seek) whatever the speed of
+    /// the copy. `nil` in production, where the copy has no extra suspension or allocation for
+    /// it. Set with `setOriginalCheckpointForTesting` before the work it must see starts.
+    /// Replaces a test that depended on the copy's real duration and failed once the copy got
+    /// faster (issue #243).
+    private var originalCheckpoint: (@Sendable (_ output: URL, _ blocksWritten: Int) async throws -> Void)?
 
     init(stream: URL, ffmpeg: URL, folder: URL, parent: URL, fetcher: LiveAudioFetching, runner: LiveAudioProcessRunning,
          isolator: LiveAudioVoiceIsolating? = nil, kind: AudioEnhancementKind = .isolated,
@@ -699,7 +707,7 @@ actor LiveAudioPipeline {
         if kind == .levelled {
             let url = runFile("original\(k)\(flags)", "raw")
             do {
-                try await Self.writeOriginal(from: decoded, offset: start - from, count: bytes / 2, to: url)
+                try await Self.writeOriginal(from: decoded, offset: start - from, count: bytes / 2, to: url, checkpoint: originalCheckpoint)
                 try Task.checkCancellation()
             } catch {
                 try? FileManager.default.removeItem(at: url)
@@ -806,8 +814,11 @@ actor LiveAudioPipeline {
 
     /// Writes `count` samples of the decoded WAV from sample `offset` as raw float mono (what
     /// `original` is), padding with silence or cutting so it has exactly `count`. In blocks:
-    /// memory does not depend on the fragment's length. Throws `CancellationError`.
-    private nonisolated static func writeOriginal(from decoded: URL, offset: Int, count: Int, to output: URL) async throws {
+    /// memory does not depend on the fragment's length. Throws `CancellationError`. `checkpoint`
+    /// (tests only, `originalCheckpoint`) is awaited after each block is on disk; with `nil` the
+    /// loop is exactly as without it.
+    private nonisolated static func writeOriginal(from decoded: URL, offset: Int, count: Int, to output: URL,
+                                                  checkpoint: (@Sendable (URL, Int) async throws -> Void)? = nil) async throws {
         let source = try AVAudioFile(forReading: decoded)
         guard FileManager.default.createFile(atPath: output.path, contents: nil) else { throw LiveAudioFetchError.unexpected }
         let destination = try FileHandle(forWritingTo: output)
@@ -815,6 +826,7 @@ actor LiveAudioPipeline {
         let block = 65_536
         guard let buffer = AVAudioPCMBuffer(pcmFormat: source.processingFormat, frameCapacity: AVAudioFrameCount(block)) else { throw LiveAudioFetchError.unexpected }
         var done = 0
+        var blocksWritten = 0
         while done < count {
             try Task.checkCancellation()
             let wanted = min(block, count - done)
@@ -845,6 +857,8 @@ actor LiveAudioPipeline {
             }
             try destination.write(contentsOf: samples.withUnsafeBytes { Data($0) })
             done += wanted
+            blocksWritten += 1
+            if let checkpoint { try await checkpoint(output, blocksWritten) }
         }
     }
 
@@ -861,6 +875,8 @@ actor LiveAudioPipeline {
     func keptPiece(_ k: Int) -> (hasLead: Bool, hasTail: Bool)? { pieces[k].map { ($0.hasLead, $0.hasTail) } }
     /// `latestRequest`, for tests, which can't tell otherwise when a request has arrived.
     func lastRequested() -> Int { latestRequest }
+    /// Sets `originalCheckpoint`, for tests (issue #243).
+    func setOriginalCheckpointForTesting(_ checkpoint: (@Sendable (URL, Int) async throws -> Void)?) { originalCheckpoint = checkpoint }
 
     private func touch(_ k: Int) {
         piecesUsed.removeAll { $0 == k }

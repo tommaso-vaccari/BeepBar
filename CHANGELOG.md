@@ -5,7 +5,7 @@
 ### New
 
 - Add a lesson to the Watchlist by pasting its Webex link with the “+” button, for recordings the archive doesn't list. The link copied from the Webex web app's address bar works too. Leave the title empty and the first Play fills in Webex's title and the length; the lesson then shows its progress bar and the “Fatta” (“Done”) checkbox like the others.
-- “Audio migliorato” (“Enhanced audio”) in the player's title bar reduces classroom noise and brings the teacher's voice forward while the lecture plays, using Apple's voice isolation. It needs ffmpeg on your Mac (`brew install ffmpeg`); without it the switch says how to get it. With it on, a lecture takes about a second to start and after each jump to a part not heard yet; if it stops working, the lecture carries on with its original audio.
+- “Audio migliorato” (“Enhanced audio”) in the player's title bar makes the teacher's voice easier to follow while the lecture plays: quiet recordings and a teacher who moves away from the microphone are brought to the same volume. The menu next to the button offers two modes: “Voce isolata” (“Isolated voice”, the default) plays only the voice, without the classroom noise; “Voce livellata” (“Levelled voice”) keeps the lecture's original sound at an even volume, for recordings where isolating the voice cuts words. The button turns the last mode used on and off. It needs ffmpeg on your Mac (`brew install ffmpeg`); without it the button says how to get it. With it on, a lecture takes a little over a second to start and after each jump to a part not heard yet; if it stops working, the lecture carries on with its original audio.
 
 ### Improved
 

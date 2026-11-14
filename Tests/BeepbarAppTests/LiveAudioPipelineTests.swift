@@ -99,13 +99,27 @@ private final class SyntheticWebex: LiveAudioFetching, @unchecked Sendable {
 /// cancellation, as `FFmpegRunner` reports it), then writes its output. A probe
 /// answers that fragment `k`'s audio starts at `30 k` s; a decode writes a stand-in WAV; an
 /// encode writes an MPEG-TS byte. `failOnce` fails the first run writing one of those names.
+/// With `originalTone` the decode writes what a real one does, a mono 48 kHz float WAV of a
+/// 440 Hz sine of that amplitude, as long as the `atrim` of its arguments says; and every encode
+/// records its arguments and the bytes of the levelled file it was given, which is deleted once
+/// the encode returns.
 private final class FakeFFmpeg: LiveAudioProcessRunning, @unchecked Sendable {
     let gates = Gates()
     private let lock = NSLock()
     private var failing: Set<String>
     private var missing: [String] = []
     private var finished: [String] = []
-    init(failOnce: Set<String> = []) { failing = failOnce }
+    private var encoded: [String: Encode] = [:]
+    private let originalTone: Float?
+    /// With `decodeLimit` a decode writes at most that many samples: a WAV shorter than the
+    /// span the isolated piece covers, as the last fragment's can be.
+    private let decodeLimit: Int?
+    init(failOnce: Set<String> = [], originalTone: Float? = nil, decodeLimit: Int? = nil) { failing = failOnce; self.originalTone = originalTone; self.decodeLimit = decodeLimit }
+    /// One encode: its arguments, the bytes of the raw float input it read and the sample
+    /// position the filter puts that input at.
+    struct Encode { let arguments: [String]; let levelled: Data?; let firstSample: Int }
+    /// The last encode that wrote each output (`out3.ts`).
+    func encode(_ name: String) -> Encode? { lock.withLock { encoded[name] } }
     /// Runs that found a file they read deleted, and those files: each one a segment or piece lost.
     var missingInputs: [String] { lock.withLock { missing } }
     var failedAll: Bool { lock.withLock { failing.isEmpty } }
@@ -133,10 +147,63 @@ private final class FakeFFmpeg: LiveAudioProcessRunning, @unchecked Sendable {
             let pts = fragment * 30 * 48000
             try "#tb 0: 1/48000\n0, \(pts), \(pts), 1024, 10, 0x00000000\n".write(to: output, atomically: true, encoding: .utf8)
         } else if arguments.contains("mpegts") {
+            let raw = zip(arguments, arguments.dropFirst()).first { $0.0 == "-i" && $0.1.hasSuffix(".raw") }?.1
+            let filter = arguments.first { $0.hasPrefix("asetpts=(N+") } ?? ""
+            let first = filter.firstMatch(of: /asetpts=\(N\+(\d+)\)/).flatMap { Int($0.1) } ?? 0
+            let levelled = raw.flatMap { FileManager.default.contents(atPath: $0) }
+            lock.withLock { encoded[name] = Encode(arguments: arguments, levelled: levelled, firstSample: first) }
             try Data([0x47]).write(to: output)
+        } else if let amplitude = originalTone, let trim = arguments.first(where: { $0.contains("atrim=start_sample=") }) {
+            // The decode: as long as the trim keeps (a fragment and its lead-in when it has no end).
+            let numbers = trim.matches(of: /_sample=(\d+)/).compactMap { Int($0.1) }
+            let length = min(decodeLimit ?? .max, numbers.count > 1 ? numbers[1] - numbers[0] : (numbers[0] > 0 ? 34 : 30) * 48000)
+            try AudioTestTones.floatWAV(tone(amplitude, hz: 440, count: length)).write(to: output)
         } else {
             try Data(count: 64).write(to: output)
         }
+    }
+}
+
+/// Sine waves for the fakes: whole-second tiles, so a long one is cheap to make. Copied a
+/// second at a time with `update(from:)`: an element-by-element `map` over a minute of samples
+/// is what made the pipeline tests cost tens of CPU seconds in debug builds.
+private func tone(_ amplitude: Float, hz: Int, count: Int) -> [Float] {
+    let second = (0..<48000).map { amplitude * Float(sin(2 * Double.pi * Double(hz) * Double($0) / 48000)) }
+    return tiled(second, count: count)
+}
+
+/// The same tone as 16-bit samples (what the isolator writes), by tiles of a second.
+private func tone16(_ amplitude: Float, hz: Int, count: Int) -> [Int16] {
+    let second = (0..<48000).map { Int16(((amplitude * Float(sin(2 * Double.pi * Double(hz) * Double($0) / 48000))) * 32767).rounded()) }
+    return tiled(second, count: count)
+}
+
+private func tiled<T>(_ tile: [T], count: Int) -> [T] {
+    guard count > 0, let first = tile.first else { return [] }
+    var out = [T](repeating: first, count: count)
+    out.withUnsafeMutableBufferPointer { destination in
+        tile.withUnsafeBufferPointer { source in
+            var at = 0
+            while at < count {
+                let n = min(source.count, count - at)
+                (destination.baseAddress! + at).update(from: source.baseAddress!, count: n)
+                at += n
+            }
+        }
+    }
+    return out
+}
+
+private enum AudioTestTones {
+    /// A mono 48 kHz 32-bit float WAV (IEEE float, format 3), as ffmpeg's decode writes.
+    static func floatWAV(_ samples: [Float]) -> Data {
+        func le<T: FixedWidthInteger>(_ v: T) -> [UInt8] { withUnsafeBytes(of: v.littleEndian) { Array($0) } }
+        let bytes = samples.count * 4
+        var d = Data("RIFF".utf8)
+        d += le(UInt32(36 + bytes)) + Data("WAVEfmt ".utf8) + le(UInt32(16)) + le(UInt16(3)) + le(UInt16(1))
+        d += le(UInt32(48000)) + le(UInt32(48000 * 4)) + le(UInt16(4)) + le(UInt16(32)) + Data("data".utf8) + le(UInt32(bytes))
+        samples.withUnsafeBufferPointer { d += Data(buffer: $0) }
+        return d
     }
 }
 
@@ -150,7 +217,20 @@ private final class FakeIsolator: LiveAudioVoiceIsolating, @unchecked Sendable {
     private var given: [URL] = []
     private var missing: [String] = []
     private var failing: Set<String>
-    init(failOnce: Set<String> = []) { failing = failOnce }
+    private let amplitude: (@Sendable (Int) -> Float)?
+    private var failingAfterWriting: Set<String>
+    private let oversized: (name: String, samples: Int)?
+    /// With `amplitude`, the isolated voice is a 880 Hz sine of the amplitude it gives for the
+    /// fragment (the decoded file's name says which), instead of zeros.
+    /// `failAfterWriting` fails the first call for those decoded files after the output is written, as a
+    /// real isolator does when it dies or is cancelled mid-write; `gates` also hold `"written-<name>"`,
+    /// the moment after the output is on disk.
+    /// With `oversized`, the output for that decoded file has that many samples whatever was asked
+    /// for, as silence (a long tone would take seconds to build): a piece long enough that the
+    /// original's copy takes many blocks, so a test can end it midway.
+    init(failOnce: Set<String> = [], failAfterWriting: Set<String> = [], amplitude: (@Sendable (Int) -> Float)? = nil, oversized: (name: String, samples: Int)? = nil) {
+        failing = failOnce; failingAfterWriting = failAfterWriting; self.amplitude = amplitude; self.oversized = oversized
+    }
     var calls: [String] { lock.withLock { made } }
     /// The decoded file each call was given, with its run number.
     var inputs: [URL] { lock.withLock { given } }
@@ -167,7 +247,15 @@ private final class FakeIsolator: LiveAudioVoiceIsolating, @unchecked Sendable {
             throw Failure()
         }
         if lock.withLock({ failing.remove(name) != nil }) { throw Failure() }
-        try Data(count: 2 * (count ?? 30 * 48000)).write(to: output)
+        let length = oversized.flatMap { $0.name == name ? $0.samples : nil } ?? count ?? 30 * 48000
+        if let amplitude, oversized?.name != name, let fragment = name.firstMatch(of: /decoded(\d+)/).flatMap({ Int($0.1) }) {
+            let samples = tone16(amplitude(fragment), hz: 880, count: length)
+            try samples.withUnsafeBufferPointer { Data(buffer: $0) }.write(to: output)
+        } else {
+            try Data(count: 2 * length).write(to: output)
+        }
+        if lock.withLock({ failingAfterWriting.remove(name) != nil }) { throw Failure() }
+        try await gates.pass("written-" + name)
     }
 }
 
@@ -186,13 +274,26 @@ struct LiveAudioPipelineTests {
         func add(_ failure: LiveAudioFailure?) { lock.withLock { seen.append(failure) } }
     }
 
-    private func pipeline(_ webex: SyntheticWebex, _ ffmpeg: FakeFFmpeg, _ isolator: FakeIsolator, reports: Reports = Reports()) -> LiveAudioPipeline {
+    private func pipeline(_ webex: SyntheticWebex, _ ffmpeg: FakeFFmpeg, _ isolator: FakeIsolator, kind: AudioEnhancementKind = .isolated, reports: Reports = Reports()) -> LiveAudioPipeline {
         LiveAudioPipeline(stream: Self.address, ffmpeg: URL(fileURLWithPath: "/usr/bin/false"), folder: parent.appendingPathComponent("session"),
-                          parent: parent, fetcher: webex, runner: ffmpeg, isolator: isolator, report: { reports.add($0) })
+                          parent: parent, fetcher: webex, runner: ffmpeg, isolator: isolator, kind: kind, report: { reports.add($0) })
+    }
+
+    /// The raw files of the session folder whose name starts with `prefix`, run numbers removed.
+    private func rawFiles(_ prefix: String) -> [String] {
+        ((try? FileManager.default.contentsOfDirectory(atPath: parent.appendingPathComponent("session").path)) ?? []).filter { $0.hasSuffix(".raw") && $0.hasPrefix(prefix) }
+    }
+    private func size(_ name: String) -> Int {
+        (try? FileManager.default.attributesOfItem(atPath: parent.appendingPathComponent("session").appendingPathComponent(name).path)[.size] as? Int) ?? 0
+    }
+
+    private static func rms(_ data: Data, _ range: Range<Int>) -> Double {
+        let samples = data.withUnsafeBytes { Array($0.bindMemory(to: Float.self)) }
+        return (range.reduce(0.0) { $0 + Double(samples[$1] * samples[$1]) } / Double(range.count)).squareRoot()
     }
 
     private var pieceFiles: Set<String> {
-        Set(((try? FileManager.default.contentsOfDirectory(atPath: parent.appendingPathComponent("session").path)) ?? []).filter { $0.hasSuffix(".raw") }.map(stem))
+        Set(((try? FileManager.default.contentsOfDirectory(atPath: parent.appendingPathComponent("session").path)) ?? []).filter { $0.hasSuffix(".raw") && $0.hasPrefix("piece") }.map(stem))
     }
 
     /// A seek forward, then a step back into the segment before: every segment is served, the
@@ -341,6 +442,83 @@ struct LiveAudioPipelineTests {
         await pipeline.stop()
     }
 
+    /// An isolation that ends after its isolator wrote the piece but before the piece is stored
+    /// (cancelled by a seek away, or the isolator dying mid-write) leaves neither the piece nor an
+    /// original on disk, in both kinds. Guards against a leak of 2.9 MB (5.8 MB more in
+    /// `.levelled`) per abandoned isolation until the player closes.
+    @Test(arguments: [AudioEnhancementKind.isolated, .levelled])
+    func anIsolationEndedBeforeItsPieceIsStoredLeavesNoFile(kind: AudioEnhancementKind) async throws {
+        defer { try? FileManager.default.removeItem(at: parent) }
+        // Cancelled after the isolator wrote the file.
+        let ffmpeg = FakeFFmpeg(originalTone: 0.01)
+        let isolator = FakeIsolator(failAfterWriting: ["decoded0t.wav"], amplitude: { _ in 0.1 })
+        let pipeline = pipeline(SyntheticWebex(fragments: 40), ffmpeg, isolator, kind: kind)
+        // The isolator dying mid-write: segment 0 fails, and the piece it started is gone.
+        await #expect(throws: (any Error).self) { _ = try await pipeline.segment(0) }
+        #expect(!rawFiles("piece").contains { stem($0) == "piece0t.raw" }, "left by a failed isolator: \(rawFiles("piece"))")
+        #expect(!rawFiles("original").contains { stem($0) == "original0t.raw" })
+        _ = try await pipeline.segment(0)
+        isolator.gates.hold("written-decoded6t.wav")
+        let six = Task { try await pipeline.segment(6) }
+        try await eventually("piece 6 written and held") { isolator.gates.isWaiting("written-decoded6t.wav") }
+        #expect(rawFiles("piece").contains { stem($0) == "piece6t.raw" }, "the isolator's output is on disk while it waits")
+        #expect(try await pipeline.segment(20).first == 0x47)
+        try await eventually("piece 6's isolation ended") { !isolator.gates.isWaiting("written-decoded6t.wav") }
+        await #expect(throws: (any Error).self) { _ = try await six.value }
+        #expect(!rawFiles("piece").contains { stem($0) == "piece6t.raw" }, "left by a cancelled isolation: \(rawFiles("piece"))")
+        #expect(!rawFiles("original").contains { stem($0) == "original6t.raw" })
+        isolator.gates.release("written-decoded6t.wav")
+        await pipeline.stop()
+    }
+
+    /// An isolation ended while the original's copy is under way (a seek away, in `.levelled`)
+    /// leaves no `original` file: the half-written copy is deleted. The piece is made long (200
+    /// seconds of isolated output, 147 blocks of 65 536 samples) and the seek comes as soon as
+    /// the copy's file exists, so it falls inside the copy. Only the first 25 or so blocks read
+    /// the decoded WAV (it holds about 34 s of tone); the others write zeros, which is cheap. The
+    /// window is the copy's own duration, not a gate: when the copy was made a block move it
+    /// ended before the seek arrived and this test failed every time (a gate inside the copy is
+    /// tracked in issue #243). The two failure points the test above covers
+    /// both precede the copy, so only this one can fail when the cleanup is removed. Guards
+    /// against 5.8 MB per 30 s of audio, up to the whole lecture, left in the temporary folder
+    /// by every seek that arrives while an original is being written.
+    @Test func anIsolationEndedWhileTheOriginalIsCopiedLeavesNoOriginal() async throws {
+        defer { try? FileManager.default.removeItem(at: parent) }
+        let ffmpeg = FakeFFmpeg(originalTone: 0.01)
+        let isolator = FakeIsolator(amplitude: { _ in 0.1 }, oversized: (name: "decoded6t.wav", samples: 9_600_000))
+        let pipeline = pipeline(SyntheticWebex(fragments: 40), ffmpeg, isolator, kind: .levelled)
+        _ = try await pipeline.segment(0)
+        let six = Task { try await pipeline.segment(6) }
+        try await eventually("the original of piece 6 being written") { rawFiles("original").contains { stem($0) == "original6t.raw" } }
+        #expect(try await pipeline.segment(20).first == 0x47)
+        await #expect(throws: (any Error).self) { _ = try await six.value }
+        try await eventually("the half-written original deleted") { !rawFiles("original").contains { stem($0) == "original6t.raw" } }
+        #expect(!rawFiles("piece").contains { stem($0) == "piece6t.raw" })
+        await pipeline.stop()
+    }
+
+    /// A decoded WAV shorter than the piece (the last fragment's can be) gives an original of
+    /// exactly the piece's length: the samples there are, then silence. `AVAudioFile.read`
+    /// throws `eofErr` at the end of the file instead of returning no frames, so asking for
+    /// more than is left used to fail the segment and, in `.levelled`, turn the lecture's
+    /// enhanced audio off. Guards against that, and against the original being shorter than the
+    /// piece (the gain and the audio drifting apart).
+    @Test func aDecodeShorterThanThePieceIsPaddedWithSilence() async throws {
+        defer { try? FileManager.default.removeItem(at: parent) }
+        let shortBy = 40_000
+        let pipeline = pipeline(SyntheticWebex(fragments: 4), FakeFFmpeg(originalTone: 0.1, decodeLimit: shortBy), FakeIsolator(amplitude: { _ in 0.1 }), kind: .levelled)
+        _ = try await pipeline.segment(0)
+        let name = try #require(rawFiles("original").first { stem($0) == "original0t.raw" })
+        let data = try #require(FileManager.default.contents(atPath: parent.appendingPathComponent("session").appendingPathComponent(name).path))
+        let pieceSamples = size(try #require(rawFiles("piece").first { stem($0) == "piece0t.raw" })) / 2
+        #expect(pieceSamples > shortBy)
+        #expect(data.count == pieceSamples * 4, "\(data.count) bytes for \(pieceSamples) samples")
+        let samples = data.withUnsafeBytes { Array($0.bindMemory(to: Float.self)) }
+        #expect(Self.rms(data, 0..<shortBy) > 0.05, "the decoded samples are there")
+        #expect(samples[shortBy...].allSatisfy { $0 == 0 }, "then silence")
+        await pipeline.stop()
+    }
+
     /// A request that arrived first but waited on the playlist, far from the next one, seeks
     /// late: it cancels the work of the request that arrived after it, which is where the
     /// player now is and so is made again. Guards against the latest request answered with a
@@ -410,14 +588,195 @@ struct LiveAudioPipelineTests {
 
     /// Played straight through, a lecture keeps at most `keptPieces` pieces on disk, the most
     /// recent ones. Guards against a lecture filling the temporary folder (2.9 MB a piece).
-    @Test func atMostKeptPiecesStayOnDisk() async throws {
+    ///
+    /// In `.levelled` each kept piece's original is kept with it and goes with it, one to one:
+    /// guards against an eviction that retires the piece file and leaves the original (5.8 MB a
+    /// piece, kept until the player closes).
+    @Test(arguments: [AudioEnhancementKind.isolated, .levelled])
+    func atMostKeptPiecesStayOnDisk(kind: AudioEnhancementKind) async throws {
         defer { try? FileManager.default.removeItem(at: parent) }
-        let count = LiveAudioPipeline.keptPieces + 6
-        let pipeline = pipeline(SyntheticWebex(fragments: count), FakeFFmpeg(), FakeIsolator())
-        for index in 0..<count { #expect(try await pipeline.segment(index).first == 0x47, "segment \(index)") }
+        let count = LiveAudioPipeline.keptPieces + 2
+        let levelled = kind == .levelled
+        // One second of decoded audio (the original is then padded with silence): the files are
+        // what is counted, and 46 segments of a full-size tone would starve the other suites.
+        let ffmpeg = FakeFFmpeg(originalTone: levelled ? 0.01 : nil, decodeLimit: 48_000)
+        var amplitude: (@Sendable (Int) -> Float)?
+        if levelled { amplitude = { _ in 0.1 } }
+        let pipeline = pipeline(SyntheticWebex(fragments: count), ffmpeg, FakeIsolator(amplitude: amplitude), kind: kind)
+        for index in 0..<count {
+            let served = try await pipeline.segment(index)
+            #expect(served.first == 0x47, "segment \(index)")
+        }
         try await eventually("only the kept pieces left") { pieceFiles.count == LiveAudioPipeline.keptPieces }
         #expect(pieceFiles.contains { $0.hasPrefix("piece\(count - 1)") })
         #expect(!pieceFiles.contains { $0.hasPrefix("piece0") })
+        if levelled {
+            try await eventually("the originals of the kept pieces only") {
+                let originals: Set<String> = Set(rawFiles("original").map { stem($0) })
+                let expected: Set<String> = Set(pieceFiles.map { "original" + String($0.dropFirst("piece".count)) })
+                return originals.count == LiveAudioPipeline.keptPieces && originals == expected
+            }
+        } else {
+            #expect(rawFiles("original").isEmpty)
+        }
+        await pipeline.stop()
+    }
+
+    // MARK: Levelling
+
+    /// In `.isolated` the segment is encoded from one raw float file and no piece has an original
+    /// file next to it; the encode is `levelledEncodeArguments` (the chain and the clock offset in
+    /// one filter). Guards against the original being written when nothing will use it (115 MB
+    /// more on disk for nothing) and against the encode reading anything but the levelled file.
+    @Test func isolatedKindEncodesOneLevelledInputAndKeepsNoOriginal() async throws {
+        defer { try? FileManager.default.removeItem(at: parent) }
+        let ffmpeg = FakeFFmpeg()
+        let pipeline = pipeline(SyntheticWebex(fragments: 4), ffmpeg, FakeIsolator())
+        _ = try await pipeline.segment(1)
+        let encode = try #require(ffmpeg.encode("out1.ts"))
+        let first = encode.firstSample
+        #expect(encode.arguments.filter { $0 == "-i" }.count == 2, "the video and one levelled input")
+        let levelledIndex = try #require(encode.arguments.lastIndex(of: "-i"))
+        #expect(encode.arguments[levelledIndex + 1].contains("levelled1"))
+        #expect(encode.arguments.contains("f32le"))
+        let filter = try #require(encode.arguments.first { $0.hasPrefix("asetpts=") })
+        #expect(filter.contains(AudioEnhancement.levelledChain))
+        #expect(first > 0 && filter.hasPrefix("asetpts=(N+\(first))/SR/TB,"))
+        #expect(rawFiles("original").isEmpty, "no original in the isolated kind: \(rawFiles("original"))")
+        await pipeline.stop()
+    }
+
+    /// In `.levelled` every piece has an original next to it with the same number of samples
+    /// (float, so twice the bytes of the 16-bit piece), the segment's levelled input is the
+    /// ORIGINAL audio (440 Hz) with a gain, not the isolated voice (880 Hz), and the levelled
+    /// file is gone once the encode has returned. Guards against the piece and the original
+    /// drifting apart (a gain applied a few ms off), against levelling the isolated voice in the
+    /// mode that is meant to keep the original, and against a temporary file left per segment.
+    @Test func levelledKindAppliesTheGainToTheOriginal() async throws {
+        defer { try? FileManager.default.removeItem(at: parent) }
+        let ffmpeg = FakeFFmpeg(originalTone: 0.01)
+        let pipeline = pipeline(SyntheticWebex(fragments: 5), ffmpeg, FakeIsolator(amplitude: { _ in 0.1 }), kind: .levelled)
+        _ = try await pipeline.segment(1)
+        // The pieces the pipeline keeps (it may still be making the next one in the background,
+        // so the folder's listing is not a stable thing to read).
+        var checked = 0
+        let folder = parent.appendingPathComponent("session")
+        for k in 0..<4 {
+            guard let flags = await pipeline.keptPiece(k) else { continue }
+            checked += 1
+            let suffix = "\(k)" + (flags.hasLead ? "l" : "") + (flags.hasTail ? "t" : "")
+            let pieceFile = try #require(rawFiles("piece").first { stem($0) == "piece\(suffix).raw" }, "piece \(suffix) is not on disk")
+            let originalFile = try #require(rawFiles("original").first { stem($0) == "original\(suffix).raw" }, "piece \(suffix) has no original")
+            let piece = (file: folder.appendingPathComponent(pieceFile), original: folder.appendingPathComponent(originalFile))
+            func bytes(_ url: URL) -> Int { (try? FileManager.default.attributesOfItem(atPath: url.path)[.size] as? Int) ?? 0 }
+            #expect(bytes(piece.original) == 2 * bytes(piece.file), "piece \(suffix): \(bytes(piece.file)) bytes, original: \(bytes(piece.original))")
+            // The original is the decoded tone with no gap: `AVAudioFile.read` returns a few frames
+            // short of what it is asked, and a copy that took that for the end left 11 silent samples
+            // in every 65 536 (the sine of the fake has a lone exact zero at most every second).
+            let values = try Data(contentsOf: piece.original).withUnsafeBytes { Array($0.bindMemory(to: Float.self)) }
+            var run = 0, longest = 0
+            for value in values { run = value == 0 ? run + 1 : 0; longest = max(longest, run) }
+            #expect(longest < 3, "piece \(suffix): \(longest) samples of silence in a row")
+        }
+        #expect(checked >= 2, "the segment's piece and the next one are kept")
+        // Only this segment's own: the pipeline may already be making the next one in the background.
+        #expect(!rawFiles("levelled").contains { stem($0) == "levelled1.raw" }, "temporary file left: \(rawFiles("levelled"))")
+        let data = try #require(ffmpeg.encode("out1.ts")?.levelled)
+        // 100 ms in the middle of the segment, in a clip that starts at the previous fragment's end - 22 s at most.
+        let middle = data.count / 4 / 2
+        let samples = data.withUnsafeBytes { Array($0.bindMemory(to: Float.self)) }
+        let crossings = (middle..<middle + 4800).filter { samples[$0 - 1] < 0 && samples[$0] >= 0 }.count
+        #expect((40...48).contains(crossings), "\(crossings) rising zero crossings in 100 ms: 440 Hz is 44, 880 Hz is 88")
+        await pipeline.stop()
+    }
+
+    /// The gain of a keypoint, once used by a segment, stays: with the isolated voice 20 dB
+    /// louder in fragment 3 than in fragment 2, segment 3 made first (a seek) and segment 2
+    /// afterwards, the gain applied to the original is the same 25 ms (11 cycles of the tone, the
+    /// gain still ramps by 2 dB a second before the boundary) before and after their
+    /// shared boundary (90 s, itself a keypoint). Without the memo segment 2 measures that
+    /// keypoint again from its own, quieter fragment and the level steps by about 20 dB at the
+    /// join: a jump every time a student seeks and steps back.
+    @Test func aSeekLeavesNoStepInTheGainAtTheBoundary() async throws {
+        defer { try? FileManager.default.removeItem(at: parent) }
+        let ffmpeg = FakeFFmpeg(originalTone: 0.002)
+        let isolator = FakeIsolator(amplitude: { $0 == 3 || $0 == 4 ? 0.02 : 0.002 })
+        let pipeline = pipeline(SyntheticWebex(fragments: 6), ffmpeg, isolator, kind: .levelled)
+        _ = try await pipeline.segment(3)
+        _ = try await pipeline.segment(2)
+        let two = try #require(ffmpeg.encode("out2.ts")), three = try #require(ffmpeg.encode("out3.ts"))
+        let seam = 90 * 48000
+        let before = Self.rms(try #require(two.levelled), (seam - 1200 - two.firstSample)..<(seam - two.firstSample))
+        let after = Self.rms(try #require(three.levelled), (seam - three.firstSample)..<(seam + 1200 - three.firstSample))
+        let difference = abs(20 * log10(before / after))
+        #expect(difference < 0.05, "\(difference) dB between the two sides of the boundary")
+        await pipeline.stop()
+    }
+
+    /// A lecture whose first four fragments (2 minutes) are silent for the isolator and whose voice,
+    /// quiet, starts at the fifth: the segment with the voice is levelled for it from the first
+    /// second (the original at −57 dBFS comes out near −20, +37 dB), and there is no step at its
+    /// boundary with the silent segment before it. Guards against the first segment's provisional
+    /// 0 dB held through the silence after it, so that the voice's segment starts near 0 dB and
+    /// climbs during the first words (before the correction: about +4 dB at that point), and
+    /// against a provisional value that changes when the next segment sees the voice.
+    @Test func aLongSilenceBeforeTheVoiceLevelsTheFirstSegmentWithVoice() async throws {
+        defer { try? FileManager.default.removeItem(at: parent) }
+        let ffmpeg = FakeFFmpeg(originalTone: 0.002)
+        let isolator = FakeIsolator(amplitude: { $0 >= 4 ? 0.002 : 0 })
+        let pipeline = pipeline(SyntheticWebex(fragments: 6), ffmpeg, isolator, kind: .levelled)
+        for index in 0...4 { _ = try await pipeline.segment(index) }
+        let three = try #require(ffmpeg.encode("out3.ts")), four = try #require(ffmpeg.encode("out4.ts"))
+        let originalRMS = 0.002 / 2.0.squareRoot()
+        func gain(_ encode: FakeFFmpeg.Encode, at second: Double) throws -> Double {
+            let sample = Int(second * 48000)
+            let rms = Self.rms(try #require(encode.levelled), (sample - 2400 - encode.firstSample)..<(sample + 2400 - encode.firstSample))
+            return 20 * log10(rms / originalRMS)
+        }
+        let seam = 120.0
+        let before = try gain(three, at: seam - 0.1), after = try gain(four, at: seam + 0.1)
+        #expect(abs(before - after) < 0.3, "\(before) dB before the boundary, \(after) dB after")
+        let first = try gain(four, at: seam + 1.0)
+        #expect(abs(first - 37) < 1.5, "\(first) dB one second into the voice, expected about +37")
+        await pipeline.stop()
+    }
+
+    /// A piece replaced (or covered) is deleted with its original; nothing of it is left. Guards
+    /// against originals left behind when their piece goes (350 MB for 40 pieces in `.levelled`).
+    @Test func aCoveredPieceTakesItsOriginalWithIt() async throws {
+        defer { try? FileManager.default.removeItem(at: parent) }
+        let ffmpeg = FakeFFmpeg(originalTone: 0.01)
+        let pipeline = pipeline(SyntheticWebex(fragments: 7), ffmpeg, FakeIsolator(amplitude: { _ in 0.1 }), kind: .levelled)
+        _ = try await pipeline.segment(0)
+        ffmpeg.gates.hold("decoded6.wav")
+        let six = Task { try? await pipeline.segment(6) }
+        try await eventually("piece 6 decoding") { ffmpeg.gates.isWaiting("decoded6.wav") }
+        _ = try await pipeline.segment(5)
+        try await eventually("piece 6 with a lead-in kept") { await pipeline.keptPiece(6).map { $0.hasLead && $0.hasTail } == true }
+        ffmpeg.gates.release("decoded6.wav")
+        _ = await six.value
+        try await eventually("the covered piece and its original deleted") { !pieceFiles.contains("piece6.raw") && !rawFiles("original").contains { stem($0) == "original6.raw" } }
+        #expect(rawFiles("original").contains { stem($0) == "original6l.raw" })
+        // The files on disk are exactly the pieces and their originals, one for one: no original
+        // outlives its piece, and no piece (an isolation cancelled before its piece was stored
+        // leaves none, `ff72404`) outlives its original.
+        try await eventually("originals and pieces match one for one") {
+            Set(rawFiles("original").map { stem($0).replacingOccurrences(of: "original", with: "") })
+                == Set(rawFiles("piece").map { stem($0).replacingOccurrences(of: "piece", with: "") })
+        }
+        await pipeline.stop()
+    }
+
+    /// The levelled file is deleted also when the encode fails. Guards against a raw file of
+    /// minutes of float audio left per failed segment.
+    @Test func aFailedEncodeLeavesNoLevelledFile() async throws {
+        defer { try? FileManager.default.removeItem(at: parent) }
+        let ffmpeg = FakeFFmpeg(failOnce: ["out0.ts"], originalTone: 0.01)
+        let pipeline = pipeline(SyntheticWebex(fragments: 3), ffmpeg, FakeIsolator(amplitude: { _ in 0.1 }), kind: .levelled)
+        await #expect(throws: (any Error).self) { try await pipeline.segment(0) }
+        #expect(ffmpeg.failedAll)
+        // The failed segment's own file (the pipeline may be making another one in the background).
+        #expect(!rawFiles("levelled").contains { stem($0) == "levelled0.raw" }, "left behind: \(rawFiles("levelled"))")
         await pipeline.stop()
     }
 

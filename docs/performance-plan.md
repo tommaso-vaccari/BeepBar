@@ -169,6 +169,73 @@ Dopo le correzioni lo stesso ciclo sotto carico: 0 esecuzioni fallite su 25, e l
 
 **Decisione.** La cache entra in questa PR anche se AGENTS.md chiede una correzione per PR di prestazioni: ottimizza codice che esiste solo su questo branch, e senza di essa ogni ritorno indietro rifaceva l’isolamento.
 
+### Registrazioni: modalità dell’audio migliorato, voce livellata e voce isolata (PR #245, 2026-11-14)
+
+Branch `fix/enhanced-audio-level-relative`, base `origin/dev` `46bd452`. Non integrata: una PR aperta non è lavoro integrato. Nessuna issue collegata: il difetto (la catena di PR #236 tagliava la voce del docente e i finali di parola) è emerso all’ascolto, prima di qualsiasi rilascio.
+
+**Cosa cambia e quale principio tocca.**
+- *Contenuto utile (2)*: dopo l’isolamento della voce non ci sono più `speechnorm` e la soglia che abbassava i suoni deboli; il volume lo decide un livellatore a punti scritto in Swift (`VoiceLeveler`: un guadagno ogni 10 secondi sull’orologio della lezione, finestra di 12 secondi, 90° percentile, obiettivo −20 dBFS, da −6 a +48 dB, fermo sotto il 15% di voce), seguito in ffmpeg da equalizzazione, compressore e limitatore. Le modalità sono due, «Voce isolata» (predefinita) e «Voce livellata» (guadagno misurato sulla voce isolata e applicato all’audio originale); la scelta e i limiti noti sono in `docs/sync-behavior.{it,en}.md`, le prove d’ascolto e le misure di qualità in `docs/benchmarks.md` (round 2, 3 e 4).
+- *Risorse limitate (6)*: il limite resta di 40 tratti per lezione. In «Voce livellata» ogni tratto tiene anche il suo audio originale (f32), quindi lo spazio temporaneo sale da circa 115 a circa 350 MB per lezione; in «Voce isolata» non cambia. I guadagni dei punti stanno in memoria per sessione (un numero ogni 10 secondi di lezione ascoltata) e spariscono con la sessione.
+- *Quiete (3)*: invariata. Niente server, processo o file finché l’audio migliorato è spento; alla chiusura, a «Spento» e al cambio di modalità la sessione si chiude e cancella la sua cartella. Il percorso di uscita non è toccato.
+- *Stato veritiero (7)*: il menu mostra sempre una sola voce selezionata fra «Spento», «Voce livellata» e «Voce isolata»; una modalità che non parte riporta la lezione all’audio di Webex nello stesso punto, seleziona «Spento» e dice perché. Le preferenze si scrivono solo dopo un avvio riuscito.
+- *Compatibilità (8)*: la preferenza acceso/spento resta la stessa chiave; la modalità ha una chiave nuova, e un valore assente o sconosciuto vale «Voce isolata», cioè ciò che l’interruttore faceva prima. L’audio migliorato non è mai stato rilasciato: nessuna migrazione.
+
+**Misure.** `BEEPBAR_MEASURE_AUDIO=1 swift test --skip-build --filter LiveAudioMeasurements` dopo `swift build --build-tests` (procedura in `docs/benchmarks.md`, «Enhanced audio»), lezione sintetica di 6 minuti letta da disco (niente rete), build di debug. Apple M5, 32 GB, alimentazione da rete. Cinque esecuzioni per commit, alternate. Mediana / p95 (con 5 campioni il p95 è il massimo). `dev` è `46bd452`; il ramo è `a0129e9` per i tempi d’attesa (cinque esecuzioni per commit, alternate) ed `ea97a18` per tempi totali, CPU e memoria (tre esecuzioni per commit, mediana / massimo). Fra i due commit del ramo cambia solo una riga di `VoiceIsolator` che ripristina il valore già predefinito.
+
+| | `dev`, isolamento | ramo, `.isolated` | ramo, `.levelled` |
+|---|---|---|---|
+| Primo segmento (seg0) | 1096 / 1203 ms | 1176 / 1180 ms | 1253 / 1257 ms |
+| Salto avanti (seg8) | 1055 / 1084 ms | 1161 / 1163 ms | 1289 / 1304 ms |
+| Ritorno a una parte ascoltata (seg1) | 344 / 347 ms | 438 / 441 ms | 473 / 480 ms |
+| Tempo totale di isolamento | 6256 / 6310 ms (10 run) | 6281 / 6286 ms (10 run) | 6082 / 6168 ms (10 run) |
+| Tempo totale di codifica | 2266 / 2300 ms (8 run) | 2252 / 2260 ms (8 run) | 2327 / 2348 ms (8 run) |
+| CPU BeepBar / ffmpeg | 6,17 / 4,32 s | 7,04 / 4,34 s | 8,29 / 4,43 s |
+| Memoria di picco | 100 / 116 MB | 151 / 153 MB | 167 / 168 MB (cumulata, vedi sotto) |
+| Dopo lo stop | 0 file, 0 processi | 0 file, 0 processi | 0 file, 0 processi |
+
+Le tre varianti girano nello stesso processo, in quest’ordine, e il modello della voce resta caricato: solo la prima di ogni commit ha un picco proprio, e «Voce livellata» parte dai 153 MB lasciati da «Voce isolata».
+
+Sul commit finale `cdc7631` il livellamento legge 10 secondi in più del tratto successivo (da 10,5 a 20,5 s, vedi «Revisione e verifiche»). Stessa misura, due esecuzioni, i valori di ciascuna:
+
+| | `.isolated` | `.levelled` | solo ffmpeg |
+|---|---|---|---|
+| Primo segmento (seg0) | 1198, 1194 ms | 1288, 1303 ms | 615, 609 ms |
+| Salto avanti (seg8) | 1205, 1203 ms | 1330, 1369 ms | 639, 627 ms |
+| Ritorno a una parte ascoltata (seg1) | 452, 432 ms | 560, 497 ms | 646, 652 ms |
+| Memoria di picco | 178, 177 MB | 205, 204 MB (cumulata) | |
+
+Memoria lungo la lezione intera (`BEEPBAR_MEASURE_AUDIO_SEGMENTS=all`, i dodici segmenti in ordine, impronta letta dopo ogni risposta; `8c163b0`, tre esecuzioni):
+
+| | Prima | Impronta dopo i segmenti 0…11 (prima esecuzione) | Picco (tre esecuzioni) | Dopo lo stop (tre esecuzioni) |
+|---|---|---|---|---|
+| `.isolated` | 11 MB | 118 120 125 136 149 149 149 127 130 130 106 118 | 149, 147, 147 MB | 118, 119, 109 MB |
+| `.levelled` | 118 MB | 131 113 125 132 143 122 133 133 125 136 136 136 | 143, 152, 152 MB | 122, 132, 129 MB |
+| solo ffmpeg | 122 MB | 122 122 122 93 93 93 93 67 67 67 67 67 | 122, 132, 129 MB | 67, 73, 70 MB |
+
+Una esecuzione su `cdc7631`: `.isolated` 128 133 140 150 150 150 150 122 125 125 94 116 (picco 150 MB, dopo lo stop 116); `.levelled` 162 138 155 155 155 129 138 142 116 149 149 154 (picco 162 MB, dopo lo stop 131); solo ffmpeg da 131 a 66 MB.
+
+La memoria non cresce con i segmenti: in «Voce isolata» sale fino a circa 150 MB entro il quinto segmento e poi resta ferma o scende; in «Voce livellata» oscilla fra 105 e 162 MB senza tendenza a salire.
+
+Senza isolamento (solo ffmpeg) i due commit coincidono: seg0 614 / 630 contro 614 / 619 ms, salto avanti 637 / 641 contro 636 / 638 ms, ritorno 644 / 648 contro 638 / 660 ms.
+
+**Regressioni e limiti.**
+- Sul commit finale una parte non ancora ascoltata attende da 100 a 150 ms più di `dev` in «Voce isolata» (circa 1,20 s contro 1,06–1,10) e da 190 a 315 ms in più in «Voce livellata» (1,29–1,37 s), che decodifica e tiene anche l’audio originale; una parte già ascoltata da 90 a 110 ms in più (0,43–0,45 s contro 0,34) e da 150 a 215 ms in più (0,50–0,56 s), perché i tratti restano grezzi su disco e ogni segmento viene livellato quando lo si codifica. È il costo accettato per non tagliare la voce: la catena di `dev` era più veloce ma sbagliata all’ascolto.
+- Spazio temporaneo in «Voce livellata»: circa 350 MB per lezione contro 115.
+- Memoria: lungo la lezione intera l’impronta letta dopo ogni risposta resta entro circa 150 MB in «Voce isolata» e 162 MB in «Voce livellata», contro i 100 di `dev`; è un tetto, non una crescita per segmento. Nella misura a cinque richieste il picco del processo sul commit finale è 178 MB (151 su `ea97a18`): i 27 MB di differenza non sono stati attribuiti (fra i due commit cambiano la coda a 20,5 s, i punti provvisori e la lettura a fine file). La causa del tetto non è stata misurata: i tempi di isolamento e codifica sono uguali a `dev`, e la differenza sta nel livellamento, che per ogni segmento tiene in memoria come float circa un minuto di audio (due clip in «Voce livellata») e il risultato. Dopo lo stop l’impronta non torna al valore di partenza (109–132 MB): il modello della voce resta caricato, come su `dev`.
+- CPU di BeepBar: +0,9 s in «Voce isolata» e +2,1 s in «Voce livellata» sulle cinque richieste della misura (6,17 → 7,04 e 8,29 s, build di debug, su `ea97a18`: non ripetuta sul commit finale); quella di ffmpeg non cambia.
+- Non misurati: build Release, una macchina con meno memoria, più lezioni consecutive, la rete verso Webex. I confronti con `scripts/benchmark.sh compare` non si applicano: l’audio migliorato non è nei suoi scenari, e su `main` non esiste (**main → HEAD: non misurato**).
+- Limiti d’ascolto di «Voce livellata», documentati nella specifica: fruscio dell’aula nelle pause di una lezione registrata molto bassa e rumorosa; in una pausa di minuti il volume può salire se l’isolamento lascia un residuo preso per voce (sulle tre lezioni intere misurate: 2, 60 e 4 secondi su 22, 42 e 10 minuti di pause).
+
+**Revisione e verifiche.** Revisione indipendente (agente diverso da chi ha scritto il codice), tre passaggi dello stesso revisore, nessun P0 in nessuno. Primo passaggio su `b957d40`: due P1 e alcuni P2, tutti corretti. P1-1: con un silenzio iniziale più lungo di circa 37 secondi il guadagno restava fermo a 0 dB anche sulle prime parole; ora un punto risolto senza alcuna voce intorno resta fissato (nessun gradino alle giunzioni) ma non fa da ancora ai successivi, e la salita al guadagno della voce avviene nel silenzio (`7f5925e`). P1-2: la specifica prometteva più del codice sul ritorno all’audio di Webex dopo un filtro che fallisce; è stata ristretta la specifica, il comportamento resta e ha un test (`c877ab7`). Fra i P2, uno era un difetto vero: `AVAudioFile.read` a fine file lancia un errore invece di restituire zero campioni, e un ultimo frammento più corto del tratto faceva fallire «Voce livellata» (`3824d5e`). Secondo passaggio su `b957d40..1c70b40`: un P1 nuovo. Con i confini reali dei segmenti di Webex, appena oltre un multiplo di 10 secondi (30,010667 s nelle fixture), la correzione di P1-1 non bastava per circa un terzo delle posizioni d’inizio della voce (in simulazione, +9 dB invece di +40 a 1,8 secondi dall’inizio della voce); corretto portando da 10,5 a 20,5 secondi l’audio del tratto successivo che il livellamento legge, con un test a confini fuori griglia che falliva sul codice precedente (`cdc7631`). Terzo passaggio su `cdc7631`: P1 risolto, nessun P0 o P1; due P2 accettati, il costo della coda più lunga (misurato sopra) e l’assenza di un test di pipeline con confini fuori griglia (la pipeline usa la stessa costante provata in Core).
+
+Mutazioni, tutte in un worktree usa e getta e tutte rilevate: 17 prima della revisione, 11 nel giro di correzioni, 2 dopo l’alleggerimento dei test (`895e3ff`: stesse forme d’onda generate a blocchi, meno segmenti). La correzione di `cdc7631` non ha una mutazione: il suo test è stato scritto prima e visto fallire sul codice precedente.
+
+Suite completa `swift test`: verde su `1c70b40` (963 test, 0 problemi); su `cdc7631` un solo fallimento, `WebexSignInWebViewTests.closingOrANewOperationEndsAStreamWaitingOnWebex` (un limite di 15 secondi reali, issue #243), che da solo passa. Su `f00ed30` la suite era fallita 4 volte su 4 con la macchina carica, sempre in test a tempo reale estranei alla modifica; i test dell’audio di quel commit costavano 94 secondi di CPU in 18 reali e sono stati alleggeriti. `895e3ff` aveva anche reso a blocchi la copia dell’audio originale: la copia finiva prima che un salto potesse interromperla e il test dell’originale scritto a metà falliva sempre; `1c70b40` ripristina la copia precedente (in una build Release le due forme si equivalgono; il vincolo è annotato nell’issue #243). Il gate `bash scripts/verify.sh` gira sul commit finale al push; l’esito è nella PR.
+
+Tempi totali di isolamento e codifica e CPU non sono stati ripetuti sul commit finale; attese e memoria sì. La build dei test in configurazione Release non compila (`UIFixtureTests` usa simboli disponibili solo con `DEBUG`), quindi tutti i tempi sono di una build di sviluppo.
+
+**Decisione.** Motore e interfaccia entrano nella stessa PR: la scelta a tre voci esiste solo perché esistono due catene, e la catena nuova senza la scelta toglierebbe a chi ha lezioni rumorose l’unico modo di non sentire l’aula. Il percorso senza l’unità di isolamento di Apple resta la vecchia catena solo ffmpeg: da macOS 14, il minimo richiesto, non viene mai usato, e riscriverlo senza poterlo provare non era giustificato.
+
 ## Review e battle testing obbligatori
 
 1. Un reviewer senior indipendente, che non ha scritto la modifica, esamina l’intero diff contro i principi qui definiti e le specifiche IT/EN. Per lavoro affidato ad agenti usare un subagente indipendente; il responsabile della modifica non può autocertificare la review.

@@ -266,15 +266,29 @@ struct RecordingsListing: Equatable {
     /// the filter reads and what "Audio migliorato" off goes back to. Nil when no account owns
     /// it (`resumeOwner`), after close and on identity change.
     private var audioLecture: (recordingID: String, key: String, stream: RecordingStream)?
-    /// Whether the player is playing `audioLecture` through the local filter rather than
-    /// Webex's stream.
-    private var enhancedAudioInUse = false
+    /// The kind of local filter the player is playing `audioLecture` through; nil when it plays
+    /// Webex's own stream.
+    private var enhancedAudioInUse: AudioEnhancementKind?
     /// Where the filtered play started, for a filter that fails before anything played (the
     /// player then reports no position).
     private var enhancedStartAt: TimeInterval?
     /// Whether the student last left "Audio migliorato" on: every lecture then starts filtered.
     /// One switch for all lectures, saved like the speed.
     nonisolated static let prefersEnhancedAudioKey = "io.github.tvaccari.beepbar.recordings-enhanced-audio"
+    /// The kind the student chose last (`AudioEnhancementKind.rawValue`), kept when they turn
+    /// enhanced audio off so the title-bar switch and the next Play bring back "the last kind
+    /// used". Read only through `resolveEnhancedAudioKind`.
+    nonisolated static let enhancedAudioKindKey = "io.github.tvaccari.beepbar.recordings-enhanced-audio-kind"
+
+    /// The kind to use for a stored value: an absent or unrecognised one is `.isolated`, what
+    /// the switch did before there was a choice, so a student who had it on hears the same.
+    nonisolated static func resolveEnhancedAudioKind(_ stored: String?) -> AudioEnhancementKind {
+        stored.flatMap(AudioEnhancementKind.init(rawValue:)) ?? .isolated
+    }
+
+    private var preferredEnhancedAudioKind: AudioEnhancementKind {
+        Self.resolveEnhancedAudioKind(defaults.string(forKey: Self.enhancedAudioKindKey))
+    }
 
     private var playbackIntent = 0
     /// Lectures already given their one fresh stream since the student pressed Play.
@@ -1947,30 +1961,34 @@ struct RecordingsListing: Equatable {
         markOpened(recording)
     }
 
+    /// What `startPlayer` plays after a switch: the filter of `kind`, or nil, Webex's stream.
+    private struct AudioSwitch { let kind: AudioEnhancementKind? }
+
     /// Hands the stream to the player, creating it on first use. The title is the archive's own
     /// (already on the page), not Webex's; the stream address is never logged.
     ///
-    /// `enhanced` is the switch to or from the local filter (`audioActionChosen`): `stream` is
+    /// `enhanced` is the switch to or from a local filter (`audioActionChosen`): `stream` is
     /// then the filter's address or the original, and the original stays the one remembered.
     /// Any other call is a stream from Webex (a Play, a recovery), which becomes the lecture's
     /// original; it plays through a new filter instead when the student left "Audio migliorato"
     /// on and the filter hasn't failed for this lecture (so a failing filter can't loop).
-    private func startPlayer(_ stream: RecordingStream, for recording: RecmanRecording, startAt: TimeInterval?, enhanced: Bool? = nil) {
+    private func startPlayer(_ stream: RecordingStream, for recording: RecmanRecording, startAt: TimeInterval?, enhanced: AudioSwitch? = nil) {
         var played = stream
         if let enhanced {
-            enhancedAudioInUse = enhanced
+            enhancedAudioInUse = enhanced.kind
         } else {
             learnManualDetails(of: recording, from: stream)
             // A new stream: whatever filtered the previous one reads an address now replaced.
             audioEnhancer?.stop()
-            enhancedAudioInUse = false
+            enhancedAudioInUse = nil
             if let owner = resumeOwner() {
                 let key = AudioEnhancer.copyKey(owner: owner, identity: RecordingsStudyState.identity(recording))
                 audioLecture = (recording.id, key, stream)
                 let enhancer = currentAudioEnhancer()
-                if defaults.bool(forKey: Self.prefersEnhancedAudioKey), enhancer.canStart(key), let url = enhancer.start(key: key, stream: stream.url) {
+                let kind = preferredEnhancedAudioKind
+                if defaults.bool(forKey: Self.prefersEnhancedAudioKey), enhancer.canStart(key), let url = enhancer.start(key: key, stream: stream.url, kind: kind) {
                     played = RecordingStream(url: url, title: stream.title, duration: stream.duration)
-                    enhancedAudioInUse = true
+                    enhancedAudioInUse = kind
                 }
             } else {
                 audioLecture = nil
@@ -2075,7 +2093,7 @@ struct RecordingsListing: Equatable {
         // it remembers (lectures where it failed) goes with the account.
         audioEnhancer?.removeAll()
         audioLecture = nil
-        enhancedAudioInUse = false
+        enhancedAudioInUse = nil
         // The sessions belong to the account going away; `forgetSeen` clears the rest.
         sessions = [:]
         if !preservingResumePoints { player?.close() }
@@ -2089,7 +2107,7 @@ struct RecordingsListing: Equatable {
     private func playerClosed(id: String) {
         guard currentLectureID == id else { return }
         audioEnhancer?.stop()
-        enhancedAudioInUse = false
+        enhancedAudioInUse = nil
     }
 
     private func currentAudioEnhancer() -> AudioEnhancer {
@@ -2110,36 +2128,49 @@ struct RecordingsListing: Equatable {
             player.showAudioEnhancement(nil, recordingID: id)
             return
         }
-        player.showAudioEnhancement(currentAudioEnhancer().state(for: lecture.key, inUse: enhancedAudioInUse), recordingID: id)
+        player.showAudioEnhancement(currentAudioEnhancer().state(for: lecture.key, inUse: enhancedAudioInUse, preferred: preferredEnhancedAudioKind), recordingID: id)
     }
 
     /// The student's choice in the player's Audio menu, for the lecture `id` that was on screen.
     /// Checked again here (the point of action): the lecture may have changed meanwhile, or the
     /// account gone. Either way the lecture continues from the same position, playing or paused
-    /// as it was: on, through a new local filter; off, from Webex's stream directly, with no
-    /// filter left running.
+    /// as it was: on, through a new local filter of the chosen kind (also when another kind was
+    /// playing); off, from Webex's stream directly, with no filter left running. The kind
+    /// already playing is a no-op.
+    ///
+    /// `enhancer.start` stops the running session before it can fail, so a kind that cannot
+    /// start while another was playing leaves the player on a dead local address: the lecture
+    /// goes back to its own stream at the same position, as the failure path does. From Off,
+    /// nothing was running and nothing changes on screen but the state.
     private func audioActionChosen(id: String, action: PlayerAudioAction) {
         guard isEnabled, let lecture = audioLecture, lecture.recordingID == id, currentLectureID == id,
               let recording = nowPlaying[id], resumeOwner() != nil else { return }
         let enhancer = currentAudioEnhancer()
-        guard case .useEnhanced(let on) = action, on != enhancedAudioInUse, let player, player.isOpen else { return }
+        guard case .use(let kind) = action, kind != enhancedAudioInUse, let player, player.isOpen else { return }
+        let position = player.playbackPosition
+        let wasPlaying = player.isPlaying
         let target: RecordingStream
-        if on {
-            guard let url = enhancer.start(key: lecture.key, stream: lecture.stream.url) else {
+        if let kind {
+            guard let url = enhancer.start(key: lecture.key, stream: lecture.stream.url, kind: kind) else {
+                if enhancedAudioInUse != nil {
+                    enhancedAudioInUse = nil
+                    startPlayer(lecture.stream, for: recording, startAt: position, enhanced: AudioSwitch(kind: nil))
+                    if !wasPlaying { player.pause() }
+                }
                 publishAudioState()
                 return
             }
             target = RecordingStream(url: url, title: lecture.stream.title, duration: lecture.stream.duration)
+            defaults.set(kind.rawValue, forKey: Self.enhancedAudioKindKey)
         } else {
             enhancer.stop()
             target = lecture.stream
         }
-        defaults.set(on, forKey: Self.prefersEnhancedAudioKey)
-        let position = player.playbackPosition
-        let wasPlaying = player.isPlaying
+        // "Spento" leaves the kind key alone: it stays the last kind used.
+        defaults.set(kind != nil, forKey: Self.prefersEnhancedAudioKey)
         // Same lecture, same id: the player keeps its zoom, the position is reported as a
         // replacement checkpoint and the watch session continues.
-        startPlayer(target, for: recording, startAt: position, enhanced: on)
+        startPlayer(target, for: recording, startAt: position, enhanced: AudioSwitch(kind: kind))
         if !wasPlaying { player.pause() }
     }
 
@@ -2703,10 +2734,10 @@ struct RecordingsListing: Equatable {
         //   at fault (found in review), nor a recovery, since the stream may be.
         // A stream started here is no longer filtered: if it fails too, it takes the usual
         // path, so this never loops.
-        if enhancedAudioInUse, let lecture = audioLecture, lecture.recordingID == id, let enhancer = audioEnhancer {
+        if enhancedAudioInUse != nil, let lecture = audioLecture, lecture.recordingID == id, let enhancer = audioEnhancer {
             let reported = enhancer.reportedFailure
             enhancer.stop()
-            enhancedAudioInUse = false
+            enhancedAudioInUse = nil
             let position: Double?
             switch failure {
             case .duringPlayback(_, let at): position = at
@@ -2715,7 +2746,7 @@ struct RecordingsListing: Equatable {
             let usualPath = reported == .streamRefused || (reported == .network && position != nil)
             if !usualPath {
                 if reported == .unavailable { enhancer.markFailed(lecture.key) }
-                startPlayer(lecture.stream, for: recording, startAt: position ?? enhancedStartAt, enhanced: false)
+                startPlayer(lecture.stream, for: recording, startAt: position ?? enhancedStartAt, enhanced: AudioSwitch(kind: nil))
                 return
             }
         }

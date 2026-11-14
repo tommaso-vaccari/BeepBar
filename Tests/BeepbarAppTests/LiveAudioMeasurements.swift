@@ -33,30 +33,40 @@ struct LiveAudioMeasurements {
         return folder
     }
 
-    @Test(arguments: [true, false])
-    func measure(isolation: Bool) async throws {
+    /// One run per variant: the isolated kind with Apple's voice isolation, the levelled kind
+    /// (which also isolates, then levels), and ffmpeg alone (`isolation: false`, no isolator).
+    /// The segments asked for, in order: by default the short sequence the documented timings
+    /// were measured with; with `BEEPBAR_MEASURE_AUDIO_SEGMENTS=all`, the twelve of the whole
+    /// synthetic lecture, to see whether memory stops growing after the first segments.
+    private static var requests: [Int] {
+        ProcessInfo.processInfo.environment["BEEPBAR_MEASURE_AUDIO_SEGMENTS"] == "all" ? Array(0...11) : [0, 1, 2, 8, 1]
+    }
+
+    @Test(arguments: [(true, AudioEnhancementKind.isolated), (true, .levelled), (false, .isolated)])
+    func measure(isolation: Bool, kind: AudioEnhancementKind) async throws {
         let lecture = try Self.lecture()
         let ffmpeg = try #require(AudioEnhancement.locateFFmpeg())
         let steps = Steps()
         let isolator: LiveAudioVoiceIsolating? = isolation ? TimedIsolator(inner: try #require(AppleVoiceIsolator.preferred()), steps: steps) : nil
-        let sessions = Self.folder.appendingPathComponent("sessions-\(isolation)")
+        let sessions = Self.folder.appendingPathComponent("sessions-\(isolation)-\(kind.rawValue)")
         let session = try LiveAudioSession(stream: Self.address, ffmpeg: ffmpeg, onFailure: { _ in },
                                            fetcher: DiskLecture(folder: lecture), runner: TimedRunner(steps: steps),
-                                           isolator: isolator, parent: sessions)
+                                           isolator: isolator, kind: kind, parent: sessions)
         let cpuBefore = (Self.cpu(RUSAGE_SELF), Self.cpu(RUSAGE_CHILDREN))
         let memoryBefore = Self.footprint()
         var peak = memoryBefore
         _ = try await URLSession.shared.data(from: session.playlistURL)
         var waits: [String] = []
         // As the player asks: the first three in order, a seek ahead, a seek back to heard audio.
-        for index in [0, 1, 2, 8, 1] {
+        for index in Self.requests {
             let clock = ContinuousClock.now
             let (data, response) = try await URLSession.shared.data(from: session.playlistURL.deletingLastPathComponent()
                 .appendingPathComponent(AudioEnhancement.segmentName(index)))
             try #require((response as? HTTPURLResponse)?.statusCode == 200 && !data.isEmpty)
             let wait = ContinuousClock.now - clock
-            waits.append("seg\(index) \(Self.ms(wait))")
-            peak = max(peak, Self.footprint())
+            let footprint = Self.footprint()
+            waits.append("seg\(index) \(Self.ms(wait)) \(footprint / 1_048_576) MB")
+            peak = max(peak, footprint)
             // The player plays a while before asking for the next one: lets prefetch finish.
             try await Task.sleep(for: .seconds(3))
         }
@@ -65,7 +75,7 @@ struct LiveAudioMeasurements {
         try await Task.sleep(for: .seconds(1))
         let leftovers = (try? FileManager.default.contentsOfDirectory(atPath: sessions.path)) ?? []
         print("""
-        MEASURE isolation=\(isolation)
+        MEASURE isolation=\(isolation) kind=\(kind.rawValue)
           waits: \(waits.joined(separator: ", "))
           steps: \(steps.summary)
           cpu: beepbar \(String(format: "%.2f", cpu.0)) s, ffmpeg \(String(format: "%.2f", cpu.1)) s
@@ -74,6 +84,30 @@ struct LiveAudioMeasurements {
         """)
         #expect(leftovers.isEmpty)
     }
+
+    /// The cost of `VoiceLeveler` on a 62 s clip (a 30 s segment with its lead and tail), which
+    /// every segment waits for: `gains` (the keypoints, run on the pipeline actor, so it blocks
+    /// the seeks it serves) and `level` (the samples, off the actor), five repetitions each,
+    /// median and max in ms. A time limit in the gate would be empty in a debug build and flaky
+    /// under load, so it is measured here. Prints; asserts nothing about time.
+    @Test func aMinuteOfLevellingTakesMilliseconds() {
+        let leveler = VoiceLeveler()
+        let clip = VoiceLeveler.Clip(samples: VoiceLevelerReferenceTests.lecture([(62, -40)]), start: 0)
+        var gainTimes: [Double] = [], levelTimes: [Double] = []
+        for _ in 0..<5 {
+            let clock = ContinuousClock()
+            var gains: [Int: Double] = [:]
+            let a = clock.measure { gains = leveler.gains(for: 0...7, detector: clip, known: [:]) }
+            let b = clock.measure { _ = leveler.level(clip, gains: gains) }
+            gainTimes.append(Self.seconds(a) * 1000)
+            levelTimes.append(Self.seconds(b) * 1000)
+        }
+        func summary(_ values: [Double]) -> String { "median \(String(format: "%.1f", values.sorted()[2])) ms, max \(String(format: "%.1f", values.max()!)) ms" }
+        print("LEVELLING 62 s clip, 5 runs: gains \(summary(gainTimes)); level \(summary(levelTimes))")
+        #expect(!gainTimes.isEmpty)
+    }
+
+    private static func seconds(_ d: Duration) -> Double { Double(d.components.seconds) + Double(d.components.attoseconds) / 1e18 }
 
     /// This process's children (ffmpeg, here) still running.
     private static func children() -> Int {

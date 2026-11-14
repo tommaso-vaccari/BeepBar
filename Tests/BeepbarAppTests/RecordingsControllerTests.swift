@@ -296,12 +296,15 @@ import BeepbarCore
     static let address = URL(string: "http://127.0.0.1:1/token/index.m3u8")!
     let stream: URL
     let ffmpeg: URL
+    /// The filter the session was asked for.
+    let kind: AudioEnhancementKind
     let onFailure: @MainActor (LiveAudioFailure?) -> Void
     private(set) var stops = 0
     var playlistURL: URL { Self.address }
-    init(stream: URL, ffmpeg: URL, onFailure: @escaping @MainActor (LiveAudioFailure?) -> Void) {
+    init(stream: URL, ffmpeg: URL, kind: AudioEnhancementKind = .isolated, onFailure: @escaping @MainActor (LiveAudioFailure?) -> Void) {
         self.stream = stream
         self.ffmpeg = ffmpeg
+        self.kind = kind
         self.onFailure = onFailure
     }
     func stop() { stops += 1 }
@@ -539,10 +542,10 @@ struct RecordingsControllerTests {
             copy: { world.copied.append($0) },
             now: { MainActor.assumeIsolated { world.now } },
             makePlayer: { world.playersMade += 1; return world.player },
-            makeAudioEnhancer: { world.enhancersMade += 1; return AudioEnhancer(locateFFmpeg: { world.ffmpeg }, makeSession: { stream, ffmpeg, onFailure in
+            makeAudioEnhancer: { world.enhancersMade += 1; return AudioEnhancer(locateFFmpeg: { world.ffmpeg }, makeSession: { stream, ffmpeg, kind, onFailure in
                 struct NoPort: Error {}
                 if world.liveSessionFails { throw NoPort() }
-                let session = FakeLiveAudio(stream: stream, ffmpeg: ffmpeg, onFailure: onFailure)
+                let session = FakeLiveAudio(stream: stream, ffmpeg: ffmpeg, kind: kind, onFailure: onFailure)
                 world.liveSessions.append(session)
                 return session
             }, legacyCopies: nil) },
@@ -2456,11 +2459,11 @@ struct RecordingsControllerTests {
         world.ffmpeg = fakeFFmpegPath
         let controller = await readyController()
         let lecture = await playing(controller, "audio")
-        #expect(world.player.audioState == .off)
+        #expect(world.player.audioState == .off(preferred: .isolated))
         #expect(world.liveSessions.isEmpty, "a filter started before the student asked")
 
         world.player.move(to: 1_234)
-        world.player.chooseAudio(.useEnhanced(true))
+        world.player.chooseAudio(.use(.isolated))
         let session = try #require(world.liveSessions.last)
         #expect(world.liveSessions.count == 1)
         #expect(session.stream == stream(lecture.id).url)
@@ -2469,26 +2472,159 @@ struct RecordingsControllerTests {
         #expect(filtered.url == FakeLiveAudio.address)
         #expect(filtered.startAt == 1_234)
         #expect(filtered.recordingID == lecture.id)
-        #expect(world.player.audioState == .on)
+        #expect(world.player.audioState == .on(.isolated))
         #expect(world.player.isPlaying)
         #expect(defaults.bool(forKey: RecordingsController.prefersEnhancedAudioKey))
         #expect(try storedResumePoints()?.position(for: RecordingsStudyState.identity(lecture)) == 1_234)
 
         world.player.pause(at: 2_000)
-        world.player.chooseAudio(.useEnhanced(false))
+        world.player.chooseAudio(.use(nil))
         #expect(session.isStopped, "the filter kept running after it was turned off")
         let back = try world.player.play(world.player.plays.count - 1)
         #expect(back.url == stream(lecture.id).url)
         #expect(back.startAt == 2_000)
-        #expect(world.player.audioState == .off)
+        #expect(world.player.audioState == .off(preferred: .isolated))
         #expect(!world.player.isPlaying, "a paused lecture started playing when the audio changed")
         #expect(!defaults.bool(forKey: RecordingsController.prefersEnhancedAudioKey))
         #expect(browser.streamCalls == ["stream \(lecture.id)"], "switching asked Webex for a new stream")
 
         // The same choice twice does nothing: no second filter, no replay.
         let plays = world.player.plays.count
-        world.player.chooseAudio(.useEnhanced(false))
+        world.player.chooseAudio(.use(nil))
         #expect(world.player.plays.count == plays)
+        controller.turnOff()
+    }
+
+    /// The kind the student left on decides what a Play starts: the bool alone (what the switch
+    /// stored before there was a choice) starts `.isolated`; with the kind key set to
+    /// `levelled`, `.levelled`; an unrecognised value falls back to `.isolated`. Guards against
+    /// a Play that ignores the stored kind, and a student who had the switch on hearing a
+    /// different filter after updating.
+    @Test(arguments: [(String?.none, AudioEnhancementKind.isolated), ("levelled", .levelled), ("isolated", .isolated), ("garbage", .isolated)])
+    func aPlayStartsTheStoredKind(stored: String?, expected: AudioEnhancementKind) async throws {
+        defer { cleanUp() }
+        world.ffmpeg = fakeFFmpegPath
+        defaults.set(true, forKey: RecordingsController.prefersEnhancedAudioKey)
+        if let stored { defaults.set(stored, forKey: RecordingsController.enhancedAudioKindKey) }
+        let controller = await readyController()
+        _ = await playing(controller, "audio")
+        #expect(world.liveSessions.last?.kind == expected)
+        #expect(world.player.audioState == .on(expected))
+        controller.turnOff()
+    }
+
+    /// Choosing a kind from Off stores both keys and starts that kind; "Spento" stores the
+    /// bool false and keeps the kind key, so the title-bar switch and a later Play bring back
+    /// the last kind used. Guards against "Spento" forgetting the kind (the switch would turn
+    /// on the wrong filter) and a kind choice that does not turn the preference on.
+    @Test func theKindChosenIsKeptAcrossOff() async throws {
+        defer { cleanUp() }
+        world.ffmpeg = fakeFFmpegPath
+        let controller = await readyController()
+        _ = await playing(controller, "audio")
+        world.player.chooseAudio(.use(.levelled))
+        #expect(world.liveSessions.last?.kind == .levelled)
+        #expect(defaults.bool(forKey: RecordingsController.prefersEnhancedAudioKey))
+        #expect(defaults.string(forKey: RecordingsController.enhancedAudioKindKey) == "levelled")
+
+        world.player.chooseAudio(.use(nil))
+        #expect(!defaults.bool(forKey: RecordingsController.prefersEnhancedAudioKey))
+        #expect(defaults.string(forKey: RecordingsController.enhancedAudioKindKey) == "levelled", "Spento forgot the last kind")
+        #expect(world.player.audioState == .off(preferred: .levelled))
+
+        // The title-bar switch asks for the preferred kind: what its action in this state is.
+        let asked = try #require(RecordingPlayerPolicy.audioButton(world.player.audioState)?.action)
+        world.player.chooseAudio(asked)
+        #expect(world.liveSessions.last?.kind == .levelled)
+        #expect(world.liveSessions.count == 2)
+        #expect(world.player.audioState == .on(.levelled))
+        controller.turnOff()
+    }
+
+    /// Switching kinds mid-lecture starts a new session of the new kind from the same position
+    /// (the old one stopped), keeps a paused lecture paused and the same lecture, and choosing
+    /// the kind already playing starts nothing. Guards against a switch that restarts the
+    /// lecture, resumes a paused one, leaves two filters running, or replays for no change.
+    @Test func switchingKindsKeepsThePositionAndThePause() async throws {
+        defer { cleanUp() }
+        world.ffmpeg = fakeFFmpegPath
+        let controller = await readyController()
+        let lecture = await playing(controller, "audio")
+        world.player.chooseAudio(.use(.isolated))
+        let isolated = try #require(world.liveSessions.last)
+
+        world.player.pause(at: 777)
+        world.player.chooseAudio(.use(.levelled))
+        let levelled = try #require(world.liveSessions.last)
+        #expect(levelled !== isolated)
+        #expect(levelled.kind == .levelled)
+        #expect(isolated.isStopped, "the old kind kept running")
+        #expect(levelled.stream == stream(lecture.id).url, "the new filter reads the lecture's own stream")
+        let switched = try world.player.play(world.player.plays.count - 1)
+        #expect(switched.url == FakeLiveAudio.address)
+        #expect(switched.startAt == 777)
+        #expect(switched.recordingID == lecture.id)
+        #expect(!world.player.isPlaying, "a paused lecture started playing")
+        #expect(world.player.audioState == .on(.levelled))
+        #expect(defaults.string(forKey: RecordingsController.enhancedAudioKindKey) == "levelled")
+        #expect(browser.streamCalls == ["stream \(lecture.id)"], "switching asked Webex for a new stream")
+
+        let plays = world.player.plays.count, sessions = world.liveSessions.count
+        world.player.chooseAudio(.use(.levelled))
+        #expect(world.player.plays.count == plays)
+        #expect(world.liveSessions.count == sessions, "the kind already playing started a session")
+        controller.turnOff()
+    }
+
+    /// A kind that cannot start while another was playing: the old session is already stopped,
+    /// so the lecture goes back to Webex's stream at the same position (paused stays paused),
+    /// the state says it failed, and the preferences stay as they were. Guards against the
+    /// player left on the dead local address of the stopped session.
+    @Test func aKindThatCannotStartFallsBackToTheStreamAtTheSamePosition() async throws {
+        defer { cleanUp() }
+        world.ffmpeg = fakeFFmpegPath
+        let controller = await readyController()
+        let lecture = await playing(controller, "audio")
+        world.player.chooseAudio(.use(.isolated))
+        let isolated = try #require(world.liveSessions.last)
+        world.player.pause(at: 640)
+        world.liveSessionFails = true
+        world.player.chooseAudio(.use(.levelled))
+        #expect(isolated.isStopped)
+        let back = try world.player.play(world.player.plays.count - 1)
+        #expect(back.url == stream(lecture.id).url, "the player stayed on the dead local address")
+        #expect(back.startAt == 640)
+        #expect(!world.player.isPlaying)
+        #expect({ if case .failed = world.player.audioState { true } else { false } }(), "\(String(describing: world.player.audioState))")
+        #expect(defaults.bool(forKey: RecordingsController.prefersEnhancedAudioKey), "the preference changed for a start that failed")
+        #expect(defaults.string(forKey: RecordingsController.enhancedAudioKindKey) == "isolated")
+
+        // From the stream, choosing "Spento" again or the kind that works recovers normally.
+        world.liveSessionFails = false
+        world.player.chooseAudio(.use(.levelled))
+        #expect(world.liveSessions.last?.kind == .levelled)
+        #expect(world.player.audioState == .on(.levelled))
+        controller.turnOff()
+    }
+
+    /// The player failing mid-lecture with the filter of a kind the student chose, and a
+    /// recovery that rebuilds the filter from a fresh stream, restarts with the stored kind.
+    /// Guards against a recovery that falls back to `.isolated` whatever was chosen.
+    @Test func aRecoveryRestartsTheStoredKind() async throws {
+        defer { cleanUp() }
+        world.ffmpeg = fakeFFmpegPath
+        let controller = await readyController()
+        let lecture = await playing(controller, "audio")
+        world.player.chooseAudio(.use(.levelled))
+        let session = try #require(world.liveSessions.last)
+        let fresh = RecordingStream(url: URL(string: "https://media.example.test/fresh/\(lecture.id).m3u8")!, title: nil, duration: nil)
+        browser.streamResults[lecture.id] = [.success(fresh)]
+        session.onFailure(.streamRefused)
+        world.player.failDuringPlayback(at: 900)
+        await settle("recovered") { world.liveSessions.count == 2 }
+        #expect(world.liveSessions.last?.kind == .levelled)
+        #expect(world.liveSessions.last?.stream == fresh.url)
+        #expect(world.player.audioState == .on(.levelled))
         controller.turnOff()
     }
 
@@ -2501,7 +2637,7 @@ struct RecordingsControllerTests {
         world.ffmpeg = fakeFFmpegPath
         let controller = await readyController()
         _ = await playing(controller, "audio")
-        world.player.chooseAudio(.useEnhanced(true))
+        world.player.chooseAudio(.use(.isolated))
         let first = try #require(world.liveSessions.last)
 
         let other = await playing(controller, "other")
@@ -2510,14 +2646,14 @@ struct RecordingsControllerTests {
         #expect(world.liveSessions.count == 2)
         #expect(second.stream == stream(other.id).url)
         #expect(world.player.plays.last?.url == FakeLiveAudio.address)
-        #expect(world.player.audioState == .on)
+        #expect(world.player.audioState == .on(.isolated))
 
-        world.player.chooseAudio(.useEnhanced(false))
+        world.player.chooseAudio(.use(nil))
         #expect(second.isStopped)
         let again = await playing(controller, "audio")
         #expect(world.liveSessions.count == 2, "a filter started with enhanced audio off")
         #expect(world.player.plays.last?.url == stream(again.id).url)
-        #expect(world.player.audioState == .off)
+        #expect(world.player.audioState == .off(preferred: .isolated))
         controller.turnOff()
     }
 
@@ -2531,7 +2667,7 @@ struct RecordingsControllerTests {
         world.ffmpeg = fakeFFmpegPath
         let controller = await readyController()
         let lecture = await playing(controller, "audio")
-        world.player.chooseAudio(.useEnhanced(true))
+        world.player.chooseAudio(.use(.isolated))
         let session = try #require(world.liveSessions.last)
         let plays = world.player.plays.count
 
@@ -2541,7 +2677,7 @@ struct RecordingsControllerTests {
         #expect(world.player.plays.count == plays + 1)
         #expect(world.player.plays.last?.url == stream(lecture.id).url)
         #expect(world.player.plays.last?.startAt == 600)
-        guard case .failed(let message) = world.player.audioState else {
+        guard case .failed(let message, _) = world.player.audioState else {
             Issue.record("the menu doesn't say the filter failed: \(String(describing: world.player.audioState))")
             return
         }
@@ -2555,10 +2691,51 @@ struct RecordingsControllerTests {
         #expect(world.player.plays.last?.url == stream(lecture.id).url, "the failed filter was tried again on its own")
         #expect(defaults.bool(forKey: RecordingsController.prefersEnhancedAudioKey))
         let sessions = world.liveSessions.count
-        world.player.chooseAudio(.useEnhanced(true))
+        world.player.chooseAudio(.use(.isolated))
         #expect(world.liveSessions.count == sessions + 1)
-        #expect(world.player.audioState == .on)
+        #expect(world.player.audioState == .on(.isolated))
         controller.turnOff()
+    }
+
+    /// A mode that started and then failed on its lecture: from `.isolated` to `.levelled`, the
+    /// new session reports `.unavailable` and the player fails. The mode is saved the moment its
+    /// session started (as the old switch was), so the key says `levelled`; the menu checks
+    /// "Spento" and gives the reason; the next lecture starts a `.levelled` session again. This
+    /// is the case that `docs/sync-behavior` separates from a mode that cannot even start (the
+    /// choice then does not change). Guards against a failure after the start that quietly
+    /// restores the previous mode in the preferences, and a next lecture that forgets the choice.
+    @Test func aModeThatStartsThenFailsStaysSavedAndIsTriedOnTheNextLecture() async throws {
+        defer { cleanUp() }
+        world.ffmpeg = fakeFFmpegPath
+        let controller = await readyController()
+        let lecture = await playing(controller, "audio")
+        world.player.chooseAudio(.use(.isolated))
+        world.player.chooseAudio(.use(.levelled))
+        let session = try #require(world.liveSessions.last)
+        #expect(session.kind == .levelled)
+
+        session.onFailure(.unavailable)
+        world.player.failDuringPlayback(at: 300)
+        #expect(session.isStopped)
+        #expect(world.player.plays.last?.url == stream(lecture.id).url)
+        #expect(defaults.string(forKey: RecordingsController.enhancedAudioKindKey) == "levelled")
+        #expect(defaults.bool(forKey: RecordingsController.prefersEnhancedAudioKey))
+        guard case .failed(let message, let preferred) = world.player.audioState else {
+            Issue.record("the menu doesn't say it failed: \(String(describing: world.player.audioState))")
+            return
+        }
+        #expect(preferred == .levelled)
+        let menu = try #require(RecordingPlayerPolicy.audioMenu(world.player.audioState))
+        #expect(menu.items.map(\.checked) == [true, false, false], "Spento is not the one checked")
+        #expect(menu.detail?.title == message.text)
+        await drainTasks()
+
+        let sessions = world.liveSessions.count
+        _ = await playing(controller, "other")
+        #expect(world.liveSessions.count == sessions + 1, "the next lecture did not try the saved mode")
+        #expect(world.liveSessions.last?.kind == .levelled)
+        controller.turnOff()
+        await drainTasks()
     }
 
     /// The filter failing before the lecture ever played (the window closes itself): the lecture
@@ -2594,7 +2771,7 @@ struct RecordingsControllerTests {
         world.ffmpeg = fakeFFmpegPath
         let controller = await readyController()
         let lecture = await playing(controller, "audio")
-        world.player.chooseAudio(.useEnhanced(true))
+        world.player.chooseAudio(.use(.isolated))
         let session = try #require(world.liveSessions.last)
         let fresh = RecordingStream(url: URL(string: "https://media.example.test/fresh/\(lecture.id).m3u8")!, title: nil, duration: nil)
         browser.streamResults[lecture.id] = [.success(fresh)]
@@ -2606,7 +2783,7 @@ struct RecordingsControllerTests {
         #expect(world.liveSessions.last?.stream == fresh.url)
         #expect(world.player.plays.last?.url == FakeLiveAudio.address)
         #expect(world.player.plays.last?.startAt == 900)
-        #expect(world.player.audioState == .on)
+        #expect(world.player.audioState == .on(.isolated))
         #expect(browser.streamCalls.count == 2)
         controller.turnOff()
     }
@@ -2632,7 +2809,7 @@ struct RecordingsControllerTests {
         world.player.failBeforeReady()
         #expect(world.player.plays.last?.url == stream(lecture.id).url)
         #expect(world.player.plays.last?.startAt == start)
-        #expect(world.player.audioState == .off, "marked as failed: \(String(describing: world.player.audioState))")
+        #expect(world.player.audioState == .off(preferred: .isolated), "marked as failed: \(String(describing: world.player.audioState))")
         await drainTasks()
         #expect(world.opened.isEmpty, "the browser opened")
         let sessions = world.liveSessions.count
@@ -2678,7 +2855,7 @@ struct RecordingsControllerTests {
         world.ffmpeg = fakeFFmpegPath
         let controller = await readyController()
         let lecture = await playing(controller, "audio")
-        world.player.chooseAudio(.useEnhanced(true))
+        world.player.chooseAudio(.use(.isolated))
         let session = try #require(world.liveSessions.last)
         for report in reports { session.onFailure(report) }
         world.player.failDuringPlayback(at: 900)
@@ -2757,10 +2934,11 @@ struct RecordingsControllerTests {
         let controller = await readyController()
         _ = await playing(controller, "audio")
         let plays = world.player.plays.count
-        world.player.chooseAudio(.useEnhanced(true))
+        world.player.chooseAudio(.use(.isolated))
         #expect(world.player.plays.count == plays)
         #expect({ if case .failed = world.player.audioState { true } else { false } }())
         #expect(!defaults.bool(forKey: RecordingsController.prefersEnhancedAudioKey))
+        #expect(defaults.string(forKey: RecordingsController.enhancedAudioKindKey) == nil, "a kind that never started was remembered")
         controller.turnOff()
     }
 
@@ -2773,7 +2951,7 @@ struct RecordingsControllerTests {
         let lecture = await playing(controller, "audio")
         #expect(world.player.plays.last?.url == stream(lecture.id).url)
         #expect(world.player.audioState == .needsFFmpeg)
-        world.player.chooseAudio(.useEnhanced(true))
+        world.player.chooseAudio(.use(.isolated))
         await drainTasks()
         #expect(world.player.audioState == .needsFFmpeg)
         #expect(world.liveSessions.isEmpty)
@@ -2788,7 +2966,7 @@ struct RecordingsControllerTests {
         world.ffmpeg = fakeFFmpegPath
         let controller = await readyController()
         _ = await playing(controller, "audio")
-        world.player.chooseAudio(.useEnhanced(true))
+        world.player.chooseAudio(.use(.isolated))
         let closed = try #require(world.liveSessions.last)
         world.player.close()
         #expect(closed.isStopped, "the filter outlived the window")
@@ -2815,7 +2993,7 @@ struct RecordingsControllerTests {
         let first = await playing(controller, "first")
         _ = await playing(controller, "second")
         let plays = world.player.plays.count
-        world.player.onAudioAction?(first.id, .useEnhanced(true))
+        world.player.onAudioAction?(first.id, .use(.isolated))
         await drainTasks()
         #expect(world.liveSessions.isEmpty)
         #expect(world.player.plays.count == plays)
@@ -2829,7 +3007,7 @@ struct RecordingsControllerTests {
         world.ffmpeg = fakeFFmpegPath
         let controller = await readyController()
         _ = await playing(controller, "first")
-        world.player.chooseAudio(.useEnhanced(true))
+        world.player.chooseAudio(.use(.isolated))
         let old = try #require(world.liveSessions.last)
         let second = await playing(controller, "second")
         let current = try #require(world.liveSessions.last)
@@ -2838,7 +3016,7 @@ struct RecordingsControllerTests {
         browser.streamResults[second.id] = [.success(stream(second.id))]
         world.player.failDuringPlayback(at: 300)
         await settle("recovered") { world.liveSessions.count == 3 }
-        #expect(world.player.audioState == .on)
+        #expect(world.player.audioState == .on(.isolated))
         controller.turnOff()
     }
 
@@ -4939,43 +5117,79 @@ struct RecordingsAccountTests {
 /// What the player's Audio menu shows and does in each state of a lecture's enhanced audio.
 @MainActor
 struct AudioMenuPresentationTests {
-    /// Every state has its own item and action; a disabled line never acts; only "on" is
-    /// checked, and a failure keeps the switch offered with the reason beneath it.
+    /// Every state shows the three choices in order with exactly the right one checked and
+    /// enabled: a kind playing is checked; Off and a failure check "Spento" (a failure leaves
+    /// both kinds enabled, since choosing one tries again, and shows the reason beneath);
+    /// without ffmpeg only "Spento" acts and the detail says how to get it. Guards against a
+    /// wrong item checked (the lecture would look filtered when it is not), a kind that cannot
+    /// be retried after a failure, and an item enabled without ffmpeg.
     @Test func eachStateShowsItsChoice() throws {
         #expect(RecordingPlayerPolicy.audioMenu(nil) == nil)
-        let missing = try #require(RecordingPlayerPolicy.audioMenu(.needsFFmpeg))
-        #expect(missing.main.action == nil)
-        #expect(missing.main.title.contains("brew install ffmpeg"))
-        #expect(missing.detail == nil)
-        let off = try #require(RecordingPlayerPolicy.audioMenu(.off))
-        #expect(off.main.action == .useEnhanced(true))
-        #expect(!off.main.checked)
-        #expect(off.detail == nil)
-        let on = try #require(RecordingPlayerPolicy.audioMenu(.on))
-        #expect(on.main.action == .useEnhanced(false))
-        #expect(on.main.checked)
-        #expect(on.main.title == off.main.title)
-        let failed = try #require(RecordingPlayerPolicy.audioMenu(.failed(BilingualText("motivo", "reason"))))
-        #expect(failed.main.action == .useEnhanced(true))
-        #expect(!failed.main.checked)
+        let off = AudioEnhancementKind?.none, levelled = AudioEnhancementKind?.some(.levelled), isolated = AudioEnhancementKind?.some(.isolated)
+        let titles = try #require(RecordingPlayerPolicy.audioMenu(.off(preferred: .isolated))).items.map(\.title)
+        #expect(titles == [tr("Spento", "Off"), tr("Voce livellata", "Levelled voice"), tr("Voce isolata", "Isolated voice")])
+        #expect(RecordingPlayerPolicy.audioMenuHeader() == tr("Audio migliorato", "Enhanced audio"))
+
+        let offMenu = try #require(RecordingPlayerPolicy.audioMenu(.off(preferred: .levelled)))
+        #expect(offMenu.items.map(\.checked) == [true, false, false])
+        #expect(offMenu.items.map(\.action) == [.use(off), .use(levelled), .use(isolated)])
+        #expect(offMenu.detail == nil)
+        for kind in AudioEnhancementKind.allCases {
+            let on = try #require(RecordingPlayerPolicy.audioMenu(.on(kind)))
+            #expect(on.items.map(\.checked) == [false, kind == .levelled, kind == .isolated])
+            #expect(on.items.map(\.action) == [.use(off), .use(levelled), .use(isolated)])
+            #expect(on.detail == nil)
+        }
+        let failed = try #require(RecordingPlayerPolicy.audioMenu(.failed(BilingualText("motivo", "reason"), preferred: .levelled)))
+        #expect(failed.items.map(\.checked) == [true, false, false])
+        #expect(failed.items.map(\.action) == [.use(off), .use(levelled), .use(isolated)])
         #expect(failed.detail?.title == "motivo")
         #expect(failed.detail?.action == nil)
+        let missing = try #require(RecordingPlayerPolicy.audioMenu(.needsFFmpeg))
+        #expect(missing.items.map(\.checked) == [true, false, false])
+        #expect(missing.items.map(\.action) == [.use(off), nil, nil])
+        #expect(missing.detail?.title == tr("Per l'audio migliorato installa ffmpeg (brew install ffmpeg)", "Enhanced audio needs ffmpeg (brew install ffmpeg)"))
+        #expect(missing.detail?.action == nil)
     }
 
-    /// The title-bar switch makes the same choice as the menu's main item in every state, lit only
-    /// when on, with a hover text for each (the failure's reason, how to get ffmpeg).
-    @Test func theTitleBarSwitchMatchesTheMenu() throws {
+    /// The title-bar switch is a two-state toggle: off or failed turns the preferred kind on,
+    /// a kind playing turns off, without ffmpeg it is disabled; lit only while a kind plays;
+    /// the tooltip names the mode. Guards against a switch that always turns the same kind on
+    /// (ignoring the last choice) or a tooltip that does not say what a click does.
+    @Test func theTitleBarSwitchTogglesTheLastKind() throws {
         #expect(RecordingPlayerPolicy.audioButton(nil) == nil)
-        let states: [AudioEnhancementState] = [.needsFFmpeg, .off, .on, .failed(BilingualText("motivo", "reason"))]
-        for state in states {
-            let button = try #require(RecordingPlayerPolicy.audioButton(state))
-            let menu = try #require(RecordingPlayerPolicy.audioMenu(state))
-            #expect(button.action == menu.main.action, "\(state)")
-            #expect(button.isOn == (state == .on), "\(state)")
-            #expect(!button.toolTip.isEmpty)
+        let off = try #require(RecordingPlayerPolicy.audioButton(.off(preferred: .levelled)))
+        #expect(off.action == .use(.levelled))
+        #expect(!off.isOn)
+        #expect(off.toolTip == tr("Audio migliorato: spento. Fai clic per attivare «Voce livellata».", "Enhanced audio: off. Click to turn on \u{201C}Levelled voice\u{201D}."))
+        #expect(RecordingPlayerPolicy.audioButton(.off(preferred: .isolated))?.action == .use(.isolated))
+        for kind in AudioEnhancementKind.allCases {
+            let on = try #require(RecordingPlayerPolicy.audioButton(.on(kind)))
+            #expect(on.action == .use(nil))
+            #expect(on.isOn)
+            #expect(on.toolTip == tr("Audio migliorato: \(kind.displayName). Fai clic per tornare all'audio originale.", "Enhanced audio: \(kind.displayName). Click to go back to the original audio."))
         }
-        #expect(RecordingPlayerPolicy.audioButton(.failed(BilingualText("motivo", "reason")))?.toolTip == "motivo")
-        #expect(RecordingPlayerPolicy.audioButton(.needsFFmpeg)?.toolTip.contains("brew install ffmpeg") == true)
-        #expect(RecordingPlayerPolicy.audioButton(.off)?.toolTip != RecordingPlayerPolicy.audioButton(.on)?.toolTip)
+        let failed = try #require(RecordingPlayerPolicy.audioButton(.failed(BilingualText("motivo", "reason"), preferred: .levelled)))
+        #expect(failed.action == .use(.levelled))
+        #expect(!failed.isOn)
+        #expect(failed.toolTip == "motivo " + tr("Fai clic per riprovare con «Voce livellata».", "Click to try \u{201C}Levelled voice\u{201D} again."))
+        let failedIsolated = try #require(RecordingPlayerPolicy.audioButton(.failed(BilingualText("motivo", "reason"), preferred: .isolated)))
+        #expect(failedIsolated.toolTip == "motivo " + tr("Fai clic per riprovare con «Voce isolata».", "Click to try \u{201C}Isolated voice\u{201D} again."))
+        let missing = try #require(RecordingPlayerPolicy.audioButton(.needsFFmpeg))
+        #expect(missing.action == nil)
+        #expect(!missing.isOn)
+        #expect(missing.toolTip.contains("brew install ffmpeg"))
+    }
+
+    /// A stored kind is read back; an absent or unrecognised one is `.isolated`, what the
+    /// switch did before there was a choice. Guards against a student who had it on hearing
+    /// something else after updating, and against a raw value that does not round-trip.
+    @Test func theStoredKindResolvesWithIsolatedAsTheDefault() {
+        #expect(RecordingsController.resolveEnhancedAudioKind(nil) == .isolated)
+        #expect(RecordingsController.resolveEnhancedAudioKind("garbage") == .isolated)
+        #expect(RecordingsController.resolveEnhancedAudioKind("") == .isolated)
+        for kind in AudioEnhancementKind.allCases {
+            #expect(RecordingsController.resolveEnhancedAudioKind(kind.rawValue) == kind)
+        }
     }
 }

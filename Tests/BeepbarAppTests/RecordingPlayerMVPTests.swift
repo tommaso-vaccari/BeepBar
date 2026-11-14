@@ -3,6 +3,7 @@ import AppKit
 import Foundation
 import os
 import Testing
+import BeepbarCore
 @testable import BeepbarApp
 
 // MARK: Test doubles
@@ -405,6 +406,56 @@ struct RecordingPlayerMVPTests {
         controller.close()
     }
 
+    /// The Audio section of the title-bar menu: titled "Enhanced audio", with Off, Levelled voice
+    /// and Isolated voice as single-choice items, the one for the state checked, the detail
+    /// line below; clicking an item sends its action, clicking the checked one sends nothing,
+    /// and without ffmpeg only "Off" is enabled. Guards against a wrong check mark, a click on
+    /// the current choice replaying the lecture, and an item sending another item's action.
+    @Test func theAudioMenuOffersThreeChoices() async throws {
+        let defaults = PlayerTestDefaults.throwaway()
+        defer { defaults.discard() }
+        let controller = makeController(defaults: defaults)
+        try await playReady(controller)
+        var asked: [PlayerAudioAction] = []
+        controller.onAudioAction = { _, action in asked.append(action) }
+        let menu = try #require(controller.speedPopUp?.menu)
+        func item(_ tag: Int) throws -> NSMenuItem { try #require(menu.item(withTag: tag)) }
+        func click(_ tag: Int) throws { menu.performActionForItem(at: menu.index(of: try item(tag))) }
+        let tags = RecordingPlayerController.AudioMenuTag.choices
+
+        #expect(try item(RecordingPlayerController.AudioMenuTag.header).title == tr("Audio migliorato", "Enhanced audio"))
+        controller.showAudioEnhancement(.on(.levelled), recordingID: controller.recordingID)
+        #expect(try tags.map { try item($0).title } == [tr("Spento", "Off"), tr("Voce livellata", "Levelled voice"), tr("Voce isolata", "Isolated voice")])
+        #expect(try tags.map { try item($0).state == .on } == [false, true, false])
+        #expect(try tags.map { try item($0).isEnabled } == [true, true, true])
+        try click(tags[2])
+        try click(tags[0])
+        try click(tags[1])
+        try await Self.waitUntil { asked.count == 2 }
+        await Self.settle()
+        #expect(asked == [.use(.isolated), .use(nil)], "the checked item sent an action, or an item the wrong one")
+
+        controller.showAudioEnhancement(.off(preferred: .isolated), recordingID: controller.recordingID)
+        #expect(try tags.map { try item($0).state == .on } == [true, false, false])
+        try click(tags[0])
+        await Self.settle()
+        #expect(asked.count == 2, "Off while off sent an action")
+
+        controller.showAudioEnhancement(.failed(BilingualText("motivo", "reason"), preferred: .isolated), recordingID: controller.recordingID)
+        #expect(try tags.map { try item($0).state == .on } == [true, false, false])
+        #expect(try tags.map { try item($0).isEnabled } == [true, true, true])
+        #expect(try item(RecordingPlayerController.AudioMenuTag.detail).title == "motivo")
+        #expect(try !item(RecordingPlayerController.AudioMenuTag.detail).isHidden)
+
+        controller.showAudioEnhancement(.needsFFmpeg, recordingID: controller.recordingID)
+        #expect(try tags.map { try item($0).isEnabled } == [true, false, false])
+        #expect(try item(RecordingPlayerController.AudioMenuTag.detail).title.contains("brew install ffmpeg"))
+
+        controller.showAudioEnhancement(nil, recordingID: controller.recordingID)
+        #expect(try tags.allSatisfy { try item($0).isHidden })
+        controller.close()
+    }
+
     /// The enhanced-audio switch in the title bar, beside the speed menu: hidden until the lecture
     /// has an Audio state; lit only while on; a click asks for the opposite of the current state
     /// and, until the controller answers, shows the state it had rather than AppKit's flip;
@@ -424,22 +475,28 @@ struct RecordingPlayerMVPTests {
         #expect(popUp.frame.minX == 0, "a hidden switch left a gap")
         #expect(button.superview === popUp.superview)
 
-        controller.showAudioEnhancement(.off, recordingID: controller.recordingID)
+        controller.showAudioEnhancement(.off(preferred: .isolated), recordingID: controller.recordingID)
         #expect(!button.isHidden)
         #expect(button.isEnabled)
         #expect(button.state == .off)
         #expect(popUp.frame.minX > button.frame.maxX, "the switch overlaps the speed menu")
         button.performClick(nil)
         try await Self.waitUntil { asked.count == 1 }
-        #expect(asked == [.useEnhanced(true)])
-        #expect(button.state == .off, "the switch showed a choice the controller hadn't applied")
-
-        controller.showAudioEnhancement(.on, recordingID: controller.recordingID)
-        #expect(button.state == .on)
-        #expect(button.toolTip?.isEmpty == false)
+        #expect(asked == [.use(.isolated)])
+        controller.showAudioEnhancement(.off(preferred: .levelled), recordingID: controller.recordingID)
         button.performClick(nil)
         try await Self.waitUntil { asked.count == 2 }
-        #expect(asked.last == .useEnhanced(false))
+        #expect(asked.last == .use(.levelled), "the switch ignored the last kind")
+        asked.removeLast()
+        controller.showAudioEnhancement(.off(preferred: .isolated), recordingID: controller.recordingID)
+        #expect(button.state == .off, "the switch showed a choice the controller hadn't applied")
+
+        controller.showAudioEnhancement(.on(.isolated), recordingID: controller.recordingID)
+        #expect(button.state == .on)
+        #expect(button.toolTip?.contains(AudioEnhancementKind.isolated.displayName) == true, "the tooltip does not name the mode")
+        button.performClick(nil)
+        try await Self.waitUntil { asked.count == 2 }
+        #expect(asked.last == .use(nil))
         #expect(button.state == .on)
 
         controller.showAudioEnhancement(.needsFFmpeg, recordingID: controller.recordingID)
@@ -451,7 +508,7 @@ struct RecordingPlayerMVPTests {
 
         // A new lecture rebuilds the menu: the switch still works, and starts hidden.
         try await playReady(controller)
-        controller.showAudioEnhancement(.off, recordingID: controller.recordingID)
+        controller.showAudioEnhancement(.off(preferred: .isolated), recordingID: controller.recordingID)
         try #require(controller.audioButton).performClick(nil)
         try await Self.waitUntil { asked.count == 3 }
         controller.showAudioEnhancement(nil, recordingID: controller.recordingID)

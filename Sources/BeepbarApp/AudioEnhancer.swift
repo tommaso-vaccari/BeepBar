@@ -7,14 +7,27 @@ import OSLog
 enum AudioEnhancementState: Equatable, Sendable {
     /// No ffmpeg where package managers install it: the menu says how to get it.
     case needsFFmpeg
-    /// The lecture plays Webex's own stream; the switch turns enhanced audio on.
-    case off
-    /// The lecture plays through the local filter (`LiveAudioSession`).
-    case on
+    /// The lecture plays Webex's own stream. `preferred` is the kind the student chose last
+    /// (`RecordingsController.resolveEnhancedAudioKind`): the one the title-bar switch turns on.
+    case off(preferred: AudioEnhancementKind)
+    /// The lecture plays through the local filter (`LiveAudioSession`) of this kind.
+    case on(AudioEnhancementKind)
     /// Enhanced audio stopped working for this lecture (ffmpeg failed, the stream isn't the
-    /// layout it understands): the lecture went back to its own stream, and the switch tries
-    /// again. The message is already bilingual.
-    case failed(BilingualText)
+    /// layout it understands): the lecture went back to its own stream, and choosing a kind
+    /// tries again; `preferred` is the one the title-bar switch tries. The message is already
+    /// bilingual.
+    case failed(BilingualText, preferred: AudioEnhancementKind)
+}
+
+extension AudioEnhancementKind {
+    /// The name the student sees for this kind, in the current language: built at use, never
+    /// cached, so a language switch shows at once.
+    var displayName: String {
+        switch self {
+        case .levelled: tr("Voce livellata", "Levelled voice")
+        case .isolated: tr("Voce isolata", "Isolated voice")
+        }
+    }
 }
 
 /// What the player's Audio menu shows for one state: pure, so tests check every state's text
@@ -26,37 +39,62 @@ struct AudioMenuPresentation: Equatable {
         let action: PlayerAudioAction?
         var checked = false
     }
-    let main: Item
-    /// A second line, disabled: why the last attempt failed; nil for none.
+    /// The three single-choice items, in order: Off, Levelled voice, Isolated voice. Exactly one
+    /// is checked.
+    let items: [Item]
+    /// A second line, disabled: why the last attempt failed or how to get ffmpeg; nil for none.
     let detail: Item?
 }
 
 extension RecordingPlayerPolicy {
     /// The Audio menu for `state`, in the current language; nil hides the section.
+    ///
+    /// A bare "Audio" header above "Spento" would read as "audio muted", so the section is
+    /// titled by the feature (`audioMenuHeader`), and the failed state checks "Spento": the
+    /// lecture is on its own audio, and choosing a kind tries again.
     static func audioMenu(_ state: AudioEnhancementState?) -> AudioMenuPresentation? {
         guard let state else { return nil }
-        let title = tr("Audio migliorato", "Enhanced audio")
+        let playing: AudioEnhancementKind?
+        var enabled = true
+        var detail: AudioMenuPresentation.Item?
         switch state {
         case .needsFFmpeg:
-            return AudioMenuPresentation(main: .init(title: tr("Audio migliorato: installa ffmpeg (brew install ffmpeg)", "Enhanced audio: install ffmpeg (brew install ffmpeg)"), action: nil), detail: nil)
-        case .off:
-            return AudioMenuPresentation(main: .init(title: title, action: .useEnhanced(true)), detail: nil)
-        case .on:
-            return AudioMenuPresentation(main: .init(title: title, action: .useEnhanced(false), checked: true), detail: nil)
-        case .failed(let message):
-            return AudioMenuPresentation(main: .init(title: title, action: .useEnhanced(true)), detail: .init(title: message.text, action: nil))
+            playing = nil
+            enabled = false
+            detail = .init(title: ffmpegHint(), action: nil)
+        case .off: playing = nil
+        case .on(let kind): playing = kind
+        case .failed(let message, _):
+            playing = nil
+            detail = .init(title: message.text, action: nil)
         }
+        func item(_ title: String, _ kind: AudioEnhancementKind?) -> AudioMenuPresentation.Item {
+            .init(title: title, action: kind == nil || enabled ? .use(kind) : nil, checked: kind == playing)
+        }
+        return AudioMenuPresentation(items: [item(tr("Spento", "Off"), nil),
+                                             item(AudioEnhancementKind.levelled.displayName, .levelled),
+                                             item(AudioEnhancementKind.isolated.displayName, .isolated)],
+                                     detail: detail)
+    }
+
+    /// The header of the Audio section.
+    static func audioMenuHeader() -> String { tr("Audio migliorato", "Enhanced audio") }
+
+    /// How to get ffmpeg: the menu's detail line and the switch's tooltip without it.
+    static func ffmpegHint() -> String {
+        tr("Per l'audio migliorato installa ffmpeg (brew install ffmpeg)", "Enhanced audio needs ffmpeg (brew install ffmpeg)")
     }
 }
 
-/// The enhanced-audio switch in the player's title bar, next to the speed menu: the same choice
-/// as the Audio menu's main item, always in sight. Pure, like `AudioMenuPresentation`.
+/// The enhanced-audio switch in the player's title bar, next to the speed menu: a two-state
+/// toggle between Off and the kind the student used last, always in sight. Pure, like
+/// `AudioMenuPresentation`.
 struct AudioButtonPresentation: Equatable {
     /// Lit: the lecture plays through the filter.
     let isOn: Bool
     /// What a click asks for; nil: shown disabled (no ffmpeg).
     let action: PlayerAudioAction?
-    /// What hovering shows: the switch's name and state, how to get ffmpeg, or why it failed.
+    /// What hovering shows: the switch's name, state and mode, how to get ffmpeg, or why it failed.
     let toolTip: String
 }
 
@@ -64,15 +102,25 @@ extension RecordingPlayerPolicy {
     /// The title-bar switch for `state`, in the current language; nil hides it (no lecture, or
     /// no account the lecture's state could belong to).
     static func audioButton(_ state: AudioEnhancementState?) -> AudioButtonPresentation? {
-        guard let state, let menu = audioMenu(state) else { return nil }
-        let toolTip: String
+        guard let state else { return nil }
         switch state {
-        case .needsFFmpeg: toolTip = menu.main.title
-        case .off: toolTip = tr("Audio migliorato: spento. Fai clic per ridurre il rumore dell'aula e far risaltare la voce.", "Enhanced audio: off. Click to reduce classroom noise and bring the voice forward.")
-        case .on: toolTip = tr("Audio migliorato: acceso. Fai clic per tornare all'audio originale.", "Enhanced audio: on. Click to go back to the original audio.")
-        case .failed(let message): toolTip = message.text
+        case .needsFFmpeg:
+            return AudioButtonPresentation(isOn: false, action: nil, toolTip: ffmpegHint())
+        case .off(let preferred):
+            return AudioButtonPresentation(isOn: false, action: .use(preferred), toolTip: tr(
+                "Audio migliorato: spento. Fai clic per attivare «\(preferred.displayName)».",
+                "Enhanced audio: off. Click to turn on \u{201C}\(preferred.displayName)\u{201D}."))
+        case .on(let kind):
+            return AudioButtonPresentation(isOn: true, action: .use(nil), toolTip: tr(
+                "Audio migliorato: \(kind.displayName). Fai clic per tornare all'audio originale.",
+                "Enhanced audio: \(kind.displayName). Click to go back to the original audio."))
+        case .failed(let message, let preferred):
+            // The click retries `preferred`, so the tooltip says so after the reason; built here, at use
+            // time, so that it follows a language switch like `message` does.
+            return AudioButtonPresentation(isOn: false, action: .use(preferred), toolTip: message.text + " " + tr(
+                "Fai clic per riprovare con «\(preferred.displayName)».",
+                "Click to try \u{201C}\(preferred.displayName)\u{201D} again."))
         }
-        return AudioButtonPresentation(isOn: menu.main.checked, action: menu.main.action, toolTip: toolTip)
     }
 }
 
@@ -116,7 +164,7 @@ enum LiveAudioFailure: Equatable, Sendable {
     /// Called on the main actor whenever a lecture's state changes, with its key (`copyKey`).
     var onChange: ((String) -> Void)?
 
-    typealias MakeSession = @MainActor (_ stream: URL, _ ffmpeg: URL, _ onFailure: @escaping @MainActor (LiveAudioFailure?) -> Void) throws -> LiveAudioStreaming
+    typealias MakeSession = @MainActor (_ stream: URL, _ ffmpeg: URL, _ kind: AudioEnhancementKind, _ onFailure: @escaping @MainActor (LiveAudioFailure?) -> Void) throws -> LiveAudioStreaming
 
     private let locateFFmpeg: () -> URL?
     private let makeSession: MakeSession
@@ -126,11 +174,11 @@ enum LiveAudioFailure: Equatable, Sendable {
     /// request has succeeded since (the failure passed). A refusal stays over later failures,
     /// whatever fails after an expired address; only a success clears it.
     private(set) var reportedFailure: LiveAudioFailure?
-    /// Lectures whose filter failed, until the student turns it on again.
+    /// Lectures whose filter failed, until a mode is chosen again.
     private var failures: [String: BilingualText] = [:]
 
     init(locateFFmpeg: @escaping () -> URL? = { AudioEnhancement.locateFFmpeg() },
-         makeSession: @escaping MakeSession = { try LiveAudioSession(stream: $0, ffmpeg: $1, onFailure: $2) },
+         makeSession: @escaping MakeSession = { try LiveAudioSession(stream: $0, ffmpeg: $1, onFailure: $3, kind: $2) },
          legacyCopies: URL? = AudioEnhancer.legacyCopiesFolder()) {
         self.locateFFmpeg = locateFFmpeg
         self.makeSession = makeSession
@@ -157,20 +205,24 @@ enum LiveAudioFailure: Equatable, Sendable {
         return digest.prefix(16).map { String(format: "%02x", $0) }.joined()
     }
 
-    /// What the menu shows for `key`; `inUse` is the caller's (it knows what the player plays).
-    func state(for key: String, inUse: Bool) -> AudioEnhancementState {
-        if inUse { return .on }
+    /// What the menu shows for `key`; `inUse` (the kind playing, nil for Webex's stream) and
+    /// `preferred` (the kind chosen last) are the caller's: it knows what the player plays and
+    /// what the student chose.
+    func state(for key: String, inUse: AudioEnhancementKind?, preferred: AudioEnhancementKind) -> AudioEnhancementState {
+        if let inUse { return .on(inUse) }
         if locateFFmpeg() == nil { return .needsFFmpeg }
-        if let failure = failures[key] { return .failed(failure) }
-        return .off
+        if let failure = failures[key] { return .failed(failure, preferred: preferred) }
+        return .off(preferred: preferred)
     }
 
     /// Whether a Play of `key` may start on the filter: ffmpeg is there and it hasn't failed.
     func canStart(_ key: String) -> Bool { failures[key] == nil && locateFFmpeg() != nil }
 
-    /// Starts filtering `stream` for `key`, replacing any session, and returns the address the
-    /// player plays; nil without ffmpeg or when the session can't start (no local port).
-    func start(key: String, stream: URL) -> URL? {
+    /// Starts filtering `stream` for `key` with the filter of `kind`, replacing any session
+    /// (which is stopped first, so a start that fails leaves none running), and returns the
+    /// address the player plays; nil without ffmpeg or when the session can't start (no local
+    /// port).
+    func start(key: String, stream: URL, kind: AudioEnhancementKind) -> URL? {
         stop()
         failures[key] = nil
         guard let ffmpeg = locateFFmpeg() else {
@@ -180,7 +232,7 @@ enum LiveAudioFailure: Equatable, Sendable {
         sessionCount += 1
         let id = sessionCount
         do {
-            let streaming = try makeSession(stream, ffmpeg) { [weak self] failure in
+            let streaming = try makeSession(stream, ffmpeg, kind) { [weak self] failure in
                 guard let self, self.session?.id == id, failure == nil || self.reportedFailure != .streamRefused else { return }
                 self.reportedFailure = failure
             }

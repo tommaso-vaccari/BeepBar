@@ -4,8 +4,8 @@ import BeepbarCore
 
 /// Runs audio through voice isolation: reads the mono 48 kHz WAV at `input` and writes to
 /// `output` its isolated samples from `first`, `count` of them (to the end when nil), on the
-/// input's own clock, as raw 16-bit little-endian mono (`AudioEnhancement.
-/// isolatedEncodeArguments` joins such pieces). The samples around the kept range are what the
+/// input's own clock, as raw 16-bit little-endian mono (the pieces `LiveAudioPipeline` levels
+/// with `VoiceLeveler` before `AudioEnhancement.levelledEncodeArguments`). The samples around the kept range are what the
 /// voice model hears before and after it (`AudioEnhancement.isolationLead`). Throws
 /// `CancellationError` when the calling task is cancelled.
 protocol LiveAudioVoiceIsolating: Sendable {
@@ -14,10 +14,11 @@ protocol LiveAudioVoiceIsolating: Sendable {
 
 /// Apple's voice isolation (`AUSoundIsolation`, the audio unit behind FaceTime's Voice
 /// Isolation), run offline on a file: it keeps the voice and removes steady noise, hum and much
-/// of the room's echo, with nothing to download. On a synthetic classroom (`AudioEnhancement.
-/// isolatedChain` has the numbers) it removed steady noise by about 45 dB, against about 15 dB
-/// for ffmpeg's `afftdn`. What it keeps: other people's voices (voice too), and a steady tone
-/// as loud as speech (a 100 Hz hum at −27 dB came through unchanged; at −42 dB it went).
+/// of the room's echo, with nothing to download. On a synthetic classroom (measured with the
+/// ffmpeg chain that preceded the leveler, removed in PR #245) it removed steady noise by about
+/// 45 dB, against about 15 dB for ffmpeg's `afftdn`. What it keeps: other people's voices (voice
+/// too), and a steady tone as loud as speech (a 100 Hz hum at −27 dB came through unchanged; at
+/// −42 dB it went).
 ///
 /// The unit's delay: it answers 0 to `kAudioUnitProperty_Latency`, yet its output comes later
 /// than its input, by 4440 samples (92.5 ms) for the high-quality voice model and 2704 (56.3 ms)
@@ -87,7 +88,8 @@ struct AppleVoiceIsolator: LiveAudioVoiceIsolating {
         engine.connect(effect, to: engine.mainMixerNode, format: format)
         try engine.enableManualRenderingMode(.offline, format: format, maximumFrameCount: 4096)
         // The standard model is the unit's default, and on macOS 14 the parameter's only value:
-        // set only to ask for the high-quality one.
+        // set only to ask for the high-quality one. The wet/dry mix is set to 100% explicitly
+        // (the isolated voice alone), so what is heard never depends on the unit's default.
         guard model == .standard || AudioUnitSetParameter(effect.audioUnit, kAUSoundIsolationParam_SoundToIsolate, kAudioUnitScope_Global, 0, model.soundType, 0) == noErr,
               AudioUnitSetParameter(effect.audioUnit, kAUSoundIsolationParam_WetDryMixPercent, kAudioUnitScope_Global, 0, 100, 0) == noErr
         else { throw IsolationError.renderFailed }

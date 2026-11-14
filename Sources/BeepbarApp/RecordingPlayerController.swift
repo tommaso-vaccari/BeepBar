@@ -70,8 +70,9 @@ import OSLog
 
 /// One choice in the player's Audio menu (`RecordingPlaying.onAudioAction`).
 enum PlayerAudioAction: Equatable, Sendable {
-    /// Play through the local filter (true) or Webex's stream (false) from the same position.
-    case useEnhanced(Bool)
+    /// Play through the local filter of that kind, or (nil) Webex's own stream, from the same
+    /// position.
+    case use(AudioEnhancementKind?)
 }
 
 /// One report of where the student stopped in a lecture (`RecordingPlaying.onPositionCheckpoint`).
@@ -1285,18 +1286,19 @@ enum RecordingPlayerError: Error {
         popUp.setAccessibilityLabel(tr("Velocità di riproduzione", "Playback speed"))
     }
 
-    /// The Audio section of the title-bar menu (`audioState`): a separator, a header, the main
-    /// item (the enhanced-audio switch, or how to get ffmpeg) and a detail item (why the last
-    /// attempt failed). Tagged so `updateAudioItems` finds them; hidden while the state is nil.
+    /// The Audio section of the title-bar menu (`audioState`): a separator, a header, the three
+    /// single-choice items (Off, Levelled voice, Isolated voice) and a detail item (why the last
+    /// attempt failed, or how to get ffmpeg). Tagged so `updateAudioItems` finds them; hidden
+    /// while the state is nil.
     private func addAudioItems(to menu: NSMenu) {
         let separator = NSMenuItem.separator()
         separator.tag = AudioMenuTag.separator
         menu.addItem(separator)
-        let header = NSMenuItem(title: tr("Audio", "Audio"), action: nil, keyEquivalent: "")
+        let header = NSMenuItem(title: RecordingPlayerPolicy.audioMenuHeader(), action: nil, keyEquivalent: "")
         header.isEnabled = false
         header.tag = AudioMenuTag.header
         menu.addItem(header)
-        for tag in [AudioMenuTag.main, AudioMenuTag.detail] {
+        for tag in AudioMenuTag.choices + [AudioMenuTag.detail] {
             let window = self.window
             let action = PlayerMenuAction { [weak self, weak window] in
                 guard let self, let window, self.window === window else { return }
@@ -1315,8 +1317,13 @@ enum RecordingPlayerError: Error {
     enum AudioMenuTag {
         static let separator = 9_001
         static let header = 9_002
-        static let main = 9_003
         static let detail = 9_004
+        /// The three choices, in the order of `AudioMenuPresentation.items`: Off, Levelled
+        /// voice, Isolated voice.
+        static let off = 9_003
+        static let levelled = 9_005
+        static let isolated = 9_006
+        static let choices = [off, levelled, isolated]
     }
 
     /// The Audio items' titles and states for `audioState`, updated in place, no rebuild; the
@@ -1338,11 +1345,13 @@ enum RecordingPlayerError: Error {
         for tag in [AudioMenuTag.separator, AudioMenuTag.header] {
             menu.item(withTag: tag)?.isHidden = presentation == nil
         }
-        if let main = menu.item(withTag: AudioMenuTag.main) {
-            main.isHidden = presentation == nil
-            main.title = presentation?.main.title ?? ""
-            main.isEnabled = presentation?.main.action != nil
-            main.state = presentation?.main.checked == true ? .on : .off
+        for (index, tag) in AudioMenuTag.choices.enumerated() {
+            guard let item = menu.item(withTag: tag) else { continue }
+            let choice = presentation.flatMap { $0.items.indices.contains(index) ? $0.items[index] : nil }
+            item.isHidden = choice == nil
+            item.title = choice?.title ?? ""
+            item.isEnabled = choice?.action != nil
+            item.state = choice?.checked == true ? .on : .off
         }
         if let detail = menu.item(withTag: AudioMenuTag.detail) {
             detail.isHidden = presentation?.detail == nil
@@ -1356,8 +1365,9 @@ enum RecordingPlayerError: Error {
     /// click, never from the title it was built with.
     func audioItemChosen(_ tag: Int) {
         guard isOpen, let presentation = RecordingPlayerPolicy.audioMenu(audioState) else { return }
-        let action = tag == AudioMenuTag.main ? presentation.main.action : presentation.detail?.action
-        guard let action else { return }
+        // The item already checked does nothing: it is where the lecture already is.
+        let choice = AudioMenuTag.choices.firstIndex(of: tag).flatMap { presentation.items.indices.contains($0) ? presentation.items[$0] : nil }
+        guard let choice, !choice.checked, let action = choice.action else { return }
         onAudioAction?(recordingID, action)
     }
 

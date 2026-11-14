@@ -68,3 +68,7 @@ Riverificate e salvate revisioni immutabili S-0008/S-0009 e fonti S-0013–S-001
 ## 2026-11-13 — modalità dell’audio migliorato, PR #245
 
 Aggiornata la riga «Audio migliorato» della mappa dei dati: in «Voce livellata» ogni tratto tiene tra i file temporanei anche il proprio audio originale (circa 350 MB per lezione contro 115), con la stessa cartella e le stesse cancellazioni; in UserDefaults si aggiunge l’ultima modalità scelta. Nessun nuovo destinatario, flusso di rete o categoria di dati: l’audio era già letto da Webex e tenuto a pezzi nella stessa cartella. Solo analisi del codice del branch e test su corpus sintetico; nessuna nuova fonte o conclusione di conformità.
+
+## 2026-11-14 — telemetria rimossa, issue #239
+
+Aggiornate mappa dei dati, valutazione (C08), piano di verifica e indice: la telemetria TelemetryDeck è rimossa dal codice (branch `fix/player-wake-crash-and-telemetry-removal`, non ancora in dev né rilasciata); le descrizioni precedenti sono marcate come storiche. Pulizia unica al primo avvio delle sette preferenze `dailyTelemetry*`. Nessuna nuova fonte acquisita: fonti grezze, schede S-0007–S-0016 e manifest restano invariati come storico. Nessuna conclusione giuridica nuova; la cancellazione dei dati già ricevuti presso il fornitore è un’azione manuale del maintainer, non eseguita né verificata qui. Solo analisi del codice, nessuna verifica runtime del binario.

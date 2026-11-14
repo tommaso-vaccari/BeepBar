@@ -5,15 +5,18 @@
 ### New
 
 - Add a lesson to the Watchlist by pasting its Webex link with the “+” button, for recordings the archive doesn't list. The link copied from the Webex web app's address bar works too. Leave the title empty and the first Play fills in Webex's title and the length; the lesson then shows its progress bar and the “Fatta” (“Done”) checkbox like the others.
-- “Audio migliorato” (“Enhanced audio”) in the player's title bar makes the teacher's voice easier to follow while the lecture plays: quiet recordings and a teacher who moves away from the microphone are brought to the same volume. The menu next to the button offers two modes: “Voce isolata” (“Isolated voice”, the default) plays only the voice, without the classroom noise; “Voce livellata” (“Levelled voice”) keeps the lecture's original sound at an even volume, for recordings where isolating the voice cuts words. The button turns the last mode used on and off. It needs ffmpeg on your Mac (`brew install ffmpeg`); without it the button says how to get it. With it on, a lecture takes a little over a second to start and after each jump to a part not heard yet; if it stops working, the lecture carries on with its original audio.
+- “Audio migliorato” (“Enhanced audio”) in the player's title bar makes the teacher's voice easier to follow while the lecture plays: quiet recordings and a teacher who moves away from the microphone are brought to the same volume. A selector offers three modes: “Spento” (“Off”), “Voce isolata” (“Isolated voice”, the default), which plays only the voice without the classroom noise, and “Voce livellata” (“Levelled voice”), which keeps the lecture's original sound at an even volume, for recordings where isolating the voice cuts words. It needs ffmpeg on your Mac (`brew install ffmpeg`); without it the selector says how to get it. With it on, a lecture takes a little over a second to start and after each jump to a part not heard yet; if it stops working, the lecture carries on with its original audio.
 
 ### Improved
 
 - Opening a course in Recordings clears its new-recordings badge in the sidebar. The blue dots stay on the new lectures while you are in the course, and once you leave it they count as read, so the “Segna novità come lette” (“Mark new recordings as read”) button is gone.
 - The Recordings sidebar is tidier: the orange dot is gone, and under each course's name you now read how many lectures are left, for example “30 registrazioni · 3 da guardare”. The only badge left counts new recordings, and it stays readable on the selected course. The number beside “Watchlist” now counts the lessons added by link too.
+- BeepBar no longer sends anonymous usage statistics, and the “Telemetria” (“Telemetry”) option in Settings is gone. There is nothing to do after updating.
 
 ### Fixed
 
+- BeepBar no longer quits unexpectedly when the Mac wakes from sleep with a lecture or the BeepBar window open.
+- A lecture left paused for a long time, or across your Mac's sleep, now resumes where you stopped instead of showing an error; BeepBar also retries a few times when the connection is not back yet.
 - In Recordings, a course BeepBar has not listed yet no longer shows an empty pane when you aren't signed in with Polimi: it asks you to sign in, with the button right there.
 
 ## 2026-10-19

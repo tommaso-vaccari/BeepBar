@@ -162,6 +162,23 @@ struct WebexSignInWebViewTests {
         #expect(await outcome(task) == "cancelled")
     }
 
+    /// The close of a window that is no longer the session's own (a late notification after the
+    /// session replaced its window) must not touch the sign-in running now: the ticket still ends
+    /// it as signed in. Guards against the hop in `windowWillClose` (#241) applying a stale
+    /// close to a newer sign-in; it fails as "cancelled" without the identity check.
+    @Test(.timeLimit(.minutes(1))) func aLateCloseOfAnotherWindowDoesNotCancelTheSignIn() async throws {
+        let harness = Harness()
+        defer { harness.session.close() }
+        try await harness.open(fixture: "<form><input type='password' name='pw'></form>", stall: .seconds(30))
+        let task = harness.start()
+        try await harness.until { harness.windowsShown == 1 }
+        let old = NSWindow()
+        harness.session.windowWillClose(Notification(name: NSWindow.willCloseNotification, object: old))
+        try await Task.sleep(for: .milliseconds(200))
+        await harness.store.setCookie(Self.ticket())
+        #expect(await outcome(task) == "signed in")
+    }
+
     /// The same page in a sign-in nobody asked for ends as "sign in again", with no window.
     @Test(.timeLimit(.minutes(1))) func aPasswordPageWithoutTheUserNeedsSignIn() async throws {
         let harness = Harness()
@@ -344,6 +361,8 @@ struct WebexSignInWebViewTests {
         let task = shown.start()
         try await shown.until { shown.windowsShown == 1 }
         shown.session.webViewWebContentProcessDidTerminate(shown.session.webView!)
+        // The delegate callback only hops to the main actor (#241): the restart follows.
+        try await shown.until { shown.started.count == 2 }
         #expect(shown.started.count == 2)
         #expect(shown.started.last == WebexSignIn.withoutEmailHint(Self.loginURL))
         await shown.store.setCookie(Self.ticket())

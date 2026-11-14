@@ -363,7 +363,7 @@ enum PlayerVideoViews {
     /// another view's layer), rather than the layer tree from the top: AppKit assembles a parent's
     /// layer tree lazily, so a view's player layer can exist before the parent lists it. A few
     /// hundred views and layers, and only when the cached view is gone.
-    @MainActor static func videoHost(in playerView: NSView) -> NSView? {
+    nonisolated static func videoHost(in playerView: NSView) -> NSView? {
         if let layer = playerView.layer, holdsPlayerLayer(layer, owner: playerView) { return playerView }
         for subview in playerView.subviews {
             if let found = videoHost(in: subview) { return found }
@@ -371,7 +371,7 @@ enum PlayerVideoViews {
         return nil
     }
 
-    @MainActor private static func holdsPlayerLayer(_ layer: CALayer, owner: NSView) -> Bool {
+    private nonisolated static func holdsPlayerLayer(_ layer: CALayer, owner: NSView) -> Bool {
         if layer is AVPlayerLayer { return true }
         for sublayer in layer.sublayers ?? [] {
             // Another view's layer belongs to that view, which `videoHost` visits on its own.
@@ -385,7 +385,7 @@ enum PlayerVideoViews {
     /// The player view itself counts (nothing above it there: a plain test view, or AVKit before
     /// its subviews exist). Without a video host only that holds, so on an AVKit whose layout
     /// this does not recognise the zoom stays off rather than stealing the controls' gestures.
-    @MainActor static func isVideo(_ hit: NSView?, in playerView: NSView, videoHost: NSView?) -> Bool {
+    nonisolated static func isVideo(_ hit: NSView?, in playerView: NSView, videoHost: NSView?) -> Bool {
         guard let hit, hit.isDescendant(of: playerView) else { return false }
         if hit === playerView { return true }
         guard let videoHost else { return false }

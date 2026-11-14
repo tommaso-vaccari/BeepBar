@@ -838,7 +838,7 @@ actor LiveAudioPipeline {
                     let frames = Int(buffer.frameLength)
                     guard frames > 0 else { break }
                     if let channel = buffer.floatChannelData?[0] {
-                        samples.withUnsafeMutableBufferPointer { ($0.baseAddress! + got).update(from: channel, count: frames) }
+                        for i in 0..<frames { samples[got + i] = channel[i] }
                     }
                     got += frames
                 }

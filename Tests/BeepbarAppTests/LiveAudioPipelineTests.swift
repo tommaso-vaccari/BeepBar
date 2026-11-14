@@ -474,7 +474,9 @@ struct LiveAudioPipelineTests {
     /// An isolation ended while the original's copy is under way (a seek away, in `.levelled`)
     /// leaves no `original` file: the half-written copy is deleted. The piece is made long (200
     /// seconds of isolated output, 147 blocks of copy) and the seek comes as soon as the copy's
-    /// file exists, so it falls inside the copy. The two failure points the test above covers
+    /// file exists, so it falls inside the copy. The window is the copy's own duration, not a
+    /// gate: when the copy was made a block move it ended before the seek arrived and this test
+    /// failed every time (a gate inside the copy is tracked in issue #243). The two failure points the test above covers
     /// both precede the copy, so only this one can fail when the cleanup is removed. Guards
     /// against 5.8 MB per 30 s of audio, up to the whole lecture, left in the temporary folder
     /// by every seek that arrives while an original is being written.

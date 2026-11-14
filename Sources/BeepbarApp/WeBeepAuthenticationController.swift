@@ -3564,6 +3564,10 @@ enum MaterialsRunEnd: Equatable, Sendable {
         // materials are done, and the recordings refresh waits for the next run instead of
         // starting now (#188). Read once, here, where nothing is under way: polling it during the
         // follow-up would need a timer of our own.
+        // No suspension point (`await`) may come between this `shouldDefer()` call and entering the
+        // hold below: `RecordingsSyncFollowUpTests.droppingTheScheduleKeepsAManualRefreshTheAutomaticRunJoined`
+        // takes the call as the signal that the automatic run has already merged into the manual
+        // refresh. With an `await` in between, that test would pass even without the merge (#243).
         let systemAsksToDefer = backgroundScheduler?.shouldDefer() ?? false
         if systemAsksToDefer { BeepbarLog.sync.notice("Recordings follow-up skipped reason=scheduler-defer") }
         if let followUp = followUpAfterRun(operationID, trigger: .automatic, stoppedByScheduler: Task.isCancelled || systemAsksToDefer) {

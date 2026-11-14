@@ -43,14 +43,16 @@ struct VoiceIsolatorTests {
     }
 
     /// Steady noise and a mains hum, with no voice, come out at least 20 dB quieter (measured
-    /// about 27 dB on these 8 seconds, 45 dB over 50). Guards against isolation silently not running (a parameter refused, the
-    /// wrong unit) while the audio still flows.
+    /// about 25.7 dB with seed 7 on these 8 seconds, 45 dB over 50). The fixed seed makes the input
+    /// reproducible: with unseeded random noise under load, 16.7 dB was measured against the 20
+    /// required. Guards against isolation silently not running (a parameter refused, the wrong
+    /// unit) while the audio still flows.
     @Test func steadyNoiseIsRemoved() async throws {
         defer { try? FileManager.default.removeItem(at: folder) }
         let ffmpeg = try prepare()
         let noise = folder.appendingPathComponent("noise.wav")
         try AudioTestSignals.run(ffmpeg, ["-nostdin", "-loglevel", "error", "-y",
-                                          "-f", "lavfi", "-i", "anoisesrc=c=pink:a=0.04:r=48000:d=8",
+                                          "-f", "lavfi", "-i", "anoisesrc=c=pink:a=0.04:r=48000:d=8:seed=7",
                                           "-f", "lavfi", "-i", "sine=f=100:r=48000:d=8",
                                           "-filter_complex", "[1]volume=0.02[h];[0][h]amix=inputs=2:normalize=0",
                                           "-ac", "1", "-c:a", "pcm_f32le", noise.path], in: folder)

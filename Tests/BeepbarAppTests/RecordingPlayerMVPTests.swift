@@ -241,10 +241,10 @@ struct RecordingPlayerMVPTests {
     }
 
     /// Plays the fixture and waits until it is ready and started.
-    private func playReady(_ controller: RecordingPlayerController, startAt: TimeInterval? = nil) async throws {
+    private func playReady(_ controller: RecordingPlayerController, startAt: TimeInterval? = nil, watchdogSeconds: Double = 20) async throws {
         let media = try await TestMedia.shared.url()
         controller.play(media, title: "Lezione", cookies: [], startAt: startAt)
-        try await Self.waitUntil { controller.isStartSettled }
+        try await Self.waitUntil(seconds: watchdogSeconds) { controller.isStartSettled }
     }
 
     /// Pauses at a known position and lets the pause report settle, so a test starts clean.
@@ -286,14 +286,18 @@ struct RecordingPlayerMVPTests {
 
     /// The remembered speed is applied to `defaultRate` (what play/resume uses), and playing
     /// never writes the preference. Guards against a speed that resets on resume, and against
-    /// writes at every play.
+    /// writes at every play. The wait for the player to be ready is 60 s here while the other tests
+    /// keep 20 s: under load in the full suite AVPlayer stayed `.unknown` past 20 s. It is a guard
+    /// against a hang, not a time the test asserts.
     @Test func theRememberedSpeedIsAppliedWithoutWriting() async throws {
         let defaults = PlayerTestDefaults.throwaway()
         defer { defaults.discard() }
         defaults.set(1.5, forKey: RecordingPlayerPolicy.speedDefaultsKey)
         let written = defaults.writes.count
         let controller = makeController(defaults: defaults)
-        try await playReady(controller)
+        defer { controller.close() }
+        try await playReady(controller, watchdogSeconds: 60)
+        try #require(controller.isStartSettled)
         let player = try #require(controller.player)
         #expect(player.defaultRate == 1.5)
         #expect(player.rate == 1.5)
@@ -301,7 +305,6 @@ struct RecordingPlayerMVPTests {
         player.play()
         #expect(player.rate == 1.5)
         #expect(defaults.writes.count == written)
-        controller.close()
     }
 
     /// Choosing a speed applies it at once while playing, keeps it across pause/resume and the
@@ -450,14 +453,18 @@ struct RecordingPlayerMVPTests {
         #expect(popUp.frame.minX > control.frame.maxX, "the selector overlaps the speed menu")
         #expect((0..<3).allSatisfy { control.image(forSegment: $0) != nil }, "a segment has no icon")
 
-        // A real click through the control's own target-action (a hop to the main actor).
+        // The control's own target-action (a hop to the main actor), sent directly. Not
+        // `performClick`: it tracks the click in a nested event loop, and the stop it posts to end
+        // that loop can land on the outer main run loop instead. In the test process that loop
+        // ending is the end of the program: the run exited with status 0 after 853 of 971 tests,
+        // with no summary and no failure (#243).
         control.selectedSegment = 2
-        control.performClick(nil)
+        #expect(control.sendAction(control.action, to: control.target))
         try await Self.waitUntil { asked.count == 1 }
         #expect(asked == [.use(.isolated)])
         #expect(control.selectedSegment == 0, "the selector showed a choice the controller hadn't applied")
         control.selectedSegment = 1
-        control.performClick(nil)
+        #expect(control.sendAction(control.action, to: control.target))
         try await Self.waitUntil { asked.count == 2 }
         #expect(asked.last == .use(.levelled), "a segment asked for another mode")
 
@@ -481,7 +488,7 @@ struct RecordingPlayerMVPTests {
         try await playReady(controller)
         controller.showAudioEnhancement(.off(preferred: .isolated), recordingID: controller.recordingID)
         control.selectedSegment = 2
-        control.performClick(nil)
+        #expect(control.sendAction(control.action, to: control.target))
         try await Self.waitUntil { asked.count == before + 2 }
         controller.showAudioEnhancement(nil, recordingID: controller.recordingID)
         #expect(control.isHidden)

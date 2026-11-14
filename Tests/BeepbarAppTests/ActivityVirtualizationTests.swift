@@ -6,7 +6,7 @@ import Testing
 /// Exercises the real Activity hierarchy after Show more has revealed a whole large course.
 /// Replacing the inner LazyVStack with VStack must fail the construction bound (#99).
 @MainActor @Suite(.serialized) struct ActivityVirtualizationTests {
-    @Test(.timeLimit(.minutes(1))) func revealedRowsStayLazyAndTheLastRowIsReachable() async throws {
+    @Test(.timeLimit(.minutes(2))) func revealedRowsStayLazyAndTheLastRowIsReachable() async throws {
         let scenario = try UIFixtureScenario(arguments: ["--scenario", "activity-15000", "--report", "/tmp/activity-unused-\(UUID().uuidString).json"])
         let fixture = try await UIFixture.make(scenario)
         var constructed = Set<String>()

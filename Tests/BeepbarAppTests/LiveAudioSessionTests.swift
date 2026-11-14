@@ -156,8 +156,21 @@ struct LiveAudioSessionTests {
         let player = AVPlayer(playerItem: item)
         player.isMuted = true
         defer { player.pause() }
-        let deadline = Date().addingTimeInterval(10)
-        while item.status == .unknown, Date() < deadline { try await Task.sleep(for: .milliseconds(50)) }
+        let readiness = AsyncStream<Void>.makeStream(bufferingPolicy: .bufferingNewest(1))
+        let observation = item.observe(\.status, options: [.initial, .new]) { item, _ in
+            if item.status != .unknown { readiness.continuation.yield(()) }
+        }
+        defer { observation.invalidate(); readiness.continuation.finish() }
+        let ready = try await withThrowingTaskGroup(of: Bool.self) { group in
+            defer { group.cancelAll() }
+            group.addTask {
+                for await _ in readiness.stream { return true }
+                return false
+            }
+            group.addTask { try await Task.sleep(for: .seconds(45)); return false }
+            return try await group.next() ?? false
+        }
+        try #require(ready, "item did not become ready or fail")
         try #require(item.status == .readyToPlay, "item: \(String(describing: item.error))")
         await player.seek(to: CMTime(seconds: 3, preferredTimescale: 600), toleranceBefore: .zero, toleranceAfter: .zero)
         player.rate = 2

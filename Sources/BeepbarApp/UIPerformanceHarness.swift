@@ -53,6 +53,7 @@ final class UIFixtureProtocol: URLProtocol, @unchecked Sendable {
         var requests = 0
         var holdContents = false
         var heldRequests: [UIFixtureProtocol] = []
+        var contentsHeld: AsyncStream<Void>.Continuation?
     }
     static let accounts = OSAllocatedUnfairLock(initialState: [String: Account]())
 
@@ -116,11 +117,12 @@ final class UIFixtureProtocol: URLProtocol, @unchecked Sendable {
             let data = try JSONSerialization.data(withJSONObject: body)
             guard let url = request.url, let response = HTTPURLResponse(url: url, statusCode: 200, httpVersion: "HTTP/1.1", headerFields: ["Content-Type": "application/json"]) else { throw UIFixtureError.unexpectedResponse }
             pending.withLock { $0.response = response; $0.data = data }
-            let held = Self.accounts.withLock { values -> Bool in
-                guard let token = fields["wstoken"], fields["wsfunction"] == "core_course_get_contents", values[token]?.holdContents == true else { return false }
+            let (held, signal) = Self.accounts.withLock { values -> (Bool, AsyncStream<Void>.Continuation?) in
+                guard let token = fields["wstoken"], fields["wsfunction"] == "core_course_get_contents", values[token]?.holdContents == true else { return (false, nil) }
                 values[token]?.heldRequests.append(self)
-                return true
+                return (true, values[token]?.contentsHeld)
             }
+            signal?.yield(())
             if !held { deliver() }
         } catch { client?.urlProtocol(self, didFailWithError: error) }
     }

@@ -11,7 +11,7 @@ Every agent must establish context from the shared repository and GitHub before 
 1. Read [team workflow](docs/team-workflow.md) for task ownership, handoff, verification, and delivery rules, and [product direction and performance plan](docs/performance-plan.md) for priorities, dependencies, evidence, and acceptance criteria.
 2. Read the relevant [behavior specification in Italian](docs/sync-behavior.it.md) and [English](docs/sync-behavior.en.md). These define the behavior to preserve; the performance plan defines improvements within those guarantees. Read [benchmark documentation](docs/benchmarks.md) before measuring performance.
 3. Inspect the current [GitHub issues](https://github.com/tommaso-vaccari/BeepBar/issues), the [performance delivery tracker](https://github.com/tommaso-vaccari/BeepBar/issues/116), the selected issue's full discussion, dependencies, linked issues and PRs, and their current status. Use the task requested by the user; when asked to choose, select an unassigned issue whose prerequisites are satisfied, following the plan's priorities. Do not duplicate work already assigned or in progress. The tracker's assignee does not own every child issue.
-4. Verify the checkout, branch, local changes, and current remote base. Recheck historical findings against current code; an old audit, chat, or override does not prove that a bug or dependency is still open. Before implementing, state the issue, base commit, scope, dependencies, and completion criteria.
+4. Verify the checkout, branch, local changes, and current remote base. Recheck historical findings against current code; an old audit, chat, or override does not prove that a bug or dependency is still open. Before implementing, state the issue, base commit, scope, risk level (see the delivery loop), dependencies, and completion criteria.
 5. Recover all context relevant to the selected task: issue bodies and comments, dependency decisions, linked PR discussions and reviews, existing reports, and related earlier chats when accessible and authorized. Search by issue number, task identifier, branch, and affected component; follow relevant references until scope, decisions, evidence, and open questions are understood. Do not assume access to other agents' chats or rely on them for essential context. Verify historical claims against current sources and preserve necessary non-private decisions or evidence in the issue, PR, or shared documentation. If required context remains unavailable, identify the gap and ask the user rather than guessing.
 6. Before pausing or handing off, record the branch/commit, PR, completed work, uncommitted changes, verification results and their SHA, unresolved findings, blockers, and next step in the shared issue or PR within the authorized scope. Keep personal details in the override. Another agent must be able to resume from shared sources without this chat.
 
@@ -20,7 +20,7 @@ Every agent must establish context from the shared repository and GitHub before 
 - Every PR must mention all related open issues and include `Closes #<issue>` for each issue whose acceptance criteria it fully satisfies; leave partially resolved issues open and state the remaining work. After merging into `dev` (or another non-default branch), manually close each fully resolved issue with a link to the merged PR and verify its closed state immediately, without waiting for a release to `main`; GitHub automatic closure applies when the PR reaches the default branch.
 - Selecting an issue means taking responsibility for its delivery. Before implementation, assign it to the responsible team member using their authorized GitHub identity and record the working branch, base SHA, dependencies, scope, and completion criteria. Recheck ownership immediately before claiming it; never take over or reassign another member's task without agreement. If GitHub access prevents recording ownership, report the coordination blocker before starting overlapping work.
 - Keep the issue, linked PR, relevant tracker entry, and `docs/performance-plan.md` consistent when work starts, scope or dependencies change, evidence changes a finding, work pauses, or delivery completes. The issue is authoritative for live ownership and operational status; the plan records the current roadmap, findings, decisions, and delivery evidence with issue/PR links. Do not store shared progress only in a chat or private override.
-- Update the relevant plan sections in every performance delivery PR, including investigations ending without a fix. Record measured results, exact SHAs, commands/report references, regressions, limitations, remaining work, and the decision. Follow the plan's requirements for both base-dev → HEAD and main → HEAD comparisons; unavailable measurements stay explicitly unmeasured. An open PR is not integrated work, and integration into `dev` is not a released feature.
+- Update the relevant plan sections in every performance delivery PR, including investigations ending without a fix. Record measured results, exact SHAs, commands/report references, regressions, limitations, remaining work, and the decision. Follow the plan's requirements for both base-dev → HEAD and main → HEAD comparisons; unavailable measurements stay explicitly unmeasured. An open PR is not integrated work, and integration into `dev` is not a released feature. A PR that is not performance work writes in the plan only when it changes one of the Performance budgets below or a finding the plan records; otherwise its measurements go in the PR description.
 - Explain how the proposal and final result satisfy the principles below, especially any affected guarantee or trade-off. If shared sources disagree, resolve or report the discrepancy rather than silently choosing one. Coordinate edits to shared plan sections with concurrent tasks and preserve unrelated changes.
 
 ## Core product principles
@@ -39,8 +39,8 @@ BeepBar provides up-to-date course materials, protects students' local work, and
 
 ## Build and verification
 
-- Battle-test every completed change as far as practical: cover the reported regression, nearby edge cases and failure paths, and user-visible UI behavior when affected. Prefer tests that exercise real behavior and would fail without the fix; avoid tests that merely repeat the implementation.
-- Run the relevant focused tests, the full test suite, and the CI Release build before calling a code change ready. Report any behavior that could not be exercised locally and why.
+- Verify in proportion to the change's level (see the delivery loop below). Prefer tests that exercise real behavior and would fail without the change; avoid tests that merely repeat the implementation. Report any behavior that could not be exercised locally and why.
+- Run focused tests while developing. The full suite and the CI Release build run once, in the pre-push gate, on the final commit.
 - Do not sign, install, or replace an installed app unless explicitly requested. Use isolated fixtures for verification; a normal local build shares its identity and persisted data with the installed app.
 
 ## Product and releases
@@ -54,19 +54,31 @@ BeepBar provides up-to-date course materials, protects students' local work, and
 - Do not commit or push unless explicitly requested.
 - No agent attribution anywhere: branch names never contain `claude` (or `codex`, or any tool name) — use descriptive prefixes like `feature/`, `fix/`, `perf/`; commits and PR bodies never carry `Co-Authored-By: Claude` or similar trailers. If a worktree or tool auto-creates a `claude/...` branch, rename it before pushing.
 
-## New features: implement, review, repeat
+## Delivery loop: rigor proportional to risk
 
-Every new feature goes through this loop before its PR is opened.
+A check earns its time only if it can find something in the change at hand. Pick the change's level before starting, state it with the scope, and write it in the PR. A change that spans levels takes the highest one; when unsure, take the higher.
 
-1. **Implement** in its own worktree from `dev`, on a `feature/...` branch, committing without pushing.
-2. **Test to prove, not to pass.** Cover the main path, edge cases and failure paths: permission denied, missing file, cancellation, a language switch, a first launch after updating, and what existing users see. Every test must fail when the behavior it covers is removed. Show this with a mutation check that uses a temporary commit or `git apply -R`, never a bare `git stash`. Run mutations of code that deletes or moves files in a disposable copy (`git worktree add --detach` in a temporary folder), never in the working checkout: a mutated path can resolve to the current directory, and `swift test` runs from the checkout.
-3. **Document for the next agent.** Code gets `///` comments on role, invariants and the reason behind non-obvious choices. Each test says what it proves and which failure it guards against.
-4. **Independent review.** A new senior subagent, one that did not write the code, reviews the diff against this file and `docs/sync-behavior.{it,en}.md`. It looks for bugs, missing edge cases and tests that would pass even when the behavior is broken.
-5. If the review finds anything, fix it, add a regression test, and review again until a review comes back clean:
-   - **At least one P0:** the next review goes to a **different** reviewer.
-   - **Only P1 and P2:** the **same** reviewer verifies the fixes and reviews again.
-6. Run the full `swift test` and the CI Release build, then present the result in chat. Push and open the PR to `dev` only after the user's go.
-7. When the user has authorized merging into `dev`, require the full local gate on the exact pushed commit, a clean worktree, and a branch containing the latest `dev`. Merge with a merge commit. If the destination changes, update and verify again before merging. PRs into `dev` do not wait for online CI. Release PRs (`dev` → `main`) always wait for green online CI as well as local verification.
+| Level | The change touches | Required |
+|---|---|---|
+| 1. User data | Sync, conflicts, recovery, journaling, deleting or moving files, stored-data migrations, account identity and logout cleanup, the quit path, AppKit isolation | Proving tests, mutation checks, independent review, full gate |
+| 2. Product behavior | Any other app or Core code (interface, Recordings, audio, menus, performance), and the tooling that gates or ships releases (`.github/workflows`, `.githooks`, `scripts/verify.sh`, version and release-note scripts) | Proving tests where the code is testable, independent review, full gate |
+| 3. Nothing shipped | Documentation, tests, benchmark harness, development scripts | Full gate |
+
+Why the levels differ: on PR #245 (level 2) thirty mutation checks, each with its own cold build, found nothing the tests did not already cover, while the independent review found two P1s and a real end-of-file bug. Mutation checks stay where a silent gap costs a user their files.
+
+1. **Implement** in its own worktree from `dev`, on a `feature/`, `fix/`, `perf/` or `docs/` branch, committing without pushing.
+2. **Test to prove, not to pass** (levels 1 and 2). Cover the main path and the edge and failure paths this change can meet: permission denied, missing file, cancellation, a language switch, a first launch after updating, and what existing users see. For a bug, write the test first, see it fail on the unfixed code, and name it in the PR: a test seen failing needs no mutation check.
+3. **Mutation checks** (level 1 only). For each guarantee the change adds or alters, remove the behavior and see a test fail. Use a temporary commit or `git apply -R`, never a bare `git stash`. Run mutations of code that deletes or moves files in a disposable copy (`git worktree add --detach` in a temporary folder), never in the working checkout: a mutated path can resolve to the current directory, and `swift test` runs from the checkout.
+4. **Document for the next agent.** Code gets `///` comments on role, invariants and the reason behind non-obvious choices. Each test says what it proves and which failure it guards against.
+5. **Independent review** (levels 1 and 2). One pass on the final diff by a senior subagent that did not write the code, against this file and `docs/sync-behavior.{it,en}.md`. It looks for bugs, missing edge cases and tests that would pass even when the behavior is broken, and grades each finding: P0 (data loss, a broken hard rule, a crash), P1 (wrong behavior a user can meet), P2 (anything else).
+   - **P0:** fix it with a regression test, then a **different** reviewer does a full pass.
+   - **P1:** fix it with a regression test; the **same** reviewer checks the fix alone, not the whole diff again.
+   - **P2:** never reopens the review. Fix it in passing, accept it in the PR description with the reason, or open an issue.
+   - The review is closed when no P0 or P1 is open.
+6. **Present the result in chat**: the level, what was tested and reviewed, what could not be exercised. Push and open the PR to `dev` only after the user's go.
+7. **The full gate runs once, at push**, on the final commit: the pre-push hook runs `bash scripts/verify.sh`. Do not run the full suite and the Release build beforehand as well. If the gate fails only in a test that passes when run alone and is listed in an open flaky-test issue (currently #243), rerun once and record the failure in that issue; if it fails again, ask the user before bypassing the hook.
+8. **No bars beyond these.** Repeated full-suite runs, extra review rounds and mutation checks below level 1 are added only when the user asks or a concrete doubt about this change calls for one; name the doubt.
+9. When the user has authorized merging into `dev`, require the full local gate on the exact pushed commit, a clean worktree, and a branch containing the latest `dev`. Merge with a merge commit. If the destination changes, update and verify again before merging. PRs into `dev` do not wait for online CI. Release PRs (`dev` → `main`) always wait for green online CI as well as local verification.
 
 ## Branches and releases (`dev` → `main`)
 
@@ -102,7 +114,7 @@ Every push to `main` that touches production paths publishes a Sparkle release t
 ## Expected sync behavior
 
 - `docs/sync-behavior.it.md` and `docs/sync-behavior.en.md` are the agreed specification of what sync does and what the user sees. Read them before changing sync, conflict, recovery or folder code, and review PRs against them.
-- A PR that changes any behavior described there updates both files in the same PR, keeping them identical in content. Behavior not yet released is marked with its PR number (e.g. **[PR #54]**); the release PR (`dev` → `main`) removes those markers.
+- A PR that changes any behavior described there updates both files in the same PR, keeping them identical in content. Behavior not yet released is marked **[non rilasciato]** in the Italian file and **[unreleased]** in the English one; the release PR (`dev` → `main`) removes those markers. Markers that carry a PR number (e.g. **[PR #236]**) were written before this rule: they mean the same and are removed the same way. The number is not needed, and it is not known until the PR is open.
 - If code and document disagree, that is a bug in one of the two: raise it with the user instead of silently picking one.
 
 ## Comments are part of the change

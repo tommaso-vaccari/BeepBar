@@ -527,6 +527,7 @@ struct LiveAudioPipelineTests {
         } catch {
             six.cancel()
             await pipeline.stop()
+            _ = try? await six.value
             throw error
         }
         await pipeline.stop()

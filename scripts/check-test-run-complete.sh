@@ -5,13 +5,16 @@
 # which in the test process is the end of the program, and the app tests ended after 853 of 971
 # with a green gate (issue #243).
 set -u
-log=${1:?usage: check-test-run-complete.sh <swift-test-log>}
+# The optional second argument is the least number of runs expected (one per test target), so a
+# process that ends before its run even starts is caught too.
+log=${1:?usage: check-test-run-complete.sh <swift-test-log> [minimum-runs]}
+minimum=${2:-1}
 [ -r "$log" ] || { echo "Test log not readable: $log" >&2; exit 2; }
 
 started=$(grep -ac 'Test run started\.' "$log")
-passed=$(grep -acE 'Test run with [0-9]+ tests? in [0-9]+ suites? passed' "$log")
-if [ "$started" -eq 0 ]; then
-    echo "No test run started: nothing was tested." >&2; exit 1
+passed=$(grep -acE 'Test run with [0-9]+ tests?( in [0-9]+ suites?)? passed' "$log")
+if [ "$started" -lt "$minimum" ]; then
+    echo "Only $started test runs started, at least $minimum expected: a test process did not run." >&2; exit 1
 fi
 if [ "$started" -ne "$passed" ]; then
     echo "Incomplete test run: $started started, $passed finished with a passing summary." >&2

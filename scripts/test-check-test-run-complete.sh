@@ -6,10 +6,11 @@ script="$(dirname "$0")/check-test-run-complete.sh"
 dir=$(mktemp -d); trap 'rm -rf "$dir"' EXIT
 failures=0
 
-# $1: expected exit status, $2: what the case stands for; the log comes on stdin.
+# $1: expected exit status, $2: what the case stands for, $3: minimum runs (optional); the log
+# comes on stdin.
 expect() {
     cat > "$dir/log"
-    bash "$script" "$dir/log" >/dev/null 2>&1; local got=$?
+    bash "$script" "$dir/log" ${3:-} >/dev/null 2>&1; local got=$?
     if [ "$got" -ne "$1" ]; then
         echo "FAIL: $2 -> exit $got, expected $1"; failures=$((failures + 1))
     fi
@@ -34,6 +35,17 @@ expect 1 "a run that failed" <<'EOF'
 EOF
 expect 1 "no run at all" <<'EOF'
 Build complete!
+EOF
+# A process that ended before its run started leaves fewer runs than there are test targets.
+expect 1 "fewer runs than test targets" 3 <<'EOF'
+◇ Test run started.
+✔ Test run with 690 tests in 64 suites passed after 16.038 seconds.
+◇ Test run started.
+✔ Test run with 31 tests in 4 suites passed after 1.923 seconds.
+EOF
+expect 0 "a target without suites" <<'EOF'
+◇ Test run started.
+✔ Test run with 0 tests passed after 0.001 seconds.
 EOF
 if bash "$script" "$dir/missing" >/dev/null 2>&1; then
     echo "FAIL: a missing log should fail"; failures=$((failures + 1))

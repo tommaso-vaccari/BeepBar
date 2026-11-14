@@ -198,7 +198,7 @@ import BeepbarCore
     func pause() { isPlaying = false }
 
     var onAudioAction: ((String, PlayerAudioAction) -> Void)?
-    /// What the Audio menu shows now, as the real player keeps it: reset by a different lecture,
+    /// What the audio selector shows now, as the real player keeps it: reset by a different lecture,
     /// ignored for any lecture but the one on screen.
     private(set) var audioState: AudioEnhancementState?
     func showAudioEnhancement(_ state: AudioEnhancementState?, recordingID: String) {
@@ -207,7 +207,7 @@ import BeepbarCore
     }
     var playbackPosition: TimeInterval? { current?.position }
     private(set) var isPlaying = false
-    /// The student picks `action` in the Audio menu of the lecture on screen.
+    /// The student picks `action` in the audio selector of the lecture on screen.
     func chooseAudio(_ action: PlayerAudioAction) {
         guard let id = current?.id else { return }
         onAudioAction?(id, action)
@@ -2514,7 +2514,7 @@ struct RecordingsControllerTests {
     }
 
     /// Choosing a kind from Off stores both keys and starts that kind; "Spento" stores the
-    /// bool false and keeps the kind key, so the title-bar switch and a later Play bring back
+    /// bool false and keeps the kind key, so the selector's kinds and a later Play bring back
     /// the last kind used. Guards against "Spento" forgetting the kind (the switch would turn
     /// on the wrong filter) and a kind choice that does not turn the preference on.
     @Test func theKindChosenIsKeptAcrossOff() async throws {
@@ -2532,8 +2532,8 @@ struct RecordingsControllerTests {
         #expect(defaults.string(forKey: RecordingsController.enhancedAudioKindKey) == "levelled", "Spento forgot the last kind")
         #expect(world.player.audioState == .off(preferred: .levelled))
 
-        // The title-bar switch asks for the preferred kind: what its action in this state is.
-        let asked = try #require(RecordingPlayerPolicy.audioButton(world.player.audioState)?.action)
+        // The title-bar selector's Levelled voice segment: what its action in this state is.
+        let asked = try #require(RecordingPlayerPolicy.audioSelector(world.player.audioState)?.segments[1].action)
         world.player.chooseAudio(asked)
         #expect(world.liveSessions.last?.kind == .levelled)
         #expect(world.liveSessions.count == 2)
@@ -2721,13 +2721,13 @@ struct RecordingsControllerTests {
         #expect(defaults.string(forKey: RecordingsController.enhancedAudioKindKey) == "levelled")
         #expect(defaults.bool(forKey: RecordingsController.prefersEnhancedAudioKey))
         guard case .failed(let message, let preferred) = world.player.audioState else {
-            Issue.record("the menu doesn't say it failed: \(String(describing: world.player.audioState))")
+            Issue.record("the selector doesn't say it failed: \(String(describing: world.player.audioState))")
             return
         }
         #expect(preferred == .levelled)
-        let menu = try #require(RecordingPlayerPolicy.audioMenu(world.player.audioState))
-        #expect(menu.items.map(\.checked) == [true, false, false], "Spento is not the one checked")
-        #expect(menu.detail?.title == message.text)
+        let selector = try #require(RecordingPlayerPolicy.audioSelector(world.player.audioState))
+        #expect(selector.selected == 0, "Spento is not the one selected")
+        #expect(selector.segments[1...].allSatisfy { $0.toolTip.contains(message.text) })
         await drainTasks()
 
         let sessions = world.liveSessions.count
@@ -5114,71 +5114,45 @@ struct RecordingsAccountTests {
 
 }
 
-/// What the player's Audio menu shows and does in each state of a lecture's enhanced audio.
+/// What the player's audio selector shows and does in each state of a lecture's enhanced audio.
 @MainActor
-struct AudioMenuPresentationTests {
-    /// Every state shows the three choices in order with exactly the right one checked and
-    /// enabled: a kind playing is checked; Off and a failure check "Spento" (a failure leaves
-    /// both kinds enabled, since choosing one tries again, and shows the reason beneath);
-    /// without ffmpeg only "Spento" acts and the detail says how to get it. Guards against a
-    /// wrong item checked (the lecture would look filtered when it is not), a kind that cannot
-    /// be retried after a failure, and an item enabled without ffmpeg.
-    @Test func eachStateShowsItsChoice() throws {
-        #expect(RecordingPlayerPolicy.audioMenu(nil) == nil)
+struct AudioSelectorPresentationTests {
+    /// Every state shows the three segments in order (Off, Levelled voice, Isolated voice) with
+    /// exactly the right one selected and the right actions: a kind playing is selected; Off and
+    /// a failure select Off (a failure leaves both kinds enabled, since choosing one tries
+    /// again, and the kinds' tooltips carry the reason and that); without ffmpeg every segment
+    /// is disabled and the tooltips say how to get it. Guards against a wrong segment selected
+    /// (the lecture would look filtered when it is not), a kind that cannot be retried after a
+    /// failure, a segment enabled without ffmpeg, and a reason nobody can read.
+    @Test func eachStateShowsItsSelection() throws {
+        #expect(RecordingPlayerPolicy.audioSelector(nil) == nil)
         let off = AudioEnhancementKind?.none, levelled = AudioEnhancementKind?.some(.levelled), isolated = AudioEnhancementKind?.some(.isolated)
-        let titles = try #require(RecordingPlayerPolicy.audioMenu(.off(preferred: .isolated))).items.map(\.title)
-        #expect(titles == [tr("Spento", "Off"), tr("Voce livellata", "Levelled voice"), tr("Voce isolata", "Isolated voice")])
-        #expect(RecordingPlayerPolicy.audioMenuHeader() == tr("Audio migliorato", "Enhanced audio"))
+        let feature = tr("Audio migliorato", "Enhanced audio")
+        let base = try #require(RecordingPlayerPolicy.audioSelector(.off(preferred: .isolated)))
+        #expect(base.label == feature)
+        #expect(base.segments.map(\.symbol) == ["waveform.slash", "waveform", "person.wave.2"])
+        #expect(base.segments.map(\.label) == [tr("Spento", "Off"), tr("Voce livellata", "Levelled voice"), tr("Voce isolata", "Isolated voice")])
+        #expect(base.segments.map(\.toolTip) == base.segments.map { "\(feature): \($0.label)" })
 
-        let offMenu = try #require(RecordingPlayerPolicy.audioMenu(.off(preferred: .levelled)))
-        #expect(offMenu.items.map(\.checked) == [true, false, false])
-        #expect(offMenu.items.map(\.action) == [.use(off), .use(levelled), .use(isolated)])
-        #expect(offMenu.detail == nil)
+        let offState = try #require(RecordingPlayerPolicy.audioSelector(.off(preferred: .levelled)))
+        #expect(offState.selected == 0)
+        #expect(offState.segments.map(\.action) == [.use(off), .use(levelled), .use(isolated)])
         for kind in AudioEnhancementKind.allCases {
-            let on = try #require(RecordingPlayerPolicy.audioMenu(.on(kind)))
-            #expect(on.items.map(\.checked) == [false, kind == .levelled, kind == .isolated])
-            #expect(on.items.map(\.action) == [.use(off), .use(levelled), .use(isolated)])
-            #expect(on.detail == nil)
+            let on = try #require(RecordingPlayerPolicy.audioSelector(.on(kind)))
+            #expect(on.selected == (kind == .levelled ? 1 : 2))
+            #expect(on.segments.map(\.action) == [.use(off), .use(levelled), .use(isolated)])
         }
-        let failed = try #require(RecordingPlayerPolicy.audioMenu(.failed(BilingualText("motivo", "reason"), preferred: .levelled)))
-        #expect(failed.items.map(\.checked) == [true, false, false])
-        #expect(failed.items.map(\.action) == [.use(off), .use(levelled), .use(isolated)])
-        #expect(failed.detail?.title == "motivo")
-        #expect(failed.detail?.action == nil)
-        let missing = try #require(RecordingPlayerPolicy.audioMenu(.needsFFmpeg))
-        #expect(missing.items.map(\.checked) == [true, false, false])
-        #expect(missing.items.map(\.action) == [.use(off), nil, nil])
-        #expect(missing.detail?.title == tr("Per l'audio migliorato installa ffmpeg (brew install ffmpeg)", "Enhanced audio needs ffmpeg (brew install ffmpeg)"))
-        #expect(missing.detail?.action == nil)
-    }
-
-    /// The title-bar switch is a two-state toggle: off or failed turns the preferred kind on,
-    /// a kind playing turns off, without ffmpeg it is disabled; lit only while a kind plays;
-    /// the tooltip names the mode. Guards against a switch that always turns the same kind on
-    /// (ignoring the last choice) or a tooltip that does not say what a click does.
-    @Test func theTitleBarSwitchTogglesTheLastKind() throws {
-        #expect(RecordingPlayerPolicy.audioButton(nil) == nil)
-        let off = try #require(RecordingPlayerPolicy.audioButton(.off(preferred: .levelled)))
-        #expect(off.action == .use(.levelled))
-        #expect(!off.isOn)
-        #expect(off.toolTip == tr("Audio migliorato: spento. Fai clic per attivare «Voce livellata».", "Enhanced audio: off. Click to turn on \u{201C}Levelled voice\u{201D}."))
-        #expect(RecordingPlayerPolicy.audioButton(.off(preferred: .isolated))?.action == .use(.isolated))
-        for kind in AudioEnhancementKind.allCases {
-            let on = try #require(RecordingPlayerPolicy.audioButton(.on(kind)))
-            #expect(on.action == .use(nil))
-            #expect(on.isOn)
-            #expect(on.toolTip == tr("Audio migliorato: \(kind.displayName). Fai clic per tornare all'audio originale.", "Enhanced audio: \(kind.displayName). Click to go back to the original audio."))
+        let failed = try #require(RecordingPlayerPolicy.audioSelector(.failed(BilingualText("motivo", "reason"), preferred: .levelled)))
+        #expect(failed.selected == 0)
+        #expect(failed.segments.map(\.action) == [.use(off), .use(levelled), .use(isolated)])
+        #expect(failed.segments[0].toolTip == "\(feature): \(tr("Spento", "Off"))\nmotivo")
+        for index in 1...2 {
+            #expect(failed.segments[index].toolTip == "\(feature): \(failed.segments[index].label)\nmotivo " + tr("Fai clic per riprovare.", "Click to try again."))
         }
-        let failed = try #require(RecordingPlayerPolicy.audioButton(.failed(BilingualText("motivo", "reason"), preferred: .levelled)))
-        #expect(failed.action == .use(.levelled))
-        #expect(!failed.isOn)
-        #expect(failed.toolTip == "motivo " + tr("Fai clic per riprovare con «Voce livellata».", "Click to try \u{201C}Levelled voice\u{201D} again."))
-        let failedIsolated = try #require(RecordingPlayerPolicy.audioButton(.failed(BilingualText("motivo", "reason"), preferred: .isolated)))
-        #expect(failedIsolated.toolTip == "motivo " + tr("Fai clic per riprovare con «Voce isolata».", "Click to try \u{201C}Isolated voice\u{201D} again."))
-        let missing = try #require(RecordingPlayerPolicy.audioButton(.needsFFmpeg))
-        #expect(missing.action == nil)
-        #expect(!missing.isOn)
-        #expect(missing.toolTip.contains("brew install ffmpeg"))
+        let missing = try #require(RecordingPlayerPolicy.audioSelector(.needsFFmpeg))
+        #expect(missing.selected == 0)
+        #expect(missing.segments.map(\.action) == [nil, nil, nil])
+        #expect(missing.segments.allSatisfy { $0.toolTip.hasSuffix(tr("Per l'audio migliorato installa ffmpeg (brew install ffmpeg)", "Enhanced audio needs ffmpeg (brew install ffmpeg)")) })
     }
 
     /// A stored kind is read back; an absent or unrecognised one is `.isolated`, what the

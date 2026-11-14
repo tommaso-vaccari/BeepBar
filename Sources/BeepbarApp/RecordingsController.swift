@@ -276,7 +276,7 @@ struct RecordingsListing: Equatable {
     /// One switch for all lectures, saved like the speed.
     nonisolated static let prefersEnhancedAudioKey = "io.github.tvaccari.beepbar.recordings-enhanced-audio"
     /// The kind the student chose last (`AudioEnhancementKind.rawValue`), kept when they turn
-    /// enhanced audio off so the title-bar switch and the next Play bring back "the last kind
+    /// enhanced audio off so the selector's kinds and the next Play bring back "the last kind
     /// used". Read only through `resolveEnhancedAudioKind`.
     nonisolated static let enhancedAudioKindKey = "io.github.tvaccari.beepbar.recordings-enhanced-audio-kind"
 
@@ -2121,7 +2121,7 @@ struct RecordingsListing: Equatable {
         return enhancer
     }
 
-    /// Tells the player what its Audio menu shows for the lecture on screen.
+    /// Tells the player what its audio selector (title bar) shows for the lecture on screen.
     private func publishAudioState() {
         guard let player, let id = currentLectureID else { return }
         guard let lecture = audioLecture, lecture.recordingID == id, resumeOwner() != nil else {
@@ -2131,7 +2131,7 @@ struct RecordingsListing: Equatable {
         player.showAudioEnhancement(currentAudioEnhancer().state(for: lecture.key, inUse: enhancedAudioInUse, preferred: preferredEnhancedAudioKind), recordingID: id)
     }
 
-    /// The student's choice in the player's Audio menu, for the lecture `id` that was on screen.
+    /// The student's choice in the player's audio selector, for the lecture `id` that was on screen.
     /// Checked again here (the point of action): the lecture may have changed meanwhile, or the
     /// account gone. Either way the lecture continues from the same position, playing or paused
     /// as it was: on, through a new local filter of the chosen kind (also when another kind was

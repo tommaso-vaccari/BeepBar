@@ -406,114 +406,106 @@ struct RecordingPlayerMVPTests {
         controller.close()
     }
 
-    /// The Audio section of the title-bar menu: titled "Enhanced audio", with Off, Levelled voice
-    /// and Isolated voice as single-choice items, the one for the state checked, the detail
-    /// line below; clicking an item sends its action, clicking the checked one sends nothing,
-    /// and without ffmpeg only "Off" is enabled. Guards against a wrong check mark, a click on
-    /// the current choice replaying the lecture, and an item sending another item's action.
-    @Test func theAudioMenuOffersThreeChoices() async throws {
+    /// The speed menu no longer has an Audio section: the three modes live in the title-bar
+    /// selector. Guards against the choices appearing twice, or the old section coming back.
+    @Test func theSpeedMenuHasNoAudioSection() async throws {
         let defaults = PlayerTestDefaults.throwaway()
         defer { defaults.discard() }
         let controller = makeController(defaults: defaults)
         try await playReady(controller)
-        var asked: [PlayerAudioAction] = []
-        controller.onAudioAction = { _, action in asked.append(action) }
-        let menu = try #require(controller.speedPopUp?.menu)
-        func item(_ tag: Int) throws -> NSMenuItem { try #require(menu.item(withTag: tag)) }
-        func click(_ tag: Int) throws { menu.performActionForItem(at: menu.index(of: try item(tag))) }
-        let tags = RecordingPlayerController.AudioMenuTag.choices
-
-        #expect(try item(RecordingPlayerController.AudioMenuTag.header).title == tr("Audio migliorato", "Enhanced audio"))
         controller.showAudioEnhancement(.on(.levelled), recordingID: controller.recordingID)
-        #expect(try tags.map { try item($0).title } == [tr("Spento", "Off"), tr("Voce livellata", "Levelled voice"), tr("Voce isolata", "Isolated voice")])
-        #expect(try tags.map { try item($0).state == .on } == [false, true, false])
-        #expect(try tags.map { try item($0).isEnabled } == [true, true, true])
-        try click(tags[2])
-        try click(tags[0])
-        try click(tags[1])
-        try await Self.waitUntil { asked.count == 2 }
-        await Self.settle()
-        #expect(asked == [.use(.isolated), .use(nil)], "the checked item sent an action, or an item the wrong one")
-
-        controller.showAudioEnhancement(.off(preferred: .isolated), recordingID: controller.recordingID)
-        #expect(try tags.map { try item($0).state == .on } == [true, false, false])
-        try click(tags[0])
-        await Self.settle()
-        #expect(asked.count == 2, "Off while off sent an action")
-
-        controller.showAudioEnhancement(.failed(BilingualText("motivo", "reason"), preferred: .isolated), recordingID: controller.recordingID)
-        #expect(try tags.map { try item($0).state == .on } == [true, false, false])
-        #expect(try tags.map { try item($0).isEnabled } == [true, true, true])
-        #expect(try item(RecordingPlayerController.AudioMenuTag.detail).title == "motivo")
-        #expect(try !item(RecordingPlayerController.AudioMenuTag.detail).isHidden)
-
-        controller.showAudioEnhancement(.needsFFmpeg, recordingID: controller.recordingID)
-        #expect(try tags.map { try item($0).isEnabled } == [true, false, false])
-        #expect(try item(RecordingPlayerController.AudioMenuTag.detail).title.contains("brew install ffmpeg"))
-
-        controller.showAudioEnhancement(nil, recordingID: controller.recordingID)
-        #expect(try tags.allSatisfy { try item($0).isHidden })
+        let menu = try #require(controller.speedPopUp?.menu)
+        let titles = menu.items.map(\.title)
+        #expect(!titles.contains(tr("Audio migliorato", "Enhanced audio")))
+        #expect(!titles.contains(tr("Voce livellata", "Levelled voice")))
+        #expect(!titles.contains(tr("Voce isolata", "Isolated voice")))
+        #expect(titles.contains(tr("Velocità", "Speed")) && titles.contains(tr("Scorciatoie da tastiera", "Keyboard shortcuts")))
         controller.close()
     }
 
-    /// The enhanced-audio switch in the title bar, beside the speed menu: hidden until the lecture
-    /// has an Audio state; lit only while on; a click asks for the opposite of the current state
-    /// and, until the controller answers, shows the state it had rather than AppKit's flip;
-    /// disabled without ffmpeg (a click asks nothing). Guards against a switch that shows a
-    /// choice that wasn't applied, sends the same choice twice, or goes dead after the menu is
-    /// rebuilt.
-    @Test func theTitleBarSwitchTogglesEnhancedAudio() async throws {
+    /// The title-bar selector: hidden until the lecture has an Audio state (leaving no gap before
+    /// the speed menu), three icon segments with the selection following the state, a click on
+    /// another segment sends that segment's action, a click on the selected one sends nothing,
+    /// and until the controller answers the control shows the state it had rather than AppKit's
+    /// move. Guards against a selector that shows a choice that wasn't applied, sends the same
+    /// choice twice, or overlaps the speed menu.
+    @Test func theTitleBarSelectorFollowsTheStateAndSendsTheClickedMode() async throws {
         let defaults = PlayerTestDefaults.throwaway()
         defer { defaults.discard() }
         let controller = makeController(defaults: defaults)
         try await playReady(controller)
         var asked: [PlayerAudioAction] = []
         controller.onAudioAction = { _, action in asked.append(action) }
-        let button = try #require(controller.audioButton)
+        let control = try #require(controller.audioSelector)
         let popUp = try #require(controller.speedPopUp)
-        #expect(button.isHidden)
-        #expect(popUp.frame.minX == 0, "a hidden switch left a gap")
-        #expect(button.superview === popUp.superview)
+        #expect(control.isHidden)
+        #expect(popUp.frame.minX == 0, "a hidden selector left a gap")
+        #expect(control.superview === popUp.superview)
+        #expect(control.segmentCount == 3 && control.trackingMode == .selectOne && control.refusesFirstResponder)
 
         controller.showAudioEnhancement(.off(preferred: .isolated), recordingID: controller.recordingID)
-        #expect(!button.isHidden)
-        #expect(button.isEnabled)
-        #expect(button.state == .off)
-        #expect(popUp.frame.minX > button.frame.maxX, "the switch overlaps the speed menu")
-        button.performClick(nil)
+        #expect(!control.isHidden)
+        #expect(control.selectedSegment == 0)
+        #expect((0..<3).allSatisfy { control.isEnabled(forSegment: $0) })
+        #expect(popUp.frame.minX > control.frame.maxX, "the selector overlaps the speed menu")
+        #expect((0..<3).allSatisfy { control.image(forSegment: $0) != nil }, "a segment has no icon")
+
+        // A real click through the control's own target-action (a hop to the main actor).
+        control.selectedSegment = 2
+        control.performClick(nil)
         try await Self.waitUntil { asked.count == 1 }
         #expect(asked == [.use(.isolated)])
-        controller.showAudioEnhancement(.off(preferred: .levelled), recordingID: controller.recordingID)
-        button.performClick(nil)
+        #expect(control.selectedSegment == 0, "the selector showed a choice the controller hadn't applied")
+        control.selectedSegment = 1
+        control.performClick(nil)
         try await Self.waitUntil { asked.count == 2 }
-        #expect(asked.last == .use(.levelled), "the switch ignored the last kind")
-        asked.removeLast()
-        controller.showAudioEnhancement(.off(preferred: .isolated), recordingID: controller.recordingID)
-        #expect(button.state == .off, "the switch showed a choice the controller hadn't applied")
+        #expect(asked.last == .use(.levelled), "a segment asked for another mode")
 
         controller.showAudioEnhancement(.on(.isolated), recordingID: controller.recordingID)
-        #expect(button.state == .on)
-        #expect(button.toolTip?.contains(AudioEnhancementKind.isolated.displayName) == true, "the tooltip does not name the mode")
-        button.performClick(nil)
-        try await Self.waitUntil { asked.count == 2 }
+        #expect(control.selectedSegment == 2)
+        controller.audioSegmentClicked(2)
+        #expect(asked.count == 2, "the selected segment sent an action")
+        controller.audioSegmentClicked(0)
         #expect(asked.last == .use(nil))
-        #expect(button.state == .on)
+        #expect(control.selectedSegment == 2, "the selector didn't go back to the state")
+        controller.showAudioEnhancement(.on(.levelled), recordingID: controller.recordingID)
+        #expect(control.selectedSegment == 1)
 
-        controller.showAudioEnhancement(.needsFFmpeg, recordingID: controller.recordingID)
-        #expect(!button.isEnabled)
-        #expect(button.toolTip?.contains("brew install ffmpeg") == true)
-        controller.audioButtonClicked()
-        await Self.settle()
-        #expect(asked.count == 2, "a disabled switch asked for something")
+        controller.showAudioEnhancement(.failed(BilingualText("motivo", "reason"), preferred: .isolated), recordingID: controller.recordingID)
+        #expect(control.selectedSegment == 0)
+        let before = asked.count
+        controller.audioSegmentClicked(1)
+        #expect(asked.count == before + 1 && asked.last == .use(.levelled), "a failed state didn't retry the clicked kind")
 
-        // A new lecture rebuilds the menu: the switch still works, and starts hidden.
+        // A new lecture rebuilds the menu: the selector still works, and goes hidden again.
         try await playReady(controller)
         controller.showAudioEnhancement(.off(preferred: .isolated), recordingID: controller.recordingID)
-        try #require(controller.audioButton).performClick(nil)
-        try await Self.waitUntil { asked.count == 3 }
+        control.selectedSegment = 2
+        control.performClick(nil)
+        try await Self.waitUntil { asked.count == before + 2 }
         controller.showAudioEnhancement(nil, recordingID: controller.recordingID)
-        #expect(try #require(controller.audioButton).isHidden)
+        #expect(control.isHidden)
         #expect(popUp.frame.minX == 0)
+        controller.close()
+    }
+
+    /// Without ffmpeg every segment is disabled and sends nothing, Off stays selected, and the
+    /// tooltips say how to get it. Guards against a disabled selector that still asks for a mode.
+    @Test func theSelectorSendsNothingWithoutFFmpeg() async throws {
+        let defaults = PlayerTestDefaults.throwaway()
+        defer { defaults.discard() }
+        let controller = makeController(defaults: defaults)
+        try await playReady(controller)
+        var asked: [PlayerAudioAction] = []
+        controller.onAudioAction = { _, action in asked.append(action) }
+        let control = try #require(controller.audioSelector)
+        controller.showAudioEnhancement(.needsFFmpeg, recordingID: controller.recordingID)
+        #expect(!control.isHidden && control.selectedSegment == 0)
+        #expect((0..<3).allSatisfy { !control.isEnabled(forSegment: $0) })
+        #expect((0..<3).allSatisfy { control.toolTip(forSegment: $0)?.contains("brew install ffmpeg") == true })
+        for index in 0..<3 { controller.audioSegmentClicked(index) }
+        await Self.settle()
+        #expect(asked.isEmpty, "a disabled selector asked for something")
         controller.close()
     }
 
@@ -1023,6 +1015,8 @@ struct RecordingPlayerMVPTests {
             recorder.checkpoints.append(checkpoint)
         }
         if byUser { controller.window?.close() } else { controller.close() }
+        // A user close reports on the hop that follows `windowWillClose` (#241), still before teardown.
+        if byUser { try await Self.waitUntil { recorder.checkpoints.count == before + 1 } }
         #expect(recorder.checkpoints.count == before + 1)
         #expect(openWhenReported == true)
         #expect(abs((recorder.checkpoints.last?.position ?? 0) - 25) < 0.5)
@@ -1030,6 +1024,99 @@ struct RecordingPlayerMVPTests {
         controller.close()
         await Self.settle()
         #expect(recorder.checkpoints.count == before + 1)
+    }
+
+    // MARK: The window's close button hops to the main actor (#241)
+
+    /// What `windowWillClose` does is only to hop: the checkpoint, the stop and `onClose` happen
+    /// on the main actor after it, once each, with the closed lecture's id. Guards against a
+    /// callback that does the work inline again (the isolated delegate method whose thunk crashed
+    /// on the first AppKit callback after a wake), and against the hop reporting twice.
+    @Test func theStudentClosingTheWindowReportsOnceAfterTheHop() async throws {
+        let recorder = Recorder()
+        let controller = makeController(recorder: recorder)
+        var closed: [String] = []
+        controller.onClose = { closed.append($0) }
+        try await playReady(controller)
+        try await park(controller, at: 25)
+        let before = recorder.checkpoints.count
+        let player = try #require(controller.player)
+        let window = try #require(controller.window)
+        window.close()
+        // Nothing ran inside the callback itself.
+        #expect(recorder.checkpoints.count == before && closed.isEmpty)
+        try await Self.waitUntil { closed.count == 1 }
+        await Self.settle()
+        #expect(recorder.checkpoints.count == before + 1)
+        #expect(recorder.checkpoints.last?.id == "Lezione" && recorder.checkpoints.last?.reason == .closed)
+        #expect(abs((recorder.checkpoints.last?.position ?? 0) - 25) < 0.5)
+        #expect(closed == ["Lezione"])
+        #expect(player.rate == 0 && player.currentItem == nil)
+        #expect(!controller.isOpen)
+    }
+
+    /// A Play of another lecture queued right after the window closed, before the hop landed:
+    /// the closed lecture is still reported once, with its own id, and the new lecture gets a
+    /// new window, not the closing one. Guards against the new lecture playing into a window
+    /// that is closing, or the old position being lost or filed under the new id.
+    @Test func aPlayRightAfterTheCloseReportsTheOldLectureAndOpensANewWindow() async throws {
+        let recorder = Recorder()
+        let controller = makeController(recorder: recorder)
+        var closed: [String] = []
+        controller.onClose = { closed.append($0) }
+        try await playReady(controller)
+        try await park(controller, at: 25)
+        let before = recorder.checkpoints.count
+        let closing = try #require(controller.window)
+        closing.close()
+        let media = try await TestMedia.shared.url()
+        controller.play(media, title: "Altra", cookies: [], startAt: nil, recordingID: "Altra", metadata: nil)
+        #expect(controller.window != nil && controller.window !== closing)
+        await Self.settle()
+        let reports = recorder.checkpoints.dropFirst(before)
+        #expect(reports.map(\.id) == ["Lezione"])
+        #expect(reports.map(\.reason) == [.closed])
+        #expect(closed == ["Lezione"])
+        // The hop that lands afterwards must not take the new window with it.
+        #expect(controller.isOpen && controller.recordingID == "Altra")
+        controller.close()
+    }
+
+    /// `close()` right after the window closed, before the hop: one checkpoint and one `onClose`
+    /// in all, not one from `close()` and one from the hop.
+    @Test func closeRightAfterTheWindowClosedReportsOnce() async throws {
+        let recorder = Recorder()
+        let controller = makeController(recorder: recorder)
+        var closed: [String] = []
+        controller.onClose = { closed.append($0) }
+        try await playReady(controller)
+        try await park(controller, at: 25)
+        let before = recorder.checkpoints.count
+        controller.window?.close()
+        controller.close()
+        await Self.settle()
+        #expect(recorder.checkpoints.count == before + 1)
+        #expect(recorder.checkpoints.last?.reason == .closed)
+        #expect(closed == ["Lezione"])
+    }
+
+    /// The controller released before the hop lands: nothing crashes and the window is let go
+    /// (the hop still releases it, as it holds the window itself). Guards against a hop that
+    /// assumes the controller outlives it, or leaves the closed window's view alive.
+    @Test func aControllerReleasedBeforeTheHopLeavesNothingBehind() async throws {
+        weak var weakWindow: NSWindow?
+        weak var weakView: NSView?
+        try await {
+            var controller: RecordingPlayerController? = makeController()
+            let media = try await TestMedia.shared.url()
+            controller?.play(media, title: "Lezione", cookies: [])
+            weakWindow = controller?.window
+            weakView = controller?.playerView
+            controller?.window?.close()
+            controller = nil
+        }()
+        try await Self.waitUntil { weakWindow == nil && weakView == nil }
+        #expect(weakWindow == nil && weakView == nil)
     }
 
     /// Closing before the stream is ready reports nothing: a saved position must never be

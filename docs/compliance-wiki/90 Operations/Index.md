@@ -29,6 +29,10 @@
 
 - [[20 Sources/S-0007 BeepBar telemetria]] — aggiornamento dev 50177f3; verifica pre-release aperta.
 
+## Telemetria rimossa — 2026-11-14
+
+Issue #239: la telemetria è rimossa dal codice (non ancora rilasciata). Le schede S-0007–S-0016 e le relative fonti grezze restano come storico di ciò che le versioni precedenti facevano; vedi [[30 Wiki/Mappa dei dati BeepBar]], [[30 Wiki/Valutazione BeepBar]] e [[30 Wiki/Piano di verifica]].
+
 ## Verifica privacy 2026-10-17
 
 - [[20 Sources/S-0008 TelemetryDeck accordo]]

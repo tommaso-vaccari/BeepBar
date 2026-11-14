@@ -528,8 +528,15 @@ struct RecmanStreamFailure: Error {
         }
     }
 
-    func cookiesDidChange(in cookieStore: WKHTTPCookieStore) {
-        if let login = webexLogin { checkWebexTicket(login) }
+    /// `nonisolated` + hop (#241, #30): this class is `@MainActor`, and an isolated witness of an
+    /// Objective-C delegate method gets a thunk that verifies the main executor before the body
+    /// runs, the check that crashed with SIGBUS on the first AppKit callback after a wake from
+    /// sleep (`StatusItemController`). The same goes for every delegate method below that only
+    /// reports an event; the navigation events and the two that must answer WebKit synchronously are left isolated.
+    nonisolated func cookiesDidChange(in cookieStore: WKHTTPCookieStore) {
+        Task { @MainActor [weak self] in
+            if let self, let login = self.webexLogin { self.checkWebexTicket(login) }
+        }
     }
 
     func close() {
@@ -920,13 +927,29 @@ struct RecmanStreamFailure: Error {
         presentSignInWindow(window)
     }
 
-    func windowWillClose(_ notification: Notification) {
-        if let entry { feed(.windowClosed, to: entry) }
-        webexLogin?.finish(.failure(CancellationError()), reason: "window-closed")
+    /// `nonisolated` + hop, see `cookiesDidChange`. The hop runs one turn after the close, so a
+    /// window that was replaced in between (the session reopened its window) must not end the
+    /// sign-in of the new one: the closing window's identity, read before the hop, is compared
+    /// with the current window inside it. A notification without a window object counts as the
+    /// current one.
+    nonisolated func windowWillClose(_ notification: Notification) {
+        let closing = (notification.object as? NSWindow).map(ObjectIdentifier.init)
+        Task { @MainActor [weak self] in
+            guard let self else { return }
+            if let closing, self.window.map(ObjectIdentifier.init) != closing { return }
+            if let entry { feed(.windowClosed, to: entry) }
+            webexLogin?.finish(.failure(CancellationError()), reason: "window-closed")
+        }
     }
 
     // MARK: WKNavigationDelegate
 
+    // The navigation events below (start, redirect, finish, fail) are left isolated on purpose,
+    // although the callbacks above hop (#241): `decidePolicyFor` answers WebKit synchronously and
+    // reads state (`webexLogin`, `capturingPlayback`, `entry`) that these events mutate. Hopping
+    // them would apply the mutations one turn late, and a policy decision for the next
+    // navigation could read stale state, a sign-in or playback behavior change that cannot be
+    // tested against a live login.
     func webView(_ webView: WKWebView, didStartProvisionalNavigation navigation: WKNavigation!) {
         guard webView === self.webView else { return }
         loadID += 1
@@ -1003,7 +1026,11 @@ struct RecmanStreamFailure: Error {
         }
     }
 
-    func webViewWebContentProcessDidTerminate(_ webView: WKWebView) {
+    nonisolated func webViewWebContentProcessDidTerminate(_ webView: WKWebView) {
+        Task { @MainActor [weak self] in self?.webContentProcessEnded(webView) }
+    }
+
+    private func webContentProcessEnded(_ webView: WKWebView) {
         guard webView === self.webView else { return }
         trace("web content process ended")
         loadWaiter?.resolve(.failure(RecmanBrowserError.unavailable))
@@ -1026,6 +1053,9 @@ struct RecmanStreamFailure: Error {
         }
     }
 
+    // Left isolated on purpose (#241): WebKit needs the decision before this method returns,
+    // and it depends on main-actor state (`webexLogin`, `capturingPlayback`, `entry`), with no
+    // copy pushed from the main actor to read instead. Same for `createWebViewWith` below.
     func webView(_ webView: WKWebView, decidePolicyFor action: WKNavigationAction, decisionHandler: @escaping @MainActor (WKNavigationActionPolicy) -> Void) {
         guard webView === self.webView, let url = action.request.url else { decisionHandler(.cancel); return }
         let mainFrame = action.targetFrame?.isMainFrame ?? true

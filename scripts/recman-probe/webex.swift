@@ -105,7 +105,7 @@ let webexVideoSource = #"""
     private var windowClosed = false
     private var candidates: [(source: String, url: URL)] = []
     private var pages = 0
-    /// Telemetry and Webex-app service calls, counted instead of printed.
+    /// Webex analytics and Webex-app service calls, counted instead of printed.
     private var quietRequests = 0
     /// The playback page's address, whose path carries the recording's uuid.
     private(set) var playbackPage: URL?
@@ -149,7 +149,7 @@ let webexVideoSource = #"""
                 found(url, source: "video element")
             }
         }
-        say("(\(quietRequests) telemetry and Webex-app service requests not printed)")
+        say("(\(quietRequests) analytics and Webex-app service requests not printed)")
         say(windowClosed ? "window closed after \(elapsed(since: start))" : "time limit reached (\(elapsed(since: start)))")
         if let facts = try? await webView.evaluateJavaScript(webexPageFacts, in: nil, contentWorld: .defaultClient) as? String {
             say("  [last page] at \(webView.url.map(streamShape) ?? "(none)") \(facts)")

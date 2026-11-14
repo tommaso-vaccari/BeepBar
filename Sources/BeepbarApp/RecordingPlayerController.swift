@@ -2,6 +2,7 @@ import AppKit
 @preconcurrency import AVFoundation
 import BeepbarCore
 import OSLog
+import os
 // No `import AVKit`, on purpose: see `AVKitLoader`.
 
 /// What Recordings needs from a native player: play a lecture stream in BeepBar, pause it, close
@@ -44,11 +45,16 @@ import OSLog
     /// ends without a new stream or the browser (issue #197): with no Recordings page open, the
     /// paused window is the only place that can explain it. Does nothing when no lecture is open.
     func showProblem(_ message: String)
+    /// Puts the course name back under the title, but only while the window still shows
+    /// `message` (a transient notice such as "Reopening the lecture…" that its owner ends without
+    /// a lecture to show): a later, truer message is never overwritten. Does nothing when no
+    /// lecture is open.
+    func clearProblem(_ message: String)
     /// Makes the player restore `policy` when it closes, for code that raised BeepBar to a
     /// regular app and finds a lecture open when it is done; see
     /// `RecordingPlayerController.adoptPolicyToRestore`.
     func adoptPolicyToRestore(_ policy: NSApplication.ActivationPolicy)
-    /// What the student chose in the window's Audio menu (`PlayerAudioAction`), with the
+    /// What the student chose in the window's enhanced-audio selector (`PlayerAudioAction`), with the
     /// `recordingID` of the lecture on screen when they chose it. Delivered on the main actor.
     var onAudioAction: ((String, PlayerAudioAction) -> Void)? { get set }
     /// Called once when the window closes (`close()` or its close button), with the
@@ -56,7 +62,7 @@ import OSLog
     /// checkpoint, which needs a position worth reporting. What lives only as long as the
     /// window (the enhanced-audio filter) ends here.
     var onClose: ((String) -> Void)? { get set }
-    /// Shows `state` in the Audio menu while `recordingID` is the lecture on screen; nil hides
+    /// Shows `state` in the audio selector while `recordingID` is the lecture on screen; nil hides
     /// the section (no account to keep a copy under). Ignored for any other lecture, so a late
     /// update of a replaced lecture never shows on the next one.
     func showAudioEnhancement(_ state: AudioEnhancementState?, recordingID: String)
@@ -68,7 +74,7 @@ import OSLog
     var isPlaying: Bool { get }
 }
 
-/// One choice in the player's Audio menu (`RecordingPlaying.onAudioAction`).
+/// One choice in the player's enhanced-audio selector (`RecordingPlaying.onAudioAction`).
 enum PlayerAudioAction: Equatable, Sendable {
     /// Play through the local filter of that kind, or (nil) Webex's own stream, from the same
     /// position.
@@ -114,6 +120,143 @@ enum RecordingPlaybackFailure {
     /// window stays open and paused at `position` seconds, so the caller can fetch a fresh stream
     /// URL and resume there, or offer the browser.
     case duringPlayback(Error?, position: TimeInterval)
+}
+
+/// Why a stream that was playing can no longer be trusted, as the player reports it through
+/// `RecordingPlaybackFailure.duringPlayback` (#241). Webex's stream addresses are short-lived: a
+/// lecture paused for a while, or left across a sleep, resumes into an address that no longer
+/// answers, and the old behaviour was an error banner for a lecture that a fresh address would
+/// play. The controller treats every case as recoverable (`RecordingStreamPolicy.classify`).
+enum RecordingStreamError: Error, Equatable {
+    /// The student started playback after a long pause or a wake from sleep
+    /// (`RecordingStreamPolicy.isStale`), so the player did not even try the old address.
+    case stale
+    /// The player sat in `waitingToPlayAtSpecifiedRate` for `RecordingStreamPolicy.stallThreshold`.
+    case stalled
+    /// The server answered the item's request with this HTTP status (from the item's error log,
+    /// where AVFoundation's own error only says "-11800" with the status buried underneath).
+    case http(Int)
+}
+
+/// The pure decisions about a stream that stopped or may have expired (#241), apart from the
+/// player and the controller so tests read them as a table. Every number here has a reason and
+/// is a named constant, not a literal at the point of use.
+enum RecordingStreamPolicy {
+    /// A lecture paused this long is assumed to hold an expired address. Webex's HLS addresses
+    /// are short-lived (minutes to tens of minutes, not documented), so a long pause is the
+    /// common way to meet one; a shorter pause keeps playing the same address.
+    nonisolated static let staleAfterPause: TimeInterval = 10 * 60
+    /// How long the player may sit waiting for data, once playing had started, before the stream
+    /// is treated as gone. A dead address often stalls rather than failing (AVFoundation retries
+    /// quietly); 15 s is longer than a normal rebuffer on a slow connection and short enough that
+    /// the student is not left staring at a frozen picture.
+    nonisolated static let stallThreshold: TimeInterval = 15
+    /// How many fresh streams one failure episode may ask for before the banner and the browser.
+    /// The first is immediate (as before #241); the others wait (`delays`).
+    nonisolated static let maximumAttempts = 4
+    /// Seconds to wait before attempt n (index n-1). The first attempt is immediate, so a plain
+    /// mid-lecture expiry is not slowed down; the later ones, 1 + 3 + 8 s in all, cover a network
+    /// that is still coming back after a wake and give a slow Webex or Polimi time to answer.
+    nonisolated static let delays: [TimeInterval] = [0, 1, 3, 8]
+    /// The longest one failure episode (first failure to the last attempt) may last, measured
+    /// from its first failure. It bounds the chain even when plays between failures are short.
+    nonisolated static let episodeTimeout: TimeInterval = 90
+    /// Seconds of lecture played after a recovery for the episode to count as over: its attempts
+    /// are forgotten, so the next sleep in the same session gets a full budget again. Measured
+    /// in media time, not by a clock. Known limitation: it is the difference of two positions, so
+    /// a seek forward of 30 s or more also counts as played time.
+    nonisolated static let stablePlayback: TimeInterval = 30
+    /// HTTP statuses a fresh stream fixes or that pass: an expired or refused address (401, 403,
+    /// 404, 410: the same four `LiveAudioFailure.streamRefused` treats as an expired address) and
+    /// a gateway or server hiccup (any 5xx, consistent with `LiveAudioFailure.network`).
+    nonisolated static func isRecoverableStatus(_ status: Int) -> Bool {
+        [401, 403, 404, 410].contains(status) || (500...599).contains(status)
+    }
+    /// URLSession errors that mean "the network is not there right now".
+    nonisolated static let transientURLErrors: Set<Int> = [
+        NSURLErrorNotConnectedToInternet, NSURLErrorTimedOut, NSURLErrorNetworkConnectionLost,
+        NSURLErrorCannotConnectToHost, NSURLErrorCannotFindHost, NSURLErrorDNSLookupFailed,
+    ]
+    /// The only causes known not to be fixed by asking for another stream: the address itself is
+    /// not a URL this player can open (the resolver builds it the same way each time). Kept
+    /// minimal on purpose: everything else not recognised is `unclassified`, which still gets
+    /// the one fresh stream the app always gave.
+    nonisolated static let permanentURLErrors: Set<Int> = [NSURLErrorBadURL, NSURLErrorUnsupportedURL]
+
+    /// How much a failure's cause says about whether a fresh stream helps (#241).
+    enum Cause: Equatable {
+        /// Known to be fixed, or passed, by a fresh stream: the full budget (`maximumAttempts`).
+        case recoverable
+        /// Not recognised (no error, an unknown domain or code, an HTTP status in neither list, a
+        /// missing status; real Webex expiry can arrive like this, wrapped by AVFoundation): exactly
+        /// one fresh stream, then the browser.
+        case unclassified
+        /// Positively not fixable by a fresh stream: the browser at once.
+        case permanent
+
+        /// How many attempts one episode may spend on a failure of this class.
+        var attemptLimit: Int {
+            switch self {
+            case .recoverable: return RecordingStreamPolicy.maximumAttempts
+            case .unclassified: return 1
+            case .permanent: return 0
+            }
+        }
+    }
+
+    /// Whether playback started now would use an address that has probably expired: the lecture
+    /// has been paused for `staleAfterPause` or more, or the Mac woke up after it was paused.
+    /// `pausedSince` is nil while playing (never stale). Timestamps only: nothing runs while
+    /// the lecture is paused.
+    nonisolated static func isStale(pausedSince: Date?, lastWake: Date?, now: Date) -> Bool {
+        guard let pausedSince else { return false }
+        if now.timeIntervalSince(pausedSince) >= staleAfterPause { return true }
+        if let lastWake, lastWake >= pausedSince { return true }
+        return false
+    }
+
+    /// Classifies `error` (see `Cause`). AVFoundation wraps the real cause (an `NSURLError`) under
+    /// `NSUnderlyingErrorKey`, so the chain is followed; the first level that says something
+    /// decides, and a chain that says nothing is `unclassified`.
+    nonisolated static func classify(_ error: Error?) -> Cause {
+        var current = error
+        var depth = 0
+        while let error = current, depth < 5 {
+            if let stream = error as? RecordingStreamError {
+                switch stream {
+                case .stale, .stalled: return .recoverable
+                case .http(let status): return isRecoverableStatus(status) ? .recoverable : .unclassified
+                }
+            }
+            let ns = error as NSError
+            if ns.domain == NSURLErrorDomain {
+                if transientURLErrors.contains(ns.code) { return .recoverable }
+                if permanentURLErrors.contains(ns.code) { return .permanent }
+            }
+            current = ns.userInfo[NSUnderlyingErrorKey] as? Error
+            depth += 1
+        }
+        return .unclassified
+    }
+
+    /// The wait before attempt `attempt` (1-based), nil once the budget is spent.
+    nonisolated static func delay(beforeAttempt attempt: Int) -> TimeInterval? {
+        guard attempt >= 1, attempt <= maximumAttempts, attempt <= delays.count else { return nil }
+        return delays[attempt - 1]
+    }
+
+    /// Whether another attempt may start: some budget is left and the episode is not too old.
+    nonisolated static func mayRetry(attemptsUsed: Int, episodeAge: TimeInterval) -> Bool {
+        attemptsUsed < maximumAttempts && episodeAge < episodeTimeout
+    }
+
+    /// The failure to report for an item that failed: the HTTP status from its error log when it
+    /// has one, else AVFoundation's own error. Known limitation: the status is the last event of the
+    /// item's error log, which may belong to an earlier request than the one that failed it.
+    nonisolated static func cause(error: Error?, httpStatus: Int?) -> Error? {
+        if let httpStatus, httpStatus >= 400 { return RecordingStreamError.http(httpStatus) }
+        return error
+    }
 }
 
 /// Errors the player raises itself, as opposed to those AVFoundation reports for the stream.
@@ -212,9 +355,9 @@ enum RecordingPlayerError: Error {
     private(set) var player: AVPlayer?
     /// The speed menu in the title bar; internal so tests can drive it.
     private(set) var speedPopUp: NSPopUpButton?
-    /// The enhanced-audio switch beside `speedPopUp` (`RecordingPlayerPolicy.audioButton`),
+    /// The enhanced-audio selector to the left of `speedPopUp` (`RecordingPlayerPolicy.audioSelector`),
     /// hidden while `audioState` is nil.
-    private(set) var audioButton: NSButton?
+    private(set) var audioSelector: NSSegmentedControl?
     /// Whether the current item reached `.readyToPlay`: decides which failure phase is reported.
     private(set) var isCurrentItemReady = false
     /// Whether the start of playback is settled: the item is ready and the `startAt` seek, if
@@ -265,6 +408,23 @@ enum RecordingPlayerError: Error {
     private var rateSupportObservations: [NSKeyValueObservation] = []
     private var defaultRateObservation: NSKeyValueObservation?
     private var failedToEndObserver: NSObjectProtocol?
+    /// `NSWorkspace.didWakeNotification` is posted on the workspace's own center, not the default
+    /// one, hence a second injected center.
+    private let workspaceNotificationCenter: NotificationCenter
+    private let now: () -> Date
+    private let sleep: @Sendable (TimeInterval) async throws -> Void
+    /// The wake observer: exists only while a lecture is open (added by `play`, removed by
+    /// `stopPlayback`), so a closed player has no observer at all. Its block is `@Sendable` and
+    /// only hops to the main actor, like every callback of the player (#241, #30).
+    private var wakeObserver: NSObjectProtocol?
+    /// When the lecture last paused, nil while it plays: `RecordingStreamPolicy.isStale` needs
+    /// only this and `lastWake`, so a paused lecture costs no timer (#241).
+    private var pausedSince: Date?
+    /// When the Mac last woke up while a lecture was open.
+    private var lastWake: Date?
+    /// The one wait for a stalled stream, alive only while the player waits for data
+    /// (`updateStallWatch`); cancelled on resume, pause, replacement and close.
+    private var stallTask: Task<Void, Never>?
     /// The one periodic time observer (`onProgress`), with the player it was added to:
     /// AVFoundation requires removing a token from that same player. Non-nil only while the
     /// player is not paused. Invariant: every path that pauses, replaces, fails or closes ends in
@@ -300,10 +460,10 @@ enum RecordingPlayerError: Error {
     private weak var videoHost: NSView?
     /// The menu items' targets: an item holds its target weakly.
     private var menuActions: [PlayerMenuAction] = []
-    /// The audio switch's target, kept apart from `menuActions`, which a menu rebuild empties:
-    /// `NSButton.target` is weak, so the switch would go dead after a language switch.
+    /// The audio selector's target, kept apart from `menuActions`, which a menu rebuild empties:
+    /// `NSControl.target` is weak, so the selector would go dead after a language switch.
     private var audioActions: [PlayerMenuAction] = []
-    /// The Audio menu's state for the lecture on screen (`showAudioEnhancement`); nil hides it.
+    /// The audio selector's state for the lecture on screen (`showAudioEnhancement`); nil hides it.
     private(set) var audioState: AudioEnhancementState?
     var onAudioAction: ((String, PlayerAudioAction) -> Void)?
     /// See `RecordingPlaying.onClose`.
@@ -335,6 +495,11 @@ enum RecordingPlayerError: Error {
     private(set) var artworkFetches = 0
     /// The record last published, so an identical one is not published again.
     private var lastNowPlaying: NowPlayingState?
+
+    /// Windows whose `windowWillClose` arrived and whose close has not finished on the main actor
+    /// (`finishClosing`). A lock around plain identifiers rather than main-actor state, so the
+    /// nonisolated AppKit callback can write it without any isolation check (#241).
+    private nonisolated let closingWindows = OSAllocatedUnfairLock(initialState: Set<ObjectIdentifier>())
 
     private let present: @MainActor (NSWindow) -> Void
     private let makePlayerView: @MainActor () -> NSView?
@@ -400,6 +565,9 @@ enum RecordingPlayerError: Error {
          frameAutosaveName: String? = RecordingPlayerController.defaultFrameAutosaveName,
          defaults: UserDefaults = .standard,
          notificationCenter: NotificationCenter = .default,
+         workspaceNotificationCenter: NotificationCenter = NSWorkspace.shared.notificationCenter,
+         now: @escaping () -> Date = Date.init,
+         sleep: @escaping @Sendable (TimeInterval) async throws -> Void = { try await Task.sleep(for: .seconds($0)) },
          toggleFullScreen: @escaping @MainActor (NSWindow) -> Void = { $0.toggleFullScreen(nil) },
          progressInterval: TimeInterval = RecordingPlayerController.progressInterval,
          nowPlaying: NowPlayingPublishing = SystemNowPlaying(),
@@ -414,6 +582,9 @@ enum RecordingPlayerError: Error {
         self.frameAutosaveName = frameAutosaveName
         self.defaults = defaults
         self.notificationCenter = notificationCenter
+        self.workspaceNotificationCenter = workspaceNotificationCenter
+        self.now = now
+        self.sleep = sleep
         self.toggleFullScreen = toggleFullScreen
         super.init()
     }
@@ -425,6 +596,9 @@ enum RecordingPlayerError: Error {
     /// as is, and a concrete type keeps the protocol usable as an existential with fakes.
     func play(_ url: URL, title: String, cookies: [HTTPCookie], startAt: TimeInterval?, recordingID: String, metadata: RecordingPlaybackMetadata?) {
         Self.log.notice("Playing a recording from \(url.host ?? "-", privacy: .public)")
+        // A window the student just closed whose hop has not landed: finish that close first, so
+        // this lecture gets a new window instead of playing into a closed one.
+        completePendingClose()
         // A newer lecture closes the one on screen: report where the student left it, with its
         // own id, while the old item is still in place.
         checkpointIfMeaningful(.replaced)
@@ -432,13 +606,17 @@ enum RecordingPlayerError: Error {
         generation += 1
         // A different lecture starts at fit; the same one (a recovery, Play again) keeps the
         // student's zoom, like its position.
-        // The Audio menu belongs to one lecture: the caller sets it again right after `play`.
+        // The audio selector belongs to one lecture: the caller sets it again right after `play`.
         if recordingID != self.recordingID {
             applyZoom(.fit)
             audioState = nil
         }
         self.recordingID = recordingID
         failureReported = false
+        // A new item is a fresh address: nothing about the old one's pause or sleep applies.
+        pausedSince = nil
+        lastWake = nil
+        installWakeObserver()
         isCurrentItemReady = false
         isStartSettled = false
         rateSupport = .unknown
@@ -486,7 +664,8 @@ enum RecordingPlayerError: Error {
         // results.
         statusObservation = item.observe(\.status, options: [.new]) { [weak self] item, _ in
             let status = item.status
-            let error = item.error
+            // The HTTP status, read here with the error: AVFoundation's error hides it.
+            let error = RecordingStreamPolicy.cause(error: item.error, httpStatus: item.errorLog()?.events.last?.errorStatusCode)
             Task { @MainActor [weak self] in
                 switch status {
                 case .readyToPlay: self?.itemBecameReady(generation: observedGeneration)
@@ -518,7 +697,8 @@ enum RecordingPlayerError: Error {
         // A stream that dies after it started (network lost, token expired) does not always move
         // the item to `.failed`; AVFoundation reports it with this notification instead.
         failedToEndObserver = notificationCenter.addObserver(forName: AVPlayerItem.failedToPlayToEndTimeNotification, object: item, queue: nil) { [weak self] notification in
-            let error = notification.userInfo?[AVPlayerItemFailedToPlayToEndTimeErrorKey] as? Error
+            let error = RecordingStreamPolicy.cause(error: notification.userInfo?[AVPlayerItemFailedToPlayToEndTimeErrorKey] as? Error,
+                                                    httpStatus: (notification.object as? AVPlayerItem)?.errorLog()?.events.last?.errorStatusCode)
             Task { @MainActor [weak self] in
                 self?.fail(generation: observedGeneration, error: error)
             }
@@ -551,6 +731,7 @@ enum RecordingPlayerError: Error {
     }
 
     func close() {
+        completePendingClose()
         checkpointIfMeaningful(.closed)
         let window = self.window
         stopPlayback()
@@ -563,7 +744,7 @@ enum RecordingPlayerError: Error {
             self.window = nil
             playerView = nil
             speedPopUp = nil
-            audioButton = nil
+            audioSelector = nil
         }
         window.close()
     }
@@ -579,7 +760,7 @@ enum RecordingPlayerError: Error {
     func showAudioEnhancement(_ state: AudioEnhancementState?, recordingID: String) {
         guard isOpen, recordingID == self.recordingID else { return }
         audioState = state
-        updateAudioItems()
+        updateAudioSelector()
     }
 
     var playbackPosition: TimeInterval? {
@@ -603,32 +784,65 @@ enum RecordingPlayerError: Error {
         window.subtitle = message
     }
 
-    func windowWillClose(_ notification: Notification) {
-        guard let closing = notification.object as? NSWindow, closing === window else { return }
-        // The student closed the window: report where they stopped before anything is released.
+    func clearProblem(_ message: String) {
+        guard isOpen, let window, window.subtitle == message else { return }
+        window.subtitle = nowPlayingMetadata?.courseName ?? ""
+    }
+
+    /// The window is about to close (its close button, or `close()`). `nonisolated` on purpose,
+    /// like every AppKit callback of the player (#241, #30): this class is `@MainActor`, and an
+    /// isolated witness of an Objective-C delegate method gets a thunk that verifies the main
+    /// executor before the body runs, which is the check that crashed with SIGBUS on the first
+    /// callback after the Mac woke from sleep (`StatusItemController`). So nothing isolated is
+    /// read here: the window is only noted in `closingWindows` (a lock, not main-actor state) and
+    /// the work hops to the main actor (`finishClosing`), where it checkpoints before releasing.
+    ///
+    /// The hop is one main-actor turn, so a Play or a `close()` queued in front of it could meet
+    /// a window that already closed: both call `completePendingClose()` first, which runs the
+    /// same `finishClosing` now. The window is retained by the hop, so its identity cannot be
+    /// reused by a new window before it runs.
+    nonisolated func windowWillClose(_ notification: Notification) {
+        guard let closing = notification.object as? NSWindow else { return }
+        let id = ObjectIdentifier(closing)
+        closingWindows.withLock { _ = $0.insert(id) }
+        Task { @MainActor [weak self] in
+            if let self { self.finishClosing(closing) } else { Self.release(closing) }
+        }
+    }
+
+    /// Finishes a close that `windowWillClose` announced, once, on the main actor: reports where
+    /// the student stopped before anything is released, stops playback (no sound may outlive the
+    /// window) and lets go of the window. Idempotent: the hop and `completePendingClose()` may
+    /// both arrive, and `close()` (which closes the window itself, after releasing it) never
+    /// leaves a pending entry for a window the player still owns.
+    private func finishClosing(_ closing: NSWindow) {
+        let announced = closingWindows.withLock { $0.remove(ObjectIdentifier(closing)) != nil }
+        // Not the current window: `close()` already released it, or a Play replaced it.
+        guard announced, closing === window else { return }
         checkpointIfMeaningful(.closed)
-        // Playback stops now: no sound may outlive the window.
         stopPlayback()
         onClose?(recordingID)
         // Synchronously, so a Play in the meantime can give the name to its new window: AppKit
         // refuses a name another live window still holds. The frame was saved on the last move
         // or resize, so nothing is lost.
         closing.setFrameAutosaveName("")
+        window = nil
+        playerView = nil
+        speedPopUp = nil
+        audioSelector = nil
         // The view and the window are released on the next main-actor turn, as
         // `ConfigurationWindowController.windowWillClose` does: AppKit (and `AVPlayerView`, which
         // watches its window to leave full screen or picture in picture) is still closing this
-        // window when the notification arrives, and pulling its content view out from under it
+        // window around the notification, and pulling its content view out from under it
         // mid-close is not something AppKit promises to survive. A Play in between builds a new
         // window, so only this one is released.
-        Task { @MainActor [weak self] in
-            Self.release(closing)
-            if let self, self.window === closing {
-                self.window = nil
-                self.playerView = nil
-                self.speedPopUp = nil
-                self.audioButton = nil
-            }
-        }
+        Task { @MainActor in Self.release(closing) }
+    }
+
+    /// Runs the close of the current window if its `windowWillClose` hop has not landed yet.
+    private func completePendingClose() {
+        guard let window, closingWindows.withLock({ $0.contains(ObjectIdentifier(window)) }) else { return }
+        finishClosing(window)
     }
 
     /// Activates the app and orders the window front. A menu-bar app has to activate itself first,
@@ -748,7 +962,8 @@ enum RecordingPlayerError: Error {
                 // play that would double up.
                 if player.rate != 0 { pause() } else { playWhenSettled.toggle() }
             } else if player.rate == 0 {
-                player.play()
+                // Checked before starting: no sound from an expired address.
+                if isStreamStale { failStale() } else { player.play() }
             } else {
                 player.pause()
             }
@@ -795,7 +1010,11 @@ enum RecordingPlayerError: Error {
     /// The window was resized (also into or out of full screen). Through a hop, like every other
     /// AppKit callback here: nothing is read from the notification. At fit there is nothing to
     /// redo, so a resize costs nothing unless the video is zoomed.
-    func windowDidResize(_ notification: Notification) {
+    ///
+    /// `nonisolated` (#241, #30): macOS sends this to the open player window when the displays
+    /// are reconfigured on wake, and an isolated witness's thunk would run the main-executor check
+    /// first (see `windowWillClose`).
+    nonisolated func windowDidResize(_ notification: Notification) {
         Task { @MainActor [weak self] in self?.zoomGeometryChanged() }
     }
 
@@ -902,7 +1121,23 @@ enum RecordingPlayerError: Error {
         // current state counts.
         if player.timeControlStatus == .paused {
             if !checkpointedSincePlaying { checkpointIfMeaningful(.paused) }
+            // The first pause of a stretch only: a second report of the same pause must not
+            // make a long pause look short.
+            if pausedSince == nil, isCurrentItemReady { pausedSince = now() }
         } else {
+            // Playback starting after a long pause or a sleep, whichever control started it
+            // (the view's own play button reaches only this observation): the address has
+            // probably expired. Pause at once and report it as a failure, so the usual
+            // recovery fetches a fresh stream and continues here. A moment of the old item may
+            // have played before this hop ran; that is the price of not owning that button.
+            if isStreamStale {
+                // `AVPlayer` keeps announcing the start for a moment after `pause()`: those echoes
+                // arrive with the rate already 0 and are not the student starting again (each
+                // would report the stale stream once more, `failStale` clearing `failureReported`).
+                if player.rate != 0 { failStale() }
+                return
+            }
+            pausedSince = nil
             checkpointedSincePlaying = false
             // Moving again after a reported mid-lecture failure: `fail` paused the player and
             // cancelled any pending start, so only the student can have restarted it. A new
@@ -916,7 +1151,71 @@ enum RecordingPlayerError: Error {
             }
         }
         updateProgressObserver(generation: observed)
+        updateStallWatch(generation: observed)
         publishNowPlaying()
+    }
+
+    /// Whether starting playback now would use an expired address (`RecordingStreamPolicy.isStale`),
+    /// for a lecture that is ready and past its start.
+    private var isStreamStale: Bool {
+        isCurrentItemReady && isStartSettled && !isResuming
+            && RecordingStreamPolicy.isStale(pausedSince: pausedSince, lastWake: lastWake, now: now())
+    }
+
+    /// Stops what the student just started and reports the stale address through the usual
+    /// failure path (`RecordingStreamError.stale`), so the controller recovers it. The position
+    /// is where the lecture was paused: the stale item has not moved.
+    private func failStale() {
+        player?.pause()
+        // A start the student made is a new chance to report: after an earlier reported failure
+        // whose recovery left the window open and paused, `fail` would swallow this report
+        // (`failureReported`) and the lecture would stay stuck with the old reason (#197 reset,
+        // which the stale paths run before reaching). The subtitle shows the old reason no more.
+        if failureReported, isCurrentItemReady {
+            failureReported = false
+            window?.subtitle = nowPlayingMetadata?.courseName ?? ""
+        }
+        fail(generation: generation, error: RecordingStreamError.stale)
+    }
+
+    /// Arms the one wait for a stalled stream while the player waits for data, and only then:
+    /// the item is ready and past its start (a slow first load is the before-ready path, a slow
+    /// seek is not a dead stream) and nothing is seeking. Idempotent; cancels the wait as soon
+    /// as the player moves, pauses or any of those stops holding. After the threshold the
+    /// stream is reported as failed (`RecordingStreamError.stalled`).
+    private func updateStallWatch(generation observed: Int) {
+        let waiting = observed == generation && isCurrentItemReady && isStartSettled && !isResuming
+            && pendingSeekTarget == nil && player?.timeControlStatus == .waitingToPlayAtSpecifiedRate
+        guard waiting else {
+            stallTask?.cancel()
+            stallTask = nil
+            return
+        }
+        guard stallTask == nil else { return }
+        let sleep = self.sleep
+        stallTask = Task { @MainActor [weak self] in
+            do { try await sleep(RecordingStreamPolicy.stallThreshold) } catch { return }
+            // The arming conditions are checked again: a seek that began during the wait (the
+            // student scrubbing) makes the waiting a slow seek, not a dead stream.
+            guard let self, !Task.isCancelled, observed == self.generation, self.stallTask != nil,
+                  self.isCurrentItemReady, self.isStartSettled, !self.isResuming, self.pendingSeekTarget == nil,
+                  self.player?.timeControlStatus == .waitingToPlayAtSpecifiedRate else { return }
+            self.stallTask = nil
+            self.fail(generation: observed, error: RecordingStreamError.stalled)
+        }
+    }
+
+    private func installWakeObserver() {
+        guard wakeObserver == nil else { return }
+        // `@Sendable` and only a hop (#241, #30): the block runs on the poster's queue.
+        wakeObserver = workspaceNotificationCenter.addObserver(forName: NSWorkspace.didWakeNotification, object: nil, queue: nil) { @Sendable [weak self] _ in
+            Task { @MainActor [weak self] in self?.systemDidWake() }
+        }
+    }
+
+    /// The Mac woke from sleep. Internal so tests can deliver it.
+    func systemDidWake() {
+        lastWake = now()
     }
 
     /// Keeps the one periodic time observer in step with the player: present while it is not
@@ -1001,6 +1300,7 @@ enum RecordingPlayerError: Error {
                 guard let self, observed == self.generation else { return }
                 if self.pendingSeekTarget == seconds { self.pendingSeekTarget = nil }
                 if settlesStart { self.settleStart() }
+                self.updateStallWatch(generation: observed)
                 self.publishNowPlaying()
             }
         }
@@ -1085,7 +1385,7 @@ enum RecordingPlayerError: Error {
         guard let player else { return }
         switch command {
         case .play:
-            if isResuming { playWhenSettled = true } else { player.play() }
+            if isResuming { playWhenSettled = true } else if isStreamStale { failStale() } else { player.play() }
         case .pause:
             pause()
         case .togglePlayPause:
@@ -1177,13 +1477,13 @@ enum RecordingPlayerError: Error {
         artwork = nil
     }
 
-    /// The trailing end of the title bar: the enhanced-audio switch (shown only while the lecture
-    /// has an Audio state) and the speed menu, always visible, which shows the current speed and
-    /// lists the keyboard shortcuts, whether or not `AVPlayerView`'s own controls offer a speed
-    /// menu in this macOS version. In the title bar rather than over the video: AVKit's control bar
-    /// takes no extra buttons, and an overlay would collide with it (and with full screen's).
-    /// `window` is passed in because `self.window` is set only after the accessory is built: the
-    /// switch's action checks it is still this window's.
+    /// The trailing end of the title bar: the enhanced-audio selector (shown only while the
+    /// lecture has an Audio state) and the speed menu, always visible, which shows the current
+    /// speed and lists the keyboard shortcuts, whether or not `AVPlayerView`'s own controls offer
+    /// a speed menu in this macOS version. In the title bar rather than over the video: AVKit's
+    /// control bar takes no extra buttons, and an overlay would collide with it (and with full
+    /// screen's). `window` is passed in because `self.window` is set only after the accessory is
+    /// built: the selector's action checks it is still this window's.
     private func makeSpeedAccessory(for window: NSWindow) -> NSTitlebarAccessoryViewController {
         let popUp = NSPopUpButton(frame: NSRect(x: 0, y: 0, width: 72, height: 22), pullsDown: true)
         popUp.bezelStyle = .accessoryBarAction
@@ -1194,55 +1494,67 @@ enum RecordingPlayerError: Error {
         popUp.autoenablesItems = false
         speedPopUp = popUp
 
-        let toggle = PlayerMenuAction { [weak self, weak window] in
-            guard let self, let window, self.window === window else { return }
-            self.audioButtonClicked()
+        // Target-action through a `PlayerMenuAction` (nonisolated entry point, hop to the main
+        // actor), never a `@MainActor` method as the target (#30). The hop reads which segment
+        // was clicked from the control: AppKit has already moved the selection to it.
+        let selection = PlayerMenuAction { [weak self, weak window] in
+            guard let self, let window, self.window === window, let control = self.audioSelector else { return }
+            self.audioSegmentClicked(control.selectedSegment)
         }
-        audioActions = [toggle]
-        let button = NSButton(frame: NSRect(x: 0, y: 0, width: 30, height: 22))
-        button.setButtonType(.pushOnPushOff)
-        button.bezelStyle = .accessoryBarAction
-        button.controlSize = .small
-        button.image = NSImage(systemSymbolName: "waveform", accessibilityDescription: tr("Audio migliorato", "Enhanced audio"))
-        button.imagePosition = .imageOnly
-        button.refusesFirstResponder = true
-        button.target = toggle
-        button.action = #selector(PlayerMenuAction.invoke(_:))
-        button.setAccessibilityLabel(tr("Audio migliorato", "Enhanced audio"))
-        button.isHidden = true
-        audioButton = button
+        audioActions = [selection]
+        let control = NSSegmentedControl(frame: NSRect(x: 0, y: 0, width: Self.audioSelectorWidth, height: 22))
+        control.segmentCount = 3
+        control.trackingMode = .selectOne
+        control.segmentStyle = .automatic
+        control.controlSize = .small
+        for index in 0..<3 { control.setWidth(Self.audioSegmentWidth, forSegment: index) }
+        control.refusesFirstResponder = true
+        control.target = selection
+        control.action = #selector(PlayerMenuAction.invoke(_:))
+        control.isHidden = true
+        audioSelector = control
 
         let container = NSView(frame: NSRect(x: 0, y: 0, width: Self.accessoryWidth(showingAudio: false), height: 22))
-        container.addSubview(button)
+        container.addSubview(control)
         container.addSubview(popUp)
         let accessory = NSTitlebarAccessoryViewController()
         accessory.layoutAttribute = .trailing
         accessory.view = container
-        layOutAccessory()
+        updateAudioSelector()
         return accessory
     }
 
-    /// The accessory's width: the speed menu alone, or with the audio switch before it.
-    private static func accessoryWidth(showingAudio: Bool) -> CGFloat { showingAudio ? 114 : 80 }
+    private static let audioSegmentWidth: CGFloat = 28
+    private static let audioSelectorWidth: CGFloat = 3 * audioSegmentWidth + 4
+    /// The gap between the selector and the speed menu.
+    private static let audioSelectorGap: CGFloat = 6
 
-    /// Places the switch and the speed menu for the switch's visibility, so a hidden switch
-    /// leaves no gap before the speed menu.
-    private func layOutAccessory() {
-        guard let popUp = speedPopUp, let button = audioButton, let container = popUp.superview else { return }
-        let showing = !button.isHidden
-        let width = Self.accessoryWidth(showingAudio: showing)
-        if container.frame.width != width { container.setFrameSize(NSSize(width: width, height: container.frame.height)) }
-        button.frame.origin = NSPoint(x: 0, y: 0)
-        popUp.frame.origin = NSPoint(x: showing ? 34 : 0, y: 0)
+    /// The accessory's width: the speed menu alone, or with the audio selector before it.
+    private static func accessoryWidth(showingAudio: Bool) -> CGFloat {
+        showingAudio ? 80 + audioSelectorGap + audioSelectorWidth : 80
     }
 
-    /// The switch was clicked: what it does is decided from `audioState` now, not from how it
-    /// looked. AppKit already flipped its look; it is set back from the state at once, and again
-    /// when the controller reports the new state, so it never shows a choice that wasn't applied.
-    func audioButtonClicked() {
-        let action = RecordingPlayerPolicy.audioButton(audioState)?.action
-        updateAudioItems()
-        guard isOpen, let action else { return }
+    /// Places the selector and the speed menu for the selector's visibility, so a hidden
+    /// selector leaves no gap before the speed menu.
+    private func layOutAccessory() {
+        guard let popUp = speedPopUp, let control = audioSelector, let container = popUp.superview else { return }
+        let showing = !control.isHidden
+        let width = Self.accessoryWidth(showingAudio: showing)
+        if container.frame.width != width { container.setFrameSize(NSSize(width: width, height: container.frame.height)) }
+        control.frame.origin = NSPoint(x: 0, y: 0)
+        popUp.frame.origin = NSPoint(x: showing ? Self.audioSelectorWidth + Self.audioSelectorGap : 0, y: 0)
+    }
+
+    /// A segment was clicked: what it does is decided from `audioState` now, not from how the
+    /// control looked. AppKit already moved the selection to `index`; it is set back from the
+    /// state at once, and again when the controller reports the new state, so it never shows a
+    /// choice that wasn't applied. The selected segment, a disabled one and an index that is no
+    /// segment do nothing.
+    func audioSegmentClicked(_ index: Int) {
+        let presentation = RecordingPlayerPolicy.audioSelector(audioState)
+        updateAudioSelector()
+        guard isOpen, let presentation, presentation.segments.indices.contains(index), index != presentation.selected,
+              let action = presentation.segments[index].action else { return }
         onAudioAction?(recordingID, action)
     }
 
@@ -1271,7 +1583,6 @@ enum RecordingPlayerError: Error {
             item.representedObject = NSNumber(value: speed)
             menu.addItem(item)
         }
-        addAudioItems(to: menu)
         menu.addItem(.separator())
         let shortcutsHeader = NSMenuItem(title: tr("Scorciatoie da tastiera", "Keyboard shortcuts"), action: nil, keyEquivalent: "")
         shortcutsHeader.isEnabled = false
@@ -1286,89 +1597,27 @@ enum RecordingPlayerError: Error {
         popUp.setAccessibilityLabel(tr("Velocità di riproduzione", "Playback speed"))
     }
 
-    /// The Audio section of the title-bar menu (`audioState`): a separator, a header, the three
-    /// single-choice items (Off, Levelled voice, Isolated voice) and a detail item (why the last
-    /// attempt failed, or how to get ffmpeg). Tagged so `updateAudioItems` finds them; hidden
-    /// while the state is nil.
-    private func addAudioItems(to menu: NSMenu) {
-        let separator = NSMenuItem.separator()
-        separator.tag = AudioMenuTag.separator
-        menu.addItem(separator)
-        let header = NSMenuItem(title: RecordingPlayerPolicy.audioMenuHeader(), action: nil, keyEquivalent: "")
-        header.isEnabled = false
-        header.tag = AudioMenuTag.header
-        menu.addItem(header)
-        for tag in AudioMenuTag.choices + [AudioMenuTag.detail] {
-            let window = self.window
-            let action = PlayerMenuAction { [weak self, weak window] in
-                guard let self, let window, self.window === window else { return }
-                self.audioItemChosen(tag)
+    /// The selector's segments for `audioState`, updated in place: selection, enabled state,
+    /// icons, tooltips (and accessibility labels, through the icons' descriptions) in the current
+    /// language, and visibility.
+    private func updateAudioSelector() {
+        guard let control = audioSelector else { return }
+        let presentation = RecordingPlayerPolicy.audioSelector(audioState)
+        let hidden = presentation == nil
+        if let presentation {
+            control.setAccessibilityLabel(presentation.label)
+            for (index, segment) in presentation.segments.enumerated() {
+                control.setImage(NSImage(systemSymbolName: segment.symbol, accessibilityDescription: segment.label), forSegment: index)
+                control.setLabel("", forSegment: index)
+                control.setToolTip(segment.toolTip, forSegment: index)
+                control.setEnabled(segment.action != nil, forSegment: index)
             }
-            menuActions.append(action)
-            let item = NSMenuItem(title: "", action: #selector(PlayerMenuAction.invoke(_:)), keyEquivalent: "")
-            item.target = action
-            item.tag = tag
-            menu.addItem(item)
+            control.selectedSegment = presentation.selected
         }
-        updateAudioItems()
-    }
-
-    /// Tags of the Audio section's items: distinct from 0, the tag of every other item.
-    enum AudioMenuTag {
-        static let separator = 9_001
-        static let header = 9_002
-        static let detail = 9_004
-        /// The three choices, in the order of `AudioMenuPresentation.items`: Off, Levelled
-        /// voice, Isolated voice.
-        static let off = 9_003
-        static let levelled = 9_005
-        static let isolated = 9_006
-        static let choices = [off, levelled, isolated]
-    }
-
-    /// The Audio items' titles and states for `audioState`, updated in place, no rebuild; the
-    /// title-bar switch too.
-    private func updateAudioItems() {
-        if let button = audioButton {
-            let presentation = RecordingPlayerPolicy.audioButton(audioState)
-            let hidden = presentation == nil
-            button.state = presentation?.isOn == true ? .on : .off
-            button.isEnabled = presentation?.action != nil
-            button.toolTip = presentation?.toolTip
-            if button.isHidden != hidden {
-                button.isHidden = hidden
-                layOutAccessory()
-            }
+        if control.isHidden != hidden {
+            control.isHidden = hidden
+            layOutAccessory()
         }
-        guard let menu = speedPopUp?.menu else { return }
-        let presentation = RecordingPlayerPolicy.audioMenu(audioState)
-        for tag in [AudioMenuTag.separator, AudioMenuTag.header] {
-            menu.item(withTag: tag)?.isHidden = presentation == nil
-        }
-        for (index, tag) in AudioMenuTag.choices.enumerated() {
-            guard let item = menu.item(withTag: tag) else { continue }
-            let choice = presentation.flatMap { $0.items.indices.contains(index) ? $0.items[index] : nil }
-            item.isHidden = choice == nil
-            item.title = choice?.title ?? ""
-            item.isEnabled = choice?.action != nil
-            item.state = choice?.checked == true ? .on : .off
-        }
-        if let detail = menu.item(withTag: AudioMenuTag.detail) {
-            detail.isHidden = presentation?.detail == nil
-            detail.title = presentation?.detail?.title ?? ""
-            detail.isEnabled = presentation?.detail?.action != nil
-            detail.state = .off
-        }
-    }
-
-    /// An Audio item was clicked: what it does is decided from the state at the time of the
-    /// click, never from the title it was built with.
-    func audioItemChosen(_ tag: Int) {
-        guard isOpen, let presentation = RecordingPlayerPolicy.audioMenu(audioState) else { return }
-        // The item already checked does nothing: it is where the lecture already is.
-        let choice = AudioMenuTag.choices.firstIndex(of: tag).flatMap { presentation.items.indices.contains($0) ? presentation.items[$0] : nil }
-        guard let choice, !choice.checked, let action = choice.action else { return }
-        onAudioAction?(recordingID, action)
     }
 
     /// Shows the applied speed in the title-bar menu and gives `AVPlayerView` the speeds the item
@@ -1433,6 +1682,8 @@ enum RecordingPlayerError: Error {
     /// every replacement and, through `stopPlayback`, on close.
     private func removeItemObservers() {
         removeProgressObserver()
+        stallTask?.cancel()
+        stallTask = nil
         statusObservation?.invalidate()
         statusObservation = nil
         timeControlObservation?.invalidate()
@@ -1457,6 +1708,10 @@ enum RecordingPlayerError: Error {
         pendingStartAt = nil
         pendingSeekTarget = nil
         removeItemObservers()
+        if let wakeObserver { workspaceNotificationCenter.removeObserver(wakeObserver) }
+        wakeObserver = nil
+        pausedSince = nil
+        lastWake = nil
         player?.pause()
         player?.replaceCurrentItem(with: nil)
         playerView?.setValue(nil, forKey: "player")

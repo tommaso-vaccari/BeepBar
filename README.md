@@ -78,10 +78,6 @@ Open conflicts show up as a badge in the menu bar and in the app's **Conflitti**
 
 BeepBar checks for new builds via [Sparkle](https://sparkle-project.org), against an appcast published alongside every push to `main`. Automatic checks are enabled by default and run every eight hours; you can disable **"Controlla automaticamente gli aggiornamenti"** in Impostazioni or trigger a one-off check with **"Cerca aggiornamenti…"**. Every update is signed with an EdDSA key that never leaves this repo's secrets, and Sparkle verifies that signature before installing anything.
 
-## Telemetry
-
-The upcoming version on `dev` uses [TelemetryDeck](https://telemetrydeck.com) for aggregate app and major macOS version statistics to plan maintenance and compatibility. Telemetry is optional and enabled by default, with a notice before the first report. It makes at most one reporting attempt per UTC day; the first monthly attempt is counted separately using a local marker. Every installation sends the same shared identifier, with no individual installation ID, language, settings, account, course or file data. TelemetryDeck receives the connection IP; it states that it does not retain IPs, but guarantees no deletion deadline for archived events. Turn off **"Telemetria"** in Impostazioni to stop future reports and cancel pending work without losing features; this does not delete events already sent. These are best-effort reporting-installation counts, not counts of people. See the [protocol and limits](docs/telemetry.md) and [privacy notice](docs/privacy-notice.md). This describes unreleased `dev` behavior; published releases can differ.
-
 ## Requirements
 
 - macOS 14 or later

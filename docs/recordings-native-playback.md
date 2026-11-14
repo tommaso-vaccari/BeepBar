@@ -29,7 +29,7 @@ All findings below come from `scripts/recman-probe.sh play` / `lab` runs on 2026
 
 ## Chosen design
 
-1. `URLSession`, no cookies, no redirects followed, `Accept: */*`: GET `ldr.php` → `302` → uuid from `Location`. Never load the player page (it pulls u2c catalogs, device registration, KMS, telemetry and Amplitude, and would play audio hidden).
+1. `URLSession`, no cookies, no redirects followed, `Accept: */*`: GET `ldr.php` → `302` → uuid from `Location`. Never load the player page (it pulls u2c catalogs, device registration, KMS, Cisco/Webex analytics and Amplitude, and would play audio hidden).
 2. `URLSession` to the stream API with the Webex cookies of the Recman store (only `ticket` matters) → `hlsURL` → native player (cookie-less).
 3. On `403`: sign in to Webex in the hidden Recman web view through the webappng login URL with `email=<confirmed Polimi email>`; Polimi SSO completes; wait for `ticket`; retry step 2 once. If a page asks for the user, the existing sign-in window flow applies. A `200` without `hlsURL` (no HLS for this recording) → browser, without signing in: live, signed out was only ever a `403`.
    - After the sign-in, whatever its outcome, the hidden web view is reset to `about:blank`, so no Webex page keeps running. Whether the final webappng → playback hop is a main-frame navigation (which the navigation policy can cancel) must be confirmed live; if it were in-page (SPA) routing, the `about:blank` reset still bounds its cost to the moments before the ticket is seen.

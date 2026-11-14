@@ -3,19 +3,18 @@ import CryptoKit
 import BeepbarCore
 import OSLog
 
-/// What the player's Audio menu shows for the lecture on screen.
+/// What the player's enhanced-audio selector shows for the lecture on screen.
 enum AudioEnhancementState: Equatable, Sendable {
-    /// No ffmpeg where package managers install it: the menu says how to get it.
+    /// No ffmpeg where package managers install it: the selector is disabled and says how to get it.
     case needsFFmpeg
     /// The lecture plays Webex's own stream. `preferred` is the kind the student chose last
-    /// (`RecordingsController.resolveEnhancedAudioKind`): the one the title-bar switch turns on.
+    /// (`RecordingsController.resolveEnhancedAudioKind`). The title-bar selector does not use it: each segment asks for its own mode.
     case off(preferred: AudioEnhancementKind)
     /// The lecture plays through the local filter (`LiveAudioSession`) of this kind.
     case on(AudioEnhancementKind)
     /// Enhanced audio stopped working for this lecture (ffmpeg failed, the stream isn't the
     /// layout it understands): the lecture went back to its own stream, and choosing a kind
-    /// tries again; `preferred` is the one the title-bar switch tries. The message is already
-    /// bilingual.
+    /// tries again (`preferred` as above). The message is already bilingual.
     case failed(BilingualText, preferred: AudioEnhancementKind)
 }
 
@@ -30,97 +29,83 @@ extension AudioEnhancementKind {
     }
 }
 
-/// What the player's Audio menu shows for one state: pure, so tests check every state's text
-/// and action without a window.
-struct AudioMenuPresentation: Equatable {
-    struct Item: Equatable {
-        let title: String
-        /// nil: shown disabled.
+/// The enhanced-audio selector in the player's title bar, to the left of the speed menu: three
+/// segments, icons only, exactly one selected. Pure, so tests check every state's selection,
+/// tooltips and actions without a window.
+struct AudioSelectorPresentation: Equatable {
+    struct Segment: Equatable {
+        /// The SF Symbol drawn in the segment.
+        let symbol: String
+        /// The mode's name: the segment's accessibility label.
+        let label: String
+        /// What hovering shows: the feature's name and the mode, plus the ffmpeg hint or the
+        /// failure and that a click tries again, where they apply.
+        let toolTip: String
+        /// What a click on it asks for; nil: shown disabled (no ffmpeg).
         let action: PlayerAudioAction?
-        var checked = false
     }
-    /// The three single-choice items, in order: Off, Levelled voice, Isolated voice. Exactly one
-    /// is checked.
-    let items: [Item]
-    /// A second line, disabled: why the last attempt failed or how to get ffmpeg; nil for none.
-    let detail: Item?
+    /// In order: Off, Levelled voice, Isolated voice.
+    let segments: [Segment]
+    /// The index of the selected segment: where the lecture is. Failed counts as Off, since the
+    /// lecture went back to Webex's own audio.
+    let selected: Int
+    /// The control's own accessibility label.
+    let label: String
 }
 
 extension RecordingPlayerPolicy {
-    /// The Audio menu for `state`, in the current language; nil hides the section.
+    /// The selector for `state`, in the current language; nil hides it (no lecture, or no account
+    /// the lecture's state could belong to). Built at use, never cached, so a language switch
+    /// shows at once.
     ///
-    /// A bare "Audio" header above "Spento" would read as "audio muted", so the section is
-    /// titled by the feature (`audioMenuHeader`), and the failed state checks "Spento": the
-    /// lecture is on its own audio, and choosing a kind tries again.
-    static func audioMenu(_ state: AudioEnhancementState?) -> AudioMenuPresentation? {
+    /// What the click on a segment does is chosen here from the state at click time, never from
+    /// how the control looked: a segment asks for its own mode (`.use(kind)`, `.use(nil)` for
+    /// Off), and the selected one is not asked again by the controller.
+    static func audioSelector(_ state: AudioEnhancementState?) -> AudioSelectorPresentation? {
         guard let state else { return nil }
-        let playing: AudioEnhancementKind?
+        let feature = audioFeatureName()
+        let selected: Int
         var enabled = true
-        var detail: AudioMenuPresentation.Item?
+        var note: String?
         switch state {
         case .needsFFmpeg:
-            playing = nil
+            selected = 0
             enabled = false
-            detail = .init(title: ffmpegHint(), action: nil)
-        case .off: playing = nil
-        case .on(let kind): playing = kind
+            note = ffmpegHint()
+        case .off:
+            selected = 0
+        case .on(let kind):
+            selected = kind == .levelled ? 1 : 2
         case .failed(let message, _):
-            playing = nil
-            detail = .init(title: message.text, action: nil)
+            // The reason is shown only here, on the kinds' tooltips (the speed menu has no Audio
+            // section any more); choosing a kind tries again.
+            selected = 0
+            note = message.text
         }
-        func item(_ title: String, _ kind: AudioEnhancementKind?) -> AudioMenuPresentation.Item {
-            .init(title: title, action: kind == nil || enabled ? .use(kind) : nil, checked: kind == playing)
+        func segment(_ symbol: String, _ name: String, _ kind: AudioEnhancementKind?) -> AudioSelectorPresentation.Segment {
+            var toolTip = "\(feature): \(name)"
+            if let note {
+                toolTip += "\n" + note
+                if kind != nil, case .failed = state {
+                    toolTip += " " + tr("Fai clic per riprovare.", "Click to try again.")
+                }
+            }
+            return .init(symbol: symbol, label: name, toolTip: toolTip, action: enabled ? .use(kind) : nil)
         }
-        return AudioMenuPresentation(items: [item(tr("Spento", "Off"), nil),
-                                             item(AudioEnhancementKind.levelled.displayName, .levelled),
-                                             item(AudioEnhancementKind.isolated.displayName, .isolated)],
-                                     detail: detail)
+        return AudioSelectorPresentation(
+            segments: [segment("waveform.slash", tr("Spento", "Off"), nil),
+                       segment("waveform", AudioEnhancementKind.levelled.displayName, .levelled),
+                       segment("person.wave.2", AudioEnhancementKind.isolated.displayName, .isolated)],
+            selected: selected,
+            label: feature)
     }
 
-    /// The header of the Audio section.
-    static func audioMenuHeader() -> String { tr("Audio migliorato", "Enhanced audio") }
+    /// The feature's name: the selector's accessibility label and the start of every tooltip.
+    static func audioFeatureName() -> String { tr("Audio migliorato", "Enhanced audio") }
 
-    /// How to get ffmpeg: the menu's detail line and the switch's tooltip without it.
+    /// How to get ffmpeg, on every segment's tooltip while it is missing.
     static func ffmpegHint() -> String {
         tr("Per l'audio migliorato installa ffmpeg (brew install ffmpeg)", "Enhanced audio needs ffmpeg (brew install ffmpeg)")
-    }
-}
-
-/// The enhanced-audio switch in the player's title bar, next to the speed menu: a two-state
-/// toggle between Off and the kind the student used last, always in sight. Pure, like
-/// `AudioMenuPresentation`.
-struct AudioButtonPresentation: Equatable {
-    /// Lit: the lecture plays through the filter.
-    let isOn: Bool
-    /// What a click asks for; nil: shown disabled (no ffmpeg).
-    let action: PlayerAudioAction?
-    /// What hovering shows: the switch's name, state and mode, how to get ffmpeg, or why it failed.
-    let toolTip: String
-}
-
-extension RecordingPlayerPolicy {
-    /// The title-bar switch for `state`, in the current language; nil hides it (no lecture, or
-    /// no account the lecture's state could belong to).
-    static func audioButton(_ state: AudioEnhancementState?) -> AudioButtonPresentation? {
-        guard let state else { return nil }
-        switch state {
-        case .needsFFmpeg:
-            return AudioButtonPresentation(isOn: false, action: nil, toolTip: ffmpegHint())
-        case .off(let preferred):
-            return AudioButtonPresentation(isOn: false, action: .use(preferred), toolTip: tr(
-                "Audio migliorato: spento. Fai clic per attivare «\(preferred.displayName)».",
-                "Enhanced audio: off. Click to turn on \u{201C}\(preferred.displayName)\u{201D}."))
-        case .on(let kind):
-            return AudioButtonPresentation(isOn: true, action: .use(nil), toolTip: tr(
-                "Audio migliorato: \(kind.displayName). Fai clic per tornare all'audio originale.",
-                "Enhanced audio: \(kind.displayName). Click to go back to the original audio."))
-        case .failed(let message, let preferred):
-            // The click retries `preferred`, so the tooltip says so after the reason; built here, at use
-            // time, so that it follows a language switch like `message` does.
-            return AudioButtonPresentation(isOn: false, action: .use(preferred), toolTip: message.text + " " + tr(
-                "Fai clic per riprovare con «\(preferred.displayName)».",
-                "Click to try \u{201C}\(preferred.displayName)\u{201D} again."))
-        }
     }
 }
 
@@ -129,6 +114,8 @@ extension RecordingPlayerPolicy {
 enum LiveAudioFailure: Equatable, Sendable {
     /// Webex refused the lecture's address (401/403/404/410): it expired. A fresh stream from the
     /// archive fixes it, so the usual recovery runs and the filter is rebuilt from the new address.
+    /// The session's own classification counts as the cause (`RecordingsController.recovery(for:attemptsUsed:viaFilter:)`),
+    /// since the player only sees its local server failing; the same retry budget applies (#241).
     case streamRefused
     /// Webex or the connection failed for now (offline, a timeout, a 5xx): not the filter's
     /// fault. The usual recovery runs, as it would without the filter, and the filter is

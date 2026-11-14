@@ -241,7 +241,11 @@ struct WebexStreamResolverTests {
 
     // MARK: Cancellation
 
-    /// Cancelling the Play while the API hangs ends it at once, and nothing follows.
+    /// Cancelling the Play while the API hangs ends it, and nothing follows. The stub never answers
+    /// until its task is cancelled; the only other end is the transport's own 30 s timeout, which
+    /// would surface as `unavailable`, so the outcome `cancelled` proves the cancellation did it
+    /// (no elapsed-time bound: the old 5 s one measured machine load, #243; a cancellation that
+    /// never arrived hangs until the `.timeLimit` guard).
     @Test(.timeLimit(.minutes(1))) func cancellingMidRequestEndsAtOnce() async throws {
         liveWebex(api: .hang)
         let browser = FakeBrowser(cookies: [])
@@ -252,11 +256,8 @@ struct WebexStreamResolverTests {
             try await Task.sleep(for: .milliseconds(10))
         }
         try #require(WebexStubProtocol.requests.count == 2)
-        let clock = ContinuousClock()
-        let started = clock.now
         task.cancel()
         #expect(await outcome { try await task.value } == "cancelled")
-        #expect(clock.now - started < .seconds(5))
         #expect(browser.events.isEmpty)
         #expect(requestedURLs == [Self.player.absoluteString, Self.api])
     }

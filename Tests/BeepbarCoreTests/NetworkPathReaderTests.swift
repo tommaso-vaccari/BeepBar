@@ -55,27 +55,24 @@ struct NetworkPathReaderTests {
         #expect(provider.cleanups == 0)
     }
 
-    @Test func cancellationOfSilentProviderIsPromptAndCleansUp() async {
+    /// A provider that never answers (and whose timeout is never fired) ends only by cancellation:
+    /// the read returns nil and the provider's cleanup has run. Finishing at all proves the
+    /// cancellation arrived (a reader that ignored it hangs until the `.timeLimit` guard); no
+    /// 100 ms bound decides it, as it failed on a loaded machine (#243).
+    @Test(.timeLimit(.minutes(1))) func cancellationOfSilentProviderIsPromptAndCleansUp() async {
         let provider = PathProvider()
-        let finished = OSAllocatedUnfairLock(initialState: false)
-        let task = Task {
-            let result = await NetworkPathReader.current(start: provider.start)
-            finished.withLock { $0 = true }
-            return result
-        }
+        let task = Task { await NetworkPathReader.current(start: provider.start) }
         await provider.waitForStart()
-        let clock = ContinuousClock()
-        let start = clock.now
         task.cancel()
-        while !finished.withLock({ $0 }), clock.now - start < .milliseconds(100) { await Task.yield() }
-        #expect(finished.withLock { $0 })
-        #expect(provider.cleanups == 1)
-        // Also lets the cancellation mutation terminate, rather than hanging the suite.
-        provider.timeout()
         #expect(await task.value == nil)
+        #expect(provider.cleanups == 1)
     }
 
-    @Test func cancellationDuringInstallationReleasesLateResources() async {
+    /// A cancellation that arrives while the provider is still installing (its `start` has not
+    /// returned) still releases what it installs once it returns. The provider stays silent and its
+    /// timeout is never fired, so the read ends only through the cancellation; awaiting it
+    /// replaces the 100 ms poll that failed on a loaded machine (#243).
+    @Test(.timeLimit(.minutes(1))) func cancellationDuringInstallationReleasesLateResources() async {
         let provider = PathProvider()
         let release = DispatchSemaphore(value: 0)
         let task = Task.detached {
@@ -88,11 +85,6 @@ struct NetworkPathReaderTests {
         await provider.waitForStart()
         task.cancel()
         release.signal()
-        let clock = ContinuousClock()
-        let deadline = clock.now + .milliseconds(100)
-        while provider.cleanups == 0, clock.now < deadline { await Task.yield() }
-        #expect(provider.cleanups == 1)
-        provider.timeout()
         #expect(await task.value == nil)
         #expect(provider.cleanups == 1)
     }

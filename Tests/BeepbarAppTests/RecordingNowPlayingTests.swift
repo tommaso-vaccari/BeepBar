@@ -254,12 +254,13 @@ struct RecordingNowPlayingTests {
     }
 
     /// A loader that never answers stops at the timeout, an answer over the cap is refused, and
-    /// an answer that is not a picture fails: each is an error, never a hang or a crash.
-    @Test func slowOversizedOrBrokenAnswersFail() async {
-        let slow: RecordingArtwork.Loader = { _ in try await Task.sleep(for: .seconds(30)); return Data() }
-        let started = Date()
+    /// an answer that is not a picture fails: each is an error, never a hang or a crash. The slow
+    /// loader answers by itself never (a day), so `timedOut` can only come from the timeout
+    /// firing; no elapsed-time bound decides it (the old 5 s one measured machine load, #243), and
+    /// a timeout that did not fire hangs until the `.timeLimit` guard.
+    @Test(.timeLimit(.minutes(1))) func slowOversizedOrBrokenAnswersFail() async {
+        let slow: RecordingArtwork.Loader = { _ in try await Task.sleep(for: .seconds(86_400)); return Data() }
         await #expect(throws: RecordingArtwork.Failure.timedOut) { try await RecordingArtwork.load(Self.courseA, loader: slow, timeout: .milliseconds(100)) }
-        #expect(Date().timeIntervalSince(started) < 5)
         let huge: RecordingArtwork.Loader = { _ in Data(count: 101) }
         await #expect(throws: RecordingArtwork.Failure.tooLarge) { try await RecordingArtwork.load(Self.courseA, loader: huge, maximumBytes: 100) }
         let html: RecordingArtwork.Loader = { _ in Data("<html>".utf8) }

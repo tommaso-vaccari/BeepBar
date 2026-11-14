@@ -453,14 +453,18 @@ struct RecordingPlayerMVPTests {
         #expect(popUp.frame.minX > control.frame.maxX, "the selector overlaps the speed menu")
         #expect((0..<3).allSatisfy { control.image(forSegment: $0) != nil }, "a segment has no icon")
 
-        // A real click through the control's own target-action (a hop to the main actor).
+        // The control's own target-action (a hop to the main actor), sent directly. Not
+        // `performClick`: it tracks the click in a nested event loop, and the stop it posts to end
+        // that loop can land on the outer main run loop instead. In the test process that loop
+        // ending is the end of the program: the run exited with status 0 after 853 of 971 tests,
+        // with no summary and no failure (#243).
         control.selectedSegment = 2
-        control.performClick(nil)
+        #expect(control.sendAction(control.action, to: control.target))
         try await Self.waitUntil { asked.count == 1 }
         #expect(asked == [.use(.isolated)])
         #expect(control.selectedSegment == 0, "the selector showed a choice the controller hadn't applied")
         control.selectedSegment = 1
-        control.performClick(nil)
+        #expect(control.sendAction(control.action, to: control.target))
         try await Self.waitUntil { asked.count == 2 }
         #expect(asked.last == .use(.levelled), "a segment asked for another mode")
 
@@ -484,7 +488,7 @@ struct RecordingPlayerMVPTests {
         try await playReady(controller)
         controller.showAudioEnhancement(.off(preferred: .isolated), recordingID: controller.recordingID)
         control.selectedSegment = 2
-        control.performClick(nil)
+        #expect(control.sendAction(control.action, to: control.target))
         try await Self.waitUntil { asked.count == before + 2 }
         controller.showAudioEnhancement(nil, recordingID: controller.recordingID)
         #expect(control.isHidden)

@@ -197,10 +197,14 @@ struct RecmanWebSessionTests {
 /// Promise, which is how a script is made to never answer.
 @MainActor
 struct RecmanWebSessionScriptTests {
-    /// A Promise that never settles. WebKit has been seen to give up on it by itself after about
-    /// 6 s, answering nil, so the interruption tests check how the call ended (`.interrupted`):
-    /// a call that WebKit ended reads `.answered(nil)`, whatever the timing.
-    private static let stalled = "return new Promise(() => {})"
+    /// A Promise that never settles, kept reachable from the page's global object. Without that
+    /// reference WebKit answers nil by itself as soon as its garbage collector finds the Promise
+    /// unreachable: about 6 s on an idle machine, at any moment under load, which made
+    /// `aNewOperationEndsThePreviousScript` read `.answered(nil)` in a loaded gate run (#243).
+    /// Referenced, it was seen still waiting after 20 s, so only the session can end the call.
+    /// The interruption tests still check how the call ended (`.interrupted`): a call that
+    /// WebKit ended reads `.answered(nil)`, whatever the timing.
+    private static let stalled = "globalThis.beepbarStalled = new Promise(() => {}); return globalThis.beepbarStalled"
 
     /// A generous finite script timeout bounds a broken interruption:
     /// the distinct `.interrupted` outcome identifies the interruption, so no elapsed-time bound is needed (the old 15 s bound was flaky under a

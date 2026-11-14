@@ -13,7 +13,13 @@ esac
 python3 scripts/test_benchmark_compare.py
 python3 scripts/test_ui_benchmark.py
 bash scripts/test-linux-core-tests.sh
-swift test
+bash scripts/test-check-test-run-complete.sh
+# The exit status of `swift test` does not show a test process that ended early (it exits 0), so
+# the log is checked too: every run that started must have printed its passing summary (#243).
+test_log=$(mktemp)
+swift test 2>&1 | tee "$test_log"
+bash scripts/check-test-run-complete.sh "$test_log"
+rm -f "$test_log"
 python3 scripts/recordings-seen-isolated-tests.py
 bash scripts/test-release-notes.sh
 bash scripts/test-build-version.sh

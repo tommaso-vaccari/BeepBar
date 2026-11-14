@@ -45,6 +45,11 @@ import os
     /// ends without a new stream or the browser (issue #197): with no Recordings page open, the
     /// paused window is the only place that can explain it. Does nothing when no lecture is open.
     func showProblem(_ message: String)
+    /// Puts the course name back under the title, but only while the window still shows
+    /// `message` (a transient notice such as "Reopening the lecture…" that its owner ends without
+    /// a lecture to show): a later, truer message is never overwritten. Does nothing when no
+    /// lecture is open.
+    func clearProblem(_ message: String)
     /// Makes the player restore `policy` when it closes, for code that raised BeepBar to a
     /// regular app and finds a lecture open when it is done; see
     /// `RecordingPlayerController.adoptPolicyToRestore`.
@@ -115,6 +120,143 @@ enum RecordingPlaybackFailure {
     /// window stays open and paused at `position` seconds, so the caller can fetch a fresh stream
     /// URL and resume there, or offer the browser.
     case duringPlayback(Error?, position: TimeInterval)
+}
+
+/// Why a stream that was playing can no longer be trusted, as the player reports it through
+/// `RecordingPlaybackFailure.duringPlayback` (#241). Webex's stream addresses are short-lived: a
+/// lecture paused for a while, or left across a sleep, resumes into an address that no longer
+/// answers, and the old behaviour was an error banner for a lecture that a fresh address would
+/// play. The controller treats every case as recoverable (`RecordingStreamPolicy.classify`).
+enum RecordingStreamError: Error, Equatable {
+    /// The student started playback after a long pause or a wake from sleep
+    /// (`RecordingStreamPolicy.isStale`), so the player did not even try the old address.
+    case stale
+    /// The player sat in `waitingToPlayAtSpecifiedRate` for `RecordingStreamPolicy.stallThreshold`.
+    case stalled
+    /// The server answered the item's request with this HTTP status (from the item's error log,
+    /// where AVFoundation's own error only says "-11800" with the status buried underneath).
+    case http(Int)
+}
+
+/// The pure decisions about a stream that stopped or may have expired (#241), apart from the
+/// player and the controller so tests read them as a table. Every number here has a reason and
+/// is a named constant, not a literal at the point of use.
+enum RecordingStreamPolicy {
+    /// A lecture paused this long is assumed to hold an expired address. Webex's HLS addresses
+    /// are short-lived (minutes to tens of minutes, not documented), so a long pause is the
+    /// common way to meet one; a shorter pause keeps playing the same address.
+    nonisolated static let staleAfterPause: TimeInterval = 10 * 60
+    /// How long the player may sit waiting for data, once playing had started, before the stream
+    /// is treated as gone. A dead address often stalls rather than failing (AVFoundation retries
+    /// quietly); 15 s is longer than a normal rebuffer on a slow connection and short enough that
+    /// the student is not left staring at a frozen picture.
+    nonisolated static let stallThreshold: TimeInterval = 15
+    /// How many fresh streams one failure episode may ask for before the banner and the browser.
+    /// The first is immediate (as before #241); the others wait (`delays`).
+    nonisolated static let maximumAttempts = 4
+    /// Seconds to wait before attempt n (index n-1). The first attempt is immediate, so a plain
+    /// mid-lecture expiry is not slowed down; the later ones, 1 + 3 + 8 s in all, cover a network
+    /// that is still coming back after a wake and give a slow Webex or Polimi time to answer.
+    nonisolated static let delays: [TimeInterval] = [0, 1, 3, 8]
+    /// The longest one failure episode (first failure to the last attempt) may last, measured
+    /// from its first failure. It bounds the chain even when plays between failures are short.
+    nonisolated static let episodeTimeout: TimeInterval = 90
+    /// Seconds of lecture played after a recovery for the episode to count as over: its attempts
+    /// are forgotten, so the next sleep in the same session gets a full budget again. Measured
+    /// in media time, not by a clock. Known limitation: it is the difference of two positions, so
+    /// a seek forward of 30 s or more also counts as played time.
+    nonisolated static let stablePlayback: TimeInterval = 30
+    /// HTTP statuses a fresh stream fixes or that pass: an expired or refused address (401, 403,
+    /// 404, 410: the same four `LiveAudioFailure.streamRefused` treats as an expired address) and
+    /// a gateway or server hiccup (any 5xx, consistent with `LiveAudioFailure.network`).
+    nonisolated static func isRecoverableStatus(_ status: Int) -> Bool {
+        [401, 403, 404, 410].contains(status) || (500...599).contains(status)
+    }
+    /// URLSession errors that mean "the network is not there right now".
+    nonisolated static let transientURLErrors: Set<Int> = [
+        NSURLErrorNotConnectedToInternet, NSURLErrorTimedOut, NSURLErrorNetworkConnectionLost,
+        NSURLErrorCannotConnectToHost, NSURLErrorCannotFindHost, NSURLErrorDNSLookupFailed,
+    ]
+    /// The only causes known not to be fixed by asking for another stream: the address itself is
+    /// not a URL this player can open (the resolver builds it the same way each time). Kept
+    /// minimal on purpose: everything else not recognised is `unclassified`, which still gets
+    /// the one fresh stream the app always gave.
+    nonisolated static let permanentURLErrors: Set<Int> = [NSURLErrorBadURL, NSURLErrorUnsupportedURL]
+
+    /// How much a failure's cause says about whether a fresh stream helps (#241).
+    enum Cause: Equatable {
+        /// Known to be fixed, or passed, by a fresh stream: the full budget (`maximumAttempts`).
+        case recoverable
+        /// Not recognised (no error, an unknown domain or code, an HTTP status in neither list, a
+        /// missing status; real Webex expiry can arrive like this, wrapped by AVFoundation): exactly
+        /// one fresh stream, then the browser.
+        case unclassified
+        /// Positively not fixable by a fresh stream: the browser at once.
+        case permanent
+
+        /// How many attempts one episode may spend on a failure of this class.
+        var attemptLimit: Int {
+            switch self {
+            case .recoverable: return RecordingStreamPolicy.maximumAttempts
+            case .unclassified: return 1
+            case .permanent: return 0
+            }
+        }
+    }
+
+    /// Whether playback started now would use an address that has probably expired: the lecture
+    /// has been paused for `staleAfterPause` or more, or the Mac woke up after it was paused.
+    /// `pausedSince` is nil while playing (never stale). Timestamps only: nothing runs while
+    /// the lecture is paused.
+    nonisolated static func isStale(pausedSince: Date?, lastWake: Date?, now: Date) -> Bool {
+        guard let pausedSince else { return false }
+        if now.timeIntervalSince(pausedSince) >= staleAfterPause { return true }
+        if let lastWake, lastWake >= pausedSince { return true }
+        return false
+    }
+
+    /// Classifies `error` (see `Cause`). AVFoundation wraps the real cause (an `NSURLError`) under
+    /// `NSUnderlyingErrorKey`, so the chain is followed; the first level that says something
+    /// decides, and a chain that says nothing is `unclassified`.
+    nonisolated static func classify(_ error: Error?) -> Cause {
+        var current = error
+        var depth = 0
+        while let error = current, depth < 5 {
+            if let stream = error as? RecordingStreamError {
+                switch stream {
+                case .stale, .stalled: return .recoverable
+                case .http(let status): return isRecoverableStatus(status) ? .recoverable : .unclassified
+                }
+            }
+            let ns = error as NSError
+            if ns.domain == NSURLErrorDomain {
+                if transientURLErrors.contains(ns.code) { return .recoverable }
+                if permanentURLErrors.contains(ns.code) { return .permanent }
+            }
+            current = ns.userInfo[NSUnderlyingErrorKey] as? Error
+            depth += 1
+        }
+        return .unclassified
+    }
+
+    /// The wait before attempt `attempt` (1-based), nil once the budget is spent.
+    nonisolated static func delay(beforeAttempt attempt: Int) -> TimeInterval? {
+        guard attempt >= 1, attempt <= maximumAttempts, attempt <= delays.count else { return nil }
+        return delays[attempt - 1]
+    }
+
+    /// Whether another attempt may start: some budget is left and the episode is not too old.
+    nonisolated static func mayRetry(attemptsUsed: Int, episodeAge: TimeInterval) -> Bool {
+        attemptsUsed < maximumAttempts && episodeAge < episodeTimeout
+    }
+
+    /// The failure to report for an item that failed: the HTTP status from its error log when it
+    /// has one, else AVFoundation's own error. Known limitation: the status is the last event of the
+    /// item's error log, which may belong to an earlier request than the one that failed it.
+    nonisolated static func cause(error: Error?, httpStatus: Int?) -> Error? {
+        if let httpStatus, httpStatus >= 400 { return RecordingStreamError.http(httpStatus) }
+        return error
+    }
 }
 
 /// Errors the player raises itself, as opposed to those AVFoundation reports for the stream.
@@ -266,6 +408,23 @@ enum RecordingPlayerError: Error {
     private var rateSupportObservations: [NSKeyValueObservation] = []
     private var defaultRateObservation: NSKeyValueObservation?
     private var failedToEndObserver: NSObjectProtocol?
+    /// `NSWorkspace.didWakeNotification` is posted on the workspace's own center, not the default
+    /// one, hence a second injected center.
+    private let workspaceNotificationCenter: NotificationCenter
+    private let now: () -> Date
+    private let sleep: @Sendable (TimeInterval) async throws -> Void
+    /// The wake observer: exists only while a lecture is open (added by `play`, removed by
+    /// `stopPlayback`), so a closed player has no observer at all. Its block is `@Sendable` and
+    /// only hops to the main actor, like every callback of the player (#241, #30).
+    private var wakeObserver: NSObjectProtocol?
+    /// When the lecture last paused, nil while it plays: `RecordingStreamPolicy.isStale` needs
+    /// only this and `lastWake`, so a paused lecture costs no timer (#241).
+    private var pausedSince: Date?
+    /// When the Mac last woke up while a lecture was open.
+    private var lastWake: Date?
+    /// The one wait for a stalled stream, alive only while the player waits for data
+    /// (`updateStallWatch`); cancelled on resume, pause, replacement and close.
+    private var stallTask: Task<Void, Never>?
     /// The one periodic time observer (`onProgress`), with the player it was added to:
     /// AVFoundation requires removing a token from that same player. Non-nil only while the
     /// player is not paused. Invariant: every path that pauses, replaces, fails or closes ends in
@@ -406,6 +565,9 @@ enum RecordingPlayerError: Error {
          frameAutosaveName: String? = RecordingPlayerController.defaultFrameAutosaveName,
          defaults: UserDefaults = .standard,
          notificationCenter: NotificationCenter = .default,
+         workspaceNotificationCenter: NotificationCenter = NSWorkspace.shared.notificationCenter,
+         now: @escaping () -> Date = Date.init,
+         sleep: @escaping @Sendable (TimeInterval) async throws -> Void = { try await Task.sleep(for: .seconds($0)) },
          toggleFullScreen: @escaping @MainActor (NSWindow) -> Void = { $0.toggleFullScreen(nil) },
          progressInterval: TimeInterval = RecordingPlayerController.progressInterval,
          nowPlaying: NowPlayingPublishing = SystemNowPlaying(),
@@ -420,6 +582,9 @@ enum RecordingPlayerError: Error {
         self.frameAutosaveName = frameAutosaveName
         self.defaults = defaults
         self.notificationCenter = notificationCenter
+        self.workspaceNotificationCenter = workspaceNotificationCenter
+        self.now = now
+        self.sleep = sleep
         self.toggleFullScreen = toggleFullScreen
         super.init()
     }
@@ -448,6 +613,10 @@ enum RecordingPlayerError: Error {
         }
         self.recordingID = recordingID
         failureReported = false
+        // A new item is a fresh address: nothing about the old one's pause or sleep applies.
+        pausedSince = nil
+        lastWake = nil
+        installWakeObserver()
         isCurrentItemReady = false
         isStartSettled = false
         rateSupport = .unknown
@@ -495,7 +664,8 @@ enum RecordingPlayerError: Error {
         // results.
         statusObservation = item.observe(\.status, options: [.new]) { [weak self] item, _ in
             let status = item.status
-            let error = item.error
+            // The HTTP status, read here with the error: AVFoundation's error hides it.
+            let error = RecordingStreamPolicy.cause(error: item.error, httpStatus: item.errorLog()?.events.last?.errorStatusCode)
             Task { @MainActor [weak self] in
                 switch status {
                 case .readyToPlay: self?.itemBecameReady(generation: observedGeneration)
@@ -527,7 +697,8 @@ enum RecordingPlayerError: Error {
         // A stream that dies after it started (network lost, token expired) does not always move
         // the item to `.failed`; AVFoundation reports it with this notification instead.
         failedToEndObserver = notificationCenter.addObserver(forName: AVPlayerItem.failedToPlayToEndTimeNotification, object: item, queue: nil) { [weak self] notification in
-            let error = notification.userInfo?[AVPlayerItemFailedToPlayToEndTimeErrorKey] as? Error
+            let error = RecordingStreamPolicy.cause(error: notification.userInfo?[AVPlayerItemFailedToPlayToEndTimeErrorKey] as? Error,
+                                                    httpStatus: (notification.object as? AVPlayerItem)?.errorLog()?.events.last?.errorStatusCode)
             Task { @MainActor [weak self] in
                 self?.fail(generation: observedGeneration, error: error)
             }
@@ -611,6 +782,11 @@ enum RecordingPlayerError: Error {
         // it or press play), and the next `play` puts the course name back. The message is the
         // language of the moment; it lasts only until the lecture moves on.
         window.subtitle = message
+    }
+
+    func clearProblem(_ message: String) {
+        guard isOpen, let window, window.subtitle == message else { return }
+        window.subtitle = nowPlayingMetadata?.courseName ?? ""
     }
 
     /// The window is about to close (its close button, or `close()`). `nonisolated` on purpose,
@@ -786,7 +962,8 @@ enum RecordingPlayerError: Error {
                 // play that would double up.
                 if player.rate != 0 { pause() } else { playWhenSettled.toggle() }
             } else if player.rate == 0 {
-                player.play()
+                // Checked before starting: no sound from an expired address.
+                if isStreamStale { failStale() } else { player.play() }
             } else {
                 player.pause()
             }
@@ -944,7 +1121,23 @@ enum RecordingPlayerError: Error {
         // current state counts.
         if player.timeControlStatus == .paused {
             if !checkpointedSincePlaying { checkpointIfMeaningful(.paused) }
+            // The first pause of a stretch only: a second report of the same pause must not
+            // make a long pause look short.
+            if pausedSince == nil, isCurrentItemReady { pausedSince = now() }
         } else {
+            // Playback starting after a long pause or a sleep, whichever control started it
+            // (the view's own play button reaches only this observation): the address has
+            // probably expired. Pause at once and report it as a failure, so the usual
+            // recovery fetches a fresh stream and continues here. A moment of the old item may
+            // have played before this hop ran; that is the price of not owning that button.
+            if isStreamStale {
+                // `AVPlayer` keeps announcing the start for a moment after `pause()`: those echoes
+                // arrive with the rate already 0 and are not the student starting again (each
+                // would report the stale stream once more, `failStale` clearing `failureReported`).
+                if player.rate != 0 { failStale() }
+                return
+            }
+            pausedSince = nil
             checkpointedSincePlaying = false
             // Moving again after a reported mid-lecture failure: `fail` paused the player and
             // cancelled any pending start, so only the student can have restarted it. A new
@@ -958,7 +1151,71 @@ enum RecordingPlayerError: Error {
             }
         }
         updateProgressObserver(generation: observed)
+        updateStallWatch(generation: observed)
         publishNowPlaying()
+    }
+
+    /// Whether starting playback now would use an expired address (`RecordingStreamPolicy.isStale`),
+    /// for a lecture that is ready and past its start.
+    private var isStreamStale: Bool {
+        isCurrentItemReady && isStartSettled && !isResuming
+            && RecordingStreamPolicy.isStale(pausedSince: pausedSince, lastWake: lastWake, now: now())
+    }
+
+    /// Stops what the student just started and reports the stale address through the usual
+    /// failure path (`RecordingStreamError.stale`), so the controller recovers it. The position
+    /// is where the lecture was paused: the stale item has not moved.
+    private func failStale() {
+        player?.pause()
+        // A start the student made is a new chance to report: after an earlier reported failure
+        // whose recovery left the window open and paused, `fail` would swallow this report
+        // (`failureReported`) and the lecture would stay stuck with the old reason (#197 reset,
+        // which the stale paths run before reaching). The subtitle shows the old reason no more.
+        if failureReported, isCurrentItemReady {
+            failureReported = false
+            window?.subtitle = nowPlayingMetadata?.courseName ?? ""
+        }
+        fail(generation: generation, error: RecordingStreamError.stale)
+    }
+
+    /// Arms the one wait for a stalled stream while the player waits for data, and only then:
+    /// the item is ready and past its start (a slow first load is the before-ready path, a slow
+    /// seek is not a dead stream) and nothing is seeking. Idempotent; cancels the wait as soon
+    /// as the player moves, pauses or any of those stops holding. After the threshold the
+    /// stream is reported as failed (`RecordingStreamError.stalled`).
+    private func updateStallWatch(generation observed: Int) {
+        let waiting = observed == generation && isCurrentItemReady && isStartSettled && !isResuming
+            && pendingSeekTarget == nil && player?.timeControlStatus == .waitingToPlayAtSpecifiedRate
+        guard waiting else {
+            stallTask?.cancel()
+            stallTask = nil
+            return
+        }
+        guard stallTask == nil else { return }
+        let sleep = self.sleep
+        stallTask = Task { @MainActor [weak self] in
+            do { try await sleep(RecordingStreamPolicy.stallThreshold) } catch { return }
+            // The arming conditions are checked again: a seek that began during the wait (the
+            // student scrubbing) makes the waiting a slow seek, not a dead stream.
+            guard let self, !Task.isCancelled, observed == self.generation, self.stallTask != nil,
+                  self.isCurrentItemReady, self.isStartSettled, !self.isResuming, self.pendingSeekTarget == nil,
+                  self.player?.timeControlStatus == .waitingToPlayAtSpecifiedRate else { return }
+            self.stallTask = nil
+            self.fail(generation: observed, error: RecordingStreamError.stalled)
+        }
+    }
+
+    private func installWakeObserver() {
+        guard wakeObserver == nil else { return }
+        // `@Sendable` and only a hop (#241, #30): the block runs on the poster's queue.
+        wakeObserver = workspaceNotificationCenter.addObserver(forName: NSWorkspace.didWakeNotification, object: nil, queue: nil) { @Sendable [weak self] _ in
+            Task { @MainActor [weak self] in self?.systemDidWake() }
+        }
+    }
+
+    /// The Mac woke from sleep. Internal so tests can deliver it.
+    func systemDidWake() {
+        lastWake = now()
     }
 
     /// Keeps the one periodic time observer in step with the player: present while it is not
@@ -1043,6 +1300,7 @@ enum RecordingPlayerError: Error {
                 guard let self, observed == self.generation else { return }
                 if self.pendingSeekTarget == seconds { self.pendingSeekTarget = nil }
                 if settlesStart { self.settleStart() }
+                self.updateStallWatch(generation: observed)
                 self.publishNowPlaying()
             }
         }
@@ -1127,7 +1385,7 @@ enum RecordingPlayerError: Error {
         guard let player else { return }
         switch command {
         case .play:
-            if isResuming { playWhenSettled = true } else { player.play() }
+            if isResuming { playWhenSettled = true } else if isStreamStale { failStale() } else { player.play() }
         case .pause:
             pause()
         case .togglePlayPause:
@@ -1424,6 +1682,8 @@ enum RecordingPlayerError: Error {
     /// every replacement and, through `stopPlayback`, on close.
     private func removeItemObservers() {
         removeProgressObserver()
+        stallTask?.cancel()
+        stallTask = nil
         statusObservation?.invalidate()
         statusObservation = nil
         timeControlObservation?.invalidate()
@@ -1448,6 +1708,10 @@ enum RecordingPlayerError: Error {
         pendingStartAt = nil
         pendingSeekTarget = nil
         removeItemObservers()
+        if let wakeObserver { workspaceNotificationCenter.removeObserver(wakeObserver) }
+        wakeObserver = nil
+        pausedSince = nil
+        lastWake = nil
         player?.pause()
         player?.replaceCurrentItem(with: nil)
         playerView?.setValue(nil, forKey: "player")

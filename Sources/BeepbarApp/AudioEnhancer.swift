@@ -114,6 +114,8 @@ extension RecordingPlayerPolicy {
 enum LiveAudioFailure: Equatable, Sendable {
     /// Webex refused the lecture's address (401/403/404/410): it expired. A fresh stream from the
     /// archive fixes it, so the usual recovery runs and the filter is rebuilt from the new address.
+    /// The session's own classification counts as the cause (`RecordingsController.recovery(for:attemptsUsed:viaFilter:)`),
+    /// since the player only sees its local server failing; the same retry budget applies (#241).
     case streamRefused
     /// Webex or the connection failed for now (offline, a timeout, a 5xx): not the filter's
     /// fault. The usual recovery runs, as it would without the filter, and the filter is

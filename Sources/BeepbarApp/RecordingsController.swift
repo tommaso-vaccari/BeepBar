@@ -291,8 +291,30 @@ struct RecordingsListing: Equatable {
     }
 
     private var playbackIntent = 0
-    /// Lectures already given their one fresh stream since the student pressed Play.
+    /// Lectures that got a fresh stream since the student pressed Play (their Now Playing
+    /// metadata is reused, `playbackMetadata(for:stream:)`). Not the retry budget: see
+    /// `recoveryEpisode`.
     private var recoveredLectures: Set<String> = []
+    /// The retry budget of the lecture on screen (#241): how many fresh streams its current
+    /// failure episode has asked for and since when. An episode starts with the first recovery
+    /// and ends when the recovered stream has played `RecordingStreamPolicy.stablePlayback`
+    /// seconds (`playerProgress`), when the lecture is played again, closed or its identity goes
+    /// away. Without the end, several sleeps in one session would use the budget up; without
+    /// the bound (`episodeTimeout`), a stream that plays a few seconds and fails again would
+    /// retry for ever.
+    ///
+    /// Two student actions also close it, because each is a new interruption and neither can
+    /// loop (both need a person, not the stream): a stale start (`playerFailed`, at any age of
+    /// the episode) and, once the recovered stream plays again (`resumedFrom` set), the
+    /// student's own pause (`studentPaused`, set by `playerCheckpoint`): the next failure then
+    /// starts a new episode with the full budget. A stream that starts, stalls and fails with no
+    /// student pause in between keeps using the one budget and reaches the browser.
+    private var recoveryEpisode: (lectureID: String, attempts: Int, startedAt: Date, resumedFrom: TimeInterval?, studentPaused: Bool)?
+    /// The wait before the next fresh-stream attempt, if one is running (`scheduleRecovery`):
+    /// kept apart from the queue so a backoff of seconds never holds up another lecture's Play.
+    private var scheduledRecovery: (serial: Int, lectureID: String, task: Task<Void, Never>)?
+    private var scheduledRecoverySerial = 0
+    private let recoverySleep: @Sendable (TimeInterval) async throws -> Void
     private var resumePoints: RecordingResumePoints?
     /// A recovery ran with no Recordings page on screen: the browser it opened closes after it.
     private var closesBrowserWhenIdle = false
@@ -540,6 +562,7 @@ struct RecordingsListing: Equatable {
             NSPasteboard.general.setString(url.absoluteString, forType: .string)
         },
         now: @escaping () -> Date = Date.init,
+        recoverySleep: @escaping @Sendable (TimeInterval) async throws -> Void = { try await Task.sleep(for: .seconds($0)) },
         makePlayer: @escaping @MainActor () -> RecordingPlaying = { RecordingPlayerController() },
         makeAudioEnhancer: @escaping @MainActor () -> AudioEnhancer = { AudioEnhancer() },
         courses: @escaping @MainActor () -> [RemoteCourseSummary] = { [] },
@@ -548,6 +571,7 @@ struct RecordingsListing: Equatable {
         playbackURLCapacity: Int = RecordingsController.playbackURLCapacity
     ) {
         self.makePlayer = makePlayer
+        self.recoverySleep = recoverySleep
         self.makeAudioEnhancer = makeAudioEnhancer
         self.courses = courses
         self.fetchProfileEmail = fetchProfileEmail
@@ -1080,9 +1104,9 @@ struct RecordingsListing: Equatable {
     /// typing in it with BeepBar's window closed.
     ///
     /// A lecture the student asked to watch is the exception (`hasPlayOrRecovery`):
-    /// - a recovery (queued or running): the student is watching a lecture that stopped, and
+    /// - a recovery (waiting for its backoff, queued or running): the student is watching a lecture that stopped, and
     ///   cancelling its fresh stream because a window closed would leave it paused and silent
-    ///   with its one retry spent;
+    ///   with its retries spent;
     /// - a Play (queued or running), from the window or from the menu bar line: the student
     ///   asked for that lecture, and closing Settings does not stop a lecture (the player
     ///   already outlives the window), so it doesn't stop one that is about to start either.
@@ -1110,7 +1134,8 @@ struct RecordingsListing: Equatable {
     /// Whether a recovery or a Play is queued or running: work for a lecture the student asked
     /// to watch, which closing the window must not cancel (`suspend`).
     private var hasPlayOrRecovery: Bool {
-        runningRecoveryGeneration == generation || runningPlayGeneration == generation || queue.contains { job in
+        // A recovery waiting out its backoff counts: it is the same student's lecture (#241).
+        scheduledRecovery != nil || runningRecoveryGeneration == generation || runningPlayGeneration == generation || queue.contains { job in
             switch job {
             case .recover, .open(_, .play, _): true
             case .list, .open: false
@@ -1286,6 +1311,9 @@ struct RecordingsListing: Equatable {
         openingRequest += 1
         if action == .play {
             playbackIntent += 1
+            // The student moved on: a recovery waiting out its backoff is over, and its notice
+            // goes with it even if this Play never reaches the player (#241).
+            cancelScheduledRecovery()
             // A newer Play stops the one being looked up rather than waiting for it (#194).
             runningPlay?.task.cancel()
         }
@@ -1841,13 +1869,20 @@ struct RecordingsListing: Equatable {
     }
 
     /// What to do about a failed play. A stream that never started goes to the browser (the
-    /// player already closed its window). One that stopped mid-lecture gets one fresh stream at
-    /// the position it stopped, then the browser: a second failure in the same Play means the
-    /// problem isn't an expired address.
-    nonisolated static func recovery(for failure: RecordingPlaybackFailure, alreadyRecovered: Bool) -> Recovery {
+    /// player already closed its window). One that stopped mid-lecture gets a fresh stream at
+    /// the position it stopped, as many as its cause allows in one failure episode
+    /// (`attemptsUsed`, see `recoveryEpisode`; `RecordingStreamPolicy.classify`): a recoverable
+    /// cause (an expired or refused address, a gateway error, the network being away) up to
+    /// `maximumAttempts`, an unclassified one exactly one (as before #241), a permanent one none.
+    /// No attempt left goes to the browser (#241). `viaFilter`: the failure came through the enhanced-audio filter and
+    /// its session already classified it (`LiveAudioFailure`), so the player's own error, which
+    /// is just the local server failing, says nothing about the cause.
+    nonisolated static func recovery(for failure: RecordingPlaybackFailure, attemptsUsed: Int, viaFilter: Bool = false) -> Recovery {
         switch failure {
         case .beforeReady: return .browser
-        case .duringPlayback(_, let position): return alreadyRecovered ? .browser : .freshStream(at: position)
+        case .duringPlayback(let error, let position):
+            let cause: RecordingStreamPolicy.Cause = viaFilter ? .recoverable : RecordingStreamPolicy.classify(error)
+            return attemptsUsed < cause.attemptLimit ? .freshStream(at: position) : .browser
         }
     }
 
@@ -1956,6 +1991,7 @@ struct RecordingsListing: Equatable {
         // A newer click replaced this one while the stream was being found: it wins.
         guard request == openingRequest else { return }
         recoveredLectures.remove(recording.id)
+        recoveryEpisode = nil
         PlaybackDiagnostics.log.notice("play: stream found, handing it to the player")
         startPlayer(stream, for: recording, startAt: RecordingPlaybackProgress.startAt(stored: storedPosition(for: recording)))
         markOpened(recording)
@@ -1974,6 +2010,8 @@ struct RecordingsListing: Equatable {
     /// on and the filter hasn't failed for this lecture (so a failing filter can't loop).
     private func startPlayer(_ stream: RecordingStream, for recording: RecmanRecording, startAt: TimeInterval?, enhanced: AudioSwitch? = nil) {
         var played = stream
+        // Whatever stream this is, a recovery still waiting for its turn is moot.
+        cancelScheduledRecovery()
         if let enhanced {
             enhancedAudioInUse = enhanced.kind
         } else {
@@ -2079,6 +2117,8 @@ struct RecordingsListing: Equatable {
         nowPlaying = [:]
         currentLectureID = nil
         recoveredLectures = []
+        recoveryEpisode = nil
+        cancelScheduledRecovery()
         // `playbackMetadata = nil` is a defensive duplicate: the metadata is only read for a
         // lecture in `recoveredLectures` (`playbackMetadata(for:stream:)`), which was just emptied,
         // so no test can tell it from the line above (`anAccountChangeDropsThePlaybackMetadata`
@@ -2106,6 +2146,9 @@ struct RecordingsListing: Equatable {
     /// checkpoint (its server, ffmpeg runs and files outlived the window, found in review).
     private func playerClosed(id: String) {
         guard currentLectureID == id else { return }
+        // The window is gone: no recovery may fetch, show a banner or open the browser for it.
+        cancelScheduledRecovery()
+        recoveryEpisode = nil
         audioEnhancer?.stop()
         enhancedAudioInUse = nil
     }
@@ -2216,6 +2259,17 @@ struct RecordingsListing: Equatable {
         // The rule itself is tested by `aReplayAfterAWindowClosedBeforeReadyReadsTheCourseAgain`,
         // which closes without a checkpoint so only the set's condition decides.
         if checkpoint.reason == .closed, playbackMetadata?.recordingID == id { playbackMetadata = nil }
+        // The student's pause while a recovered stream plays: marks the episode (`recoveryEpisode`).
+        // The `.paused` checkpoint is the one signal that is only the student's: every pause the
+        // player makes itself reports something else or nothing (`fail` and `failStale` report
+        // `.failed`, a close `.closed`, a replacement `.replaced`; a pause before the item is
+        // ready reports nothing), and the end of the lecture, which also reports `.paused`, is
+        // left out by position.
+        if checkpoint.reason == .paused, var episode = recoveryEpisode, episode.lectureID == id,
+           episode.resumedFrom != nil, !Self.isAtEnd(checkpoint) {
+            episode.studentPaused = true
+            recoveryEpisode = episode
+        }
         guard let recording = nowPlaying[id], let owner = resumeOwner() else { return }
         recordWatchCheckpoint(checkpoint, of: recording, owner: owner)
         let update = RecordingPlaybackProgress.update(position: checkpoint.position, duration: checkpoint.duration)
@@ -2233,6 +2287,13 @@ struct RecordingsListing: Equatable {
         if update == .finished, let key = RecmanCourseKey(courseCode: recording.courseCode, academicYear: recording.academicYear) {
             scheduleAcknowledge([recording.id], for: key)
         }
+    }
+
+    /// Whether a `.paused` checkpoint is the lecture reaching its end rather than a pause: within
+    /// `RecordingPlayerPolicy.resumeMargin` of a known duration.
+    nonisolated private static func isAtEnd(_ checkpoint: RecordingCheckpoint) -> Bool {
+        guard let duration = checkpoint.duration, duration.isFinite, duration > 0 else { return false }
+        return checkpoint.position > duration - RecordingPlayerPolicy.resumeMargin
     }
 
     /// Removes stored positions that don't belong to `owner`, without a controller: an account
@@ -2339,6 +2400,23 @@ struct RecordingsListing: Equatable {
     /// course's live summary; never a write, never `watchSummaries` (the menu changes at
     /// checkpoints only). Refused for a lecture no longer playing or an unknown account.
     private func playerProgress(id: String, position: TimeInterval, duration: TimeInterval?) {
+        // A recovered stream that has played a while ends the failure episode, so its attempts
+        // are forgotten (`recoveryEpisode`). Media time, no clock.
+        if var episode = recoveryEpisode, episode.lectureID == id {
+            if let from = episode.resumedFrom {
+                if position - from >= RecordingStreamPolicy.stablePlayback {
+                    recoveryEpisode = nil
+                } else if position < from {
+                    // A seek back: counted from where playback is now, not from a position the
+                    // student has left behind (the difference would stay negative).
+                    episode.resumedFrom = position
+                    recoveryEpisode = episode
+                }
+            } else {
+                episode.resumedFrom = position
+                recoveryEpisode = episode
+            }
+        }
         guard let recording = nowPlaying[id], resumeOwner() != nil,
               let fraction = RecordingWatchProgress.fraction(position: position, playerDuration: duration, archiveMinutes: recording.minutes) else { return }
         var session = sessions[id] ?? newSession(for: recording, start: nil)
@@ -2734,6 +2812,7 @@ struct RecordingsListing: Equatable {
         //   at fault (found in review), nor a recovery, since the stream may be.
         // A stream started here is no longer filtered: if it fails too, it takes the usual
         // path, so this never loops.
+        var viaFilter = false
         if enhancedAudioInUse != nil, let lecture = audioLecture, lecture.recordingID == id, let enhancer = audioEnhancer {
             let reported = enhancer.reportedFailure
             enhancer.stop()
@@ -2743,7 +2822,13 @@ struct RecordingsListing: Equatable {
             case .duringPlayback(_, let at): position = at
             case .beforeReady: position = nil
             }
-            let usualPath = reported == .streamRefused || (reported == .network && position != nil)
+            // A stale address (a long pause or a sleep, `RecordingStreamError.stale`) is the
+            // refused address in advance: the usual path, so the filter is rebuilt from the
+            // fresh stream and enhanced audio stays on (#241).
+            var isStale = false
+            if case .duringPlayback(let error, _) = failure, (error as? RecordingStreamError) == .stale { isStale = true }
+            let usualPath = reported == .streamRefused || (reported == .network && position != nil) || (reported == nil && isStale)
+            viaFilter = usualPath
             if !usualPath {
                 if reported == .unavailable { enhancer.markFailed(lecture.key) }
                 startPlayer(lecture.stream, for: recording, startAt: position ?? enhancedStartAt, enhanced: AudioSwitch(kind: nil))
@@ -2761,14 +2846,32 @@ struct RecordingsListing: Equatable {
         let pending = runningRecoveryGeneration == generation
             && runningRecovery?.lectureID == id && runningRecovery?.start == lectureStarts
             || queue.contains { if case .recover(let queued, _, let start) = $0 { queued.id == id && start == lectureStarts } else { false } }
+            // Waiting out a backoff: the next attempt is already scheduled (#241).
+            || scheduledRecovery?.lectureID == id
         if pending {
             PlaybackDiagnostics.log.notice("play: failure while its recovery is pending, ignored")
             return
         }
-        // The retry is spent when the recovery runs (`recoverPlayback`), not here: a failure
+        // An attempt is spent when the recovery runs (`recoverPlayback`), not here: a failure
         // that can't be recovered now (no Polimi session) or a recovery that never starts must
         // not use it up.
-        let recovery = Self.recovery(for: failure, alreadyRecovered: recoveredLectures.contains(id))
+        // Two failures that follow a student action are a new interruption, not one more attempt
+        // of the old burst, at any age of the episode: a stale start (the student pressing Play
+        // after a long pause or a sleep) and any failure after the student paused the recovered
+        // stream (`studentPaused`). The old episode is closed and this one starts with a full
+        // budget. Only these: each takes a person, so neither can loop, whereas any other failure
+        // reopened here, such as a stream that starts and stalls over and over, would never
+        // reach the browser.
+        if let old = recoveryEpisode, old.lectureID == id {
+            var isStaleStart = false
+            if case .duringPlayback(let cause, _) = failure, (cause as? RecordingStreamError) == .stale { isStaleStart = true }
+            if isStaleStart || old.studentPaused { recoveryEpisode = nil }
+        }
+        let episode = recoveryEpisode?.lectureID == id ? recoveryEpisode : nil
+        let age = episode.map { now().timeIntervalSince($0.startedAt) } ?? 0
+        let attemptsUsed = RecordingStreamPolicy.mayRetry(attemptsUsed: episode?.attempts ?? 0, episodeAge: age)
+            ? (episode?.attempts ?? 0) : RecordingStreamPolicy.maximumAttempts
+        let recovery = Self.recovery(for: failure, attemptsUsed: attemptsUsed, viaFilter: viaFilter)
         // A stream that was found but never played ends in the browser from here: without this
         // line it looked exactly like a stream that was never found (#148, package F diagnostics).
         let diagnosis = Self.playerFailureDiagnosis(failure, recovery: recovery)
@@ -2783,8 +2886,83 @@ struct RecordingsListing: Equatable {
             return
         }
         if visiblePages == 0 { closesBrowserWhenIdle = true }
+        if case .freshStream = recovery {
+            scheduleRecovery(recording, recovery, attemptsUsed: attemptsUsed)
+            return
+        }
         queue.insert(.recover(recording, recovery, start: lectureStarts), at: 0)
         startWorker()
+    }
+
+    /// Queues a fresh-stream recovery after its backoff (`RecordingStreamPolicy.delays`; the
+    /// first attempt has none): the waits cover a network still coming back after a wake. The wait is a task of its own, not
+    /// a sleep in the worker, so another lecture's Play never waits behind it, and it is
+    /// cancelled by everything that ends the lecture (`cancelScheduledRecovery`). Until it fires
+    /// the window says the lecture is being reopened. When the budget is spent the browser
+    /// fallback is queued instead, as before (#241).
+    private func scheduleRecovery(_ recording: RecmanRecording, _ recovery: Recovery, attemptsUsed: Int) {
+        guard let delay = RecordingStreamPolicy.delay(beforeAttempt: attemptsUsed + 1) else {
+            queue.insert(.recover(recording, .browser, start: lectureStarts), at: 0)
+            startWorker()
+            return
+        }
+        // The first attempt is immediate, as before #241: no task, no wait. Its fetch still says
+        // "reopening" (`recoverPlayback`); only a wait announces itself here.
+        if delay == 0 {
+            queue.insert(.recover(recording, recovery, start: lectureStarts), at: 0)
+            startWorker()
+            return
+        }
+        cancelScheduledRecovery()
+        scheduledRecoverySerial += 1
+        let serial = scheduledRecoverySerial
+        let generation = self.generation
+        let intent = playbackIntent
+        let start = lectureStarts
+        let sleep = recoverySleep
+        player?.showProblem(Self.reopeningMessage)
+        let task = Task { @MainActor [weak self] in
+            do { try await sleep(delay) } catch { return }
+            // Everything that can end the lecture during the wait fails one of these checks; the
+            // task is cancelled too, this is the belt for a wait that finished in the same turn.
+            guard let self, !Task.isCancelled, self.scheduledRecovery?.serial == serial, generation == self.generation,
+                  intent == self.playbackIntent, start == self.lectureStarts, self.stillShowing(recording) else {
+                // The wait is over and nothing will follow: forget it, or `pending` stays true and
+                // the notice stays on (a cancelled wait was cleared by its canceller).
+                if let self, self.scheduledRecovery?.serial == serial {
+                    self.scheduledRecovery = nil
+                    self.endReopeningNotice(for: recording)
+                }
+                return
+            }
+            self.scheduledRecovery = nil
+            self.queue.insert(.recover(recording, recovery, start: start), at: 0)
+            self.startWorker()
+        }
+        scheduledRecovery = (serial, recording.id, task)
+    }
+
+    private func cancelScheduledRecovery() {
+        guard let scheduled = scheduledRecovery else { return }
+        scheduled.task.cancel()
+        scheduledRecovery = nil
+        // The "reopening" notice was for this wait.
+        player?.clearProblem(Self.reopeningMessage)
+    }
+
+    /// Takes the "reopening" notice off the window when a recovery ends without anything else to
+    /// say while the window is still this lecture's (another Play took over, the attempt was
+    /// superseded): the subtitle must not keep announcing a recovery that is no longer running.
+    /// A message set meanwhile by `reportStoppedLecture` is not touched.
+    private func endReopeningNotice(for recording: RecmanRecording) {
+        guard stillShowing(recording) else { return }
+        player?.clearProblem(Self.reopeningMessage)
+    }
+
+    /// What the player's window says while a recovery waits for its turn or fetches. Resolved
+    /// when shown (`tr`), never cached.
+    static var reopeningMessage: String {
+        tr("Riapro la lezione…", "Reopening the lecture…")
     }
 
     private func recoverPlayback(_ recording: RecmanRecording, _ recovery: Recovery, start: Int, browser: RecmanBrowsing, generation: Int) async throws {
@@ -2800,19 +2978,34 @@ struct RecordingsListing: Equatable {
         if case .freshStream(let position) = recovery {
             guard stillShowing(recording) else { return }
             recoveredLectures.insert(recording.id)
+            var episode = recoveryEpisode?.lectureID == recording.id ? recoveryEpisode! : (recording.id, 0, now(), nil, false)
+            episode.attempts += 1
+            recoveryEpisode = episode
+            let attemptsUsed = episode.attempts
+            player?.showProblem(Self.reopeningMessage)
             if confirmedEmail == nil {
                 await learnEmail()
-                guard isCurrent() else { return }
+                guard isCurrent() else { endReopeningNotice(for: recording); return }
             }
             do {
                 let stream = try await browser.stream(for: recording, email: confirmedEmail)
-                guard isCurrent() else { return }
+                guard isCurrent() else { endReopeningNotice(for: recording); return }
                 startPlayer(stream, for: recording, startAt: position)
+                // Counted again from the first tick of this stream (`playerProgress`).
+                recoveryEpisode?.resumedFrom = nil
                 return
             } catch {
-                guard isCurrent() else { return }
+                guard isCurrent() else { endReopeningNotice(for: recording); return }
                 let (cause, player) = Self.streamFailureCause(error)
                 found = player
+                // Polimi or Webex not answering (offline just after a wake, a timeout) is the
+                // transient case the retries exist for: try again after the next backoff while
+                // the budget lasts, and only then fall back to the browser (#241).
+                if (cause as? RecmanBrowserError) == .unavailable,
+                   RecordingStreamPolicy.mayRetry(attemptsUsed: attemptsUsed, episodeAge: now().timeIntervalSince(episode.startedAt)) {
+                    scheduleRecovery(recording, recovery, attemptsUsed: attemptsUsed)
+                    return
+                }
                 let diagnosis = "play: recovery stream failed reason=\(Self.playFailureReason(cause).rawValue) error=\(PlaybackDiagnostics.errorName(cause))"
                 PlaybackDiagnostics.log.notice("\(diagnosis, privacy: .public)")
                 if (cause as? RecmanBrowserError) == .needsSignIn {
@@ -2833,14 +3026,14 @@ struct RecordingsListing: Equatable {
         }
         do {
             let url = try await playerLink(for: recording, browser: browser, found: found)
-            guard isCurrent() else { return }
+            guard isCurrent() else { endReopeningNotice(for: recording); return }
             playbackURLs[recording.id] = url
             // The window of a lecture that can't continue is no use next to the browser. Closing
             // it reports the position, so the student's place is kept.
             if currentLectureID == recording.id { player?.close() }
             openURL(url)
         } catch {
-            guard isCurrent() else { return }
+            guard isCurrent() else { endReopeningNotice(for: recording); return }
             if (error as? RecmanBrowserError) == .needsSignIn {
                 reportStoppedLecture(recording, message: Self.signInToContinueMessage)
                 throw error
@@ -3058,6 +3251,8 @@ struct RecordingsListing: Equatable {
         // generation cannot publish, so force a history reload when this list returns.
         for key in pendingAcknowledgements.values { listings[key]?.updatedAt = nil }
         generation += 1
+        cancelScheduledRecovery()
+        recoveryEpisode = nil
         // Its job goes with the queue below; nothing of it is left to report.
         menuPlay = nil
         worker?.cancel()

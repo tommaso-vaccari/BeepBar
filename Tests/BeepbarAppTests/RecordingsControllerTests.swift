@@ -1,5 +1,6 @@
 import AppKit
 import Combine
+import AVFoundation
 import Foundation
 import os
 import Testing
@@ -234,7 +235,10 @@ import BeepbarCore
     /// What the controller told the open window about a lecture that can't continue
     /// (`showProblem`), in order.
     private(set) var problems: [String] = []
-    func showProblem(_ message: String) { if isOpen { problems.append(message) } }
+    func showProblem(_ message: String) { if isOpen { problems.append(message); shownProblem = message } }
+    /// What the window's subtitle says now: the last problem shown, nil once cleared.
+    private(set) var shownProblem: String?
+    func clearProblem(_ message: String) { if isOpen, shownProblem == message { shownProblem = nil } }
 
     /// Reports the lecture on screen, if any, with `reason`: what the real player's checkpoint
     /// carries.
@@ -264,11 +268,12 @@ import BeepbarCore
 
     /// The stream dies mid-lecture at `position`, as the real player reports it: the position
     /// first, then the failure, the window staying open.
-    func failDuringPlayback(at position: TimeInterval) {
+    /// The default error is one a fresh stream fixes (`RecordingStreamPolicy.classify`).
+    func failDuringPlayback(at position: TimeInterval, error: Error? = URLError(.timedOut)) {
         guard let id = current?.id else { return }
         current?.position = position
         report(.failed)
-        onFailure?(id, .duringPlayback(nil, position: position))
+        onFailure?(id, .duringPlayback(error, position: position))
     }
 
     /// The student closes the window before the stream is ready: the real player reports nothing
@@ -456,6 +461,11 @@ final class SessionFileProbe: @unchecked Sendable {
     var owner: Int? = 42
     var polimi = true
     var now = Date(timeIntervalSince1970: 1_790_000_000)
+    /// The waits the controller asked for before each recovery attempt (#241), in order. They
+    /// return at once unless `holdSleeps`, so no test depends on the wall clock.
+    var sleeps: [TimeInterval] = []
+    /// While true a wait lasts until it is cancelled: a recovery sitting in its backoff.
+    var holdSleeps = false
     var opened: [URL] = []
     var copied: [URL] = []
     let sessionFiles = SessionFileProbe()
@@ -541,6 +551,10 @@ struct RecordingsControllerTests {
             openURL: { world.opened.append($0) },
             copy: { world.copied.append($0) },
             now: { MainActor.assumeIsolated { world.now } },
+            recoverySleep: { delay in
+                await MainActor.run { world.sleeps.append(delay) }
+                if await MainActor.run(body: { world.holdSleeps }) { try await Task.sleep(for: .seconds(3600)) }
+            },
             makePlayer: { world.playersMade += 1; return world.player },
             makeAudioEnhancer: { world.enhancersMade += 1; return AudioEnhancer(locateFFmpeg: { world.ffmpeg }, makeSession: { stream, ffmpeg, kind, onFailure in
                 struct NoPort: Error {}
@@ -3226,8 +3240,8 @@ struct RecordingsControllerTests {
     }
 
     /// Which failures fall back and which are reported, and what each player failure asks for.
-    /// Pure, so the table is checked directly. Mutation: return `.freshStream` when
-    /// `alreadyRecovered` and the second row fails.
+    /// Pure, so the table is checked directly. It fails if a spent budget, or a
+    /// cause no fresh stream fixes, still asks for one.
     @Test func theFailureDecisionTables() {
         typealias Controller = RecordingsController
         #expect(Controller.streamFailureOutcome(RecmanBrowserError.playbackUnavailable) == .browser)
@@ -3238,9 +3252,18 @@ struct RecordingsControllerTests {
         #expect(Controller.streamFailureOutcome(RecmanBrowserError.unavailable) == .report)
         #expect(Controller.streamFailureOutcome(CancellationError()) == .report)
 
-        #expect(Controller.recovery(for: .beforeReady(nil), alreadyRecovered: false) == .browser)
-        #expect(Controller.recovery(for: .duringPlayback(nil, position: 321), alreadyRecovered: false) == .freshStream(at: 321))
-        #expect(Controller.recovery(for: .duringPlayback(nil, position: 321), alreadyRecovered: true) == .browser)
+        let expired = RecordingStreamError.http(403)
+        #expect(Controller.recovery(for: .beforeReady(expired), attemptsUsed: 0) == .browser)
+        #expect(Controller.recovery(for: .duringPlayback(expired, position: 321), attemptsUsed: 0) == .freshStream(at: 321))
+        #expect(Controller.recovery(for: .duringPlayback(expired, position: 321), attemptsUsed: 3) == .freshStream(at: 321))
+        #expect(Controller.recovery(for: .duringPlayback(expired, position: 321), attemptsUsed: 4) == .browser)
+        // An unclassified cause (none, unknown) gets exactly one fresh stream, as before #241;
+        // a permanent one none; a filter's own classification counts as recoverable.
+        #expect(Controller.recovery(for: .duringPlayback(nil, position: 321), attemptsUsed: 0) == .freshStream(at: 321))
+        #expect(Controller.recovery(for: .duringPlayback(nil, position: 321), attemptsUsed: 1) == .browser)
+        #expect(Controller.recovery(for: .duringPlayback(URLError(.badURL), position: 321), attemptsUsed: 0) == .browser)
+        #expect(Controller.recovery(for: .duringPlayback(nil, position: 321), attemptsUsed: 3, viaFilter: true) == .freshStream(at: 321))
+        #expect(Controller.recovery(for: .duringPlayback(nil, position: 321), attemptsUsed: 4, viaFilter: true) == .browser)
     }
 
     /// Package F diagnostics: each way a Play can miss the player is logged under its own
@@ -3751,11 +3774,10 @@ struct RecordingsControllerTests {
 
     // MARK: Recovery
 
-    /// A stream that dies mid-lecture is resolved again once and resumes where it stopped; a
-    /// second failure in the same Play opens the browser and closes the dead window. Guards
-    /// against a lecture left frozen, and against retrying forever.
-    /// Mutation: never insert into `recoveredLectures` and the third stream request happens.
-    @Test func aStreamThatDiesIsResolvedOnceMoreThenTheBrowserOpens() async throws {
+    /// The bug of #241: a lecture whose stream dies, is recovered, and dies again for a cause a
+    /// fresh stream fixes (here the connection timing out) must be recovered again, not sent to
+    /// the browser. Third stream request = the second recovery.
+    @Test func aSecondRecoverableFailureAfterARecoveryIsRecoveredAgain() async throws {
         defer { cleanUp() }
         browser.streamResults["a"] = [.success(stream("a")), .success(stream("a")), .success(stream("a"))]
         browser.playbackResults["a"] = .success(playerLink("a"))
@@ -3764,15 +3786,388 @@ struct RecordingsControllerTests {
         await settle("a playing") { world.player.plays.count == 1 }
 
         world.player.failDuringPlayback(at: 1_234)
-        await settle("resumed") { world.player.plays.count == 2 }
-        #expect(try world.player.play(1).startAt == 1_234)
-        #expect(try world.player.play(1).recordingID == "a")
+        await settle("first recovery") { world.player.plays.count == 2 }
+        world.player.failDuringPlayback(at: 2_000)
+        await settle("second recovery") { world.player.plays.count == 3 }
+        #expect(try world.player.play(2).startAt == 2_000)
+        #expect(browser.streamCalls == ["stream a", "stream a", "stream a"])
+        #expect(world.opened.isEmpty, "no browser while a fresh stream can still fix it")
+        controller.turnOff()
+    }
+
+    /// A stream that keeps dying is resolved again up to four times: the first at once, the next
+    /// ones after 1, 3 and 8 s, each resuming where it stopped; the failure after the fourth
+    /// opens the browser and closes the dead window. Guards against a lecture left frozen,
+    /// against slowing the first attempt, and against retrying for ever.
+    @Test func aStreamThatKeepsDyingGetsFourFreshStreamsThenTheBrowserOpens() async throws {
+        defer { cleanUp() }
+        browser.streamResults["a"] = (0..<5).map { _ in .success(stream("a")) }
+        browser.playbackResults["a"] = .success(playerLink("a"))
+        let controller = await readyController()
+        controller.play(recording("a"))
+        await settle("a playing") { world.player.plays.count == 1 }
+
+        for round in 1...4 {
+            world.player.failDuringPlayback(at: Double(1_000 + round))
+            await settle("recovery \(round)") { world.player.plays.count == round + 1 }
+            #expect(try world.player.play(round).startAt == Double(1_000 + round))
+            #expect(try world.player.play(round).recordingID == "a")
+            if round == 1 { #expect(world.sleeps.isEmpty, "the first attempt is immediate") }
+        }
         #expect(world.opened.isEmpty)
+        #expect(world.sleeps == [1, 3, 8])
 
         world.player.failDuringPlayback(at: 2_000)
         await settle("browser opened") { world.opened == [playerLink("a")] }
-        #expect(browser.streamCalls == ["stream a", "stream a"], "no third stream request")
+        #expect(browser.streamCalls == Array(repeating: "stream a", count: 5), "no sixth stream request")
+        #expect(world.sleeps == [1, 3, 8], "no wait before the browser")
         #expect(!world.player.isOpen, "the dead window is closed")
+        controller.turnOff()
+    }
+
+    /// An unclassified cause (no error, an unknown one, an HTTP status in neither list) gets
+    /// exactly one fresh stream, at once, as before #241; if that one dies too, the browser. A
+    /// permanent cause (a URL the player cannot open) goes to the browser with no second stream.
+    @Test(arguments: [nil, RecordingStreamError.http(429), NSError(domain: "Other", code: 1)] as [Error?])
+    func anUnclassifiedFailureGetsExactlyOneFreshStream(error: Error?) async throws {
+        defer { cleanUp() }
+        browser.streamResults["a"] = [.success(stream("a")), .success(stream("a")), .success(stream("a"))]
+        browser.playbackResults["a"] = .success(playerLink("a"))
+        let controller = await readyController()
+        controller.play(recording("a"))
+        await settle("a playing") { world.player.plays.count == 1 }
+        world.player.failDuringPlayback(at: 77, error: error)
+        await settle("recovered") { world.player.plays.count == 2 }
+        #expect(try world.player.play(1).startAt == 77)
+        #expect(world.sleeps.isEmpty, "no wait")
+        world.player.failDuringPlayback(at: 99, error: error)
+        await settle("browser opened") { world.opened == [playerLink("a")] }
+        #expect(browser.streamCalls == ["stream a", "stream a"], "no second fresh stream")
+        #expect(world.sleeps.isEmpty)
+        controller.turnOff()
+    }
+
+    @Test(arguments: [URLError(.badURL), URLError(.unsupportedURL)])
+    func aPermanentFailureOpensTheBrowserAtOnce(error: URLError) async throws {
+        defer { cleanUp() }
+        browser.streamResults["a"] = [.success(stream("a")), .success(stream("a"))]
+        browser.playbackResults["a"] = .success(playerLink("a"))
+        let controller = await readyController()
+        controller.play(recording("a"))
+        await settle("a playing") { world.player.plays.count == 1 }
+        world.player.failDuringPlayback(at: 77, error: error)
+        await settle("browser opened") { world.opened == [playerLink("a")] }
+        #expect(browser.streamCalls == ["stream a"])
+        #expect(world.sleeps.isEmpty)
+        controller.turnOff()
+    }
+
+    /// Polimi or Webex not answering while the fresh stream is looked up (the network still
+    /// coming back after a wake) is retried after the next backoff, and the lecture resumes when
+    /// an attempt gets through: here the third fetch of the episode (the first is immediate).
+    @Test func aFreshStreamLookupThatIsOfflineIsRetriedThenPlays() async throws {
+        defer { cleanUp() }
+        browser.streamResults["a"] = [.success(stream("a")), .failure(RecmanBrowserError.unavailable), .failure(RecmanBrowserError.unavailable), .success(stream("a"))]
+        browser.playbackResults["a"] = .success(playerLink("a"))
+        let controller = await readyController()
+        controller.play(recording("a"))
+        await settle("a playing") { world.player.plays.count == 1 }
+        world.player.failDuringPlayback(at: 640)
+        await settle("resumed") { world.player.plays.count == 2 }
+        #expect(try world.player.play(1).startAt == 640)
+        #expect(world.sleeps == [1, 3], "the immediate first fetch failed, then 1 s and 3 s")
+        #expect(world.opened.isEmpty)
+        controller.turnOff()
+    }
+
+    /// The same offline lookup for good: after the fourth attempt the browser fallback runs as
+    /// before, never a fourth wait.
+    @Test func aFreshStreamLookupThatStaysOfflineEndsInTheBrowser() async throws {
+        defer { cleanUp() }
+        browser.streamResults["a"] = [.success(stream("a"))] + (0..<4).map { _ in .failure(RecmanBrowserError.unavailable) }
+        browser.playbackResults["a"] = .success(playerLink("a"))
+        let controller = await readyController()
+        controller.play(recording("a"))
+        await settle("a playing") { world.player.plays.count == 1 }
+        world.player.failDuringPlayback(at: 640)
+        await settle("browser opened") { world.opened == [playerLink("a")] }
+        #expect(world.sleeps == [1, 3, 8])
+        #expect(browser.streamCalls.count == 5)
+        controller.turnOff()
+    }
+
+    /// A recovered stream that plays 30 s of lecture ends the episode: the next failure starts
+    /// over, its first attempt immediate again, with the full budget (a second sleep in one session).
+    /// One that fails again sooner keeps spending the same budget (the previous test).
+    @Test func aRecoveredStreamThatPlaysAWhileRestoresTheBudget() async throws {
+        defer { cleanUp() }
+        browser.streamResults["a"] = (0..<3).map { _ in .success(stream("a")) }
+        browser.playbackResults["a"] = .success(playerLink("a"))
+        let controller = await readyController()
+        controller.play(recording("a"))
+        await settle("a playing") { world.player.plays.count == 1 }
+        world.player.failDuringPlayback(at: 100)
+        await settle("recovered once") { world.player.plays.count == 2 }
+        world.player.onProgress?("a", 100, nil)
+        world.player.onProgress?("a", 131, nil)
+        world.player.failDuringPlayback(at: 131)
+        await settle("recovered twice") { world.player.plays.count == 3 }
+        #expect(world.sleeps.isEmpty, "each episode starts with its immediate attempt")
+        controller.turnOff()
+    }
+
+    /// An episode that runs longer than its limit (90 s from its first failure) stops retrying
+    /// even with attempts left, so short plays between failures can't chain for ever.
+    @Test func anEpisodeThatRunsTooLongGoesToTheBrowser() async throws {
+        defer { cleanUp() }
+        browser.streamResults["a"] = (0..<3).map { _ in .success(stream("a")) }
+        browser.playbackResults["a"] = .success(playerLink("a"))
+        let controller = await readyController()
+        controller.play(recording("a"))
+        await settle("a playing") { world.player.plays.count == 1 }
+        world.player.failDuringPlayback(at: 100)
+        await settle("recovered once") { world.player.plays.count == 2 }
+        world.now = world.now.addingTimeInterval(RecordingStreamPolicy.episodeTimeout + 1)
+        world.player.failDuringPlayback(at: 105)
+        await settle("browser opened") { world.opened == [playerLink("a")] }
+        #expect(world.sleeps.isEmpty)
+        controller.turnOff()
+    }
+
+    /// P1-B: the 90 s limit bounds the attempts of one interruption, not the later ones. A
+    /// recovery succeeds, the student listens a few seconds (under the 30 s that end an episode),
+    /// pauses, and returns after ten minutes: the stale start is a new interruption and gets a
+    /// fresh stream at once, not the browser. Before the fix the old episode was past its limit
+    /// and the budget counted as spent. (A non-stale failure past the limit still goes to the
+    /// browser, above: a stream that keeps starting and dying must not retry for ever.)
+    @Test func aStaleStartLongAfterARecoveryGetsAFreshStream() async throws {
+        defer { cleanUp() }
+        browser.streamResults["a"] = (0..<3).map { _ in .success(stream("a")) }
+        browser.playbackResults["a"] = .success(playerLink("a"))
+        let controller = await readyController()
+        controller.play(recording("a"))
+        await settle("a playing") { world.player.plays.count == 1 }
+        world.player.failDuringPlayback(at: 100)
+        await settle("recovered once") { world.player.plays.count == 2 }
+        world.player.onProgress?("a", 100, nil)
+        world.player.onProgress?("a", 110, nil)
+        world.now = world.now.addingTimeInterval(RecordingStreamPolicy.staleAfterPause)
+        world.player.failDuringPlayback(at: 110, error: RecordingStreamError.stale)
+        await settle("recovered again") { world.player.plays.count == 3 }
+        #expect(try world.player.play(2).startAt == 110)
+        #expect(world.opened.isEmpty, "no browser for a lecture that only needs a fresh stream")
+        controller.turnOff()
+    }
+
+    /// Fix 1: a stale start closes the current episode at any age, not only past the 90 s limit.
+    /// Three attempts used, then 20 s later the student returns after a long pause: the stale start
+    /// gets the full budget (its first attempt at once, four in all), and only the fifth failure
+    /// after it reaches the browser.
+    @Test func aStaleStartOpensANewEpisodeAtAnyAge() async throws {
+        defer { cleanUp() }
+        browser.streamResults["a"] = (0..<8).map { _ in .success(stream("a")) }
+        browser.playbackResults["a"] = .success(playerLink("a"))
+        let controller = await readyController()
+        controller.play(recording("a"))
+        await settle("a playing") { world.player.plays.count == 1 }
+        for round in 1...3 {
+            world.player.failDuringPlayback(at: Double(100 + round))
+            await settle("recovery \(round)") { world.player.plays.count == round + 1 }
+        }
+        #expect(world.sleeps == [1, 3])
+        world.now = world.now.addingTimeInterval(20)
+        world.player.failDuringPlayback(at: 110, error: RecordingStreamError.stale)
+        await settle("stale recovery") { world.player.plays.count == 5 }
+        #expect(world.sleeps == [1, 3], "the new episode's first attempt is immediate")
+        for round in 2...4 {
+            world.player.failDuringPlayback(at: Double(120 + round))
+            await settle("new episode attempt \(round)") { world.player.plays.count == 4 + round }
+        }
+        #expect(world.sleeps == [1, 3, 1, 3, 8])
+        #expect(world.opened.isEmpty)
+        world.player.failDuringPlayback(at: 200)
+        await settle("browser opened") { world.opened == [playerLink("a")] }
+        controller.turnOff()
+    }
+
+    /// Fix 2 (a): after a recovery the student listens under 30 s, pauses for a few minutes (not
+    /// stale) and resumes, and the stream drops again within 30 s of playback. The pause closed the
+    /// episode, so this is a new interruption with a fresh stream, not the browser (the episode
+    /// was past its 90 s limit).
+    @Test func aStudentPauseAfterARecoveryOpensANewEpisode() async throws {
+        defer { cleanUp() }
+        browser.streamResults["a"] = (0..<3).map { _ in .success(stream("a")) }
+        browser.playbackResults["a"] = .success(playerLink("a"))
+        let controller = await readyController()
+        controller.play(recording("a"))
+        await settle("a playing") { world.player.plays.count == 1 }
+        world.player.failDuringPlayback(at: 100)
+        await settle("recovered once") { world.player.plays.count == 2 }
+        world.player.tick(at: 100)
+        world.player.tick(at: 110)
+        world.player.pause(at: 110)
+        world.now = world.now.addingTimeInterval(300)
+        world.player.tick(at: 110)
+        world.player.failDuringPlayback(at: 125)
+        await settle("recovered again") { world.player.plays.count == 3 }
+        #expect(try world.player.play(2).startAt == 125)
+        #expect(world.opened.isEmpty, "the student's pause was an interruption of its own")
+        controller.turnOff()
+    }
+
+    /// Fix 2 (b), the loop guard: a stream that starts, plays a few seconds and dies, over and
+    /// over, with nobody pausing, keeps spending one budget: four fresh streams, then the browser.
+    @Test func aStreamThatStartsAndDiesWithoutAStudentPauseStillReachesTheBrowser() async throws {
+        defer { cleanUp() }
+        browser.streamResults["a"] = (0..<5).map { _ in .success(stream("a")) }
+        browser.playbackResults["a"] = .success(playerLink("a"))
+        let controller = await readyController()
+        controller.play(recording("a"))
+        await settle("a playing") { world.player.plays.count == 1 }
+        for round in 1...4 {
+            world.player.tick(at: Double(100 * round))
+            world.player.failDuringPlayback(at: Double(100 * round + 10))
+            await settle("recovery \(round)") { world.player.plays.count == round + 1 }
+        }
+        world.player.tick(at: 500)
+        world.player.failDuringPlayback(at: 510)
+        await settle("browser opened") { world.opened == [playerLink("a")] }
+        controller.turnOff()
+    }
+
+    /// Fix 2 (c): the end of the lecture also reports `.paused`, and is not the student's pause.
+    @Test func theEndOfTheLectureIsNotAStudentPause() async throws {
+        defer { cleanUp() }
+        browser.streamResults["a"] = (0..<3).map { _ in .success(stream("a")) }
+        browser.playbackResults["a"] = .success(playerLink("a"))
+        let controller = await readyController()
+        controller.play(recording("a"))
+        await settle("a playing") { world.player.plays.count == 1 }
+        world.player.failDuringPlayback(at: 100)
+        await settle("recovered once") { world.player.plays.count == 2 }
+        world.player.tick(at: 100)
+        world.player.tick(at: 110)
+        world.player.pause(at: 6_000)
+        world.now = world.now.addingTimeInterval(RecordingStreamPolicy.episodeTimeout + 1)
+        world.player.failDuringPlayback(at: 125)
+        await settle("browser opened") { world.opened == [playerLink("a")] }
+        controller.turnOff()
+    }
+
+    /// A Play of the same lecture during a backoff ends the wait right then and takes its
+    /// "reopening" notice off, even when that Play never reaches the player (its lookup is still
+    /// running): before, the wait woke up, failed its guard and left the notice and the pending
+    /// state behind.
+    @Test func aPlayDuringABackoffEndsTheWaitAndItsNotice() async throws {
+        defer { cleanUp() }
+        browser.streamResults["a"] = [.success(stream("a")), .success(stream("a")), .success(stream("a"))]
+        browser.playbackResults["a"] = .success(playerLink("a"))
+        let controller = await readyController()
+        controller.play(recording("a"))
+        await settle("a playing") { world.player.plays.count == 1 }
+        world.player.failDuringPlayback(at: 400)
+        await settle("first recovery") { world.player.plays.count == 2 }
+        world.holdSleeps = true
+        world.player.failDuringPlayback(at: 500)
+        await settle("waiting") { world.sleeps == [1] && world.player.shownProblem == RecordingsController.reopeningMessage }
+        let lookup = FakeRecmanBrowser.Gate()
+        defer { lookup.release() }
+        browser.streamGates["a"] = lookup
+        controller.play(recording("a"))
+        await settle("the new Play looking up") { lookup.isWaiting }
+        #expect(world.player.shownProblem == nil, "the notice of the cancelled wait is still shown")
+        world.holdSleeps = false
+        await drainTasks()
+        #expect(browser.streamCalls.count == 3, "the cancelled wait fetched nothing")
+        lookup.release()
+        controller.turnOff()
+    }
+
+    /// A recovery whose attempt is superseded while its fetch runs (the student pressed Play on
+    /// the same lecture) takes its "reopening" notice off as it gives up; the window is still
+    /// this lecture's, and nothing else would clear it before the new Play reaches the player.
+    @Test func aSupersededAttemptTakesItsNoticeOff() async throws {
+        defer { cleanUp() }
+        browser.streamResults["a"] = [.success(stream("a")), .success(stream("a")), .success(stream("a"))]
+        browser.playbackResults["a"] = .success(playerLink("a"))
+        let controller = await readyController()
+        controller.play(recording("a"))
+        await settle("a playing") { world.player.plays.count == 1 }
+        let first = FakeRecmanBrowser.Gate()
+        defer { first.release() }
+        browser.streamGates["a"] = first
+        world.player.failDuringPlayback(at: 400)
+        await settle("recovery fetching") { first.isWaiting }
+        #expect(world.player.shownProblem == RecordingsController.reopeningMessage)
+        let second = FakeRecmanBrowser.Gate()
+        defer { second.release() }
+        controller.play(recording("a"))
+        browser.streamGates["a"] = second
+        first.release()
+        await settle("the new Play looking up") { second.isWaiting }
+        #expect(world.player.shownProblem == nil, "the notice of the superseded attempt is still shown")
+        second.release()
+        controller.turnOff()
+    }
+
+    /// Closing the window, playing another lecture, or turning Recordings off during a backoff
+    /// cancels the wait: no further stream request, no browser, no banner for the old lecture, and
+    /// nothing of it changes after. Guards against a recovery that outlives its lecture.
+    @Test(arguments: ["the student closes the window", "another lecture", "Recordings is turned off"])
+    func aBackoffEndsWithItsLecture(scenario name: String) async throws {
+        defer { cleanUp() }
+        browser.streamResults["a"] = [.success(stream("a")), .success(stream("a")), .success(stream("a"))]
+        browser.streamResults["b"] = [.success(stream("b"))]
+        browser.playbackResults["a"] = .success(playerLink("a"))
+        let controller = await readyController()
+        controller.play(recording("a"))
+        await settle("a playing") { world.player.plays.count == 1 }
+        // The first attempt is immediate; the second one waits.
+        world.player.failDuringPlayback(at: 400)
+        await settle("first recovery") { world.player.plays.count == 2 }
+        world.holdSleeps = true
+        world.player.failDuringPlayback(at: 500)
+        await settle("waiting") { world.sleeps == [1] }
+        #expect(world.player.plays.count == 2, "nothing fetched during the wait")
+
+        switch name {
+        case "the student closes the window": world.player.close()
+        case "another lecture":
+            controller.play(recording("b"))
+            await settle("b playing") { world.player.plays.count == 3 }
+        default: controller.turnOff()
+        }
+        world.holdSleeps = false
+        await drainTasks()
+        let aStreams = browser.streamCalls.filter { $0 == "stream a" }.count
+        #expect(aStreams == 2, "no further stream request for a")
+        #expect(world.opened.isEmpty)
+        #expect(controller.openingProblem == nil)
+        #expect(world.sleeps == [1], "no later attempt was scheduled")
+        if name == "another lecture" { #expect(world.player.plays.last?.recordingID == "b") }
+        controller.turnOff()
+    }
+
+    /// Enhanced audio survives a recovery that takes more than one attempt: each fresh stream
+    /// gets its filter again, of the kind the student chose, and the selector stays on.
+    @Test func enhancedAudioStaysOnAcrossSeveralRecoveries() async throws {
+        defer { cleanUp() }
+        world.ffmpeg = fakeFFmpegPath
+        let controller = await readyController()
+        let lecture = await playing(controller, "audio")
+        world.player.chooseAudio(.use(.levelled))
+        let fresh = RecordingStream(url: URL(string: "https://media.example.test/fresh/\(lecture.id).m3u8")!, title: nil, duration: nil)
+        browser.streamResults[lecture.id] = [.success(fresh), .success(fresh)]
+        try #require(world.liveSessions.last).onFailure(.streamRefused)
+        world.player.failDuringPlayback(at: 900, error: nil)
+        await settle("first recovery") { world.liveSessions.count == 2 }
+        try #require(world.liveSessions.last).onFailure(.network)
+        world.player.failDuringPlayback(at: 950, error: nil)
+        await settle("second recovery") { world.liveSessions.count == 3 }
+        #expect(world.liveSessions.last?.kind == .levelled)
+        #expect(world.liveSessions.last?.stream == fresh.url)
+        #expect(world.player.audioState == .on(.levelled))
+        #expect(world.opened.isEmpty)
         controller.turnOff()
     }
 
@@ -3821,13 +4216,13 @@ struct RecordingsControllerTests {
             await settle("resumed once") { world.player.plays.count == 2 }
             world.player.failDuringPlayback(at: 400)
         }
-        await settle("the window was told") { !world.player.problems.isEmpty }
+        await settle("the window was told") { world.player.problems.contains { $0 != RecordingsController.reopeningMessage } }
         let expected: String = switch name {
         case "needs email": RecordingsProblem.playbackUnavailable.message
         case "browser link unavailable": RecordingsProblem.unavailable.message
         default: RecordingsController.signInToContinueMessage
         }
-        #expect(world.player.problems == [expected])
+        #expect(world.player.problems.filter { $0 != RecordingsController.reopeningMessage } == [expected])
         #expect(world.player.isOpen, "the paused window stays, with the reason")
         #expect(world.opened.isEmpty)
         controller.turnOff()
@@ -5165,5 +5560,78 @@ struct AudioSelectorPresentationTests {
         for kind in AudioEnhancementKind.allCases {
             #expect(RecordingsController.resolveEnhancedAudioKind(kind.rawValue) == kind)
         }
+    }
+}
+
+
+/// The pure decisions about a stream that stopped or may have expired (#241): one table per
+/// question, so the thresholds and classes can be edited and read in one place.
+@Suite struct RecordingStreamPolicyTests {
+    private let t0 = Date(timeIntervalSince1970: 1_800_000_000)
+
+    /// Stale = paused 10 minutes or more, or woken after the pause began; never while playing.
+    /// Fails if the threshold moves, the wake rule goes, or a playing lecture counts as paused.
+    @Test func staleness() {
+        typealias P = RecordingStreamPolicy
+        #expect(!P.isStale(pausedSince: nil, lastWake: t0, now: t0.addingTimeInterval(9_999)))
+        #expect(!P.isStale(pausedSince: t0, lastWake: nil, now: t0.addingTimeInterval(P.staleAfterPause - 1)))
+        #expect(P.isStale(pausedSince: t0, lastWake: nil, now: t0.addingTimeInterval(P.staleAfterPause)))
+        #expect(P.isStale(pausedSince: t0, lastWake: t0.addingTimeInterval(5), now: t0.addingTimeInterval(6)))
+        #expect(!P.isStale(pausedSince: t0, lastWake: t0.addingTimeInterval(-5), now: t0.addingTimeInterval(6)), "a wake before the pause says nothing about this pause")
+    }
+
+    /// Every status and error class, including AVFoundation's wrapper around the real cause.
+    @Test func recoverableCauses() {
+        typealias P = RecordingStreamPolicy
+        // recoverable: the refused-address statuses (the same four as LiveAudioFailure.streamRefused) and every 5xx.
+        for status in [401, 403, 404, 410, 500, 501, 502, 503, 504, 599] { #expect(P.classify(RecordingStreamError.http(status)) == .recoverable, "\(status)") }
+        // unclassified: any other status.
+        for status in [400, 402, 405, 429, 451, 499] { #expect(P.classify(RecordingStreamError.http(status)) == .unclassified, "\(status)") }
+        #expect(P.classify(RecordingStreamError.stale) == .recoverable)
+        #expect(P.classify(RecordingStreamError.stalled) == .recoverable)
+        for code in [NSURLErrorNotConnectedToInternet, NSURLErrorTimedOut, NSURLErrorNetworkConnectionLost, NSURLErrorCannotConnectToHost, NSURLErrorCannotFindHost, NSURLErrorDNSLookupFailed] {
+            #expect(P.classify(NSError(domain: NSURLErrorDomain, code: code)) == .recoverable, "\(code)")
+        }
+        // permanent: only the addresses the player cannot open.
+        for code in [NSURLErrorBadURL, NSURLErrorUnsupportedURL] {
+            #expect(P.classify(NSError(domain: NSURLErrorDomain, code: code)) == .permanent, "\(code)")
+        }
+        #expect(P.classify(NSError(domain: NSURLErrorDomain, code: NSURLErrorCancelled)) == .unclassified)
+        #expect(P.classify(nil) == .unclassified)
+        #expect(P.classify(NSError(domain: "Other", code: 1)) == .unclassified)
+        #expect(P.Cause.recoverable.attemptLimit == 4 && P.Cause.unclassified.attemptLimit == 1 && P.Cause.permanent.attemptLimit == 0)
+        // AVFoundation: -11800 on top, the transport error underneath.
+        let wrapped = NSError(domain: AVFoundationErrorDomain, code: -11800, userInfo: [NSUnderlyingErrorKey: NSError(domain: NSURLErrorDomain, code: NSURLErrorNetworkConnectionLost)])
+        #expect(P.classify(wrapped) == .recoverable)
+        let wrappedTwice = NSError(domain: AVFoundationErrorDomain, code: -11800, userInfo: [NSUnderlyingErrorKey: NSError(domain: "CoreMediaErrorDomain", code: -12660, userInfo: [NSUnderlyingErrorKey: NSError(domain: NSURLErrorDomain, code: NSURLErrorTimedOut)])])
+        #expect(P.classify(wrappedTwice) == .recoverable)
+        // Real Webex expiry can look like this, with no status and no URL error: unclassified, one fresh stream.
+        #expect(P.classify(NSError(domain: AVFoundationErrorDomain, code: -11800, userInfo: [NSUnderlyingErrorKey: NSError(domain: "CoreMediaErrorDomain", code: -12660)])) == .unclassified)
+        // A permanent cause under AVFoundation's wrapper is still found.
+        #expect(P.classify(NSError(domain: AVFoundationErrorDomain, code: -11800, userInfo: [NSUnderlyingErrorKey: NSError(domain: NSURLErrorDomain, code: NSURLErrorBadURL)])) == .permanent)
+    }
+
+    /// The error log's HTTP status wins over AVFoundation's opaque error; no status keeps it.
+    @Test func theLoggedStatusIsTheCause() {
+        let opaque = NSError(domain: AVFoundationErrorDomain, code: -11800)
+        #expect(RecordingStreamPolicy.cause(error: opaque, httpStatus: 403) as? RecordingStreamError == .http(403))
+        #expect((RecordingStreamPolicy.cause(error: opaque, httpStatus: 0) as NSError?) == opaque)
+        #expect((RecordingStreamPolicy.cause(error: opaque, httpStatus: nil) as NSError?) == opaque)
+    }
+
+    /// No wait before attempt 1, then 1, 3, 8 s before attempts 2 to 4, none after; the budget
+    /// needs attempts and age.
+    @Test func delaysAndBudget() {
+        typealias P = RecordingStreamPolicy
+        #expect(P.delay(beforeAttempt: 1) == 0)
+        #expect(P.delay(beforeAttempt: 2) == 1)
+        #expect(P.delay(beforeAttempt: 3) == 3)
+        #expect(P.delay(beforeAttempt: 4) == 8)
+        #expect(P.delay(beforeAttempt: 5) == nil)
+        #expect(P.delay(beforeAttempt: 0) == nil)
+        #expect(P.mayRetry(attemptsUsed: 3, episodeAge: 0))
+        #expect(!P.mayRetry(attemptsUsed: 4, episodeAge: 0))
+        #expect(!P.mayRetry(attemptsUsed: 0, episodeAge: P.episodeTimeout))
+        #expect(P.stallThreshold == 15)
     }
 }

@@ -15,6 +15,7 @@
 ### Fixed
 
 - BeepBar no longer quits unexpectedly when the Mac wakes from sleep with a lecture or the BeepBar window open.
+- A lecture left paused for a long time, or across your Mac's sleep, now resumes where you stopped instead of showing an error; BeepBar also retries a few times when the connection is not back yet.
 - In Recordings, a course BeepBar has not listed yet no longer shows an empty pane when you aren't signed in with Polimi: it asks you to sign in, with the button right there.
 
 ## 2026-10-19

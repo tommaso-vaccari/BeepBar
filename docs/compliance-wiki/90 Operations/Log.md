@@ -65,6 +65,6 @@ Riverificato dev c22f194: la disattivazione conserva i punti di ripresa, logout/
 
 Riverificate e salvate revisioni immutabili S-0008/S-0009 e fonti S-0013–S-0016. Rivalutati primo invio subito dopo Chiudi e opposizione tramite Impostazioni. Esito favorevole qualificato v2, costo navigazione e limiti documentali espliciti; nessuna certificazione globale, accettazione contrattuale, contatto o invio reale. Valutazioni storiche UUID non riaperte.
 
-## 2026-11-13 — modalità dell’audio migliorato, PR #242
+## 2026-11-13 — modalità dell’audio migliorato, PR #245
 
 Aggiornata la riga «Audio migliorato» della mappa dei dati: in «Voce livellata» ogni tratto tiene tra i file temporanei anche il proprio audio originale (circa 350 MB per lezione contro 115), con la stessa cartella e le stesse cancellazioni; in UserDefaults si aggiunge l’ultima modalità scelta. Nessun nuovo destinatario, flusso di rete o categoria di dati: l’audio era già letto da Webex e tenuto a pezzi nella stessa cartella. Solo analisi del codice del branch e test su corpus sintetico; nessuna nuova fonte o conclusione di conformità.

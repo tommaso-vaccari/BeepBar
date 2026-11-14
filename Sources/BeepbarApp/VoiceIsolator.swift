@@ -15,7 +15,7 @@ protocol LiveAudioVoiceIsolating: Sendable {
 /// Apple's voice isolation (`AUSoundIsolation`, the audio unit behind FaceTime's Voice
 /// Isolation), run offline on a file: it keeps the voice and removes steady noise, hum and much
 /// of the room's echo, with nothing to download. On a synthetic classroom (measured with the
-/// ffmpeg chain that preceded the leveler, removed in PR #242) it removed steady noise by about
+/// ffmpeg chain that preceded the leveler, removed in PR #245) it removed steady noise by about
 /// 45 dB, against about 15 dB for ffmpeg's `afftdn`. What it keeps: other people's voices (voice
 /// too), and a steady tone as loud as speech (a 100 Hz hum at −27 dB came through unchanged; at
 /// −42 dB it went).

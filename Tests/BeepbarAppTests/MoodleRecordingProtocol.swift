@@ -38,6 +38,8 @@ final class MoodleRecordingProtocol: URLProtocol, @unchecked Sendable {
         var heldEmails: [@Sendable () -> Void] = []
         var holdsCourseImages = false
         var heldCourseImages: [@Sendable () -> Void] = []
+        /// Tests awaiting the first held course picture (`waitUntilCourseImageHeld`).
+        var courseImageWaiters: [CheckedContinuation<Void, Never>] = []
     }
 
     /// What a download records as its `function`.
@@ -94,6 +96,19 @@ final class MoodleRecordingProtocol: URLProtocol, @unchecked Sendable {
     /// `releaseCourseImages(token:)`: lets a test change the account while a picture is on its way.
     static func holdCourseImages(token: String) {
         accounts.withLock { $0[token]?.holdsCourseImages = true }
+    }
+
+    /// Returns once a course picture request is held by `holdCourseImages` (at once if one is):
+    /// an awaited signal from the mock instead of a timed poll.
+    static func waitUntilCourseImageHeld(token: String) async {
+        await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
+            let ready = accounts.withLock { accounts -> Bool in
+                if (accounts[token]?.heldCourseImages.count ?? 0) > 0 { return true }
+                accounts[token]?.courseImageWaiters.append(continuation)
+                return false
+            }
+            if ready { continuation.resume() }
+        }
     }
 
     static func heldCourseImageCount(token: String) -> Int {
@@ -228,12 +243,14 @@ final class MoodleRecordingProtocol: URLProtocol, @unchecked Sendable {
                 if found { this.client?.urlProtocol(this, didLoad: Data([1, 2, 3])) }
                 this.client?.urlProtocolDidFinishLoading(this)
             }
-            let held = Self.accounts.withLock { accounts in
-                guard accounts[token]?.holdsCourseImages == true else { return false }
+            let held = Self.accounts.withLock { accounts -> [CheckedContinuation<Void, Never>]? in
+                guard accounts[token]?.holdsCourseImages == true else { return nil }
                 accounts[token]?.heldCourseImages.append(deliver)
-                return true
+                defer { accounts[token]?.courseImageWaiters = [] }
+                return accounts[token]?.courseImageWaiters ?? []
             }
-            if !held { deliver() }
+            held?.forEach { $0.resume() }
+            if held == nil { deliver() }
             return
         }
         if isDownload {

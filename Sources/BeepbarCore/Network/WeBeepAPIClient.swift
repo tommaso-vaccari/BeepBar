@@ -245,6 +245,10 @@ public final class WeBeepAPIClient: @unchecked Sendable {
     public static let endpoint = WeBeepServerPolicy.production.endpoint
     private let session: URLSession
     public let policy: WeBeepServerPolicy
+    /// The timeout `fetchCourseImage` puts on its request: `courseImageTimeout` in production.
+    /// Internal, for tests that hold a picture's answer across other work and need a timeout that
+    /// cannot run out on a loaded machine (issue #243). Set before the client is used.
+    var courseImageRequestTimeout: TimeInterval = WeBeepAPIClient.courseImageTimeout
 
     public init() {
         self.session = Self.makeSession()
@@ -328,7 +332,7 @@ public final class WeBeepAPIClient: @unchecked Sendable {
         do { request = try RemoteDownloader.request(url: url, token: token, policy: policy) }
         catch { throw WeBeepAPIError.unexpectedSite }
         request.setValue("image/*", forHTTPHeaderField: "Accept")
-        request.timeoutInterval = Self.courseImageTimeout
+        request.timeoutInterval = courseImageRequestTimeout
         let receiver = BoundedMetadataResponse(limit: Self.courseImageByteLimit, acceptsContentType: { $0?.lowercased().hasPrefix("image/") == true })
         do { return try await receiver.run(request, in: session) }
         catch let error as WeBeepAPIError { throw error }

@@ -54,20 +54,12 @@ struct BeepbarApp: App {
         let build = Bundle.main.object(forInfoDictionaryKey: "CFBundleVersion") as? String ?? "unknown"
         BeepbarLog.lifecycle.notice("Application launched version=\(version, privacy: .public) build=\(build, privacy: .public)")
         _ = UpdaterController.shared
+        // Once per launch, before anything else: clears the preferences the removed telemetry left
+        // behind (#239). A no-op, with no write, once they are gone.
+        if !PreviewMode.isActive { LegacyTelemetryCleanup.removeLeftovers(from: .standard) }
         // Once per install: on by default, never re-applied after the user turns it off.
-        // Telemetry starts after it, so the day's first signal reports the login item's real state.
-        Task { [authentication] in
+        Task {
             await LaunchAtLoginController.shared.applyDefaultOnLaunch()
-            await DailyTelemetryController.shared.startForApplication(context: {
-                DailyTelemetryContext(
-                    language: .current,
-                    systemMajorVersion: ProcessInfo.processInfo.operatingSystemVersion.majorVersion,
-                    automaticSyncEnabled: authentication.automaticSyncEnabled,
-                    automaticSyncInterval: authentication.automaticSyncInterval,
-                    dataSaverEnabled: authentication.dataSaverEnabled,
-                    recordingsEnabled: authentication.recordingsEnabledWithoutCreating,
-                    launchAtLogin: LaunchAtLoginController.shared.status.map(LaunchAtLoginPolicy.isOn))
-            })
         }
         statusItemController = StatusItemController(authentication: authentication)
 #if DEBUG

@@ -14,6 +14,10 @@ struct PrivacyNoticeTests {
         let english = try PrivacyNotice.text(language: .english)
         #expect(italian.contains("**Assistenza e diritti.**"))
         #expect(english.contains("**Support and rights.**"))
+        #expect(italian.contains("**Statistiche d’uso.**"))
+        #expect(english.contains("**Usage statistics.**"))
+        #expect(!italian.contains("**Telemetria.**"))
+        #expect(!english.contains("**Telemetry.**"))
         #expect(italian.contains("**Aggiornamenti.**"))
         #expect(english.contains("**Updates.**"))
         #expect(!italian.contains("**Publisher and contact:**"))
@@ -21,10 +25,17 @@ struct PrivacyNoticeTests {
         for text in [italian, english] {
             #expect(text.contains("tommaso.vaccari@mail.polimi.it"))
             #expect(text.contains("90"))
-            #expect(text.contains("6(1)(f)"))
-            #expect(text.contains("TelemetryDeck"))
-            #expect(text.contains("https://telemetrydeck.com/docs/guides/privacy-faq/"))
-            #expect(text.contains("https://telemetrydeck.com/avv/"))
+            #expect(text.contains("6(1)(c)"))
+            // Telemetry was removed (#239): no link to the provider, no pointer to a Settings switch
+            // that no longer exists, and nothing left that says the app sends statistics.
+            #expect(!text.contains("telemetrydeck.com"))
+            // The usage-statistics paragraph is one line: it does not name the provider and does not
+            // describe what earlier versions sent.
+            #expect(!text.localizedCaseInsensitiveContains("TelemetryDeck"))
+            #expect(!text.contains("Le versioni precedenti inviavano"))
+            #expect(!text.contains("Earlier versions sent"))
+            #expect(!text.contains("Impostazioni → Telemetria"))
+            #expect(!text.contains("Settings → Telemetry"))
             #expect(text.contains("https://docs.github.com/en/site-policy/privacy-policies/github-general-privacy-statement"))
         }
     }

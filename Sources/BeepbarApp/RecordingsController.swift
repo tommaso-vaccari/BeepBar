@@ -167,7 +167,7 @@ struct RecordingsListing: Equatable {
     private static let sessionDiscardedKey = "io.github.tvaccari.beepbar.recordings-session-discarded.v1"
 
     /// The switch as saved: on by default, and off wherever the feature isn't available. Shared by
-    /// `init` and by readers that must not create the controller (daily telemetry).
+    /// `init` and by readers that must not create the controller.
     nonisolated static func storedEnabled(in defaults: UserDefaults, isAvailable: Bool) -> Bool {
         (defaults.object(forKey: enabledKey) as? Bool ?? true) && isAvailable
     }

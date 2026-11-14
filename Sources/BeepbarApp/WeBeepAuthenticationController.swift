@@ -1398,13 +1398,6 @@ enum MaterialsRunEnd: Equatable, Sendable {
         return (operationDefaults.bool(forKey: RecordingsController.sessionDeletionPendingKey) || operationDefaults.bool(forKey: RecordingsController.studyDeletionPendingKey)) ? recordings : nil
     }
 
-    /// Whether Recordings is on, read without creating its controller (daily telemetry asks once a
-    /// day and must not build the feature just to report it is off).
-    var recordingsEnabledWithoutCreating: Bool {
-        if let recordingsStorage { return recordingsStorage.isEnabled }
-        return RecordingsController.storedEnabled(in: operationDefaults, isAvailable: selectedSite.university == .polimi)
-    }
-
     /// The WeBeep account the saved Polimi session is bound to; nil until the account is
     /// validated in this launch (`siteInfo`).
     var recordingsOwnerUserID: Int? {
@@ -4007,7 +4000,7 @@ enum MaterialsRunEnd: Equatable, Sendable {
 struct BackgroundActivityRegistration {
     let invalidate: () -> Void
     /// The system's `NSBackgroundActivityScheduler.shouldDefer`: true when it wants background
-    /// work to yield. Registrations that never defer (DailyTelemetry, tests) keep the default.
+    /// work to yield. Registrations that never defer (tests) keep the default.
     var shouldDefer: () -> Bool = { false }
 }
 

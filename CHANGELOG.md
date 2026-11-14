@@ -11,6 +11,7 @@
 
 - Opening a course in Recordings clears its new-recordings badge in the sidebar. The blue dots stay on the new lectures while you are in the course, and once you leave it they count as read, so the “Segna novità come lette” (“Mark new recordings as read”) button is gone.
 - The Recordings sidebar is tidier: the orange dot is gone, and under each course's name you now read how many lectures are left, for example “30 registrazioni · 3 da guardare”. The only badge left counts new recordings, and it stays readable on the selected course. The number beside “Watchlist” now counts the lessons added by link too.
+- BeepBar no longer sends anonymous usage statistics, and the “Telemetria” (“Telemetry”) option in Settings is gone. There is nothing to do after updating.
 
 ### Fixed
 

@@ -36,7 +36,7 @@ struct VoiceLevelerReferenceTests {
     static let wholeReference = KeypointLeveler().curve(over: KeypointLeveler.Audio(whole, bootstrap: true)).apply(to: 0..<whole.count)
 
     /// One segment the way `LiveAudioPipeline.produceIsolated` makes it: a clip of the last 22 s
-    /// of the previous segment (when it exists), the segment, and the first 10.5 s of the next;
+    /// of the previous segment (when it exists), the segment, and the first `levelTail` (20.5 s) of the next;
     /// the keypoints it covers resolved with `memo`, merged into it (existing entries win), and
     /// the segment's own samples kept.
     static func render(_ signal: [Float], from start: Int, to end: Int, memo: inout [Int: Double], withPrevious: Bool, leveler: VoiceLeveler = VoiceLeveler()) -> [Float] {
@@ -81,12 +81,18 @@ struct VoiceLevelerReferenceTests {
     /// within 1 dB; the gain at every nonsilent sample is the whole render's within 1 dB; a
     /// keypoint, once used, is never changed by a later segment; and at each segment boundary
     /// that falls inside the voice the gain just before and just after differ by less than
-    /// 0.3 dB (`onset` 119 puts the 120 s boundary there). Guards against a first segment's
+    /// 0.3 dB (`onset` 119 puts the 120 s boundary there). `first` is the first segment's length,
+    /// the others being 30 s: 30.010667 puts every boundary a little past the 10 s keypoint grid,
+    /// as Webex's do (the last keypoint a segment asks for is then a whole `spacing` past its
+    /// end, and the one after it, which "unanchored" looks at, has almost none of its window in
+    /// the clip unless `levelTail` leaves room for it: 130.5 s is the onset that fell there).
+    /// Guards against a first segment's
     /// provisional 0 dB being held through the silence that follows, so that the first words of a
     /// quiet lecture come out up to 40 dB too low and the gain climbs during them (before the
     /// correction: about +7 dB at that instant), and against fixing that by recomputing a
     /// keypoint, which would put a step at a seam.
-    @Test(arguments: [120.0, 119.0]) func aLongSilenceBeforeTheVoiceLevelsFromTheFirstWords(onset: Double) {
+    @Test(arguments: [(120.0, 30.0), (119.0, 30.0), (130.5, 30.010667), (134.0, 30.010667), (137.0, 30.010667)])
+    func aLongSilenceBeforeTheVoiceLevelsFromTheFirstWords(onset: Double, first: Double) {
         // The silence is zeros, not generated noise at −120 dB: a minute of samples through the
         // generator costs seconds in a debug build and the silence's values are all zero anyway.
         let lecture = [Float](repeating: 0, count: Self.seconds(onset)) + Self.lecture([(180 - onset, -60)])
@@ -98,9 +104,10 @@ struct VoiceLevelerReferenceTests {
         var memo: [Int: Double] = [:]
         var provisional: Set<Int> = []
         var start = 0
-        let length = Self.seconds(30)
+        var boundaries: [Int] = []
         while start < whole.count {
-            let end = min(whole.count, start + length)
+            let end = min(whole.count, boundaries.isEmpty ? Self.seconds(first) : start + Self.seconds(30))
+            boundaries.append(end)
             let before = memo
             produced += Self.renderKeepingProvisional(whole, from: start, to: end, memo: &memo, provisional: &provisional, withPrevious: start > 0)
             for (k, gain) in before { #expect(memo[k] == gain, "keypoint \(k) changed after it was used") }
@@ -126,7 +133,7 @@ struct VoiceLevelerReferenceTests {
         #expect(worst < 1, "largest difference from the whole render \(worst) dB")
 
         var checkedSeams = 0
-        for seam in stride(from: Self.seconds(30), to: whole.count, by: Self.seconds(30)) where seam > Self.seconds(onset) {
+        for seam in boundaries.dropLast() where seam > Self.seconds(onset) {
             let a = nearest(seam - 1, -1), b = nearest(seam, 1)
             #expect(abs(gain(produced, a) - gain(produced, b)) < 0.3, "step at \(seam / Self.rate) s")
             checkedSeams += 1

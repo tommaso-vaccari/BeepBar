@@ -50,7 +50,7 @@ import Foundation
 /// - That last `neutral` is *provisional* (`Resolution.provisional`). The caller keeps it like
 ///   any value, so it is never recomputed and a seam never has a step, but it anchors nothing:
 ///   on a hold chain it is not a known value for the keypoints after it, and "unanchored" skips
-///   it. Without that, a lecture whose first stretch is longer than the look-ahead (about 37 s)
+///   it. Without that, a lecture whose first stretch is longer than the look-ahead (about 47 s)
 ///   in silence would hold its 0 dB through the silence that follows, even in a clip that
 ///   contains the voice, and the gain would climb to the voice's only after the first words
 ///   (a lecture at −60 dBFS started up to 40 dB too low). With it, the climb happens in the

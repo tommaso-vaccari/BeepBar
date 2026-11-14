@@ -191,13 +191,14 @@ struct AudioEnhancementTests {
     }
 
     /// How far a segment's levelling reads around it: 22 s before (12 s window before a keypoint
-    /// up to 10 s before the segment) and 10.5 s after (a keypoint up to 10 s past its end plus
+    /// up to 10 s before the segment) and 20.5 s after (the last keypoint asked for is up to 10 s
+    /// past the segment's end, the one after it, which "unanchored" looks at, another 10 s, plus
     /// the ceiling's look-ahead). Guards against a lead that no longer covers the leveler's
     /// window, which would make a segment's gain differ from the lecture's.
     @Test func theLevellingLeadAndTailCoverTheLevelersReach() {
         let leveler = VoiceLeveler()
         #expect(AudioEnhancement.levelLead == Int((leveler.window + leveler.spacing) * Double(AudioEnhancement.isolationSampleRate)))
-        #expect(AudioEnhancement.levelTail == Int((leveler.spacing + 0.5) * Double(AudioEnhancement.isolationSampleRate)))
+        #expect(AudioEnhancement.levelTail == Int((2 * leveler.spacing + 0.5) * Double(AudioEnhancement.isolationSampleRate)))
         #expect(AudioEnhancementKind.allCases == [.levelled, .isolated])
         // The pipeline mixes the two units (the lead and tail are counted in samples of the
         // isolation rate but the leveler reads them at its own): they must be the same rate.

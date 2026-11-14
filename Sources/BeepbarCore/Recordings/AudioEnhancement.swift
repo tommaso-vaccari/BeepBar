@@ -125,9 +125,14 @@ public enum AudioEnhancement {
     /// uses may be up to one `spacing` (10 s) before the segment's start, and its window reaches
     /// 12 s before that (`VoiceLeveler`).
     public static let levelLead = 22 * isolationSampleRate
-    /// How much after: the closing keypoint is up to one `spacing` past the segment's end, and
-    /// the ceiling looks 0.2 s ahead of a sample (10.5 s in all).
-    public static let levelTail = isolationSampleRate * 21 / 2
+    /// How much after, in all 20.5 s: two `spacing`s and the ceiling's 0.5 s look-ahead. The last
+    /// keypoint a segment asks for can lie up to one `spacing` past its end (`keypoints(covering:)`
+    /// rounds up), and the keypoint after that one, which "unanchored" consults, must have a
+    /// measurable window in the clip. With 10.5 s and a segment ending just past a multiple of
+    /// 10 s (Webex's do: 30.010667 s) that keypoint had only 0.5 s of its window in the clip, so
+    /// the last keypoint in a long silence stayed a provisional 0 dB and the first words after
+    /// it started at 0 dB and climbed.
+    public static let levelTail = isolationSampleRate * 41 / 2
 
     /// ffmpeg's command that decodes audio to a mono 48 kHz WAV for voice isolation. Its input
     /// starts at `firstSample` on the lecture's clock; the WAV holds the samples from `from` to

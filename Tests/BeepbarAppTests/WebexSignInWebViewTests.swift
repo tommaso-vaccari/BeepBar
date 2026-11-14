@@ -377,8 +377,7 @@ struct WebexSignInWebViewTests {
         }
     }
 
-    /// A Webex request that never answers and can end only by cancellation: `send` waits a day,
-    /// far beyond any time limit, so it returns by itself never. `requestSent` fires when the
+    /// A Webex request that never answers and can end only by cancellation: `send` has a generous finite fallback timeout. `requestSent` fires when the
     /// Play reaches it (the test interrupts a stream really waiting on Webex) and
     /// `requestCancelled` when the transport saw its task cancelled, which proves the
     /// interruption reached the request itself and not only the stream's caller.
@@ -389,7 +388,7 @@ struct WebexSignInWebViewTests {
         func send(_ request: URLRequest, limit: Int) async throws -> WebexHTTPResponse {
             requestSent.fire()
             do {
-                try await Task.sleep(for: .seconds(86_400))
+                try await Task.sleep(for: .seconds(90))
             } catch {
                 requestCancelled.fire()
                 throw error
@@ -400,10 +399,10 @@ struct WebexSignInWebViewTests {
 
     /// `close()` and a newer operation end a Play waiting on Webex: the request is cancelled,
     /// not left to its timeout. Nothing but the interruption under test can end the transport
-    /// (it never answers, and there is no watchdog), so the stream finishing with
+    /// (it never answers), so the stream finishing with
     /// `CancellationError` and the transport having seen the cancellation proves the wiring
     /// with no time bound in the assertion; a broken wiring leaves the Play waiting until the
-    /// `.timeLimit` hang guard fails the test. Guards against `close()` or a new operation
+    /// watchdog fails the test and cancels the task. Guards against `close()` or a new operation
     /// leaving the stream's task running (a Play that outlives its window or its replacement).
     @Test(.timeLimit(.minutes(2))) func closingOrANewOperationEndsAStreamWaitingOnWebex() async throws {
         for interruption in ["close", "newer operation"] {
@@ -413,6 +412,13 @@ struct WebexSignInWebViewTests {
             await session.open(cookies: [])
             defer { session.close() }
             let task = Task { try await session.stream(player: URL(string: Self.page)!, email: nil) }
+            let watchdog = Task.detached {
+                do { try await Task.sleep(for: .seconds(45)) } catch { return false }
+                task.cancel()
+                transport.requestSent.fire()
+                transport.requestCancelled.fire()
+                return true
+            }
             // Interrupted only once the request is out. Interrupting earlier would land while the
             // Play still reads WebKit's cookie store (a call nothing cancels), so the test would
             // measure WebKit's delay (up to 11.5 s, over 20 s under a parallel ffmpeg load, in the
@@ -429,6 +435,8 @@ struct WebexSignInWebViewTests {
             // The transport observes the cancellation as the stream's task unwinds; awaiting its
             // signal (not a timed poll) tolerates that lag.
             await transport.requestCancelled.wait()
+            watchdog.cancel()
+            #expect(await watchdog.value == false, "\(interruption): stream did not finish")
         }
     }
 

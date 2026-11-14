@@ -13,31 +13,6 @@ private func eventually(_ what: String, _ condition: () async -> Bool) async thr
     throw CancellationError()
 }
 
-/// A one-shot event a test awaits without polling: `wait()` returns once `fire()` has been
-/// called, whether before or after.
-private final class Signal: @unchecked Sendable {
-    private let lock = NSLock()
-    private var fired = false
-    private var waiters: [CheckedContinuation<Void, Never>] = []
-    func fire() {
-        let toResume = lock.withLock { () -> [CheckedContinuation<Void, Never>] in
-            fired = true
-            defer { waiters = [] }
-            return waiters
-        }
-        toResume.forEach { $0.resume() }
-    }
-    func wait() async {
-        await withCheckedContinuation { continuation in
-            let already = lock.withLock { () -> Bool in
-                if !fired { waiters.append(continuation) }
-                return fired
-            }
-            if already { continuation.resume() }
-        }
-    }
-}
-
 /// The name a file of one run has without its run number (`runFile`): `decoded6l-12.wav` is
 /// `decoded6l.wav`, the name tests hold, fail and look for.
 private func stem(_ name: String) -> String {
@@ -511,15 +486,30 @@ struct LiveAudioPipelineTests {
         // Stops the copy of piece 6's original after its first block, until its task is
         // cancelled: the wait ends only that way, so the seek below is what ends it. Other
         // pieces' copies (the prefetched neighbours, segment 20's) are not held.
-        let stopped = Signal()
+        let stopped = AsyncStream<Void>.makeStream(bufferingPolicy: .bufferingNewest(1))
+        defer { stopped.continuation.finish() }
         await pipeline.setOriginalCheckpointForTesting { output, blocks in
             guard blocks == 1, stem(output.lastPathComponent) == "original6t.raw" else { return }
-            stopped.fire()
-            try await Task.sleep(for: .seconds(86_400))
+            stopped.continuation.yield(())
+            try await Task.sleep(for: .seconds(90))
+            Issue.record("the seek did not cancel the copy")
+            throw CancellationError()
         }
         _ = try await pipeline.segment(0)
         let six = Task { try await pipeline.segment(6) }
-        await stopped.wait()
+        let reached = await withTaskGroup(of: Bool.self) { group in
+            group.addTask { for await _ in stopped.stream { return true }; return false }
+            group.addTask { do { try await Task.sleep(for: .seconds(45)) } catch { return false }; return false }
+            let result = await group.next() ?? false
+            group.cancelAll()
+            return result
+        }
+        guard reached else {
+            Issue.record("original copy did not reach its checkpoint")
+            six.cancel()
+            await pipeline.stop()
+            return
+        }
         // The copy is under way and cut short: the file is there with exactly the one block.
         let original = try #require(rawFiles("original").first { stem($0) == "original6t.raw" }, "the copy stopped before its file existed")
         #expect(size(original) == 65_536 * 4, "the copy was not stopped after its first block")

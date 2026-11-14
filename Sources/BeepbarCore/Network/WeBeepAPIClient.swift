@@ -247,22 +247,25 @@ public final class WeBeepAPIClient: @unchecked Sendable {
     public let policy: WeBeepServerPolicy
     /// The timeout `fetchCourseImage` puts on its request: `courseImageTimeout` in production.
     /// Internal, for tests that hold a picture's answer across other work and need a timeout that
-    /// cannot run out on a loaded machine (issue #243). Set before the client is used.
-    var courseImageRequestTimeout: TimeInterval = WeBeepAPIClient.courseImageTimeout
+    /// cannot run out on a loaded machine (issue #243).
+    private let courseImageRequestTimeout: TimeInterval
 
-    public init() {
-        self.session = Self.makeSession()
-        self.policy = .production
+    public convenience init() {
+        self.init(policy: .production, session: Self.makeSession(), courseImageRequestTimeout: Self.courseImageTimeout)
     }
 
-    public init(session: URLSession) {
+    public convenience init(session: URLSession) {
+        self.init(policy: .production, session: session, courseImageRequestTimeout: Self.courseImageTimeout)
+    }
+
+    public convenience init(policy: WeBeepServerPolicy, session: URLSession? = nil) {
+        self.init(policy: policy, session: session ?? Self.makeSession(), courseImageRequestTimeout: Self.courseImageTimeout)
+    }
+
+    init(policy: WeBeepServerPolicy, session: URLSession, courseImageRequestTimeout: TimeInterval) {
         self.session = session
-        self.policy = .production
-    }
-
-    public init(policy: WeBeepServerPolicy, session: URLSession? = nil) {
         self.policy = policy
-        self.session = session ?? Self.makeSession()
+        self.courseImageRequestTimeout = courseImageRequestTimeout
     }
 
     public func validateToken(_ token: String) async throws -> WeBeepSiteInfo {

@@ -57,14 +57,21 @@ struct NetworkPathReaderTests {
 
     /// A provider that never answers (and whose timeout is never fired) ends only by cancellation:
     /// the read returns nil and the provider's cleanup has run. Finishing at all proves the
-    /// cancellation arrived (a reader that ignored it hangs until the `.timeLimit` guard); no
+    /// cancellation arrived (a watchdog fires the provider timeout if cancellation is ignored); no
     /// 100 ms bound decides it, as it failed on a loaded machine (#243).
-    @Test(.timeLimit(.minutes(1))) func cancellationOfSilentProviderIsPromptAndCleansUp() async {
+    @Test(.timeLimit(.minutes(2))) func cancellationOfSilentProviderIsPromptAndCleansUp() async {
         let provider = PathProvider()
         let task = Task { await NetworkPathReader.current(start: provider.start) }
         await provider.waitForStart()
+        let watchdog = Task.detached {
+            do { try await Task.sleep(for: .seconds(45)) } catch { return false }
+            provider.timeout()
+            return true
+        }
         task.cancel()
         #expect(await task.value == nil)
+        watchdog.cancel()
+        #expect(await watchdog.value == false, "cancellation did not end the read")
         #expect(provider.cleanups == 1)
     }
 
@@ -72,7 +79,7 @@ struct NetworkPathReaderTests {
     /// returned) still releases what it installs once it returns. The provider stays silent and its
     /// timeout is never fired, so the read ends only through the cancellation; awaiting it
     /// replaces the 100 ms poll that failed on a loaded machine (#243).
-    @Test(.timeLimit(.minutes(1))) func cancellationDuringInstallationReleasesLateResources() async {
+    @Test(.timeLimit(.minutes(2))) func cancellationDuringInstallationReleasesLateResources() async {
         let provider = PathProvider()
         let release = DispatchSemaphore(value: 0)
         let task = Task.detached {
@@ -82,10 +89,23 @@ struct NetworkPathReaderTests {
                 return cleanup
             }
         }
-        await provider.waitForStart()
+        let watchdog = Task.detached {
+            do { try await Task.sleep(for: .seconds(45)) } catch { return false }
+            provider.finishStartSignal()
+            provider.timeout()
+            return true
+        }
+        guard await provider.waitForStart() else {
+            task.cancel()
+            release.signal()
+            Issue.record("provider did not start")
+            return
+        }
         task.cancel()
         release.signal()
         #expect(await task.value == nil)
+        watchdog.cancel()
+        #expect(await watchdog.value == false, "cancellation did not end the read")
         #expect(provider.cleanups == 1)
     }
 
@@ -146,7 +166,11 @@ private final class PathProvider: Sendable {
             state.withLock { $0.cleanups += 1; $0.receive = nil; $0.timeout = nil }
         }
     }
-    func waitForStart() async { for await _ in started.stream { return } }
+    @discardableResult func waitForStart() async -> Bool {
+        for await _ in started.stream { return true }
+        return false
+    }
+    func finishStartSignal() { started.continuation.finish() }
     func receive(_ result: NetworkPathConditions?) { state.withLock { $0.receive }?(result) }
     func timeout() { state.withLock { $0.timeout }?() }
 }

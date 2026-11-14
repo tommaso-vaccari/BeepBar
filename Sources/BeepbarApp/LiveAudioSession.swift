@@ -857,8 +857,10 @@ actor LiveAudioPipeline {
             }
             try destination.write(contentsOf: samples.withUnsafeBytes { Data($0) })
             done += wanted
-            blocksWritten += 1
-            if let checkpoint { try await checkpoint(output, blocksWritten) }
+            if let checkpoint {
+                blocksWritten += 1
+                try await checkpoint(output, blocksWritten)
+            }
         }
     }
 

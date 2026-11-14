@@ -50,7 +50,7 @@ struct VoiceIsolatorTests {
         let ffmpeg = try prepare()
         let noise = folder.appendingPathComponent("noise.wav")
         try AudioTestSignals.run(ffmpeg, ["-nostdin", "-loglevel", "error", "-y",
-                                          "-f", "lavfi", "-i", "anoisesrc=c=pink:a=0.04:r=48000:d=8",
+                                          "-f", "lavfi", "-i", "anoisesrc=c=pink:a=0.04:r=48000:d=8:seed=7",
                                           "-f", "lavfi", "-i", "sine=f=100:r=48000:d=8",
                                           "-filter_complex", "[1]volume=0.02[h];[0][h]amix=inputs=2:normalize=0",
                                           "-ac", "1", "-c:a", "pcm_f32le", noise.path], in: folder)

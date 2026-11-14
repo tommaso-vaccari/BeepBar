@@ -1,6 +1,6 @@
 import Foundation
 import os
-import BeepbarCore
+@testable import BeepbarCore
 
 /// A local Moodle for app tests: answers site info, the enrolled courses and course contents,
 /// serves file downloads, and records every request with the network restrictions it carried.
@@ -39,7 +39,7 @@ final class MoodleRecordingProtocol: URLProtocol, @unchecked Sendable {
         var holdsCourseImages = false
         var heldCourseImages: [@Sendable () -> Void] = []
         /// Tests awaiting the first held course picture (`waitUntilCourseImageHeld`).
-        var courseImageWaiters: [CheckedContinuation<Void, Never>] = []
+        var courseImageWaiters: [UUID: AsyncStream<Void>.Continuation] = [:]
     }
 
     /// What a download records as its `function`.
@@ -100,14 +100,25 @@ final class MoodleRecordingProtocol: URLProtocol, @unchecked Sendable {
 
     /// Returns once a course picture request is held by `holdCourseImages` (at once if one is):
     /// an awaited signal from the mock instead of a timed poll.
-    static func waitUntilCourseImageHeld(token: String) async {
-        await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
-            let ready = accounts.withLock { accounts -> Bool in
-                if (accounts[token]?.heldCourseImages.count ?? 0) > 0 { return true }
-                accounts[token]?.courseImageWaiters.append(continuation)
-                return false
-            }
-            if ready { continuation.resume() }
+    static func waitUntilCourseImageHeld(token: String) async -> Bool {
+        let id = UUID()
+        let event = AsyncStream<Void>.makeStream(bufferingPolicy: .bufferingNewest(1))
+        let ready = accounts.withLock { accounts -> Bool in
+            if (accounts[token]?.heldCourseImages.count ?? 0) > 0 { return true }
+            accounts[token]?.courseImageWaiters[id] = event.continuation
+            return false
+        }
+        defer {
+            _ = accounts.withLock { $0[token]?.courseImageWaiters.removeValue(forKey: id) }
+            event.continuation.finish()
+        }
+        if ready { return true }
+        return await withTaskGroup(of: Bool.self) { group in
+            group.addTask { for await _ in event.stream { return true }; return false }
+            group.addTask { do { try await Task.sleep(for: .seconds(45)) } catch { return false }; return false }
+            let result = await group.next() ?? false
+            group.cancelAll()
+            return result
         }
     }
 
@@ -181,8 +192,11 @@ final class MoodleRecordingProtocol: URLProtocol, @unchecked Sendable {
         accounts.withLock { $0[token]?.requests ?? [] }
     }
 
-    static func makeClient() -> WeBeepAPIClient {
-        WeBeepAPIClient(session: makeSession())
+    static func makeClient(courseImageTimeout: TimeInterval? = nil) -> WeBeepAPIClient {
+        if let courseImageTimeout {
+            return WeBeepAPIClient(policy: .production, session: makeSession(), courseImageRequestTimeout: courseImageTimeout)
+        }
+        return WeBeepAPIClient(session: makeSession())
     }
 
     /// A downloader whose requests stay in this protocol, for the files `register(files:)` lists.
@@ -243,13 +257,13 @@ final class MoodleRecordingProtocol: URLProtocol, @unchecked Sendable {
                 if found { this.client?.urlProtocol(this, didLoad: Data([1, 2, 3])) }
                 this.client?.urlProtocolDidFinishLoading(this)
             }
-            let held = Self.accounts.withLock { accounts -> [CheckedContinuation<Void, Never>]? in
+            let held = Self.accounts.withLock { accounts -> [AsyncStream<Void>.Continuation]? in
                 guard accounts[token]?.holdsCourseImages == true else { return nil }
                 accounts[token]?.heldCourseImages.append(deliver)
-                defer { accounts[token]?.courseImageWaiters = [] }
-                return accounts[token]?.courseImageWaiters ?? []
+                defer { accounts[token]?.courseImageWaiters = [:] }
+                return accounts[token].map { Array($0.courseImageWaiters.values) } ?? []
             }
-            held?.forEach { $0.resume() }
+            held?.forEach { $0.yield(()) }
             if held == nil { deliver() }
             return
         }

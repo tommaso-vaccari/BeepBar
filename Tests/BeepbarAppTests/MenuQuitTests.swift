@@ -18,21 +18,29 @@ struct MenuQuitTests {
     }
 
     /// A sync that stops when cancelled lets "Esci" go ahead as soon as it has stopped, not after
-    /// the full timeout. Fails if the sync isn't cancelled, or if the wait ignores its end. The
-    /// timeout is a day, so the wait can only end because the sync stopped; a wait that ignored
-    /// its end hangs until the `.timeLimit` guard (no elapsed-time comparison: #243).
-    @Test(.timeLimit(.minutes(1))) @MainActor func menuQuitCancelsTheSyncAndGoesOnOnceItStops() async throws {
+    /// the full timeout. Fails if the sync isn't cancelled, or if the wait ignores its end. A watchdog records a failure if the sync does not stop; the finite timeout also bounds the wait (#243).
+    @Test(.timeLimit(.minutes(2))) @MainActor func menuQuitCancelsTheSyncAndGoesOnOnceItStops() async throws {
         let root = FileManager.default.temporaryDirectory.appending(path: UUID().uuidString)
         try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
         defer { try? FileManager.default.removeItem(at: root) }
         let controller = WeBeepAuthenticationController(testRootURL: root)
+        var syncFinished = false
         let sync = Task { @MainActor in
             while !Task.isCancelled { try? await Task.sleep(for: .milliseconds(5)) }
+            syncFinished = true
         }
         controller.setOperationForTesting(UUID(), task: sync)
         controller.setSyncStateForTesting(.syncing)
 
-        #expect(await controller.prepareForMenuQuit(timeout: .seconds(86_400)))
+        let watchdog = Task { @MainActor in
+            do { try await Task.sleep(for: .seconds(45)) } catch { return false }
+            sync.cancel()
+            return true
+        }
+        #expect(await controller.prepareForMenuQuit(timeout: .seconds(90)))
+        #expect(syncFinished)
+        watchdog.cancel()
+        #expect(await watchdog.value == false, "quit did not stop the sync")
         #expect(sync.isCancelled)
         #expect(controller.syncState == .cancelling)
         #expect(controller.menuQuitDrained)
@@ -40,10 +48,8 @@ struct MenuQuitTests {
 
     /// A sync that doesn't stop in time can't hold the quit hostage: "Esci" goes ahead after the
     /// timeout, as a quit from outside does. Fails if the wait is `await syncTask.value` (which
-    /// ignores cancellation) instead of a capped wait. The sync stays on its gate for the whole
-    /// test (no watchdog that would release it after 30 s and so end the wait by itself): only the
-    /// 200 ms timeout can return the quit, and a wait without it hangs until the `.timeLimit` guard.
-    @Test(.timeLimit(.minutes(1))) @MainActor func menuQuitGivesUpWaitingAfterTheTimeout() async throws {
+    /// ignores cancellation) instead of a capped wait. A watchdog releases the gate and records a failure if the quit does not return.
+    @Test(.timeLimit(.minutes(2))) @MainActor func menuQuitGivesUpWaitingAfterTheTimeout() async throws {
         let root = FileManager.default.temporaryDirectory.appending(path: UUID().uuidString)
         try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
         defer { try? FileManager.default.removeItem(at: root) }
@@ -56,8 +62,18 @@ struct MenuQuitTests {
         }
         while !gate.isWaiting { await Task.yield() }
         controller.setOperationForTesting(UUID(), task: sync)
+        let watchdog = Task { @MainActor in
+            do { try await Task.sleep(for: .seconds(45)) } catch { return false }
+            gate.release()
+            return true
+        }
 
-        #expect(await controller.prepareForMenuQuit(timeout: .milliseconds(200)))
+        let timeout = Duration.milliseconds(200)
+        let started = ContinuousClock.now
+        #expect(await controller.prepareForMenuQuit(timeout: timeout))
+        #expect(ContinuousClock.now - started >= timeout)
+        watchdog.cancel()
+        #expect(await watchdog.value == false, "quit did not respect its timeout")
         #expect(!syncFinished)
         #expect(sync.isCancelled)
         #expect(controller.menuQuitDrained)
@@ -97,13 +113,16 @@ struct MenuQuitTests {
         #expect(controller.menuQuitDrained)
     }
 
-    /// The capped wait itself: it returns when the task ends, or when the timeout passes. Each half
-    /// is proved by making the other unable to happen: a day-long timeout with a task that ends,
-    /// and a task held on a gate (no watchdog) with a 100 ms timeout. Returning at all is the
-    /// proof; a wait missing either half hangs until the `.timeLimit` guard (#243).
-    @Test(.timeLimit(.minutes(1))) @MainActor func cappedWaitReturnsOnWhicheverComesFirst() async {
+    /// The capped wait itself: it returns when the task ends, or when the timeout passes. A watchdog records a failure and releases the held task if either wait stalls (#243).
+    @Test(.timeLimit(.minutes(2))) @MainActor func cappedWaitReturnsOnWhicheverComesFirst() async {
         let quick = Task<Void, Never> {}
-        await WeBeepAuthenticationController.wait(for: quick, atMost: .seconds(86_400))
+        let quickWatchdog = Task { @MainActor in
+            do { try await Task.sleep(for: .seconds(45)) } catch { return false }
+            return true
+        }
+        await WeBeepAuthenticationController.wait(for: quick, atMost: .seconds(90))
+        quickWatchdog.cancel()
+        #expect(await quickWatchdog.value == false, "wait did not observe the finished task")
 
         let gate = FakeRecmanBrowser.Gate()
         var slowFinished = false
@@ -112,7 +131,17 @@ struct MenuQuitTests {
             slowFinished = true
         }
         while !gate.isWaiting { await Task.yield() }
-        await WeBeepAuthenticationController.wait(for: slow, atMost: .milliseconds(100))
+        let watchdog = Task { @MainActor in
+            do { try await Task.sleep(for: .seconds(45)) } catch { return false }
+            gate.release()
+            return true
+        }
+        let timeout = Duration.milliseconds(100)
+        let started = ContinuousClock.now
+        await WeBeepAuthenticationController.wait(for: slow, atMost: timeout)
+        #expect(ContinuousClock.now - started >= timeout)
+        watchdog.cancel()
+        #expect(await watchdog.value == false, "wait did not respect its timeout")
         #expect(!slowFinished)
         gate.release()
         await slow.value

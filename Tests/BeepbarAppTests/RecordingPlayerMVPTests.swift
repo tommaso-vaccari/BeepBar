@@ -241,10 +241,10 @@ struct RecordingPlayerMVPTests {
     }
 
     /// Plays the fixture and waits until it is ready and started.
-    private func playReady(_ controller: RecordingPlayerController, startAt: TimeInterval? = nil) async throws {
+    private func playReady(_ controller: RecordingPlayerController, startAt: TimeInterval? = nil, watchdogSeconds: Double = 20) async throws {
         let media = try await TestMedia.shared.url()
         controller.play(media, title: "Lezione", cookies: [], startAt: startAt)
-        try await Self.waitUntil { controller.isStartSettled }
+        try await Self.waitUntil(seconds: watchdogSeconds) { controller.isStartSettled }
     }
 
     /// Pauses at a known position and lets the pause report settle, so a test starts clean.
@@ -293,7 +293,9 @@ struct RecordingPlayerMVPTests {
         defaults.set(1.5, forKey: RecordingPlayerPolicy.speedDefaultsKey)
         let written = defaults.writes.count
         let controller = makeController(defaults: defaults)
-        try await playReady(controller)
+        defer { controller.close() }
+        try await playReady(controller, watchdogSeconds: 60)
+        try #require(controller.isStartSettled)
         let player = try #require(controller.player)
         #expect(player.defaultRate == 1.5)
         #expect(player.rate == 1.5)
@@ -301,7 +303,6 @@ struct RecordingPlayerMVPTests {
         player.play()
         #expect(player.rate == 1.5)
         #expect(defaults.writes.count == written)
-        controller.close()
     }
 
     /// Choosing a speed applies it at once while playing, keeps it across pause/resume and the

@@ -202,11 +202,10 @@ struct RecmanWebSessionScriptTests {
     /// not only how soon: a call that WebKit ended reads `.answered(nil)`, whatever the timing.
     private static let stalled = "return new Promise(() => {})"
 
-    /// A script timeout that cannot run out during a test, far past the `.timeLimit` hang guard:
-    /// an interrupted script can then only have been ended by the interruption under test, never
-    /// by the timeout, so no elapsed-time bound is needed (the old 15 s bound was flaky under a
+    /// A generous finite script timeout bounds a broken interruption:
+    /// the distinct `.interrupted` outcome identifies the interruption, so no elapsed-time bound is needed (the old 15 s bound was flaky under a
     /// loaded suite: #243). `call.outcome == .interrupted` says how the call ended.
-    private static let neverRunsOut: Duration = .seconds(86_400)
+    private static let fallbackTimeout: Duration = .seconds(90)
 
     private func openSession(scriptTimeout: Duration) async throws -> RecmanWebSession {
         let session = RecmanWebSession()
@@ -320,25 +319,34 @@ struct RecmanWebSessionScriptTests {
     /// A script that never answers ends at `scriptTimeout` as `unavailable`, the error a page load
     /// that never finishes gives, so the controller stops instead of waiting forever. The lower
     /// bound (it did not end early) is deterministic; the "not forever" half is the time limit.
-    @Test(.timeLimit(.minutes(1))) func aScriptThatNeverAnswersEndsAtTheTimeout() async throws {
+    @Test(.timeLimit(.minutes(2))) func aScriptThatNeverAnswersEndsAtTheTimeout() async throws {
         let session = try await openSession(scriptTimeout: .milliseconds(300))
         defer { session.close() }
         let clock = ContinuousClock()
         let started = clock.now
-        await #expect(throws: RecmanBrowserError.unavailable) { try await session.runScript(Self.stalled, arguments: [:]) }
+        let task = Task { try await session.runScript(Self.stalled, arguments: [:]) }
+        let watchdog = Task { @MainActor in
+            do { try await Task.sleep(for: .seconds(45)) } catch { return false }
+            task.cancel()
+            return true
+        }
+        await #expect(throws: RecmanBrowserError.unavailable) { try await task.value }
         let elapsed = clock.now - started
+        watchdog.cancel()
+        #expect(await watchdog.value == false, "script timeout did not fire")
+        #expect(session.lastScriptCall?.outcome == .timedOut)
         #expect(elapsed >= .milliseconds(300))
         // No upper bound: the failure guarded against is a wait that never ends, which the
-        // `.timeLimit` hang guard catches (a 15 s bound failed on loaded runners: #243). The error
+        // watchdog bounds (a 15 s bound failed on loaded runners: #243). The outcome
         // and the lower bound together say the timeout ended it.
         #expect(!session.hasPendingScript)
     }
 
     /// `close()` (Recordings turned off, sign-out, another account) ends a script in flight. The
-    /// script timeout cannot run out, so only `close()` can have ended it (`.interrupted`, not
-    /// `.timedOut`); a close that left it waiting hangs until the `.timeLimit` guard.
-    @Test(.timeLimit(.minutes(1))) func closingEndsAScriptInFlight() async throws {
-        let session = try await openSession(scriptTimeout: Self.neverRunsOut)
+    /// script timeout is finite; `close()` must end it (`.interrupted`, not
+    /// `.timedOut`); a close that left it waiting eventually reports `.timedOut`.
+    @Test(.timeLimit(.minutes(2))) func closingEndsAScriptInFlight() async throws {
+        let session = try await openSession(scriptTimeout: Self.fallbackTimeout)
         let task = start(Self.stalled, in: session)
         let call = try await pendingCall(session)
         session.close()
@@ -348,10 +356,9 @@ struct RecmanWebSessionScriptTests {
     }
 
     /// A newer operation (another course, a playback request) ends the previous operation's script
-    /// and gets its own answer, not the old one. The script timeout cannot run out, so only the
-    /// newer operation can have interrupted it.
-    @Test(.timeLimit(.minutes(1))) func aNewOperationEndsThePreviousScript() async throws {
-        let session = try await openSession(scriptTimeout: Self.neverRunsOut)
+    /// and gets its own answer, not the old one. The interruption outcome identifies the newer operation as the cause.
+    @Test(.timeLimit(.minutes(2))) func aNewOperationEndsThePreviousScript() async throws {
+        let session = try await openSession(scriptTimeout: Self.fallbackTimeout)
         defer { session.close() }
         let first = start(Self.stalled, in: session)
         let call = try await pendingCall(session)
@@ -363,10 +370,9 @@ struct RecmanWebSessionScriptTests {
     }
 
     /// Cancelling the task that awaits the script (the controller's `worker?.cancel()`) ends it
-    /// and the session keeps working for the next operation. The script timeout cannot run out,
-    /// so only the cancellation can have interrupted it.
-    @Test(.timeLimit(.minutes(1))) func cancellingTheAwaitingTaskEndsTheScript() async throws {
-        let session = try await openSession(scriptTimeout: Self.neverRunsOut)
+    /// and the session keeps working for the next operation. The interruption outcome identifies cancellation as the cause.
+    @Test(.timeLimit(.minutes(2))) func cancellingTheAwaitingTaskEndsTheScript() async throws {
+        let session = try await openSession(scriptTimeout: Self.fallbackTimeout)
         defer { session.close() }
         let task = start(Self.stalled, in: session)
         let call = try await pendingCall(session)
@@ -380,13 +386,25 @@ struct RecmanWebSessionScriptTests {
     /// An answer WebKit delivers after the call ended (here, after the timeout) is dropped: the
     /// ended call keeps its timeout and records the answer as late, and the next operation gets
     /// its own answer.
-    @Test(.timeLimit(.minutes(1))) func anAnswerAfterTheCallEndedIsDropped() async throws {
+    @Test(.timeLimit(.minutes(2))) func anAnswerAfterTheCallEndedIsDropped() async throws {
         let session = try await openSession(scriptTimeout: .milliseconds(100))
         defer { session.close() }
-        let late = "return new Promise(resolve => setTimeout(() => resolve('late'), 400))"
-        await #expect(throws: RecmanBrowserError.unavailable) { try await session.runScript(late, arguments: [:]) }
+        let late = "return new Promise(resolve => { if (globalThis.releaseLate) resolve('late'); else globalThis.resolveLate = resolve; })"
+        let task = Task { try await session.runScript(late, arguments: [:]) }
+        let watchdog = Task { @MainActor in
+            do { try await Task.sleep(for: .seconds(45)) } catch { return false }
+            task.cancel()
+            return true
+        }
+        await #expect(throws: RecmanBrowserError.unavailable) { try await task.value }
+        watchdog.cancel()
+        #expect(await watchdog.value == false, "script timeout did not fire")
         let ended = try #require(session.lastScriptCall)
-        for _ in 0..<300 where ended.lateSignals.isEmpty {
+        try #require(ended.outcome == .timedOut)
+        let webView = try #require(session.webView)
+        webView.evaluateJavaScript("globalThis.releaseLate = true; if (globalThis.resolveLate) globalThis.resolveLate('late')", in: nil, in: .defaultClient, completionHandler: nil)
+        let deadline = ContinuousClock.now + .seconds(45)
+        while ended.lateSignals.isEmpty && ContinuousClock.now < deadline {
             try await Task.sleep(for: .milliseconds(10))
         }
         #expect(ended.outcome == .timedOut)
@@ -398,9 +416,9 @@ struct RecmanWebSessionScriptTests {
 
     /// `close()` lets the web view go even while WebKit still holds the callback of a Promise that
     /// never settles: the callback captures the pending call, not the session or its web view.
-    /// The script timeout cannot run out, so `close()` is what ends the wait, not the timeout.
-    @Test(.timeLimit(.minutes(1))) func closingReleasesTheWebViewDespiteAStalledScript() async throws {
-        let session = try await openSession(scriptTimeout: Self.neverRunsOut)
+    /// The interruption outcome identifies `close()` as the cause.
+    @Test(.timeLimit(.minutes(2))) func closingReleasesTheWebViewDespiteAStalledScript() async throws {
+        let session = try await openSession(scriptTimeout: Self.fallbackTimeout)
         weak var webView = session.webView
         #expect(webView != nil)
         let task = start(Self.stalled, in: session)

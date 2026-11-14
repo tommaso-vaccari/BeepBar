@@ -5074,20 +5074,22 @@ struct RecordingsAccountTests {
     /// a late picture of account A showing in account B's player.
     /// Mutation: drop the `apiClient === client, siteInfo?.userID == userID` guard in
     /// `courseImage` and the late picture is returned. The picture request's own 10 s timeout is
-    /// replaced by one that cannot run out (`courseImageRequestTimeout`, test seam of #243): the
+    /// replaced by a generous timeout (`courseImageRequestTimeout`, test seam of #243): the
     /// answer is held across a login, and on a loaded machine the real timeout ran out first and
     /// the test got a timeout error instead of the guard's refusal. The request being held is
     /// awaited from the mock, not polled.
-    @Test(.timeLimit(.minutes(1))) func aCoursePictureArrivingAfterAnAccountChangeIsDropped() async throws {
+    @Test(.timeLimit(.minutes(2))) func aCoursePictureArrivingAfterAnAccountChangeIsDropped() async throws {
         defer { try? FileManager.default.removeItem(at: root) }
-        let (controller, token) = try await signedInAccount(userID: 7, email: "mario.rossi@mail.polimi.it", listed: false, courseImageTimeout: 86_400)
+        let (controller, token) = try await signedInAccount(userID: 7, email: "mario.rossi@mail.polimi.it", listed: false, courseImageTimeout: 300)
         let picture = URL(string: "https://webeep.polimi.it/webservice/pluginfile.php/1/course/overviewfiles/a.png")!
         let delivered = try await controller.courseImageForTesting(picture)
         #expect(delivered == Data([1, 2, 3]), "the same account gets its picture")
 
         MoodleRecordingProtocol.holdCourseImages(token: token)
         let fetch = Task { try await controller.courseImageForTesting(picture) }
-        await MoodleRecordingProtocol.waitUntilCourseImageHeld(token: token)
+        defer { fetch.cancel(); MoodleRecordingProtocol.releaseCourseImages(token: token) }
+        let held = await MoodleRecordingProtocol.waitUntilCourseImageHeld(token: token)
+        guard held else { Issue.record("course image request did not reach the fixture"); return }
         #expect(MoodleRecordingProtocol.heldCourseImageCount(token: token) == 1)
         let other = MoodleRecordingProtocol.register(courses: [(1, "Course")], userID: 8)
         await controller.completeLoginForTesting(moodleLoginCallback(token: other))
@@ -5110,8 +5112,7 @@ struct RecordingsAccountTests {
         MoodleRecordingProtocol.setProfileEmail(token: token, email, listed: listed)
         let current = OSAllocatedUnfairLock(initialState: token)
         let vault = CredentialVault(read: { _ in current.withLock { $0 } }, write: { new in current.withLock { $0 = new } })
-        let client = MoodleRecordingProtocol.makeClient()
-        if let courseImageTimeout { client.courseImageRequestTimeout = courseImageTimeout }
+        let client = MoodleRecordingProtocol.makeClient(courseImageTimeout: courseImageTimeout)
         let controller = WeBeepAuthenticationController(testRootURL: sync, database: database, rootID: rootID, apiClient: client, credentialVault: vault, defaults: WeBeepAuthenticationController.throwawayDefaults(), recordingsStore: store)
         await controller.completeLoginForTesting(moodleLoginCallback(token: token))
         #expect(controller.courseLoadError == nil)

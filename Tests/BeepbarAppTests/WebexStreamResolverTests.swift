@@ -257,7 +257,11 @@ struct WebexStreamResolverTests {
 
     // MARK: Cancellation
 
-    /// Check the real transport's error before the resolver can translate it.
+    /// Proves that cancelling the Play while the request to the API is pending ends that request in
+    /// the transport and follows nothing else (no browser step, no further request). Guards against a
+    /// cancellation that leaves the request running, or that sends the Play on to another step.
+    /// The transport's own error is observed before the resolver translates it: a request timeout
+    /// was otherwise reported as "cancelled", a false green (#243).
     @Test(.timeLimit(.minutes(1))) func cancellingMidRequestEndsAtOnce() async throws {
         liveWebex(api: .hang)
         let browser = FakeBrowser(cookies: [])

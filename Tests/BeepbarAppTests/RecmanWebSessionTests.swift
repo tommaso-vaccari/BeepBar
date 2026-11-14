@@ -198,8 +198,8 @@ struct RecmanWebSessionTests {
 @MainActor
 struct RecmanWebSessionScriptTests {
     /// A Promise that never settles. WebKit has been seen to give up on it by itself after about
-    /// 6 s, answering nil, so the interruption tests check how the call ended (`.interrupted`),
-    /// not only how soon: a call that WebKit ended reads `.answered(nil)`, whatever the timing.
+    /// 6 s, answering nil, so the interruption tests check how the call ended (`.interrupted`):
+    /// a call that WebKit ended reads `.answered(nil)`, whatever the timing.
     private static let stalled = "return new Promise(() => {})"
 
     /// A generous finite script timeout bounds a broken interruption:

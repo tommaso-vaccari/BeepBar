@@ -286,7 +286,9 @@ struct RecordingPlayerMVPTests {
 
     /// The remembered speed is applied to `defaultRate` (what play/resume uses), and playing
     /// never writes the preference. Guards against a speed that resets on resume, and against
-    /// writes at every play.
+    /// writes at every play. The wait for the player to be ready is 60 s here while the other tests
+    /// keep 20 s: under load in the full suite AVPlayer stayed `.unknown` past 20 s. It is a guard
+    /// against a hang, not a time the test asserts.
     @Test func theRememberedSpeedIsAppliedWithoutWriting() async throws {
         let defaults = PlayerTestDefaults.throwaway()
         defer { defaults.discard() }

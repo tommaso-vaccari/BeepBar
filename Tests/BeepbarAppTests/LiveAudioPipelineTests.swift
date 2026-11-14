@@ -510,16 +510,24 @@ struct LiveAudioPipelineTests {
             await pipeline.stop()
             return
         }
-        // The copy is under way and cut short: the file is there with exactly the one block.
-        let original = try #require(rawFiles("original").first { stem($0) == "original6t.raw" }, "the copy stopped before its file existed")
-        #expect(size(original) == 65_536 * 4, "the copy was not stopped after its first block")
-        #expect(rawFiles("piece").contains { stem($0) == "piece6t.raw" })
-        #expect(try await pipeline.segment(20).first == 0x47)
-        await #expect(throws: (any Error).self) { _ = try await six.value }
-        // `six` may throw before the cancelled isolation has finished unwinding, so the cleanup
-        // is waited for (an external event: it has no signal of its own).
-        try await eventually("the half-written original and its piece deleted") {
-            !rawFiles("original").contains { stem($0) == "original6t.raw" } && !rawFiles("piece").contains { stem($0) == "piece6t.raw" }
+        // A throw from here on must still stop the pipeline before the `defer` above removes the
+        // folder: the held copy would otherwise keep writing into a deleted directory.
+        do {
+            // The copy is under way and cut short: the file is there with exactly the one block.
+            let original = try #require(rawFiles("original").first { stem($0) == "original6t.raw" }, "the copy stopped before its file existed")
+            #expect(size(original) == 65_536 * 4, "the copy was not stopped after its first block")
+            #expect(rawFiles("piece").contains { stem($0) == "piece6t.raw" })
+            #expect(try await pipeline.segment(20).first == 0x47)
+            await #expect(throws: (any Error).self) { _ = try await six.value }
+            // `six` may throw before the cancelled isolation has finished unwinding, so the cleanup
+            // is waited for (an external event: it has no signal of its own).
+            try await eventually("the half-written original and its piece deleted") {
+                !rawFiles("original").contains { stem($0) == "original6t.raw" } && !rawFiles("piece").contains { stem($0) == "piece6t.raw" }
+            }
+        } catch {
+            six.cancel()
+            await pipeline.stop()
+            throw error
         }
         await pipeline.stop()
     }

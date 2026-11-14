@@ -62,11 +62,18 @@ struct NetworkPathReaderTests {
     @Test(.timeLimit(.minutes(2))) func cancellationOfSilentProviderIsPromptAndCleansUp() async {
         let provider = PathProvider()
         let task = Task { await NetworkPathReader.current(start: provider.start) }
-        await provider.waitForStart()
+        // Armed before waiting for the start, so a start that never comes is bounded too.
         let watchdog = Task.detached {
             do { try await Task.sleep(for: .seconds(45)) } catch { return false }
+            provider.finishStartSignal()
             provider.timeout()
             return true
+        }
+        guard await provider.waitForStart() else {
+            task.cancel()
+            watchdog.cancel()
+            Issue.record("provider did not start")
+            return
         }
         task.cancel()
         #expect(await task.value == nil)

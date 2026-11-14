@@ -246,8 +246,8 @@ public final class WeBeepAPIClient: @unchecked Sendable {
     private let session: URLSession
     public let policy: WeBeepServerPolicy
     /// The timeout `fetchCourseImage` puts on its request: `courseImageTimeout` in production.
-    /// Internal, for tests that hold a picture's answer across other work and need a timeout that
-    /// cannot run out on a loaded machine (issue #243).
+    /// Private; the internal initializer sets it, so tests that hold a picture's answer across
+    /// other work can fix a timeout that cannot run out on a loaded machine (issue #243).
     private let courseImageRequestTimeout: TimeInterval
 
     public convenience init() {
@@ -262,6 +262,8 @@ public final class WeBeepAPIClient: @unchecked Sendable {
         self.init(policy: policy, session: session ?? Self.makeSession(), courseImageRequestTimeout: Self.courseImageTimeout)
     }
 
+    /// Internal so tests can fix `courseImageRequestTimeout` at creation. Production always passes
+    /// `courseImageTimeout` (10 s) through the public initializers above.
     init(policy: WeBeepServerPolicy, session: URLSession, courseImageRequestTimeout: TimeInterval) {
         self.session = session
         self.policy = policy

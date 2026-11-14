@@ -11,6 +11,21 @@ import Testing
 @MainActor struct RecordingsSyncFollowUpTests {
     private static let key = RecmanCourseKey(courseCode: "058167", academicYear: 2026)!
 
+    /// Waits until `gate` has a waiter, at most 45 s: a bound against a hang, not a time the test
+    /// asserts. When it runs out, records `event` as the missing signal and returns false; the
+    /// caller then releases its gates and awaits its tasks so the test ends.
+    private static func waitUntilWaiting(_ gate: FakeRecmanBrowser.Gate, _ event: String) async -> Bool {
+        let deadline = ContinuousClock.now + .seconds(45)
+        while !gate.isWaiting {
+            if ContinuousClock.now >= deadline {
+                Issue.record("\(event)")
+                return false
+            }
+            await Task.yield()
+        }
+        return true
+    }
+
     // MARK: The gate: nothing is created for a skipped follow-up
 
     /// Proves that with the Recordings switch off, or on a non-Polimi site, an automatic sync and a
@@ -51,7 +66,10 @@ import Testing
             return result
         }
 
-        while !gate.isWaiting { await Task.yield() }
+        guard await Self.waitUntilWaiting(gate, "the refresh did not reach its gate") else {
+            gate.release(); _ = await fired.value
+            return
+        }
         guard case .synced = harness.controller.syncState else {
             Issue.record("Expected the materials result, got \(harness.controller.syncState)")
             gate.release(); _ = await fired.value
@@ -221,7 +239,11 @@ import Testing
             await harness.controller.completeSyncForTesting(firstID, summary: summary)
             await harness.controller.startFollowUpForTesting(firstID, trigger: .manual)?.value
         }
-        while !gates[0].isWaiting { await Task.yield() }
+        guard await Self.waitUntilWaiting(gates[0], "the first notification did not reach its gate") else {
+            gates.forEach { $0.release() }
+            await first.value
+            return
+        }
         #expect(!harness.controller.isSyncActive)
         let secondID = UUID()
         harness.controller.setOperationForTesting(secondID)
@@ -229,7 +251,12 @@ import Testing
             await harness.controller.completeSyncForTesting(secondID, summary: summary)
             await harness.controller.startFollowUpForTesting(secondID, trigger: .manual)?.value
         }
-        while !gates[1].isWaiting { await Task.yield() }
+        guard await Self.waitUntilWaiting(gates[1], "the second notification did not reach its gate") else {
+            gates.forEach { $0.release() }
+            await first.value
+            await second.value
+            return
+        }
 
         gates[0].release()
         await first.value
@@ -251,7 +278,11 @@ import Testing
             await harness.controller.completeSyncForTesting(operationID, summary: SyncProgress(completed: 0, total: 0, added: 0, updated: 0, preservedLocal: 0, unchanged: 0, conflicts: 0, failures: 0))
             await harness.controller.startFollowUpForTesting(operationID, trigger: .manual)?.value
         }
-        while !gate.isWaiting { await Task.yield() }
+        guard await Self.waitUntilWaiting(gate, "the notification did not reach its gate") else {
+            gate.release()
+            await completed.value
+            return
+        }
         let newRoot = harness.root.appending(path: "new-root", directoryHint: .isDirectory)
         try FileManager.default.createDirectory(at: newRoot, withIntermediateDirectories: true)
         await harness.controller.useRootForTesting(newRoot)
@@ -463,6 +494,9 @@ import Testing
         guard reached else {
             fired.cancel()
             manual.cancel()
+            // Both tasks end before the fixture is removed, so nothing writes into a deleted folder.
+            _ = await fired.value
+            await manual.value
             Issue.record("automatic run did not reach follow-up decision")
             return
         }
@@ -857,7 +891,13 @@ private final class NetworkSequence: Sendable {
     /// Waits for the refresh fake to observe cancellation, with a failure bound if it never does.
     func waitForCancellation() async {
         let deadline = ContinuousClock.now + .seconds(45)
-        while !seam.sawCancellation, ContinuousClock.now < deadline { await Task.yield() }
+        while !seam.sawCancellation {
+            if ContinuousClock.now >= deadline {
+                Issue.record("the refresh did not observe cancellation")
+                return
+            }
+            await Task.yield()
+        }
     }
 
     /// Lets a manual sync end and anything it would start get going, for "nothing happened" checks.

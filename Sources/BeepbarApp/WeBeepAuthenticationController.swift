@@ -4293,15 +4293,31 @@ enum AutomaticSyncOutcome: Equatable {
         webView.load(URLRequest(url: site.loginURL))
     }
 
-    @objc private func retryTapped() {
+    /// Target-action: `nonisolated` + hop (#241, #30), never a `@MainActor` method as the action.
+    @objc private nonisolated func retryTapped() {
+        Task { @MainActor [weak self] in self?.retry() }
+    }
+
+    private func retry() {
         automaticRetriesRemaining = Self.maximumAutomaticRetries
         phase = .signingIn
         waitingOverlay.isHidden = false
         webView.load(URLRequest(url: site.loginURL))
     }
 
-    func windowWillClose(_ notification: Notification) { finish(.failure(.cancelled)) }
+    /// `nonisolated` + hop (#241, #30): this class is `@MainActor`, and an isolated witness of an
+    /// Objective-C delegate method gets a thunk that verifies the main executor before the body
+    /// runs, the check that crashed with SIGBUS on the first AppKit callback after a wake from
+    /// sleep (`StatusItemController`).
+    nonisolated func windowWillClose(_ notification: Notification) {
+        Task { @MainActor [weak self] in self?.finish(.failure(.cancelled)) }
+    }
 
+    // The navigation events below (start, fail, finish) are left isolated on purpose, although
+    // `windowWillClose` hops (#241): `decidePolicyFor` answers WebKit synchronously and reads
+    // `phase`, which these events' handlers mutate (the retry). Hopping them would apply the
+    // mutations one turn late, and a policy decision for the next navigation could read stale
+    // state, a sign-in behavior change that cannot be tested against a live login.
     func webView(_ webView: WKWebView, didStartProvisionalNavigation navigation: WKNavigation!) {
         waitingOverlay.isHidden = false
     }

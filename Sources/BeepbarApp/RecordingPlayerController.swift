@@ -2,6 +2,7 @@ import AppKit
 @preconcurrency import AVFoundation
 import BeepbarCore
 import OSLog
+import os
 // No `import AVKit`, on purpose: see `AVKitLoader`.
 
 /// What Recordings needs from a native player: play a lecture stream in BeepBar, pause it, close
@@ -336,6 +337,11 @@ enum RecordingPlayerError: Error {
     /// The record last published, so an identical one is not published again.
     private var lastNowPlaying: NowPlayingState?
 
+    /// Windows whose `windowWillClose` arrived and whose close has not finished on the main actor
+    /// (`finishClosing`). A lock around plain identifiers rather than main-actor state, so the
+    /// nonisolated AppKit callback can write it without any isolation check (#241).
+    private nonisolated let closingWindows = OSAllocatedUnfairLock(initialState: Set<ObjectIdentifier>())
+
     private let present: @MainActor (NSWindow) -> Void
     private let makePlayerView: @MainActor () -> NSView?
     private let makePlayer: @MainActor () -> AVPlayer
@@ -425,6 +431,9 @@ enum RecordingPlayerError: Error {
     /// as is, and a concrete type keeps the protocol usable as an existential with fakes.
     func play(_ url: URL, title: String, cookies: [HTTPCookie], startAt: TimeInterval?, recordingID: String, metadata: RecordingPlaybackMetadata?) {
         Self.log.notice("Playing a recording from \(url.host ?? "-", privacy: .public)")
+        // A window the student just closed whose hop has not landed: finish that close first, so
+        // this lecture gets a new window instead of playing into a closed one.
+        completePendingClose()
         // A newer lecture closes the one on screen: report where the student left it, with its
         // own id, while the old item is still in place.
         checkpointIfMeaningful(.replaced)
@@ -551,6 +560,7 @@ enum RecordingPlayerError: Error {
     }
 
     func close() {
+        completePendingClose()
         checkpointIfMeaningful(.closed)
         let window = self.window
         stopPlayback()
@@ -603,32 +613,60 @@ enum RecordingPlayerError: Error {
         window.subtitle = message
     }
 
-    func windowWillClose(_ notification: Notification) {
-        guard let closing = notification.object as? NSWindow, closing === window else { return }
-        // The student closed the window: report where they stopped before anything is released.
+    /// The window is about to close (its close button, or `close()`). `nonisolated` on purpose,
+    /// like every AppKit callback of the player (#241, #30): this class is `@MainActor`, and an
+    /// isolated witness of an Objective-C delegate method gets a thunk that verifies the main
+    /// executor before the body runs, which is the check that crashed with SIGBUS on the first
+    /// callback after the Mac woke from sleep (`StatusItemController`). So nothing isolated is
+    /// read here: the window is only noted in `closingWindows` (a lock, not main-actor state) and
+    /// the work hops to the main actor (`finishClosing`), where it checkpoints before releasing.
+    ///
+    /// The hop is one main-actor turn, so a Play or a `close()` queued in front of it could meet
+    /// a window that already closed: both call `completePendingClose()` first, which runs the
+    /// same `finishClosing` now. The window is retained by the hop, so its identity cannot be
+    /// reused by a new window before it runs.
+    nonisolated func windowWillClose(_ notification: Notification) {
+        guard let closing = notification.object as? NSWindow else { return }
+        let id = ObjectIdentifier(closing)
+        closingWindows.withLock { _ = $0.insert(id) }
+        Task { @MainActor [weak self] in
+            if let self { self.finishClosing(closing) } else { Self.release(closing) }
+        }
+    }
+
+    /// Finishes a close that `windowWillClose` announced, once, on the main actor: reports where
+    /// the student stopped before anything is released, stops playback (no sound may outlive the
+    /// window) and lets go of the window. Idempotent: the hop and `completePendingClose()` may
+    /// both arrive, and `close()` (which closes the window itself, after releasing it) never
+    /// leaves a pending entry for a window the player still owns.
+    private func finishClosing(_ closing: NSWindow) {
+        let announced = closingWindows.withLock { $0.remove(ObjectIdentifier(closing)) != nil }
+        // Not the current window: `close()` already released it, or a Play replaced it.
+        guard announced, closing === window else { return }
         checkpointIfMeaningful(.closed)
-        // Playback stops now: no sound may outlive the window.
         stopPlayback()
         onClose?(recordingID)
         // Synchronously, so a Play in the meantime can give the name to its new window: AppKit
         // refuses a name another live window still holds. The frame was saved on the last move
         // or resize, so nothing is lost.
         closing.setFrameAutosaveName("")
+        window = nil
+        playerView = nil
+        speedPopUp = nil
+        audioButton = nil
         // The view and the window are released on the next main-actor turn, as
         // `ConfigurationWindowController.windowWillClose` does: AppKit (and `AVPlayerView`, which
         // watches its window to leave full screen or picture in picture) is still closing this
-        // window when the notification arrives, and pulling its content view out from under it
+        // window around the notification, and pulling its content view out from under it
         // mid-close is not something AppKit promises to survive. A Play in between builds a new
         // window, so only this one is released.
-        Task { @MainActor [weak self] in
-            Self.release(closing)
-            if let self, self.window === closing {
-                self.window = nil
-                self.playerView = nil
-                self.speedPopUp = nil
-                self.audioButton = nil
-            }
-        }
+        Task { @MainActor in Self.release(closing) }
+    }
+
+    /// Runs the close of the current window if its `windowWillClose` hop has not landed yet.
+    private func completePendingClose() {
+        guard let window, closingWindows.withLock({ $0.contains(ObjectIdentifier(window)) }) else { return }
+        finishClosing(window)
     }
 
     /// Activates the app and orders the window front. A menu-bar app has to activate itself first,
@@ -795,7 +833,11 @@ enum RecordingPlayerError: Error {
     /// The window was resized (also into or out of full screen). Through a hop, like every other
     /// AppKit callback here: nothing is read from the notification. At fit there is nothing to
     /// redo, so a resize costs nothing unless the video is zoomed.
-    func windowDidResize(_ notification: Notification) {
+    ///
+    /// `nonisolated` (#241, #30): macOS sends this to the open player window when the displays
+    /// are reconfigured on wake, and an isolated witness's thunk would run the main-executor check
+    /// first (see `windowWillClose`).
+    nonisolated func windowDidResize(_ notification: Notification) {
         Task { @MainActor [weak self] in self?.zoomGeometryChanged() }
     }
 

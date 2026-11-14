@@ -316,7 +316,10 @@ enum RecordingArtwork {
         let succeeded = RecordingNowPlayingPolicy.commandSucceeded
         // The handler runs on whatever thread MediaPlayer calls it on: it reads the event there,
         // answers at once, and hands the command to the main actor (the same hop as every AppKit
-        // callback in BeepBar, never `assumeIsolated`).
+        // callback in BeepBar, never `assumeIsolated`). `@Sendable` is explicit (#241, #30): a
+        // closure written inside this `@MainActor` method is otherwise inferred main-actor
+        // isolated, and the block MediaPlayer calls on its own queue would then verify the main
+        // executor before its body runs, the check behind the wake-from-sleep SIGBUS.
         func register(_ name: String, _ command: @escaping @Sendable (NSObject) -> NowPlayingCommand?) {
             guard commands.responds(to: NSSelectorFromString(name)), let remote = commands.value(forKey: name) as? NSObject,
                   remote.responds(to: NSSelectorFromString("addTargetWithHandler:")) else { return }
@@ -324,7 +327,7 @@ enum RecordingArtwork {
                 remote.setValue([NSNumber(value: RecordingNowPlayingPolicy.skipInterval)], forKey: "preferredIntervals")
             }
             if remote.responds(to: NSSelectorFromString("setEnabled:")) { remote.setValue(true, forKey: "enabled") }
-            let handler: @convention(block) (NSObject) -> Int = { event in
+            let handler: @Sendable @convention(block) (NSObject) -> Int = { event in
                 if let received = command(event) {
                     Task { @MainActor in onCommand(received) }
                 }

@@ -179,6 +179,8 @@ struct RecordingPlayerControllerTests {
             weakWindow = controller.window
             controller.window?.close()
         }
+        // The close finishes one main-actor turn after `windowWillClose` (#241).
+        await Self.settle()
         #expect(controller.isOpen == false)
         #expect(controller.player == nil)
         controller.close()
@@ -195,6 +197,8 @@ struct RecordingPlayerControllerTests {
         let player = try #require(controller.player)
         #expect(player.rate != 0)
         if byUser { controller.window?.close() } else { controller.close() }
+        // A user close stops playback on the hop that follows `windowWillClose` (#241).
+        if byUser { await Self.settle() }
         #expect(player.rate == 0)
         #expect(player.currentItem == nil)
     }
@@ -223,9 +227,10 @@ struct RecordingPlayerControllerTests {
         withExtendedLifetime((heldWindow, heldView)) {}
     }
 
-    /// When the user closes the window, playback stops at once but the view leaves the window only
-    /// on the next main-actor turn, after AppKit has finished closing it (as the configuration
-    /// window does). Guards against tearing the content view out mid-close.
+    /// When the user closes the window, `windowWillClose` only hops to the main actor (#241): the
+    /// hop stops playback, and the view leaves the window on the turn after that, once AppKit has
+    /// finished closing it (as the configuration window does). Guards against tearing the
+    /// content view out mid-close, or releasing it inside the callback itself.
     @Test func aUserCloseDetachesTheViewOnTheNextTurn() async throws {
         let media = try await TestMedia.shared.url()
         let controller = makeController()
@@ -233,6 +238,11 @@ struct RecordingPlayerControllerTests {
         let window = try #require(controller.window)
         let view = try #require(controller.playerView)
         window.close()
+        // Nothing has happened inside the callback: the hop has not run yet.
+        #expect(controller.isOpen)
+        // One yield runs the hop queued by `windowWillClose` (playback stops) and returns here
+        // before the release it queues.
+        await Task.yield()
         #expect(Self.player(of: view) == nil)
         #expect(window.contentView === view)
         try await Self.expectReleased { window.contentView == nil && window.delegate == nil && controller.window == nil }
@@ -293,6 +303,7 @@ struct RecordingPlayerControllerTests {
         controller.play(media, title: "Due", cookies: [])
         #expect(policy.changes == [.regular])
         if byUser { controller.window?.close() } else { controller.close() }
+        if byUser { await Self.settle() }
         #expect(policy.policy == .accessory)
         #expect(policy.changes == [.regular, .accessory])
         controller.close()

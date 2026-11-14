@@ -288,26 +288,40 @@ struct RateSupport: Equatable, Sendable {
 /// decision also needs what is under the pointer: the window hit-tests its own views for that,
 /// as AppKit does to route the event anyway, and reads `isVideoZoomed`, a copy the controller
 /// pushes from the main actor. It never calls into the controller synchronously.
+///
+/// The overrides are `nonisolated` (#241, #30): `NSWindow` is `@MainActor` in the SDK, so an
+/// isolated override gets an Objective-C thunk that verifies the main executor before its body
+/// runs, the check that crashed with SIGBUS on the first callback after the Mac woke from sleep
+/// (`StatusItemController`). AppKit delivers every event on the main thread, so the stored
+/// properties below are `nonisolated(unsafe)`: written by the controller on the main actor, read
+/// here on the main thread, never concurrently. The compiler still warns about the calls into
+/// `NSWindow`/`NSView` members from a nonisolated context (`super.sendEvent`, `contentView`,
+/// `hitTest`); they are plain Objective-C calls made on the main thread by AppKit's own
+/// dispatch, and `MainActor.assumeIsolated` (the usual silencer) is exactly what AGENTS.md
+/// forbids on these paths.
 final class RecordingPlayerWindow: NSWindow {
     /// Runs a shortcut; called only from the main-actor hop, never inside `sendEvent`.
-    var shortcutHandler: (@MainActor @Sendable (PlayerShortcut) -> Void)?
+    nonisolated(unsafe) var shortcutHandler: (@MainActor @Sendable (PlayerShortcut) -> Void)?
     /// Applies a zoom input; called only from the main-actor hop. Nil turns the zoom's event
     /// handling off entirely (a released window).
-    var zoomHandler: (@MainActor @Sendable (PlayerZoomInput) -> Void)?
+    nonisolated(unsafe) var zoomHandler: (@MainActor @Sendable (PlayerZoomInput) -> Void)?
     /// Whether the video is zoomed in, pushed by `RecordingPlayerController` whenever its zoom
     /// changes (data flows from the main actor to the AppKit side, as with `menuBarSnapshot`).
     /// Decides whether drags and scrolls over the video pan or go through to `AVPlayerView`.
-    var isVideoZoomed = false
+    nonisolated(unsafe) var isVideoZoomed = false
     /// The pinch or pan drag under way.
-    private(set) var gestures = PlayerGestureTracker()
+    nonisolated(unsafe) private(set) var gestures = PlayerGestureTracker()
     /// The view showing the video, looked up on first need and checked on every use:
     /// `AVPlayerView` moves it into a scroll view on the first zoom but keeps the object.
-    private weak var videoHost: NSView?
+    nonisolated(unsafe) private weak var videoHost: NSView?
 
-    override func sendEvent(_ event: NSEvent) {
+    nonisolated override func sendEvent(_ event: NSEvent) {
         if takeShortcut(event) { return }
         if let pointer = PlayerPointerEvent(event), handlePointer(pointer) { return }
-        super.sendEvent(event)
+        // The same event, on the same (main) thread AppKit called us on: `NSEvent` is not
+        // `Sendable`, so the compiler wants it declared as not crossing an isolation boundary.
+        nonisolated(unsafe) let forwarded = event
+        super.sendEvent(forwarded)
     }
 
     /// ⌘ chords reach the key window here before the main menu, and reach `sendEvent` as a
@@ -315,12 +329,14 @@ final class RecordingPlayerWindow: NSWindow {
     /// `AVPlayerView`'s own key equivalents can see them. Same decision and hop as `sendEvent`.
     /// Only for this window's own events: AppKit may offer a key equivalent to windows other
     /// than the key one, and ⌘- typed in Settings must not zoom a lecture behind it.
-    override func performKeyEquivalent(with event: NSEvent) -> Bool {
-        (event.windowNumber == windowNumber && takeShortcut(event)) || super.performKeyEquivalent(with: event)
+    nonisolated override func performKeyEquivalent(with event: NSEvent) -> Bool {
+        if event.windowNumber == windowNumber && takeShortcut(event) { return true }
+        nonisolated(unsafe) let forwarded = event
+        return super.performKeyEquivalent(with: forwarded)
     }
 
     /// Takes the event if it is one of the player's keys, running its shortcut through a hop.
-    private func takeShortcut(_ event: NSEvent) -> Bool {
+    private nonisolated func takeShortcut(_ event: NSEvent) -> Bool {
         guard let handler = shortcutHandler, let decision = RecordingPlayerPolicy.keyDecision(for: event) else { return false }
         if decision.perform {
             let shortcut = decision.shortcut
@@ -332,7 +348,7 @@ final class RecordingPlayerWindow: NSWindow {
     /// Decides a pointer event for the zoom (`PlayerGestureTracker`) and, when it is taken, hands
     /// its input to the controller through a hop. Returns whether it was taken, i.e. must not be
     /// forwarded. Internal so tests can deliver pinches, which AppKit cannot synthesise.
-    func handlePointer(_ pointer: PlayerPointerEvent) -> Bool {
+    nonisolated func handlePointer(_ pointer: PlayerPointerEvent) -> Bool {
         guard let handler = zoomHandler else { return false }
         let action = gestures.handle(pointer, isZoomed: isVideoZoomed, isOverVideo: { isOverVideo(pointer.location) })
         guard case .take(let input) = action else { return false }
@@ -342,7 +358,7 @@ final class RecordingPlayerWindow: NSWindow {
 
     /// Whether the point (window coordinates) is over the video, rather than over the controls
     /// or outside the content view (title bar, speed menu): see `PlayerVideoViews`.
-    func isOverVideo(_ location: CGPoint) -> Bool {
+    nonisolated func isOverVideo(_ location: CGPoint) -> Bool {
         guard let content = contentView else { return false }
         let point = content.superview?.convert(location, from: nil) ?? location
         if videoHost.map({ !$0.isDescendant(of: content) }) ?? true {

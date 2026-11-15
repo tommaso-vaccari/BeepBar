@@ -6,9 +6,13 @@
 # with a green gate (issue #243).
 set -u
 # The optional second argument is the least number of runs expected (one per test target), so a
-# process that ends before its run even starts is caught too.
-log=${1:?usage: check-test-run-complete.sh <swift-test-log> [minimum-runs]}
+# process that ends before its run even starts is caught too. The optional third argument is the
+# least number of tests, summed over the passing summaries: a `--filter` whose pattern lost a
+# suite still passes, with fewer tests, so a pass that must run a known set (the serial web-view
+# pass, #267) states how many.
+log=${1:?usage: check-test-run-complete.sh <swift-test-log> [minimum-runs] [minimum-tests]}
 minimum=${2:-1}
+minimum_tests=${3:-0}
 [ -r "$log" ] || { echo "Test log not readable: $log" >&2; exit 2; }
 
 started=$(grep -ac 'Test run started\.' "$log")
@@ -21,4 +25,8 @@ if [ "$started" -ne "$passed" ]; then
     echo "A test process ended early or failed; its exit status alone does not show it." >&2
     exit 1
 fi
-echo "Test runs complete: $passed of $started."
+total=$(grep -aoE 'Test run with [0-9]+ tests?' "$log" | grep -oE '[0-9]+' | awk '{ sum += $1 } END { print sum + 0 }')
+if [ "$total" -lt "$minimum_tests" ]; then
+    echo "Only $total tests ran, at least $minimum_tests expected: the test filter matched too little." >&2; exit 1
+fi
+echo "Test runs complete: $passed of $started, $total tests."

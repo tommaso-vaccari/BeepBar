@@ -6,11 +6,11 @@ script="$(dirname "$0")/check-test-run-complete.sh"
 dir=$(mktemp -d); trap 'rm -rf "$dir"' EXIT
 failures=0
 
-# $1: expected exit status, $2: what the case stands for, $3: minimum runs (optional); the log
-# comes on stdin.
+# $1: expected exit status, $2: what the case stands for, $3: minimum runs and $4: minimum tests
+# (both optional); the log comes on stdin.
 expect() {
     cat > "$dir/log"
-    bash "$script" "$dir/log" ${3:-} >/dev/null 2>&1; local got=$?
+    bash "$script" "$dir/log" ${3:-} ${4:-} >/dev/null 2>&1; local got=$?
     if [ "$got" -ne "$1" ]; then
         echo "FAIL: $2 -> exit $got, expected $1"; failures=$((failures + 1))
     fi
@@ -46,6 +46,38 @@ EOF
 expect 0 "a target without suites" <<'EOF'
 ◇ Test run started.
 ✔ Test run with 0 tests passed after 0.001 seconds.
+EOF
+# The serial web-view pass (#267) states a minimum number of tests: runs that all "passed" with 0
+# tests must not satisfy it.
+expect 1 "a filter that matched no test" 2 1 <<'EOF'
+◇ Test run started.
+✔ Test run with 0 tests passed after 0.001 seconds.
+◇ Test run started.
+✔ Test run with 0 tests passed after 0.001 seconds.
+EOF
+expect 0 "a filter that matched enough tests" 2 60 <<'EOF'
+◇ Test run started.
+✔ Test run with 0 tests passed after 0.001 seconds.
+◇ Test run started.
+✔ Test run with 66 tests in 4 suites passed after 9.000 seconds.
+EOF
+# "1 test" (singular) counts as one: a pattern requiring "tests" would read 0 and fail.
+expect 0 "a single test counted" 1 1 <<'EOF'
+◇ Test run started.
+✔ Test run with 1 test in 1 suite passed after 0.100 seconds.
+EOF
+expect 1 "tests summed over runs fall short" 2 5 <<'EOF'
+◇ Test run started.
+✔ Test run with 2 tests in 1 suite passed after 0.100 seconds.
+◇ Test run started.
+✔ Test run with 1 test in 1 suite passed after 0.100 seconds.
+EOF
+# The minimum is met only by the sum: taking the largest run, or the last, would read 3 and fail.
+expect 0 "tests summed over runs reach the minimum" 2 5 <<'EOF'
+◇ Test run started.
+✔ Test run with 2 tests in 1 suite passed after 0.100 seconds.
+◇ Test run started.
+✔ Test run with 3 tests in 1 suite passed after 0.100 seconds.
 EOF
 if bash "$script" "$dir/missing" >/dev/null 2>&1; then
     echo "FAIL: a missing log should fail"; failures=$((failures + 1))

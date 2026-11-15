@@ -3067,13 +3067,14 @@ struct RecordingsListing: Equatable {
                 // Polimi or Webex not answering (offline just after a wake, a timeout) is the
                 // transient case the retries exist for: try again after the next backoff while
                 // the budget lasts, and only then fall back to the browser (#241).
-                if (cause as? RecmanBrowserError) == .unavailable,
-                   RecordingStreamPolicy.mayRetry(attemptsUsed: attemptsUsed, episodeAge: now().timeIntervalSince(episode.startedAt)) {
+                let willRetry = (cause as? RecmanBrowserError) == .unavailable
+                    && RecordingStreamPolicy.mayRetry(attemptsUsed: attemptsUsed, episodeAge: now().timeIntervalSince(episode.startedAt))
+                let diagnosis = "play: recovery stream failed reason=\(Self.playFailureReason(cause).rawValue) error=\(PlaybackDiagnostics.errorName(cause)) attempt=\(attemptsUsed) retry=\(willRetry)"
+                PlaybackDiagnostics.log.notice("\(diagnosis, privacy: .public)")
+                if willRetry {
                     scheduleRecovery(recording, recovery, attemptsUsed: attemptsUsed)
                     return
                 }
-                let diagnosis = "play: recovery stream failed reason=\(Self.playFailureReason(cause).rawValue) error=\(PlaybackDiagnostics.errorName(cause))"
-                PlaybackDiagnostics.log.notice("\(diagnosis, privacy: .public)")
                 if (cause as? RecmanBrowserError) == .needsSignIn {
                     reportStoppedLecture(recording, message: Self.signInToContinueMessage)
                     throw cause

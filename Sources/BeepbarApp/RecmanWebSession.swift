@@ -148,6 +148,8 @@ struct RecmanStreamFailure: Error {
     /// Starts the Webex sign-in's first load. Tests load a local fixture at the login address
     /// instead, so nothing reaches Webex.
     var startWebexLogin: @MainActor (WKWebView, URL) -> Void = { webView, url in webView.load(URLRequest(url: url)) }
+    /// Starts the archive preview. Tests supply a local response in place of the Polimi request.
+    var startPlaybackPreview: @MainActor (WKWebView, URL) -> Void = { webView, url in webView.load(URLRequest(url: url)) }
     /// Puts the sign-in window on screen. Tests replace it so a run never takes the focus.
     var presentSignInWindow: @MainActor (NSWindow) -> Void = { window in
         window.center()
@@ -245,7 +247,7 @@ struct RecmanStreamFailure: Error {
         defer { capturingPlayback = false }
         let waiter = startWaiting()
         defer { stopWaiting(waiter) }
-        browser().load(URLRequest(url: recording.previewURL))
+        startPlaybackPreview(browser(), recording.previewURL)
         do {
             try await wait(for: waiter, operation: operation)
         } catch RecmanBrowserError.unrecognized {
@@ -966,6 +968,28 @@ struct RecmanStreamFailure: Error {
             restartStall(webexLogin)
             checkWebexTicket(webexLogin)
         }
+    }
+
+    /// A server error page can finish loading normally in WebKit. During a preview lookup it
+    /// must reach the recovery as a temporary outage before we try to extract a player link.
+    func webView(_ webView: WKWebView, decidePolicyFor navigationResponse: WKNavigationResponse, decisionHandler: @escaping @MainActor (WKNavigationResponsePolicy) -> Void) {
+        guard webView === self.webView, capturingPlayback,
+              let waiter = loadWaiter, loadID > waiter.after,
+              let status = Self.playbackServerErrorStatus(navigationResponse.response, isMainFrame: navigationResponse.isForMainFrame) else {
+            decisionHandler(.allow)
+            return
+        }
+        diagnose("stream: step=archive-player-link status=\(status)")
+        loadWaiter = nil
+        capturingPlayback = false
+        waiter.resolve(.failure(RecmanBrowserError.unavailable))
+        decisionHandler(.cancel)
+    }
+
+    nonisolated static func playbackServerErrorStatus(_ response: URLResponse, isMainFrame: Bool) -> Int? {
+        guard isMainFrame, let response = response as? HTTPURLResponse,
+              (500...599).contains(response.statusCode) else { return nil }
+        return response.statusCode
     }
 
     func webView(_ webView: WKWebView, didFinish navigation: WKNavigation!) {

@@ -61,6 +61,74 @@ struct RecmanWebSessionTests {
         await #expect(throws: RecmanBrowserError.playbackUnavailable) { try await session.playbackURL(for: tampered.recording) }
     }
 
+    /// A failed preview can return HTML with HTTP 500. Only a server error on the main frame
+    /// makes the lookup retryable, since a failed frame cannot tell us whether the preview worked.
+    @Test(arguments: [200, 404, 500, 503, 599])
+    func previewServerErrorsAreRecognizedOnlyInTheMainFrame(status: Int) throws {
+        let url = try #require(URL(string: "https://onlineservices.polimi.it/"))
+        let response = try #require(HTTPURLResponse(url: url, statusCode: status, httpVersion: nil, headerFields: nil))
+        let expected = status >= 500 ? status : nil
+        #expect(RecmanWebSession.playbackServerErrorStatus(response, isMainFrame: true) == expected)
+        #expect(RecmanWebSession.playbackServerErrorStatus(response, isMainFrame: false) == nil)
+    }
+
+    /// WebKit finishes an HTTP error page as a document load. A 500 must reach the caller as
+    /// unavailable so recovery can retry, while an ordinary page without a link stays unsupported.
+    @Test(.timeLimit(.minutes(1)), arguments: [200, 500])
+    func aPreviewHTTP500ReachesStreamLookupAsUnavailable(status: Int) async throws {
+        let server = try LoopbackHTTPServer { _ in
+            .init(status: status, contentType: "text/html", body: Data("<p>No player link</p>".utf8))
+        }
+        defer { server.stop() }
+        let session = RecmanWebSession()
+        await session.open(cookies: [])
+        defer { session.close() }
+        let webView = try #require(session.webView)
+        let archive = try #require(URL(string: "https://\(RecmanURLPolicy.archiveHost)\(RecmanURLPolicy.archivePath)"))
+        let preview = try #require(URL(string: archive.absoluteString + "?evn_preview_link&transfer_id=fixture"))
+        let local = try #require(URL(string: "http://127.0.0.1:\(server.port)/preview"))
+        let loaded = PageLoad()
+        webView.navigationDelegate = loaded
+        webView.loadHTMLString("""
+            <select name="aa"></select><input name="contesto"><button name="EVN_SEARCH"></button>
+            """, baseURL: archive)
+        await loaded.wait()
+        try #require(try await session.probeArchive())
+
+        let navigation = LocalPreviewNavigation(session: session)
+        webView.navigationDelegate = navigation
+        session.startPlaybackPreview = { webView, _ in webView.load(URLRequest(url: local)) }
+        var trace: [String] = []
+        session.traceHandler = { trace.append($0) }
+        let recording = RecmanRecording(id: "fixture", courseCode: "123456", academicYear: 2026,
+                                        title: "Fixture", recordedAt: now, kind: "", duration: "", size: nil, previewURL: preview)
+        let expected: RecmanBrowserError = status == 500 ? .unavailable : .playbackUnavailable
+        await #expect(throws: expected) { try await session.stream(for: recording, email: nil) }
+        #expect(navigation.status == status)
+        #expect(trace.contains("stream: step=archive-player-link status=\(status)") == (status == 500))
+    }
+
+    /// Allows the local fixture's navigation and forwards its actual WebKit events to the session.
+    private final class LocalPreviewNavigation: NSObject, WKNavigationDelegate {
+        let session: RecmanWebSession
+        private(set) var status: Int?
+
+        init(session: RecmanWebSession) { self.session = session }
+
+        func webView(_ webView: WKWebView, didStartProvisionalNavigation navigation: WKNavigation!) {
+            session.webView(webView, didStartProvisionalNavigation: navigation)
+        }
+
+        func webView(_ webView: WKWebView, didFinish navigation: WKNavigation!) {
+            session.webView(webView, didFinish: navigation)
+        }
+
+        func webView(_ webView: WKWebView, decidePolicyFor response: WKNavigationResponse, decisionHandler: @escaping @MainActor (WKNavigationResponsePolicy) -> Void) {
+            status = (response.response as? HTTPURLResponse)?.statusCode
+            session.webView(webView, decidePolicyFor: response, decisionHandler: decisionHandler)
+        }
+    }
+
     /// Opening starts from an empty browser and closing drops it: turning the feature off, or
     /// another account signing in, leaves no Polimi session behind in memory.
     @Test func openStartsEmptyAndCloseForgetsEverything() async throws {

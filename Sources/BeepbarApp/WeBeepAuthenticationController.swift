@@ -3058,7 +3058,8 @@ enum MaterialsRunEnd: Equatable, Sendable {
                 // A logout in this launch left Recordings off although the stored choice is still
                 // on (the default): back on as at a normal start, with no window, before the offer.
                 if self.selectedSite.university == .polimi, RecordingsController.isSwitchedOn(in: self.operationDefaults) {
-                    self.recordings.resumeIfSwitchedOn()
+                    // Only an existing controller can be off from a logout; a new one reads the stored choice itself.
+                    self.recordingsIfCreated?.resumeIfSwitchedOn()
                 }
                 if self.selectedSite.university == .polimi, !polimiCookies.isEmpty,
                    RecordingsController.isSwitchedOn(in: self.operationDefaults) {

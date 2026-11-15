@@ -15,6 +15,9 @@ struct RecordingsWebBeepSessionTests {
     private let defaults = MemoryCountingDefaults.isolated()
     private let browser = FakeRecmanBrowser()
     private let world = RecordingsWorld()
+    /// Test hook run once at the next owner read after a browser was made (`onOwnerRead`).
+    private final class Hooks { var onOwnerRead: (() -> Void)? }
+    private let hooks = Hooks()
     private let course = RecmanCourseKey(courseCode: "058167", academicYear: 2026)!
     private var store: RecordingsSessionStore {
         let folder = folder
@@ -26,6 +29,7 @@ struct RecordingsWebBeepSessionTests {
         let world = world
         let browser = browser
         let folder = folder
+        let hooks = hooks
         return RecordingsController(
             makeBrowser: { world.browsersMade += 1; return browser },
             store: RecordingsSessionStore { folder },
@@ -35,7 +39,11 @@ struct RecordingsWebBeepSessionTests {
                 world.historyActors.append(history)
                 return history
             },
-            ownerUserID: { world.owner },
+            ownerUserID: {
+                // Runs inside the drain's look at the candidate, after its browser was made.
+                if world.browsersMade == 1, let hook = hooks.onOwnerRead { hooks.onOwnerRead = nil; hook() }
+                return world.owner
+            },
             isAvailable: { world.polimi },
             openURL: { world.opened.append($0) },
             copy: { world.copied.append($0) },
@@ -240,29 +248,21 @@ struct RecordingsWebBeepSessionTests {
         #expect(world.browsersMade == 0)
     }
 
-    /// Not for Unipd, and not with the feature off.
-    /// Mutation: drop `isEnabled, isAvailable()` from `offerSessionCandidate`.
-    @Test func notOfferedOutsidePolimiOrWithTheFeatureOff() async throws {
+    /// Not for Unipd, and not with the feature off: a candidate offered then is not kept, so it
+    /// is not there when the controller becomes usable (switch turned on, or Polimi selected).
+    /// The sign-in that the switch starts shows it: it opens with the candidate's cookies if one
+    /// was kept, with none otherwise. Mutation: drop `isEnabled, isAvailable()` from
+    /// `offerSessionCandidate`.
+    @Test(arguments: ["unipd", "off"]) func notOfferedOutsidePolimiOrWithTheFeatureOff(case name: String) async throws {
         defer { cleanUp() }
-        world.polimi = false
-        let unipd = try launched()
-        unipd.offerSessionCandidate(login(), owner: 42)
+        if name == "unipd" { world.polimi = false } else { defaults.set(false, forKey: RecordingsController.enabledKey) }
+        let controller = makeController()
+        controller.offerSessionCandidate(login(), owner: 42)
         world.polimi = true
-        // The same controller later on Polimi would use a candidate kept from before: none is.
-        #expect(await unipd.refreshForSync([course], force: false) == .skipped(.switchedOff))
-        let later = await unipd.refreshForSync([course], force: false)
-        #expect(later != .refreshed(newlyPublished: 0, failedKeys: 0), "nothing was kept for the account")
-        #expect(world.browsersMade == 0)
-
-        // Switched off, offered, then switched on again behind the controller's back (no
-        // `turnOff`, which would discard it anyway): still nothing to use.
-        defaults.set(false, forKey: RecordingsController.enabledKey)
-        let off = makeController()
-        off.offerSessionCandidate(login(), owner: 42)
-        defaults.set(true, forKey: RecordingsController.enabledKey)
-        let afterwards = await off.refreshForSync([course], force: false)
-        #expect(afterwards != .refreshed(newlyPublished: 0, failedKeys: 0))
-        #expect(world.browsersMade == 0)
+        controller.setEnabled(true)
+        await waitUntil("the sign-in opened a browser") { browser.openedWith.count == 1 }
+        #expect(browser.openedWith == [[]], "no candidate was kept")
+        controller.turnOff()
     }
 
     // MARK: Clean-up
@@ -323,6 +323,158 @@ struct RecordingsWebBeepSessionTests {
         _ = await next.refreshForSync([course], force: false)
         #expect(browser.openedWith.last == ["SSO_NEW"])
         #expect(browser.openedWith.first == ["SSO_SAME"])
+    }
+
+    // MARK: A sign-in already asked for
+
+    /// An account change with the previous account's session in memory ends in `.needsSignIn`,
+    /// and the new account's candidate arrives right after: it must be used, not consumed by a
+    /// sign-in that opens with no cookies. Guards a new WeBeep login that is followed by a second
+    /// Polimi login. Mutations: `offerSessionCandidate` not going back to `.ready`; `runSignIn`
+    /// dropping the candidate when `freshSession`.
+    @Test func aCandidateAfterAnAccountChangeWithASessionInMemoryEnters() async throws {
+        defer { cleanUp() }
+        let controller = try launched(savedFile: true)
+        browser.listResults[course.courseCode] = .success([recording("a")])
+        controller.pageAppeared()
+        controller.refresh([course], selected: course)
+        await waitUntil("the listing") { controller.listing(for: course)?.recordings != nil }
+        #expect(browser.openedWith == [["SSO_SAVED"]])
+
+        world.owner = 43
+        controller.webBeepAccountChanged(to: 43)
+        #expect(controller.access == .needsSignIn(nil))
+        controller.offerSessionCandidate(login("SSO_43"), owner: 43)
+        #expect(controller.access == .ready, "the candidate gives the sign-in something to try")
+        let outcome = await controller.refreshForSync([course], force: true)
+        #expect(outcome == .refreshed(newlyPublished: 0, failedKeys: 0), "\(outcome) \(controller.access)")
+        #expect(browser.openedWith == [["SSO_SAVED"], ["SSO_43"]])
+        #expect(!browser.calls.contains("signIn"))
+        controller.pageDisappeared()
+    }
+
+    /// The first check found no file and the student sits in `.needsSignIn`; a WeBeep login then
+    /// delivers a candidate: the next sync enters with it without anyone pressing anything.
+    /// Mutation: `offerSessionCandidate` without the return to `.ready` and the re-armed check.
+    @Test func aCandidateAfterAnEmptyFirstCheckIsUsedByTheNextSync() async throws {
+        defer { cleanUp() }
+        let controller = try launched()
+        browser.listResults[course.courseCode] = .success([])
+        #expect(await controller.refreshForSync([course], force: false) == .needsSignIn(newlyPublished: 0))
+        controller.offerSessionCandidate(login(), owner: 42)
+        #expect(await controller.refreshForSync([course], force: true) == .refreshed(newlyPublished: 0, failedKeys: 0))
+        #expect(browser.openedWith == [["SSO_LOGIN"]])
+    }
+
+    /// "Accedi con Polimi" with a candidate and a lapsed session (so `freshSession`) opens with
+    /// the candidate, not with no cookies. Reached with a page on screen: its browser stays open
+    /// after a cancelled sign-in, so an offer then leaves `.needsSignIn` alone.
+    /// Mutation: `runSignIn` opening with `[]` whenever `freshSession`.
+    @Test func signInOpensWithTheCandidateEvenAfterALapsedSession() async throws {
+        defer { cleanUp() }
+        let controller = try launched()
+        controller.pageAppeared()
+        browser.signInError = CancellationError()
+        controller.signIn()
+        await waitUntil("the first sign-in ended") { controller.access == .needsSignIn(nil) }
+        #expect(browser.isOpen, "the page keeps the browser")
+        controller.offerSessionCandidate(login(), owner: 42)
+        #expect(controller.access == .needsSignIn(nil), "a browser is open: its sign-in is the student's")
+        browser.signInError = nil
+        controller.signIn()
+        await waitUntil("the second sign-in opened a browser") { browser.openedWith.count == 2 }
+        #expect(browser.openedWith == [[], ["SSO_LOGIN"]])
+        controller.pageDisappeared()
+    }
+
+    /// The sign-in takes the candidate: a second one after a cancelled first starts with nothing.
+    /// Mutation: drop `consumeCandidate` in `runSignIn`.
+    @Test func theSignInConsumesTheCandidate() async throws {
+        defer { cleanUp() }
+        let controller = try launched()
+        controller.offerSessionCandidate(login(), owner: 42)
+        browser.signInError = CancellationError()
+        controller.signIn()
+        await waitUntil("the first sign-in ended") { controller.access == .needsSignIn(nil) }
+        controller.signIn()
+        await waitUntil("the second sign-in opened a browser") { browser.openedWith.count == 2 }
+        #expect(browser.openedWith == [["SSO_LOGIN"], []])
+    }
+
+    // MARK: One use, exactly
+
+    /// A candidate that arrives while the file is being read, and is not the one the browser was
+    /// opened with, is not consumed by that opening. The hook offers a second candidate at the
+    /// moment the first is looked at. Guards a login lost to an unrelated opening.
+    /// Mutation: clear the candidate after the opening whatever its serial.
+    @Test func aCandidateThatArrivedDuringTheReadIsNotConsumedByTheOpening() async throws {
+        defer { cleanUp() }
+        let controller = try launched(savedFile: true)
+        browser.listResults[course.courseCode] = .failure(RecmanBrowserError.needsSignIn)
+        controller.offerSessionCandidate(login("SSO_FIRST"), owner: 42)
+        hooks.onOwnerRead = { controller.offerSessionCandidate(self.login("SSO_SECOND"), owner: 42) }
+        _ = await controller.refreshForSync([course], force: false)
+        #expect(hooks.onOwnerRead == nil, "the hook ran")
+        #expect(browser.openedWith == [["SSO_SAVED"]], "the first opening did not use the newer candidate")
+        controller.signIn()
+        await waitUntil("the sign-in opened a browser") { browser.openedWith.count == 2 }
+        #expect(browser.openedWith == [["SSO_SAVED"], ["SSO_SECOND"]])
+    }
+
+    /// A candidate that arrives with the browser already open is not for a later opening once the
+    /// session it stands beside was saved: the file then holds a session at least as new.
+    /// Both ways the save ends (`.saved`, cookies changed; `.unchanged`, same ones).
+    /// Mutations: drop `sessionCandidate = nil` from the `.saved` case, or from `.unchanged`.
+    @Test(arguments: [true, false]) func aSavedSessionRetiresALateCandidate(changed: Bool) async throws {
+        defer { cleanUp() }
+        let controller = try launched(savedFile: true)
+        let gate = FakeRecmanBrowser.Gate()
+        browser.listGates[course.courseCode] = gate
+        browser.listResults[course.courseCode] = .success([])
+        if changed { browser.cookiesAfterListing = [FakeRecmanBrowser.cookie("SSO_RENEWED")] }
+        let outcome = Task { await controller.refreshForSync([course], force: false) }
+        await waitUntil("the listing is held") { gate.isWaiting }
+        controller.offerSessionCandidate(login("SSO_LATE"), owner: 42)
+        gate.release()
+        _ = await outcome.value
+        await controller.settleSessionFile()
+        browser.listGates[course.courseCode] = nil
+        _ = await controller.refreshForSync([course], force: true)
+        #expect(browser.openedWith.count == 2)
+        #expect(browser.openedWith.last != ["SSO_LATE"], "the late candidate was not kept")
+    }
+
+    // MARK: The saved file as a way back
+
+    /// A candidate that Polimi refuses falls back, once, on the same account's saved cookies: the
+    /// entry works and the session is not lost. Mutation: no fallback in `drain`.
+    @Test func aRefusedCandidateFallsBackOnTheSavedFile() async throws {
+        defer { cleanUp() }
+        let controller = try launched(savedFile: true)
+        browser.rejectedCookieNames = ["SSO_LOGIN"]
+        browser.listResults[course.courseCode] = .success([recording("a")])
+        controller.offerSessionCandidate(login(), owner: 42)
+        #expect(await controller.refreshForSync([course], force: false) == .refreshed(newlyPublished: 0, failedKeys: 0))
+        #expect(browser.openedWith == [["SSO_LOGIN"], ["SSO_SAVED"]])
+        #expect(controller.access == .ready)
+        await controller.settleSessionFile()
+        #expect(try savedOwner() == 42, "the session file is still there")
+    }
+
+    /// With no file, or one of another account, there is nothing to fall back on: one entry,
+    /// `.needsSignIn`, nothing written. Mutation: a second attempt with no cookies, or with
+    /// another account's.
+    @Test(arguments: [false, true]) func aRefusedCandidateWithoutAUsableFileGoesToSignIn(foreignFile: Bool) async throws {
+        defer { cleanUp() }
+        let controller = try launched(savedFile: foreignFile)
+        if foreignFile { world.owner = 43 }
+        browser.rejectedCookieNames = ["SSO_LOGIN"]
+        browser.listResults[course.courseCode] = .success([])
+        controller.offerSessionCandidate(login(), owner: world.owner ?? 42)
+        #expect(await controller.refreshForSync([course], force: false) == .needsSignIn(newlyPublished: 0))
+        #expect(browser.openedWith == [["SSO_LOGIN"]])
+        await controller.settleSessionFile()
+        #expect(try savedOwner() == nil, "nothing written (the foreign file was deleted, not replaced)")
     }
 }
 
@@ -402,11 +554,11 @@ struct WebBeepLoginSessionHandoverTests {
         #expect(controller.recordingsIfCreated == nil)
     }
 
-    /// Signing in as another account: the previous candidate goes with the account change and the
-    /// new login's candidate, delivered after it, is the one used. Guards the order in
-    /// `completeLogin`: delivering before `siteInfo` changes would have the cleanup throw the
-    /// new candidate away (or keep a foreign one). Mutation: move the delivery above
-    /// `self.siteInfo = siteInfo`.
+    /// Signing in as another account: the first account really enters (its session is in the
+    /// file and was in use), then the new login's candidate, delivered after the account-change
+    /// cleanup, is the one used. Guards the order in `completeLogin` and the way back from the
+    /// `.needsSignIn` that the account change leaves. Mutations: move the delivery above
+    /// `self.siteInfo = siteInfo`; `offerSessionCandidate` not returning to `.ready`.
     @Test func theNewAccountsCandidateSurvivesTheAccountChange() async throws {
         defer { try? FileManager.default.removeItem(at: root) }
         let first = MoodleRecordingProtocol.register(courses: [(1, "Course")], userID: 7)
@@ -415,12 +567,73 @@ struct WebBeepLoginSessionHandoverTests {
         browser.listResults[course.courseCode] = .success([])
         let controller = makeController(token: first, browser: browser)
         await controller.completeLoginForTesting(moodleLoginCallback(token: first), polimiCookies: cookie("SSO_ACCOUNT_7"))
+        #expect(await controller.recordings.refreshForSync([course], force: false) == .refreshed(newlyPublished: 0, failedKeys: 0))
+        await controller.recordings.settleSessionFile()
+        #expect(try RecmanSessionCodec.decode(try #require(try store.load()), now: Date()).ownerUserID == 7)
+
         await controller.completeLoginForTesting(moodleLoginCallback(token: second), polimiCookies: cookie("SSO_ACCOUNT_8"))
         _ = await controller.recordings.refreshForSync([course], force: false)
-        #expect(browser.openedWith == [["SSO_ACCOUNT_8"]])
+        #expect(browser.openedWith == [["SSO_ACCOUNT_7"], ["SSO_ACCOUNT_8"]])
         await controller.recordings.settleSessionFile()
         let saved = try #require(try store.load())
         #expect(try RecmanSessionCodec.decode(saved, now: Date()).ownerUserID == 8)
+    }
+
+    /// Logout turns Recordings off for the rest of the launch (`turnOff`), although the stored
+    /// choice (absent: on) says on. A validated Polimi login brings it back as at a normal start,
+    /// then hands over the candidate, which is used with no window. Mutation: drop
+    /// `resumeIfSwitchedOn()` in `completeLogin`.
+    @Test func aNewLoginAfterLogoutTurnsRecordingsBackOnAndEnters() async throws {
+        defer { try? FileManager.default.removeItem(at: root) }
+        let token = MoodleRecordingProtocol.register(courses: [(1, "Course")], userID: 7)
+        let browser = FakeRecmanBrowser()
+        browser.listResults[course.courseCode] = .success([])
+        let controller = makeController(token: token, browser: browser)
+        await controller.completeLoginForTesting(moodleLoginCallback(token: token), polimiCookies: cookie("SSO_FIRST"))
+        controller.signOut(removeFile: { _ in })
+        #expect(controller.recordings.isEnabled == false)
+
+        await controller.completeLoginForTesting(moodleLoginCallback(token: token), polimiCookies: cookie("SSO_AGAIN"))
+        #expect(controller.recordings.isEnabled)
+        #expect(controller.recordings.access == .ready, "back on, no sign-in started")
+        #expect(browser.openedWith.isEmpty)
+        #expect(await controller.recordings.refreshForSync([course], force: false) == .refreshed(newlyPublished: 0, failedKeys: 0))
+        #expect(browser.openedWith == [["SSO_AGAIN"]])
+        #expect(!browser.calls.contains("signIn"))
+    }
+
+    /// A switch the user turned off stays off through a new login: no candidate is kept either.
+    /// Mutation: have `resumeIfSwitchedOn` ignore the stored choice.
+    @Test func aSwitchTurnedOffStaysOffAfterANewLogin() async throws {
+        defer { try? FileManager.default.removeItem(at: root) }
+        let token = MoodleRecordingProtocol.register(courses: [(1, "Course")], userID: 7)
+        let browser = FakeRecmanBrowser()
+        let controller = makeController(token: token, browser: browser)
+        await controller.completeLoginForTesting(moodleLoginCallback(token: token), polimiCookies: cookie("SSO_FIRST"))
+        controller.recordings.setEnabled(false)
+        await controller.completeLoginForTesting(moodleLoginCallback(token: token), polimiCookies: cookie("SSO_AGAIN"))
+        #expect(controller.recordings.isEnabled == false)
+        #expect(await controller.recordings.refreshForSync([course], force: false) == .skipped(.switchedOff))
+        #expect(browser.openedWith.isEmpty)
+    }
+
+    /// The sign-in window closed while its cookies are read: the token has arrived, so the login
+    /// completes (with no cookies) instead of ending as cancelled; and "Ricarica" in that moment
+    /// is ignored. Mutation: `windowClosed` finishing with `.cancelled` in every phase; `retry()`
+    /// without its `.collecting` guard.
+    @Test func aWindowClosedWhileTheCookiesAreReadCompletesTheLogin() {
+        let results = OSAllocatedUnfairLock<[String]>(initialState: [])
+        let window = LoginWindowController(site: .polimi) { result, cookies in
+            switch result {
+            case .success: results.withLock { $0.append("success \(cookies.count)") }
+            case .failure: results.withLock { $0.append("failure") }
+            }
+        }
+        window.beginCollectingForTesting(URL(string: "moodlemobile://token=x")!)
+        window.reloadForTesting()
+        #expect(window.isCollectingForTesting, "a reload does not undo a finished login")
+        window.closeWindowForTesting()
+        #expect(results.withLock { $0 } == ["success 0"])
     }
 
     /// A second account whose own login carries no Polimi cookies must not inherit the first

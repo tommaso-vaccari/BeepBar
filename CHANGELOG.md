@@ -9,7 +9,7 @@
 
 ### Improved
 
-- Recordings no longer asks you to sign in with Polimi a second time after you sign in to WeBeep: the same sign-in is used to open the archive, and the first check can run in the background after the first sync without opening the page.
+- Signing in to WeBeep with Polimi now also opens the Recordings archive: there is no second Polimi sign-in, and the first sync after signing in already loads your recordings, even if you never open the Recordings page. Turn Recordings off in Settings if you don't want that.
 - Opening a course in Recordings clears its new-recordings badge in the sidebar. The blue dots stay on the new lectures while you are in the course, and once you leave it they count as read, so the “Segna novità come lette” (“Mark new recordings as read”) button is gone.
 - The Recordings sidebar is tidier: the orange dot is gone, and under each course's name you now read how many lectures are left, for example “30 registrazioni · 3 da guardare”. The only badge left counts new recordings, and it stays readable on the selected course. The number beside “Watchlist” now counts the lessons added by link too.
 - BeepBar no longer sends anonymous usage statistics, and the “Telemetria” (“Telemetry”) option in Settings is gone. There is nothing to do after updating.

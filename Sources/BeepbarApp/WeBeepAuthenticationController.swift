@@ -3055,6 +3055,11 @@ enum MaterialsRunEnd: Equatable, Sendable {
                 // that cleanup drops a previous account's candidate, so the new one must come
                 // after it or it would be discarded with the old (#234). Polimi only, with the
                 // feature on; the controller is not created for anyone else.
+                // A logout in this launch left Recordings off although the stored choice is still
+                // on (the default): back on as at a normal start, with no window, before the offer.
+                if self.selectedSite.university == .polimi, RecordingsController.isSwitchedOn(in: self.operationDefaults) {
+                    self.recordings.resumeIfSwitchedOn()
+                }
                 if self.selectedSite.university == .polimi, !polimiCookies.isEmpty,
                    RecordingsController.isSwitchedOn(in: self.operationDefaults) {
                     self.recordings.offerSessionCandidate(polimiCookies, owner: siteInfo.userID)
@@ -4237,6 +4242,8 @@ enum AutomaticSyncOutcome: Equatable {
     private static let maximumAutomaticRetries = 2
     private let site: MoodleSite
     private var phase: Phase = .signingIn
+    /// The token's address while `collecting`, for a window closed meanwhile (`windowClosed`).
+    private var pendingTokenURL: URL?
     /// The result and, for Polimi, the live `polimi.it` cookies of this window's store (#234).
     private var completion: ((Result<URL, LoginWindowError>, [HTTPCookie]) -> Void)?
     private let webView: WKWebView
@@ -4299,6 +4306,11 @@ enum AutomaticSyncOutcome: Equatable {
 #if DEBUG
     /// For tests: the window's web view is the one that handles ⌘V, ⌘C and ⌘A itself.
     var webViewHandlesEditingShortcutsForTesting: Bool { webView is RecmanSignInWebView }
+    /// The state right after the token arrived, with the cookies still being read.
+    func beginCollectingForTesting(_ url: URL) { phase = .collecting; pendingTokenURL = url }
+    var isCollectingForTesting: Bool { phase == .collecting }
+    func closeWindowForTesting() { windowClosed() }
+    func reloadForTesting() { retry() }
 #endif
 
     override func showWindow(_ sender: Any?) {
@@ -4317,6 +4329,8 @@ enum AutomaticSyncOutcome: Equatable {
     }
 
     private func retry() {
+        // The token is already in: a reload now would throw a finished login away (#234).
+        guard phase != .collecting else { return }
         automaticRetriesRemaining = Self.maximumAutomaticRetries
         phase = .signingIn
         waitingOverlay.isHidden = false
@@ -4328,7 +4342,14 @@ enum AutomaticSyncOutcome: Equatable {
     /// runs, the check that crashed with SIGBUS on the first AppKit callback after a wake from
     /// sleep (`StatusItemController`).
     nonisolated func windowWillClose(_ notification: Notification) {
-        Task { @MainActor [weak self] in self?.finish(.failure(.cancelled)) }
+        Task { @MainActor [weak self] in self?.windowClosed() }
+    }
+
+    /// The window was closed. While the cookies are read (`collecting`) a valid token has already
+    /// arrived: the login succeeds, with no cookies to hand over, instead of ending as cancelled
+    /// and sending the user through the sign-in again (#234).
+    private func windowClosed() {
+        if phase == .collecting, let url = pendingTokenURL { finish(.success(url)) } else { finish(.failure(.cancelled)) }
     }
 
     // The navigation events below (start, fail, finish) are left isolated on purpose, although
@@ -4403,6 +4424,7 @@ enum AutomaticSyncOutcome: Equatable {
         guard phase == .launchingMobile else { return }
         guard site.university == .polimi else { finish(.success(url)); return }
         phase = .collecting
+        pendingTokenURL = url
         let store = webView.configuration.websiteDataStore.httpCookieStore
         Task { @MainActor [weak self] in
             let cookies = await store.allCookies()

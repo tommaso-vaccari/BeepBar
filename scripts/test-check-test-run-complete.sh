@@ -72,6 +72,13 @@ expect 1 "tests summed over runs fall short" 2 5 <<'EOF'
 ◇ Test run started.
 ✔ Test run with 1 test in 1 suite passed after 0.100 seconds.
 EOF
+# The minimum is met only by the sum: taking the largest run, or the last, would read 3 and fail.
+expect 0 "tests summed over runs reach the minimum" 2 5 <<'EOF'
+◇ Test run started.
+✔ Test run with 2 tests in 1 suite passed after 0.100 seconds.
+◇ Test run started.
+✔ Test run with 3 tests in 1 suite passed after 0.100 seconds.
+EOF
 if bash "$script" "$dir/missing" >/dev/null 2>&1; then
     echo "FAIL: a missing log should fail"; failures=$((failures + 1))
 fi

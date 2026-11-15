@@ -25,19 +25,22 @@ test_targets=$(find Tests -mindepth 1 -maxdepth 1 -type d | wc -l | tr -d ' ')
 # suites') failed now and then; `.serialized` only orders tests inside one suite, so it cannot
 # isolate them. They run alone, one at a time, in the second pass; everything else stays parallel.
 # ONE regex feeds both passes (`--skip` in the first, `--filter` in the second), so no test can
-# fall between them. It matches the Swift Testing id "Target.Suite/test()" and must name a suite
-# whose tests are only web-view tests, or a single test. Adding a suite or test that creates a
-# web view (a WKWebView, `RecmanWebSession.open`, `LoginWindowController`...)? Add it here. Only the
+# fall between them. It matches the Swift Testing id, "Target.Suite/test()" followed on this
+# toolchain by "/File.swift:line:column": name a suite whose tests are only web-view tests as
+# "Suite/", or single tests as "Suite/(testA|testB)\(\)(/|$)" (a bare "\(\)$" never matches,
+# because of the location suffix). Adding a suite or test that creates a web view (a WKWebView,
+# `RecmanWebSession.open`, `LoginWindowController`...)? Add it here and raise the minimum. Only the
 # targets with a matching test start a run in the second pass, hence its minimum of one run: a
 # pattern that matches nothing starts none and fails there. A pattern that loses one suite (a
 # typo, a rename) would still be green, with that suite back in the parallel pass unnoticed, so
-# the second pass also states a minimum number of tests (the check's third argument; 65 ran when
-# this was written: change it deliberately if suites are removed).
-webview_tests='^BeepbarAppTests\.(RecmanScriptsTests|RecmanWebSessionTests|RecmanWebSessionScriptTests|WebexSignInWebViewTests)/|^BeepbarAppTests\.RecordingsWebBeepSessionTests/theLoginWindowUsesTheWebViewWithEditingShortcuts\(\)$'
+# the second pass also states a minimum number of tests (the check's third argument): the exact
+# number that runs today, so losing even one test fails. New tests pass it; lower it deliberately
+# when a web-view test is removed.
+webview_tests='^BeepbarAppTests\.(RecmanScriptsTests|RecmanWebSessionTests|RecmanWebSessionScriptTests|WebexSignInWebViewTests)/|^BeepbarAppTests\.WebBeepLoginSessionHandoverTests/(theLoginWindowUsesTheWebViewWithEditingShortcuts|aWindowClosedWhileTheCookiesAreReadCompletesTheLogin)\(\)(/|$)'
 swift test --skip "$webview_tests" 2>&1 | tee "$test_log"
 bash scripts/check-test-run-complete.sh "$test_log" "$test_targets"
 swift test --no-parallel --filter "$webview_tests" 2>&1 | tee "$test_log"
-bash scripts/check-test-run-complete.sh "$test_log" 1 50
+bash scripts/check-test-run-complete.sh "$test_log" 1 67
 python3 scripts/recordings-seen-isolated-tests.py
 bash scripts/test-release-notes.sh
 bash scripts/test-build-version.sh

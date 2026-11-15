@@ -72,3 +72,7 @@ Aggiornata la riga «Audio migliorato» della mappa dei dati: in «Voce livellat
 ## 2026-11-14 — telemetria rimossa, issue #239
 
 Aggiornate mappa dei dati, valutazione (C08), piano di verifica e indice: la telemetria TelemetryDeck è rimossa dal codice (branch `fix/player-wake-crash-and-telemetry-removal`, non ancora in dev né rilasciata); le descrizioni precedenti sono marcate come storiche. Pulizia unica al primo avvio delle sette preferenze `dailyTelemetry*`. Nessuna nuova fonte acquisita: fonti grezze, schede S-0007–S-0016 e manifest restano invariati come storico. Nessuna conclusione giuridica nuova; la cancellazione dei dati già ricevuti presso il fornitore è un’azione manuale del maintainer, non eseguita né verificata qui. Solo analisi del codice, nessuna verifica runtime del binario.
+
+## 2026-11-15 — accesso WeBeep riutilizzato per le registrazioni, issue #234
+
+Aggiornata la riga «Archivio Polimi» della mappa dei dati e l'informativa (testo IT/EN): i cookie Polimi dell'accesso a WeBeep restano in memoria, legati all'account verificato, e finiscono nel file della sessione solo dopo l'ingresso riuscito in archivio. Corretta nell'informativa la frase «le funzioni sono attivate dall'utente», non esatta perché Registrazioni è attiva per impostazione predefinita con un account Polimi. Nessun nuovo destinatario, flusso di rete, categoria di dati o base giuridica; nessuna nuova fonte. Solo analisi del codice e test del branch, non rilasciato; nessuna verifica runtime del binario.

@@ -489,7 +489,7 @@ struct RecordingsListing: Equatable {
         let serial: Int
         let cookies: [HTTPCookie]
         let owner: Int
-        let epoch: Int
+        var epoch: Int
     }
     private var sessionCandidate: SessionCandidate?
     private var sessionCandidates = 0
@@ -3543,6 +3543,16 @@ struct RecordingsListing: Equatable {
         return await task.value
     }
 
+    /// Deletes a saved file that is not usable for the connected account (undecodable, or another
+    /// account's) from `adopt`. The deletion bumps the vault epoch, but it is not an identity
+    /// change: a candidate made for the connected account (#234) is the account's own and must
+    /// outlive it, so its epoch follows. Without this a stale file left by a previous account
+    /// cost the new sign-in its candidate on the next look in the same cycle.
+    private func discardUnusableFile() {
+        discardSessionFile()
+        if sessionCandidate?.owner == ownerUserID() { sessionCandidate?.epoch = vault.epoch }
+    }
+
     /// Applies a finished read on the main actor, unless turn-off, logout or an account change
     /// discarded the session since it started: what was read is being deleted.
     private func adopt(_ outcome: RecmanSessionVault.LoadOutcome, epoch: Int, load: Int) -> [HTTPCookie] {
@@ -3564,7 +3574,7 @@ struct RecordingsListing: Equatable {
             log.notice("Saved Polimi session unreadable: dropped")
             legacySeen = .init(ids: [], baselines: [])
             discardLegacyDefaults()
-            discardSessionFile()
+            discardUnusableFile()
             return []
         case .session(let saved):
             snapshot = saved
@@ -3577,7 +3587,7 @@ struct RecordingsListing: Equatable {
             forgetSeen()
             forgetResumePoints()
             forgetEmailOptOut()
-            discardSessionFile()
+            discardUnusableFile()
             return []
         }
         sessionOwner = snapshot.ownerUserID

@@ -9,12 +9,14 @@
 
 ### Improved
 
+- Recordings no longer asks you to sign in with Polimi a second time after you sign in to WeBeep: the same sign-in is used to open the archive, and the first check can run in the background after the first sync without opening the page.
 - Opening a course in Recordings clears its new-recordings badge in the sidebar. The blue dots stay on the new lectures while you are in the course, and once you leave it they count as read, so the “Segna novità come lette” (“Mark new recordings as read”) button is gone.
 - The Recordings sidebar is tidier: the orange dot is gone, and under each course's name you now read how many lectures are left, for example “30 registrazioni · 3 da guardare”. The only badge left counts new recordings, and it stays readable on the selected course. The number beside “Watchlist” now counts the lessons added by link too.
 - BeepBar no longer sends anonymous usage statistics, and the “Telemetria” (“Telemetry”) option in Settings is gone. There is nothing to do after updating.
 
 ### Fixed
 
+- Paste, copy and select all (⌘V, ⌘C, ⌘A) now work in the WeBeep sign-in window, so a password can be pasted.
 - BeepBar no longer quits unexpectedly when the Mac wakes from sleep with a lecture or the BeepBar window open.
 - A lecture left paused for a long time, or across your Mac's sleep, now resumes where you stopped instead of showing an error; BeepBar also retries a few times when the connection is not back yet.
 - In Recordings, a course BeepBar has not listed yet no longer shows an empty pane when you aren't signed in with Polimi: it asks you to sign in, with the button right there.

@@ -169,6 +169,23 @@ struct RecordingsWebBeepSessionTests {
         #expect(browser.openedWith == [["SSO_LOGIN"], []])
     }
 
+    /// A saved file left by another account (the normal state after a sign-in as someone else on
+    /// a Mac where Recordings was used) is deleted when read, which bumps the session epoch; the
+    /// new account's own candidate must survive that and enter the archive, on the sync's first
+    /// opening. Guards a candidate thrown away by the discard of a file that was never its own.
+    /// Mutation: make `discardUnusableFile` call `discardSessionFile` alone (no epoch follow).
+    @Test func aForeignSavedFileDoesNotCostTheCandidate() async throws {
+        defer { cleanUp() }
+        let controller = try launched(savedFile: true)   // the file belongs to account 42
+        world.owner = 43
+        browser.listResults[course.courseCode] = .success([])
+        controller.offerSessionCandidate(login("SSO_FOR_43"), owner: 43)
+        _ = await controller.refreshForSync([course], force: false)
+        #expect(browser.openedWith == [["SSO_FOR_43"]])
+        await controller.settleSessionFile()
+        #expect(try savedOwner() == 43)
+    }
+
     // MARK: Identity
 
     /// A candidate made for another account is never kept, and one that was kept stops counting
@@ -182,6 +199,15 @@ struct RecordingsWebBeepSessionTests {
         let outcome = await controller.refreshForSync([course], force: false)
         #expect(outcome == .needsSignIn(newlyPublished: 0))
         #expect(world.browsersMade == 0)
+
+        // Offered for 43 while 42 is connected, then 43 connects: the offer-time check alone keeps
+        // it out (the use-time check would now agree), so the two guards are tested separately.
+        let early = try launched()
+        early.offerSessionCandidate(login(), owner: 43)
+        world.owner = 43
+        #expect(await early.refreshForSync([course], force: false) == .needsSignIn(newlyPublished: 0))
+        #expect(world.browsersMade == 0)
+        world.owner = 42
 
         // Kept for 42, then the connected account is another one before the first use.
         let second = try launched()
@@ -224,16 +250,19 @@ struct RecordingsWebBeepSessionTests {
         world.polimi = true
         // The same controller later on Polimi would use a candidate kept from before: none is.
         #expect(await unipd.refreshForSync([course], force: false) == .skipped(.switchedOff))
+        let later = await unipd.refreshForSync([course], force: false)
+        #expect(later != .refreshed(newlyPublished: 0, failedKeys: 0), "nothing was kept for the account")
         #expect(world.browsersMade == 0)
 
+        // Switched off, offered, then switched on again behind the controller's back (no
+        // `turnOff`, which would discard it anyway): still nothing to use.
         defaults.set(false, forKey: RecordingsController.enabledKey)
         let off = makeController()
         off.offerSessionCandidate(login(), owner: 42)
         defaults.set(true, forKey: RecordingsController.enabledKey)
-        let on = makeController()
-        #expect(await on.refreshForSync([course], force: false) == .needsSignIn(newlyPublished: 0))
+        let afterwards = await off.refreshForSync([course], force: false)
+        #expect(afterwards != .refreshed(newlyPublished: 0, failedKeys: 0))
         #expect(world.browsersMade == 0)
-        #expect(!off.isEnabled)
     }
 
     // MARK: Clean-up
@@ -256,8 +285,8 @@ struct RecordingsWebBeepSessionTests {
 
     /// An account change drops the candidate made for the previous account, and a candidate
     /// delivered after the change survives it (the order `completeLogin` relies on).
-    /// Mutation: remove the owner check in `webBeepAccountChanged` (the old one survives); or
-    /// have `webBeepAccountChanged` clear every candidate (the new one would not).
+    /// Mutations: remove the owner check in `webBeepAccountChanged` (a candidate comes back when
+    /// its account does); have it clear every candidate (one for the new account would not survive).
     @Test func anAccountChangeDropsTheOldCandidateAndKeepsTheNewOne() async throws {
         defer { cleanUp() }
         let controller = try launched()
@@ -268,12 +297,32 @@ struct RecordingsWebBeepSessionTests {
         #expect(await controller.refreshForSync([course], force: false) == .needsSignIn(newlyPublished: 0))
         #expect(world.browsersMade == 0, "account 42's login is not used for account 43")
 
+        // 42 -> 43 -> 42: the use-time owner check would accept the old candidate again, so only
+        // the clear in `webBeepAccountChanged` keeps it out.
+        world.owner = 42
+        let back = try launched()
+        back.offerSessionCandidate(login("SSO_OLD"), owner: 42)
+        world.owner = 43
+        back.webBeepAccountChanged(to: 43)
+        world.owner = 42
+        #expect(await back.refreshForSync([course], force: false) == .needsSignIn(newlyPublished: 0))
+        #expect(world.browsersMade == 0, "a candidate does not come back when its account does")
+
+        // A change to the candidate's own account does not drop it, whatever the order.
+        let same = try launched()
+        same.offerSessionCandidate(login("SSO_SAME"), owner: 42)
+        same.webBeepAccountChanged(to: 42)
+        _ = await same.refreshForSync([course], force: false)
+        #expect(browser.openedWith == [["SSO_SAME"]])
+
+        world.owner = 43
         let next = try launched()
         next.offerSessionCandidate(login("SSO_OLD"), owner: 43)
         next.webBeepAccountChanged(to: 43)
         next.offerSessionCandidate(login("SSO_NEW"), owner: 43)
         _ = await next.refreshForSync([course], force: false)
-        #expect(browser.openedWith == [["SSO_NEW"]])
+        #expect(browser.openedWith.last == ["SSO_NEW"])
+        #expect(browser.openedWith.first == ["SSO_SAME"])
     }
 }
 

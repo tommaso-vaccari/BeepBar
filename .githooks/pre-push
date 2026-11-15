@@ -2,6 +2,13 @@
 set -euo pipefail
 cd "$(git rev-parse --show-toplevel)"
 
+# Git runs hooks with its own environment exported: in a linked worktree GIT_DIR is the absolute
+# path of this repository. Tools that call git on another repository inherit it: with an empty
+# build/SourcePackages, xcodebuild's checkout of Sparkle then reads this repository instead and
+# fails with "unable to read tree", so the first push from every new worktree was blocked.
+# From the top level git finds this checkout by itself, so the variables are dropped here.
+unset $(git rev-parse --local-env-vars)
+
 head=$(git rev-parse HEAD)
 verify=false
 while read -r local_ref local_sha remote_ref remote_sha; do

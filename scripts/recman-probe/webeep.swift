@@ -162,8 +162,11 @@ func hostAndPath(_ url: URL?) -> String {
 }
 
 /// `webeep <state> [code year]`. Contacts Polimi; run it only by hand, with your own account.
+/// `RECMAN_PROBE_NO_EDIT_MENU=1` leaves the Edit menu out, so the window gets its shortcuts the way
+/// the app's sign-in window does (the app installs no Edit menu): ⌘V working then shows that the
+/// web view alone handles paste (#234).
 @MainActor func webeepMode(state: URL, course: (code: String, year: Int)?) async -> Int32 {
-    installEditMenu()
+    if ProcessInfo.processInfo.environment["RECMAN_PROBE_NO_EDIT_MENU"] != "1" { installEditMenu() }
     let seconds = Int(ProcessInfo.processInfo.environment["RECMAN_PROBE_WINDOW_SECONDS"] ?? "") ?? 300
     say("Sign in to WeBeep in the window that opens, as in the app (up to \(seconds) s).")
     let login = WeBeepLoginProbe()

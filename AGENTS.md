@@ -35,7 +35,7 @@ BeepBar provides up-to-date course materials, protects students' local work, and
 6. **Bound resources during work.** Bound response reception, memory, concurrency, and queues. Stream large files and avoid UI work proportional to every list element on each event.
 7. **Make cancellation real and state truthful.** Stop interruptible work promptly; finish or recover atomic changes safely. Distinguish saved, refreshing, paused, failed, cancelled, and completed states; reject stale asynchronous results.
 8. **Preserve identity and compatibility.** Scope caches and results to site, account, root, and operation. Prevent old identity data returning after logout or account changes; verify migrations and rollback for users who skip releases.
-9. **Prove benefits with the smallest justified change.** Reproduce or measure first, prioritize correctness and blocked user actions, and report regressions and uncertainty. Never trade guarantees for benchmark gains or infer app-wide responsiveness from Core measurements. Use isolated synthetic data; real-account validation requires explicit authorization.
+9. **Prove benefits with the smallest justified change.** Reproduce or measure first (a lower-level swap on a hot path is justified by the work it removes instead; see Performance), prioritize correctness and blocked user actions, and report regressions and uncertainty. Never trade guarantees for benchmark gains or infer app-wide responsiveness from Core measurements. Use isolated synthetic data; real-account validation requires explicit authorization.
 
 ## Build and verification
 
@@ -161,6 +161,11 @@ Being fast, reactive and nearly free in the background is a product feature. Per
   - **Cost proportional to what changed:** a run with nothing new costs almost nothing, locally and on the network.
 - **Freshness is not a budget to cut.** Automatic checks keep running at the interval the user chose, and new files are downloaded when they appear. Idle savings come from making each check cheaper, never from checking less often, delaying downloads or skipping runs.
 - Performance never trades away sync guarantees: local files never overwritten without the user's choice, three-way sync, cancellation, atomicity and recovery, compatibility of stored data. The hard rules above apply unchanged.
+- **Lowest efficient level on hot paths.** On paths that run per file, per chunk or per row (the sync tree, hashing, downloads, the database), use the lowest-level call that does the job rather than a convenience wrapper, and accept the lost abstraction: fd-relative POSIX, `read(2)`/`write(2)` into a reused buffer, the SQLite C API with reused statements.
+  - Decide by technical judgment, not by benchmark. The change is justified when it removes countable work (fewer passes over the data, syscalls, allocations or copies) and the independent review agrees, with no guarantee weakened. A measurement is not required; when one exists, report it.
+  - Never reimplement security or protocol libraries: networking stays on `URLSession`, and `fsync` versus `F_FULLFSYNC` is a durability choice, not an efficiency one.
+
+  Every new platform call needs its Linux and Windows counterpart in the Core's platform layer (#260). Open work: #261.
 - Provisional budgets. Replace each one with a measured baseline once the harness exists:
 
   | Moment | Budget |
@@ -194,7 +199,7 @@ Being fast, reactive and nearly free in the background is a product feature. Per
   - The branch is pushed and its PR opened against `dev` only after the user's explicit go.
 - Every performance PR:
   - Targets `dev`, or its predecessor branch when part of a stack that integrates into `dev`. Releasing to `main` is the user's decision alone.
-  - One fix per PR. The description shows before/after numbers for the budget it touches.
+  - One fix per PR. The description shows before/after numbers for the budget it touches, or, for a lower-level swap on a hot path, the work it removes.
   - Adds a regression test when the property is testable (e.g. "a run with nothing new writes nothing", "unchanged files are not hashed", "sync progress doesn't re-render the course list").
   - Explains the *why* in comments.
   - Adds a CHANGELOG entry only when users can notice the change.

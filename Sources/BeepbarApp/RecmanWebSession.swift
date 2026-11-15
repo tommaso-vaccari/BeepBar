@@ -269,7 +269,14 @@ struct RecmanStreamFailure: Error {
                 try await enterInBackground(operation: operation)
             } catch {
                 diagnose("stream: step=archive-reentry result=\(Self.reentryResult(error))")
-                throw error
+                switch error {
+                case is CancellationError, RecmanBrowserError.needsSignIn: throw error
+                // Whatever else stopped the re-entry (a page that looks different, a timeout), the
+                // truthful cause is the 5xx that started it: the archive is not answering. Only
+                // `unavailable` keeps the controller's retries going; `unrecognized` would end
+                // them with "the archive looks different" for what is an outage.
+                default: throw RecmanBrowserError.unavailable
+                }
             }
             diagnose("stream: step=archive-reentry result=archive")
             return try await previewPlayerLink(for: recording, operation: operation)
@@ -282,6 +289,7 @@ struct RecmanStreamFailure: Error {
         case is CancellationError: "cancelled"
         case RecmanBrowserError.needsSignIn: "needs-user"
         case RecmanBrowserError.unavailable: "unavailable"
+        case RecmanBrowserError.unrecognized: "unrecognized"
         default: "failed"
         }
     }
@@ -1024,27 +1032,42 @@ struct RecmanStreamFailure: Error {
         }
     }
 
-    /// A server error page can finish loading normally in WebKit. During a preview lookup it
-    /// must reach the recovery as a temporary outage before we try to extract a player link.
-    /// It also records that the cause was the server's answer (`previewRejectedByServer`):
-    /// `playbackURL(for:)` uses it to tell a dead archive session from a timeout or a network
-    /// failure, and enters the archive again once.
+    /// A server error page can finish loading normally in WebKit, so two cases look at the status
+    /// of a main-frame response before the page is read:
+    /// - During a preview lookup it must reach the recovery as a temporary outage before we try
+    ///   to extract a player link. It also records that the cause was the server's answer
+    ///   (`previewRejectedByServer`): `playbackURL(for:)` uses it to tell a dead archive session
+    ///   from a timeout or a network failure, and enters the archive again once.
+    /// - During a background entry a 5xx ends the entry as failed (Polimi not responding). Left
+    ///   alone, the error page has no archive form and on the archive host is classified as
+    ///   "transit, then unrecognized", so an outage would read as "the archive looks different"
+    ///   and stop the recovery's retries; on a login host it would wait out the patience and read
+    ///   as "sign in". An interactive entry is left as it is: the user is looking at that page.
     func webView(_ webView: WKWebView, decidePolicyFor navigationResponse: WKNavigationResponse, decisionHandler: @escaping @MainActor (WKNavigationResponsePolicy) -> Void) {
-        guard webView === self.webView, capturingPlayback,
-              let waiter = loadWaiter, loadID > waiter.after,
-              let status = Self.playbackServerErrorStatus(navigationResponse.response, isMainFrame: navigationResponse.isForMainFrame) else {
+        guard webView === self.webView,
+              let status = Self.mainFrameServerErrorStatus(navigationResponse.response, isMainFrame: navigationResponse.isForMainFrame) else {
             decisionHandler(.allow)
             return
         }
-        diagnose("stream: step=archive-player-link status=\(status)")
-        loadWaiter = nil
-        capturingPlayback = false
-        previewRejectedByServer = true
-        waiter.resolve(.failure(RecmanBrowserError.unavailable))
-        decisionHandler(.cancel)
+        if capturingPlayback, let waiter = loadWaiter, loadID > waiter.after {
+            diagnose("stream: step=archive-player-link status=\(status)")
+            loadWaiter = nil
+            capturingPlayback = false
+            previewRejectedByServer = true
+            waiter.resolve(.failure(RecmanBrowserError.unavailable))
+            decisionHandler(.cancel)
+            return
+        }
+        if webexLogin == nil, let entry, entry.navigator.mode == .background {
+            diagnose("stream: step=archive-entry status=\(status)")
+            feed(.loadFailed(id: loadID), to: entry)
+            decisionHandler(.cancel)
+            return
+        }
+        decisionHandler(.allow)
     }
 
-    nonisolated static func playbackServerErrorStatus(_ response: URLResponse, isMainFrame: Bool) -> Int? {
+    nonisolated static func mainFrameServerErrorStatus(_ response: URLResponse, isMainFrame: Bool) -> Int? {
         guard isMainFrame, let response = response as? HTTPURLResponse,
               (500...599).contains(response.statusCode) else { return nil }
         return response.statusCode
@@ -1129,7 +1152,7 @@ struct RecmanStreamFailure: Error {
         guard let entry else { return }
         if entry.navigator.isWaitingForUser {
             // The user is looking at a blank window: start the way in again for them.
-            webView.load(URLRequest(url: PolimiPage.entryURL))
+            startArchiveEntry(webView, PolimiPage.entryURL)
         } else {
             feed(.loadFailed(id: loadID), to: entry)
         }

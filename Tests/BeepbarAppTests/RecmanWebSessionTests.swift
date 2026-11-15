@@ -68,8 +68,8 @@ struct RecmanWebSessionTests {
         let url = try #require(URL(string: "https://onlineservices.polimi.it/"))
         let response = try #require(HTTPURLResponse(url: url, statusCode: status, httpVersion: nil, headerFields: nil))
         let expected = status >= 500 ? status : nil
-        #expect(RecmanWebSession.playbackServerErrorStatus(response, isMainFrame: true) == expected)
-        #expect(RecmanWebSession.playbackServerErrorStatus(response, isMainFrame: false) == nil)
+        #expect(RecmanWebSession.mainFrameServerErrorStatus(response, isMainFrame: true) == expected)
+        #expect(RecmanWebSession.mainFrameServerErrorStatus(response, isMainFrame: false) == nil)
     }
 
     /// WebKit finishes an HTTP error page as a document load. A 500 must reach the caller as
@@ -144,7 +144,7 @@ struct RecmanWebSessionTests {
     // MARK: A Recman session that died while the page in the web view still looks alive
 
     private enum PreviewReply { case serverError, player, unreachable }
-    private enum EntryReply { case archive, needsCredentials, neverFinishes }
+    private enum EntryReply { case archive, needsCredentials, neverFinishes, serverError, otherPage }
 
     /// A session whose web view shows (or not) the archive, with the preview and the single
     /// sign-on entry replaced by local scripted replies: one reply per preview load, one per entry.
@@ -203,6 +203,8 @@ struct RecmanWebSessionTests {
                     let login = URL(string: "https://aunicalogin.polimi.it/aunicalogin/login")
                     webView.loadHTMLString("<input type=\"password\" name=\"password\">", baseURL: login)
                 case .neverFinishes: break
+                case .serverError: webView.load(URLRequest(url: failingURL))
+                case .otherPage: webView.loadHTMLString("<p>Something else</p>", baseURL: URL(string: "https://example.com/"))
                 }
             }
         }
@@ -271,6 +273,58 @@ struct RecmanWebSessionTests {
 
     /// Cancelling the Play while the re-entry is under way ends it with a plain cancellation, not
     /// a wrapped or "unavailable" error, and no second preview starts.
+    /// An outage that also hits the re-entry: the single sign-on lands on a main-frame 5xx page.
+    /// Left to the page classifier that page is "not the archive" and the background entry ends as
+    /// unrecognized after its patience, which stops the controller's retries with "the archive
+    /// looks different". A 5xx during a background entry must end it at once as unavailable.
+    /// (The fixture's 5xx page is on loopback, not on the archive host: the delegate decides by
+    /// status, not by host.)
+    @Test(.timeLimit(.minutes(1)))
+    func aServerErrorDuringTheReentryEndsItAsUnavailableAtOnce() async throws {
+        let scenario = try await StaleSessionScenario(startOnArchive: true, previews: [.serverError, .player], entry: .serverError)
+        defer { scenario.stop() }
+        let start = ContinuousClock.now
+        await #expect(throws: RecmanBrowserError.unavailable) { try await scenario.session.playbackURL(for: scenario.recording) }
+        #expect(scenario.events == ["preview", "entry"])
+        #expect(ContinuousClock.now - start < .seconds(5))
+    }
+
+    /// The same for a first entry (the web view is not on the archive): a 5xx on the way in is
+    /// Polimi not responding, not an unfamiliar page.
+    @Test(.timeLimit(.minutes(1)))
+    func aServerErrorOnAFirstBackgroundEntryIsUnavailable() async throws {
+        let scenario = try await StaleSessionScenario(startOnArchive: false, previews: [.player], entry: .serverError)
+        defer { scenario.stop() }
+        await #expect(throws: RecmanBrowserError.unavailable) { try await scenario.session.playbackURL(for: scenario.recording) }
+        #expect(scenario.events == ["entry"])
+    }
+
+    /// A re-entry that ends on a page that is neither the archive nor a login (unrecognized) is
+    /// reported as unavailable by `playbackURL`: the 5xx that caused the re-entry is the truthful
+    /// cause, and only unavailable keeps the controller's retries going.
+    @Test(.timeLimit(.minutes(1)))
+    func anUnrecognizedReentryIsReportedAsUnavailable() async throws {
+        let scenario = try await StaleSessionScenario(startOnArchive: true, previews: [.serverError, .player], entry: .otherPage)
+        defer { scenario.stop() }
+        await #expect(throws: RecmanBrowserError.unavailable) { try await scenario.session.playbackURL(for: scenario.recording) }
+        #expect(scenario.events == ["preview", "entry"])
+    }
+
+    /// An interactive entry (the user asked to sign in) that meets a 5xx page is untouched: the
+    /// window is shown and the entry keeps waiting for the user, as before.
+    @Test(.timeLimit(.minutes(1)))
+    func anInteractiveEntryMeetingAServerErrorStillShowsTheWindow() async throws {
+        let scenario = try await StaleSessionScenario(startOnArchive: false, previews: [], entry: .serverError)
+        defer { scenario.stop() }
+        var shown = false
+        scenario.session.presentSignInWindow = { _ in shown = true }
+        let task = Task { try await scenario.session.signIn() }
+        while !shown { try await Task.sleep(for: .milliseconds(10)) }
+        task.cancel()
+        await #expect(throws: CancellationError.self) { try await task.value }
+        #expect(scenario.events == ["entry"])
+    }
+
     @Test(.timeLimit(.minutes(1)))
     func cancellingDuringTheReentryThrowsCancellation() async throws {
         let scenario = try await StaleSessionScenario(startOnArchive: true, previews: [.serverError, .player], entry: .neverFinishes)

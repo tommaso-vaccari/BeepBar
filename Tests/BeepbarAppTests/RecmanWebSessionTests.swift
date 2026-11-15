@@ -98,6 +98,14 @@ struct RecmanWebSessionTests {
         let navigation = LocalPreviewNavigation(session: session)
         webView.navigationDelegate = navigation
         session.startPlaybackPreview = { webView, _ in webView.load(URLRequest(url: local)) }
+        // A 500 on a page that looks live now makes the session enter the archive once more
+        // (see `aServerErrorOnAnApparentlyLiveSessionEntersTheArchiveAgainAndRetriesOnce`): answer
+        // that entry locally, so this test never reaches Polimi.
+        session.startArchiveEntry = { webView, _ in
+            webView.loadHTMLString("""
+                <select name="aa"></select><input name="contesto"><button name="EVN_SEARCH"></button>
+                """, baseURL: archive)
+        }
         var trace: [String] = []
         session.traceHandler = { trace.append($0) }
         let recording = RecmanRecording(id: "fixture", courseCode: "123456", academicYear: 2026,
@@ -123,10 +131,155 @@ struct RecmanWebSessionTests {
             session.webView(webView, didFinish: navigation)
         }
 
+        func webView(_ webView: WKWebView, didFailProvisionalNavigation navigation: WKNavigation!, withError error: Error) {
+            session.webView(webView, didFailProvisionalNavigation: navigation, withError: error)
+        }
+
         func webView(_ webView: WKWebView, decidePolicyFor response: WKNavigationResponse, decisionHandler: @escaping @MainActor (WKNavigationResponsePolicy) -> Void) {
             status = (response.response as? HTTPURLResponse)?.statusCode
             session.webView(webView, decidePolicyFor: response, decisionHandler: decisionHandler)
         }
+    }
+
+    // MARK: A Recman session that died while the page in the web view still looks alive
+
+    private enum PreviewReply { case serverError, player, unreachable }
+    private enum EntryReply { case archive, needsCredentials, neverFinishes }
+
+    /// A session whose web view shows (or not) the archive, with the preview and the single
+    /// sign-on entry replaced by local scripted replies: one reply per preview load, one per entry.
+    /// Counts both, in order, so a test can say exactly what the session did between the two.
+    @MainActor private final class StaleSessionScenario {
+        let session = RecmanWebSession()
+        let recording: RecmanRecording
+        private let servers: [LoopbackHTTPServer]
+        private var navigation: LocalPreviewNavigation?
+        private(set) var events: [String] = []
+        var previews: Int { events.filter { $0 == "preview" }.count }
+        var entries: Int { events.filter { $0 == "entry" }.count }
+        static let playerLink = URL(string: "https://politecnicomilano.webex.com/recordingservice/sites/politecnicomilano/recording/playback/0123456789abcdef0123456789abcdef")!
+
+        init(startOnArchive: Bool, previews: [PreviewReply], entry: EntryReply) async throws {
+            let failing = try LoopbackHTTPServer { _ in .init(status: 500, contentType: "text/html", body: Data("<p>Error</p>".utf8)) }
+            let closed = try LoopbackHTTPServer { _ in .init(status: 200, contentType: "text/html", body: Data()) }
+            let closedPort = closed.port
+            closed.stop()  // its port now refuses connections: a load that fails without any HTTP status
+            servers = [failing]
+            let archive = try #require(URL(string: "https://\(RecmanURLPolicy.archiveHost)\(RecmanURLPolicy.archivePath)"))
+            let preview = try #require(URL(string: archive.absoluteString + "?evn_preview_link&transfer_id=fixture"))
+            recording = RecmanRecording(id: "fixture", courseCode: "123456", academicYear: 2026, title: "Fixture",
+                                        recordedAt: Date(), kind: "", duration: "", size: nil, previewURL: preview)
+            await session.open(cookies: [])
+            let webView = try #require(session.webView)
+            let archiveForm = """
+                <select name="aa"></select><input name="contesto"><button name="EVN_SEARCH"></button>
+                """
+            if startOnArchive {
+                let loaded = PageLoad()
+                webView.navigationDelegate = loaded
+                webView.loadHTMLString(archiveForm, baseURL: archive)
+                await loaded.wait()
+                try #require(try await session.probeArchive())
+            }
+            let navigation = LocalPreviewNavigation(session: session)
+            self.navigation = navigation
+            webView.navigationDelegate = navigation
+            var replies = previews
+            let failingURL = try #require(URL(string: "http://127.0.0.1:\(failing.port)/preview"))
+            let closedURL = try #require(URL(string: "http://127.0.0.1:\(closedPort)/preview"))
+            session.startPlaybackPreview = { [unowned self] webView, _ in
+                events.append("preview")
+                switch replies.isEmpty ? .serverError : replies.removeFirst() {
+                case .serverError: webView.load(URLRequest(url: failingURL))
+                case .unreachable: webView.load(URLRequest(url: closedURL))
+                case .player: webView.loadHTMLString("<a href=\"\(Self.playerLink.absoluteString)\">Play</a>", baseURL: archive)
+                }
+            }
+            session.startArchiveEntry = { [unowned self] webView, _ in
+                events.append("entry")
+                switch entry {
+                case .archive: webView.loadHTMLString(archiveForm, baseURL: archive)
+                case .needsCredentials:
+                    let login = URL(string: "https://aunicalogin.polimi.it/aunicalogin/login")
+                    webView.loadHTMLString("<input type=\"password\" name=\"password\">", baseURL: login)
+                case .neverFinishes: break
+                }
+            }
+        }
+
+        func stop() {
+            session.close()
+            servers.forEach { $0.stop() }
+        }
+    }
+
+    /// The bug: a lecture is playing, the Mac sleeps for an hour, and on wake the player asks for a
+    /// fresh stream. The hidden web view still shows the pre-sleep archive page, so the session
+    /// looks alive and goes straight to the preview, while the server side has expired and answers
+    /// HTTP 500. Without the re-entry every retry reuses the dead session and the user ends with
+    /// "Polimi isn't responding". This proves the 5xx triggers exactly one entry through single
+    /// sign-on and exactly one more preview, which then yields the player link.
+    @Test(.timeLimit(.minutes(1)))
+    func aServerErrorOnAnApparentlyLiveSessionEntersTheArchiveAgainAndRetriesOnce() async throws {
+        let scenario = try await StaleSessionScenario(startOnArchive: true, previews: [.serverError, .player], entry: .archive)
+        defer { scenario.stop() }
+        let link = try await scenario.session.playbackURL(for: scenario.recording)
+        #expect(link == StaleSessionScenario.playerLink)
+        #expect(scenario.events == ["preview", "entry", "preview"])
+    }
+
+    /// If the single sign-on can no longer renew the session without the user, the caller must
+    /// hear "sign in", not "Polimi isn't responding": retrying would never help.
+    @Test(.timeLimit(.minutes(1)))
+    func aStaleSessionThatNeedsTheUserAsksForSignIn() async throws {
+        let scenario = try await StaleSessionScenario(startOnArchive: true, previews: [.serverError, .player], entry: .needsCredentials)
+        defer { scenario.stop() }
+        await #expect(throws: RecmanBrowserError.needsSignIn) { try await scenario.session.playbackURL(for: scenario.recording) }
+        #expect(scenario.events == ["preview", "entry"])
+    }
+
+    /// A real server problem stays a real outage: when the renewed session also gets a 500 the
+    /// lookup ends as unavailable (the controller's retries go on), with one entry and two previews
+    /// and no loop of entries.
+    @Test(.timeLimit(.minutes(1)))
+    func aServerErrorAfterTheReentryIsUnavailableWithoutAnotherEntry() async throws {
+        let scenario = try await StaleSessionScenario(startOnArchive: true, previews: [.serverError, .serverError, .serverError], entry: .archive)
+        defer { scenario.stop() }
+        await #expect(throws: RecmanBrowserError.unavailable) { try await scenario.session.playbackURL(for: scenario.recording) }
+        #expect(scenario.events == ["preview", "entry", "preview"])
+    }
+
+    /// A session this very call just entered is fresh: a 500 on it is the server's, so no second
+    /// entry is made. Guards against re-entering on every 5xx.
+    @Test(.timeLimit(.minutes(1)))
+    func aServerErrorRightAfterThisCallEnteredTheArchiveDoesNotEnterAgain() async throws {
+        let scenario = try await StaleSessionScenario(startOnArchive: false, previews: [.serverError], entry: .archive)
+        defer { scenario.stop() }
+        await #expect(throws: RecmanBrowserError.unavailable) { try await scenario.session.playbackURL(for: scenario.recording) }
+        #expect(scenario.events == ["entry", "preview"])
+    }
+
+    /// Only an HTTP 5xx points at a dead archive session. A load that fails outright (offline,
+    /// refused connection) is the network's problem: entering again would just repeat it.
+    @Test(.timeLimit(.minutes(1)))
+    func aFailedPreviewLoadWithoutAServerErrorDoesNotEnterAgain() async throws {
+        let scenario = try await StaleSessionScenario(startOnArchive: true, previews: [.unreachable], entry: .archive)
+        defer { scenario.stop() }
+        await #expect(throws: RecmanBrowserError.unavailable) { try await scenario.session.playbackURL(for: scenario.recording) }
+        #expect(scenario.events == ["preview"])
+    }
+
+    /// Cancelling the Play while the re-entry is under way ends it with a plain cancellation, not
+    /// a wrapped or "unavailable" error, and no second preview starts.
+    @Test(.timeLimit(.minutes(1)))
+    func cancellingDuringTheReentryThrowsCancellation() async throws {
+        let scenario = try await StaleSessionScenario(startOnArchive: true, previews: [.serverError, .player], entry: .neverFinishes)
+        defer { scenario.stop() }
+        let task = Task { try await scenario.session.playbackURL(for: scenario.recording) }
+        while scenario.entries == 0 { try await Task.sleep(for: .milliseconds(10)) }
+        task.cancel()
+        await #expect(throws: CancellationError.self) { try await task.value }
+        #expect(scenario.events == ["preview", "entry"])
     }
 
     /// Opening starts from an empty browser and closing drops it: turning the feature off, or

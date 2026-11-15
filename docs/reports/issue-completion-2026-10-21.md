@@ -114,6 +114,28 @@ Enabled interactive rows are not measured. The fixture disables all of its contr
 scenario, so hover tracking and pointer-style costs are excluded and the jump numbers may
 understate the cost of enabled rows. Manual scrolling and actions remain required.
 
+### Owner decision (2026-11-15)
+
+This supersedes the sentence above that "#99 stays open".
+
+1. The realistic worst case for the Activity page is **1,000 files** in one expanded course.
+   Acceptance tests and documented benchmark commands for #99 use 1,000. The 15,000 measurements
+   above stay as history, not as a criterion; `activity-15000` remains a stress scenario.
+2. The owner **accepts the residual** on the 16 ms main-thread budget: the explicit jump to the
+   last row costs one frame of 16.80 ms median / 17.68 ms max (1,000 rows, unprofiled, five runs
+   plus one warm-up, `b612bd2`, Mac17,3 / 32 GB, AC power). Continuous scrolling peaks at 4.74
+   median / 5.52 max ms. The residual is SwiftUI construction of one viewport of rows, independent
+   of corpus size; reducing it further would need an AppKit-backed table, judged not worth it. The
+   exception covers only that frame, as measured, on that machine. The budget is otherwise unchanged.
+3. **Not measured:** the final HEAD of PR #249 (it also contains dev up to `967353d`, which did not
+   touch `ActivityPage.swift`; the owner decided against a confirmation series), the earlier
+   reference machine (Apple M2 / 8 GB) for scrolling, enabled interactive rows (hover), p95 (five
+   samples), and compositor presentation. Base-dev -> HEAD and main -> HEAD opening comparisons
+   exist only as recorded at `b612bd2` against `7ad62a2` / `07fba3b` (1,000 rows: window key main
+   248.7 ms, base dev 90.1, candidate 86.5; first expanded Activity 122.0 / 32.1 / 30.2).
+4. #99 closes with PR #249 (scroll measurement, row-layout simplification, hosted accessibility
+   regression), on top of the lazy rows delivered by PR #232.
+
 ## Tooling #222
 
 The shared gate now executes the isolated recordings fixture; repairing its extracted debug probe dependency demonstrates the previously untested dependency rot. The extraction checks its source anchor and copies only the needed bulk-scan declaration. The fixture passes 142 tests. UI benchmark and Linux-wrapper regression suites already belong to the gate and remain enabled. Mutation switches intentionally expect failing tests and are not normal green gate invocations.

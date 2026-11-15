@@ -4,17 +4,20 @@ import Testing
 import BeepbarCore
 @testable import BeepbarApp
 
-/// Exercises the real Activity hierarchy after Show more has revealed a whole large course.
-/// Replacing the inner LazyVStack with VStack must fail the construction bound (#99).
+/// Exercises the real Activity hierarchy for the owner's realistic worst case, 1,000 files in one
+/// expanded course (decision of 2026-11-15, #99). `activity-1000` stays a stress scenario, not a criterion.
 @MainActor @Suite(.serialized) struct ActivityVirtualizationTests {
+    /// Proves that after Show more has revealed all 1,000 rows only a viewport of them is built, and that
+    /// the last one is reachable by scrolling. Guards against replacing the inner LazyVStack with a VStack,
+    /// which would construct every revealed row and break the bounds below.
     @Test(.timeLimit(.minutes(2))) func revealedRowsStayLazyAndTheLastRowIsReachable() async throws {
-        let scenario = try UIFixtureScenario(arguments: ["--scenario", "activity-15000", "--report", "/tmp/activity-unused-\(UUID().uuidString).json"])
+        let scenario = try UIFixtureScenario(arguments: ["--scenario", "activity-1000", "--report", "/tmp/activity-unused-\(UUID().uuidString).json"])
         let fixture = try await UIFixture.make(scenario)
         var constructed = Set<String>()
         ActivityPageProbes.row = { constructed.insert($0) }
         let host = NSHostingView(rootView: ActivityPage(authentication: fixture.controller)
             .environment(\.uiFixtureExpandedActivity, true)
-            .environment(\.uiFixtureActivityVisibleRows, 15_000))
+            .environment(\.uiFixtureActivityVisibleRows, 1_000))
         let window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 1000, height: 700), styleMask: [.titled], backing: .buffered, defer: false)
         window.isReleasedWhenClosed = false
         window.contentView = host
@@ -42,8 +45,8 @@ import BeepbarCore
         let scroll = try #require(scrollViews(host).first)
         let document = try #require(scroll.documentView)
         document.scroll(NSPoint(x: 0, y: document.bounds.maxY))
-        try await settle { constructed.contains("1/file/fixture-14999") }
-        #expect(constructed.contains("1/file/fixture-14999"), "last revealed row was unreachable")
+        try await settle { constructed.contains("1/file/fixture-999") }
+        #expect(constructed.contains("1/file/fixture-999"), "last revealed row was unreachable")
         #expect(constructed.count < 400, "scrolling to the end constructed \(constructed.count) rows")
     }
 
@@ -67,7 +70,10 @@ import BeepbarCore
         return nil
     }
 
-    @Test(.timeLimit(.minutes(2)), arguments: [1_000, 15_000], [480, 1_000])
+    /// Proves that the first and last rows of a 1,000-file course (owner's worst case, #99), reached through
+    /// three Show more presses, stay visible with their accessible open / show-in-Finder actions at both
+    /// widths. Guards against the lazy layout dropping rows from the accessibility tree.
+    @Test(.timeLimit(.minutes(2)), arguments: [1_000], [480, 1_000])
     func firstAndLastVisibleRowsKeepTheirAccessibleActions(count: Int, width: Int) async throws {
         let root = FileManager.default.temporaryDirectory.appending(path: "ActivityViewportTests-\(UUID().uuidString)", directoryHint: .isDirectory)
         try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
@@ -151,7 +157,7 @@ import BeepbarCore
             visible = ActivityRowLayout.nextVisibleCount(after: visible, total: count)
             reveals += 1
         }
-        #expect(reveals == (count == 1_000 ? 3 : 7))
+        #expect(reveals == 3)
         try await settle {
             document.scroll(NSPoint(x: 0, y: document.bounds.maxY))
             scroll.reflectScrolledClipView(scroll.contentView)

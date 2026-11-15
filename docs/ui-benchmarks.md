@@ -139,8 +139,12 @@ as part of D07. Later work runs this command on its own revisions when it needs 
 
 ```sh
 scripts/ui-benchmark.py --ref HEAD --out PerformanceReports/activity-scroll \
-  --scenarios activity-1000 activity-15000 --scroll-all --runs 5 --warmup 1
+  --scenarios activity-1000 --scroll-all --runs 5 --warmup 1
 ```
+
+By the owner's decision of 2026-11-15, 1,000 files in one expanded course is the realistic worst
+case and therefore the acceptance case for #99. `activity-15000` remains available as a stress
+scenario (add it to `--scenarios` to run it); it is not a criterion.
 
 `--scroll-all` requires Activity scenarios and a revision containing the scrolling seam. It
 reveals the complete synthetic corpus before measurement, rather than clicking the pagination

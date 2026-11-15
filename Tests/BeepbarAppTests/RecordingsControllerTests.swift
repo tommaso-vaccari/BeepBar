@@ -883,6 +883,41 @@ struct RecordingsControllerTests {
         }
     }
 
+    /// Restoring the account's manual lessons while the session read is pending must let the
+    /// saved session open the archive without another sign-in (#263).
+    @Test func aSameAccountAppearingDuringTheFirstReadKeepsTheSessionWithManualLessons() async throws {
+        defer { cleanUp() }
+        let owner = 42
+        try saveSession(owner: owner)
+        var lessons = ManualWebexLessons()
+        let lesson = try lessons.add(link: "https://politecnicomilano.webex.com/recordingservice/sites/politecnicomilano/recording/playback/0123456789abcdef0123456789abcdef", title: "Guest", courseName: "")
+        defaults.set(try PropertyListEncoder().encode(lessons), forKey: RecordingsController.manualLessonsKey(owner: owner))
+        world.owner = nil
+        browser.listResults[course.courseCode] = .success([recording("a")])
+        let controller = makeController(useDefault: true)
+
+        world.sessionFiles.hold(access: 1)
+        defer { world.sessionFiles.release() }
+        controller.pageAppeared()
+        controller.refresh([course], selected: course)
+        await settle("the saved session read is held") { world.sessionFiles.isHolding }
+        try #require(world.sessionFiles.isHolding)
+        #expect(controller.manualLessons.lessons.isEmpty)
+
+        world.owner = owner
+        controller.webBeepAccountChanged(to: owner)
+        world.sessionFiles.release()
+        await settle("the archive is listed or sign-in is requested") {
+            controller.listing(for: course)?.recordings != nil || controller.access == .needsSignIn(nil)
+        }
+        await controller.settleSessionFile()
+        #expect(controller.manualLessons.lesson(id: lesson.id) != nil)
+        try #require(controller.access == .ready, "loading the account's manual lessons must not trigger a Polimi sign-in")
+        #expect(controller.listing(for: course)?.recordings?.map(\.id) == ["a"])
+        #expect(browser.openedWith == [["SSO_LOGIN"]])
+        #expect(!browser.calls.contains("signIn"))
+    }
+
     /// Turning the feature off while the session is being written to a slow disk ends with no
     /// session file: the delete runs after the write, never before it. Turning on again with the
     /// very same Polimi cookies writes them: the controller must not believe the deleted file still

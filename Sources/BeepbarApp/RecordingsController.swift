@@ -1030,6 +1030,12 @@ struct RecordingsListing: Equatable {
     /// cost is one more "Accedi con Polimi" in that rare case. Nothing in memory, nothing done:
     /// the account becoming known at a normal launch stays free.
     func webBeepAccountChanged(to userID: Int) {
+        // Loading study data publishes the incoming account's manual progress into the same
+        // model. Inspect the existing state first so that progress cannot invalidate the
+        // session while its saved owner is still being read (#263).
+        let foreignSession = sessionOwner.map { $0 != userID } ?? false
+        let unattributedMemory = sessionOwner == nil && (browser != nil || !playbackURLs.isEmpty
+            || !watchProgress.known.isEmpty || listings.values.contains { $0.recordings != nil })
         loadStudy()
         // Before the session check: an address learned with no Polimi session yet belongs to the
         // account that was signed in then, not to this one.
@@ -1043,9 +1049,6 @@ struct RecordingsListing: Equatable {
         // outlive the change, whether or not a session or memory is dropped (#234). The sign-in
         // delivers the new account's candidate only after this has run (`completeLogin`).
         if let owner = sessionCandidate?.owner, owner != userID { sessionCandidate = nil }
-        let foreignSession = sessionOwner.map { $0 != userID } ?? false
-        let unattributedMemory = sessionOwner == nil && (browser != nil || !playbackURLs.isEmpty
-            || !watchProgress.known.isEmpty || listings.values.contains { $0.recordings != nil })
         guard foreignSession || unattributedMemory else { return }
         log.notice("Polimi session belongs to another or an unknown WeBeep account: dropped foreign=\(foreignSession, privacy: .public)")
         supersedeInitialSessionCheck()

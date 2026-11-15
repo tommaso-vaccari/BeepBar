@@ -555,25 +555,25 @@ import BeepbarCore
         #expect(!WatchProgressReader(recordings: recordings) { _ in EmptyView() }.values.canEdit)
     }
 
-    /// The sidebar row on the real page: it shows the sidebar name (renamed folder), shows the
-    /// orange marker for a saved summary with lectures left (read from the account controller's
-    /// committed summaries, not from the Recordings controller), redraws when the commit changes
-    /// or the folder is renamed, and does NOT run its body on a playback tick.
-    /// Mutations: show `entry.name` instead of `entry.sidebarName`; never pass the marker;
+    /// The sidebar row on the real page: it shows the sidebar name (renamed folder), says the
+    /// lectures left for a saved summary (read from the account controller's committed
+    /// summaries, not from the Recordings controller), redraws when the commit changes or the
+    /// folder is renamed, and does NOT run its body on a playback tick.
+    /// Mutations: show `entry.name` instead of `entry.sidebarName`; never pass the summary;
     /// drop `folders` from the sidebar cache key (the rename never arrives); read the window's
     /// live summaries or wrap the rows in the progress reader (the tick reaches the row).
-    @Test(.timeLimit(.minutes(1))) func theSidebarRowShowsItsNameAndMarkerAndIgnoresTicks() async throws {
+    @Test(.timeLimit(.minutes(1))) func theSidebarRowShowsItsNameAndLecturesLeftAndIgnoresTicks() async throws {
         let page = try await HostedPage()
         defer { RecordingsPageProbes.sidebarRow = nil; page.close() }
         let (key, playing) = try await page.loadedCourse()
         let course = try #require(page.fixture.controller.courses.first { RecmanCourseKey(course: $0) == key })
-        var drawn: [(name: String, marker: Bool)] = []
+        var drawn: [(name: String, subtitle: String)] = []
         RecordingsPageProbes.sidebarRow = { drawn.append(($0, $1)) }
         let auth = page.fixture.controller
 
         auth.setWatchSummariesForTesting([key: CourseWatchSummary(done: 1, total: 4, remainingMinutes: 10, unknownDurationCount: 0)])
-        try await page.settle { drawn.last?.marker == true }
-        #expect(drawn.last?.marker == true, "a saved summary with lectures left shows the marker")
+        try await page.settle { drawn.last?.subtitle.hasSuffix("3 da guardare") == true }
+        #expect(drawn.last?.subtitle.hasSuffix("3 da guardare") == true, "a saved summary with lectures left says them, was \(drawn.last?.subtitle ?? "never drawn")")
 
         let cleaned = RecordingsPresentation.courseName(course)
         auth.setCourseFoldersForTesting([course.id: "GAL"])
@@ -583,8 +583,8 @@ import BeepbarCore
         #expect(drawn.last?.name == expected, "the row follows the renamed folder, was \(drawn.last?.name ?? "never drawn")")
 
         auth.setWatchSummariesForTesting([key: CourseWatchSummary(done: 4, total: 4, remainingMinutes: 0, unknownDurationCount: 0)])
-        try await page.settle { drawn.last?.marker == false }
-        #expect(drawn.last?.marker == false, "all done: the marker goes")
+        try await page.settle { drawn.last?.subtitle.contains("da guardare") == false }
+        #expect(drawn.last?.subtitle.contains("da guardare") == false, "all done: nothing left is said")
 
         drawn = []
         page.recordings.watchProgress.setLive(0.4, for: RecordingsStudyState.identity(playing))

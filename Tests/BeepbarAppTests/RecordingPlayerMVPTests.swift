@@ -3,6 +3,7 @@ import AppKit
 import Foundation
 import os
 import Testing
+import BeepbarCore
 @testable import BeepbarApp
 
 // MARK: Test doubles
@@ -240,10 +241,10 @@ struct RecordingPlayerMVPTests {
     }
 
     /// Plays the fixture and waits until it is ready and started.
-    private func playReady(_ controller: RecordingPlayerController, startAt: TimeInterval? = nil) async throws {
+    private func playReady(_ controller: RecordingPlayerController, startAt: TimeInterval? = nil, watchdogSeconds: Double = 20) async throws {
         let media = try await TestMedia.shared.url()
         controller.play(media, title: "Lezione", cookies: [], startAt: startAt)
-        try await Self.waitUntil { controller.isStartSettled }
+        try await Self.waitUntil(seconds: watchdogSeconds) { controller.isStartSettled }
     }
 
     /// Pauses at a known position and lets the pause report settle, so a test starts clean.
@@ -285,14 +286,18 @@ struct RecordingPlayerMVPTests {
 
     /// The remembered speed is applied to `defaultRate` (what play/resume uses), and playing
     /// never writes the preference. Guards against a speed that resets on resume, and against
-    /// writes at every play.
+    /// writes at every play. The wait for the player to be ready is 60 s here while the other tests
+    /// keep 20 s: under load in the full suite AVPlayer stayed `.unknown` past 20 s. It is a guard
+    /// against a hang, not a time the test asserts.
     @Test func theRememberedSpeedIsAppliedWithoutWriting() async throws {
         let defaults = PlayerTestDefaults.throwaway()
         defer { defaults.discard() }
         defaults.set(1.5, forKey: RecordingPlayerPolicy.speedDefaultsKey)
         let written = defaults.writes.count
         let controller = makeController(defaults: defaults)
-        try await playReady(controller)
+        defer { controller.close() }
+        try await playReady(controller, watchdogSeconds: 60)
+        try #require(controller.isStartSettled)
         let player = try #require(controller.player)
         #expect(player.defaultRate == 1.5)
         #expect(player.rate == 1.5)
@@ -300,7 +305,6 @@ struct RecordingPlayerMVPTests {
         player.play()
         #expect(player.rate == 1.5)
         #expect(defaults.writes.count == written)
-        controller.close()
     }
 
     /// Choosing a speed applies it at once while playing, keeps it across pause/resume and the
@@ -402,6 +406,113 @@ struct RecordingPlayerMVPTests {
         #expect(item.state == .on)
         #expect(menu.item(at: 0)?.title == "1,25×")
         #expect(defaults.double(forKey: RecordingPlayerPolicy.speedDefaultsKey) == 1.25)
+        controller.close()
+    }
+
+    /// The speed menu no longer has an Audio section: the three modes live in the title-bar
+    /// selector. Guards against the choices appearing twice, or the old section coming back.
+    @Test func theSpeedMenuHasNoAudioSection() async throws {
+        let defaults = PlayerTestDefaults.throwaway()
+        defer { defaults.discard() }
+        let controller = makeController(defaults: defaults)
+        try await playReady(controller)
+        controller.showAudioEnhancement(.on(.levelled), recordingID: controller.recordingID)
+        let menu = try #require(controller.speedPopUp?.menu)
+        let titles = menu.items.map(\.title)
+        #expect(!titles.contains(tr("Audio migliorato", "Enhanced audio")))
+        #expect(!titles.contains(tr("Voce livellata", "Levelled voice")))
+        #expect(!titles.contains(tr("Voce isolata", "Isolated voice")))
+        #expect(titles.contains(tr("Velocità", "Speed")) && titles.contains(tr("Scorciatoie da tastiera", "Keyboard shortcuts")))
+        controller.close()
+    }
+
+    /// The title-bar selector: hidden until the lecture has an Audio state (leaving no gap before
+    /// the speed menu), three icon segments with the selection following the state, a click on
+    /// another segment sends that segment's action, a click on the selected one sends nothing,
+    /// and until the controller answers the control shows the state it had rather than AppKit's
+    /// move. Guards against a selector that shows a choice that wasn't applied, sends the same
+    /// choice twice, or overlaps the speed menu.
+    @Test func theTitleBarSelectorFollowsTheStateAndSendsTheClickedMode() async throws {
+        let defaults = PlayerTestDefaults.throwaway()
+        defer { defaults.discard() }
+        let controller = makeController(defaults: defaults)
+        try await playReady(controller)
+        var asked: [PlayerAudioAction] = []
+        controller.onAudioAction = { _, action in asked.append(action) }
+        let control = try #require(controller.audioSelector)
+        let popUp = try #require(controller.speedPopUp)
+        #expect(control.isHidden)
+        #expect(popUp.frame.minX == 0, "a hidden selector left a gap")
+        #expect(control.superview === popUp.superview)
+        #expect(control.segmentCount == 3 && control.trackingMode == .selectOne && control.refusesFirstResponder)
+
+        controller.showAudioEnhancement(.off(preferred: .isolated), recordingID: controller.recordingID)
+        #expect(!control.isHidden)
+        #expect(control.selectedSegment == 0)
+        #expect((0..<3).allSatisfy { control.isEnabled(forSegment: $0) })
+        #expect(popUp.frame.minX > control.frame.maxX, "the selector overlaps the speed menu")
+        #expect((0..<3).allSatisfy { control.image(forSegment: $0) != nil }, "a segment has no icon")
+
+        // The control's own target-action (a hop to the main actor), sent directly. Not
+        // `performClick`: it tracks the click in a nested event loop, and the stop it posts to end
+        // that loop can land on the outer main run loop instead. In the test process that loop
+        // ending is the end of the program: the run exited with status 0 after 853 of 971 tests,
+        // with no summary and no failure (#243).
+        control.selectedSegment = 2
+        #expect(control.sendAction(control.action, to: control.target))
+        try await Self.waitUntil { asked.count == 1 }
+        #expect(asked == [.use(.isolated)])
+        #expect(control.selectedSegment == 0, "the selector showed a choice the controller hadn't applied")
+        control.selectedSegment = 1
+        #expect(control.sendAction(control.action, to: control.target))
+        try await Self.waitUntil { asked.count == 2 }
+        #expect(asked.last == .use(.levelled), "a segment asked for another mode")
+
+        controller.showAudioEnhancement(.on(.isolated), recordingID: controller.recordingID)
+        #expect(control.selectedSegment == 2)
+        controller.audioSegmentClicked(2)
+        #expect(asked.count == 2, "the selected segment sent an action")
+        controller.audioSegmentClicked(0)
+        #expect(asked.last == .use(nil))
+        #expect(control.selectedSegment == 2, "the selector didn't go back to the state")
+        controller.showAudioEnhancement(.on(.levelled), recordingID: controller.recordingID)
+        #expect(control.selectedSegment == 1)
+
+        controller.showAudioEnhancement(.failed(BilingualText("motivo", "reason"), preferred: .isolated), recordingID: controller.recordingID)
+        #expect(control.selectedSegment == 0)
+        let before = asked.count
+        controller.audioSegmentClicked(1)
+        #expect(asked.count == before + 1 && asked.last == .use(.levelled), "a failed state didn't retry the clicked kind")
+
+        // A new lecture rebuilds the menu: the selector still works, and goes hidden again.
+        try await playReady(controller)
+        controller.showAudioEnhancement(.off(preferred: .isolated), recordingID: controller.recordingID)
+        control.selectedSegment = 2
+        #expect(control.sendAction(control.action, to: control.target))
+        try await Self.waitUntil { asked.count == before + 2 }
+        controller.showAudioEnhancement(nil, recordingID: controller.recordingID)
+        #expect(control.isHidden)
+        #expect(popUp.frame.minX == 0)
+        controller.close()
+    }
+
+    /// Without ffmpeg every segment is disabled and sends nothing, Off stays selected, and the
+    /// tooltips say how to get it. Guards against a disabled selector that still asks for a mode.
+    @Test func theSelectorSendsNothingWithoutFFmpeg() async throws {
+        let defaults = PlayerTestDefaults.throwaway()
+        defer { defaults.discard() }
+        let controller = makeController(defaults: defaults)
+        try await playReady(controller)
+        var asked: [PlayerAudioAction] = []
+        controller.onAudioAction = { _, action in asked.append(action) }
+        let control = try #require(controller.audioSelector)
+        controller.showAudioEnhancement(.needsFFmpeg, recordingID: controller.recordingID)
+        #expect(!control.isHidden && control.selectedSegment == 0)
+        #expect((0..<3).allSatisfy { !control.isEnabled(forSegment: $0) })
+        #expect((0..<3).allSatisfy { control.toolTip(forSegment: $0)?.contains("brew install ffmpeg") == true })
+        for index in 0..<3 { controller.audioSegmentClicked(index) }
+        await Self.settle()
+        #expect(asked.isEmpty, "a disabled selector asked for something")
         controller.close()
     }
 
@@ -911,6 +1022,8 @@ struct RecordingPlayerMVPTests {
             recorder.checkpoints.append(checkpoint)
         }
         if byUser { controller.window?.close() } else { controller.close() }
+        // A user close reports on the hop that follows `windowWillClose` (#241), still before teardown.
+        if byUser { try await Self.waitUntil { recorder.checkpoints.count == before + 1 } }
         #expect(recorder.checkpoints.count == before + 1)
         #expect(openWhenReported == true)
         #expect(abs((recorder.checkpoints.last?.position ?? 0) - 25) < 0.5)
@@ -918,6 +1031,99 @@ struct RecordingPlayerMVPTests {
         controller.close()
         await Self.settle()
         #expect(recorder.checkpoints.count == before + 1)
+    }
+
+    // MARK: The window's close button hops to the main actor (#241)
+
+    /// What `windowWillClose` does is only to hop: the checkpoint, the stop and `onClose` happen
+    /// on the main actor after it, once each, with the closed lecture's id. Guards against a
+    /// callback that does the work inline again (the isolated delegate method whose thunk crashed
+    /// on the first AppKit callback after a wake), and against the hop reporting twice.
+    @Test func theStudentClosingTheWindowReportsOnceAfterTheHop() async throws {
+        let recorder = Recorder()
+        let controller = makeController(recorder: recorder)
+        var closed: [String] = []
+        controller.onClose = { closed.append($0) }
+        try await playReady(controller)
+        try await park(controller, at: 25)
+        let before = recorder.checkpoints.count
+        let player = try #require(controller.player)
+        let window = try #require(controller.window)
+        window.close()
+        // Nothing ran inside the callback itself.
+        #expect(recorder.checkpoints.count == before && closed.isEmpty)
+        try await Self.waitUntil { closed.count == 1 }
+        await Self.settle()
+        #expect(recorder.checkpoints.count == before + 1)
+        #expect(recorder.checkpoints.last?.id == "Lezione" && recorder.checkpoints.last?.reason == .closed)
+        #expect(abs((recorder.checkpoints.last?.position ?? 0) - 25) < 0.5)
+        #expect(closed == ["Lezione"])
+        #expect(player.rate == 0 && player.currentItem == nil)
+        #expect(!controller.isOpen)
+    }
+
+    /// A Play of another lecture queued right after the window closed, before the hop landed:
+    /// the closed lecture is still reported once, with its own id, and the new lecture gets a
+    /// new window, not the closing one. Guards against the new lecture playing into a window
+    /// that is closing, or the old position being lost or filed under the new id.
+    @Test func aPlayRightAfterTheCloseReportsTheOldLectureAndOpensANewWindow() async throws {
+        let recorder = Recorder()
+        let controller = makeController(recorder: recorder)
+        var closed: [String] = []
+        controller.onClose = { closed.append($0) }
+        try await playReady(controller)
+        try await park(controller, at: 25)
+        let before = recorder.checkpoints.count
+        let closing = try #require(controller.window)
+        closing.close()
+        let media = try await TestMedia.shared.url()
+        controller.play(media, title: "Altra", cookies: [], startAt: nil, recordingID: "Altra", metadata: nil)
+        #expect(controller.window != nil && controller.window !== closing)
+        await Self.settle()
+        let reports = recorder.checkpoints.dropFirst(before)
+        #expect(reports.map(\.id) == ["Lezione"])
+        #expect(reports.map(\.reason) == [.closed])
+        #expect(closed == ["Lezione"])
+        // The hop that lands afterwards must not take the new window with it.
+        #expect(controller.isOpen && controller.recordingID == "Altra")
+        controller.close()
+    }
+
+    /// `close()` right after the window closed, before the hop: one checkpoint and one `onClose`
+    /// in all, not one from `close()` and one from the hop.
+    @Test func closeRightAfterTheWindowClosedReportsOnce() async throws {
+        let recorder = Recorder()
+        let controller = makeController(recorder: recorder)
+        var closed: [String] = []
+        controller.onClose = { closed.append($0) }
+        try await playReady(controller)
+        try await park(controller, at: 25)
+        let before = recorder.checkpoints.count
+        controller.window?.close()
+        controller.close()
+        await Self.settle()
+        #expect(recorder.checkpoints.count == before + 1)
+        #expect(recorder.checkpoints.last?.reason == .closed)
+        #expect(closed == ["Lezione"])
+    }
+
+    /// The controller released before the hop lands: nothing crashes and the window is let go
+    /// (the hop still releases it, as it holds the window itself). Guards against a hop that
+    /// assumes the controller outlives it, or leaves the closed window's view alive.
+    @Test func aControllerReleasedBeforeTheHopLeavesNothingBehind() async throws {
+        weak var weakWindow: NSWindow?
+        weak var weakView: NSView?
+        try await {
+            var controller: RecordingPlayerController? = makeController()
+            let media = try await TestMedia.shared.url()
+            controller?.play(media, title: "Lezione", cookies: [])
+            weakWindow = controller?.window
+            weakView = controller?.playerView
+            controller?.window?.close()
+            controller = nil
+        }()
+        try await Self.waitUntil { weakWindow == nil && weakView == nil }
+        #expect(weakWindow == nil && weakView == nil)
     }
 
     /// Closing before the stream is ready reports nothing: a saved position must never be

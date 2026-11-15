@@ -35,6 +35,8 @@ with tempfile.TemporaryDirectory(prefix="beepbar-seen-fixture-") as scratch:
         "RecmanWebSession.swift", "RecmanScripts.swift", "WebexStreamResolver.swift",
         "RecordingPlayerController.swift", "RecordingPlayerControls.swift", "RecordingNowPlaying.swift",
         "PlayerZoom.swift", "RecordingsWatchProgressModel.swift",
+        # The player and the controller drive enhanced audio.
+        "AudioEnhancer.swift", "LiveAudioSession.swift", "VoiceIsolator.swift",
     ):
         shutil.copy(root / "Sources/BeepbarApp" / name, app / name)
     # Watchlist reconciliation now depends on the unchanged pure presentation rules.

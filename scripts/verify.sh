@@ -4,11 +4,23 @@ cd "$(dirname "$0")/.."
 
 xcodebuild -version
 swift --version
-test "$(xcrun --sdk macosx --show-sdk-version)" = "27.0"
+# The GitHub runner (`xcode-27`) has the 27.0 SDK; local machines updated to Xcode 27.2 must still
+# pass the same gate. Any other SDK fails, so a toolchain change is a deliberate edit here.
+case "$(xcrun --sdk macosx --show-sdk-version)" in
+    27.0|27.2) ;;
+    *) echo "Unsupported macOS SDK $(xcrun --sdk macosx --show-sdk-version)" >&2; exit 1 ;;
+esac
 python3 scripts/test_benchmark_compare.py
 python3 scripts/test_ui_benchmark.py
 bash scripts/test-linux-core-tests.sh
-swift test
+bash scripts/test-check-test-run-complete.sh
+# The exit status of `swift test` does not show a test process that ended early (it exits 0), so
+# the log is checked too: every run that started must have printed its passing summary (#243).
+# One run per test target: the folders under Tests/.
+test_log=$(mktemp)
+trap 'rm -f "$test_log"' EXIT
+swift test 2>&1 | tee "$test_log"
+bash scripts/check-test-run-complete.sh "$test_log" "$(find Tests -mindepth 1 -maxdepth 1 -type d | wc -l | tr -d ' ')"
 python3 scripts/recordings-seen-isolated-tests.py
 bash scripts/test-release-notes.sh
 bash scripts/test-build-version.sh

@@ -21,7 +21,6 @@ struct SettingsPage: View {
             automaticSection
             notificationsSection
             updatesSection
-            TelemetrySettingsSection(telemetry: .shared)
             privacySection
         }
         .formStyle(.grouped)
@@ -524,24 +523,5 @@ struct PrivacyNoticeView: View {
         }
         .padding(24)
         .frame(width: 560, height: 460)
-    }
-}
-
-/// The Settings opt-out control; injected controllers keep UI verification off real preferences.
-struct TelemetrySettingsSection: View {
-    @ObservedObject var telemetry: DailyTelemetryController
-
-    var body: some View {
-        Section(tr("Telemetria", "Telemetry")) {
-            Toggle(isOn: Binding(
-                get: { telemetry.isEnabled },
-                set: { telemetry.setEnabled($0) }
-            )) {
-                SettingLabel(tr("Telemetria", "Telemetry"), explanation: tr("Attiva di default. Invia a TelemetryDeck al massimo un segnale al giorno: versione dell’app e versione principale di macOS, con un identificativo condiviso da tutte le installazioni e il primo invio mensile contato separatamente. Non invia lingua, impostazioni, account, corsi o file. Il server riceve anche l’indirizzo IP della connessione. Spegnendola si interrompono gli invii futuri e si eliminano gli identificativi delle vecchie versioni; i segnali già inviati non vengono cancellati.", "Enabled by default. Sends TelemetryDeck at most one signal a day: app version and major macOS version, with one identifier shared by every installation and the first monthly report counted separately. Language, settings, accounts, courses and files are not sent. The server also receives the connection IP address. Turning it off stops future sends and removes identifiers from older versions; previously sent signals are not deleted."))
-            }
-            .accessibilityIdentifier("telemetry-toggle")
-            .accessibilityLabel(tr("Telemetria", "Telemetry"))
-            .disabled(!telemetry.isConfigured)
-        }
     }
 }

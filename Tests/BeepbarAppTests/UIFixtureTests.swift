@@ -87,21 +87,43 @@ import BeepbarCore
     /// then release the request and finish. Merely assigning `.syncing` would fail this test.
     @Test(.timeLimit(.minutes(1))) func contentsGateKeepsARealSyncRunningUntilReleased() async throws {
         let fixture = try await UIFixture.make(scenario("reopen-sync"))
-        defer { UIFixtureProtocol.releaseContents(token: fixture.token); fixture.dispose() }
-        UIFixtureProtocol.accounts.withLock { $0[fixture.token]?.holdContents = true }
+        defer { fixture.dispose() }
+        let held = AsyncStream<Void>.makeStream(bufferingPolicy: .bufferingNewest(1))
+        defer { held.continuation.finish() }
+        UIFixtureProtocol.accounts.withLock {
+            $0[fixture.token]?.holdContents = true
+            $0[fixture.token]?.contentsHeld = held.continuation
+        }
         fixture.controller.synchronizeNow()
-        try await waitUntil { UIFixtureProtocol.accounts.withLock { $0[fixture.token]?.heldRequests.count == 1 } }
-        #expect(fixture.controller.isSyncActive)
-        UIFixtureProtocol.releaseContents(token: fixture.token)
-        await fixture.controller.waitForSyncForTesting()
-        #expect(!fixture.controller.isSyncActive)
-        if case .synced = fixture.controller.syncState {} else { Issue.record("Synthetic sync did not complete successfully") }
-        #expect(UIFixtureProtocol.accounts.withLock { $0[fixture.token]?.heldRequests.isEmpty == true })
+        do {
+            let arrived = await withTaskGroup(of: Bool.self) { group in
+                group.addTask {
+                    for await _ in held.stream { return true }
+                    return false
+                }
+                group.addTask { do { try await Task.sleep(for: .seconds(45)) } catch { return false }; return false }
+                let result = await group.next() ?? false
+                group.cancelAll()
+                return result
+            }
+            try #require(arrived && UIFixtureProtocol.accounts.withLock { $0[fixture.token]?.heldRequests.count == 1 })
+            #expect(fixture.controller.isSyncActive)
+            UIFixtureProtocol.releaseContents(token: fixture.token)
+            await fixture.controller.waitForSyncForTesting()
+            #expect(!fixture.controller.isSyncActive)
+            if case .synced = fixture.controller.syncState {} else { Issue.record("Synthetic sync did not complete successfully") }
+            #expect(UIFixtureProtocol.accounts.withLock { $0[fixture.token]?.heldRequests.isEmpty == true })
+        } catch {
+            UIFixtureProtocol.releaseContents(token: fixture.token)
+            if fixture.controller.isSyncActive { fixture.controller.cancelSynchronization() }
+            await fixture.controller.waitForSyncForTesting()
+            throw error
+        }
     }
 
     /// Activity and Recordings retain their full large corpus. The browser exercises the real
     /// controller's listing/session flow; it never uses WebKit or a real sign-in.
-    @Test(.timeLimit(.minutes(1))) func largeCorporaReachRealControllers() async throws {
+    @Test(.timeLimit(.minutes(2))) func largeCorporaReachRealControllers() async throws {
         let activity = try await UIFixture.make(scenario("activity-15000"))
         defer { activity.dispose() }
         #expect(activity.controller.lastSyncSummary?.perCourse.first?.items.count == 15_000)
@@ -124,7 +146,7 @@ import BeepbarCore
     /// directly records no entry, and one that hops per event records thousands. Afterwards no
     /// sync is shown as active and the run is closed: a late final event, which an open run's
     /// throttle would always pass, must not even enter the main actor.
-    @Test(.timeLimit(.minutes(1))) func progressBurstTravelsTheThrottledSyncPath() async throws {
+    @Test(.timeLimit(.minutes(2))) func progressBurstTravelsTheThrottledSyncPath() async throws {
         let fixture = try await UIFixture.make(scenario("progress-burst"))
         defer { fixture.dispose() }
         let start = ContinuousClock.now

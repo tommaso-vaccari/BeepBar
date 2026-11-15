@@ -55,22 +55,19 @@ enum RecordingsPresentation {
         RecmanCourseSidebar.sidebarName(courseName: courseName, courseDisplayName: courseDisplayName, courseID: courseID, localFolderName: localFolderName)
     }
 
-    /// Whether the sidebar row shows the orange "lectures to watch" marker: only for a known
-    /// summary of a course with recordings that are not all done. An unknown summary (nil: the
-    /// listing was never loaded, another account) claims nothing; a course with none (0/0) or all
-    /// done shows nothing (`done < total` is false for both). `next` is not used: it is nil for old saved data that still has counts.
-    static func hasLecturesToWatch(summary: CourseWatchSummary?) -> Bool {
-        guard let summary else { return false }
-        return summary.done < summary.total
-    }
-
-    /// VoiceOver's label of that marker.
-    static let lecturesToWatchLabel = BilingualText("Lezioni da guardare", "Lectures to watch")
-
-    /// VoiceOver's value of that marker: how many lectures are left.
-    static func lecturesToWatchValue(_ summary: CourseWatchSummary) -> BilingualText {
-        let left = max(0, summary.total - summary.done)
-        return BilingualText("\(left) da guardare", "\(left) left")
+    /// "3 da guardare" / "3 to watch": the lectures of a course not done yet, said in words at
+    /// the end of the sidebar row's subtitle. Nil when there is nothing to say: an unknown
+    /// summary (the listing was never loaded, another account) claims nothing; a course with
+    /// none (0/0) or all done says nothing. `next` is not used: it is nil for old saved data that
+    /// still has counts.
+    ///
+    /// Words, not a marker: the row had an orange dot for this beside the blue count of new
+    /// lectures, and two dots of two colours read as clutter whose meaning had to be guessed
+    /// (2026-11-09). The only badge left on a row is the count of new lectures.
+    static func lecturesToWatchText(summary: CourseWatchSummary?) -> BilingualText? {
+        guard let summary, summary.done < summary.total else { return nil }
+        let left = summary.total - summary.done
+        return BilingualText("\(left) da guardare", "\(left) to watch")
     }
 
     /// "1 registrazione" / "3 registrazioni": the course's recording count, in the sidebar
@@ -79,19 +76,84 @@ enum RecordingsPresentation {
         BilingualText(italianCount(count, "registrazione", "registrazioni"), englishCount(count, "recording", "recordings"))
     }
 
+    /// The new-lectures badge's colours: white on the accent colour, inverted on the selected
+    /// row, whose background is the accent colour (`NewCountBadge`).
+    static func newCountColors(onSelectedRow: Bool) -> (text: Color, fill: Color) {
+        onSelectedRow ? (.accentColor, .white) : (.white, .accentColor)
+    }
+
+    /// The new-lectures badge a sidebar row shows (#238): none on the course whose list is open,
+    /// whose new lectures keep their dots in the list and become read when the student leaves it
+    /// (`RecordingsController.leaveOpenCourse`). The Watchlist being open counts as no course.
+    /// Compared by archive key, not WeBeep course id: two synced courses with the same code and
+    /// year share one listing, so they are open (and left) together.
+    nonisolated static func sidebarNewCount(_ count: Int, rowKey: RecmanCourseKey, openKey: RecmanCourseKey?) -> Int {
+        rowKey == openKey ? 0 : count
+    }
+
+    /// Whether the page shows its two panes (sidebar and course or Watchlist) rather than the
+    /// full-page sign-in. Without a session the saved Watchlist is still worth showing; with
+    /// none, there is nothing to show but the invitation to sign in. The course pane is on screen
+    /// only in the two panes, which is what makes a course "open" for #238.
+    nonisolated static func showsBrowser(access: RecordingsAccess, hasBookmarks: Bool) -> Bool {
+        switch access {
+        case .ready: true
+        case .signingIn, .needsSignIn: hasBookmarks
+        case .off: false
+        }
+    }
+
+    /// What the course pane shows below its header and toolbar (#237). Every case draws
+    /// something that fills the pane: an empty pane let the header float to mid-height.
+    enum CourseContent: Equatable {
+        /// The listing: its rows, "no recordings yet" or no search match.
+        case list
+        /// Asked, or about to be asked (the page enqueues on its next turn, or the saved
+        /// session is still being read).
+        case loading
+        /// No Polimi session and no list kept in memory: nothing can be loaded until sign-in.
+        case signIn
+        /// The sign-in is running.
+        case signingIn
+        /// Signed in, but the last request failed with nothing to show; its banner says why.
+        case unavailable
+    }
+
+    /// Chooses `CourseContent`. A list in memory always wins, signed in or not: its saved rows
+    /// are useful content even when they can't be refreshed.
+    nonisolated static func courseContent(hasList: Bool, isLoading: Bool, hasProblem: Bool, access: RecordingsAccess) -> CourseContent {
+        if hasList { return .list }
+        if isLoading { return .loading }
+        switch access {
+        case .off, .needsSignIn: return .signIn
+        case .signingIn: return .signingIn
+        case .ready: return hasProblem ? .unavailable : .loading
+        }
+    }
+
     /// VoiceOver's label of the sidebar badge counting new lectures: "1 nuova" / "3 nuove" (#195).
     static func newCountLabel(_ count: Int) -> BilingualText {
         BilingualText(italianCount(count, "nuova", "nuove"), "\(count) new")
     }
 
-    /// The sidebar course row's third line: the recording count, or what the listing is doing.
-    static func courseSubtitle(for listing: RecordingsListing?) -> String {
+    /// The sidebar course row's third line: the recording count, or what the listing is doing,
+    /// then the lectures left to watch when there are any (`lecturesToWatchText`), e.g.
+    /// "30 registrazioni · 3 da guardare". The lectures left come from the saved summary, so
+    /// they show before the listing loads (then alone).
+    static func courseSubtitle(for listing: RecordingsListing?, summary: CourseWatchSummary? = nil) -> String {
+        let state: String?
         if let count = listing?.recordings?.count {
-            return count == 0 ? tr("Nessuna registrazione", "No recordings") : recordingCount(count).text
+            state = count == 0 ? tr("Nessuna registrazione", "No recordings") : recordingCount(count).text
+        } else if listing?.isLoading == true {
+            state = tr("Caricamento…", "Loading…")
+        } else if listing?.problem != nil {
+            state = tr("Non disponibile", "Unavailable")
+        } else {
+            state = nil
         }
-        if listing?.isLoading == true { return tr("Caricamento…", "Loading…") }
-        if listing?.problem != nil { return tr("Non disponibile", "Unavailable") }
-        return " "
+        let parts = [state, lecturesToWatchText(summary: summary)?.text].compactMap { $0 }
+        // A blank line rather than none, so rows keep one height while listings load.
+        return parts.isEmpty ? " " : parts.joined(separator: " · ")
     }
 
     // MARK: Watch progress
@@ -348,12 +410,7 @@ struct RecordingsPage: View {
 
     var body: some View {
         Group {
-            switch recordings.access {
-            case .ready: browser
-            case .signingIn, .needsSignIn:
-                if !recordings.study.bookmarks.isEmpty { browser } else { signIn }
-            case .off: signIn
-            }
+            if showsBrowser { browser } else { signIn }
         }
         .onAppear {
             authentication.seedWatchSummariesIfNeeded()
@@ -363,13 +420,20 @@ struct RecordingsPage: View {
         .onDisappear { recordings.pageDisappeared() }
         .onChange(of: keys) { refresh() }
         .onChange(of: destination) { refresh() }
+        // The course becomes open (#238) when the panes replace the sign-in screen, and stops
+        // being open when the sign-in screen replaces them.
+        .onChange(of: showsBrowser) { refresh() }
         .onChange(of: recordings.study.bookmarks.map(\.id)) { refresh() }
     }
 
     private func refresh(force: Bool = false) {
         let savedKeys = recordings.study.bookmarks.compactMap { RecmanCourseKey(courseCode: $0.recording.courseCode, academicYear: $0.recording.academicYear) }
         let requested = destination == .watchlist ? Array(Set(keys + savedKeys)).sorted { ($0.academicYear, $0.courseCode) < ($1.academicYear, $1.courseCode) } : keys
-        recordings.refresh(requested, selected: destination == .watchlist ? nil : selectedEntry?.key, force: force)
+        recordings.refresh(requested, selected: destination == .watchlist ? nil : selectedEntry?.key, force: force, showing: showsBrowser)
+    }
+
+    private var showsBrowser: Bool {
+        RecordingsPresentation.showsBrowser(access: recordings.access, hasBookmarks: !recordings.study.bookmarks.isEmpty)
     }
 
     // MARK: Sign-in
@@ -448,14 +512,14 @@ struct RecordingsPage: View {
                 HStack {
                     Label(tr("Watchlist", "Watchlist"), systemImage: "bookmark")
                     Spacer()
-                    Text(recordings.study.bookmarks.count, format: .number)
+                    Text(recordings.watchlistCount, format: .number)
                         .foregroundStyle(.secondary)
                         .monospacedDigit()
                 }
                 .tag(RecordingsDestination.watchlist)
             }
             Section(tr("I tuoi corsi", "Your courses")) {
-                // The marker reads the committed summaries the menu bar uses
+                // The lectures left in the subtitle read the committed summaries the menu bar uses
                 // (`authentication.watchSummaries`: seeded from storage when the account is
                 // known, so it shows before any listing loads or without a Polimi session, and
                 // `@Published`, so the page redraws on a commit). Not the window's live
@@ -465,8 +529,9 @@ struct RecordingsPage: View {
                 // header keeps the WeBeep name on purpose: owner decision, sidebar and menu only.
                 ForEach(model.searchable) { entry in
                     let summary = authentication.watchSummaries[entry.key]
-                    CourseRow(name: entry.sidebarName, key: entry.key, subtitle: RecordingsPresentation.courseSubtitle(for: recordings.listing(for: entry.key)), newCount: recordings.newCount(for: entry.key),
-                              toWatch: RecordingsPresentation.hasLecturesToWatch(summary: summary) ? summary.map(RecordingsPresentation.lecturesToWatchValue) : nil)
+                    CourseRow(name: entry.sidebarName, key: entry.key, subtitle: RecordingsPresentation.courseSubtitle(for: recordings.listing(for: entry.key), summary: summary),
+                              newCount: RecordingsPresentation.sidebarNewCount(recordings.newCount(for: entry.key), rowKey: entry.key,
+                                                                               openKey: destination == .watchlist ? nil : selectedEntry?.key))
                         .equatable()
                         .tag(RecordingsDestination.course(entry.course.id))
                 }
@@ -516,14 +581,13 @@ struct RecordingsPage: View {
 private struct CourseRow: View, Equatable {
     let name: String
     let key: RecmanCourseKey
+    /// The recordings and the lectures left to watch (`RecordingsPresentation.courseSubtitle`).
     let subtitle: String
     let newCount: Int
-    /// Non-nil (the lectures left, as VoiceOver's value) when the orange marker shows.
-    let toWatch: BilingualText?
 
     var body: some View {
 #if DEBUG
-        let _ = RecordingsPageProbes.sidebarRow?(name, toWatch != nil)
+        let _ = RecordingsPageProbes.sidebarRow?(name, subtitle)
 #endif
         HStack(spacing: 8) {
             VStack(alignment: .leading, spacing: 2) {
@@ -540,29 +604,33 @@ private struct CourseRow: View, Equatable {
                     .lineLimit(1)
             }
             Spacer(minLength: 0)
-            // The marker sits before the "new" badge in the same trailing stack: both can show,
-            // side by side, without overlapping. Orange is not the accent colour of the badge.
-            if let toWatch {
-                Circle()
-                    .fill(Color.orange)
-                    .frame(width: 8, height: 8)
-                    .help(RecordingsPresentation.lecturesToWatchLabel.text)
-                    .accessibilityElement()
-                    .accessibilityLabel(RecordingsPresentation.lecturesToWatchLabel.text)
-                    .accessibilityValue(toWatch.text)
-            }
             if newCount > 0 {
-                Text(newCount, format: .number)
-                    .font(.caption2.weight(.bold))
-                    .monospacedDigit()
-                    .foregroundStyle(.white)
-                    .padding(.horizontal, 6)
-                    .frame(minHeight: 17)
-                    .background(Color.accentColor, in: Capsule())
-                    .accessibilityLabel(RecordingsPresentation.newCountLabel(newCount).text)
+                NewCountBadge(count: newCount)
             }
         }
         .padding(.vertical, 2)
+    }
+}
+
+/// The count of new lectures on a sidebar row: white on the accent colour, and the other way
+/// round on the selected row, whose background is the accent colour itself. Before, the badge
+/// vanished into a selected row's blue and only its number showed, as a bare "1" (2026-11-09).
+/// The sidebar raises `backgroundProminence` on the selected row; the colours follow it.
+private struct NewCountBadge: View {
+    let count: Int
+    @Environment(\.backgroundProminence) private var prominence
+
+    var body: some View {
+        let colors = RecordingsPresentation.newCountColors(onSelectedRow: prominence == .increased)
+        Text(count, format: .number)
+            .font(.caption2.weight(.bold))
+            .monospacedDigit()
+            .foregroundStyle(colors.text)
+            .padding(.horizontal, 6)
+            .frame(minHeight: 17)
+            .background(colors.fill, in: Capsule())
+            .help(RecordingsPresentation.newCountLabel(count).text)
+            .accessibilityLabel(RecordingsPresentation.newCountLabel(count).text)
     }
 }
 
@@ -658,12 +726,6 @@ private struct CourseRecordings: View {
                     .fixedSize()
                     .disabled(!action.enabled)
             }
-            if recordings.newCount(for: key) > 0 {
-                Button(tr("Segna novità come lette", "Mark new recordings as read")) { recordings.markSeen(key) }
-                    .buttonStyle(.borderless)
-                    .font(.callout)
-                    .fixedSize()
-            }
             Button(action: refresh) {
                 ZStack {
                     ProgressView().controlSize(.small).opacity(listing?.isLoading == true ? 1 : 0)
@@ -672,7 +734,9 @@ private struct CourseRecordings: View {
                 .frame(width: 24, height: 24)
             }
             .buttonStyle(.borderless)
-            .disabled(listing?.isLoading == true)
+            // Without a Polimi session a refresh can't load anything (#237); the sign-in is offered
+            // in the pane and in the banner above, as on the Watchlist.
+            .disabled(listing?.isLoading == true || recordings.access != .ready)
             .help(tr("Aggiorna le registrazioni", "Refresh the recordings"))
             .accessibilityLabel(tr("Aggiorna registrazioni", "Refresh recordings"))
         }
@@ -716,7 +780,10 @@ private struct CourseRecordings: View {
     }
 
     @ViewBuilder private var content: some View {
-        if let list = listing?.recordings {
+        switch RecordingsPresentation.courseContent(hasList: listing?.recordings != nil, isLoading: listing?.isLoading == true,
+                                                    hasProblem: listing?.problem != nil, access: recordings.access) {
+        case .list:
+            let list = listing?.recordings ?? []
             let model = derivedList(list)
             if list.isEmpty {
                 ContentUnavailableView {
@@ -729,12 +796,31 @@ private struct CourseRecordings: View {
             } else {
                 recordingList(model, numbers: summary(list).numbers)
             }
-        } else if listing?.isLoading == true {
+        case .loading:
             VStack(spacing: 10) {
                 ProgressView()
                 Text(tr("Cerco le registrazioni nell'archivio del Politecnico…", "Looking for recordings in Polimi's archive…"))
                     .font(.callout)
                     .foregroundStyle(.secondary)
+            }
+        case .signIn, .signingIn:
+            ContentUnavailableView {
+                Label(tr("Accedi con Polimi per vedere le lezioni", "Sign in with Polimi to see the lessons"), systemImage: "person.badge.key")
+            } description: {
+                Text(tr("BeepBar non ha ancora un elenco di questo corso.", "BeepBar doesn't have this course's list yet."))
+            } actions: {
+                if recordings.access == .signingIn {
+                    ProgressView().controlSize(.small)
+                } else {
+                    Button(tr("Accedi con Polimi", "Sign in with Polimi")) { recordings.signIn() }
+                        .buttonStyle(.borderedProminent)
+                }
+            }
+        case .unavailable:
+            ContentUnavailableView {
+                Label(tr("Elenco non disponibile", "List unavailable"), systemImage: "wifi.exclamationmark")
+            } description: {
+                Text(tr("Riprova con il pulsante di aggiornamento.", "Try again with the refresh button."))
             }
         }
     }
@@ -805,14 +891,22 @@ private struct WatchlistRecordings: View {
     /// the bookmarks or the search change, not on every publication of the controller.
     @State private var shownCache = DerivedValueCache<ShownInputs, [RecordingsStudyState.Bookmark]>()
 
+    @State private var addingLesson = false
+
     private struct ShownInputs: Equatable {
         let bookmarks: [RecordingsStudyState.Bookmark]
+        let manual: ManualWebexLessons
+        /// The language the fallback course label was resolved in: a switch must redo it.
+        let language: AppLanguage
         let query: String
     }
 
     private var shown: [RecordingsStudyState.Bookmark] {
         let study = recordings.study
-        return shownCache.value(for: ShownInputs(bookmarks: study.bookmarks, query: query)) { study.visibleBookmarks(query: $0.query) }
+        let inputs = ShownInputs(bookmarks: study.bookmarks, manual: recordings.manualLessons, language: AppLanguage.current, query: query)
+        return shownCache.value(for: inputs) {
+            study.watchlistEntries(manual: $0.manual, fallbackCourseName: tr("Link Webex", "Webex link"), query: $0.query)
+        }
     }
 
     private var listings: [RecordingsListing] {
@@ -842,6 +936,11 @@ private struct WatchlistRecordings: View {
                     .textFieldStyle(.roundedBorder)
                     .frame(minWidth: 120, maxWidth: 280)
                 Spacer(minLength: 0)
+                Button { addingLesson = true } label: { Image(systemName: "plus") }
+                    .buttonStyle(.borderless)
+                    .help(tr("Aggiungi una lezione con un link Webex", "Add a lesson with a Webex link"))
+                    .accessibilityLabel(tr("Aggiungi una lezione con un link Webex", "Add a lesson with a Webex link"))
+                    .disabled(!recordings.canAddManualLesson)
                 Button(action: refresh) {
                     ZStack {
                         Image(systemName: "arrow.clockwise").opacity(isLoading ? 0 : 1)
@@ -904,18 +1003,70 @@ private struct WatchlistRecordings: View {
                 }
             }
         }
+        .sheet(isPresented: $addingLesson) {
+            AddWebexLessonSheet { link, title, course in
+                recordings.addManualLesson(link: link, title: title, courseName: course).map { _ in () }
+            }
+        }
     }
 
     @ViewBuilder private var empty: some View {
-        if recordings.study.bookmarks.isEmpty {
+        if recordings.study.bookmarks.isEmpty && recordings.manualLessons.lessons.isEmpty {
             ContentUnavailableView {
                 Label(tr("La watchlist è vuota", "Your watchlist is empty"), systemImage: "bookmark")
             } description: {
-                Text(tr("Scegli un corso e usa il segnalibro accanto a una lezione per aggiungerla qui.", "Choose a course and bookmark a lesson to add it here."))
+                Text(tr("Scegli un corso e usa il segnalibro accanto a una lezione per aggiungerla qui, oppure aggiungi una lezione con il suo link Webex (+).", "Choose a course and bookmark a lesson to add it here, or add a lesson by its Webex link (+)."))
             }
         } else {
             ContentUnavailableView.search(text: query)
         }
+    }
+}
+
+/// The form behind the Watchlist's "+": a Webex link, an optional title and course label. Only
+/// the link is needed: an untitled lesson is named after Webex's recording at its first Play
+/// (`ManualWebexLesson.learn`).
+/// `add` saves and answers; the sheet closes only on success, so a refused link stays in the
+/// field with the reason under it.
+struct AddWebexLessonSheet: View {
+    let add: (_ link: String, _ title: String, _ course: String) -> Result<Void, RecordingsController.ManualLessonFailure>
+    @Environment(\.dismiss) private var dismiss
+    @State private var link = ""
+    @State private var title = ""
+    @State private var course = ""
+    @State private var problem: BilingualText?
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 14) {
+            Text(tr("Aggiungi una lezione Webex", "Add a Webex lesson")).font(.headline)
+            Text(tr("Incolla il link della registrazione Webex. Senza titolo, prende quello di Webex e la durata alla prima riproduzione. La lezione resta nella watchlist finché non la rimuovi.", "Paste the Webex recording link. Without a title, it takes Webex's title and length the first time you play it. The lesson stays in your watchlist until you remove it."))
+                .font(.callout).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
+            Form {
+                TextField(tr("Link Webex", "Webex link"), text: $link, prompt: Text(verbatim: "https://politecnicomilano.webex.com/…"))
+                TextField(tr("Titolo (facoltativo)", "Title (optional)"), text: $title)
+                TextField(tr("Corso (facoltativo)", "Course (optional)"), text: $course)
+            }
+            .formStyle(.columns)
+            if let problem {
+                Label(problem.text, systemImage: "exclamationmark.triangle").foregroundStyle(.orange).font(.callout)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+            HStack {
+                Spacer()
+                Button(tr("Annulla", "Cancel"), role: .cancel) { dismiss() }.keyboardShortcut(.cancelAction)
+                Button(tr("Aggiungi", "Add")) {
+                    switch add(link, title, course) {
+                    case .success: dismiss()
+                    case .failure(let failure): problem = failure.message
+                    }
+                }
+                .keyboardShortcut(.defaultAction)
+                .disabled(link.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+            }
+        }
+        .padding(20)
+        .frame(width: 440)
+        .onChange(of: link) { problem = nil }
     }
 }
 
@@ -970,8 +1121,8 @@ struct WatchProgressReader<Content: View>: View {
     static var header: ((String) -> Void)?
     /// A scan of the listing by the course toolbar's bulk button, with the listing's size.
     static var bulkScan: ((Int) -> Void)?
-    /// A sidebar course row's body: its title and whether the orange marker shows.
-    static var sidebarRow: ((_ name: String, _ marker: Bool) -> Void)?
+    /// A sidebar course row's body: its title and its subtitle.
+    static var sidebarRow: ((_ name: String, _ subtitle: String) -> Void)?
 }
 #endif
 
@@ -1159,6 +1310,7 @@ struct RecordingRow: View, Equatable {
         }
         let when = recording.recordedAt.formatted(style)
         let length = RecordingsPresentation.minutes(recording.duration).map { RecordingsPresentation.durationText(minutes: $0) } ?? recording.duration
-        return "\(when) · \(length)"
+        // A lesson added by its Webex link has no archive duration: only the date it was added.
+        return length.isEmpty ? when : "\(when) · \(length)"
     }
 }

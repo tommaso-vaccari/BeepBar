@@ -29,6 +29,7 @@ final class WebexStubProtocol: URLProtocol, @unchecked Sendable {
     private struct State {
         var handler: @Sendable (URLRequest) -> Reply = { _ in .answer(status: 404) }
         var requests: [Recorded] = []
+        let requestEvents = AsyncStream<Int>.makeStream(bufferingPolicy: .bufferingNewest(1))
     }
 
     private static let state = OSAllocatedUnfairLock(initialState: State())
@@ -38,6 +39,7 @@ final class WebexStubProtocol: URLProtocol, @unchecked Sendable {
     }
 
     static var requests: [Recorded] { state.withLock { $0.requests } }
+    static var requestEvents: AsyncStream<Int> { state.withLock { $0.requestEvents.stream } }
 
     static func makeTransport() -> WebexURLSessionTransport {
         WebexURLSessionTransport(protocolClasses: [WebexStubProtocol.self])
@@ -51,6 +53,7 @@ final class WebexStubProtocol: URLProtocol, @unchecked Sendable {
         let url = request.url!
         let handler = Self.state.withLock { state -> @Sendable (URLRequest) -> Reply in
             state.requests.append(Recorded(url: url, method: request.httpMethod ?? "GET", headers: request.allHTTPHeaderFields ?? [:]))
+            state.requestEvents.continuation.yield(state.requests.count)
             return state.handler
         }
         switch handler(request) {

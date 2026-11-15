@@ -1,4 +1,5 @@
 import Foundation
+import os
 import Testing
 import BeepbarCore
 @testable import BeepbarApp
@@ -61,6 +62,21 @@ struct WebexStreamResolverTests {
                     try Task.checkCancellation()
                     guard self.isCurrent else { throw CancellationError() }
                 })
+        }
+    }
+
+    private struct ObservingTransport: WebexHTTPTransport {
+        let base: WebexURLSessionTransport
+        let apiCancelled: OSAllocatedUnfairLock<Bool?>
+
+        func send(_ request: URLRequest, limit: Int) async throws -> WebexHTTPResponse {
+            do { return try await base.send(request, limit: limit) }
+            catch {
+                if request.url?.absoluteString == WebexStreamResolverTests.api {
+                    apiCancelled.withLock { $0 = error is CancellationError || (error as? URLError)?.code == .cancelled }
+                }
+                throw error
+            }
         }
     }
 
@@ -241,22 +257,32 @@ struct WebexStreamResolverTests {
 
     // MARK: Cancellation
 
-    /// Cancelling the Play while the API hangs ends it at once, and nothing follows.
+    /// Proves that cancelling the Play while the request to the API is pending ends that request in
+    /// the transport and follows nothing else (no browser step, no further request). Guards against a
+    /// cancellation that leaves the request running, or that sends the Play on to another step.
+    /// The transport's own error is observed before the resolver translates it: a request timeout
+    /// was otherwise reported as "cancelled", a false green (#243).
     @Test(.timeLimit(.minutes(1))) func cancellingMidRequestEndsAtOnce() async throws {
         liveWebex(api: .hang)
         let browser = FakeBrowser(cookies: [])
-        let resolver = resolver()
+        let apiCancelled = OSAllocatedUnfairLock<Bool?>(initialState: nil)
+        let resolver = WebexStreamResolver(transport: ObservingTransport(base: WebexStubProtocol.makeTransport(), apiCancelled: apiCancelled))
         let email = self.email
         let task = Task { try await resolver.stream(player: Self.player, email: email, driver: browser.driver) }
-        for _ in 0..<500 where WebexStubProtocol.requests.count < 2 {
-            try await Task.sleep(for: .milliseconds(10))
+        let started = await withTaskGroup(of: Bool.self) { group in
+            group.addTask {
+                for await count in WebexStubProtocol.requestEvents where count >= 2 { return true }
+                return false
+            }
+            group.addTask { do { try await Task.sleep(for: .seconds(45)) } catch { return false }; return false }
+            let result = await group.next() ?? false
+            group.cancelAll()
+            return result
         }
-        try #require(WebexStubProtocol.requests.count == 2)
-        let clock = ContinuousClock()
-        let started = clock.now
+        guard started else { task.cancel(); Issue.record("Webex request did not start"); return }
         task.cancel()
         #expect(await outcome { try await task.value } == "cancelled")
-        #expect(clock.now - started < .seconds(5))
+        #expect(apiCancelled.withLock { $0 } == true)
         #expect(browser.events.isEmpty)
         #expect(requestedURLs == [Self.player.absoluteString, Self.api])
     }

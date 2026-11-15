@@ -54,20 +54,12 @@ struct BeepbarApp: App {
         let build = Bundle.main.object(forInfoDictionaryKey: "CFBundleVersion") as? String ?? "unknown"
         BeepbarLog.lifecycle.notice("Application launched version=\(version, privacy: .public) build=\(build, privacy: .public)")
         _ = UpdaterController.shared
+        // Once per launch, before anything else: clears the preferences the removed telemetry left
+        // behind (#239). A no-op, with no write, once they are gone.
+        if !PreviewMode.isActive { LegacyTelemetryCleanup.removeLeftovers(from: .standard) }
         // Once per install: on by default, never re-applied after the user turns it off.
-        // Telemetry starts after it, so the day's first signal reports the login item's real state.
-        Task { [authentication] in
+        Task {
             await LaunchAtLoginController.shared.applyDefaultOnLaunch()
-            await DailyTelemetryController.shared.startForApplication(context: {
-                DailyTelemetryContext(
-                    language: .current,
-                    systemMajorVersion: ProcessInfo.processInfo.operatingSystemVersion.majorVersion,
-                    automaticSyncEnabled: authentication.automaticSyncEnabled,
-                    automaticSyncInterval: authentication.automaticSyncInterval,
-                    dataSaverEnabled: authentication.dataSaverEnabled,
-                    recordingsEnabled: authentication.recordingsEnabledWithoutCreating,
-                    launchAtLogin: LaunchAtLoginController.shared.status.map(LaunchAtLoginPolicy.isOn))
-            })
         }
         statusItemController = StatusItemController(authentication: authentication)
 #if DEBUG
@@ -367,18 +359,23 @@ final class StatusItemController: NSObject, NSMenuDelegate {
         return window
     }
 
-    func windowWillClose(_ notification: Notification) {
-        if let appearanceTrace {
-            PerformanceTrace.shared.end("ui.configurationWindow", category: .ui, state: appearanceTrace)
-        }
-        appearanceTrace = nil
-        // Drop the whole SwiftUI hierarchy once the window is gone, so that a closed window keeps
-        // no view graph subscribed to the controller's @Published state: background syncs then
-        // cost exactly what they cost without any UI. Deferred to the next main-actor turn so
-        // AppKit finishes closing first; skipped if the window was reopened in the meantime.
-        // This reuses the pre-existing delegate callback — no new AppKit→@MainActor entry point.
+    /// `nonisolated` with the whole body behind the main-actor hop (#241, #30): this class is
+    /// `@MainActor`, and an isolated delegate method's Objective-C thunk verifies the main
+    /// executor before the body runs, the check that crashed with SIGBUS on the first AppKit
+    /// callback after a wake from sleep (`StatusItemController`). The configuration window is
+    /// often the one left open across sleep.
+    nonisolated func windowWillClose(_ notification: Notification) {
         Task { @MainActor [weak self] in
-            guard let self, let window = self.window, !window.isVisible else { return }
+            guard let self else { return }
+            if let appearanceTrace {
+                PerformanceTrace.shared.end("ui.configurationWindow", category: .ui, state: appearanceTrace)
+            }
+            appearanceTrace = nil
+            // Drop the whole SwiftUI hierarchy once the window is gone, so that a closed window keeps
+            // no view graph subscribed to the controller's @Published state: background syncs then
+            // cost exactly what they cost without any UI. This hop is after AppKit finished closing
+            // (the callback itself only schedules it); skipped if the window was reopened meanwhile.
+            guard let window = self.window, !window.isVisible else { return }
             window.delegate = nil
             self.window = nil
             self.router.page = .home
@@ -390,10 +387,13 @@ final class StatusItemController: NSObject, NSMenuDelegate {
         }
     }
 
-    func windowDidBecomeKey(_ notification: Notification) {
-        guard let appearanceTrace else { return }
-        PerformanceTrace.shared.end("ui.configurationWindow", category: .ui, state: appearanceTrace)
-        self.appearanceTrace = nil
+    /// `nonisolated`, hop only: see `windowWillClose`.
+    nonisolated func windowDidBecomeKey(_ notification: Notification) {
+        Task { @MainActor [weak self] in
+            guard let self, let appearanceTrace else { return }
+            PerformanceTrace.shared.end("ui.configurationWindow", category: .ui, state: appearanceTrace)
+            self.appearanceTrace = nil
+        }
     }
 }
 

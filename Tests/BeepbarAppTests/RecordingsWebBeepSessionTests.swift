@@ -18,6 +18,25 @@ struct RecordingsWebBeepSessionTests {
     /// Test hook run once at the next owner read after a browser was made (`onOwnerRead`).
     private final class Hooks { var onOwnerRead: (() -> Void)? }
     private let hooks = Hooks()
+    /// Holds the session file's write: once armed, the next time the store's folder is asked for
+    /// (the write itself) it signals `reached` and waits for `release()`.
+    private final class StoreGate: @unchecked Sendable {
+        private let semaphore = DispatchSemaphore(value: 0)
+        private let state = OSAllocatedUnfairLock(initialState: (armed: false, reached: false))
+        func arm() { state.withLock { $0.armed = true } }
+        var reached: Bool { state.withLock { $0.reached } }
+        func release() { semaphore.signal() }
+        func pass() {
+            let hold = state.withLock { state -> Bool in
+                guard state.armed else { return false }
+                state.armed = false
+                state.reached = true
+                return true
+            }
+            if hold { semaphore.wait() }
+        }
+    }
+    private let storeGate = StoreGate()
     private let course = RecmanCourseKey(courseCode: "058167", academicYear: 2026)!
     private var store: RecordingsSessionStore {
         let folder = folder
@@ -30,9 +49,10 @@ struct RecordingsWebBeepSessionTests {
         let browser = browser
         let folder = folder
         let hooks = hooks
+        let storeGate = storeGate
         return RecordingsController(
             makeBrowser: { world.browsersMade += 1; return browser },
-            store: RecordingsSessionStore { folder },
+            store: RecordingsSessionStore { storeGate.pass(); return folder },
             defaults: defaults,
             makeSeenHistory: { namespace in
                 let history = RecordingsSeenHistory(store: RecordingsSeenStore(directory: { folder }, namespace: namespace))
@@ -444,6 +464,73 @@ struct RecordingsWebBeepSessionTests {
         #expect(browser.openedWith.last != ["SSO_LATE"], "the late candidate was not kept")
     }
 
+    /// A save that began for the previous account and finishes after the account change must not
+    /// take the new account's candidate with it: the new login's candidate is the one used.
+    /// The file write is held while the account changes and the new candidate is offered, then
+    /// released. Mutation: `retireCandidate` clearing the candidate with no owner and epoch check.
+    @Test func anOldAccountsSaveDoesNotRetireTheNewAccountsCandidate() async throws {
+        defer { cleanUp() }
+        let controller = try launched(savedFile: true)
+        let gate = FakeRecmanBrowser.Gate()
+        browser.listGates[course.courseCode] = gate
+        browser.listResults[course.courseCode] = .success([])
+        browser.cookiesAfterListing = [FakeRecmanBrowser.cookie("SSO_RENEWED")]
+        let first = Task { await controller.refreshForSync([course], force: false) }
+        await waitUntil("the listing is held") { gate.isWaiting }
+        storeGate.arm()
+        gate.release()
+        await waitUntil("the write of 42's session is held") { storeGate.reached }
+
+        world.owner = 43
+        controller.webBeepAccountChanged(to: 43)
+        controller.offerSessionCandidate(login("SSO_43"), owner: 43)
+        storeGate.release()
+        _ = await first.value
+        await controller.settleSessionFile()
+
+        browser.listGates[course.courseCode] = nil
+        browser.cookiesAfterListing = nil
+        _ = await controller.refreshForSync([course], force: true)
+        #expect(browser.openedWith.last == ["SSO_43"], "\(browser.openedWith)")
+    }
+
+    /// With the page on screen, a candidate that takes the page from `.needsSignIn` back to
+    /// `.ready` starts the first check itself and the page's courses are queued: nobody else
+    /// would, and the course would stay loading until the next sync. Mutation: drop the
+    /// `visiblePages > 0` start in `returnToReadyForCandidate`.
+    @Test func aCandidateWhilePageIsVisibleEntersAtOnce() async throws {
+        defer { cleanUp() }
+        let controller = try launched()
+        browser.listResults[course.courseCode] = .success([recording("a")])
+        controller.pageAppeared()
+        controller.refresh([course], selected: course)
+        await waitUntil("the empty first check asked for the sign-in") { controller.access == .needsSignIn(nil) }
+        controller.offerSessionCandidate(login(), owner: 42)
+        await waitUntil("the page's course was listed with the candidate") { controller.listing(for: course)?.recordings != nil }
+        #expect(browser.openedWith == [["SSO_LOGIN"]])
+        #expect(controller.access == .ready)
+        controller.pageDisappeared()
+    }
+
+    /// A cancelled sign-in with the page open leaves the browser open, so a candidate that
+    /// arrives then finds it busy; when the page closes the browser goes and the candidate is
+    /// used by the next sync, as promised. Mutation: no `returnToReadyForCandidate` in `suspend`.
+    @Test func aCandidateOfferedWhileTheBrowserWasOpenIsUsedAfterThePageCloses() async throws {
+        defer { cleanUp() }
+        let controller = try launched()
+        controller.pageAppeared()
+        browser.signInError = CancellationError()
+        controller.signIn()
+        await waitUntil("the sign-in was cancelled") { controller.access == .needsSignIn(nil) }
+        controller.offerSessionCandidate(login(), owner: 42)
+        #expect(controller.access == .needsSignIn(nil))
+        controller.pageDisappeared()
+        await waitUntil("the browser closed and the candidate has a way in") { controller.access == .ready }
+        browser.listResults[course.courseCode] = .success([])
+        #expect(await controller.refreshForSync([course], force: false) == .refreshed(newlyPublished: 0, failedKeys: 0))
+        #expect(browser.openedWith.last == ["SSO_LOGIN"])
+    }
+
     // MARK: The saved file as a way back
 
     /// A candidate that Polimi refuses falls back, once, on the same account's saved cookies: the
@@ -489,14 +576,15 @@ struct WebBeepLoginSessionHandoverTests {
         return RecordingsSessionStore { folder }
     }
 
-    private func makeController(token: String, browser: FakeRecmanBrowser, site: MoodleSite = .polimi, failSave: Bool = false) -> WeBeepAuthenticationController {
+    private func makeController(token: String, browser: FakeRecmanBrowser, site: MoodleSite = .polimi, failSave: Bool = false, defaults sharedDefaults: UserDefaults? = nil) -> WeBeepAuthenticationController {
         let current = OSAllocatedUnfairLock(initialState: token)
         let vault = CredentialVault(read: { _ in current.withLock { $0 } }, write: { new in
             if failSave { throw CredentialStorageError.write }
             current.withLock { $0 = new }
         })
-        let defaults = WeBeepAuthenticationController.throwawayDefaults()
-        defaults.set(true, forKey: RecordingsController.enabledKey)
+        // A second controller on the same defaults is a relaunch: the stored choice is not touched.
+        let defaults = sharedDefaults ?? WeBeepAuthenticationController.throwawayDefaults()
+        if sharedDefaults == nil { defaults.set(true, forKey: RecordingsController.enabledKey) }
         return WeBeepAuthenticationController(testRootURL: root.appendingPathComponent("sync"), apiClient: MoodleRecordingProtocol.makeClient(), credentialVault: vault, defaults: defaults, recordingsStore: store, recordingsBrowser: { browser }, site: site)
     }
 
@@ -615,6 +703,62 @@ struct WebBeepLoginSessionHandoverTests {
         #expect(controller.recordings.isEnabled == false)
         #expect(await controller.recordings.refreshForSync([course], force: false) == .skipped(.switchedOff))
         #expect(browser.openedWith.isEmpty)
+    }
+
+    /// An explicit "off" outlives a logout, a site change and a relaunch: a new login must not
+    /// turn the archive back on, keep a candidate or enter in the background. Mutation: `turnOff`
+    /// removing the stored choice whatever it is.
+    @Test func anExplicitOffSurvivesLogoutSiteChangeAndRelaunch() async throws {
+        defer { try? FileManager.default.removeItem(at: root) }
+        let token = MoodleRecordingProtocol.register(courses: [(1, "Course")], userID: 7)
+        let browser = FakeRecmanBrowser()
+        let defaults = WeBeepAuthenticationController.throwawayDefaults()
+        let controller = makeController(token: token, browser: browser, defaults: defaults)
+        defaults.set(true, forKey: RecordingsController.enabledKey)
+        await controller.completeLoginForTesting(moodleLoginCallback(token: token), polimiCookies: cookie("SSO_FIRST"))
+        controller.recordings.setEnabled(false)
+        controller.signOut(removeFile: { _ in })
+        controller.selectSite(MoodleSite.unipd[0])
+        controller.selectSite(.polimi)
+        #expect(defaults.object(forKey: RecordingsController.enabledKey) as? Bool == false, "the choice survived turnOff")
+
+        await controller.completeLoginForTesting(moodleLoginCallback(token: token), polimiCookies: cookie("SSO_AGAIN"))
+        #expect(controller.recordings.isEnabled == false)
+        #expect(controller.recordings.access == .off)
+        #expect(await controller.recordings.refreshForSync([course], force: false) == .skipped(.switchedOff))
+        #expect(browser.openedWith.isEmpty)
+
+        let relaunched = makeController(token: token, browser: browser, defaults: defaults)
+        await relaunched.completeLoginForTesting(moodleLoginCallback(token: token), polimiCookies: cookie("SSO_THIRD"))
+        #expect(relaunched.recordings.isEnabled == false)
+        #expect(await relaunched.recordings.refreshForSync([course], force: false) == .skipped(.switchedOff))
+        #expect(browser.openedWith.isEmpty)
+    }
+
+    /// The default (on) is not a stored choice: after a logout the key is gone and a new login
+    /// turns Recordings back on, with the study state and the watch summaries of the account
+    /// read after the resume (the account change had run while it was off). Mutation: drop
+    /// `loadStudy()` from `resumeIfSwitchedOn`, or the seed in `completeLogin`.
+    @Test func theDefaultOnIsNotAStoredChoiceAndTheResumeLoadsTheAccountsState() async throws {
+        defer { try? FileManager.default.removeItem(at: root) }
+        let token = MoodleRecordingProtocol.register(courses: [(1, "Course")], userID: 7)
+        let browser = FakeRecmanBrowser()
+        let defaults = WeBeepAuthenticationController.throwawayDefaults()
+        let controller = makeController(token: token, browser: browser, defaults: defaults)
+        defaults.set(true, forKey: RecordingsController.enabledKey)
+        await controller.completeLoginForTesting(moodleLoginCallback(token: token), polimiCookies: cookie("SSO_FIRST"))
+        controller.recordings.selectDestination(.course(5))
+        controller.signOut(removeFile: { _ in })
+        #expect(defaults.object(forKey: RecordingsController.enabledKey) == nil, "an \"on\" goes back to the default")
+
+        let course = RecmanCourseKey(courseCode: "058167", academicYear: 2026)!
+        let summary = CourseWatchSummary(done: 1, total: 3, remainingMinutes: 20, unknownDurationCount: 0)
+        let stored = RecordingsController.StoredWatchSummaries(owner: 7, courses: ["058167-2026": summary])
+        defaults.set(try PropertyListEncoder().encode(stored), forKey: RecordingsController.watchSummaryKey)
+        await controller.completeLoginForTesting(moodleLoginCallback(token: token), polimiCookies: cookie("SSO_AGAIN"))
+        #expect(controller.recordings.isEnabled)
+        #expect(controller.recordings.study.destination == .course(5), "the account's study state was read after the resume")
+        #expect(controller.watchSummaries[course] != nil, "the saved summaries were read after the resume")
     }
 
     /// The sign-in window closed while its cookies are read: the token has arrived, so the login

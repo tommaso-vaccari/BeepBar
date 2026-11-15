@@ -3060,6 +3060,8 @@ enum MaterialsRunEnd: Equatable, Sendable {
                 if self.selectedSite.university == .polimi, RecordingsController.isSwitchedOn(in: self.operationDefaults) {
                     // Only an existing controller can be off from a logout; a new one reads the stored choice itself.
                     self.recordingsIfCreated?.resumeIfSwitchedOn()
+                    // `siteInfo`'s seed ran while the feature was off.
+                    self.seedWatchSummariesIfNeeded()
                 }
                 if self.selectedSite.university == .polimi, !polimiCookies.isEmpty,
                    RecordingsController.isSwitchedOn(in: self.operationDefaults) {

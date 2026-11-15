@@ -952,7 +952,12 @@ struct RecordingsListing: Equatable {
         audioEnhancer?.removeAll()
         studyLoaded = false
         loadStudy()
-        defaults.removeObject(forKey: Self.enabledKey)
+        // An explicit "off" is the user's choice and outlives a logout and a site change (#234):
+        // removing it would turn the archive back on at the next login, and the first sync would
+        // enter it in the background. Anything else goes back to the default (on).
+        if defaults.object(forKey: Self.enabledKey) as? Bool != false {
+            defaults.removeObject(forKey: Self.enabledKey)
+        }
         // Logout, site change and the switch all come through here (#234).
         sessionCandidate = nil
         discardSessionFile()
@@ -993,6 +998,7 @@ struct RecordingsListing: Equatable {
             access = .needsSignIn(error is CancellationError ? nil : RecordingsProblem(error))
             log.notice("Polimi sign-in ended without the archive cancelled=\(error is CancellationError, privacy: .public)")
             if visiblePages == 0 { closeBrowser() }
+            returnToReadyForCandidate()
             return
         }
         guard generation == self.generation else { return }
@@ -1066,6 +1072,11 @@ struct RecordingsListing: Equatable {
         visiblePages += 1
         // Keep launch and disabled recordings quiet; check only the first visit, before refresh
         // can open WebKit. Later visits must preserve a session established by explicit sign-in.
+        startInitialSessionCheckIfDue()
+    }
+
+    /// The first check of the saved session, when the feature is ready and none has run yet.
+    private func startInitialSessionCheckIfDue() {
         guard isEnabled, access == .ready, !hasCheckedInitialSession else { return }
         let check = beginInitialSessionCheck()
         // Not tied to `generation`: closing the page while the file is read must not lose the
@@ -1161,6 +1172,7 @@ struct RecordingsListing: Equatable {
         }
         invalidate()
         closeBrowser()
+        returnToReadyForCandidate()
     }
 
     /// Whether a sync refresh is still waiting for its courses (`refreshForSync`).
@@ -3549,10 +3561,21 @@ struct RecordingsListing: Equatable {
         // session, a tab open before the WeBeep login) has the candidate to try: back to ready,
         // with the first check armed again, so the next page or sync refresh enters on its own.
         // Not while a sign-in runs or a browser is open: those have their own course.
-        if case .needsSignIn = access, signInTask == nil, !(browser?.isOpen ?? false) {
-            access = .ready
-            hasCheckedInitialSession = false
-        }
+        returnToReadyForCandidate()
+    }
+
+    /// A usable candidate while the page waits for the sign-in (`.needsSignIn`) with nothing
+    /// running and no browser open: back to ready with the first check armed again, so the next
+    /// page or sync refresh enters with it. Called when the candidate arrives and when a sign-in
+    /// or a browser that was in the way ends (a candidate offered meanwhile found them busy).
+    /// With the page on screen nobody else would restart the check, so it starts now and the
+    /// page's keys are queued by its answer, as `pageAppeared` does.
+    private func returnToReadyForCandidate() {
+        guard usableCandidate() != nil, case .needsSignIn = access, signInTask == nil,
+              !(browser?.isOpen ?? false) else { return }
+        access = .ready
+        hasCheckedInitialSession = false
+        if visiblePages > 0 { startInitialSessionCheckIfDue() }
     }
 
     /// Back on after a logout, a university change or an account change turned it off in this
@@ -3565,6 +3588,8 @@ struct RecordingsListing: Equatable {
         isEnabled = true
         access = .ready
         hasCheckedInitialSession = false
+        // `siteInfo`'s account change ran with the feature off: the study state is read now.
+        loadStudy()
     }
 
     /// What of a sign-in window's cookies may be kept as a session candidate or in the session

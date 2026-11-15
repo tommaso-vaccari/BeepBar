@@ -15,12 +15,28 @@ python3 scripts/test_ui_benchmark.py
 bash scripts/test-linux-core-tests.sh
 bash scripts/test-check-test-run-complete.sh
 # The exit status of `swift test` does not show a test process that ended early (it exits 0), so
-# the log is checked too: every run that started must have printed its passing summary (#243).
+# each log is checked too: every run that started must have printed its passing summary (#243).
 # One run per test target: the folders under Tests/.
 test_log=$(mktemp)
 trap 'rm -f "$test_log"' EXIT
-swift test 2>&1 | tee "$test_log"
-bash scripts/check-test-run-complete.sh "$test_log" "$(find Tests -mindepth 1 -maxdepth 1 -type d | wc -l | tr -d ' ')"
+test_targets=$(find Tests -mindepth 1 -maxdepth 1 -type d | wc -l | tr -d ' ')
+# The tests are run in two passes (#267). Suites that drive a real WKWebView load the main thread
+# so heavily that, in one parallel queue of ~1000 tests, time-sensitive tests (theirs and other
+# suites') failed now and then; `.serialized` only orders tests inside one suite, so it cannot
+# isolate them. They run alone, one at a time, in the second pass; everything else stays parallel.
+# ONE regex feeds both passes (`--skip` in the first, `--filter` in the second), so no test can
+# fall between them. It matches the Swift Testing id "Target.Suite/test()" and must name a suite
+# whose tests are only web-view tests, or a single test. Adding a suite or test that creates a
+# web view (a WKWebView, `RecmanWebSession.open`, `LoginWindowController`...)? Add it here. A
+# pattern that matches nothing would leave the second pass empty and green, so that pass states
+# a minimum number of tests (the check's third argument; 65 ran when this was written, and the
+# floor is what a typo that loses a whole suite cannot reach: change it deliberately if suites
+# are removed). Only the targets with a matching test start a run, hence a minimum of one run.
+webview_tests='^BeepbarAppTests\.(RecmanScriptsTests|RecmanWebSessionTests|RecmanWebSessionScriptTests|WebexSignInWebViewTests)/|^BeepbarAppTests\.RecordingsWebBeepSessionTests/theLoginWindowUsesTheWebViewWithEditingShortcuts\(\)$'
+swift test --skip "$webview_tests" 2>&1 | tee "$test_log"
+bash scripts/check-test-run-complete.sh "$test_log" "$test_targets"
+swift test --no-parallel --filter "$webview_tests" 2>&1 | tee "$test_log"
+bash scripts/check-test-run-complete.sh "$test_log" 1 50
 python3 scripts/recordings-seen-isolated-tests.py
 bash scripts/test-release-notes.sh
 bash scripts/test-build-version.sh

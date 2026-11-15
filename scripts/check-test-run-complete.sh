@@ -7,9 +7,9 @@
 set -u
 # The optional second argument is the least number of runs expected (one per test target), so a
 # process that ends before its run even starts is caught too. The optional third argument is the
-# least number of tests, summed over the passing summaries: a `--filter` that matches nothing
-# still prints "Test run with 0 tests passed" in every target and exits 0, so a pass that must run
-# something (the serial web-view pass, #267) states how much.
+# least number of tests, summed over the passing summaries: a `--filter` whose pattern lost a
+# suite still passes, with fewer tests, so a pass that must run a known set (the serial web-view
+# pass, #267) states how many.
 log=${1:?usage: check-test-run-complete.sh <swift-test-log> [minimum-runs] [minimum-tests]}
 minimum=${2:-1}
 minimum_tests=${3:-0}

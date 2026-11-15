@@ -27,11 +27,12 @@ test_targets=$(find Tests -mindepth 1 -maxdepth 1 -type d | wc -l | tr -d ' ')
 # ONE regex feeds both passes (`--skip` in the first, `--filter` in the second), so no test can
 # fall between them. It matches the Swift Testing id "Target.Suite/test()" and must name a suite
 # whose tests are only web-view tests, or a single test. Adding a suite or test that creates a
-# web view (a WKWebView, `RecmanWebSession.open`, `LoginWindowController`...)? Add it here. A
-# pattern that matches nothing would leave the second pass empty and green, so that pass states
-# a minimum number of tests (the check's third argument; 65 ran when this was written, and the
-# floor is what a typo that loses a whole suite cannot reach: change it deliberately if suites
-# are removed). Only the targets with a matching test start a run, hence a minimum of one run.
+# web view (a WKWebView, `RecmanWebSession.open`, `LoginWindowController`...)? Add it here. Only the
+# targets with a matching test start a run in the second pass, hence its minimum of one run: a
+# pattern that matches nothing starts none and fails there. A pattern that loses one suite (a
+# typo, a rename) would still be green, with that suite back in the parallel pass unnoticed, so
+# the second pass also states a minimum number of tests (the check's third argument; 65 ran when
+# this was written: change it deliberately if suites are removed).
 webview_tests='^BeepbarAppTests\.(RecmanScriptsTests|RecmanWebSessionTests|RecmanWebSessionScriptTests|WebexSignInWebViewTests)/|^BeepbarAppTests\.RecordingsWebBeepSessionTests/theLoginWindowUsesTheWebViewWithEditingShortcuts\(\)$'
 swift test --skip "$webview_tests" 2>&1 | tee "$test_log"
 bash scripts/check-test-run-complete.sh "$test_log" "$test_targets"

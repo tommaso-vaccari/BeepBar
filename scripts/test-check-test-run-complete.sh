@@ -47,8 +47,8 @@ expect 0 "a target without suites" <<'EOF'
 ◇ Test run started.
 ✔ Test run with 0 tests passed after 0.001 seconds.
 EOF
-# The serial web-view pass (#267): a filter that matches nothing leaves every run at 0 tests, still
-# "passed", and must not pass the gate.
+# The serial web-view pass (#267) states a minimum number of tests: runs that all "passed" with 0
+# tests must not satisfy it.
 expect 1 "a filter that matched no test" 2 1 <<'EOF'
 ◇ Test run started.
 ✔ Test run with 0 tests passed after 0.001 seconds.

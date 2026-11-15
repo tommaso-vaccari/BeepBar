@@ -271,14 +271,14 @@ struct RecmanWebSessionTests {
         #expect(scenario.events == ["preview"])
     }
 
-    /// Cancelling the Play while the re-entry is under way ends it with a plain cancellation, not
-    /// a wrapped or "unavailable" error, and no second preview starts.
     /// An outage that also hits the re-entry: the single sign-on lands on a main-frame 5xx page.
-    /// Left to the page classifier that page is "not the archive" and the background entry ends as
-    /// unrecognized after its patience, which stops the controller's retries with "the archive
-    /// looks different". A 5xx during a background entry must end it at once as unavailable.
-    /// (The fixture's 5xx page is on loopback, not on the archive host: the delegate decides by
-    /// status, not by host.)
+    /// The request must end as unavailable, so the controller's retries go on, and without a
+    /// second preview. This passes through either guard (the delegate's 5xx branch or the
+    /// re-entry's error mapping): the fixture's 5xx page is on loopback, which the classifier
+    /// calls unrecognized at once, so the archive-host "transit, then unrecognized" wait cannot be
+    /// reproduced here. The delegate branch alone is proved by
+    /// `aServerErrorOnAFirstBackgroundEntryIsUnavailable`, the mapping alone by
+    /// `anUnrecognizedReentryIsReportedAsUnavailable`.
     @Test(.timeLimit(.minutes(1)))
     func aServerErrorDuringTheReentryEndsItAsUnavailableAtOnce() async throws {
         let scenario = try await StaleSessionScenario(startOnArchive: true, previews: [.serverError, .player], entry: .serverError)
@@ -325,6 +325,8 @@ struct RecmanWebSessionTests {
         #expect(scenario.events == ["entry"])
     }
 
+    /// Cancelling the Play while the re-entry is under way ends it with a plain cancellation, not
+    /// a wrapped or "unavailable" error, and no second preview starts.
     @Test(.timeLimit(.minutes(1)))
     func cancellingDuringTheReentryThrowsCancellation() async throws {
         let scenario = try await StaleSessionScenario(startOnArchive: true, previews: [.serverError, .player], entry: .neverFinishes)

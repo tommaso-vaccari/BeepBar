@@ -1059,7 +1059,8 @@ struct RecmanStreamFailure: Error {
             return
         }
         if webexLogin == nil, let entry, entry.navigator.mode == .background {
-            diagnose("stream: step=archive-entry status=\(status)")
+            // Not "stream:": this entry may belong to a listing or a sync refresh, not to a Play.
+            diagnose("entry: step=archive-entry status=\(status)")
             feed(.loadFailed(id: loadID), to: entry)
             decisionHandler(.cancel)
             return

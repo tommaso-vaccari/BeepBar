@@ -116,7 +116,9 @@ understate the cost of enabled rows. Manual scrolling and actions remain require
 
 ### Owner decision (2026-11-15)
 
-This supersedes the sentence above that "#99 stays open".
+This supersedes every earlier statement in this report that #99 remains open or must not be
+closed. The "continuous 48-pt steps" figures above exclude the explicit jump (callback 120) by
+hand; the driver's own per-run maximum includes it.
 
 1. The realistic worst case for the Activity page is **1,000 files** in one expanded course.
    Acceptance tests and documented benchmark commands for #99 use 1,000. The 15,000 measurements

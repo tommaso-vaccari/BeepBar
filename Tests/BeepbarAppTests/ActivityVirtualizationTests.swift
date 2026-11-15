@@ -5,7 +5,7 @@ import BeepbarCore
 @testable import BeepbarApp
 
 /// Exercises the real Activity hierarchy for the owner's realistic worst case, 1,000 files in one
-/// expanded course (decision of 2026-11-15, #99). `activity-1000` stays a stress scenario, not a criterion.
+/// expanded course (decision of 2026-11-15, #99). `activity-15000` stays a stress scenario, not a criterion.
 @MainActor @Suite(.serialized) struct ActivityVirtualizationTests {
     /// Proves that after Show more has revealed all 1,000 rows only a viewport of them is built, and that
     /// the last one is reachable by scrolling. Guards against replacing the inner LazyVStack with a VStack,

@@ -355,6 +355,10 @@ struct UIFixtureResources: Codable {
               constructed.contains("1/file/fixture-\(count - 1)") else { throw UIFixtureError.missingContent }
     }
 
+    /// Deliberate exception to the "AppKit callbacks hop to the main actor" rule: the work to be
+    /// measured must run inside the display-link callback, and a hop would move it to a later
+    /// turn and change what is timed. Acceptable only because this type exists in the DEBUG
+    /// harness build alone and is never on a menu or quit path. Do not copy this into app code.
     @objc private func tick(_ link: CADisplayLink) {
         let start = CACurrentMediaTime()
         if let previous { deliveryMilliseconds.append((start - previous) * 1000) }

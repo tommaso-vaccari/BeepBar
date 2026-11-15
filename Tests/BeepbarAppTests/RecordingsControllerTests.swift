@@ -74,6 +74,8 @@ import Testing
     /// What the jar holds after a successful sign-in.
     var signedInCookies = [FakeRecmanBrowser.cookie("SSO_LOGIN", value: "fresh")]
     var signInError: Error?
+    /// Cookie names that make a listing answer `needsSignIn`, as Polimi refusing that session (#234).
+    var rejectedCookieNames: Set<String> = []
     var signInGate: Gate?
     var listResults: [String: Result<[RecmanRecording], Error>] = [:]
     var listGates: [String: Gate] = [:]
@@ -119,6 +121,7 @@ import Testing
     func recordings(for key: RecmanCourseKey) async throws -> [RecmanRecording] {
         calls.append("list \(key.courseCode)")
         await listGates[key.courseCode]?.wait()
+        if jar.contains(where: { rejectedCookieNames.contains($0.name) }) { throw RecmanBrowserError.needsSignIn }
         guard let result = listResults[key.courseCode] else { throw RecmanBrowserError.unrecognized }
         let recordings = try result.get()
         if let cookiesAfterListing { jar = cookiesAfterListing }

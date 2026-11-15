@@ -18,6 +18,8 @@ import WebKit
 //   lab <state> code year [n]  unattended, no window, nothing typed: the uuid without a web view,
 //                              the stream API's cookie needs, and what a later Webex login asks
 //                              (see lab.swift)
+//   webeep <state> [code year]  sign in to WeBeep in a window, then check whether the cookies it
+//                              left reach the archive with no new sign-in (see webeep.swift)
 //   sync <state> code year [code year ...] [--dry-run]
 //                              one background refresh as the app does it, measured; numbers only
 //                              (see sync.swift)
@@ -75,15 +77,16 @@ let diagnostics = #"""
 }
 
 /// The session file, written as BeepBar writes its own: 0600 in a 0700 folder, replaced whole.
-@MainActor func save(_ session: RecmanWebSession, to file: URL) async throws {
+/// `describe: false` prints only the counts (the `webeep` mode never lists cookie names).
+@MainActor func save(_ session: RecmanWebSession, to file: URL, describe: Bool = true) async throws {
     let cookies = await session.cookies()
     let data = try RecmanSessionCodec.encode(cookies, ownerUserID: 0)
     let kept = try RecmanSessionCodec.decode(data).cookies
     let temporary = file.deletingLastPathComponent().appendingPathComponent(".session-\(UUID().uuidString).tmp")
     guard FileManager.default.createFile(atPath: temporary.path, contents: data, attributes: [.posixPermissions: 0o600]) else { throw CocoaError(.fileWriteUnknown) }
     if rename(temporary.path, file.path) != 0 { throw CocoaError(.fileWriteUnknown) }
-    say("saved \(kept.count) of \(cookies.count) cookies (Polimi only, unexpired):")
-    describeCookies(kept)
+    say("saved \(kept.count) of \(cookies.count) cookies (Polimi only, unexpired)\(describe ? ":" : "")")
+    if describe { describeCookies(kept) }
 }
 
 @MainActor func list(_ session: RecmanWebSession, code: String, year: Int) async {
@@ -126,6 +129,10 @@ let diagnostics = #"""
     let arguments = CommandLine.arguments
     if arguments.count >= 3, arguments[1] == "sync" {
         return await syncMode(state: URL(fileURLWithPath: arguments[2]), arguments: Array(arguments.dropFirst(3)))
+    }
+    if arguments.count >= 3, arguments[1] == "webeep" {
+        let course = arguments.count >= 5 ? (code: arguments[3], year: Int(arguments[4]) ?? 0) : nil
+        return await webeepMode(state: URL(fileURLWithPath: arguments[2]), course: course)
     }
     guard arguments.count >= 3, ["cold", "warm", "play", "lab"].contains(arguments[1]), !["play", "lab"].contains(arguments[1]) || arguments.count >= 5 else {
         say("usage: RecmanProbe cold|warm <state folder> [course code] [academic year] | play <state folder> <course code> <academic year> [n]")
@@ -240,7 +247,7 @@ let diagnostics = #"""
 
 let application = NSApplication.shared
 application.setActivationPolicy(.accessory)
-// No main menu on purpose: the sign-in window must take pasted passwords on its own
+// No main menu on purpose (except in `webeep`, see webeep.swift): the sign-in window must take pasted passwords on its own
 // (`RecmanSignInWebView`), so this checks the same path BeepBar relies on.
 Task { @MainActor in
     let status = await run()

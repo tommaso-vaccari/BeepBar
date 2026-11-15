@@ -8,7 +8,7 @@
 #                                   open the n-th newest recording's Webex player (default the
 #                                   newest) in a window, report the way to the stream and whether
 #                                   AVPlayer plays it; run warm or cold first
-#                                   (RECMAN_PROBE_WINDOW_SECONDS limits the window, default 300)
+#                                   (RECMAN_PROBE_WINDOW_SECONDS limits the window, default 300; webeep too)
 #   scripts/recman-probe.sh lab <course code> <academic year> [n]
 #                                   unattended, no window, nothing typed: stream API cookie
 #                                   needs and Webex re-login (RECMAN_PROBE_LAB_WAIT_MINUTES, default 10)
@@ -18,6 +18,11 @@
 #                                   page loads, recordings counted, WebKit memory, whether the
 #                                   session cookies changed. Numbers only; never shows a window.
 #                                   CONTACTS POLIMI: only with the owner's go. --dry-run: no network.
+#   scripts/recman-probe.sh webeep [course code] [academic year]
+#                                   issue #234: sign in to WeBeep in a window as the app does, then
+#                                   try the archive from only the cookies that sign-in left, with
+#                                   no window: ENTERED archive or NEEDS SIGN-IN. On success saves
+#                                   the session as cold does. CONTACTS POLIMI: run by hand only.
 #   scripts/recman-probe.sh clean                                delete the saved session
 #
 # e.g. scripts/recman-probe.sh cold 058167 2026, then scripts/recman-probe.sh warm 058167 2026.
@@ -31,9 +36,9 @@ set -euo pipefail
 mode="${1:-}"
 state="${TMPDIR:-/tmp}/beepbar-recman-probe"
 case "$mode" in
-  cold|warm|play|lab|sync) ;;
+  cold|warm|play|lab|sync|webeep) ;;
   clean) rm -rf "$state"; echo "deleted $state"; exit 0 ;;
-  *) sed -n '2,29p' "$0" | sed 's/^# \{0,1\}//'; exit 2 ;;
+  *) sed -n '2,33p' "$0" | sed 's/^# \{0,1\}//'; exit 2 ;;
 esac
 shift
 
@@ -58,6 +63,13 @@ if [ "$mode" = sync ]; then
     if ! [[ "${args[$((i+1))]}" =~ ^[0-9]{4}$ ]]; then echo "not a 4-digit academic year (value withheld)" >&2; sync_usage >&2; exit 2; fi
     i=$((i+2))
   done
+fi
+
+# webeep: same early check for the optional course (both or neither).
+if [ "$mode" = webeep ]; then
+  if [ "$#" -ne 0 ] && { [ "$#" -ne 2 ] || ! [[ "$1" =~ ^[0-9]{6}$ ]] || ! [[ "$2" =~ ^[0-9]{4}$ ]]; }; then
+    echo "webeep takes either nothing or a 6-digit course code and a 4-digit academic year" >&2; exit 2
+  fi
 fi
 
 here="$(cd "$(dirname "$0")" && pwd)"
@@ -90,6 +102,7 @@ swiftc -swift-version 6 -O \
   "$here/recman-probe/webex.swift" \
   "$here/recman-probe/lab.swift" \
   "$here/recman-probe/sync.swift" \
+  "$here/recman-probe/webeep.swift" \
   "${core_files[@]}" \
   "$root/Sources/BeepbarCore/Localization/AppLanguage.swift" \
   "$root/Sources/BeepbarApp/RecmanScripts.swift" \

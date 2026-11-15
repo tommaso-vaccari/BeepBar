@@ -468,6 +468,31 @@ struct RecordingsListing: Equatable {
     /// The WeBeep account the cookies in the browser belong to: read from the saved session, or
     /// the account connected when the user signed in. The session is saved under this id only.
     private var sessionOwner: Int?
+
+    /// A Polimi session handed over by the WeBeep sign-in (#234): the `polimi.it` cookies that
+    /// window's store held when the token arrived, which Polimi's single sign-on accepts for the
+    /// archive without a second login (checked live, 2026-11-15).
+    ///
+    /// Invariants, each guarded by `RecordingsControllerTests`:
+    /// - **Memory only.** Nothing is written when it is offered. `recordings-session.plist` is
+    ///   written only by `saveSession`, after the archive was actually entered with it, so the
+    ///   ten days of that file start there.
+    /// - **Bound to one identity.** It names the WeBeep account it was made for (`owner`, the
+    ///   verified one) and the vault epoch at delivery; `usableCandidate` drops it when the
+    ///   feature is off, the account is not that owner or the epoch moved.
+    /// - **Used once.** Taken the moment a browser is opened with it (`consumeCandidate`) and
+    ///   also dropped by a successful save (the file then holds a newer session), turn-off, an
+    ///   account change and logout. A failed entry therefore never retries with it.
+    /// - It only stands in for the saved file's cookies in `savedCookies`; it never touches the
+    ///   file, the discard flag or the quit path.
+    private struct SessionCandidate {
+        let serial: Int
+        let cookies: [HTTPCookie]
+        let owner: Int
+        var epoch: Int
+    }
+    private var sessionCandidate: SessionCandidate?
+    private var sessionCandidates = 0
     /// The saved session as read for the current opening cycle, shared by the first visit's check,
     /// the worker and a sign-in so the file is read once, not once per caller. Forgotten when the
     /// browser closes (the next opening reads again), when the file is discarded, after a save
@@ -927,7 +952,14 @@ struct RecordingsListing: Equatable {
         audioEnhancer?.removeAll()
         studyLoaded = false
         loadStudy()
-        defaults.removeObject(forKey: Self.enabledKey)
+        // An explicit "off" is the user's choice and outlives a logout and a site change (#234):
+        // removing it would turn the archive back on at the next login, and the first sync would
+        // enter it in the background. Anything else goes back to the default (on).
+        if defaults.object(forKey: Self.enabledKey) as? Bool != false {
+            defaults.removeObject(forKey: Self.enabledKey)
+        }
+        // Logout, site change and the switch all come through here (#234).
+        sessionCandidate = nil
         discardSessionFile()
     }
 
@@ -949,9 +981,13 @@ struct RecordingsListing: Equatable {
 
     private func runSignIn(_ generation: Int, freshSession: Bool) async {
         let browser = currentBrowser()
-        let cookies = await savedCookies()
+        let saved = await savedSession()
         guard generation == self.generation else { return }
-        await browser.open(cookies: freshSession ? [] : cookies)
+        // `freshSession` (the saved session lapsed) rules out the file only: a candidate is the
+        // login the student has just made, so it is tried first and the window appears only if
+        // Polimi still asks for the user (#234).
+        await browser.open(cookies: saved.candidateSerial != nil || !freshSession ? saved.cookies : [])
+        consumeCandidate(saved.candidateSerial)
         guard generation == self.generation else { return }
         do {
             try await browser.signIn()
@@ -962,6 +998,7 @@ struct RecordingsListing: Equatable {
             access = .needsSignIn(error is CancellationError ? nil : RecordingsProblem(error))
             log.notice("Polimi sign-in ended without the archive cancelled=\(error is CancellationError, privacy: .public)")
             if visiblePages == 0 { closeBrowser() }
+            returnToReadyForCandidate()
             return
         }
         guard generation == self.generation else { return }
@@ -1002,6 +1039,10 @@ struct RecordingsListing: Equatable {
         }
         resumePoints = nil
         Self.forgetResumePoints(in: defaults, notOwnedBy: userID)
+        // Before the guard below, which can return: a candidate made for another account must not
+        // outlive the change, whether or not a session or memory is dropped (#234). The sign-in
+        // delivers the new account's candidate only after this has run (`completeLogin`).
+        if let owner = sessionCandidate?.owner, owner != userID { sessionCandidate = nil }
         let foreignSession = sessionOwner.map { $0 != userID } ?? false
         let unattributedMemory = sessionOwner == nil && (browser != nil || !playbackURLs.isEmpty
             || !watchProgress.known.isEmpty || listings.values.contains { $0.recordings != nil })
@@ -1031,6 +1072,11 @@ struct RecordingsListing: Equatable {
         visiblePages += 1
         // Keep launch and disabled recordings quiet; check only the first visit, before refresh
         // can open WebKit. Later visits must preserve a session established by explicit sign-in.
+        startInitialSessionCheckIfDue()
+    }
+
+    /// The first check of the saved session, when the feature is ready and none has run yet.
+    private func startInitialSessionCheckIfDue() {
         guard isEnabled, access == .ready, !hasCheckedInitialSession else { return }
         let check = beginInitialSessionCheck()
         // Not tied to `generation`: closing the page while the file is read must not lose the
@@ -1126,6 +1172,7 @@ struct RecordingsListing: Equatable {
         }
         invalidate()
         closeBrowser()
+        returnToReadyForCandidate()
     }
 
     /// Whether a sync refresh is still waiting for its courses (`refreshForSync`).
@@ -1740,10 +1787,16 @@ struct RecordingsListing: Equatable {
 
     private func drain(_ generation: Int) async {
         let browser = currentBrowser()
+        // The same account's saved cookies, tried once if the entry with a fresh candidate is
+        // refused: a login that Polimi does not honour must not cost a file that still works.
+        var fileFallback: [HTTPCookie] = []
         if !browser.isOpen {
-            let cookies = await savedCookies()
+            let saved = await savedSession()
             guard generation == self.generation else { return }
-            await browser.open(cookies: cookies)
+            await browser.open(cookies: saved.cookies)
+            // Taken by this opening, whatever the entry's outcome (#234).
+            consumeCandidate(saved.candidateSerial)
+            if saved.candidateSerial != nil { fileFallback = saved.fileCookies }
         }
         guard generation == self.generation else { return }
         var succeeded = false
@@ -1804,6 +1857,16 @@ struct RecordingsListing: Equatable {
             } catch {
                 guard generation == self.generation else { return }
                 if case .open(_, _, let request) = job, request != openingRequest { continue }
+                if case RecmanBrowserError.needsSignIn = error, !fileFallback.isEmpty {
+                    let cookies = fileFallback
+                    fileFallback = []
+                    runningKey = nil
+                    browser.close()
+                    await browser.open(cookies: cookies)
+                    guard generation == self.generation else { return }
+                    queue.insert(job, at: 0)
+                    continue
+                }
                 runningKey = nil
                 let outcome = handle(error, of: job)
                 if outcome == .next { continue }
@@ -3442,7 +3505,110 @@ struct RecordingsListing: Equatable {
     /// decoded, or that belongs to another known account, is deleted; one that can't be read
     /// right now (a disk error) is kept for the next try. Read off the main actor, once per
     /// opening cycle: later callers in the same cycle share the first read.
-    private func savedCookies() async -> [HTTPCookie] {
+    private func savedCookies() async -> [HTTPCookie] { await savedSession().cookies }
+
+    /// What `savedSession` found: the cookies to open the browser with, the serial of the
+    /// candidate they are (nil when they are the file's), and the file's own cookies.
+    private struct SavedSession {
+        var cookies: [HTTPCookie]
+        var candidateSerial: Int?
+        var fileCookies: [HTTPCookie]
+    }
+
+    /// The file now holds a session at least as new as a candidate of the same account (#234):
+    /// it is not tried again. Only for the identity the save belongs to: a save that finishes
+    /// after an account change (another epoch, another owner) must not take the new account's
+    /// candidate with it.
+    private func retireCandidate(afterSavingFor owner: Int, epoch: Int) {
+        if vault.epoch == epoch, sessionCandidate?.owner == owner { sessionCandidate = nil }
+    }
+
+    /// Drops the candidate that a browser opening used, and only that one: a newer candidate
+    /// that arrived while the file was being read stays for the next opening.
+    private func consumeCandidate(_ serial: Int?) {
+        if let serial, sessionCandidate?.serial == serial { sessionCandidate = nil }
+    }
+
+    private func savedSession() async -> SavedSession {
+        // Checked before the read: a read that discards a file of another account (`adopt`) bumps
+        // the epoch for a candidate that is not affected, as it names the current account.
+        let offered = usableCandidate()
+        let fromFile = await savedFileCookies()
+        // After the read, an identity change (turn-off, account change, a consumption) has
+        // already cleared the candidate itself, so only that is checked again.
+        guard let offered, let current = sessionCandidate, current.serial == offered.serial,
+              isEnabled, ownerUserID() == current.owner else { return SavedSession(cookies: fromFile, candidateSerial: nil, fileCookies: fromFile) }
+        // The file was still read above, for its owner and its email (`adopt`), so a save keeps
+        // what the student confirmed; only the cookies come from the sign-in.
+        sessionOwner = current.owner
+        return SavedSession(cookies: current.cookies, candidateSerial: current.serial, fileCookies: fromFile)
+    }
+
+    /// A Polimi session from the WeBeep sign-in, delivered once the token was validated and
+    /// stored (#234). Only a Polimi account with the feature on keeps it, and only its `polimi.it`
+    /// cookies that haven't expired (`sessionCookies`): the rest never leave this call. Replaces
+    /// an earlier candidate. Nothing is written and nothing starts: the next opening of the
+    /// browser (the page, or a sync's listings refresh) enters the archive with it, or finds
+    /// that it doesn't open and asks for the sign-in as before.
+    func offerSessionCandidate(_ cookies: [HTTPCookie], owner: Int) {
+        sessionCandidate = nil
+        guard isEnabled, isAvailable(), ownerUserID() == owner else { return }
+        let kept = Self.sessionCookies(from: cookies, now: now())
+        guard !kept.isEmpty else { return }
+        sessionCandidates += 1
+        sessionCandidate = SessionCandidate(serial: sessionCandidates, cookies: kept, owner: owner, epoch: vault.epoch)
+        // A page that already asked for the sign-in (an account change, a lapsed or refused
+        // session, a tab open before the WeBeep login) has the candidate to try: back to ready,
+        // with the first check armed again, so the next page or sync refresh enters on its own.
+        // Not while a sign-in runs or a browser is open: those have their own course.
+        returnToReadyForCandidate()
+    }
+
+    /// A usable candidate while the page waits for the sign-in (`.needsSignIn`) with nothing
+    /// running and no browser open: back to ready with the first check armed again, so the next
+    /// page or sync refresh enters with it. Called when the candidate arrives and when a sign-in
+    /// or a browser that was in the way ends (a candidate offered meanwhile found them busy).
+    /// With the page on screen nobody else would restart the check, so it starts now and the
+    /// page's keys are queued by its answer, as `pageAppeared` does.
+    private func returnToReadyForCandidate() {
+        guard usableCandidate() != nil, case .needsSignIn = access, signInTask == nil,
+              !(browser?.isOpen ?? false) else { return }
+        access = .ready
+        hasCheckedInitialSession = false
+        if visiblePages > 0 { startInitialSessionCheckIfDue() }
+    }
+
+    /// Back on after a logout, a university change or an account change turned it off in this
+    /// launch, when a validated WeBeep sign-in on Polimi finds the stored choice still on (the
+    /// default): the state a normal launch would have, with no window and no sign-in started
+    /// (#234). A switch the user turned off stays off, and so does anything but Polimi.
+    func resumeIfSwitchedOn() {
+        guard !isEnabled, isAvailable(), ownerUserID() != nil,
+              Self.storedEnabled(in: defaults, isAvailable: true) else { return }
+        isEnabled = true
+        access = .ready
+        hasCheckedInitialSession = false
+        // `siteInfo`'s account change ran with the feature off: the study state is read now.
+        loadStudy()
+    }
+
+    /// What of a sign-in window's cookies may be kept as a session candidate or in the session
+    /// file: exactly `RecmanSessionCodec.keeps` (live `polimi.it` and Webex families).
+    nonisolated static func sessionCookies(from cookies: [HTTPCookie], now: Date) -> [HTTPCookie] {
+        cookies.filter { RecmanSessionCodec.keeps($0, now: now) }
+    }
+
+    /// Whether a candidate is offered now and still describes the connected identity.
+    private func usableCandidate() -> SessionCandidate? {
+        guard let candidate = sessionCandidate else { return nil }
+        guard isEnabled, vault.epoch == candidate.epoch, ownerUserID() == candidate.owner else {
+            sessionCandidate = nil
+            return nil
+        }
+        return candidate
+    }
+
+    private func savedFileCookies() async -> [HTTPCookie] {
         if defaults.bool(forKey: Self.sessionDiscardedKey) {
             retryObsoleteSessionDeletion()
             emailLoaded = true
@@ -3461,6 +3627,16 @@ struct RecordingsListing: Equatable {
         }
         sessionLoad = (id, task)
         return await task.value
+    }
+
+    /// Deletes a saved file that is not usable for the connected account (undecodable, or another
+    /// account's) from `adopt`. The deletion bumps the vault epoch, but it is not an identity
+    /// change: a candidate made for the connected account (#234) is the account's own and must
+    /// outlive it, so its epoch follows. Without this a stale file left by a previous account
+    /// cost the new sign-in its candidate on the next look in the same cycle.
+    private func discardUnusableFile() {
+        discardSessionFile()
+        if sessionCandidate?.owner == ownerUserID() { sessionCandidate?.epoch = vault.epoch }
     }
 
     /// Applies a finished read on the main actor, unless turn-off, logout or an account change
@@ -3484,7 +3660,7 @@ struct RecordingsListing: Equatable {
             log.notice("Saved Polimi session unreadable: dropped")
             legacySeen = .init(ids: [], baselines: [])
             discardLegacyDefaults()
-            discardSessionFile()
+            discardUnusableFile()
             return []
         case .session(let saved):
             snapshot = saved
@@ -3497,7 +3673,7 @@ struct RecordingsListing: Equatable {
             forgetSeen()
             forgetResumePoints()
             forgetEmailOptOut()
-            discardSessionFile()
+            discardUnusableFile()
             return []
         }
         sessionOwner = snapshot.ownerUserID
@@ -3545,6 +3721,7 @@ struct RecordingsListing: Equatable {
         let keepFileEmail = !emailLoaded && !emailEditedByUser
         switch await vault.save(cookies, ownerUserID: owner, email: confirmedEmail?.value, keepingFileEmail: keepFileEmail, epoch: epoch, now: now()).value {
         case .saved:
+            retireCandidate(afterSavingFor: owner, epoch: epoch)
             scheduleSessionExpiration()
             // The epoch alone proves the file now holds the current identity's session, so the
             // discard flag goes whatever the generation: a newer sign-in started during the write
@@ -3558,6 +3735,7 @@ struct RecordingsListing: Equatable {
             // The cycle's cached read now describes an older file.
             sessionLoad = nil
         case .unchanged:
+            retireCandidate(afterSavingFor: owner, epoch: epoch)
             if vault.epoch == epoch, defaults.bool(forKey: Self.sessionDiscardedKey) {
                 defaults.removeObject(forKey: Self.sessionDiscardedKey)
                 defaults.removeObject(forKey: Self.sessionDeletionPendingKey)

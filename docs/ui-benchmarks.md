@@ -73,7 +73,7 @@ There is a fixed 300ms shown settling period after refresh and 3s after each clo
 not readiness estimates: key/content callbacks provide the reported latencies. A missing key
 window or populated-content marker times out and invalidates the sample; a valid empty window
 cannot substitute for a data row. A reduced/wrong corpus, wrong cycle count, nonfinite timing,
-failed run, Low Power Mode or nonnominal end thermal state invalidates the series. Power is
+failed run, Low Power Mode or nonnominal end thermal state invalidates the series. The console must remain unlocked; locked or unknown console state invalidates the run. Power is
 checked before and after every process and after trace export. These are endpoint checks;
 keep power unchanged throughout the run. Trace failure also fails the command: each required
 trace must be nonempty and readable by Instruments export, identify the successful fixture,
@@ -124,14 +124,49 @@ The target check applies to the observed samples and does not establish the popu
 These results establish tooling evidence, not performance benefits.
 
 **Cross-revision comparisons.** A UI comparison is only possible between revisions that both
-contain this harness. `main` and any `dev` before D07 lack the content-readiness markers, which
-are edits to production views (`HomePage`, `ActivityPage`, `RecordingsPage`, `BeepbarApp`).
+contain this harness. Revisions before D07 lack the content-readiness markers, which are edits to production
+views (`HomePage`, `ActivityPage`, `RecordingsPage`, `BeepbarApp`). Current `main` at
+`07fba3b` contains the original harness and supports the initial-page Activity comparison;
+it does not contain the full-corpus scrolling seam.
 Adding them to an older revision would change its application code, which the
 [comparison rules](benchmarks.md#reproducible-ref-comparisons-single-agent-command) forbid, so
-base-dev → HEAD and main → HEAD UI comparisons against those revisions are **not measured** and
+UI comparisons against those older revisions are **not measured** and
 are never produced by patching. By the owner's decision of 2026-10-11, D07 delivers the tooling
 only: the five-run AC series, 30-minute idle and ten-cycle memory observations were not collected
 as part of D07. Later work runs this command on its own revisions when it needs UI evidence.
+
+## Expanded Activity scrolling (#99)
+
+```sh
+scripts/ui-benchmark.py --ref HEAD --out PerformanceReports/activity-scroll \
+  --scenarios activity-1000 --scroll-all --runs 5 --warmup 1
+```
+
+By the owner's decision of 2026-11-15, 1,000 files in one expanded course is the realistic worst
+case and therefore the acceptance case for #99. `activity-15000` remains available as a stress
+scenario (add it to `--scenarios` to run it); it is not a criterion.
+
+`--scroll-all` requires Activity scenarios and a revision containing the scrolling seam. It
+reveals the complete synthetic corpus before measurement, rather than clicking the pagination
+button. It performs 240 display-link callbacks with normal 48-point steps, a jump to the last
+row and a return to the top. Missing scroll movement, last-row construction, callback samples
+or completion invalidates the run. This establishes construction reachability; it does not
+prove viewport visibility, accessibility or real action behavior. The fixture disables all controls, so the
+measured rows exclude hover tracking and pointer-style costs of enabled rows.
+
+`--unprofiled` produces a diagnostic series without Instruments to quantify profiling overhead
+on the same source revision and corpus. Revisions before `68c5af9` emit `ui.fixtureActivityScroll`
+around a different interval, so the profiled driver rejects their traces. For before/after work
+with such a revision, run both refs unprofiled. The jump to the last row is callback 120 in every
+sample array. Its report explicitly records missing trace/frame
+evidence; do not combine it with a profiled series or present it as compositor validation.
+
+The report preserves synchronous scroll callback work and display-link delivery intervals
+separately, including the worst sample from every process. Neither signal proves compositor
+presentation. The retained Hitches instrument must contain fixture frame updates during the
+single `ui.fixtureActivityScroll` interval; an empty hitch table alone is insufficient evidence.
+Hitch rows with an unresolved zero timing origin make `scrollHitches.valid` false; retain the raw trace and make no hitch-count or presentation claim from it. Hitches and Time Profiler stacks complement these callback measurements. Preserve outliers,
+including the explicit end jump, when assessing the 16ms budget.
 
 ## Tooling verification
 

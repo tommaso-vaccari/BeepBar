@@ -88,7 +88,7 @@ def finite(value):
     return type(value) in (int, float) and math.isfinite(value) and value >= 0
 
 
-def validate_sample(sample, scenario):
+def validate_sample(sample, scenario, scroll_all=False):
     """Refuse missing/invalid samples instead of reporting a success from an empty window."""
     if sample.get("schemaVersion") != 1 or sample.get("scenario") != scenario or sample.get("valid") is not True or sample.get("error") is not None:
         raise ValueError("invalid fixture report for " + scenario)
@@ -118,6 +118,11 @@ def validate_sample(sample, scenario):
             if not isinstance(sample.get(side), dict) or not all(finite(sample[side].get(key)) for key in
                 ("footprintBytes", "cpuNanoseconds", "diskBytesWritten", "logicalBytesWritten", "interruptWakeups", "idleWakeups")):
                 raise ValueError("missing idle counters")
+    if scroll_all:
+        for key, count in (("scrollWorkMilliseconds", 240), ("scrollDeliveryMilliseconds", 239)):
+            values = sample.get(key)
+            if not isinstance(values, list) or len(values) != count or not all(finite(value) for value in values):
+                raise ValueError("missing or invalid scrolling samples")
     return sample
 
 
@@ -126,6 +131,10 @@ def cost_rows(samples, scenario):
     kinds = samples[0]["cycles"][cycle_index]["contentMilliseconds"].keys()
     values = {"window key (ms)": [sample["cycles"][cycle_index]["keyMilliseconds"] for sample in samples]}
     values.update({"first %s (ms)" % kind: [sample["cycles"][cycle_index]["contentMilliseconds"][kind] for sample in samples] for kind in kinds})
+    if samples[0].get("scrollWorkMilliseconds") is not None:
+        for key, label in (("scrollWorkMilliseconds", "scroll synchronous work"), ("scrollDeliveryMilliseconds", "display-link delivery")):
+            values[label + " per-run maximum (ms)"] = [max(sample[key]) for sample in samples]
+            values[label + " per-run median (ms)"] = [statistics.median(sample[key]) for sample in samples]
     rows = []
     for metric, raw in values.items():
         if len(raw) < 5:
@@ -225,7 +234,82 @@ def signpost_summary(path, scenario):
     return names
 
 
-def validate_trace(trace, scenario, cwd, output_prefix):
+def resolved_trace_rows(path):
+    values = {}
+    for _, row in ET.iterparse(path, events=("end",)):
+        if row.tag != "row":
+            continue
+        for value in row.iter():
+            if value.get("id"):
+                values[value.get("id")] = value
+        yield {value.tag: values.get(value.get("ref") or value.get("id"), value) for value in row}
+
+
+def scrolling_interval(path, target_pid):
+    events = []
+    for row in resolved_trace_rows(path):
+        def text(tag):
+            value = row.get(tag)
+            return None if value is None else value.text
+        process = row.get("process")
+        if (text("subsystem") == "io.github.tvaccari.beepbar.performance" and
+                text("category") == "ui" and text("signpost-name") == "ui.fixtureActivityScroll"):
+            if process is None or process.findtext("pid") != target_pid:
+                raise ValueError("scroll interval lacks fixture process")
+            try:
+                timestamp = int(text("event-time"))
+            except (ValueError, TypeError):
+                raise ValueError("invalid scroll interval timestamp") from None
+            events.append((text("event-type"), timestamp, text("os-signpost-identifier")))
+    if (len(events) != 2 or [event[0] for event in events] != ["Begin", "End"] or
+            events[0][1] < 0 or events[1][1] <= events[0][1] or
+            events[0][2] is None or events[0][2] != events[1][2]):
+        raise ValueError("trace requires exactly one complete scroll interval")
+    return events[0][1], events[1][1]
+
+
+def hitches_summary(hitches, updates, target_pid, interval):
+    start, end = interval
+    invalid_hitch_rows = []
+    def matching(path, schema, clip_overlap=False):
+        if not any(value.get("name") == schema for _, value in ET.iterparse(path, events=("end",)) if value.tag == "schema"):
+            raise ValueError("trace lacks required " + schema + " schema")
+        for row in resolved_trace_rows(path):
+            process = row.get("process")
+            if process is None or process.findtext("pid") != target_pid:
+                continue
+            try:
+                timestamp = int(row["start-time"].text)
+                duration = int(row["duration"].text)
+            except (KeyError, ValueError, TypeError):
+                raise ValueError("invalid fixture Hitches timing") from None
+            if timestamp < 0 or duration < 0:
+                raise ValueError("invalid fixture Hitches timing")
+            if clip_overlap:
+                if timestamp == 0 and duration > 0:
+                    invalid_hitch_rows.append({"startNanoseconds": timestamp, "durationNanoseconds": duration})
+                    continue
+                overlap = min(timestamp + duration, end) - max(timestamp, start)
+                if overlap > 0:
+                    yield max(timestamp, start), overlap
+            elif start <= timestamp < end:
+                yield timestamp, duration
+    frames = list(matching(updates, "hitches-updates"))
+    if not frames:
+        raise ValueError("trace has no fixture frame updates during scrolling")
+    durations = [duration / 1_000_000 for _, duration in matching(hitches, "hitches", clip_overlap=True)]
+    if invalid_hitch_rows:
+        return {"valid": False, "reason": "fixture hitch rows have an unresolved zero timing origin",
+                "fixtureUpdatesDuringScroll": len(frames), "invalidHitchRows": invalid_hitch_rows,
+                "scrollStartNanoseconds": start, "scrollEndNanoseconds": end}
+    return {"valid": True, "fixtureUpdatesDuringScroll": len(frames), "fixtureHitchesDuringScroll": len(durations),
+            "hitchDurationScope": "overlap clipped to scroll interval",
+            "hitchDurationsMilliseconds": durations, "totalHitchMilliseconds": sum(durations),
+            "maximumHitchMilliseconds": max(durations, default=0),
+            "scrollStartNanoseconds": start, "scrollEndNanoseconds": end}
+
+
+def validate_trace(trace, scenario, cwd, output_prefix, scroll_all=False):
     if not trace.is_dir() or not any(path.is_file() and path.stat().st_size > 0 for path in trace.rglob("*")):
         raise ValueError("missing or empty required trace")
     toc = output_prefix.with_suffix(".toc.xml")
@@ -234,13 +318,34 @@ def validate_trace(trace, scenario, cwd, output_prefix):
     command(["xcrun", "xctrace", "export", "--input", str(trace), "--toc", "--output", str(toc)], cwd,
             output_prefix.with_suffix(".toc.log"), timeout=60)
     pid = trace_target(toc)
-    for schema, output in (("time-profile", profile), ("os-signpost", signposts)):
+    exports = [("time-profile", profile), ("os-signpost", signposts)]
+    if scroll_all:
+        exports += [("hitches", output_prefix.with_suffix(".hitches.xml")),
+                    ("hitches-updates", output_prefix.with_suffix(".updates.xml"))]
+    for schema, output in exports:
         command(["xcrun", "xctrace", "export", "--input", str(trace), "--xpath",
                  "/trace-toc/run[@number='1']/data/table[@schema='%s']" % schema, "--output", str(output)], cwd,
                 output.with_suffix(".log"), timeout=180)
     result = profile_summary(profile, pid)
     result["uiSignposts"] = signpost_summary(signposts, scenario)
+    if scroll_all:
+        interval = scrolling_interval(signposts, pid)
+        result["scrollHitches"] = hitches_summary(output_prefix.with_suffix(".hitches.xml"),
+                                                output_prefix.with_suffix(".updates.xml"), pid, interval)
     return result
+
+
+def require_unlocked_console(repo):
+    # Read only the root IORegistry key (as plist): a substring match could also hit a nested
+    # per-session entry while the active console is locked (fast user switching).
+    state = command(["ioreg", "-n", "Root", "-d1", "-a"], repo)
+    try:
+        roots = plistlib.loads(state.encode())
+    except Exception:
+        roots = None
+    root = roots[0] if isinstance(roots, list) and roots else roots
+    if not isinstance(root, dict) or root.get("IOConsoleLocked") is not False:
+        raise RuntimeError("UI measurements require an unlocked console")
 
 
 def power(repo):
@@ -260,12 +365,13 @@ def run(args):
     base_sha = command(["git", "rev-parse", "origin/dev^{commit}"], repo)
     xcode = command(["xcodebuild", "-version"], repo)
     trace_version = command(["xcrun", "xctrace", "version"], repo)
+    require_unlocked_console(repo)
     initial_power = power(repo)
     out = args.out.resolve()
     out.mkdir(parents=True, exist_ok=False)
     series = {"schemaVersion": 1, "valid": False, "sourceSHA": sha, "mainSHA": main_sha,
               "baseDevSHA": base_sha, "runs": args.runs, "warmup": args.warmup,
-              "scenarios": args.scenarios, "driverSHA256": hashlib.sha256(Path(__file__).read_bytes()).hexdigest(),
+              "scenarios": args.scenarios, "scrollAll": args.scroll_all, "instrumentation": "none" if args.unprofiled else "Time Profiler and signposts" + (" and Hitches" if args.scroll_all else ""), "driverSHA256": hashlib.sha256(Path(__file__).read_bytes()).hexdigest(),
               "xcode": xcode, "xctrace": trace_version, "machine": platform.machine(),
               "macOS": command(["sw_vers"], repo), "model": command(["sysctl", "-n", "hw.model"], repo),
               "memoryBytes": command(["sysctl", "-n", "hw.memsize"], repo), "power": initial_power,
@@ -277,6 +383,8 @@ def run(args):
                 "Only synthetic known-content offline refresh is covered; persisted cold offline restoration remains D10.",
                 "Idle runs once, unprofiled, for 30 minutes; real scheduled checks are disabled and count zero by construction.",
                 "Five measured runs cannot establish a reliable p95. Manual scrolling/actions remain required."]}
+    if args.unprofiled:
+        series["limitations"].append("Unprofiled diagnostic series: no trace, frame-update or hitch evidence. Compare with a profiled series at the same source SHA; callback work does not prove compositor frame time.")
     results = {}
     try:
         with tempfile.TemporaryDirectory(prefix="BeepbarUIBuild-") as temporary:
@@ -315,6 +423,9 @@ def run(args):
                 raise RuntimeError("not an arm64 fixture")
             fixture_parent = root / "fixtures"; fixture_parent.mkdir()
             fixture_env = dict(os.environ, BEEPBAR_UI_FIXTURE_TEMP_ROOT=str(fixture_parent))
+            fixture_env.pop("BEEPBAR_UI_SCROLL_ALL", None)
+            if args.scroll_all:
+                fixture_env["BEEPBAR_UI_SCROLL_ALL"] = "1"
             for scenario in args.scenarios:
                 scenario_out = out / scenario; scenario_out.mkdir()
                 # Idle is a single distinct 30-minute observation, never repeated as short UI samples.
@@ -325,21 +436,25 @@ def run(args):
                     report = scenario_out / (name + ".json")
                     stdout = scenario_out / (name + ".stdout.log")
                     launch = [str(executable), "--scenario", scenario, "--report", str(report)]
-                    if scenario != "idle":
+                    if scenario != "idle" and not args.unprofiled:
                         trace = scenario_out / (name + ".trace")
                         launch = ["xcrun", "xctrace", "record", "--template", "Time Profiler", "--instrument", "os_signpost", "--output", str(trace), "--target-stdout", str(stdout), "--env", "BEEPBAR_UI_FIXTURE_TEMP_ROOT=" + str(fixture_parent), "--launch", "--"] + launch
+                        if args.scroll_all:
+                            launch[launch.index("--launch"):launch.index("--launch")] = ["--instrument", "Hitches", "--env", "BEEPBAR_UI_SCROLL_ALL=1"]
+                    require_unlocked_console(repo)
                     if power(repo) != initial_power:
                         raise RuntimeError("power source changed")
                     print("%s %s" % (scenario, name), flush=True)
                     started = time.time()
                     command(launch, source, scenario_out / (name + ".log"), timeout=1900 if scenario == "idle" else 180, env=fixture_env)
                     series["commands"].append({"argv": launch, "elapsedSeconds": time.time() - started, "exit": 0})
+                    require_unlocked_console(repo)
                     # A final idle run must not make a series valid after switching to battery.
                     validate_power_source(initial_power, power(repo))
-                    if scenario != "idle":
-                        series["commands"][-1]["trace"] = validate_trace(trace, scenario, source, scenario_out / name)
+                    if scenario != "idle" and not args.unprofiled:
+                        series["commands"][-1]["trace"] = validate_trace(trace, scenario, source, scenario_out / name, args.scroll_all)
                         validate_power_source(initial_power, power(repo))
-                    sample = validate_sample(json.loads(report.read_text()), scenario)
+                    sample = validate_sample(json.loads(report.read_text()), scenario, args.scroll_all)
                     if not warmup:
                         samples.append(sample)
                 results[scenario] = samples
@@ -387,9 +502,13 @@ def main():
     parser.add_argument("--warmup", default=1, type=count)
     parser.add_argument("--scenarios", nargs="+", choices=SCENARIOS, default=list(SCENARIOS))
     parser.add_argument("--dependency-cache", type=Path)
+    parser.add_argument("--unprofiled", action="store_true", help="diagnostic timings without Instruments; no frame or trace evidence")
+    parser.add_argument("--scroll-all", action="store_true", help="scroll all revealed Activity rows and retain the Hitches instrument")
     args = parser.parse_args()
     if len(args.scenarios) != len(set(args.scenarios)):
         parser.error("duplicate scenarios")
+    if args.scroll_all and any(not name.startswith("activity-") for name in args.scenarios):
+        parser.error("--scroll-all requires Activity scenarios only")
     try:
         run(args)
     except (RuntimeError, OSError, ValueError, ET.ParseError, subprocess.SubprocessError) as error:

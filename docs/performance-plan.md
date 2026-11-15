@@ -420,25 +420,9 @@ Misure sintetiche Release arm64, M5/32 GB, AC, una warm-up e sette run: D04, cor
 
 ## Lavoro aperto e issue
 
-[Tracker di consegna](https://github.com/tommaso-vaccari/BeepBar/issues/116). Gli assegnatari correnti e le prese in carico sono nelle singole issue; concordare eventuali riassegnazioni prima di lavorare.
+Il lavoro aperto, il backlog, gli assegnatari e lo stato operativo sono solo nelle [issue aperte su GitHub](https://github.com/tommaso-vaccari/BeepBar/issues): questo piano non ne tiene un elenco, perché una copia qui diventa obsoleta. Prima di scegliere un lavoro consultare le issue e concordare eventuali riassegnazioni.
 
-| Task | Branch | Dipendenze | Issue |
-|---|---|---|---|
-| I9d | `perf/recordings-play-priority` | D07 | [#107](https://github.com/tommaso-vaccari/BeepBar/issues/107) |
-| R07 | `docs/recordings-live-validation` | Nessuna | [#115](https://github.com/tommaso-vaccari/BeepBar/issues/115) |
-
-D10, D12, I1, I9b e R06 sono integrate (tabella «Consegne integrate»). D13 ([#101](https://github.com/tommaso-vaccari/BeepBar/issues/101)) è stata chiusa dal proprietario il 2026-10-10: non è una consegna separata, le evidenze restano nelle singole PR e in questo piano.
-
-## Backlog già esistente
-
-Non duplicare queste issue. Prima di avviarle ricontrollare lo stato su dev: alcune richieste possono essere già soddisfatte; le estensioni di prodotto restano separate dai fix di performance.
-
-- [#88 — Streamline CI while preserving validation and release behavior](https://github.com/tommaso-vaccari/BeepBar/issues/88)
-- [#87 — Allow downloading recordings for offline viewing](https://github.com/tommaso-vaccari/BeepBar/issues/87)
-- [#70 — Mettere in quarantena i file scaricati, come fanno i browser](https://github.com/tommaso-vaccari/BeepBar/issues/70)
-- [#64 — Interruttore in Impostazioni per disattivare le notifiche (attive di default)](https://github.com/tommaso-vaccari/BeepBar/issues/64)
-- [#56 — Uniformare il nome in BeepBar: testo dell'app, link e README](https://github.com/tommaso-vaccari/BeepBar/issues/56)
-- [#8 — Extend beyond WeBeep to general Moodle instances](https://github.com/tommaso-vaccari/BeepBar/issues/8)
+Il tracker di consegna [#116](https://github.com/tommaso-vaccari/BeepBar/issues/116) è chiuso dal 2026-10-21 e non ha un successore. Le consegne concluse restano documentate nella tabella «Consegne integrate» e nelle sezioni di questo piano.
 
 ## Schede operative
 

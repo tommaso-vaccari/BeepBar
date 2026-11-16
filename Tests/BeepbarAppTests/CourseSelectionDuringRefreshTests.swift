@@ -85,6 +85,55 @@ struct CourseSelectionDuringRefreshTests {
         #expect(controller.enabledCourseIDs == [1])
     }
 
+    /// Logout clears the cache after earlier scope work; later queries may populate it again.
+    @Test @MainActor func logoutClearsPreparedStatementsAfterPendingScopeWrites() async throws {
+        let root = FileManager.default.temporaryDirectory.appending(path: UUID().uuidString, directoryHint: .isDirectory)
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let database = try SyncDatabase(url: root.appending(path: "state.sqlite"))
+        let rootID = UUID()
+        try await database.registerRoot(id: rootID, canonicalPath: root.path)
+        let controller = WeBeepAuthenticationController(testRootURL: root, database: database, rootID: rootID, deleteCredential: {})
+        let release = AsyncStream<Void>.makeStream()
+        let write = Task {
+            for await _ in release.stream { break }
+            try? await database.upsertScope(SyncScope(rootID: rootID, courseID: 1, displayName: "Course", localFolder: "Course", enabled: true))
+        }
+        controller.setScopeWriteTaskForTesting(write)
+        controller.signOut()
+        #expect(await database.statementCacheCounters().cached > 0)
+        release.continuation.yield()
+        await controller.waitForScopeWritesForTesting()
+        #expect(await database.statementCacheCounters().cached == 0)
+        #expect(try await database.scope(rootID: rootID, courseID: 1)?.enabled == true)
+        #expect(await database.statementCacheCounters().cached > 0)
+    }
+
+    /// Changing site clears the statements after the preceding selection write and site cleanup.
+    @Test @MainActor func changingSiteClearsPreparedStatementsAfterPendingScopeWrites() async throws {
+        let root = FileManager.default.temporaryDirectory.appending(path: UUID().uuidString, directoryHint: .isDirectory)
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let database = try SyncDatabase(url: root.appending(path: "state.sqlite"))
+        let rootID = UUID()
+        try await database.registerRoot(id: rootID, canonicalPath: root.path)
+        let controller = WeBeepAuthenticationController(testRootURL: root, database: database, rootID: rootID)
+        controller.setDisconnectedForTesting()
+        let release = AsyncStream<Void>.makeStream()
+        let write = Task {
+            for await _ in release.stream { break }
+            try? await database.upsertScope(SyncScope(rootID: rootID, courseID: 1, displayName: "Course", localFolder: "Course", enabled: true))
+        }
+        controller.setScopeWriteTaskForTesting(write)
+        controller.selectSite(MoodleSite.unipd[0])
+        #expect(controller.selectedSite == MoodleSite.unipd[0])
+        #expect(await database.statementCacheCounters().cached > 0)
+        release.continuation.yield()
+        await controller.waitForScopeWritesForTesting()
+        #expect(await database.statementCacheCounters().cached == 0)
+        #expect(try await database.scope(rootID: rootID, courseID: 1)?.enabled == false)
+    }
+
     @Test @MainActor func refreshWaitsForPendingCourseSelectionWrite() async throws {
         let root = FileManager.default.temporaryDirectory.appending(path: UUID().uuidString, directoryHint: .isDirectory)
         try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)

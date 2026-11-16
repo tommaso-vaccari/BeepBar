@@ -340,6 +340,46 @@ struct LoginFeedbackTests {
         #expect(!FileManager.default.fileExists(atPath: absentTokenRoot.path))
     }
 
+    /// A successful sign-in invalidates SQL after earlier writes, before the held course refresh.
+    @Test @MainActor func successfulLoginClearsPreparedStatementsAfterPendingScopeWrites() async throws {
+        let root = FileManager.default.temporaryDirectory.appending(path: UUID().uuidString, directoryHint: .isDirectory)
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let database = try SyncDatabase(url: root.appending(path: "state.sqlite"))
+        let rootID = UUID()
+        try await database.registerRoot(id: rootID, canonicalPath: root.path)
+        let configuration = URLSessionConfiguration.ephemeral
+        configuration.protocolClasses = [LoginFeedbackProtocol.self]
+        let session = URLSession(configuration: configuration)
+        defer { session.invalidateAndCancel() }
+        let gate = LoginSuspension(outcome: "success", coursesOnly: true)
+        defer { gate.open() }
+        let token = UUID().uuidString
+        LoginFeedbackProtocol.suspensions.withLock { $0[token] = gate }
+        defer { _ = LoginFeedbackProtocol.suspensions.withLock { $0.removeValue(forKey: token) } }
+        let vault = CredentialVault(read: { _ in throw CredentialStorageError.absent }, write: { _ in })
+        let controller = WeBeepAuthenticationController(testRootURL: root, database: database, rootID: rootID, apiClient: WeBeepAPIClient(session: session), credentialVault: vault)
+        controller.setDisconnectedForTesting()
+        let release = AsyncStream<Void>.makeStream()
+        defer { release.continuation.yield() }
+        let write = Task {
+            for await _ in release.stream { break }
+            try? await database.upsertScope(SyncScope(rootID: rootID, courseID: 1, displayName: "Course", localFolder: "Course", enabled: true))
+        }
+        controller.setScopeWriteTaskForTesting(write)
+        let login = Task { await controller.completeLoginForTesting(callback(token)) }
+        var started = gate.started.stream.makeAsyncIterator()
+        _ = await started.next()
+        #expect(controller.hasStoredCredential)
+        #expect(await database.statementCacheCounters().cached > 0)
+        release.continuation.yield()
+        await controller.waitForScopeWritesForTesting()
+        #expect(await database.statementCacheCounters().cached == 0)
+        gate.open()
+        await login.value
+        #expect(try await database.scope(rootID: rootID, courseID: 1)?.enabled == true)
+    }
+
     @Test @MainActor func successfulCallbackWaitsForSpawnedCourseRefresh() async throws {
         let configuration = URLSessionConfiguration.ephemeral
         configuration.protocolClasses = [LoginFeedbackProtocol.self]

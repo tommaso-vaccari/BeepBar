@@ -672,6 +672,43 @@ public actor FileStore {
         return StageHandle(name: name, identity: try Self.identity(of: stage), relativePath: try RelativePath(internal: ".beepbar/staging/\(name)"))
     }
 
+    /// Creates a stage exactly as `createStage()` does (same name, flags and 0600 mode, so the
+    /// installed file gets the same permissions as before) but returns the open read-write
+    /// descriptor too, so `RemoteDownloader` can write the response body straight into it (#250).
+    /// The caller owns the descriptor and must close it. On any error here the descriptor is
+    /// closed and the stage is removed.
+    func openDownloadStage() throws -> (StageHandle, Int32) {
+        let staging = try directoryFD(for: [".beepbar", "staging"], create: true)
+        defer { close(staging) }
+        let name = UUID().uuidString + ".partial"
+        let fd = openat(staging, name, O_RDWR | O_CREAT | O_EXCL | O_CLOEXEC | O_NOFOLLOW, S_IRUSR | S_IWUSR)
+        guard fd >= 0 else { throw fileStoreError() }
+        do {
+            let handle = StageHandle(name: name, identity: try Self.identity(of: fd), relativePath: try RelativePath(internal: ".beepbar/staging/\(name)"))
+            return (handle, fd)
+        } catch {
+            close(fd)
+            unlinkat(staging, name, 0)
+            throw error
+        }
+    }
+
+    /// Hands a completed download over as a `StagedArtifact` (#250).
+    ///
+    /// `sha256` was computed by the downloader from the received bytes in the same pass that wrote
+    /// them, as the previous import computed it from the temporary file it copied; this function
+    /// does not read the contents again. A same-user process writing into the live stage is outside
+    /// the model, exactly as it was on the copy-based path. Before the hand-off it rechecks that the
+    /// path still names the same file (identity) and that its size is the one reported.
+    func downloadedArtifact(_ stage: StageHandle, sha256: String, size: Int64) throws -> StagedArtifact {
+        let staging = try directoryFD(for: [".beepbar", "staging"], create: false)
+        defer { close(staging) }
+        let fd = try openStage(stage, in: staging, flags: O_RDONLY)
+        defer { close(fd) }
+        guard try fileSize(of: fd) == size else { throw FileStoreError.sizeMismatch }
+        return StagedArtifact(name: stage.name, identity: stage.identity, stagePath: stage.relativePath, sha256: sha256, size: size)
+    }
+
     public func write(_ data: Data, to stage: StageHandle) throws {
         let staging = try directoryFD(for: [".beepbar", "staging"], create: false)
         defer { close(staging) }
@@ -683,45 +720,6 @@ public actor FileStore {
                 let count = posixWrite(fd, bytes.baseAddress!.advanced(by: offset), bytes.count - offset)
                 if count < 0, errno == EINTR { continue }
                 guard count > 0 else { throw fileStoreError() }
-                offset += count
-            }
-        }
-    }
-
-    public func importDownloadedFile(at source: URL, expectedSize: Int64, maximumSize: Int64) throws -> StagedArtifact {
-        let trace = PerformanceTrace.shared.begin("filesystem.import", category: .filesystem)
-        defer { PerformanceTrace.shared.end("filesystem.import", category: .filesystem, state: trace) }
-        try Task.checkCancellation()
-        guard expectedSize >= 0, expectedSize <= maximumSize else { throw FileStoreError.tooLarge }
-        let sourceFD = open(source.path, O_RDONLY | O_CLOEXEC | O_NOFOLLOW)
-        guard sourceFD >= 0 else { throw fileStoreError() }
-        defer { close(sourceFD) }
-        try requireRegularFile(sourceFD)
-        guard try fileSize(of: sourceFD) == expectedSize else { throw FileStoreError.sizeMismatch }
-
-        let stage = try createStage()
-        do {
-            let staging = try directoryFD(for: [".beepbar", "staging"], create: false)
-            defer { close(staging) }
-            let stageFD = try openStage(stage, in: staging, flags: O_WRONLY | O_TRUNC)
-            defer { close(stageFD) }
-            let copied = try hashContents(of: sourceFD, copyingTo: stageFD, maximumSize: maximumSize, checksCancellation: true)
-            guard copied.size == expectedSize else { throw FileStoreError.sizeMismatch }
-            guard fsync(stageFD) == 0 else { throw fileStoreError() }
-            return StagedArtifact(name: stage.name, identity: stage.identity, stagePath: stage.relativePath, sha256: copied.sha256, size: copied.size)
-        } catch {
-            try? discard(stage)
-            throw error
-        }
-    }
-
-    private static func write(_ data: Data, to fd: Int32) throws {
-        try data.withUnsafeBytes { bytes in
-            var offset = 0
-            while offset < bytes.count {
-                let count = posixWrite(fd, bytes.baseAddress!.advanced(by: offset), bytes.count - offset)
-                if count < 0, errno == EINTR { continue }
-                guard count > 0 else { throw FileStoreError.ioFailure }
                 offset += count
             }
         }
@@ -852,15 +850,15 @@ public actor FileStore {
         try requireRegularFile(source)
         let stage = try createStage()
         do {
-            let duplicate = dup(source)
-            guard duplicate >= 0 else { throw FileStoreError.ioFailure }
-            let handle = FileHandle(fileDescriptor: duplicate, closeOnDealloc: true)
-            defer { try? handle.close() }
+            let staging = try directoryFD(for: [".beepbar", "staging"], create: false)
+            defer { close(staging) }
+            let destination = try openStage(stage, in: staging, flags: O_WRONLY | O_APPEND)
+            defer { close(destination) }
             var copiedBytes: Int64 = 0
-            try Self.forEachChunk(of: handle) { chunk in
+            try Self.forEachChunk(of: source) { chunk in
                 beforeReadChunk?(true, copiedBytes)
                 try Task.checkCancellation()
-                try write(chunk, to: stage)
+                try Self.write(chunk, to: destination)
                 copiedBytes += Int64(chunk.count)
             }
             let copied = try finalize(stage)
@@ -1084,46 +1082,62 @@ public actor FileStore {
         )
     }
 
-    private func hashContents(of fd: Int32, copyingTo destinationFD: Int32? = nil, maximumSize: Int64? = nil, checksCancellation: Bool) throws -> (sha256: String, size: Int64) {
+    private func hashContents(of fd: Int32, checksCancellation: Bool) throws -> (sha256: String, size: Int64) {
         if checksCancellation { try Task.checkCancellation() }
         hashCount += 1
-        let duplicate = dup(fd)
-        guard duplicate >= 0 else { throw FileStoreError.ioFailure }
-        let handle = FileHandle(fileDescriptor: duplicate, closeOnDealloc: true)
-        defer { try? handle.close() }
-        try handle.seek(toOffset: 0)
+        guard lseek(fd, 0, SEEK_SET) >= 0 else { throw FileStoreError.ioFailure }
         var total: Int64 = 0
         var hash = SHA256()
-        try Self.forEachChunk(of: handle) { chunk in
+        try Self.forEachChunk(of: fd) { chunk in
             beforeReadChunk?(checksCancellation, total)
             if checksCancellation { try Task.checkCancellation() }
             total += Int64(chunk.count)
             bytesHashed += Int64(chunk.count)
-            if let maximumSize, total > maximumSize { throw FileStoreError.tooLarge }
-            hash.update(data: chunk)
-            if let destinationFD { try Self.write(chunk, to: destinationFD) }
+            hash.update(bufferPointer: chunk)
         }
         if checksCancellation { try Task.checkCancellation() }
-        return (hash.finalize().map { String(format: "%02x", $0) }.joined(), total)
+        return (hexSHA256(hash.finalize()), total)
     }
 
-    /// Reads `handle` from its current offset to the end in 1 MiB chunks, each read and handled
-    /// inside its own autorelease pool. Every file read and copy in this store goes through here.
-    ///
-    /// `FileHandle.read(upToCount:)` returns its buffer autoreleased, and a sync runs on a
-    /// cooperative thread whose pool only drains once the whole call returns. Without a pool per
-    /// chunk, every chunk of the file stayed alive until then: updating a 256 MiB file, which then
-    /// read it five times, peaked at about 1 GiB (`large-update` in docs/benchmarks.md). With it, the
-    /// peak stays at a few MiB whatever the size, as the "peak memory independent of file size"
-    /// budget in AGENTS.md requires. The read must stay inside the pool, not in a `while let`
-    /// condition outside it, or its buffer escapes the drain.
-    private static func forEachChunk(of handle: FileHandle, _ body: (Data) throws -> Void) throws {
-        while try autoreleasepool(invoking: {
-            guard let chunk = try handle.read(upToCount: 1 << 20), !chunk.isEmpty else { return false }
-            try body(chunk)
-            return true
-        }) {}
+    /// Reads `fd` from its current offset to the end into one reused 1 MiB buffer and hands each
+    /// chunk to `body` as a raw pointer, valid only during the call (#251). The previous version
+    /// kept memory bounded with a per-chunk autorelease pool, which worked; this removes the
+    /// per-chunk `Data` allocation, the `dup`/`FileHandle` and the pool altogether, so peak memory
+    /// stays a few MiB whatever the file size (the "peak memory independent of file size" budget).
+    private static func forEachChunk(of fd: Int32, _ body: (UnsafeRawBufferPointer) throws -> Void) throws {
+        let capacity = 1 << 20
+        let buffer = UnsafeMutableRawPointer.allocate(byteCount: capacity, alignment: 1)
+        defer { buffer.deallocate() }
+        while true {
+            let count = read(fd, buffer, capacity)
+            if count < 0, errno == EINTR { continue }
+            guard count >= 0 else { throw FileStoreError.ioFailure }
+            guard count > 0 else { return }
+            try body(UnsafeRawBufferPointer(start: buffer, count: count))
+        }
     }
+
+    private static func write(_ bytes: UnsafeRawBufferPointer, to fd: Int32) throws {
+        var offset = 0
+        while offset < bytes.count {
+            let count = posixWrite(fd, bytes.baseAddress!.advanced(by: offset), bytes.count - offset)
+            if count < 0, errno == EINTR { continue }
+            guard count > 0 else { throw FileStoreError.ioFailure }
+            offset += count
+        }
+    }
+}
+
+/// Formats the SHA-256 bytes without allocating a formatted string for each byte (#251).
+func hexSHA256(_ digest: SHA256.Digest) -> String {
+    let digits = Array("0123456789abcdef".utf8)
+    var result = [UInt8]()
+    result.reserveCapacity(64)
+    for byte in digest {
+        result.append(digits[Int(byte >> 4)])
+        result.append(digits[Int(byte & 0x0f)])
+    }
+    return String(decoding: result, as: UTF8.self)
 }
 
 extension FileStore {
@@ -1142,9 +1156,10 @@ extension FileStore {
     }
 }
 
-/// `write(2)`, named so it is not shadowed by `FileStore`'s own `write` methods.
+/// `write(2)`, named so it is not shadowed by `FileStore`'s own `write` methods. Shared with
+/// `RemoteDownloader`, which writes the response body to its stage with the same call.
 #if canImport(Darwin)
-private let posixWrite = Darwin.write
+let posixWrite = Darwin.write
 #else
-private let posixWrite = Glibc.write
+let posixWrite = Glibc.write
 #endif

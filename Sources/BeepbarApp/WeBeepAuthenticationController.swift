@@ -1130,6 +1130,8 @@ enum MaterialsRunEnd: Equatable, Sendable {
         scopeWriteTask = task
     }
 
+    func waitForScopeWritesForTesting() async { await scopeWriteTask?.value }
+
     func setBeforeScopeRestoreForTesting(_ action: @escaping @MainActor () -> Void) {
         beforeScopeRestoreForTesting = action
     }
@@ -1530,6 +1532,7 @@ enum MaterialsRunEnd: Equatable, Sendable {
             setSyncState(.failed(.local(BilingualText("Impossibile eliminare il token salvato. Riprova a disconnetterti.", "Couldn't remove the stored token. Try disconnecting again."))))
             return
         }
+        queueStatementCacheClear()
         Task { await credentialVault.invalidate() }
         Self.defaults.removeObject(forKey: Self.credentialExpiredKey)
         notificationCoordinator.clearFailure()
@@ -2681,7 +2684,15 @@ enum MaterialsRunEnd: Equatable, Sendable {
             let previousWrite = scopeWriteTask
             scopeWriteTask = Task { await previousWrite?.value; try? await database.disableAllScopes(rootID: rootID) }
         }
+        queueStatementCacheClear()
         configureBackgroundScheduler()
+    }
+
+    /// Orders cache invalidation after pending scope writes and before subsequent syncs.
+    private func queueStatementCacheClear() {
+        guard let database else { return }
+        let previousWrite = scopeWriteTask
+        scopeWriteTask = Task { await previousWrite?.value; await database.clearStatementCache() }
     }
 
     @discardableResult func validateConnection() -> Task<Void, Never>? {
@@ -3046,6 +3057,7 @@ enum MaterialsRunEnd: Equatable, Sendable {
                 guard let self else { return }
                 let siteInfo = try await self.apiClient.validateToken(token)
                 try await self.credentialVault.save(token)
+                self.queueStatementCacheClear()
                 // Only a token that was accepted and stored replaces the previous account's state,
                 // including the course list saved for the previous sign-in, even if it is the same
                 // account: the new token has its own fingerprint (#98).

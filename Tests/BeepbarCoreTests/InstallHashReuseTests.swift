@@ -34,11 +34,9 @@ struct InstallHashReuseTests {
 
         /// Stages Moodle's new version the way a download does.
         func stagedUpdate() async throws -> StagedArtifact {
-            let download = FileManager.default.temporaryDirectory.appending(path: "Beepbar-test-\(UUID().uuidString)")
-            defer { try? FileManager.default.removeItem(at: download) }
-            let bytes = Data("versione nuova di Moodle".utf8)
-            try bytes.write(to: download)
-            return try await store.importDownloadedFile(at: download, expectedSize: Int64(bytes.count), maximumSize: 1 << 20)
+            let stage = try await store.createStage()
+            try await store.write(Data("versione nuova di Moodle".utf8), to: stage)
+            return try await store.finalize(stage)
         }
 
         /// Full reads made by `body` alone.

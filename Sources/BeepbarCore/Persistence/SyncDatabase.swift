@@ -11,6 +11,11 @@ public enum SyncDatabaseError: Error, Sendable, Equatable {
 
 private final class SQLiteHandle: @unchecked Sendable {
     let pointer: OpaquePointer?
+    var statements: [String: OpaquePointer] = [:]
+    var prepareCount = 0
+#if DEBUG
+    var closeObserver: (@Sendable (Int32) -> Void)?
+#endif
     /// Write transactions this connection committed, counted by SQLite's commit hook. Owned here so
     /// it lives exactly as long as the connection the hook belongs to: `sqlite3_close` runs in
     /// `deinit`, before the stored properties are released.
@@ -27,7 +32,20 @@ private final class SQLiteHandle: @unchecked Sendable {
             return 0
         }, Unmanaged.passUnretained(commits).toOpaque())
     }
-    deinit { sqlite3_close(pointer) }
+    func clearStatements() {
+        for statement in statements.values { sqlite3_finalize(statement) }
+        statements.removeAll()
+    }
+
+    deinit {
+        clearStatements()
+#if DEBUG
+        let result = sqlite3_close(pointer)
+        closeObserver?(result)
+#else
+        sqlite3_close(pointer)
+#endif
+    }
 }
 
 /// Only touched from inside `sqlite3_step`, on the `SyncDatabase` actor that owns the connection.
@@ -139,8 +157,47 @@ public actor SyncDatabase {
     }
 
     public func migrate() throws {
+        handle.clearStatements()
+        defer { handle.clearStatements() }
         try Self.migrate(database)
     }
+
+    /// Drops prepared SQL at an account boundary; bindings are cleared after every use.
+    public func clearStatementCache() { handle.clearStatements() }
+
+    /// Connection-local counts for verifying reuse and lifecycle.
+    package func statementCacheCounters() -> (cached: Int, prepares: Int, busy: Int) {
+        var count = 0
+        var busy = 0
+        var statement = sqlite3_next_stmt(database, nil)
+        while let current = statement {
+            count += 1
+            if sqlite3_stmt_busy(current) != 0 { busy += 1 }
+            statement = sqlite3_next_stmt(database, current)
+        }
+        return (count, handle.prepareCount, busy)
+    }
+
+#if DEBUG
+    /// Reports the real close result when this test connection is released.
+    package func observeCloseForTesting(_ observer: @escaping @Sendable (Int32) -> Void) {
+        handle.closeObserver = observer
+    }
+
+    /// Inspects SQLite's actual bindings using synthetic values in tests.
+    package func statementCacheContains(_ value: String) -> Bool {
+        var statement = sqlite3_next_stmt(database, nil)
+        while let current = statement {
+            if let expanded = sqlite3_expanded_sql(current) {
+                let found = String(cString: expanded).contains(value)
+                sqlite3_free(expanded)
+                if found { return true }
+            }
+            statement = sqlite3_next_stmt(database, current)
+        }
+        return false
+    }
+#endif
 
     /// Everything this connection has written since it opened, opening migrations included; take
     /// the difference of two readings (`since`) to measure one operation.
@@ -266,14 +323,16 @@ public actor SyncDatabase {
         ownershipBackfillCounters.transactions += 1
         try execute("BEGIN IMMEDIATE")
         do {
-            for (remoteID, owner) in owners {
-                ownershipBackfillCounters.updates += 1
-                try withStatement("UPDATE items SET course_id = ?, module_id = ? WHERE root_id = ? AND remote_id = ? AND course_id IS NULL AND module_id IS NULL") { statement in
-                    guard sqlite3_bind_int64(statement, 1, owner.0) == SQLITE_OK,
-                          sqlite3_bind_int64(statement, 2, owner.1) == SQLITE_OK else { throw SyncDatabaseError.execution }
-                    try bind(rootID.uuidString, to: statement, index: 3)
-                    try bind(remoteID, to: statement, index: 4)
-                    try stepDone(statement)
+            try withStatement("UPDATE items SET course_id = ?, module_id = ? WHERE root_id = ? AND remote_id = ? AND course_id IS NULL AND module_id IS NULL") { statement in
+                for (remoteID, owner) in owners {
+                    ownershipBackfillCounters.updates += 1
+                    try withResetRow(statement) {
+                        guard sqlite3_bind_int64(statement, 1, owner.0) == SQLITE_OK,
+                              sqlite3_bind_int64(statement, 2, owner.1) == SQLITE_OK else { throw SyncDatabaseError.execution }
+                        try bind(rootID.uuidString, to: statement, index: 3)
+                        try bind(remoteID, to: statement, index: 4)
+                        try stepDone(statement)
+                    }
                 }
             }
             try execute("COMMIT")
@@ -341,12 +400,14 @@ public actor SyncDatabase {
         let sql = "UPDATE items SET placement_section = ?, placement_module = ?, placement_single = ? WHERE root_id = ? AND remote_id = ?" + (onlyIfMissing ? " AND placement_section IS NULL" : "")
         try execute("BEGIN IMMEDIATE")
         do {
-            for (remoteID, placement) in placements {
-                try withStatement(sql) { statement in
-                    try bindPlacement(placement, to: statement, from: 1)
-                    try bind(rootID.uuidString, to: statement, index: 4)
-                    try bind(remoteID, to: statement, index: 5)
-                    try stepDone(statement)
+            try withStatement(sql) { statement in
+                for (remoteID, placement) in placements {
+                    try withResetRow(statement) {
+                        try bindPlacement(placement, to: statement, from: 1)
+                        try bind(rootID.uuidString, to: statement, index: 4)
+                        try bind(remoteID, to: statement, index: 5)
+                        try stepDone(statement)
+                    }
                 }
             }
             try execute("COMMIT")
@@ -374,14 +435,16 @@ public actor SyncDatabase {
     public func beginRemoteMoves(rootID: UUID, _ moves: [PendingRemoteMove]) throws {
         try execute("BEGIN IMMEDIATE")
         do {
-            for move in moves {
-                try withStatement("INSERT OR REPLACE INTO pending_remote_moves(root_id, remote_id, batch_id, from_path, to_path, sha256, placement_section, placement_module, placement_single) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)") { statement in
-                    try bind(rootID.uuidString, to: statement, index: 1); try bind(move.remoteID, to: statement, index: 2)
-                    try bind(move.batchID.uuidString, to: statement, index: 3)
-                    try bind(move.from.value, to: statement, index: 4); try bind(move.to.value, to: statement, index: 5)
-                    try bind(move.sha256, to: statement, index: 6)
-                    try bindPlacement(move.placement, to: statement, from: 7)
-                    try stepDone(statement)
+            try withStatement("INSERT OR REPLACE INTO pending_remote_moves(root_id, remote_id, batch_id, from_path, to_path, sha256, placement_section, placement_module, placement_single) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)") { statement in
+                for move in moves {
+                    try withResetRow(statement) {
+                        try bind(rootID.uuidString, to: statement, index: 1); try bind(move.remoteID, to: statement, index: 2)
+                        try bind(move.batchID.uuidString, to: statement, index: 3)
+                        try bind(move.from.value, to: statement, index: 4); try bind(move.to.value, to: statement, index: 5)
+                        try bind(move.sha256, to: statement, index: 6)
+                        try bindPlacement(move.placement, to: statement, from: 7)
+                        try stepDone(statement)
+                    }
                 }
             }
             try execute("COMMIT")
@@ -502,21 +565,23 @@ public actor SyncDatabase {
             for change in existing where !desiredIDs.contains(change.remoteID) {
                 try deleteRows("remote_changes", rootID: rootID, remoteID: change.remoteID)
             }
-            for change in desired {
-                if let current = existingByRemoteID[change.remoteID], current.describesSameChange(as: change) { continue }
-                try withStatement("INSERT OR REPLACE INTO remote_changes(root_id, \(Self.remoteChangeColumns)) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)") { statement in
-                    try bind(rootID.uuidString, to: statement, index: 1); try bind(change.id.uuidString, to: statement, index: 2)
-                    guard sqlite3_bind_int64(statement, 3, change.courseID) == SQLITE_OK else { throw SyncDatabaseError.execution }
-                    try bind(change.remoteID, to: statement, index: 4); try bind(change.kind.rawValue, to: statement, index: 5)
-                    try bind(change.relativePath.value, to: statement, index: 6); try bind(change.targetPath?.value, to: statement, index: 7)
-                    try bind(change.newRemoteID, to: statement, index: 8)
-                    try bindPlacement(change.placement, to: statement, from: 9)
-                    try bind(change.localSHA256, to: statement, index: 12)
-                    guard sqlite3_bind_int(statement, 13, change.isLocallyModified ? 1 : 0) == SQLITE_OK else { throw SyncDatabaseError.execution }
-                    sqlite3_bind_double(statement, 14, change.detectedAt.timeIntervalSince1970)
-                    try stepDone(statement)
+            try withStatement("INSERT OR REPLACE INTO remote_changes(root_id, \(Self.remoteChangeColumns)) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)") { statement in
+                for change in desired {
+                    if let current = existingByRemoteID[change.remoteID], current.describesSameChange(as: change) { continue }
+                    try withResetRow(statement) {
+                        try bind(rootID.uuidString, to: statement, index: 1); try bind(change.id.uuidString, to: statement, index: 2)
+                        guard sqlite3_bind_int64(statement, 3, change.courseID) == SQLITE_OK else { throw SyncDatabaseError.execution }
+                        try bind(change.remoteID, to: statement, index: 4); try bind(change.kind.rawValue, to: statement, index: 5)
+                        try bind(change.relativePath.value, to: statement, index: 6); try bind(change.targetPath?.value, to: statement, index: 7)
+                        try bind(change.newRemoteID, to: statement, index: 8)
+                        try bindPlacement(change.placement, to: statement, from: 9)
+                        try bind(change.localSHA256, to: statement, index: 12)
+                        guard sqlite3_bind_int(statement, 13, change.isLocallyModified ? 1 : 0) == SQLITE_OK else { throw SyncDatabaseError.execution }
+                        sqlite3_bind_double(statement, 14, change.detectedAt.timeIntervalSince1970)
+                        try stepDone(statement)
+                    }
+                    created.append(change)
                 }
-                created.append(change)
             }
             try execute("COMMIT")
             return created
@@ -634,20 +699,22 @@ public actor SyncDatabase {
                 try bind(move.action.rawValue, to: statement, index: 5); try bind(move.oldFolder, to: statement, index: 6); try bind(move.newFolder, to: statement, index: 7)
                 try bind(move.lastKnownName, to: statement, index: 8); try stepDone(statement)
             }
-            for file in move.files {
-                try withStatement("INSERT INTO pending_module_move_files(move_id, remote_id, old_path, new_path, source_kind, source_device, source_inode, source_sha256) VALUES (?, ?, ?, ?, ?, ?, ?, ?)") { statement in
-                    try bind(move.id.uuidString, to: statement, index: 1); try bind(file.remoteID, to: statement, index: 2)
-                    try bind(file.oldPath.value, to: statement, index: 3); try bind(file.newPath.value, to: statement, index: 4)
-                    switch file.source {
-                    case .missing:
-                        try bind("MISSING", to: statement, index: 5); sqlite3_bind_null(statement, 6); sqlite3_bind_null(statement, 7); sqlite3_bind_null(statement, 8)
-                    case .present(let snapshot):
-                        try bind("PRESENT", to: statement, index: 5)
-                        guard sqlite3_bind_int64(statement, 6, snapshot.device) == SQLITE_OK,
-                              sqlite3_bind_int64(statement, 7, Int64(bitPattern: snapshot.inode)) == SQLITE_OK else { throw SyncDatabaseError.execution }
-                        try bind(snapshot.sha256, to: statement, index: 8)
+            try withStatement("INSERT INTO pending_module_move_files(move_id, remote_id, old_path, new_path, source_kind, source_device, source_inode, source_sha256) VALUES (?, ?, ?, ?, ?, ?, ?, ?)") { statement in
+                for file in move.files {
+                    try withResetRow(statement) {
+                        try bind(move.id.uuidString, to: statement, index: 1); try bind(file.remoteID, to: statement, index: 2)
+                        try bind(file.oldPath.value, to: statement, index: 3); try bind(file.newPath.value, to: statement, index: 4)
+                        switch file.source {
+                        case .missing:
+                            try bind("MISSING", to: statement, index: 5); sqlite3_bind_null(statement, 6); sqlite3_bind_null(statement, 7); sqlite3_bind_null(statement, 8)
+                        case .present(let snapshot):
+                            try bind("PRESENT", to: statement, index: 5)
+                            guard sqlite3_bind_int64(statement, 6, snapshot.device) == SQLITE_OK,
+                                  sqlite3_bind_int64(statement, 7, Int64(bitPattern: snapshot.inode)) == SQLITE_OK else { throw SyncDatabaseError.execution }
+                            try bind(snapshot.sha256, to: statement, index: 8)
+                        }
+                        try stepDone(statement)
                     }
-                    try stepDone(statement)
                 }
             }
             try execute("COMMIT")
@@ -1165,10 +1232,33 @@ public actor SyncDatabase {
     }
 
     private func withStatement<T>(_ sql: String, _ body: (OpaquePointer) throws -> T) throws -> T {
-        var statement: OpaquePointer?
-        guard sqlite3_prepare_v2(database, sql, -1, &statement, nil) == SQLITE_OK, let statement else { throw SyncDatabaseError.statement }
-        defer { sqlite3_finalize(statement) }
+        // Removing the checked-out statement also handles a nested use of the same SQL: it gets
+        // its own cursor rather than resetting the outer reader mid-row. Only fixed internal SQL
+        // and identifiers selected from finite internal lists reach this method.
+        let statement: OpaquePointer
+        if let cached = handle.statements.removeValue(forKey: sql) {
+            statement = cached
+        } else {
+            var prepared: OpaquePointer?
+            guard sqlite3_prepare_v3(database, sql, -1, UInt32(SQLITE_PREPARE_PERSISTENT), &prepared, nil) == SQLITE_OK, let prepared else { throw SyncDatabaseError.statement }
+            statement = prepared
+            handle.prepareCount += 1
+        }
+        defer {
+            // reset's return value is the prior step error, not a failure to reset. Always clear
+            // bindings as well, including on throws, so no transaction or account data is held.
+            sqlite3_reset(statement)
+            let cleared = sqlite3_clear_bindings(statement) == SQLITE_OK
+            if cleared && handle.statements[sql] == nil { handle.statements[sql] = statement }
+            else { sqlite3_finalize(statement) }
+        }
         return try body(statement)
+    }
+
+    /// Completes one use of a bulk statement before binding the next row, even on failure.
+    private func withResetRow(_ statement: OpaquePointer, _ body: () throws -> Void) throws {
+        defer { sqlite3_reset(statement); sqlite3_clear_bindings(statement) }
+        try body()
     }
 
     private func bind(_ value: String?, to statement: OpaquePointer, index: Int32) throws {

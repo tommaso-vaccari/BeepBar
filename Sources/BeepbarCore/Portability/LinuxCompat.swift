@@ -85,14 +85,6 @@ extension URLRequest {
 #endif
 
 #if os(Linux)
-/// No Objective-C runtime, so no autorelease pools: `FileStore.forEachChunk` keeps its per-chunk
-/// pool on macOS (where it bounds peak memory, see there) and simply runs the body here.
-func autoreleasepool<R>(invoking body: () throws -> R) rethrows -> R {
-    try body()
-}
-#endif
-
-#if os(Linux)
 import Crypto
 
 /// CryptoKit's `SHA256` is `Sendable`; swift-crypto's is a plain value type over the same state.

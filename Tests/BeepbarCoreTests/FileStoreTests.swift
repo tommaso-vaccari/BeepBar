@@ -13,6 +13,29 @@ import Testing
 @testable import BeepbarCore
 
 struct FileStoreTests {
+    /// Staging, hashing (`finalize`) and the conflict-restore copy preserve bytes and SHA-256 around
+    /// the 1 MiB read buffer boundary (#251). Guards against a chunk being mis-sized or re-written.
+    @Test(arguments: [0, 73, 1 << 20, 2 << 20, (1 << 20) + 37])
+    func stagedAndConflictCopiedFilesKeepBytesAndDigest(_ size: Int) async throws {
+        let root = try temporaryRoot()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let bytes = Data((0..<size).map { UInt8(truncatingIfNeeded: $0 * 31 + $0 / 257) })
+        let store = try FileStore(root: root)
+        let expected = SHA256.hash(data: bytes).map { String(format: "%02x", $0) }.joined()
+        let handle = try await store.createStage()
+        try await store.write(bytes, to: handle)
+        let imported = try await store.finalize(handle)
+        #expect(imported.sha256 == expected)
+        #expect(imported.size == Int64(size))
+        #expect(try Data(contentsOf: root.appending(path: imported.stagePath.value)) == bytes)
+        let conflict = try await store.preserveAsConflict(imported, conflictID: UUID(), at: RelativePath("course/file"))
+        let copy = try await store.copyConflictArtifactToStage(at: conflict, expectedSHA256: expected)
+        #expect(copy.sha256 == expected)
+        #expect(copy.size == Int64(size))
+        #expect(try Data(contentsOf: root.appending(path: copy.stagePath.value)) == bytes)
+        #expect(try Data(contentsOf: root.appending(path: conflict.value)) == bytes)
+    }
+
     @Test func trashRefusesAReplacedRootWithoutTouchingEitherFile() async throws {
         let container = try temporaryRoot()
         defer { try? FileManager.default.removeItem(at: container) }

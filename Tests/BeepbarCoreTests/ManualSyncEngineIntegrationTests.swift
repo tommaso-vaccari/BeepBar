@@ -135,27 +135,27 @@ import Testing
         #expect(values["file"]?.relativePath == fixture.path)
     }
 
-    @Test func removesDownloadTemporaryFileAfterSuccessfulImport() async throws {
+    /// After a successful install the download left no `.partial` in `.beepbar/staging` (the stage
+    /// was renamed into place, not copied). Guards against a stage leaking on the success path (#250).
+    @Test func successfulSyncLeavesNoPartialInStaging() async throws {
         let body = Data("import-leak-\(UUID().uuidString)".utf8)
         let fixture = try await Fixture(remoteData: body)
         defer { fixture.remove() }
-        let before = Fixture.downloadTemporaryFiles()
         #expect(try await fixture.engine().sync(file: fixture.file(revision: "1"), destination: fixture.path, token: "token") == .installedNew)
-        #expect(Fixture.leakedDownloadTemporaries(since: before, body: body).isEmpty)
+        #expect(fixture.stagedPartials().isEmpty)
     }
 
-    @Test func removesDownloadTemporaryFileWhenImportRejectsSizeMismatch() async throws {
+    /// A body shorter than the reported size, with no Content-Length to catch it early, fails the
+    /// transfer and its stage is removed from `.beepbar/staging` (#250).
+    @Test func shortBodyFailsTheDownloadAndLeavesNoPartialInStaging() async throws {
         let body = Data("mismatch-leak-\(UUID().uuidString)".utf8)
         let fixture = try await Fixture(remoteData: body)
         defer { fixture.remove() }
-        // Without Content-Length the downloader cannot catch the short body, so the size check
-        // happens in the import and the temporary file has to be cleaned up on that path too.
         IntegrationDownloadProtocol.sendsContentLength = false
-        let before = Fixture.downloadTemporaryFiles()
-        await #expect(throws: FileStoreError.sizeMismatch) {
+        await #expect(throws: RemoteDownloadError.invalidResponse) {
             try await fixture.engine().sync(file: fixture.file(revision: "1", size: 4096), destination: fixture.path, token: "token")
         }
-        #expect(Fixture.leakedDownloadTemporaries(since: before, body: body).isEmpty)
+        #expect(fixture.stagedPartials().isEmpty)
     }
 
     private final class Fixture {
@@ -179,18 +179,10 @@ import Testing
             IntegrationDownloadProtocol.sendsContentLength = true
         }
 
-        // URLSession stages every download in the process temporary directory, which the rest of
-        // the suite uses at the same time: only a file holding this test's body is our leak.
-        static func leakedDownloadTemporaries(since before: Set<String>, body: Data) -> [String] {
-            let directory = URL(fileURLWithPath: NSTemporaryDirectory(), isDirectory: true)
-            return downloadTemporaryFiles().subtracting(before).filter {
-                (try? Data(contentsOf: directory.appending(path: $0))) == body
-            }
-        }
-
-        static func downloadTemporaryFiles() -> Set<String> {
-            let entries = (try? FileManager.default.contentsOfDirectory(atPath: NSTemporaryDirectory())) ?? []
-            return Set(entries.filter { $0.hasPrefix("CFNetworkDownload") })
+        /// Stage files left in the store's staging directory (the root is private to this fixture).
+        func stagedPartials() -> [String] {
+            let entries = (try? FileManager.default.contentsOfDirectory(atPath: root.appending(path: ".beepbar/staging").path)) ?? []
+            return entries.filter { $0.hasSuffix(".partial") }
         }
 
         var downloadCount: Int { IntegrationDownloadProtocol.requestCount }

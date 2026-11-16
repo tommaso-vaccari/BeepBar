@@ -1,3 +1,13 @@
+#if canImport(CryptoKit)
+import CryptoKit
+#else
+import Crypto
+#endif
+#if canImport(Darwin)
+import Darwin
+#else
+import Glibc
+#endif
 import Foundation
 #if canImport(FoundationNetworking)
 import FoundationNetworking
@@ -35,25 +45,23 @@ public struct NetworkAccess: Sendable, Equatable {
     public static let dataSaver = NetworkAccess(allowsExpensiveNetworkAccess: false, allowsConstrainedNetworkAccess: false)
 }
 
-public struct DownloadedRemoteFile: Sendable {
-    public let temporaryURL: URL
-    public let expectedSize: Int64
-}
-
 public final class RemoteDownloader: @unchecked Sendable {
     /// The largest file Beepbar downloads unless a caller asks for another limit.
     public static let defaultMaximumSize: Int64 = 1_073_741_824
 
     private let session: URLSession
-    /// The largest file this downloader accepts. The import that copies a download into the
-    /// sync root reads it from here, so the two checks can never disagree.
+    /// The largest file this downloader accepts before opening a stage.
     public let maximumSize: Int64
     private let policy: WeBeepServerPolicy
     private let ownsSession: Bool
+    private let writeStage: @Sendable (Int32, UnsafeRawPointer, Int) -> Int
+    private let afterStageOpened: (@Sendable () async -> Void)?
 
     public init(maximumSize: Int64 = RemoteDownloader.defaultMaximumSize, maximumConnections: Int = 3, policy: WeBeepServerPolicy = .production) {
         self.maximumSize = maximumSize
         self.policy = policy
+        self.writeStage = posixWrite
+        self.afterStageOpened = nil
         let configuration = URLSessionConfiguration.ephemeral
         configuration.urlCache = nil
         configuration.requestCachePolicy = .reloadIgnoringLocalCacheData
@@ -65,9 +73,21 @@ public final class RemoteDownloader: @unchecked Sendable {
 
     public init(session: URLSession, maximumSize: Int64 = RemoteDownloader.defaultMaximumSize, policy: WeBeepServerPolicy = .production) {
         self.session = session
+        self.writeStage = posixWrite
+        self.afterStageOpened = nil
         self.maximumSize = maximumSize
         self.policy = policy
         ownsSession = false
+    }
+
+    /// Injects only the stage write syscall, to exercise failures without modifying real files.
+    init(session: URLSession, maximumSize: Int64 = RemoteDownloader.defaultMaximumSize, policy: WeBeepServerPolicy = .production, writeStage: @escaping @Sendable (Int32, UnsafeRawPointer, Int) -> Int, afterStageOpened: (@Sendable () async -> Void)? = nil) {
+        self.session = session
+        self.maximumSize = maximumSize
+        self.policy = policy
+        self.writeStage = writeStage
+        self.afterStageOpened = afterStageOpened
+        self.ownsSession = false
     }
 
     deinit {
@@ -76,7 +96,14 @@ public final class RemoteDownloader: @unchecked Sendable {
         if ownsSession { session.finishTasksAndInvalidate() }
     }
 
-    public func download(_ file: RemoteFileCandidate, token: String, access: NetworkAccess) async throws -> DownloadedRemoteFile {
+    /// Downloads `file` straight into a stage of `store` and returns it as a `StagedArtifact` (#250).
+    ///
+    /// The stage is opened before the request so the body goes to its final volume in one pass,
+    /// hashed as it is received, with no temporary file and no second copy. Any error, including
+    /// cancellation, a rejected response or a short write, discards the stage, so a failed transfer
+    /// leaves nothing in staging. The errors surfaced are `RemoteDownloadError`, `FileStoreError`
+    /// (stage I/O, e.g. a full disk), `CocoaError` and `CancellationError`.
+    public func download(_ file: RemoteFileCandidate, token: String, access: NetworkAccess, into store: FileStore) async throws -> StagedArtifact {
         guard file.isSupported else { throw RemoteDownloadError.unsupportedFile }
         guard let url = file.downloadURL else { throw RemoteDownloadError.missingURL }
         guard file.size >= 0 else { throw RemoteDownloadError.invalidSize }
@@ -85,29 +112,45 @@ public final class RemoteDownloader: @unchecked Sendable {
         request.allowsExpensiveNetworkAccess = access.allowsExpensiveNetworkAccess
         request.allowsConstrainedNetworkAccess = access.allowsConstrainedNetworkAccess
         let requestURL = request.url!
-        let transfer = CappedDownload(
-            limit: file.size,
-            destination: FileManager.default.temporaryDirectory.appending(path: "\(Self.temporaryFilePrefix)\(UUID().uuidString)")
-        ) { http in
+        try Task.checkCancellation()
+        let (stage, fd) = try await store.openDownloadStage()
+        let transfer = CappedDownload(limit: file.size, fd: fd, writeStage: writeStage) { http in
             guard http.statusCode == 200 else { return .transport(http.statusCode) }
             guard let finalURL = http.url, Self.matchesAuthorizedURL(finalURL, requestURL: requestURL) else { return .unexpectedRedirect }
             let length = http.expectedContentLength
             if length >= 0, length != file.size { return .invalidResponse }
             return nil
         }
-        do { try await transfer.run(request, in: session) }
-        catch let error as RemoteDownloadError { throw error }
-        catch let error as CocoaError { throw error }
-        catch let error as URLError where error.code == .cancelled { throw CancellationError() }
-        catch let error as URLError where error.code == .badServerResponse { throw RemoteDownloadError.unexpectedRedirect }
-        catch let error as URLError { throw RemoteDownloadError.network(NetworkFailure(error.code)) }
-        catch is CancellationError { throw CancellationError() }
-        catch { throw RemoteDownloadError.invalidResponse }
-        return DownloadedRemoteFile(temporaryURL: transfer.destination, expectedSize: file.size)
+        do {
+            let hash: String
+            do {
+                await afterStageOpened?()
+                try Task.checkCancellation()
+                hash = try await transfer.run(request, in: session)
+                guard fsync(fd) == 0 else { throw FileStoreError.ioFailure }
+            } catch {
+                close(fd)
+                throw error
+            }
+            guard close(fd) == 0 else { throw FileStoreError.ioFailure }
+            try Task.checkCancellation()
+            let artifact = try await store.downloadedArtifact(stage, sha256: hash, size: file.size)
+            try Task.checkCancellation()
+            return artifact
+        } catch {
+            try? await store.discard(stage)
+            if let error = error as? RemoteDownloadError { throw error }
+            if let error = error as? FileStoreError { throw error }
+            if let error = error as? CocoaError { throw error }
+            if let error = error as? URLError {
+                if error.code == .cancelled { throw CancellationError() }
+                if error.code == .badServerResponse { throw RemoteDownloadError.unexpectedRedirect }
+                throw RemoteDownloadError.network(NetworkFailure(error.code))
+            }
+            if error is CancellationError { throw CancellationError() }
+            throw RemoteDownloadError.invalidResponse
+        }
     }
-
-    /// Names every body this downloader writes, so a leak is recognisable in the temporary directory.
-    static let temporaryFilePrefix = "Beepbar-download-"
 
     public static func request(url: URL, token: String) throws -> URLRequest {
         try request(url: url, token: token, policy: .production)
@@ -134,72 +177,72 @@ public final class RemoteDownloader: @unchecked Sendable {
     }
 }
 
-/// One download written by Beepbar itself, so the response is checked before any byte lands
-/// on disk and the body is cut off the moment it grows past the size Moodle reported.
-///
-/// A download task only reports the response once the whole body is on disk, and a response
-/// without a Content-Length skipped that check entirely: a file replaced by a much larger one
-/// between listing and download, or a misbehaving server, filled the temporary directory
-/// before being rejected (ultrareview finding). Cancelling a download task instead leaves its
-/// partial file behind, in a place only CFNetwork knows. Here the file is ours: every failure
-/// removes it, and the import refuses any size but the reported one, so nothing valid is lost.
-///
-/// The delegate is per task, so an injected session needs no delegate of its own; methods not
-/// implemented here, such as the redirect refusal, still go to the session's delegate.
+/// Holds the completion under the download delegate's lock.
+struct DownloadCompletion {
+    private var receiver: (@Sendable (Result<String, Error>) -> Void)?
+    private var parked: Result<String, Error>?
+    private var finished = false
+
+    mutating func register(_ receiver: @escaping @Sendable (Result<String, Error>) -> Void) -> Result<String, Error>? {
+        if let parked { self.parked = nil; return parked }
+        self.receiver = receiver
+        return nil
+    }
+
+    mutating func finish(_ result: Result<String, Error>) -> (@Sendable (Result<String, Error>) -> Void)? {
+        guard !finished else { return nil }
+        finished = true
+        guard let receiver else { parked = result; return nil }
+        self.receiver = nil
+        return receiver
+    }
+}
+
+/// Receives one bounded response into its already-open stage descriptor, hashing the bytes it
+/// writes. The response is validated before any byte is written and the body is cut off as soon
+/// as it would pass the size Moodle reported. A write that stores fewer bytes than it was given
+/// fails the transfer (`FileStoreError.ioFailure`): the digest must describe exactly what reached
+/// the file, so a partial write can never be hashed as if complete. Delegate callbacks serialize
+/// under the lock; writes and hashing need no hop to the FileStore actor.
 private final class CappedDownload: NSObject, URLSessionDataDelegate, @unchecked Sendable {
-    let destination: URL
+    private let fd: Int32
     private let limit: Int64
+    private let writeStage: @Sendable (Int32, UnsafeRawPointer, Int) -> Int
     private let validate: @Sendable (HTTPURLResponse) -> RemoteDownloadError?
     private let lock = NSLock()
-    private var handle: FileHandle?
     private var receivedResponse = false
     private var written: Int64 = 0
+    private var hasher = SHA256()
     private var rejection: Error?
-    private var continuation: CheckedContinuation<Void, Error>?
+    private var completion = DownloadCompletion()
 
-    init(limit: Int64, destination: URL, validate: @escaping @Sendable (HTTPURLResponse) -> RemoteDownloadError?) {
+    init(limit: Int64, fd: Int32, writeStage: @escaping @Sendable (Int32, UnsafeRawPointer, Int) -> Int, validate: @escaping @Sendable (HTTPURLResponse) -> RemoteDownloadError?) {
         self.limit = limit
-        self.destination = destination
+        self.fd = fd
+        self.writeStage = writeStage
         self.validate = validate
     }
 
-    /// Returns once the body is complete at `destination`; on any error the file is gone.
-    func run(_ request: URLRequest, in session: URLSession) async throws {
+    func run(_ request: URLRequest, in session: URLSession) async throws -> String {
         let task = session.dataTask(with: request)
         task.delegate = self
-        do {
-            try await withTaskCancellationHandler {
-                try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
-                    lock.withLock { self.continuation = continuation }
-                    task.resume()
+        return try await withTaskCancellationHandler {
+            try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<String, Error>) in
+                let parked = lock.withLock {
+                    completion.register { continuation.resume(with: $0) }
                 }
-            } onCancel: {
-                task.cancel()
+                if let parked { continuation.resume(with: parked) }
+                task.resume()
             }
-        } catch {
-            try? FileManager.default.removeItem(at: destination)
-            throw error
+        } onCancel: {
+            task.cancel()
         }
     }
 
     func urlSession(_ session: URLSession, dataTask: URLSessionDataTask, didReceive response: URLResponse, completionHandler: @escaping @Sendable (URLSession.ResponseDisposition) -> Void) {
-        let failure: Error?
-        if let http = response as? HTTPURLResponse {
-            if let rejected = validate(http) {
-                failure = rejected
-            } else {
-                do {
-                    guard FileManager.default.createFile(atPath: destination.path, contents: nil) else { throw CocoaError(.fileWriteUnknown) }
-                    let handle = try FileHandle(forWritingTo: destination)
-                    lock.withLock { self.handle = handle }
-                    failure = nil
-                } catch {
-                    failure = error
-                }
-            }
-        } else {
-            failure = RemoteDownloadError.invalidResponse
-        }
+        let failure: RemoteDownloadError?
+        if let http = response as? HTTPURLResponse { failure = validate(http) }
+        else { failure = .invalidResponse }
         lock.withLock {
             receivedResponse = true
             if let failure { rejection = failure }
@@ -209,30 +252,33 @@ private final class CappedDownload: NSObject, URLSessionDataDelegate, @unchecked
 
     func urlSession(_ session: URLSession, dataTask: URLSessionDataTask, didReceive data: Data) {
         let stop = lock.withLock { () -> Bool in
-            guard rejection == nil, let handle else { return true }
-            written += Int64(data.count)
-            guard written <= limit else {
+            guard rejection == nil, receivedResponse else { return true }
+            guard Int64(data.count) <= limit - written else {
                 rejection = RemoteDownloadError.invalidResponse
                 return true
             }
-            do { try handle.write(contentsOf: data) } catch { rejection = error; return true }
+            let result = data.withUnsafeBytes { bytes -> Int in
+                guard let base = bytes.baseAddress else { return 0 }
+                var count: Int
+                repeat { count = writeStage(fd, base, bytes.count) } while count < 0 && errno == EINTR
+                return count
+            }
+            // A partial write is a failed transfer; the digest must describe exactly what was saved.
+            guard result == data.count else { rejection = FileStoreError.ioFailure; return true }
+            hasher.update(data: data)
+            written += Int64(result)
             return false
         }
         if stop { dataTask.cancel() }
     }
 
     func urlSession(_ session: URLSession, task: URLSessionTask, didCompleteWithError error: Error?) {
-        let (continuation, outcome) = lock.withLock { () -> (CheckedContinuation<Void, Error>?, Error?) in
-            try? handle?.close()
-            handle = nil
-            let pending = self.continuation
-            self.continuation = nil
-            // The session's own error only when nothing here stopped the task first: the
-            // cancellation that follows a rejection must not read as the user cancelling.
-            let outcome = rejection ?? error ?? (receivedResponse ? nil : RemoteDownloadError.invalidResponse)
-            return (pending, outcome)
+        let (receiver, result) = lock.withLock { () -> ((@Sendable (Result<String, Error>) -> Void)?, Result<String, Error>) in
+            let outcome = rejection ?? error ?? (receivedResponse && written == limit ? nil : RemoteDownloadError.invalidResponse)
+            let result: Result<String, Error> = outcome.map { .failure($0) } ?? .success(hexSHA256(hasher.finalize()))
+            return (completion.finish(result), result)
         }
-        if let outcome { continuation?.resume(throwing: outcome) } else { continuation?.resume() }
+        receiver?(result)
     }
 }
 

@@ -294,8 +294,7 @@ import Testing
         #expect(!harness.controller.isSyncActive)
     }
 
-    /// Proves that "Annulla" while a refused run reads the network ends the run as cancelled:
-    /// "Pronto", like any cancelled sync, with no pause and no failure. Guards against the
+    /// Cancellation while checking a refusal restores the prior result, with no pause or failure. Guards against the
     /// cancellation being lost and the run reported as paused, or as "Connessione assente".
     @Test func cancellingWhileTheRefusalIsCheckedCancels() async throws {
         let harness = try await Harness(networks: [.unrestricted, .hotspot])
@@ -308,9 +307,47 @@ import Testing
         await harness.controller.runAutomaticSyncForTesting()
 
         #expect(harness.networkReads == 2)
-        #expect(harness.controller.syncState == .readyUnchecked)
+        #expect(harness.controller.syncState == .synced(Self.lastResult))
         #expect(harness.controller.dataSaverPause == nil)
         #expect(!harness.controller.isSyncActive)
+    }
+
+    /// A manual run with no enabled course retains the previous result instead of saying Ready.
+    @Test(arguments: [(AppSyncState.synced(lastResult), AppSyncState.synced(lastResult)), (.partial(lastResult), .partial(lastResult)), (.conflicts(2, lastResult), .conflicts(2, lastResult)), (.failed(.connectivity), .readyUnchecked)])
+    func manualRunWithoutCoursesRestoresPreviousState(_ previous: AppSyncState, _ expected: AppSyncState) async throws {
+        let harness = try await Harness(networks: [.unrestricted])
+        defer { harness.remove() }
+        harness.controller.setCourse(harness.controller.courses[0], enabled: false)
+        harness.controller.setSyncStateForTesting(previous)
+        harness.controller.synchronizeNow()
+        await harness.controller.waitForSyncForTesting()
+        #expect(harness.controller.syncState == expected)
+    }
+
+    /// Cancelling a manual run restores its exact previous result, or Ready for an old error.
+    @Test(arguments: [(AppSyncState.synced(lastResult), AppSyncState.synced(lastResult)), (.partial(lastResult), .partial(lastResult)), (.conflicts(2, lastResult), .conflicts(2, lastResult)), (.failed(.connectivity), .readyUnchecked)])
+    func cancellingManualRunRestoresPreviousState(_ previous: AppSyncState, _ expected: AppSyncState) async throws {
+        let harness = try await Harness(networks: [.unrestricted])
+        defer { harness.remove() }
+        harness.controller.setSyncStateForTesting(previous)
+        harness.controller.synchronizeNow()
+        harness.controller.cancelSynchronization()
+        await harness.controller.waitForSyncForTesting()
+        #expect(harness.controller.syncState == expected)
+        #expect(!harness.controller.isSyncActive)
+    }
+
+    /// A folder lease defers an automatic run without erasing its previous result.
+    @Test func busyFolderDeferralRestoresPreviousState() async throws {
+        let harness = try await Harness(networks: [.unrestricted])
+        defer { harness.remove() }
+        harness.controller.setSyncStateForTesting(synced: await EncodedSyncSummary.encode(Self.lastResult))
+        let lease = try await harness.controller.acquireOperationGateForTesting(.renaming(1))
+        let outcome = await harness.controller.runAutomaticSyncForTesting()
+        await lease.release()
+        #expect(outcome == .deferred)
+        #expect(harness.controller.syncState == .synced(Self.lastResult))
+        #expect(harness.controller.summaryEncodedOnMainThreadForTesting == nil)
     }
 
     /// Proves that a run whose operation was replaced while it read the network leaves the new

@@ -140,6 +140,111 @@ struct SyncFinalizationTests {
         #expect(defaults.writes.isEmpty)
     }
 
+    /// A launch restore already decoding when Sync Now starts supplies the previous result even
+    /// if the user cancels or there are no selected courses; it never replaces progress midway.
+    @Test(arguments: [(true, true), (false, true), (true, false)]) @MainActor
+    func earlyManualRunKeepsTheBootstrapResult(_ cancel: Bool, _ restoreStartsFirst: Bool) async throws {
+        let root = FileManager.default.temporaryDirectory.appending(path: UUID().uuidString)
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let rootID = UUID()
+        let database = try SyncDatabase(url: root.appending(path: "state.sqlite"))
+        try await database.registerRoot(id: rootID, canonicalPath: root.path)
+        let defaults = MemoryCountingDefaults.isolated()
+        let previous = Self.syntheticSummary(details: 4, courses: 2, completedAt: Date(timeIntervalSince1970: 123))
+        defaults.set(try JSONEncoder().encode(previous), forKey: "io.github.tvaccari.beepbar.last-successful-summary.v1." + rootID.uuidString)
+        defaults.resetWrites()
+        let controller = WeBeepAuthenticationController(testRootURL: root, database: database, rootID: rootID, defaults: defaults)
+        controller.setCoursesForTesting([RemoteCourseSummary(id: 2, shortName: "2", displayName: "Other", isVisible: true, startDate: nil, endDate: nil)])
+        controller.setSyncStateForTesting(.starting)
+        let decoding = AsyncStream<Void>.makeStream()
+        let resume = AsyncStream<Void>.makeStream()
+        controller.setBeforeRestoredSummaryPublicationForTesting {
+            decoding.continuation.yield()
+            for await _ in resume.stream { break }
+        }
+        let begin = AsyncStream<Void>.makeStream()
+        let bootstrap = Task {
+            defer { decoding.continuation.finish() }
+            for await _ in begin.stream { break }
+            await controller.applyLaunchBootstrapForTesting()
+        }
+        controller.holdLaunchBootstrapForTesting(bootstrap)
+        var started = decoding.stream.makeAsyncIterator()
+        if restoreStartsFirst {
+            begin.continuation.yield()
+            guard await started.next() != nil else { Issue.record("bootstrap did not decode the saved result"); return }
+        }
+        controller.synchronizeNow()
+        if !restoreStartsFirst {
+            begin.continuation.yield()
+            guard await started.next() != nil else {
+                Issue.record("bootstrap did not decode the saved result")
+                await controller.waitForSyncForTesting()
+                return
+            }
+        }
+        if cancel { controller.cancelSynchronization(); controller.cancelSynchronization() }
+        #expect(controller.syncState == (cancel ? .cancelling : .checking))
+        resume.continuation.yield()
+        await controller.waitForSyncForTesting()
+        #expect(controller.syncState == .synced(previous))
+        #expect(!controller.isSyncActive)
+        #expect(!defaults.writes.contains("io.github.tvaccari.beepbar.last-successful-summary.v1." + rootID.uuidString))
+        #expect(!defaults.writes.contains("io.github.tvaccari.beepbar.last-successful-reconciliation.v1." + rootID.uuidString))
+    }
+
+    /// A launch recovery or sign-in problem remains visible when an early sync is cancelled.
+    @Test(arguments: [true, false]) @MainActor
+    func earlyCancellationKeepsBootstrapFailure(_ recoveryBlocked: Bool) async throws {
+        let root = FileManager.default.temporaryDirectory.appending(path: UUID().uuidString)
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let rootID = UUID()
+        let database = try SyncDatabase(url: root.appending(path: "state.sqlite"))
+        try await database.registerRoot(id: rootID, canonicalPath: root.path)
+        let controller = WeBeepAuthenticationController(testRootURL: root, database: database, rootID: rootID)
+        controller.setSyncStateForTesting(.starting)
+        let begin = AsyncStream<Void>.makeStream()
+        let bootstrap = Task {
+            for await _ in begin.stream { break }
+            await controller.applyLaunchBootstrapForTesting(recoveryBlocked: recoveryBlocked, credentialPresent: false)
+        }
+        controller.holdLaunchBootstrapForTesting(bootstrap)
+        controller.synchronizeNow()
+        controller.cancelSynchronization()
+        begin.continuation.yield()
+        await controller.waitForSyncForTesting()
+        #expect(controller.syncState == (recoveryBlocked ? .recoveryBlocked : .loginRequired))
+        #expect(!controller.isSyncActive)
+    }
+
+    /// An early manual sync must stop after bootstrap blocks recovery, before course requests.
+    @Test @MainActor func earlyManualRunStopsWhenBootstrapBlocksRecovery() async throws {
+        let root = FileManager.default.temporaryDirectory.appending(path: UUID().uuidString)
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let rootID = UUID()
+        let database = try SyncDatabase(url: root.appending(path: "state.sqlite"))
+        try await database.registerRoot(id: rootID, canonicalPath: root.path)
+        let token = MoodleRecordingProtocol.register(courses: [(1, "Course")], files: [:])
+        let vault = CredentialVault(read: { _ in token }, write: { _ in })
+        let controller = WeBeepAuthenticationController(testRootURL: root, database: database, rootID: rootID, apiClient: MoodleRecordingProtocol.makeClient(), credentialVault: vault)
+        controller.setSyncStateForTesting(.starting)
+        let begin = AsyncStream<Void>.makeStream()
+        let bootstrap = Task {
+            for await _ in begin.stream { break }
+            await controller.applyLaunchBootstrapForTesting(recoveryBlocked: true)
+        }
+        controller.holdLaunchBootstrapForTesting(bootstrap)
+        controller.synchronizeNow()
+        begin.continuation.yield()
+        await controller.waitForSyncForTesting()
+        #expect(controller.syncState == .recoveryBlocked)
+        #expect(MoodleRecordingProtocol.requests(token: token).isEmpty)
+        #expect(!controller.isSyncActive)
+    }
+
     /// Two syncs in a row, each with a new successful result, then a third result published
     /// directly: as each returns, both keys already hold it, and the next launch shows the newest
     /// (R01, #109). The encode
@@ -239,6 +344,7 @@ struct SyncFinalizationTests {
         let controller = WeBeepAuthenticationController(testRootURL: root, database: database, rootID: rootID, defaults: defaults)
         let operation = UUID()
         controller.setOperationForTesting(operation)
+        controller.setSyncStateForTesting(.syncing)
         // The hook runs after the encode and before the operation's guard.
         let encoded = AsyncStream<Void>.makeStream()
         let resume = AsyncStream<Void>.makeStream()
@@ -330,6 +436,7 @@ struct SyncFinalizationTests {
         let controller = WeBeepAuthenticationController(testRootURL: root, database: database, rootID: rootID, defaults: defaults)
         let operation = UUID()
         controller.setOperationForTesting(operation)
+        controller.setSyncStateForTesting(.syncing)
         let reading = AsyncStream<Void>.makeStream()
         let resume = AsyncStream<Void>.makeStream()
         controller.setBeforePendingChoicesForTesting {
@@ -590,6 +697,7 @@ struct SyncFinalizationTests {
         let controller = WeBeepAuthenticationController(testRootURL: root, database: database, rootID: rootID)
         let operationID = UUID()
         controller.setOperationForTesting(operationID)
+        controller.setSyncStateForTesting(.syncing)
 
         let reconciliationStarted = AsyncStream<Void>.makeStream()
         let resumeReconciliation = AsyncStream<Void>.makeStream()

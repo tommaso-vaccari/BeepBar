@@ -844,6 +844,7 @@ enum MaterialsRunEnd: Equatable, Sendable {
     /// see that it was asked for, and for which course (nil: the page as it was), without a
     /// window.
     var showRecordingsPageForTesting: (@MainActor (Int64?) -> Void)?
+    private var beforeAutomaticFailureForTesting: (@MainActor () -> Void)?
     private var beforeReconciliationStateForTesting: (@MainActor () async -> Void)?
     /// Whether the last sync result to be encoded was encoded on the main thread; nil until one
     /// is (R01, #109). Set by the pre-encode in `finishReconciliation` and by the inline
@@ -1164,6 +1165,10 @@ enum MaterialsRunEnd: Equatable, Sendable {
 
     func setBeforeReconciliationStateForTesting(_ action: @escaping @MainActor () async -> Void) {
         beforeReconciliationStateForTesting = action
+    }
+
+    func setBeforeAutomaticFailureForTesting(_ action: @escaping @MainActor () -> Void) {
+        beforeAutomaticFailureForTesting = action
     }
 
     @discardableResult func runAutomaticSyncForTesting() async -> AutomaticSyncOutcome { await runAutomaticSync() }
@@ -3567,6 +3572,11 @@ enum MaterialsRunEnd: Equatable, Sendable {
                 self?.cancelledSync(operationID)
             } catch let error as WeBeepAPIError {
                 guard let self else { return }
+#if DEBUG
+                self.beforeAutomaticFailureForTesting?()
+#endif
+                // A delivered network error can race with cancellation of this inner task (#269).
+                if Task.isCancelled { self.cancelledSync(operationID); return }
                 if networkAccess == .dataSaver, await self.pausedMidRun(operationID, error: error, restoring: stateBeforeRun) { return }
                 await self.failedSync(operationID, error: error, automatic: true)
             } catch let error as CredentialStorageError {
@@ -3978,6 +3988,8 @@ enum MaterialsRunEnd: Equatable, Sendable {
             await expireCredential()
             return automatic ? .authenticationExpired : nil
         case .connectivity:
+            // Ask the system to retry an automatic outage without changing manual failures (#269).
+            if automatic { automaticOutcome = .deferred }
             setSyncState(.failed(.connectivity))
             return nil
         case .serviceUnavailable:

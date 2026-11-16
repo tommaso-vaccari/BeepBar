@@ -72,6 +72,41 @@ import Testing
         #expect(schedule.registrations == 1 && schedule.deadline == deadline)
     }
 
+    /// An offline automatic run must request a system retry and recover on its next callback.
+    @Test func offlineAutomaticRunRequestsRetry() async throws {
+        let schedule = TestSchedule()
+        let harness = try await Harness(networks: [.unrestricted], schedule: schedule)
+        defer { harness.remove() }
+        MoodleRecordingProtocol.setOffline(token: harness.token, true)
+        #expect(await schedule.fire(0) == .deferred)
+        #expect(harness.controller.syncState == .failed(.connectivity))
+        MoodleRecordingProtocol.setOffline(token: harness.token, false)
+        #expect(await schedule.fire(0) == .finished)
+        #expect(harness.downloaded("a.txt"))
+    }
+
+    /// Cancellation after delivery of a network error must not schedule a retry or show failure.
+    @Test func cancellingAfterNetworkErrorWasDeliveredDoesNotRetry() async throws {
+        let schedule = TestSchedule()
+        let harness = try await Harness(networks: [.unrestricted], schedule: schedule)
+        defer { harness.remove() }
+        MoodleRecordingProtocol.setOffline(token: harness.token, true)
+        harness.controller.setBeforeAutomaticFailureForTesting { [weak controller = harness.controller] in controller?.cancelSynchronization() }
+        #expect(await schedule.fire(0) == .finished)
+        #expect(harness.controller.syncState == .readyUnchecked)
+        #expect(!harness.controller.isSyncActive)
+    }
+
+    /// A malformed response is not an outage and must retain the normal schedule.
+    @Test func automaticServiceFailureDoesNotRequestRetry() async throws {
+        let schedule = TestSchedule()
+        let harness = try await Harness(networks: [.unrestricted], schedule: schedule)
+        defer { harness.remove() }
+        MoodleRecordingProtocol.setMalformedCourseLists(token: harness.token, true)
+        #expect(await schedule.fire(0) == .finished)
+        #expect(harness.controller.syncState == .failed(.incompatibleResponse))
+    }
+
     // MARK: Before a run
 
     /// Proves that with Data Saver on, an automatic run on a hotspot or a Low Data Mode network
@@ -224,12 +259,13 @@ import Testing
     /// connection failure of a Data Saver run being hidden behind the pause.
     @Test(arguments: [NetworkPathConditions.unrestricted, .offline])
     func aRealOutageMidwayStillSaysNoConnection(_ networkAfterwards: NetworkPathConditions) async throws {
-        let harness = try await Harness(networks: [.unrestricted, networkAfterwards])
+        let schedule = TestSchedule()
+        let harness = try await Harness(networks: [.unrestricted, networkAfterwards], schedule: schedule)
         defer { harness.remove() }
         harness.controller.setDataSaver(enabled: true)
         MoodleRecordingProtocol.setOnHotspot(token: harness.token, true)
 
-        _ = await harness.controller.runAutomaticSyncForTesting()
+        #expect(await schedule.fire(0) == .deferred)
 
         #expect(!harness.downloads.isEmpty)
         #expect(harness.controller.syncState == .failed(.connectivity))

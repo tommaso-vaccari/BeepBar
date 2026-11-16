@@ -824,6 +824,9 @@ enum MaterialsRunEnd: Equatable, Sendable {
     /// Survives operation finalization, so awaiting notification permission cannot resurrect an
     /// earlier result once a new run or account state has replaced it.
     private var notificationGeneration = 0
+    /// The active run's prior state; never save an already published result again (#270).
+    private var stateBeforeSync: AppSyncState?
+    private var launchSyncRestore: (id: UUID, before: Int, expected: Int)?
     private var automaticOutcome: AutomaticSyncOutcome = .finished
     private let automaticSyncEnvironment: AutomaticSyncEnvironment
     private var rootID: UUID? {
@@ -985,7 +988,7 @@ enum MaterialsRunEnd: Equatable, Sendable {
                 let result = try await bootstrap.prepare(databaseDirectory: Self.databaseDirectory(), rootURL: rootURL, rootID: rootID, gate: operationGate, credentialVault: credentialVault)
                 guard let self else { return }
                 self.database = result.database
-                await self.applyBootstrap(result)
+                await self.applyBootstrap(result, launch: true)
                 BeepbarLog.lifecycle.notice("Bootstrap completed recoveryBlocked=\(result.recoveryBlocked, privacy: .public)")
             } catch {
                 BeepbarLog.lifecycle.error("Bootstrap failed errorType=\(String(reflecting: type(of: error)), privacy: .public)")
@@ -1104,6 +1107,12 @@ enum MaterialsRunEnd: Equatable, Sendable {
 
     /// Makes everything that waits for the launch bootstrap wait for `task` instead.
     func holdBootstrapForTesting(_ task: Task<Void, Never>) { bootstrapTask = task }
+    func holdLaunchBootstrapForTesting(_ task: Task<Void, Never>) { hasBootstrapped = false; bootstrapTask = task }
+    func applyLaunchBootstrapForTesting(recoveryBlocked: Bool = false, credentialPresent: Bool = true) async {
+        guard let database else { return }
+        await applyBootstrap(BootstrapService.Result(database: database, recoveryBlocked: recoveryBlocked, credential: credentialPresent ? .present : .absent), launch: true)
+        hasBootstrapped = true
+    }
 
     /// The folder handling after the open panel, with `url` as if picked there.
     func useRootForTesting(_ url: URL) async {
@@ -1237,7 +1246,7 @@ enum MaterialsRunEnd: Equatable, Sendable {
 
     /// Applies the outcome of the launch bootstrap or of a recovery retry. A blocked recovery keeps
     /// every root operation gated; otherwise the account and the persisted sync state are restored.
-    private func applyBootstrap(_ result: BootstrapService.Result) async {
+    private func applyBootstrap(_ result: BootstrapService.Result, launch: Bool = false) async {
         await refreshPendingModuleMoves()
         // Before the blocked-recovery return: a launch without a credential deletes the saved
         // course list whether or not a pending operation blocks recovery, as documented (#98).
@@ -1277,7 +1286,7 @@ enum MaterialsRunEnd: Equatable, Sendable {
                 setSyncState(.failed(.authenticationExpired))
             } else {
                 accountState = .connected
-                await restorePersistedSyncState()
+                await restorePersistedSyncState(launchBootstrap: launch)
             }
             configureBackgroundScheduler()
         case .absent:
@@ -1895,7 +1904,7 @@ enum MaterialsRunEnd: Equatable, Sendable {
         }
     }
 
-    private func restorePersistedSyncState() async {
+    private func restorePersistedSyncState(launchBootstrap: Bool = false) async {
         guard !Self.isUIPreview else { return }
         guard !recoveryBlocked else { setSyncState(.recoveryBlocked); return }
         guard accountState != .expired else { setSyncState(.failed(.authenticationExpired)); return }
@@ -1904,19 +1913,37 @@ enum MaterialsRunEnd: Equatable, Sendable {
         let generation = notificationGeneration
         let expectedSite = selectedSite
         let expectedURL = rootURL
+        // A launch restore may finish inside the one manual run waiting for that bootstrap.
+        // The generation permits only that run's checking/cancelling publications, not a newer
+        // identity or operation, even if the restore began before the run (#270).
+        func current() -> Bool {
+            guard self.rootID == rootID, selectedSite == expectedSite, rootURL == expectedURL,
+                  hasStoredCredential, accountState != .expired, !recoveryBlocked, !Task.isCancelled else { return false }
+            if !isSyncActive { return notificationGeneration == generation }
+            guard launchBootstrap, let marker = launchSyncRestore, activeOperationID == marker.id,
+                  notificationGeneration == marker.expected else { return false }
+            return (marker.before...marker.expected).contains(generation)
+        }
+        func publishRestored(_ state: AppSyncState) {
+            if launchBootstrap, let marker = launchSyncRestore, activeOperationID == marker.id {
+                stateBeforeSync = state
+            } else {
+                publishSyncState(state)
+            }
+        }
         let open: [ConflictRecord]
         do {
             let pending = try await loadPendingChoices()
-            guard self.rootID == rootID, selectedSite == expectedSite, rootURL == expectedURL, notificationGeneration == generation, hasStoredCredential, accountState != .expired, !recoveryBlocked, !isSyncActive, !Task.isCancelled else { return }
+            guard current() else { return }
             open = pending.conflicts
             conflicts = open
             remoteChanges = pending.changes
         } catch {
-            guard self.rootID == rootID, selectedSite == expectedSite, rootURL == expectedURL, notificationGeneration == generation, hasStoredCredential, accountState != .expired, !recoveryBlocked, !isSyncActive, !Task.isCancelled else { return }
+            guard current() else { return }
             reportPendingChoicesReadFailure()
             return
         }
-        if !open.isEmpty { setSyncState(.conflicts(open.count, nil)); return }
+        if !open.isEmpty { publishRestored(.conflicts(open.count, nil)); return }
         if let data = operationDefaults.data(forKey: Self.lastSuccessfulSummaryKey + rootID.uuidString) {
             // A large Activity summary can take more than a frame to decode. A detached task
             // keeps that CPU work off the UI; its result remains subject to the captured identity.
@@ -1926,18 +1953,21 @@ enum MaterialsRunEnd: Equatable, Sendable {
 #if DEBUG
             await beforeRestoredSummaryPublicationForTesting?()
 #endif
-            guard self.rootID == rootID, selectedSite == expectedSite, rootURL == expectedURL,
-                  notificationGeneration == generation, hasStoredCredential,
-                  accountState != .expired, !recoveryBlocked, !isSyncActive, !Task.isCancelled else { return }
+            guard current() else { return }
             if let summary {
-                publishSyncState(.synced(summary))
+                publishRestored(.synced(summary))
                 return
             }
         }
         let timestamp = operationDefaults.double(forKey: Self.lastSuccessfulReconciliationKey + rootID.uuidString)
         let legacy = SyncCompletionSummary(completedAt: Date(timeIntervalSince1970: timestamp), added: 0, updated: 0, unchanged: 0, preservedLocal: 0, conflicts: 0, failures: 0)
         // Timestamp-only installs migrate once; later restores take the read-only summary path.
-        setSyncState(timestamp > 0 ? .synced(legacy) : .readyUnchecked)
+        if launchBootstrap, let marker = launchSyncRestore, activeOperationID == marker.id {
+            publishRestored(timestamp > 0 ? .synced(legacy) : .readyUnchecked)
+            if timestamp > 0 { saveSuccessfulResult(legacy, data: try? JSONEncoder().encode(legacy), rootID: rootID) }
+        } else {
+            setSyncState(timestamp > 0 ? .synced(legacy) : .readyUnchecked)
+        }
     }
 
     var lastSyncSummary: SyncCompletionSummary? {
@@ -2347,11 +2377,14 @@ enum MaterialsRunEnd: Equatable, Sendable {
         guard !recoveryBlocked else { setSyncState(.recoveryBlocked); return }
         guard activeOperationID == nil, !isLoadingCourses else { return }
         let operationID = UUID()
+        let launchGeneration = !hasBootstrapped && syncState == .starting ? notificationGeneration : nil
+        stateBeforeSync = syncState
         activeOperationID = operationID
         pruneExpiredCourseList()
         // «Sincronizza ora» always downloads, on any network: nothing is paused any more.
         dataSaverPause = nil
         setSyncState(.checking)
+        if let launchGeneration { launchSyncRestore = (operationID, launchGeneration, notificationGeneration) }
         // Through the helper, not the coordinator directly: it also refreshes the Settings footer.
         Task { await requestNotificationPermissionIfNeeded() }
         syncTask = Task { [weak self] in
@@ -2364,6 +2397,12 @@ enum MaterialsRunEnd: Equatable, Sendable {
                 await self.bootstrapTask?.value
                 try Task.checkCancellation()
                 guard self.activeOperationID == operationID else { return }
+                // Launch recovery or credential failure is authoritative: do not start work over it.
+                if self.launchSyncRestore?.id == operationID, self.syncState != .checking {
+                    self.recordRunEnd(operationID, .unconfigured)
+                    self.endOperation(operationID)
+                    return
+                }
                 // The course list is only loaded when the window opens, so a sync started from the
                 // menu right after launch would otherwise find nothing selected and do nothing. A
                 // list restored from disk is not enough either: saved enrollments never decide
@@ -2380,7 +2419,7 @@ enum MaterialsRunEnd: Equatable, Sendable {
                 let selected = self.courseListFreshness == .current ? self.courses.filter { self.enabledCourseIDs.contains($0.id) } : []
                 guard !selected.isEmpty else {
                     self.recordRunEnd(operationID, .unconfigured)
-                    self.setSyncState(.readyUnchecked)
+                    self.restoreStateBeforeSync()
                     self.endOperation(operationID)
                     return
                 }
@@ -2456,7 +2495,13 @@ enum MaterialsRunEnd: Equatable, Sendable {
             return
         }
         syncTask.cancel()
-        setSyncState(.cancelling)
+        switch syncState {
+        case .checking, .syncing:
+            let acceptsCancellation = launchSyncRestore?.id == operationID && launchSyncRestore?.expected == notificationGeneration
+            setSyncState(.cancelling)
+            if acceptsCancellation { launchSyncRestore?.expected = notificationGeneration }
+        default: break
+        }
     }
 
     /// Stops what must not outlive the app: the background scheduler and a running sync, which is
@@ -3519,6 +3564,7 @@ enum MaterialsRunEnd: Equatable, Sendable {
         // Captured once: switching "Risparmio dati" during the run changes the next run, not this one.
         let networkAccess: NetworkAccess = dataSaverEnabled ? .dataSaver : .unrestricted
         let operationID = UUID()
+        stateBeforeSync = syncState
         activeOperationID = operationID
         automaticOutcome = .finished
         await scopeWriteTask?.value
@@ -3546,7 +3592,7 @@ enum MaterialsRunEnd: Equatable, Sendable {
         guard activeOperationID == operationID else { return .cancelled }
         BeepbarLog.sync.notice("Automatic synchronization started dataSaver=\(networkAccess == .dataSaver, privacy: .public)")
         // Put back if "Risparmio dati" stops the run midway, so the last result stays on screen.
-        let stateBeforeRun = syncState
+        stateBeforeSync = syncState
         setSyncState(.checking)
         let apiClient = self.apiClient
         let downloader = self.downloader
@@ -3577,7 +3623,7 @@ enum MaterialsRunEnd: Equatable, Sendable {
 #endif
                 // A delivered network error can race with cancellation of this inner task (#269).
                 if Task.isCancelled { self.cancelledSync(operationID); return }
-                if networkAccess == .dataSaver, await self.pausedMidRun(operationID, error: error, restoring: stateBeforeRun) { return }
+                if networkAccess == .dataSaver, await self.pausedMidRun(operationID, error: error) { return }
                 await self.failedSync(operationID, error: error, automatic: true)
             } catch let error as CredentialStorageError {
                 self?.recordRunEnd(operationID, .credentialUnavailable)
@@ -3874,8 +3920,21 @@ enum MaterialsRunEnd: Equatable, Sendable {
         guard activeOperationID == operationID else { return }
         BeepbarLog.sync.notice("Synchronization cancelled")
         recordRunEnd(operationID, .cancelled)
-        setSyncState(.readyUnchecked)
+        restoreStateBeforeSync()
         endOperation(operationID)
+    }
+
+    /// Restore a prior result without writing it again; a state published during bootstrap wins.
+    private func restoreStateBeforeSync() {
+        switch syncState {
+        case .checking, .syncing, .cancelling:
+            let previous = stateBeforeSync ?? .readyUnchecked
+            publishSyncState(previous == .starting ? .readyUnchecked : Self.stateAfterPauseMidway(previous))
+        default:
+            if let previous = stateBeforeSync, case .failed = previous, syncState == previous {
+                publishSyncState(.readyUnchecked)
+            }
+        }
     }
 
     /// A manual sync found the folder busy with a rename, a module move or a conflict being resolved.
@@ -3893,7 +3952,7 @@ enum MaterialsRunEnd: Equatable, Sendable {
     /// back on screen as `stateAfterPauseMidway` decides, nothing reported as failed) and returns
     /// `true`. On an ordinary or no network it returns `false` and the failure is reported as
     /// usual, so a real outage still says so.
-    private func pausedMidRun(_ operationID: UUID, error: WeBeepAPIError, restoring stateBeforeRun: AppSyncState) async -> Bool {
+    private func pausedMidRun(_ operationID: UUID, error: WeBeepAPIError) async -> Bool {
         guard SyncServiceFailure(error) == .connectivity, activeOperationID == operationID else { return false }
         let network = await automaticSyncEnvironment.currentNetwork()
         // The run may have been cancelled, or the app quit, while the network was read.
@@ -3904,7 +3963,7 @@ enum MaterialsRunEnd: Equatable, Sendable {
         BeepbarLog.sync.notice("Automatic synchronization deferred midway reason=data-saver")
         recordRunEnd(operationID, .pausedMidRun(pause))
         automaticOutcome = .deferred
-        setSyncState(Self.stateAfterPauseMidway(stateBeforeRun))
+        restoreStateBeforeSync()
         // Turned off while the run was going: nothing to show, and the retry runs without limits.
         // Either way the refusal came from the run's limits, so it is not shown as an outage.
         dataSaverPause = dataSaverEnabled ? pause : nil
@@ -3947,7 +4006,7 @@ enum MaterialsRunEnd: Equatable, Sendable {
         guard activeOperationID == operationID else { return }
         recordRunEnd(operationID, .deferredWhileBusy)
         automaticOutcome = .deferred
-        setSyncState(.readyUnchecked)
+        restoreStateBeforeSync()
         endOperation(operationID)
     }
 
@@ -4031,6 +4090,8 @@ enum MaterialsRunEnd: Equatable, Sendable {
         progressStore.closeCurrentRun()
         activeOperationID = nil
         syncTask = nil
+        stateBeforeSync = nil
+        launchSyncRestore = nil
         // Quitting: nothing new starts on the way out (no Keychain or network work, #168).
         guard !isTerminating else { return }
         // The course list the window asked for while this sync ran (#98). An open window still

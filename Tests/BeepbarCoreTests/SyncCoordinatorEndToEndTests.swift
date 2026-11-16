@@ -608,8 +608,14 @@ private let temporaryVolumeIgnoresCase: Bool = {
         let fixture = try await Fixture()
         defer { fixture.remove() }
         _ = try await fixture.synchronize()
+        // Downloads are hashed by the downloader while it receives them (#250), so the first run
+        // no longer moves `hashCount`. Prove the counter is live instead: inspecting one installed
+        // file must hash it. Then the second run must add nothing on top of that.
+        let baseline = try #require(await fixture.database.baseline(rootID: fixture.rootID, remoteID: fixture.remoteID(course: 1, file: 0)))
+        let hashesBeforeProbe = await fixture.coordinator.fileStore.hashCount
+        _ = try await fixture.coordinator.fileStore.inspect(baseline.relativePath)
         let hashesAfterFirstRun = await fixture.coordinator.fileStore.hashCount
-        #expect(hashesAfterFirstRun > 0)
+        #expect(hashesAfterFirstRun > hashesBeforeProbe)
 
         let second = try await fixture.synchronize()
 

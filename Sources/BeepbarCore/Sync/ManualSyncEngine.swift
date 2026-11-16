@@ -41,11 +41,10 @@ public actor ManualSyncEngine {
             return try await apply(SyncPlanner.decide(baseline: baseline, local: local, remote: RemoteState(sha256: baseline.sha256, revision: file.observedRevision)), remoteID: file.id, courseID: file.courseID, moduleID: file.moduleID, baseline: baseline, destination: destination, local: local, remote: RemoteState(sha256: baseline.sha256, revision: file.observedRevision), artifact: nil)
         }
         try Task.checkCancellation()
-        let downloaded = try await downloader.download(file, token: token, access: networkAccess)
-        // The import copies the body out of the temporary file, so nothing else ever removes it.
-        defer { try? FileManager.default.removeItem(at: downloaded.temporaryURL) }
-        try Task.checkCancellation()
-        let artifact = try await fileStore.importDownloadedFile(at: downloaded.temporaryURL, expectedSize: downloaded.expectedSize, maximumSize: downloader.maximumSize)
+        // The stage is created inside `download`, while this run holds the root's `.syncing`
+        // state in the in-process `RootOperationGate`; recovery needs `.recovering`, so it cannot
+        // sweep a live stage. The gate is per process: another process is not excluded here.
+        let artifact = try await downloader.download(file, token: token, access: networkAccess, into: fileStore)
         let remote = RemoteState(sha256: artifact.sha256, revision: file.observedRevision)
         do {
             try Task.checkCancellation()

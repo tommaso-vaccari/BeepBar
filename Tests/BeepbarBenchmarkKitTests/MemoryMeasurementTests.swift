@@ -82,7 +82,7 @@ struct MemoryMeasurementTests {
     }
 
     /// Hashing a large file holds one chunk at a time. Guards the chunk loop in
-    /// `FileStore.hashContents`: without a pool per chunk, the 192 MiB read stays in memory.
+    /// `FileStore.hashContents`: guards against retaining the 192 MiB read in memory.
     @Test func hashingALargeFileKeepsMemoryFlat() async throws {
         let root = try Self.temporaryRoot()
         defer { try? FileManager.default.removeItem(at: root) }

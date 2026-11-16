@@ -1,3 +1,8 @@
+#if canImport(CryptoKit)
+import CryptoKit
+#else
+import Crypto
+#endif
 import Foundation
 #if canImport(FoundationNetworking)
 import FoundationNetworking
@@ -11,6 +16,182 @@ import Testing
 @testable import BeepbarCore
 
 @Suite(.serialized) struct RemoteDownloaderTests {
+    private let fixture = try! DownloadFixture()
+    /// Completion preceding continuation registration must be delivered exactly once.
+    @Test func completionBeforeRegistrationIsNotLost() {
+        var completion = DownloadCompletion()
+        let received = CompletionProbe()
+        let result: Result<String, Error> = .failure(URLError(.cancelled))
+        completion.finish(result)?(result)
+        if let parked = completion.register({ received.accept($0) }) { received.accept(parked) }
+        #expect(received.calls == 1)
+        #expect(received.wasCancelled)
+    }
+
+    /// Completion after registration must also be delivered exactly once.
+    @Test func completionAfterRegistrationIsDelivered() {
+        var completion = DownloadCompletion()
+        let received = CompletionProbe()
+        if let parked = completion.register({ received.accept($0) }) { received.accept(parked) }
+        let result: Result<String, Error> = .success("digest")
+        completion.finish(result)?(result)
+        #expect(received.calls == 1)
+        #expect(received.digest == "digest")
+    }
+
+    /// Cancellation at the stage handoff closes and removes it before any request starts.
+    @Test func cancellationImmediatelyAfterOpeningStageCleansUp() async throws {
+        StreamingProtocol.reset(chunks: 1, chunkSize: 1)
+        let barrier = StageBarrier()
+        let store = fixture.store
+        let downloader = RemoteDownloader(session: Self.session(StreamingProtocol.self), writeStage: { write($0, $1, $2) }, afterStageOpened: { await barrier.pause() })
+        let done = CompletionProbe()
+        let task = Task {
+            do {
+                _ = try await downloader.download(Self.file(size: 1), token: "token", access: .unrestricted, into: store)
+                done.accept(.success("unexpected success"))
+            } catch { done.accept(.failure(error)) }
+        }
+        await Self.waitUntil { barrier.waiting }
+        #expect(barrier.waiting)
+        #expect(fixture.stageFiles.count == 1)
+        task.cancel()
+        barrier.release()
+        await Self.waitUntil { done.calls > 0 }
+        #expect(done.calls == 1)
+        #expect(done.wasTaskCancelled)
+        #expect(fixture.stageFiles.isEmpty)
+        #expect(StreamingProtocol.deliveredChunks == 0)
+    }
+
+    /// The received bytes are written once to a stage and the artifact names their SHA-256.
+    @Test func downloadWritesOnePassIntoTheStage() async throws {
+        let fixture = try DownloadFixture()
+        StreamingProtocol.reset(chunks: 4, chunkSize: 256)
+        let counter = DownloadWriteCounter()
+        let downloader = RemoteDownloader(session: Self.session(StreamingProtocol.self), writeStage: { fd, bytes, count in
+            let result = write(fd, bytes, count)
+            if result > 0 { counter.add(result) }
+            return result
+        })
+        let before = Self.downloadTemporaryFiles()
+        let artifact = try await downloader.download(Self.file(size: 1_024), token: "token", access: .unrestricted, into: fixture.store)
+        let bytes = try Data(contentsOf: fixture.root.appending(path: artifact.stagePath.value))
+        #expect(bytes.count == 1_024)
+        #expect(counter.total == 1_024)
+        #expect(artifact.sha256 == fixture.digest(bytes))
+        #expect(Self.downloadTemporaryFiles().subtracting(before).isEmpty)
+    }
+
+    /// Proves a completed download hands over a stage whose stored bytes hash to the reported
+    /// digest, whose size is the reported one, and whose permission bits equal those of a stage made
+    /// by `createStage()` (so the installed file is permissioned as before). Guards against hashing
+    /// something other than what was saved, and against the download path changing file modes.
+    @Test func completedDownloadMatchesItsDigestSizeAndStageMode() async throws {
+        StreamingProtocol.reset(chunks: 200, chunkSize: 256)
+        let downloader = RemoteDownloader(session: Self.session(StreamingProtocol.self))
+        let artifact = try await downloader.download(Self.file(size: 51_200), token: "token", access: .unrestricted, into: fixture.store)
+        let path = fixture.root.appending(path: artifact.stagePath.value)
+        let bytes = try Data(contentsOf: path)
+        #expect(bytes.count == 51_200)
+        #expect(artifact.size == 51_200)
+        #expect(artifact.sha256 == fixture.digest(bytes))
+        let reference = try await fixture.store.createStage()
+        let referenceMode = try FileManager.default.attributesOfItem(atPath: fixture.root.appending(path: reference.relativePath.value).path)[.posixPermissions] as? Int
+        let downloadedMode = try FileManager.default.attributesOfItem(atPath: path.path)[.posixPermissions] as? Int
+        #expect(downloadedMode != nil)
+        #expect(downloadedMode == referenceMode)
+    }
+
+    /// Proves the hand-off rechecks the stage identity: if the path is replaced by a different
+    /// file of the same size after the last byte is written, the download fails with
+    /// `invalidStage` and the original is not handed over. `discard` refuses to unlink a file that
+    /// is not the one the stage created, so the foreign replacement stays in staging for the
+    /// recovery sweep (asserted below) instead of being deleted blindly. The swap runs inside the
+    /// injected write, on the final write, so it is deterministic; the replacement is created
+    /// before the original is renamed over, so the two inodes are necessarily distinct.
+    @Test func replacedStageFailsHandOffAndLeavesTheForeignFileForTheSweep() async throws {
+        StreamingProtocol.reset(chunks: 4, chunkSize: 256)
+        let counter = DownloadWriteCounter()
+        let staging = fixture.root.appending(path: ".beepbar/staging")
+        let downloader = RemoteDownloader(session: Self.session(StreamingProtocol.self), writeStage: { fd, bytes, count in
+            let result = write(fd, bytes, count)
+            if result > 0 { counter.add(result) }
+            if counter.total == 1_024 {
+                let entries = (try? FileManager.default.contentsOfDirectory(atPath: staging.path)) ?? []
+                if let name = entries.first {
+                    let replacement = staging.appending(path: "replacement.tmp")
+                    try? Data(count: 1_024).write(to: replacement)
+                    rename(replacement.path, staging.appending(path: name).path)
+                }
+            }
+            return result
+        })
+        await #expect(throws: FileStoreError.invalidStage) {
+            try await downloader.download(Self.file(size: 1_024), token: "token", access: .unrestricted, into: fixture.store)
+        }
+        // `discard` refuses to unlink a file that is not the one the stage created, so the foreign
+        // replacement stays for the recovery sweep instead of being deleted blindly.
+        #expect(fixture.stageFiles.count == 1)
+        try await fixture.store.sweepUnreferencedStages(referencedPaths: [])
+        #expect(fixture.stageFiles.isEmpty)
+    }
+
+    /// Proves the hand-off rechecks the stage size: the injected write truncates the stage through
+    /// its own descriptor after the last byte, so the inode (identity) is unchanged and only the
+    /// size check can notice. Expects `sizeMismatch` and the stage removed (it is still ours).
+    /// Guards against handing over a file whose size no longer matches the digest's source.
+    @Test func truncatedStageFailsHandOffOnSizeAndIsRemoved() async throws {
+        StreamingProtocol.reset(chunks: 4, chunkSize: 256)
+        let counter = DownloadWriteCounter()
+        let downloader = RemoteDownloader(session: Self.session(StreamingProtocol.self), writeStage: { fd, bytes, count in
+            let result = write(fd, bytes, count)
+            if result > 0 { counter.add(result) }
+            if counter.total == 1_024 { _ = ftruncate(fd, 512) }
+            return result
+        })
+        await #expect(throws: FileStoreError.sizeMismatch) {
+            try await downloader.download(Self.file(size: 1_024), token: "token", access: .unrestricted, into: fixture.store)
+        }
+        #expect(fixture.stageFiles.isEmpty)
+    }
+
+    /// A body shorter than the reported size (no Content-Length to catch it early) is rejected and
+    /// its partial stage removed, instead of being handed over as if complete.
+    @Test func shorterBodyThanReportedIsRejectedAndRemoved() async throws {
+        StreamingProtocol.reset(chunks: 2, chunkSize: 256)
+        let downloader = RemoteDownloader(session: Self.session(StreamingProtocol.self))
+        await #expect(throws: RemoteDownloadError.invalidResponse) {
+            try await downloader.download(Self.file(size: 1_024), token: "token", access: .unrestricted, into: fixture.store)
+        }
+        #expect(fixture.stageFiles.isEmpty)
+    }
+
+    /// A short syscall write must reject the transfer and discard its partial stage.
+    @Test func shortWriteRejectsAndRemovesTheStage() async throws {
+        StreamingProtocol.reset(chunks: 4, chunkSize: 256)
+        let downloader = RemoteDownloader(session: Self.session(StreamingProtocol.self), writeStage: { fd, bytes, count in
+            write(fd, bytes, max(1, count / 2))
+        })
+        await #expect(throws: FileStoreError.ioFailure) {
+            try await downloader.download(Self.file(size: 1_024), token: "token", access: .unrestricted, into: fixture.store)
+        }
+        #expect(fixture.stageFiles.isEmpty)
+        await Self.waitUntil { StreamingProtocol.wasStopped }
+    }
+
+    /// A crash-left partial remains discoverable and is swept on recovery.
+    @Test func crashLeftStageIsSwept() async throws {
+        let (_, fd) = try await fixture.store.openDownloadStage()
+        let bytes = Data("partial".utf8)
+        let count = bytes.withUnsafeBytes { write(fd, $0.baseAddress!, $0.count) }
+        #expect(count == bytes.count)
+        close(fd)
+        #expect(fixture.stageFiles.count == 1)
+        try await fixture.store.sweepUnreferencedStages(referencedPaths: [])
+        #expect(fixture.stageFiles.isEmpty)
+    }
+
     @Test(arguments: [
         (URLError.Code.notConnectedToInternet, RemoteDownloadError.network(.offline)),
         (.timedOut, .network(.timedOut)),
@@ -28,7 +209,7 @@ import Testing
             downloadURL: URL(string: "https://webeep.polimi.it/pluginfile.php/file")!,
             size: 1, modifiedAt: nil, observedRevision: "1", isSupported: true
         )
-        await #expect(throws: expected) { try await downloader.download(file, token: "token", access: .unrestricted) }
+        await #expect(throws: expected) { try await downloader.download(file, token: "token", access: .unrestricted, into: fixture.store) }
     }
 
     @Test func removesTemporaryFileWhenResponseIsRejected() async throws {
@@ -43,8 +224,9 @@ import Testing
             size: 4, modifiedAt: nil, observedRevision: "1", isSupported: true
         )
         let before = Self.downloadTemporaryFiles()
-        await #expect(throws: RemoteDownloadError.transport(404)) { try await downloader.download(file, token: "token", access: .unrestricted) }
+        await #expect(throws: RemoteDownloadError.transport(404)) { try await downloader.download(file, token: "token", access: .unrestricted, into: fixture.store) }
         #expect(Self.leakedDownloadTemporaries(since: before, body: DownloadRejectedProtocol.body).isEmpty)
+        #expect(fixture.stageFiles.isEmpty)
     }
 
     @Test func stopsABodyLargerThanReportedBeforeItIsFullyWritten() async throws {
@@ -54,9 +236,8 @@ import Testing
         // partial file is removed, which a first chunk already over the limit never exercised.
         StreamingProtocol.reset(chunks: 400, chunkSize: 256)
         let downloader = RemoteDownloader(session: Self.session(StreamingProtocol.self))
-        let before = Self.downloadTemporaryFiles()
         await #expect(throws: RemoteDownloadError.invalidResponse) {
-            try await downloader.download(Self.file(size: 1_000), token: "token", access: .unrestricted)
+            try await downloader.download(Self.file(size: 1_000), token: "token", access: .unrestricted, into: fixture.store)
         }
         // URLSession tears the transfer down (`stopLoading`) on its own queue a few ms after the
         // downloader cancels it. Asserting `wasStopped` right away is what failed 19 of 25 runs
@@ -67,18 +248,15 @@ import Testing
         // second) before the download even throws.
         await Self.waitUntil { StreamingProtocol.wasStopped }
         #expect(StreamingProtocol.deliveredChunks < 400)
-        #expect(Self.downloadTemporaries(since: before, startingWith: StreamingProtocol.marker).isEmpty)
+        #expect(fixture.stageFiles.isEmpty)
     }
 
     @Test func acceptsABodyOfExactlyTheReportedSizeWithoutContentLength() async throws {
         StreamingProtocol.reset(chunks: 4, chunkSize: 256)
         let downloader = RemoteDownloader(session: Self.session(StreamingProtocol.self))
-        let downloaded = try await downloader.download(Self.file(size: 1_024), token: "token", access: .unrestricted)
-        defer { try? FileManager.default.removeItem(at: downloaded.temporaryURL) }
-        #expect(downloaded.expectedSize == 1_024)
-        // The leak checks look for this prefix: prove they would see a body left behind.
-        #expect(downloaded.temporaryURL.lastPathComponent.hasPrefix(RemoteDownloader.temporaryFilePrefix))
-        #expect(try Data(contentsOf: downloaded.temporaryURL).count == 1_024)
+        let downloaded = try await downloader.download(Self.file(size: 1_024), token: "token", access: .unrestricted, into: fixture.store)
+        #expect(downloaded.size == 1_024)
+        #expect(try Data(contentsOf: fixture.root.appending(path: downloaded.stagePath.value)).count == 1_024)
     }
 
     /// Proves nothing is left behind; the body may reach disk before the rejection removes it.
@@ -86,9 +264,10 @@ import Testing
         let before = Self.downloadTemporaryFiles()
         let downloader = RemoteDownloader(session: Self.session(RedirectingProtocol.self))
         await #expect(throws: RemoteDownloadError.unexpectedRedirect) {
-            try await downloader.download(Self.file(size: Int64(RedirectingProtocol.body.count)), token: "token", access: .unrestricted)
+            try await downloader.download(Self.file(size: Int64(RedirectingProtocol.body.count)), token: "token", access: .unrestricted, into: fixture.store)
         }
         #expect(Self.leakedDownloadTemporaries(since: before, body: RedirectingProtocol.body).isEmpty)
+        #expect(fixture.stageFiles.isEmpty)
     }
 
     @Test func anHTTPRedirectIsRefusedBeforeTheSecondRequest() async throws {
@@ -98,9 +277,10 @@ import Testing
         let downloader = RemoteDownloader(policy: policy)
         let file = RemoteFileCandidate(id: "file", courseID: 1, sectionID: 1, moduleID: 1, sectionName: "", moduleName: "", filename: "file.txt", remoteFilePath: "/", canonicalPluginPath: "/pluginfile.php/file", downloadURL: server.url, size: 1, modifiedAt: nil, observedRevision: "1", isSupported: true)
         await #expect(throws: RemoteDownloadError.transport(302)) {
-            try await downloader.download(file, token: "token", access: .unrestricted)
+            try await downloader.download(file, token: "token", access: .unrestricted, into: fixture.store)
         }
         #expect(server.requestCount == 1)
+        #expect(fixture.stageFiles.isEmpty)
     }
 
     /// The server announces fewer bytes than WeBeep reported for the file. The body is smaller
@@ -110,16 +290,17 @@ import Testing
         let before = Self.downloadTemporaryFiles()
         let downloader = RemoteDownloader(session: Self.session(WrongLengthProtocol.self))
         await #expect(throws: RemoteDownloadError.invalidResponse) {
-            try await downloader.download(Self.file(size: Int64(WrongLengthProtocol.body.count + 10)), token: "token", access: .unrestricted)
+            try await downloader.download(Self.file(size: Int64(WrongLengthProtocol.body.count + 10)), token: "token", access: .unrestricted, into: fixture.store)
         }
         #expect(Self.leakedDownloadTemporaries(since: before, body: WrongLengthProtocol.body).isEmpty)
+        #expect(fixture.stageFiles.isEmpty)
     }
 
     @Test func aServerErrorKeepsItsStatusWhateverTheBodySize() async throws {
         // Error pages are larger than most files: the size cap must not hide a 401/500.
         let downloader = RemoteDownloader(session: Self.session(DownloadRejectedProtocol.self))
         await #expect(throws: RemoteDownloadError.transport(404)) {
-            try await downloader.download(Self.file(size: 1), token: "token", access: .unrestricted)
+            try await downloader.download(Self.file(size: 1), token: "token", access: .unrestricted, into: fixture.store)
         }
     }
 
@@ -127,18 +308,18 @@ import Testing
         // Chunks at least as long as the marker, so the partial file starts with it.
         StreamingProtocol.reset(chunks: 10_000, chunkSize: 64)
         let downloader = RemoteDownloader(session: Self.session(StreamingProtocol.self))
-        // Taken before the transfer starts, so the partial body it writes counts as a leak.
-        let before = Self.downloadTemporaryFiles()
-        let task = Task { try await downloader.download(Self.file(size: 640_000), token: "token", access: .unrestricted) }
+        let store = fixture.store
+        let task = Task { try await downloader.download(Self.file(size: 640_000), token: "token", access: .unrestricted, into: store) }
         // Cancel only once the downloader has really written a partial file. Without a
         // Content-Type, URLSession held back the first 512 bytes to guess one, so a cancel after a
         // few chunks never reached the cleanup this test is about; `StreamingProtocol` now sends
         // a Content-Type, and waiting for the file keeps the test independent of that buffering.
-        await Self.waitUntil { !Self.downloadTemporaries(since: before, startingWith: StreamingProtocol.marker).isEmpty }
-        #expect(!Self.downloadTemporaries(since: before, startingWith: StreamingProtocol.marker).isEmpty, "the partial file must exist before cancelling")
+        await Self.waitUntil { !fixture.stages(startingWith: StreamingProtocol.marker).isEmpty }
+        #expect(!fixture.stages(startingWith: StreamingProtocol.marker).isEmpty, "the partial file must exist before cancelling")
+        #expect(StreamingProtocol.deliveredChunks < 10_000)
         task.cancel()
         await #expect(throws: CancellationError.self) { try await task.value }
-        #expect(Self.downloadTemporaries(since: before, startingWith: StreamingProtocol.marker).isEmpty)
+        #expect(fixture.stageFiles.isEmpty)
         // Let the transfer finish tearing down, so it can't add to the next test's counters; a
         // timeout fails here rather than in whichever test runs next.
         await Self.waitUntil { StreamingProtocol.wasStopped }
@@ -155,7 +336,7 @@ import Testing
         StreamingProtocol.reset(chunks: 1, chunkSize: 1)
         let downloader = RemoteDownloader(session: Self.session(StreamingProtocol.self), maximumSize: 10)
         await #expect(throws: RemoteDownloadError.tooLarge) {
-            try await downloader.download(Self.file(size: 11), token: "token", access: .unrestricted)
+            try await downloader.download(Self.file(size: 11), token: "token", access: .unrestricted, into: fixture.store)
         }
         #expect(StreamingProtocol.deliveredChunks == 0)
     }
@@ -201,7 +382,7 @@ import Testing
 
     private static func downloadTemporaryFiles() -> Set<String> {
         let entries = (try? FileManager.default.contentsOfDirectory(atPath: NSTemporaryDirectory())) ?? []
-        return Set(entries.filter { $0.hasPrefix(RemoteDownloader.temporaryFilePrefix) || $0.hasPrefix("CFNetworkDownload") })
+        return Set(entries.filter { $0.hasPrefix("Beepbar-download-") || $0.hasPrefix("CFNetworkDownload") })
     }
 }
 
@@ -345,4 +526,67 @@ private final class WrongLengthProtocol: URLProtocol, @unchecked Sendable {
         client?.urlProtocolDidFinishLoading(self)
     }
     override func stopLoading() {}
+}
+
+private final class DownloadWriteCounter: @unchecked Sendable {
+    private let lock = NSLock()
+    private var value = 0
+    var total: Int { lock.withLock { value } }
+    func add(_ amount: Int) { lock.withLock { value += amount } }
+}
+
+private final class DownloadFixture {
+    let root: URL
+    let store: FileStore
+    init() throws {
+        root = FileManager.default.temporaryDirectory.appending(path: UUID().uuidString)
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        store = try FileStore(root: root)
+    }
+    var stageFiles: [URL] {
+        let directory = root.appending(path: ".beepbar/staging")
+        return (try? FileManager.default.contentsOfDirectory(at: directory, includingPropertiesForKeys: nil)) ?? []
+    }
+    func stages(startingWith prefix: Data) -> [URL] {
+        stageFiles.filter {
+            (try? Data(contentsOf: $0).starts(with: prefix)) == true
+        }
+    }
+    func digest(_ data: Data) -> String { SHA256.hash(data: data).map { String(format: "%02x", $0) }.joined() }
+    deinit { try? FileManager.default.removeItem(at: root) }
+}
+
+private final class CompletionProbe: @unchecked Sendable {
+    private let lock = NSLock()
+    private var results: [Result<String, Error>] = []
+    func accept(_ result: Result<String, Error>) { lock.withLock { results.append(result) } }
+    var calls: Int { lock.withLock { results.count } }
+    var digest: String? { lock.withLock { try? results.first?.get() } }
+    var wasTaskCancelled: Bool { lock.withLock { guard case .failure(let error) = results.first else { return false }; return error is CancellationError } }
+    var wasCancelled: Bool { lock.withLock { guard case .failure(let error) = results.first else { return false }; return (error as? URLError)?.code == .cancelled } }
+}
+
+private final class StageBarrier: @unchecked Sendable {
+    private let lock = NSLock()
+    private var continuation: CheckedContinuation<Void, Never>?
+    private var released = false
+    var waiting: Bool { lock.withLock { continuation != nil } }
+    func pause() async {
+        await withCheckedContinuation { continuation in
+            let resume = lock.withLock {
+                if released { return true }
+                self.continuation = continuation
+                return false
+            }
+            if resume { continuation.resume() }
+        }
+    }
+    func release() {
+        let pending = lock.withLock { () -> CheckedContinuation<Void, Never>? in
+            released = true
+            defer { continuation = nil }
+            return continuation
+        }
+        pending?.resume()
+    }
 }

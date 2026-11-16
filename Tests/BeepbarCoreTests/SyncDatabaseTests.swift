@@ -8,6 +8,55 @@ import Testing
 @testable import BeepbarCore
 
 struct SyncDatabaseTests {
+    /// Repeated queries reuse a cursor, while migration and explicit account cleanup finalize it.
+    @Test func preparedStatementsAreReusedAndClearedAtLifecycleBoundaries() async throws {
+        let root = try temporaryRoot()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let url = root.appending(path: "state.sqlite")
+        let rootID = UUID()
+        var database: SyncDatabase? = try SyncDatabase(url: url)
+        try await database!.registerRoot(id: rootID, canonicalPath: root.path)
+        await database!.clearStatementCache()
+        let before = await database!.statementCacheCounters().prepares
+        for _ in 0..<5 { _ = try await database!.baseline(rootID: rootID, remoteID: "missing") }
+        #expect(await database!.statementCacheCounters().prepares - before == 1)
+        #expect(await database!.statementCacheCounters().cached == 1)
+        try await database!.upsertBaseline(rootID: rootID, baseline: Baseline(remoteID: "present", relativePath: try RelativePath("present"), sha256: "hash", remoteRevision: "1"))
+        _ = try await database!.baseline(rootID: rootID, remoteID: "present")
+        #expect(await database!.statementCacheCounters().busy == 0)
+        #expect(await !database!.statementCacheContains("present"))
+        try await database!.migrate()
+        #expect(await database!.statementCacheCounters().cached == 0)
+        _ = try await database!.baseline(rootID: rootID, remoteID: "missing")
+        await database!.clearStatementCache()
+        #expect(await database!.statementCacheCounters().cached == 0)
+        _ = try await database!.baseline(rootID: rootID, remoteID: "present")
+        let closeResult = SQLiteCloseProbe()
+        await database!.observeCloseForTesting { closeResult.record($0) }
+        database = nil
+        #expect(closeResult.result == SQLITE_OK)
+    }
+
+    /// Failure on the second row rolls back the first and the cached cursor is reusable unlocked.
+    @Test func failedBulkStatementResetsAndRollsBackBeforeRetry() async throws {
+        let root = try temporaryRoot()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let url = root.appending(path: "state.sqlite")
+        let rootID = UUID()
+        let database = try SyncDatabase(url: url)
+        try await database.registerRoot(id: rootID, canonicalPath: root.path)
+        let file = PendingModuleMoveFile(remoteID: "same", oldPath: try RelativePath("a"), newPath: try RelativePath("b"), source: .missing)
+        let broken = PendingModuleMove(rootID: rootID, courseID: 1, moduleID: 1, action: .set, oldFolder: nil, newFolder: "b", lastKnownName: "b", files: [file, file])
+        await #expect(throws: SyncDatabaseError.execution) { try await database.beginModuleMove(broken) }
+        #expect(await database.statementCacheCounters().busy == 0)
+        #expect(try await database.pendingModuleMoves(rootID: rootID).isEmpty)
+        try RawSQLite(url: url).execute("BEGIN IMMEDIATE; ROLLBACK")
+        let second = PendingModuleMoveFile(remoteID: "second", oldPath: try RelativePath("c"), newPath: try RelativePath("d"), source: .missing)
+        let fixed = PendingModuleMove(rootID: rootID, courseID: 1, moduleID: 1, action: .set, oldFolder: nil, newFolder: "b", lastKnownName: "b", files: [file, second])
+        try await database.beginModuleMove(fixed)
+        #expect(try await database.pendingModuleMoves(rootID: rootID) == [fixed])
+    }
+
     @Test func keptPathsSurviveReopeningAndStayWithinTheirRoot() async throws {
         let root = try temporaryRoot()
         defer { try? FileManager.default.removeItem(at: root) }
@@ -421,4 +470,12 @@ final class RawSQLite {
             }
         }
     }
+}
+
+/// Captures the SQLite close result across actor destruction.
+private final class SQLiteCloseProbe: @unchecked Sendable {
+    private let lock = NSLock()
+    private var value: Int32?
+    var result: Int32? { lock.withLock { value } }
+    func record(_ result: Int32) { lock.withLock { value = result } }
 }

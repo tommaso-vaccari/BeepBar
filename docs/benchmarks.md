@@ -9,7 +9,7 @@ only runs its own tests and a tiny run of each scenario, about a second in all.
 - **Synthetic data only.**
   - The corpus is generated: course names, file names, sizes and bytes.
   - Every run happens in a new temporary folder, holding its own sync folder, its own `sync.sqlite` and its own trash folder. All of it is deleted afterwards.
-  - Download bodies stream to the downloader's own temporary files (`$TMPDIR/Beepbar-download-*`), as in the app, and are removed when each download ends.
+  - Download bodies stream directly to a stage under the synthetic sync folder, as in the app; failed transfers discard their stage.
 - **The user's data is never touched.** That covers:
   - the WeBeep account and the keychain token (a fixed fake token is used);
   - `~/Library/Application Support/Beepbar`;

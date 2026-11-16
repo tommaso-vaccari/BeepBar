@@ -16,6 +16,7 @@
 
 ### Fixed
 
+- When an automatic sync fails because of a connection problem, BeepBar asks macOS to retry; macOS decides when.
 - Recordings keeps a valid Polimi sign-in across restarts when your Watchlist includes lessons added by Webex link.
 - Paste, copy and select all (⌘V, ⌘C, ⌘A) now work in the WeBeep sign-in window, so a password can be pasted.
 - BeepBar no longer quits unexpectedly when the Mac wakes from sleep with a lecture or the BeepBar window open.

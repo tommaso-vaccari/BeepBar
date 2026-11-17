@@ -165,7 +165,8 @@ The inline controls style (measurements in "Player findings" above) is applied b
 
 - Lifetime of `hlsURL` beyond 10 min and server-side lifetime of `ticket` / idbroker sessions beyond ~30 min.
 - Live confirmation (with consent) that the `email=` hint with the real address completes the sign-in unattended.
-- The `viewFrom` value of the webappng login URL (packages D/E leave the parameter out), and the unit of the stream API's `duration` (read as seconds).
+- The `viewFrom` value of the webappng login URL (packages D/E leave the parameter out).
+- Verified live (2026-11-17, #289): the stream API's `duration` is a JSON integer in **milliseconds** (read as seconds it exceeded a day for every real lecture and was refused), and the answer carries the recording's date as `gmtCreateTime` ("yyyy-MM-dd HH:mm:ss", UTC; `createTime` is the same moment in the site's local time, no zone). Both are decoded in `WebexStreamAPI`.
 - Energy comparison native player vs Webex web page (measurement in progress).
 
 

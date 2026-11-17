@@ -886,14 +886,27 @@ struct RecordingsListing: Equatable {
     }
 
     /// What a Play of a manual lesson learned from Webex (`ManualWebexLesson.learn`): its title
-    /// when the student gave none, and its length, saved so the row shows both from now on.
+    /// when the student gave none, its length and the date it was recorded, saved so the row shows
+    /// them from now on.
     /// Only from a fresh stream answer, and only for the account that owns the lesson.
     private func learnManualDetails(of recording: RecmanRecording, from stream: RecordingStream) {
         guard ManualWebexLesson.isManual(recording), let owner = manualLessonsWriter,
-              var lesson = manualLessons.lesson(id: recording.id), lesson.learn(title: stream.title, duration: stream.duration) else { return }
+              var lesson = manualLessons.lesson(id: recording.id), lesson.learn(title: stream.title, duration: stream.duration, recordedAt: stream.recordedAt) else { return }
         var updated = manualLessons
         updated.replace(lesson)
         if !saveManualLessons(updated, owner: owner) { log.error("Couldn't save what a Play learned of a manual lesson") }
+    }
+
+    /// A manual lesson without a saved length takes the player's own (a checkpoint's `duration`),
+    /// for when Webex's answer gave none usable (it once did not: the API's milliseconds were
+    /// read as seconds and refused). Never replaces a length already known.
+    private func learnManualLength(of recording: RecmanRecording, seconds: TimeInterval?) {
+        guard let seconds, ManualWebexLesson.isManual(recording), let owner = manualLessonsWriter,
+              var lesson = manualLessons.lesson(id: recording.id), lesson.durationSeconds == nil,
+              lesson.learn(title: nil, duration: seconds) else { return }
+        var updated = manualLessons
+        updated.replace(lesson)
+        if !saveManualLessons(updated, owner: owner) { log.error("Couldn't save a manual lesson's length") }
     }
 
     /// The watchlist toggle of an archive lesson. A lesson added by link is always in the
@@ -2099,7 +2112,7 @@ struct RecordingsListing: Equatable {
                 let enhancer = currentAudioEnhancer()
                 let kind = preferredEnhancedAudioKind
                 if defaults.bool(forKey: Self.prefersEnhancedAudioKey), enhancer.canStart(key), let url = enhancer.start(key: key, stream: stream.url, kind: kind) {
-                    played = RecordingStream(url: url, title: stream.title, duration: stream.duration)
+                    played = RecordingStream(url: url, title: stream.title, duration: stream.duration, recordedAt: stream.recordedAt)
                     enhancedAudioInUse = kind
                 }
             } else {
@@ -2277,7 +2290,7 @@ struct RecordingsListing: Equatable {
                 publishAudioState()
                 return
             }
-            target = RecordingStream(url: url, title: lecture.stream.title, duration: lecture.stream.duration)
+            target = RecordingStream(url: url, title: lecture.stream.title, duration: lecture.stream.duration, recordedAt: lecture.stream.recordedAt)
             defaults.set(kind.rawValue, forKey: Self.enhancedAudioKindKey)
         } else {
             enhancer.stop()
@@ -2522,6 +2535,7 @@ struct RecordingsListing: Equatable {
         if let fraction = RecordingWatchProgress.fraction(position: checkpoint.position, playerDuration: checkpoint.duration, archiveMinutes: recording.minutes) {
             session.progress.observe(fraction)
         }
+        learnManualLength(of: recording, seconds: checkpoint.duration)
         let closes = RecordingWatchProgress.checkpointCloses(reason: checkpoint.reason, reportedID: checkpoint.id, nextID: pendingPlayID)
         sessions[checkpoint.id] = closes ? nil : session
         if !closes { publishLive(of: recording) }

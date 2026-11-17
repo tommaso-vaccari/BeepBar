@@ -29,6 +29,10 @@ public struct ManualWebexLesson: Codable, Equatable, Sendable, Identifiable {
     /// The lesson's length in seconds, as Webex's stream answer gave it at a Play; nil until
     /// then. Shown as the row's length and used for the hours left, like Recman's minutes.
     public var durationSeconds: Double?
+    /// When Webex says the recording was made, learned at a Play; nil until then. The row's date
+    /// (`recording.recordedAt`) is this, else the day the lesson was added, so a recording from
+    /// weeks ago doesn't sort under "This week" once it has been played.
+    public var recordedAt: Date?
     /// How much of it was watched, and whether it is done: the same entry and rules
     /// (`RecordingWatchProgress`) as an archive lecture's, kept here because the store's
     /// `progress` table is keyed by course (`RecmanCourseKey`), which a manual lesson has none of.
@@ -50,11 +54,11 @@ public struct ManualWebexLesson: Codable, Equatable, Sendable, Identifiable {
         self.addedAt = addedAt
     }
 
-    /// `durationSeconds` and `progress` were added after the first lessons were saved (by a
-    /// build that never shipped, 2026-11-09): absent, they decode as nil. Each is decoded on
-    /// its own and a damaged one reads as nil, so it costs that lesson's length or progress,
-    /// never every lesson (an undecodable list is shown as none, `manualLessonsUnreadable`).
-    /// A rollback to that build drops both fields at its next save; the lessons stay.
+    /// `durationSeconds`, `progress` and `recordedAt` were added after the first lessons were
+    /// saved: absent, they decode as nil. Each is decoded on its own and a damaged one reads as
+    /// nil, so it costs that lesson's length, progress or date, never every lesson (an
+    /// undecodable list is shown as none, `manualLessonsUnreadable`). A rollback to an older
+    /// build drops the fields it doesn't know at its next save; the lessons stay.
     public init(from decoder: Decoder) throws {
         let container = try decoder.container(keyedBy: CodingKeys.self)
         id = try container.decode(String.self, forKey: .id)
@@ -65,6 +69,7 @@ public struct ManualWebexLesson: Codable, Equatable, Sendable, Identifiable {
         addedAt = try container.decode(Date.self, forKey: .addedAt)
         durationSeconds = (try? container.decodeIfPresent(Double.self, forKey: .durationSeconds)).flatMap { $0 }.flatMap(Self.plausibleDuration)
         progress = (try? container.decodeIfPresent(RecordingWatchEntry.self, forKey: .progress)).flatMap { $0 }
+        recordedAt = (try? container.decodeIfPresent(Date.self, forKey: .recordedAt)).flatMap { $0 }
     }
 
     /// The row the Watchlist and the player work with. `kind` "Webex" is what an untitled lesson
@@ -72,14 +77,15 @@ public struct ManualWebexLesson: Codable, Equatable, Sendable, Identifiable {
     /// `RecmanRecording.minutes`) once a Play has read it, empty until then.
     public var recording: RecmanRecording {
         let minutes = durationSeconds.map { Int(($0 / 60).rounded()) }
-        return RecmanRecording(id: id, courseCode: Self.courseCode, academicYear: 0, title: title, recordedAt: addedAt,
+        return RecmanRecording(id: id, courseCode: Self.courseCode, academicYear: 0, title: title, recordedAt: recordedAt ?? addedAt,
                                kind: "Webex", duration: minutes.map { "\($0) min" } ?? "", size: nil, previewURL: link)
     }
 
-    /// What a Play learned from Webex's answer: its title when the student gave none, and the
-    /// length. A title the student typed is never replaced. Returns whether anything changed.
+    /// What a Play learned from Webex's answer: its title when the student gave none, the
+    /// length, and the recording's date (only the first one: it doesn't change). A title the
+    /// student typed is never replaced. Returns whether anything changed.
     @discardableResult
-    public mutating func learn(title streamTitle: String?, duration: Double?) -> Bool {
+    public mutating func learn(title streamTitle: String?, duration: Double?, recordedAt streamDate: Date? = nil) -> Bool {
         var changed = false
         if title.isEmpty, let streamTitle, case let cleaned = Self.cleaned(streamTitle), !cleaned.isEmpty {
             title = cleaned
@@ -87,6 +93,10 @@ public struct ManualWebexLesson: Codable, Equatable, Sendable, Identifiable {
         }
         if let duration = duration.flatMap(Self.plausibleDuration), duration != durationSeconds {
             durationSeconds = duration
+            changed = true
+        }
+        if recordedAt == nil, let streamDate {
+            recordedAt = streamDate
             changed = true
         }
         return changed

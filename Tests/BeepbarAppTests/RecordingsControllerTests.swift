@@ -2494,6 +2494,49 @@ struct RecordingsControllerTests {
         controller.turnOff()
     }
 
+    /// A Play also saves when the recording was made (`gmtCreateTime`), so an old recording is
+    /// listed on its own date and not under "This week" for being added today; the date is kept
+    /// across a restart and not replaced by a later Play. Guards against the row's date staying
+    /// the day it was added.
+    @Test func aPlaySavesTheRecordingDateOfALinkedLesson() async throws {
+        defer { cleanUp() }
+        let controller = await readyController()
+        let lesson = try controller.addManualLesson(link: manualLink, title: "lab1", courseName: "").get()
+        let recorded = Date(timeIntervalSince1970: 1_793_717_389)
+        browser.streamResults[lesson.id] = [.success(RecordingStream(url: stream(lesson.id).url, title: "x", duration: 8_402, recordedAt: recorded))]
+        controller.play(lesson.recording)
+        await settle("lecture playing") { world.player.plays.count == 1 }
+        let learned = try #require(controller.manualLessons.lesson(id: lesson.id))
+        #expect(learned.recording.recordedAt == recorded)
+        #expect(learned.recording.duration == "140 min")
+        #expect(learned.title == "lab1")
+        let restored = makeController(useDefault: true)
+        restored.pageAppeared()
+        #expect(restored.manualLessons.lesson(id: lesson.id)?.recordedAt == recorded)
+        restored.turnOff()
+        controller.turnOff()
+    }
+
+    /// When Webex's answer has no usable length (a changed answer: it was once read in the wrong
+    /// unit and every real length was dropped), the player's own length at the first checkpoint
+    /// is saved, so a played lesson never stays without one. A length already known is kept.
+    @Test func aLinkedLessonWithoutALengthTakesItFromThePlayer() async throws {
+        defer { cleanUp() }
+        let controller = await readyController()
+        let lesson = try controller.addManualLesson(link: manualLink, title: "lab1", courseName: "").get()
+        browser.streamResults[lesson.id] = [.success(RecordingStream(url: stream(lesson.id).url, title: nil, duration: nil))]
+        controller.play(lesson.recording)
+        await settle("lecture playing") { world.player.plays.count == 1 }
+        #expect(controller.manualLessons.lesson(id: lesson.id)?.durationSeconds == nil)
+        world.player.pause(at: 3_900)
+        let learned = try #require(controller.manualLessons.lesson(id: lesson.id))
+        #expect(learned.durationSeconds == 6_000)
+        #expect(learned.recording.duration == "100 min")
+        #expect(learned.progress != nil, "the checkpoint's own progress must still be saved")
+        controller.turnOff()
+    }
+
+
     // MARK: Enhanced audio
 
     private let fakeFFmpegPath = URL(fileURLWithPath: "/opt/homebrew/bin/ffmpeg")

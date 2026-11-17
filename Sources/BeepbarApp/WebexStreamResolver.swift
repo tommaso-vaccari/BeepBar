@@ -12,7 +12,10 @@ import BeepbarCore
 struct RecordingStream: Equatable, Sendable {
     let url: URL
     let title: String?
+    /// The length in seconds (`WebexStreamAPI.duration`).
     let duration: TimeInterval?
+    /// When it was recorded, if Webex said (`WebexStreamAPI.recordedAt`).
+    var recordedAt: Date? = nil
 }
 
 /// One HTTP answer, as far as native playback reads it.
@@ -207,9 +210,9 @@ final class WebexURLSessionTransport: WebexHTTPTransport, @unchecked Sendable {
         let answer = WebexStreamAPI.decode(status: response.status, data: response.body)
         diagnose(Self.apiDiagnosis(attempt: attempt, ticket: ticket, status: response.status, answer: answer, body: response.body))
         switch answer {
-        case .stream(let hls, let title, let duration):
+        case .stream(let hls, let title, let duration, let recordedAt):
             trace("stream API answered \(response.status) with a stream")
-            return .stream(RecordingStream(url: hls, title: title, duration: duration))
+            return .stream(RecordingStream(url: hls, title: title, duration: duration, recordedAt: recordedAt))
         case .signedOut:
             trace("stream API answered \(response.status): signed out")
             return .signedOut

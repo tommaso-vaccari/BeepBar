@@ -166,7 +166,7 @@ struct WebexStreamTests {
         if let hls { info["hlsURL"] = hls }
         var body: [String: Any] = [
             "requireLogin": 1, "canPlayback": true, "preventPlayback": false, "passwordProtected": false, "needPassword": false, "preventDownload": false,
-            "downloadRecordingInfo": ["downloadInfo": info], "mp4StreamOption": [String: Any](), "duration": 8160, "recordName": "  Lezione sintetica  ",
+            "downloadRecordingInfo": ["downloadInfo": info], "mp4StreamOption": [String: Any](), "duration": 8_160_000, "recordName": "  Lezione sintetica  ",
             "chapterLayout": [Any](), "transcriptStatus": "none", "showAISummary": false,
         ]
         extra.forEach { body[$0.key] = $0.value }
@@ -176,6 +176,33 @@ struct WebexStreamTests {
     /// The signed-out 403 as the probe saw it.
     private var signedOut: [String: Any] {
         ["requireLogin": 0, "canPlayback": false, "preventPlayback": false, "passwordProtected": false, "needPassword": false, "preventDownload": false]
+    }
+
+    /// The API's `duration` is in MILLISECONDS (a real answer: 8402000 for a lecture of 2 h 20 min,
+    /// verified 2026-11-17). Read as seconds, every real length exceeded a day, was refused as
+    /// implausible and never saved, so a linked lesson that was played still showed no length.
+    @Test func theApisDurationIsMillisecondsReadAsSeconds() throws {
+        let answer = WebexStreamAPI.decode(status: 200, data: try json(signedIn(extra: ["duration": 8_402_000])))
+        guard case .stream(_, _, let duration, _) = answer else { Issue.record("no stream"); return }
+        #expect(duration == 8_402)
+        #expect(ManualWebexLesson.plausibleDuration(8_402) == 8_402)
+    }
+
+    /// The recording's date is `gmtCreateTime` read as UTC ("2026-11-03 14:49:49"; the real answer's
+    /// `createTime` is the same moment in local time, 15:49:49, and is ignored). A missing or
+    /// malformed one is no date, never a failed stream.
+    @Test func theRecordingDateIsTheUTCCreateTime() throws {
+        func recorded(_ extra: [String: Any]) throws -> Date? {
+            guard case .stream(_, _, _, let date) = WebexStreamAPI.decode(status: 200, data: try json(signedIn(extra: extra))) else { Issue.record("no stream"); return nil }
+            return date
+        }
+        let expected = Date(timeIntervalSince1970: 1_793_717_389)  // 2026-11-03 14:49:49 UTC
+        #expect(try recorded(["createTime": "2026-11-03 15:49:49", "gmtCreateTime": "2026-11-03 14:49:49"]) == expected)
+        #expect(try recorded([:]) == nil)
+        for bad in ["", "yesterday", "2026-11-03", "2026-13-45 99:99:99", "2026-11-03T14:49:49Z"] as [Any] {
+            #expect(try recorded(["gmtCreateTime": bad]) == nil, "\(bad)")
+        }
+        #expect(try recorded(["gmtCreateTime": 1_793_717_389]) == nil)
     }
 
     @Test func aSignedIn200GivesTheStreamWithItsTitleAndLength() throws {
@@ -255,7 +282,7 @@ struct WebexStreamTests {
         let hls = URL(string: "https://nfg1wss.webex.com/nbr/MultiThumbnail/hls.m3u8?trackingID=t-1")!
         #expect(WebexStreamAPI.decode(status: 200, data: try json(signedIn(extra: ["recordName": "   ", "duration": true]))) == .stream(hls: hls, title: nil, duration: nil))
         #expect(WebexStreamAPI.decode(status: 200, data: try json(signedIn(extra: ["recordName": 3, "duration": -5]))) == .stream(hls: hls, title: nil, duration: nil))
-        #expect(WebexStreamAPI.decode(status: 200, data: try json(signedIn(extra: ["duration": "8160"]))) == .stream(hls: hls, title: "Lezione sintetica", duration: nil))
+        #expect(WebexStreamAPI.decode(status: 200, data: try json(signedIn(extra: ["duration": "8160000"]))) == .stream(hls: hls, title: "Lezione sintetica", duration: nil))
     }
 
     // MARK: Stream policy

@@ -413,21 +413,26 @@ import BeepbarCore
         #expect(RecordingsPageProbes.submitManualLesson != nil)
     }
 
-    /// Manual rows delete their saved lesson, so they must not look like archive bookmarks.
-    @Test func manualRowsUseADeleteSymbol() {
+    /// A linked lesson's bookmark slot is a filled, inert bookmark: one click must never delete a
+    /// lesson (#286). Mutation: return "trash" or `.toggle` for manual rows and this fails.
+    @Test func manualRowsShowAFilledInertBookmark() {
         let archive = recording("archive")
         let manual = ManualWebexLesson(title: "Guest", courseName: "", link: URL(string: "https://politecnicomilano.webex.com/ldr.php?RCID=test")!, addedAt: .now).recording
         #expect(RecordingRow.watchlistSymbol(for: archive, isWatchlisted: true) == "bookmark.fill")
         #expect(RecordingRow.watchlistSymbol(for: archive, isWatchlisted: false) == "bookmark")
-        #expect(RecordingRow.watchlistSymbol(for: manual, isWatchlisted: true) == "trash")
+        #expect(RecordingRow.watchlistSymbol(for: manual, isWatchlisted: true) == "bookmark.fill")
+        #expect(RecordingRow.watchlistSymbol(for: manual, isWatchlisted: false) == "bookmark.fill")
+        #expect(RecordingRow.bookmarkSlot(for: archive) == .toggle)
+        #expect(RecordingRow.bookmarkSlot(for: manual) == .pinned)
     }
 
-    /// The manual and archive lists must each route selection and actions to their own row.
-    @Test(.timeLimit(.minutes(1))) func manualAndArchiveCourseListsKeepTheirActionsSeparate() async throws {
+    /// The linked lessons are the first section of the course's single list, the archive's weeks
+    /// follow, and each row's menu and double click act on its own lesson. A "⋯" or right-click
+    /// "Delete lesson…" only asks: the lesson is still there until the dialog is confirmed.
+    @Test(.timeLimit(.minutes(1))) func manualAndArchiveShareOneCourseList() async throws {
         let page = try await HostedPage()
         defer { page.close() }
-        let (key, newest) = try await page.loadedCourse()
-        let second = try #require(page.recordings.listings[key]?.recordings?.sorted { $0.recordedAt > $1.recordedAt }[1])
+        let (_, newest) = try await page.loadedCourse()
         let courseID = try #require(page.fixture.controller.courses.first?.id)
         let link = "https://politecnicomilano.webex.com/ldr.php?RCID=manual-test"
         let manual = try page.recordings.addManualLesson(link: link, title: "Guest", courseName: "Course", courseID: courseID).get()
@@ -436,28 +441,34 @@ import BeepbarCore
             ((view as? NSTableView).map { [$0] } ?? []) + view.subviews.flatMap(tables)
         }
         let detail = tables(page.host).filter { $0.convert($0.bounds, to: nil).minX > 200 && $0.numberOfRows >= 2 }
-            .sorted { $0.convert($0.bounds, to: nil).midY > $1.convert($1.bounds, to: nil).midY }
-        #expect(detail.count == 2)
-        let manualTable = try #require(detail.first)
-        let menu = try page.contextMenu(manualTable, row: 1)
-        #expect(menu.items.map(\.title) == ["Apri nel browser", "Copia link", "Elimina lezione"])
-        manualTable.selectRowIndexes([1], byExtendingSelection: false)
+        #expect(detail.count == 1, "one list, not one per kind")
+        let table = try #require(detail.first)
+        // Row 0 is the "Added by link" header, row 1 the lesson, then the archive's first week.
+        let menu = try page.contextMenu(table, row: 1)
+        #expect(menu.items.map(\.title) == ["Apri nel browser", "Copia link", "Elimina lezione…"])
+        table.selectRowIndexes([1], byExtendingSelection: false)
         try await page.settle()
-        #expect(manualTable.sendAction(manualTable.doubleAction, to: manualTable.target))
+        #expect(table.sendAction(table.doubleAction, to: table.target))
         #expect(page.recordings.openingRecordingID == manual.id)
         try await page.untilOpeningEnds()
         #expect(page.recordings.access == .ready)
-        let archiveTable = try await page.detailTable(rows: 3)
-        let archiveMenu = try page.contextMenu(archiveTable, row: 2)
+        // Row 2 is the first week's header, row 3 the newest archive lesson.
+        let archiveMenu = try page.contextMenu(table, row: 3)
         #expect(archiveMenu.items.map(\.title) == ["Apri nel browser", "Copia link", "Aggiungi alla watchlist"])
-        archiveTable.selectRowIndexes([2], byExtendingSelection: false)
+        table.selectRowIndexes([3], byExtendingSelection: false)
         try await page.settle()
-        #expect(archiveTable.sendAction(archiveTable.doubleAction, to: archiveTable.target))
-        #expect(page.recordings.openingRecordingID == second.id)
+        #expect(table.sendAction(table.doubleAction, to: table.target))
+        #expect(page.recordings.openingRecordingID == newest.id)
         try await page.untilOpeningEnds()
+        // The archive rows are numbered, the linked one is not.
+        #expect(page.rows.first { $0.recording.id == manual.id }?.number == nil)
+        #expect(page.rows.first { $0.recording.id == newest.id }?.number != nil)
+        // Delete only asks.
         menu.performActionForItem(at: 2)
-        #expect(page.recordings.manualLessons.lesson(id: manual.id) == nil)
-        #expect(page.recordings.listing(for: try #require(RecmanCourseKey(course: page.fixture.controller.courses[0])))?.recordings?.contains(newest) == true)
+        try await page.settle()
+        #expect(page.recordings.manualLessons.lesson(id: manual.id) != nil, "the menu deleted the lesson without a confirmation")
+        page.rows.last { $0.recording.id == manual.id }?.actions.requestDelete()
+        #expect(page.recordings.manualLessons.lesson(id: manual.id) != nil)
     }
 
     /// An unsearchable course still displays its manual lesson without an archive listing.
@@ -481,6 +492,8 @@ import BeepbarCore
         }
         let row = try #require(page.rows.last { $0.recording.id == lesson.id })
         #expect(row.isWatchlisted && !row.isNew && row.watch.known)
+        // A linked lesson's checkbox is live like an archive row's: known from the saved lessons, editable with the account (#286).
+        #expect(row.watch.checkboxVisible && row.watch.checkboxEnabled)
         page.recordings.webBeepAccountChanged(to: -1)
         #expect(page.recordings.access != .ready)
         try await page.settle { host.layoutSubtreeIfNeeded(); host.displayIfNeeded(); return page.rows.last?.canPlay == false }
@@ -492,10 +505,10 @@ import BeepbarCore
         let point = table.convert(NSPoint(x: rect.midX, y: rect.midY), to: nil)
         let event = try #require(NSEvent.mouseEvent(with: .rightMouseDown, location: point, modifierFlags: [], timestamp: 0, windowNumber: window.windowNumber, context: nil, eventNumber: 0, clickCount: 1, pressure: 1))
         let menu = try #require(table.menu(for: event))
-        #expect(menu.items.map(\.title) == ["Apri nel browser", "Copia link", "Elimina lezione"])
+        #expect(menu.items.map(\.title) == ["Apri nel browser", "Copia link", "Elimina lezione…"])
         #expect(!menu.items[0].isEnabled && !menu.items[1].isEnabled)
-        row.actions.toggleWatchlist()
-        #expect(page.recordings.manualLessons.lesson(id: lesson.id) == nil)
+        row.actions.requestDelete()
+        #expect(page.recordings.manualLessons.lesson(id: lesson.id) != nil, "asking to delete must not delete")
     }
 
     /// The same for the Watchlist, whose list is wrapped the same way: the menu has the
@@ -512,7 +525,7 @@ import BeepbarCore
         let table = try await page.detailTable(rows: 1)
 
         let menu = try page.contextMenu(table, row: 0)
-        #expect(menu.items.map(\.title) == ["Rimuovi dalla watchlist", "Apri nel browser"])
+        #expect(menu.items.map(\.title) == ["Apri nel browser", "Copia link", "Rimuovi dalla watchlist"])
 
         table.selectRowIndexes([0], byExtendingSelection: false)
         try await page.settle()

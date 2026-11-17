@@ -164,6 +164,99 @@ enum RecordingsPresentation {
         }
     }
 
+    /// One action of a recording's "⋯" menu and of its right-click menu. Both menus are built from
+    /// `menuEntries(for:)`, so they can never offer different things (#286).
+    enum RecordingMenuItem: Hashable, Sendable {
+        case openInBrowser, copyLink, addToWatchlist, removeFromWatchlist
+        /// Linked lessons only; always behind a confirmation (`DeleteLessonConfirmation`).
+        case deleteLesson
+    }
+
+    struct RecordingMenuEntry: Equatable, Sendable {
+        let item: RecordingMenuItem
+        let title: BilingualText
+        let enabled: Bool
+        var isDestructive: Bool { item == .deleteLesson }
+    }
+
+    /// The items a recording's menus offer, in order, with whether each can be used now.
+    ///
+    /// - An archive lesson: open in the browser, copy the link, then the watchlist toggle.
+    /// - A lesson added by link: the same two link items, then only "Delete lesson…". It has no
+    ///   watchlist toggle: it always stays in the Watchlist, and deleting is the one way to take
+    ///   it out, so the two actions are never one slot's two meanings (#286).
+    /// - `canUseLinks`: a Polimi session is ready (and the bookmark's archive entry still exists);
+    ///   `canEdit`: the account is known and the study state writable.
+    nonisolated static func menuEntries(for recording: RecmanRecording, isWatchlisted: Bool, canEdit: Bool, canUseLinks: Bool) -> [RecordingMenuEntry] {
+        var entries = [
+            RecordingMenuEntry(item: .openInBrowser, title: BilingualText("Apri nel browser", "Open in browser"), enabled: canUseLinks),
+            RecordingMenuEntry(item: .copyLink, title: BilingualText("Copia link", "Copy link"), enabled: canUseLinks),
+        ]
+        if ManualWebexLesson.isManual(recording) {
+            entries.append(RecordingMenuEntry(item: .deleteLesson, title: BilingualText("Elimina lezione…", "Delete lesson…"), enabled: canEdit))
+        } else if isWatchlisted {
+            entries.append(RecordingMenuEntry(item: .removeFromWatchlist, title: BilingualText("Rimuovi dalla watchlist", "Remove from watchlist"), enabled: canEdit))
+        } else {
+            entries.append(RecordingMenuEntry(item: .addToWatchlist, title: BilingualText("Aggiungi alla watchlist", "Add to watchlist"), enabled: canEdit))
+        }
+        return entries
+    }
+
+    /// What fills the archive's place in a course (the rows aside): its own state, or a note.
+    enum ArchivePart: Equatable, Sendable {
+        /// Archive rows to list.
+        case rows
+        /// The listing is empty.
+        case emptyArchive
+        /// The search matches nothing in the archive.
+        case noSearchResults
+        /// The course has no code and year, so there is no archive to ask.
+        case noKey
+        case loading, signIn, signingIn, unavailable
+    }
+
+    /// The archive part of a course from what the page knows. `courseContent` decides among the
+    /// listing states; this adds the empty and no-match cases of a listing in memory.
+    nonisolated static func archivePart(hasKey: Bool, content: CourseContent, archiveCount: Int, archiveShownCount: Int) -> ArchivePart {
+        guard hasKey else { return .noKey }
+        switch content {
+        case .list: return archiveCount == 0 ? .emptyArchive : (archiveShownCount == 0 ? .noSearchResults : .rows)
+        case .loading: return .loading
+        case .signIn: return .signIn
+        case .signingIn: return .signingIn
+        case .unavailable: return .unavailable
+        }
+    }
+
+    /// How a course pane is composed.
+    struct CoursePlan: Equatable, Sendable {
+        /// The first section of the list, "Added by link", is present.
+        let showsManualSection: Bool
+        /// The archive's week sections are present.
+        let showsArchiveRows: Bool
+        /// A compact note inside the list standing for the archive's state (only when linked
+        /// lessons are listed; otherwise the archive's own full-size state fills the pane).
+        let inlineNote: ArchivePart?
+        /// The archive's full-size state, as before linked lessons existed.
+        let fullState: ArchivePart?
+    }
+
+    /// Linked lessons share the archive's one list, first (#286). Without any, nothing changes:
+    /// the archive's state fills the pane as it always did. With some, an archive that has no rows
+    /// to show (empty, loading, signed out…) shrinks to a note under them, so the lessons stay
+    /// visible and the pane is not split by a second list with a full-size empty state.
+    /// `hasManual`: the course has linked lessons at all; `manualShownCount`: those the search
+    /// leaves. A search matching nothing anywhere keeps the usual "no results" state.
+    nonisolated static func coursePlan(hasManual: Bool, manualShownCount: Int, archive: ArchivePart) -> CoursePlan {
+        guard hasManual else {
+            return CoursePlan(showsManualSection: false, showsArchiveRows: archive == .rows, inlineNote: nil, fullState: archive == .rows ? nil : archive)
+        }
+        if manualShownCount == 0, archive == .noSearchResults {
+            return CoursePlan(showsManualSection: false, showsArchiveRows: false, inlineNote: nil, fullState: .noSearchResults)
+        }
+        return CoursePlan(showsManualSection: manualShownCount > 0, showsArchiveRows: archive == .rows, inlineNote: archive == .rows ? nil : archive, fullState: nil)
+    }
+
     /// VoiceOver's label of the sidebar badge counting new lectures: "1 nuova" / "3 nuove" (#195).
     static func newCountLabel(_ count: Int) -> BilingualText {
         BilingualText(italianCount(count, "nuova", "nuove"), "\(count) new")
@@ -674,7 +767,8 @@ struct CourseRecordings: View {
     let refresh: () -> Void
     @State private var query = ""
     @State private var selection: String?
-    @State private var manualSelection: String?
+    /// The linked lesson whose deletion waits for the student's confirmation (#286).
+    @State private var deleting: RecmanRecording?
     @FocusState private var searchFocused: Bool
     /// The pane's rows and week sections (#100). The pane observes the whole controller, so its
     /// `body` runs again when a spinner flips, a row starts opening or another course's listing
@@ -818,47 +912,47 @@ struct CourseRecordings: View {
     }
 
     private var content: some View {
-        VStack(spacing: 0) {
-            if !manual.isEmpty {
-                Text(tr("Lezioni aggiunte con link", "Lessons added by link"))
-                    .font(.headline).frame(maxWidth: .infinity, alignment: .leading).padding(14)
-                recordingList(derivedList(manual, manual: true), numbers: [:], selection: $manualSelection)
-                    .frame(minHeight: 100, idealHeight: 180, maxHeight: 240)
-                Divider()
+        // Linked lessons first, the archive after, in one list (#286). Both derivations are cached
+        // (`derivedList`); `RecordingsPresentation.coursePlan` decides what the pane shows.
+        let archiveList = listing?.recordings ?? []
+        let archiveModel = derivedList(archiveList)
+        let manualModel = derivedList(manual, manual: true)
+        let part = RecordingsPresentation.archivePart(
+            hasKey: key != nil,
+            content: RecordingsPresentation.courseContent(hasList: listing?.recordings != nil, isLoading: listing?.isLoading == true,
+                                                          hasProblem: listing?.problem != nil, access: recordings.access),
+            archiveCount: archiveList.count, archiveShownCount: archiveModel.shown.count)
+        let plan = RecordingsPresentation.coursePlan(hasManual: !manual.isEmpty, manualShownCount: manualModel.shown.count, archive: part)
+        return Group {
+            if let full = plan.fullState {
+                fullState(full)
+            } else {
+                recordingList(plan, manual: manualModel, archive: archiveModel, numbers: plan.showsArchiveRows ? summary(archiveList).numbers : [:])
             }
-            archiveContent
         }
+        .deleteLessonConfirmation($deleting) { recordings.toggleWatchlist($0, courseName: name) }
     }
 
-    @ViewBuilder private var archiveContent: some View {
-        if key == nil {
+    /// The archive's state filling the pane: what a course without linked lessons shows.
+    @ViewBuilder private func fullState(_ part: RecordingsPresentation.ArchivePart) -> some View {
+        switch part {
+        case .rows:
+            EmptyView()
+        case .noKey:
             ContentUnavailableView {
                 Label(name, systemImage: "questionmark.folder")
             } description: {
                 Text(tr("Il nome del corso su WeBeep non riporta codice e anno accademico, quindi BeepBar non sa quali registrazioni cercare.",
                         "The course's name on WeBeep doesn't carry its code and academic year, so BeepBar can't tell which recordings to look for."))
             }
-        } else {
-            switch RecordingsPresentation.courseContent(hasList: listing?.recordings != nil, isLoading: listing?.isLoading == true,
-                                                    hasProblem: listing?.problem != nil, access: recordings.access) {
-        case .list:
-            let list = listing?.recordings ?? []
-            let model = derivedList(list)
-            if list.isEmpty {
-                ContentUnavailableView {
-                    Label(manual.isEmpty ? tr("Ancora nessuna registrazione", "No recordings yet") : tr("Nessuna registrazione in archivio", "No archived recordings"), systemImage: "video.slash")
-                } description: {
-                    Text(tr("Quando ne viene pubblicata una, la trovi qui.", "When one is published, you'll find it here."))
-                }
-            } else if model.shown.isEmpty {
-                if manual.isEmpty {
-                    ContentUnavailableView.search(text: query)
-                } else {
-                    ContentUnavailableView(tr("Nessun risultato in archivio", "No archive results"), systemImage: "magnifyingglass")
-                }
-            } else {
-                recordingList(model, numbers: summary(list).numbers, selection: $selection)
+        case .emptyArchive:
+            ContentUnavailableView {
+                Label(tr("Ancora nessuna registrazione", "No recordings yet"), systemImage: "video.slash")
+            } description: {
+                Text(tr("Quando ne viene pubblicata una, la trovi qui.", "When one is published, you'll find it here."))
             }
+        case .noSearchResults:
+            ContentUnavailableView.search(text: query)
         case .loading:
             VStack(spacing: 10) {
                 ProgressView()
@@ -885,48 +979,107 @@ struct CourseRecordings: View {
             } description: {
                 Text(tr("Riprova con il pulsante di aggiornamento.", "Try again with the refresh button."))
             }
-            }
         }
     }
 
-    private func watchlistActionTitle(_ recording: RecmanRecording) -> String {
-        if ManualWebexLesson.isManual(recording) { return tr("Elimina lezione", "Delete lesson") }
-        return recordings.study.contains(recording) ? tr("Rimuovi dalla watchlist", "Remove from watchlist") : tr("Aggiungi alla watchlist", "Add to watchlist")
+    /// The archive's state as a compact row under the linked lessons, which keep the pane. The
+    /// sign-in stays reachable here as in the full-size state.
+    @ViewBuilder private func archiveNote(_ part: RecordingsPresentation.ArchivePart) -> some View {
+        switch part {
+        case .rows:
+            EmptyView()
+        case .emptyArchive:
+            noteText(tr("Nessuna registrazione in archivio", "No archived recordings"))
+        case .noSearchResults:
+            noteText(tr("Nessun risultato in archivio", "No archive results"))
+        case .noKey:
+            noteText(tr("Il nome del corso su WeBeep non riporta codice e anno accademico: BeepBar non può cercare registrazioni in archivio.",
+                        "The course's name on WeBeep doesn't carry its code and academic year, so BeepBar can't look for archived recordings."))
+        case .loading:
+            HStack(spacing: 8) {
+                ProgressView().controlSize(.small)
+                noteText(tr("Cerco le registrazioni nell'archivio del Politecnico…", "Looking for recordings in Polimi's archive…"))
+            }
+        case .signIn, .signingIn:
+            HStack(spacing: 10) {
+                noteText(tr("Accedi con Polimi per vedere le lezioni in archivio.", "Sign in with Polimi to see the archived lessons."))
+                Spacer(minLength: 0)
+                if recordings.access == .signingIn {
+                    ProgressView().controlSize(.small)
+                } else {
+                    Button(tr("Accedi con Polimi", "Sign in with Polimi")) { recordings.signIn() }
+                }
+            }
+        case .unavailable:
+            noteText(tr("Elenco dell'archivio non disponibile. Riprova con il pulsante di aggiornamento.",
+                        "The archive's list is unavailable. Try again with the refresh button."))
+        }
     }
 
-    private func recordingList(_ model: RecmanCourseListDerivation, numbers: [String: Int], selection: Binding<String?>) -> some View {
-        let byID = model.byID
-        let firstID = model.shown.first?.id
+    private func noteText(_ text: String) -> some View {
+        Text(text).font(.callout).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
+    }
+
+    /// The one handler behind the row's "⋯" menu and the right-click menu (same
+    /// `RecordingsPresentation.menuEntries`). Deleting only asks: `deleteLessonConfirmation` runs it.
+    private func perform(_ item: RecordingsPresentation.RecordingMenuItem, on recording: RecmanRecording) {
+        switch item {
+        case .openInBrowser: recordings.openInBrowser(recording)
+        case .copyLink: recordings.copyLink(recording)
+        case .addToWatchlist, .removeFromWatchlist: recordings.toggleWatchlist(recording, courseName: name)
+        case .deleteLesson: deleting = recording
+        }
+    }
+
+    private func courseRow(_ recording: RecmanRecording, number: Int?, watchlisted: Set<String>, progress: RecordingsPresentation.WatchValues, firstID: String?) -> some View {
+        RecordingRow(
+            recording: recording,
+            number: number,
+            isNew: recordings.isNew(recording),
+            isOpening: recordings.openingRecordingID == recording.id,
+            isWatchlisted: ManualWebexLesson.isManual(recording) || watchlisted.contains(RecordingsStudyState.identity(recording)),
+            canEdit: recordings.canEditStudy,
+            canPlay: recordings.access == .ready,
+            canUseLinks: recordings.access == .ready,
+            watchlistCourseName: name,
+            watch: progress.row(for: recording),
+            actions: RecordingRow.Actions(
+                toggleWatchlist: { recordings.toggleWatchlist(recording, courseName: name) },
+                play: { recordings.play(recording) },
+                setDone: { recordings.setDone(recording, $0) },
+                openInBrowser: { recordings.openInBrowser(recording) },
+                copyLink: { recordings.copyLink(recording) },
+                requestDelete: { deleting = recording }
+            )
+        )
+        .equatable()
+        .uiContentReady(.recordings, enabled: recording.id == firstID)
+        .tag(recording.id)
+    }
+
+    private func recordingList(_ plan: RecordingsPresentation.CoursePlan, manual manualModel: RecmanCourseListDerivation, archive archiveModel: RecmanCourseListDerivation, numbers: [String: Int]) -> some View {
+        let firstID = (plan.showsManualSection ? manualModel.shown.first : archiveModel.shown.first)?.id
         // One set per `body` instead of a scan of every bookmark for every row.
         let watchlisted = Set(recordings.study.bookmarks.map(\.id))
         // Sections, filtering and numbering stay here (this view doesn't observe the progress
         // model); a tick re-runs only the reader's closure below, see `WatchProgressReader`.
         return WatchProgressReader(recordings: recordings) { progress in
-            List(selection: selection) {
-                ForEach(model.sections, id: \.title) { section in
-                    Section(section.title) {
-                        ForEach(section.recordings) { recording in
-                            RecordingRow(
-                                recording: recording,
-                                number: numbers[recording.id],
-                                isNew: recordings.isNew(recording),
-                                isOpening: recordings.openingRecordingID == recording.id,
-                                isWatchlisted: ManualWebexLesson.isManual(recording) || watchlisted.contains(RecordingsStudyState.identity(recording)),
-                                canEdit: recordings.canEditStudy,
-                                canPlay: recordings.access == .ready,
-                                watchlistCourseName: name,
-                                watch: progress.row(for: recording),
-                                actions: RecordingRow.Actions(
-                                    toggleWatchlist: { recordings.toggleWatchlist(recording, courseName: name) },
-                                    play: { recordings.play(recording) },
-                                    setDone: { recordings.setDone(recording, $0) }
-                                )
-                            )
-                            .equatable()
-                            .uiContentReady(.recordings, enabled: recording.id == firstID)
-                            .tag(recording.id)
+            List(selection: $selection) {
+                if plan.showsManualSection {
+                    // Never numbered: the numbers are the archive's lesson order.
+                    Section(tr("Aggiunte con link", "Added by link")) {
+                        ForEach(manualModel.shown) { courseRow($0, number: nil, watchlisted: watchlisted, progress: progress, firstID: firstID) }
+                    }
+                }
+                if plan.showsArchiveRows {
+                    ForEach(archiveModel.sections, id: \.title) { section in
+                        Section(section.title) {
+                            ForEach(section.recordings) { courseRow($0, number: numbers[$0.id], watchlisted: watchlisted, progress: progress, firstID: firstID) }
                         }
                     }
+                }
+                if let note = plan.inlineNote {
+                    Section(tr("Archivio", "Archive")) { archiveNote(note) }
                 }
             }
         }
@@ -936,18 +1089,16 @@ struct CourseRecordings: View {
         // sits on the reader, not on the `List` inside it; SwiftUI still hands it to the list
         // (`courseListMenuAndPrimaryActionReachTheList` drives the real AppKit list, #198).
         .contextMenu(forSelectionType: String.self) { ids in
-            if let recording = ids.first.flatMap({ byID[$0] }) {
+            if let recording = ids.first.flatMap({ manualModel.byID[$0] ?? archiveModel.byID[$0] }) {
                 // Really the browser: Play (double click, Return, the row's button) is BeepBar's
                 // own player since #148, and this item is the way around it.
-                Button(tr("Apri nel browser", "Open in browser")) { recordings.openInBrowser(recording) }
-                    .disabled(recordings.access != .ready)
-                Button(tr("Copia link", "Copy link")) { recordings.copyLink(recording) }
-                    .disabled(recordings.access != .ready)
-                Button(watchlistActionTitle(recording)) { recordings.toggleWatchlist(recording, courseName: name) }
-                    .disabled(!recordings.canEditStudy)
+                RecordingMenuItems(
+                    entries: RecordingsPresentation.menuEntries(for: recording, isWatchlisted: watchlisted.contains(RecordingsStudyState.identity(recording)),
+                                                                canEdit: recordings.canEditStudy, canUseLinks: recordings.access == .ready),
+                    perform: { perform($0, on: recording) })
             }
         } primaryAction: { ids in
-            if let recording = ids.first.flatMap({ byID[$0] }) { recordings.play(recording) }
+            if let recording = ids.first.flatMap({ manualModel.byID[$0] ?? archiveModel.byID[$0] }) { recordings.play(recording) }
         }
     }
 }
@@ -966,6 +1117,8 @@ private struct WatchlistRecordings: View {
 
     @State private var addingLesson = false
     @State private var addingOwner: Int?
+    /// The linked lesson whose deletion waits for the student's confirmation, with its bookmark's course label (#286).
+    @State private var deleting: RecmanRecording?
 
     private struct ShownInputs: Equatable {
         let bookmarks: [RecordingsStudyState.Bookmark]
@@ -1047,13 +1200,17 @@ private struct WatchlistRecordings: View {
                                 isOpening: recordings.openingRecordingID == item.id,
                                 isWatchlisted: true,
                                 canEdit: recordings.canEditStudy, canPlay: recordings.access == .ready && !bookmark.unavailable,
+                                canUseLinks: recordings.access == .ready && !bookmark.unavailable,
                                 courseName: bookmark.courseName, unavailable: bookmark.unavailable,
                                 watchlistCourseName: bookmark.courseName,
                                 watch: progress.row(for: item),
                                 actions: RecordingRow.Actions(
                                     toggleWatchlist: { recordings.toggleWatchlist(item, courseName: bookmark.courseName) },
                                     play: { recordings.play(item) },
-                                    setDone: { recordings.setDone(item, $0) }
+                                    setDone: { recordings.setDone(item, $0) },
+                                    openInBrowser: { recordings.openInBrowser(item) },
+                                    copyLink: { recordings.copyLink(item) },
+                                    requestDelete: { deleting = item }
                                 ))
                                 .equatable()
                                 .tag(bookmark.id)
@@ -1065,10 +1222,10 @@ private struct WatchlistRecordings: View {
                 // `watchlistMenuAndPrimaryActionReachTheList` (#198).
                 .contextMenu(forSelectionType: String.self) { ids in
                     if let bookmark = shown.first(where: { ids.contains($0.id) }) {
-                        Button(ManualWebexLesson.isManual(bookmark.recording) ? tr("Elimina lezione", "Delete lesson") : tr("Rimuovi dalla watchlist", "Remove from watchlist")) { recordings.toggleWatchlist(bookmark.recording, courseName: bookmark.courseName) }
-                            .disabled(!recordings.canEditStudy)
-                        Button(tr("Apri nel browser", "Open in browser")) { recordings.openInBrowser(bookmark.recording) }
-                            .disabled(recordings.access != .ready || bookmark.unavailable)
+                        RecordingMenuItems(
+                            entries: RecordingsPresentation.menuEntries(for: bookmark.recording, isWatchlisted: true, canEdit: recordings.canEditStudy,
+                                                                        canUseLinks: recordings.access == .ready && !bookmark.unavailable),
+                            perform: { perform($0, on: bookmark) })
                     }
                 } primaryAction: { ids in
                     if let bookmark = shown.first(where: { ids.contains($0.id) }), !bookmark.unavailable {
@@ -1076,6 +1233,10 @@ private struct WatchlistRecordings: View {
                     }
                 }
             }
+        }
+        .deleteLessonConfirmation($deleting) { lesson in
+            let courseName = shown.first { $0.recording.id == lesson.id }?.courseName ?? ""
+            recordings.toggleWatchlist(lesson, courseName: courseName)
         }
         .sheet(isPresented: $addingLesson) {
             AddWebexLessonSheet(courses: courses, add: submitManualLesson)
@@ -1088,6 +1249,18 @@ private struct WatchlistRecordings: View {
         .onAppear { RecordingsPageProbes.beginManualLesson = beginManualLesson }
         .onDisappear { RecordingsPageProbes.beginManualLesson = nil }
 #endif
+    }
+
+    /// The handler behind the row's "⋯" menu and the right-click menu (same
+    /// `RecordingsPresentation.menuEntries`). Deleting only asks: `deleteLessonConfirmation` runs it.
+    private func perform(_ item: RecordingsPresentation.RecordingMenuItem, on bookmark: RecordingsStudyState.Bookmark) {
+        let recording = bookmark.recording
+        switch item {
+        case .openInBrowser: recordings.openInBrowser(recording)
+        case .copyLink: recordings.copyLink(recording)
+        case .addToWatchlist, .removeFromWatchlist: recordings.toggleWatchlist(recording, courseName: bookmark.courseName)
+        case .deleteLesson: deleting = recording
+        }
     }
 
     private func beginManualLesson() {
@@ -1229,11 +1402,52 @@ struct WatchProgressReader<Content: View>: View {
 }
 #endif
 
+/// The items of a recording's menus, built from `RecordingsPresentation.menuEntries` by the row's
+/// "⋯" menu and by both pages' right-click menus, so the three can't drift apart (#286).
+struct RecordingMenuItems: View {
+    let entries: [RecordingsPresentation.RecordingMenuEntry]
+    let perform: (RecordingsPresentation.RecordingMenuItem) -> Void
+
+    var body: some View {
+        ForEach(entries, id: \.item) { entry in
+            Button(entry.title.text, role: entry.isDestructive ? .destructive : nil) { perform(entry.item) }
+                .disabled(!entry.enabled)
+        }
+    }
+}
+
+/// Asks before a linked lesson is deleted (with its progress, from the course and the Watchlist).
+/// `lesson` is set by the menu's "Delete lesson…"; `confirm` runs only on the destructive button.
+private struct DeleteLessonConfirmation: ViewModifier {
+    @Binding var lesson: RecmanRecording?
+    let confirm: (RecmanRecording) -> Void
+
+    func body(content: Content) -> some View {
+        let title = lesson.map(RecordingsPresentation.title) ?? ""
+        content.confirmationDialog(
+            tr("Eliminare «\(title)»?", "Delete “\(title)”?"),
+            isPresented: Binding(get: { lesson != nil }, set: { if !$0 { lesson = nil } }),
+            titleVisibility: .visible, presenting: lesson
+        ) { lesson in
+            Button(tr("Elimina", "Delete"), role: .destructive) { confirm(lesson) }
+            Button(tr("Annulla", "Cancel"), role: .cancel) {}
+        } message: { _ in
+            Text(tr("La lezione e i suoi progressi vengono rimossi da BeepBar.", "The lesson and its progress are removed from BeepBar."))
+        }
+    }
+}
+
+private extension View {
+    func deleteLessonConfirmation(_ lesson: Binding<RecmanRecording?>, confirm: @escaping (RecmanRecording) -> Void) -> some View {
+        modifier(DeleteLessonConfirmation(lesson: lesson, confirm: confirm))
+    }
+}
+
 /// A recording keeps its title above its metadata and its play action visible without hover.
 ///
 /// `Equatable` on purpose (see `WatchProgressReader`): `==` compares every value the body shows
 /// and ignores `actions`. Invariant: the actions capture only the controller (one per page),
-/// `recording` and `watchlistCourseName`, all compared or constant, so a row skipped as equal
+/// `recording`, `watchlistCourseName` and the page's delete-request state, all compared or constant, so a row skipped as equal
 /// can never hold an action aimed at another recording or course name. Add any new captured
 /// value as a compared field.
 struct RecordingRow: View, Equatable {
@@ -1243,6 +1457,21 @@ struct RecordingRow: View, Equatable {
         let play: () -> Void
         /// Ticks (true) or un-ticks the lecture: `RecordingsController.setDone`.
         let setDone: (Bool) -> Void
+        /// The "⋯" menu's items (`RecordingsPresentation.menuEntries`). Defaults keep hosts that
+        /// don't exercise the menu short.
+        var openInBrowser: () -> Void = {}
+        var copyLink: () -> Void = {}
+        /// Asks to delete a linked lesson; the page confirms before anything is removed.
+        var requestDelete: () -> Void = {}
+
+        func perform(_ item: RecordingsPresentation.RecordingMenuItem) {
+            switch item {
+            case .openInBrowser: openInBrowser()
+            case .copyLink: copyLink()
+            case .addToWatchlist, .removeFromWatchlist: toggleWatchlist()
+            case .deleteLesson: requestDelete()
+            }
+        }
     }
 
     let recording: RecmanRecording
@@ -1252,6 +1481,8 @@ struct RecordingRow: View, Equatable {
     let isWatchlisted: Bool
     let canEdit: Bool
     let canPlay: Bool
+    /// "Open in browser" and "Copy link" can be used (compared: it enables the menu's items).
+    var canUseLinks = false
     var courseName: String? = nil
     var unavailable = false
     /// The course name a bookmark made from this row stores (the page's name in a course list,
@@ -1263,7 +1494,7 @@ struct RecordingRow: View, Equatable {
     nonisolated static func == (lhs: RecordingRow, rhs: RecordingRow) -> Bool {
         lhs.recording == rhs.recording && lhs.number == rhs.number && lhs.isNew == rhs.isNew
             && lhs.isOpening == rhs.isOpening && lhs.isWatchlisted == rhs.isWatchlisted
-            && lhs.canEdit == rhs.canEdit && lhs.canPlay == rhs.canPlay && lhs.courseName == rhs.courseName
+            && lhs.canEdit == rhs.canEdit && lhs.canPlay == rhs.canPlay && lhs.canUseLinks == rhs.canUseLinks && lhs.courseName == rhs.courseName
             && lhs.unavailable == rhs.unavailable && lhs.watchlistCourseName == rhs.watchlistCourseName
             && lhs.watch == rhs.watch
     }
@@ -1282,9 +1513,17 @@ struct RecordingRow: View, Equatable {
             : BilingualText("Aggiungi \(title) alla watchlist", "Add \(title) to watchlist")
     }
 
+    /// What the bookmark slot is. A lesson added by link is always in the Watchlist and leaves it
+    /// only by being deleted (the "⋯" menu, with a confirmation), so its slot shows the filled
+    /// bookmark and does nothing: one click never deletes (#286).
+    enum BookmarkSlot: Equatable { case toggle, pinned }
+
+    static func bookmarkSlot(for recording: RecmanRecording) -> BookmarkSlot {
+        ManualWebexLesson.isManual(recording) ? .pinned : .toggle
+    }
+
     static func watchlistSymbol(for recording: RecmanRecording, isWatchlisted: Bool) -> String {
-        if ManualWebexLesson.isManual(recording) { return "trash" }
-        return isWatchlisted ? "bookmark.fill" : "bookmark"
+        isWatchlisted || bookmarkSlot(for: recording) == .pinned ? "bookmark.fill" : "bookmark"
     }
 
     var body: some View {
@@ -1330,15 +1569,7 @@ struct RecordingRow: View, Equatable {
             }
             .frame(maxWidth: .infinity, alignment: .leading)
             doneCheckbox
-            Button(action: actions.toggleWatchlist) {
-                Image(systemName: Self.watchlistSymbol(for: recording, isWatchlisted: isWatchlisted))
-                    .font(.system(size: 20))
-                    .foregroundStyle(isWatchlisted && !ManualWebexLesson.isManual(recording) ? Color.accentColor : .secondary)
-                    .frame(width: 32, height: 32)
-            }
-            .buttonStyle(.plain).disabled(!canEdit)
-            .help(ManualWebexLesson.isManual(recording) ? tr("Elimina lezione", "Delete lesson") : (isWatchlisted ? tr("Rimuovi dalla watchlist", "Remove from watchlist") : tr("Aggiungi alla watchlist", "Add to watchlist")))
-            .accessibilityLabel(ManualWebexLesson.isManual(recording) ? tr("Elimina \(RecordingsPresentation.title(recording))", "Delete \(RecordingsPresentation.title(recording))") : Self.watchlistAccessibilityLabel(isWatchlisted: isWatchlisted, title: RecordingsPresentation.title(recording)).text)
+            bookmarkSlot
             Button(action: actions.play) {
                 ZStack {
                     ProgressView().controlSize(.small).opacity(isOpening ? 1 : 0)
@@ -1355,9 +1586,51 @@ struct RecordingRow: View, Equatable {
             // "Apri nel browser" is the row menu's item.
             .help(tr("Riproduci", "Play"))
             .accessibilityLabel(tr("Riproduci \(RecordingsPresentation.title(recording))", "Play \(RecordingsPresentation.title(recording))"))
+            moreMenu
         }
         .padding(.vertical, 9)
         .contentShape(Rectangle())
+    }
+
+    /// The bookmark: a button for an archive lesson, a plain filled bookmark for a linked one.
+    @ViewBuilder private var bookmarkSlot: some View {
+        let symbol = Image(systemName: Self.watchlistSymbol(for: recording, isWatchlisted: isWatchlisted))
+            .font(.system(size: 20))
+            .foregroundStyle(isWatchlisted ? Color.accentColor : .secondary)
+            .frame(width: 32, height: 32)
+        switch Self.bookmarkSlot(for: recording) {
+        case .toggle:
+            Button(action: actions.toggleWatchlist) { symbol }
+                .buttonStyle(.plain).disabled(!canEdit)
+                .help(isWatchlisted ? tr("Rimuovi dalla watchlist", "Remove from watchlist") : tr("Aggiungi alla watchlist", "Add to watchlist"))
+                .accessibilityLabel(Self.watchlistAccessibilityLabel(isWatchlisted: isWatchlisted, title: RecordingsPresentation.title(recording)).text)
+        case .pinned:
+            // Not a button: nothing here changes the lesson's place in the Watchlist.
+            symbol
+                .help(Self.pinnedBookmarkHelp.text)
+                .accessibilityLabel(Self.pinnedBookmarkHelp.text)
+        }
+    }
+
+    static let pinnedBookmarkHelp = BilingualText("Le lezioni aggiunte con link restano nella watchlist", "Lessons added by link stay in the Watchlist")
+
+    /// The "⋯" menu: the same items as the right-click menu (`RecordingsPresentation.menuEntries`).
+    private var moreMenu: some View {
+        Menu {
+            RecordingMenuItems(
+                entries: RecordingsPresentation.menuEntries(for: recording, isWatchlisted: isWatchlisted, canEdit: canEdit, canUseLinks: canUseLinks),
+                perform: actions.perform)
+        } label: {
+            Image(systemName: "ellipsis.circle")
+                .font(.system(size: 20))
+                .foregroundStyle(.secondary)
+                .frame(width: 32, height: 32)
+        }
+        .menuStyle(.borderlessButton)
+        .menuIndicator(.hidden)
+        .fixedSize()
+        .help(tr("Altre azioni", "More actions"))
+        .accessibilityLabel(tr("Altre azioni per \(RecordingsPresentation.title(recording))", "More actions for \(RecordingsPresentation.title(recording))"))
     }
 
     /// A thin read-only bar under the metadata: how far the student got, full and green once

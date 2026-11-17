@@ -896,7 +896,10 @@ struct RecordingsControllerTests {
         browser.listResults[course.courseCode] = .success([recording("a")])
         let controller = makeController(useDefault: true)
 
-        world.sessionFiles.hold(access: 1)
+        // Initialization checks expiry asynchronously; wait for it before holding the page's
+        // read, otherwise it may consume access 1 before the hold is armed.
+        await controller.settleSessionFile()
+        world.sessionFiles.hold(access: world.sessionFiles.accesses + 1)
         defer { world.sessionFiles.release() }
         controller.pageAppeared()
         controller.refresh([course], selected: course)

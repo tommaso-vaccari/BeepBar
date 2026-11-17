@@ -761,6 +761,7 @@ struct RecordingsListing: Equatable {
     /// Whether a lesson can be added with a Webex link now: the account is known and neither
     /// the study state nor the saved manual lessons are unreadable.
     var canAddManualLesson: Bool { canEditStudy && !manualLessonsUnreadable }
+    var manualLessonOwner: Int? { ownerUserID() }
 
     /// Why a Webex link wasn't added, for the sheet that asked.
     enum ManualLessonFailure: Error, Equatable {
@@ -780,12 +781,12 @@ struct RecordingsListing: Equatable {
     /// so what the Watchlist shows is what is on disk. Checks the account at the point of action:
     /// a lesson is never written under another account's key.
     @discardableResult
-    func addManualLesson(link: String, title: String, courseName: String) -> Result<ManualWebexLesson, ManualLessonFailure> {
+    func addManualLesson(link: String, title: String, courseName: String, courseID: Int64? = nil) -> Result<ManualWebexLesson, ManualLessonFailure> {
         loadStudy()
         guard canAddManualLesson, let owner = studyOwner, owner == ownerUserID() else { return .failure(.notEditable) }
         var updated = manualLessons
         let lesson: ManualWebexLesson
-        do { lesson = try updated.add(link: link, title: title, courseName: courseName) }
+        do { lesson = try updated.add(link: link, title: title, courseName: courseName, courseID: courseID) }
         catch ManualWebexLessons.AddError.duplicate { return .failure(.duplicate) }
         catch { return .failure(.invalidLink) }
         guard saveManualLessons(updated, owner: owner) else { return .failure(.saveFailed) }

@@ -272,6 +272,8 @@ import BeepbarCore
         @MainActor func close() {
             RecordingsPageProbes.row = nil
             RecordingsPageProbes.header = nil
+            RecordingsPageProbes.beginManualLesson = nil
+            RecordingsPageProbes.submitManualLesson = nil
             window.close()
             fixture.dispose()
         }
@@ -389,6 +391,111 @@ import BeepbarCore
         table.keyDown(with: returnKey)
         #expect(recordings.openingRecordingID == expected, "Return played \(recordings.openingRecordingID ?? "nothing")")
         try await page.untilOpeningEnds()
+    }
+
+    /// Submitting an open sheet rechecks the live course selection instead of its initial snapshot.
+    @Test(.timeLimit(.minutes(1))) func openManualSheetRejectsACourseDisabledBeforeSubmit() async throws {
+        let page = try await HostedPage()
+        defer { page.close() }
+        _ = try await page.loadedCourse()
+        let course = try #require(page.fixture.controller.courses.first)
+        page.recordings.selectDestination(.watchlist)
+        try await page.settle { RecordingsPageProbes.beginManualLesson != nil }
+        let begin = try #require(RecordingsPageProbes.beginManualLesson)
+        begin()
+        try await page.settle { RecordingsPageProbes.submitManualLesson != nil }
+        let submit = try #require(RecordingsPageProbes.submitManualLesson)
+        page.fixture.controller.setCourse(course, enabled: false)
+        try await page.settle()
+        let result = submit("https://politecnicomilano.webex.com/ldr.php?RCID=stale-sheet", "Guest", course.id)
+        if case .success = result { Issue.record("The stale course was accepted") }
+        #expect(page.recordings.manualLessons.lessons.isEmpty)
+        #expect(RecordingsPageProbes.submitManualLesson != nil)
+    }
+
+    /// Manual rows delete their saved lesson, so they must not look like archive bookmarks.
+    @Test func manualRowsUseADeleteSymbol() {
+        let archive = recording("archive")
+        let manual = ManualWebexLesson(title: "Guest", courseName: "", link: URL(string: "https://politecnicomilano.webex.com/ldr.php?RCID=test")!, addedAt: .now).recording
+        #expect(RecordingRow.watchlistSymbol(for: archive, isWatchlisted: true) == "bookmark.fill")
+        #expect(RecordingRow.watchlistSymbol(for: archive, isWatchlisted: false) == "bookmark")
+        #expect(RecordingRow.watchlistSymbol(for: manual, isWatchlisted: true) == "trash")
+    }
+
+    /// The manual and archive lists must each route selection and actions to their own row.
+    @Test(.timeLimit(.minutes(1))) func manualAndArchiveCourseListsKeepTheirActionsSeparate() async throws {
+        let page = try await HostedPage()
+        defer { page.close() }
+        let (key, newest) = try await page.loadedCourse()
+        let second = try #require(page.recordings.listings[key]?.recordings?.sorted { $0.recordedAt > $1.recordedAt }[1])
+        let courseID = try #require(page.fixture.controller.courses.first?.id)
+        let link = "https://politecnicomilano.webex.com/ldr.php?RCID=manual-test"
+        let manual = try page.recordings.addManualLesson(link: link, title: "Guest", courseName: "Course", courseID: courseID).get()
+        try await page.settle { page.bodies[manual.id] != nil }
+        func tables(_ view: NSView) -> [NSTableView] {
+            ((view as? NSTableView).map { [$0] } ?? []) + view.subviews.flatMap(tables)
+        }
+        let detail = tables(page.host).filter { $0.convert($0.bounds, to: nil).minX > 200 && $0.numberOfRows >= 2 }
+            .sorted { $0.convert($0.bounds, to: nil).midY > $1.convert($1.bounds, to: nil).midY }
+        #expect(detail.count == 2)
+        let manualTable = try #require(detail.first)
+        let menu = try page.contextMenu(manualTable, row: 1)
+        #expect(menu.items.map(\.title) == ["Apri nel browser", "Copia link", "Elimina lezione"])
+        manualTable.selectRowIndexes([1], byExtendingSelection: false)
+        try await page.settle()
+        #expect(manualTable.sendAction(manualTable.doubleAction, to: manualTable.target))
+        #expect(page.recordings.openingRecordingID == manual.id)
+        try await page.untilOpeningEnds()
+        #expect(page.recordings.access == .ready)
+        let archiveTable = try await page.detailTable(rows: 3)
+        let archiveMenu = try page.contextMenu(archiveTable, row: 2)
+        #expect(archiveMenu.items.map(\.title) == ["Apri nel browser", "Copia link", "Aggiungi alla watchlist"])
+        archiveTable.selectRowIndexes([2], byExtendingSelection: false)
+        try await page.settle()
+        #expect(archiveTable.sendAction(archiveTable.doubleAction, to: archiveTable.target))
+        #expect(page.recordings.openingRecordingID == second.id)
+        try await page.untilOpeningEnds()
+        menu.performActionForItem(at: 2)
+        #expect(page.recordings.manualLessons.lesson(id: manual.id) == nil)
+        #expect(page.recordings.listing(for: try #require(RecmanCourseKey(course: page.fixture.controller.courses[0])))?.recordings?.contains(newest) == true)
+    }
+
+    /// An unsearchable course still displays its manual lesson without an archive listing.
+    @Test(.timeLimit(.minutes(1))) func manualOnlyCourseShowsItsLessonWithoutAnArchiveKey() async throws {
+        let page = try await HostedPage()
+        defer { page.close() }
+        _ = try await page.loadedCourse()
+        let lesson = try page.recordings.addManualLesson(link: "https://politecnicomilano.webex.com/ldr.php?RCID=manual-only",
+                                                          title: "Guest", courseName: "Seminar", courseID: 999).get()
+        let host = NSHostingView(rootView: CourseRecordings(name: "Seminar", courseID: 999, key: nil, recordings: page.recordings, refresh: {}))
+        let window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 700, height: 500), styleMask: [.titled], backing: .buffered, defer: false)
+        window.isReleasedWhenClosed = false
+        window.contentView = host
+        window.alphaValue = 0
+        window.orderFront(nil)
+        defer { window.close() }
+        try await page.settle {
+            host.layoutSubtreeIfNeeded()
+            host.displayIfNeeded()
+            return page.bodies[lesson.id] != nil
+        }
+        let row = try #require(page.rows.last { $0.recording.id == lesson.id })
+        #expect(row.isWatchlisted && !row.isNew && row.watch.known)
+        page.recordings.webBeepAccountChanged(to: -1)
+        #expect(page.recordings.access != .ready)
+        try await page.settle { host.layoutSubtreeIfNeeded(); host.displayIfNeeded(); return page.rows.last?.canPlay == false }
+        func tables(_ view: NSView) -> [NSTableView] {
+            ((view as? NSTableView).map { [$0] } ?? []) + view.subviews.flatMap(tables)
+        }
+        let table = try #require(tables(host).first { $0.numberOfRows >= 2 })
+        let rect = table.rect(ofRow: 1)
+        let point = table.convert(NSPoint(x: rect.midX, y: rect.midY), to: nil)
+        let event = try #require(NSEvent.mouseEvent(with: .rightMouseDown, location: point, modifierFlags: [], timestamp: 0, windowNumber: window.windowNumber, context: nil, eventNumber: 0, clickCount: 1, pressure: 1))
+        let menu = try #require(table.menu(for: event))
+        #expect(menu.items.map(\.title) == ["Apri nel browser", "Copia link", "Elimina lezione"])
+        #expect(!menu.items[0].isEnabled && !menu.items[1].isEnabled)
+        row.actions.toggleWatchlist()
+        #expect(page.recordings.manualLessons.lesson(id: lesson.id) == nil)
     }
 
     /// The same for the Watchlist, whose list is wrapped the same way: the menu has the

@@ -16,6 +16,32 @@ enum RecordingsPresentation {
         RecmanCourseSidebar(.init(courses: courses, enabledIDs: Set(courses.map(\.id)))).selectedCourse(id: selectedID)
     }
 
+    /// A sheet belongs to the account that opened it and may only name a still-selected course.
+    nonisolated static func canSubmitManualLesson(owner: Int?, currentOwner: Int?, courseID: Int64?, availableIDs: Set<Int64>) -> Bool {
+        guard let owner, owner == currentOwner else { return false }
+        return courseID.map { availableIDs.contains($0) } ?? true
+    }
+
+    /// A cached course snapshot can repeat an ID; the first entry owns the picker option.
+    static func manualPickerCourses(_ courses: [RemoteCourseSummary]) -> [RemoteCourseSummary] {
+        var seen = Set<Int64>()
+        return courses.filter { seen.insert($0.id).inserted }
+    }
+
+    /// Full names retain code and year; identical names also need a stable course ID.
+    static func manualCourseLabels(_ courses: [RemoteCourseSummary]) -> [Int64: String] {
+        let unique = manualPickerCourses(courses)
+        let names = unique.map { course in
+            let name = course.displayName.trimmingCharacters(in: .whitespacesAndNewlines)
+            return name.isEmpty ? course.shortName : name
+        }
+        let counts = Dictionary(names.map { ($0, 1) }, uniquingKeysWith: +)
+        return zip(unique, names).reduce(into: [Int64: String]()) { result, pair in
+            let (course, name) = pair
+            result[course.id] = counts[name, default: 0] > 1 ? "\(name) (ID \(course.id))" : name
+        }
+    }
+
     /// Hide recognized archive identifiers without changing the course's wording or acronyms.
     static func courseName(_ course: RemoteCourseSummary) -> String {
         RecmanCourseSidebar.courseName(course)
@@ -74,6 +100,13 @@ enum RecordingsPresentation {
     /// subtitle and the course header. Both languages agree in number (#195).
     static func recordingCount(_ count: Int) -> BilingualText {
         BilingualText(italianCount(count, "registrazione", "registrazioni"), englishCount(count, "recording", "recordings"))
+    }
+
+    /// In a mixed view, distinguish the archive count from the manual section.
+    static func courseRecordingCount(_ count: Int, hasManual: Bool) -> BilingualText {
+        guard hasManual else { return recordingCount(count) }
+        return BilingualText(italianCount(count, "registrazione in archivio", "registrazioni in archivio"),
+                             englishCount(count, "archived recording", "archived recordings"))
     }
 
     /// The new-lectures badge's colours: white on the accent colour, inverted on the selected
@@ -341,8 +374,14 @@ enum RecordingsPresentation {
     struct BulkAction: Equatable {
         let allDone: Bool
         let enabled: Bool
-        var label: BilingualText {
-            allDone ? BilingualText("Segna tutte come non viste", "Mark all as unseen") :
+        var label: BilingualText { label(hasManual: false) }
+
+        func label(hasManual: Bool) -> BilingualText {
+            if hasManual {
+                return allDone ? BilingualText("Segna tutte non viste (archivio)", "Mark all archive lessons unseen") :
+                    BilingualText("Completa tutte (archivio)", "Mark all archive lessons done")
+            }
+            return allDone ? BilingualText("Segna tutte come non viste", "Mark all as unseen") :
                 BilingualText("Segna tutte come completate", "Mark all as completed")
         }
     }
@@ -433,7 +472,7 @@ struct RecordingsPage: View {
     }
 
     private var showsBrowser: Bool {
-        RecordingsPresentation.showsBrowser(access: recordings.access, hasBookmarks: !recordings.study.bookmarks.isEmpty)
+        RecordingsPresentation.showsBrowser(access: recordings.access, hasBookmarks: recordings.watchlistCount > 0)
     }
 
     // MARK: Sign-in
@@ -555,21 +594,13 @@ struct RecordingsPage: View {
 
     @ViewBuilder private var detail: some View {
         if destination == .watchlist {
-            WatchlistRecordings(recordings: recordings) { refresh(force: true) }
+            WatchlistRecordings(recordings: recordings, courses: model.courses, currentCourses: { model.courses }) { refresh(force: true) }
         } else if let course = selectedCourse {
-            if let entry = selectedEntry {
-                CourseRecordings(name: entry.name, key: entry.key, recordings: recordings) {
-                    refresh(force: true)
-                }
-                .id(course.id)
-            } else {
-                ContentUnavailableView {
-                    Label(model.unsearchable.first { $0.course.id == course.id }?.name ?? RecordingsPresentation.courseName(course), systemImage: "questionmark.folder")
-                } description: {
-                    Text(tr("Il nome del corso su WeBeep non riporta codice e anno accademico, quindi BeepBar non sa quali registrazioni cercare.",
-                            "The course's name on WeBeep doesn't carry its code and academic year, so BeepBar can't tell which recordings to look for."))
-                }
+            CourseRecordings(name: selectedEntry?.name ?? RecordingsPresentation.courseName(course), courseID: course.id,
+                             key: selectedEntry?.key, recordings: recordings) {
+                refresh(force: true)
             }
+            .id(course.id)
         }
     }
 }
@@ -635,13 +666,15 @@ private struct NewCountBadge: View {
 }
 
 /// The right pane: one course's recordings, searchable, grouped by week.
-private struct CourseRecordings: View {
+struct CourseRecordings: View {
     let name: String
-    let key: RecmanCourseKey
+    let courseID: Int64
+    let key: RecmanCourseKey?
     @ObservedObject var recordings: RecordingsController
     let refresh: () -> Void
     @State private var query = ""
     @State private var selection: String?
+    @State private var manualSelection: String?
     @FocusState private var searchFocused: Bool
     /// The pane's rows and week sections (#100). The pane observes the whole controller, so its
     /// `body` runs again when a spinner flips, a row starts opening or another course's listing
@@ -649,16 +682,18 @@ private struct CourseRecordings: View {
     /// only when the listing, the search, the language, the time zone or the day changes.
     /// `RecmanCourseListDerivation.Inputs` says why each is there.
     @State private var derivation = DerivedValueCache<RecmanCourseListDerivation.Inputs, RecmanCourseListDerivation>()
+    @State private var manualDerivation = DerivedValueCache<RecmanCourseListDerivation.Inputs, RecmanCourseListDerivation>()
     /// Lesson numbers and total minutes, which depend on the listing alone: typing in the search
     /// doesn't sort the whole list again.
     @State private var summaryCache = DerivedValueCache<[RecmanRecording], RecmanCourseListSummary>()
     /// The bulk button's last scan, so a progress tick doesn't scan the listing (#209).
     @State private var bulkCache = RecordingsPresentation.BulkActionCache()
 
-    private var listing: RecordingsListing? { recordings.listing(for: key) }
+    private var listing: RecordingsListing? { key.flatMap { recordings.listing(for: $0) } }
+    private var manual: [RecmanRecording] { recordings.manualLessons.recordings(courseID: courseID) }
 
-    private func derivedList(_ list: [RecmanRecording]) -> RecmanCourseListDerivation {
-        derivation.value(for: .init(recordings: list, query: query, language: AppLanguage.current, timeZone: .current, now: Date()), compute: RecmanCourseListDerivation.init)
+    private func derivedList(_ list: [RecmanRecording], manual: Bool = false) -> RecmanCourseListDerivation {
+        (manual ? manualDerivation : derivation).value(for: .init(recordings: list, query: query, language: AppLanguage.current, timeZone: .current, now: Date()), compute: RecmanCourseListDerivation.init)
     }
 
     private func summary(_ list: [RecmanRecording]) -> RecmanCourseListSummary {
@@ -693,7 +728,7 @@ private struct CourseRecordings: View {
                 .lineLimit(3)
                 .fixedSize(horizontal: false, vertical: true)
             WatchProgressReader(recordings: recordings) { progress in
-                let line = progress.headerLine(summary, for: key)
+                let line = key.map { progress.headerLine(summary, for: $0) } ?? summary
                 #if DEBUG
                 let _ = RecordingsPageProbes.header?(line)
                 #endif
@@ -715,16 +750,19 @@ private struct CourseRecordings: View {
     }
 
     private var toolbar: some View {
-        HStack(spacing: 12) {
+        let hasManual = !manual.isEmpty
+        return HStack(spacing: 12) {
             searchField
             Spacer(minLength: 0)
-            WatchProgressReader(recordings: recordings) { progress in
-                let action = bulkCache.action(for: key, recordings: listing?.recordings, values: progress)
-                Button(action.label.text) { recordings.toggleAllDone(key) }
-                    .buttonStyle(.borderless)
-                    .font(.callout)
-                    .fixedSize()
-                    .disabled(!action.enabled)
+            if let key {
+                WatchProgressReader(recordings: recordings) { progress in
+                    let action = bulkCache.action(for: key, recordings: listing?.recordings, values: progress)
+                    Button(action.label(hasManual: hasManual).text) { recordings.toggleAllDone(key) }
+                        .buttonStyle(.borderless)
+                        .font(.callout)
+                        .fixedSize()
+                        .disabled(!action.enabled)
+                }
             }
             Button(action: refresh) {
                 ZStack {
@@ -736,7 +774,7 @@ private struct CourseRecordings: View {
             .buttonStyle(.borderless)
             // Without a Polimi session a refresh can't load anything (#237); the sign-in is offered
             // in the pane and in the banner above, as on the Watchlist.
-            .disabled(listing?.isLoading == true || recordings.access != .ready)
+            .disabled(key == nil || listing?.isLoading == true || recordings.access != .ready)
             .help(tr("Aggiorna le registrazioni", "Refresh the recordings"))
             .accessibilityLabel(tr("Aggiorna registrazioni", "Refresh recordings"))
         }
@@ -745,12 +783,12 @@ private struct CourseRecordings: View {
     }
 
     private var summary: String {
-        let year = key.academicYearLabel
+        let year = key?.academicYearLabel ?? ""
         guard let list = listing?.recordings else {
             return listing?.isLoading == true ? "\(year) · \(tr("caricamento…", "loading…"))" : year
         }
         let minutes = summary(list).totalMinutes
-        var parts = [year, RecordingsPresentation.recordingCount(list.count).text]
+        var parts = [year, RecordingsPresentation.courseRecordingCount(list.count, hasManual: !manual.isEmpty).text].filter { !$0.isEmpty }
         if minutes > 0 { parts.append(RecordingsPresentation.durationText(minutes: minutes)) }
         return parts.joined(separator: " · ")
     }
@@ -779,22 +817,47 @@ private struct CourseRecordings: View {
         .overlay(RoundedRectangle(cornerRadius: 8).strokeBorder(.separator, lineWidth: 0.5))
     }
 
-    @ViewBuilder private var content: some View {
-        switch RecordingsPresentation.courseContent(hasList: listing?.recordings != nil, isLoading: listing?.isLoading == true,
+    private var content: some View {
+        VStack(spacing: 0) {
+            if !manual.isEmpty {
+                Text(tr("Lezioni aggiunte con link", "Lessons added by link"))
+                    .font(.headline).frame(maxWidth: .infinity, alignment: .leading).padding(14)
+                recordingList(derivedList(manual, manual: true), numbers: [:], selection: $manualSelection)
+                    .frame(minHeight: 100, idealHeight: 180, maxHeight: 240)
+                Divider()
+            }
+            archiveContent
+        }
+    }
+
+    @ViewBuilder private var archiveContent: some View {
+        if key == nil {
+            ContentUnavailableView {
+                Label(name, systemImage: "questionmark.folder")
+            } description: {
+                Text(tr("Il nome del corso su WeBeep non riporta codice e anno accademico, quindi BeepBar non sa quali registrazioni cercare.",
+                        "The course's name on WeBeep doesn't carry its code and academic year, so BeepBar can't tell which recordings to look for."))
+            }
+        } else {
+            switch RecordingsPresentation.courseContent(hasList: listing?.recordings != nil, isLoading: listing?.isLoading == true,
                                                     hasProblem: listing?.problem != nil, access: recordings.access) {
         case .list:
             let list = listing?.recordings ?? []
             let model = derivedList(list)
             if list.isEmpty {
                 ContentUnavailableView {
-                    Label(tr("Ancora nessuna registrazione", "No recordings yet"), systemImage: "video.slash")
+                    Label(manual.isEmpty ? tr("Ancora nessuna registrazione", "No recordings yet") : tr("Nessuna registrazione in archivio", "No archived recordings"), systemImage: "video.slash")
                 } description: {
                     Text(tr("Quando ne viene pubblicata una, la trovi qui.", "When one is published, you'll find it here."))
                 }
             } else if model.shown.isEmpty {
-                ContentUnavailableView.search(text: query)
+                if manual.isEmpty {
+                    ContentUnavailableView.search(text: query)
+                } else {
+                    ContentUnavailableView(tr("Nessun risultato in archivio", "No archive results"), systemImage: "magnifyingglass")
+                }
             } else {
-                recordingList(model, numbers: summary(list).numbers)
+                recordingList(model, numbers: summary(list).numbers, selection: $selection)
             }
         case .loading:
             VStack(spacing: 10) {
@@ -822,10 +885,16 @@ private struct CourseRecordings: View {
             } description: {
                 Text(tr("Riprova con il pulsante di aggiornamento.", "Try again with the refresh button."))
             }
+            }
         }
     }
 
-    private func recordingList(_ model: RecmanCourseListDerivation, numbers: [String: Int]) -> some View {
+    private func watchlistActionTitle(_ recording: RecmanRecording) -> String {
+        if ManualWebexLesson.isManual(recording) { return tr("Elimina lezione", "Delete lesson") }
+        return recordings.study.contains(recording) ? tr("Rimuovi dalla watchlist", "Remove from watchlist") : tr("Aggiungi alla watchlist", "Add to watchlist")
+    }
+
+    private func recordingList(_ model: RecmanCourseListDerivation, numbers: [String: Int], selection: Binding<String?>) -> some View {
         let byID = model.byID
         let firstID = model.shown.first?.id
         // One set per `body` instead of a scan of every bookmark for every row.
@@ -833,7 +902,7 @@ private struct CourseRecordings: View {
         // Sections, filtering and numbering stay here (this view doesn't observe the progress
         // model); a tick re-runs only the reader's closure below, see `WatchProgressReader`.
         return WatchProgressReader(recordings: recordings) { progress in
-            List(selection: $selection) {
+            List(selection: selection) {
                 ForEach(model.sections, id: \.title) { section in
                     Section(section.title) {
                         ForEach(section.recordings) { recording in
@@ -842,7 +911,7 @@ private struct CourseRecordings: View {
                                 number: numbers[recording.id],
                                 isNew: recordings.isNew(recording),
                                 isOpening: recordings.openingRecordingID == recording.id,
-                                isWatchlisted: watchlisted.contains(RecordingsStudyState.identity(recording)),
+                                isWatchlisted: ManualWebexLesson.isManual(recording) || watchlisted.contains(RecordingsStudyState.identity(recording)),
                                 canEdit: recordings.canEditStudy,
                                 canPlay: recordings.access == .ready,
                                 watchlistCourseName: name,
@@ -871,8 +940,10 @@ private struct CourseRecordings: View {
                 // Really the browser: Play (double click, Return, the row's button) is BeepBar's
                 // own player since #148, and this item is the way around it.
                 Button(tr("Apri nel browser", "Open in browser")) { recordings.openInBrowser(recording) }
+                    .disabled(recordings.access != .ready)
                 Button(tr("Copia link", "Copy link")) { recordings.copyLink(recording) }
-                Button(recordings.study.contains(recording) ? tr("Rimuovi dalla watchlist", "Remove from watchlist") : tr("Aggiungi alla watchlist", "Add to watchlist")) { recordings.toggleWatchlist(recording, courseName: name) }
+                    .disabled(recordings.access != .ready)
+                Button(watchlistActionTitle(recording)) { recordings.toggleWatchlist(recording, courseName: name) }
                     .disabled(!recordings.canEditStudy)
             }
         } primaryAction: { ids in
@@ -884,6 +955,8 @@ private struct CourseRecordings: View {
 /// The global queue uses saved snapshots, so choosing what to watch never requires visiting each course.
 private struct WatchlistRecordings: View {
     @ObservedObject var recordings: RecordingsController
+    let courses: [RemoteCourseSummary]
+    let currentCourses: () -> [RemoteCourseSummary]
     let refresh: () -> Void
     @State private var query = ""
     @State private var selection: String?
@@ -892,6 +965,7 @@ private struct WatchlistRecordings: View {
     @State private var shownCache = DerivedValueCache<ShownInputs, [RecordingsStudyState.Bookmark]>()
 
     @State private var addingLesson = false
+    @State private var addingOwner: Int?
 
     private struct ShownInputs: Equatable {
         let bookmarks: [RecordingsStudyState.Bookmark]
@@ -936,7 +1010,7 @@ private struct WatchlistRecordings: View {
                     .textFieldStyle(.roundedBorder)
                     .frame(minWidth: 120, maxWidth: 280)
                 Spacer(minLength: 0)
-                Button { addingLesson = true } label: { Image(systemName: "plus") }
+                Button(action: beginManualLesson) { Image(systemName: "plus") }
                     .buttonStyle(.borderless)
                     .help(tr("Aggiungi una lezione con un link Webex", "Add a lesson with a Webex link"))
                     .accessibilityLabel(tr("Aggiungi una lezione con un link Webex", "Add a lesson with a Webex link"))
@@ -991,7 +1065,7 @@ private struct WatchlistRecordings: View {
                 // `watchlistMenuAndPrimaryActionReachTheList` (#198).
                 .contextMenu(forSelectionType: String.self) { ids in
                     if let bookmark = shown.first(where: { ids.contains($0.id) }) {
-                        Button(tr("Rimuovi dalla watchlist", "Remove from watchlist")) { recordings.toggleWatchlist(bookmark.recording, courseName: bookmark.courseName) }
+                        Button(ManualWebexLesson.isManual(bookmark.recording) ? tr("Elimina lezione", "Delete lesson") : tr("Rimuovi dalla watchlist", "Remove from watchlist")) { recordings.toggleWatchlist(bookmark.recording, courseName: bookmark.courseName) }
                             .disabled(!recordings.canEditStudy)
                         Button(tr("Apri nel browser", "Open in browser")) { recordings.openInBrowser(bookmark.recording) }
                             .disabled(recordings.access != .ready || bookmark.unavailable)
@@ -1004,10 +1078,29 @@ private struct WatchlistRecordings: View {
             }
         }
         .sheet(isPresented: $addingLesson) {
-            AddWebexLessonSheet { link, title, course in
-                recordings.addManualLesson(link: link, title: title, courseName: course).map { _ in () }
-            }
+            AddWebexLessonSheet(courses: courses, add: submitManualLesson)
+#if DEBUG
+                .onAppear { RecordingsPageProbes.submitManualLesson = submitManualLesson }
+                .onDisappear { RecordingsPageProbes.submitManualLesson = nil }
+#endif
         }
+#if DEBUG
+        .onAppear { RecordingsPageProbes.beginManualLesson = beginManualLesson }
+        .onDisappear { RecordingsPageProbes.beginManualLesson = nil }
+#endif
+    }
+
+    private func beginManualLesson() {
+        addingOwner = recordings.manualLessonOwner
+        addingLesson = true
+    }
+
+    private func submitManualLesson(link: String, title: String, courseID: Int64?) -> Result<Void, RecordingsController.ManualLessonFailure> {
+        let current = currentCourses()
+        guard RecordingsPresentation.canSubmitManualLesson(owner: addingOwner, currentOwner: recordings.manualLessonOwner,
+                                                            courseID: courseID, availableIDs: Set(current.map(\.id))) else { return .failure(.notEditable) }
+        let name = current.first { $0.id == courseID }.map(RecordingsPresentation.courseName) ?? ""
+        return recordings.addManualLesson(link: link, title: title, courseName: name, courseID: courseID).map { _ in () }
     }
 
     @ViewBuilder private var empty: some View {
@@ -1029,22 +1122,30 @@ private struct WatchlistRecordings: View {
 /// `add` saves and answers; the sheet closes only on success, so a refused link stays in the
 /// field with the reason under it.
 struct AddWebexLessonSheet: View {
-    let add: (_ link: String, _ title: String, _ course: String) -> Result<Void, RecordingsController.ManualLessonFailure>
+    let courses: [RemoteCourseSummary]
+    let add: (_ link: String, _ title: String, _ course: Int64?) -> Result<Void, RecordingsController.ManualLessonFailure>
     @Environment(\.dismiss) private var dismiss
     @State private var link = ""
     @State private var title = ""
-    @State private var course = ""
+    @State private var course: Int64? = nil
     @State private var problem: BilingualText?
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 14) {
+        let options = RecordingsPresentation.manualPickerCourses(courses)
+        let labels = RecordingsPresentation.manualCourseLabels(options)
+        return VStack(alignment: .leading, spacing: 14) {
             Text(tr("Aggiungi una lezione Webex", "Add a Webex lesson")).font(.headline)
             Text(tr("Incolla il link della registrazione Webex. Senza titolo, prende quello di Webex e la durata alla prima riproduzione. La lezione resta nella watchlist finché non la rimuovi.", "Paste the Webex recording link. Without a title, it takes Webex's title and length the first time you play it. The lesson stays in your watchlist until you remove it."))
                 .font(.callout).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
             Form {
                 TextField(tr("Link Webex", "Webex link"), text: $link, prompt: Text(verbatim: "https://politecnicomilano.webex.com/…"))
                 TextField(tr("Titolo (facoltativo)", "Title (optional)"), text: $title)
-                TextField(tr("Corso (facoltativo)", "Course (optional)"), text: $course)
+                Picker(tr("Corso (facoltativo)", "Course (optional)"), selection: $course) {
+                    Text(tr("Nessuno", "None")).tag(Int64?.none)
+                    ForEach(options, id: \.id) { course in
+                        Text(labels[course.id] ?? course.displayName).tag(Optional(course.id))
+                    }
+                }
             }
             .formStyle(.columns)
             if let problem {
@@ -1119,6 +1220,8 @@ struct WatchProgressReader<Content: View>: View {
 @MainActor enum RecordingsPageProbes {
     static var row: ((RecordingRow) -> Void)?
     static var header: ((String) -> Void)?
+    static var beginManualLesson: (() -> Void)?
+    static var submitManualLesson: ((String, String, Int64?) -> Result<Void, RecordingsController.ManualLessonFailure>)?
     /// A scan of the listing by the course toolbar's bulk button, with the listing's size.
     static var bulkScan: ((Int) -> Void)?
     /// A sidebar course row's body: its title and its subtitle.
@@ -1179,6 +1282,11 @@ struct RecordingRow: View, Equatable {
             : BilingualText("Aggiungi \(title) alla watchlist", "Add \(title) to watchlist")
     }
 
+    static func watchlistSymbol(for recording: RecmanRecording, isWatchlisted: Bool) -> String {
+        if ManualWebexLesson.isManual(recording) { return "trash" }
+        return isWatchlisted ? "bookmark.fill" : "bookmark"
+    }
+
     var body: some View {
         #if DEBUG
         let _ = RecordingsPageProbes.row?(self)
@@ -1223,14 +1331,14 @@ struct RecordingRow: View, Equatable {
             .frame(maxWidth: .infinity, alignment: .leading)
             doneCheckbox
             Button(action: actions.toggleWatchlist) {
-                Image(systemName: isWatchlisted ? "bookmark.fill" : "bookmark")
+                Image(systemName: Self.watchlistSymbol(for: recording, isWatchlisted: isWatchlisted))
                     .font(.system(size: 20))
-                    .foregroundStyle(isWatchlisted ? Color.accentColor : .secondary)
+                    .foregroundStyle(isWatchlisted && !ManualWebexLesson.isManual(recording) ? Color.accentColor : .secondary)
                     .frame(width: 32, height: 32)
             }
             .buttonStyle(.plain).disabled(!canEdit)
-            .help(isWatchlisted ? tr("Rimuovi dalla watchlist", "Remove from watchlist") : tr("Aggiungi alla watchlist", "Add to watchlist"))
-            .accessibilityLabel(Self.watchlistAccessibilityLabel(isWatchlisted: isWatchlisted, title: RecordingsPresentation.title(recording)).text)
+            .help(ManualWebexLesson.isManual(recording) ? tr("Elimina lezione", "Delete lesson") : (isWatchlisted ? tr("Rimuovi dalla watchlist", "Remove from watchlist") : tr("Aggiungi alla watchlist", "Add to watchlist")))
+            .accessibilityLabel(ManualWebexLesson.isManual(recording) ? tr("Elimina \(RecordingsPresentation.title(recording))", "Delete \(RecordingsPresentation.title(recording))") : Self.watchlistAccessibilityLabel(isWatchlisted: isWatchlisted, title: RecordingsPresentation.title(recording)).text)
             Button(action: actions.play) {
                 ZStack {
                     ProgressView().controlSize(.small).opacity(isOpening ? 1 : 0)

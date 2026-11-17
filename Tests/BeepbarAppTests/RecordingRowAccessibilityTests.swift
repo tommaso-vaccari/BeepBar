@@ -4,10 +4,30 @@ import Testing
 import BeepbarCore
 @testable import BeepbarApp
 
+/// Keeps SwiftUI's process-wide accessibility tree enabled across overlapping async tests.
+@MainActor enum AssistiveClient {
+    private static var users = 0
+
+    static func acquire() {
+        if users == 0 { setEnabled(true) }
+        users += 1
+    }
+
+    static func release() {
+        precondition(users > 0)
+        users -= 1
+        if users == 0 { setEnabled(false) }
+    }
+
+    private static func setEnabled(_ enabled: Bool) {
+        NSApplication.shared.perform(Selector(("accessibilitySetValue:forAttribute:")), with: NSNumber(value: enabled), with: "AXEnhancedUserInterface")
+    }
+}
+
 /// What VoiceOver finds in a Recordings row, read from the real accessibility tree of a hosted
 /// `RecordingRow` (#196). SwiftUI builds that tree only for an assistive client, so the test turns
 /// on `AXEnhancedUserInterface` for the app (the switch VoiceOver flips) while it runs and off
-/// again afterwards. Serialized: that switch is process-global. Text is checked in the tests'
+/// again afterwards, shared with other tests using the process-global switch. Text is checked in the tests'
 /// Italian default, and both languages through `BilingualText`.
 @Suite(.serialized) @MainActor struct RecordingRowAccessibilityTests {
     private struct Node {
@@ -60,19 +80,14 @@ import BeepbarCore
         return nodes
     }
 
-    /// Turns the app's assistive-client switch on or off (see the suite's comment).
-    private func setAssistiveClient(_ on: Bool) {
-        NSApplication.shared.perform(Selector(("accessibilitySetValue:forAttribute:")), with: NSNumber(value: on), with: "AXEnhancedUserInterface")
-    }
-
     /// A row that isn't new exposes no unnamed element: the clear dot is hidden from VoiceOver,
     /// so it no longer stops on an empty element at the start of most rows. A new row still
     /// announces "Nuova". Mutation: put back `.accessibilityLabel(isNew ? … : "")` without
     /// `.accessibilityHidden(!isNew)` and the old row gains an unlabelled element; hide the dot
     /// always and the new row loses "Nuova".
     @Test(.timeLimit(.minutes(1))) func onlyNewRowsExposeTheDot() async throws {
-        setAssistiveClient(true)
-        defer { setAssistiveClient(false) }
+        AssistiveClient.acquire()
+        defer { AssistiveClient.release() }
         do {
             let old = try await elements(isNew: false, isWatchlisted: false)
             #expect(old.contains { $0.label == "Riproduci Lesson A" }, "the tree was read: \(old)")
@@ -92,8 +107,8 @@ import BeepbarCore
                 == BilingualText("Aggiungi Lesson A alla watchlist", "Add Lesson A to watchlist"))
         #expect(RecordingRow.watchlistAccessibilityLabel(isWatchlisted: true, title: "Lesson A")
                 == BilingualText("Rimuovi Lesson A dalla watchlist", "Remove Lesson A from watchlist"))
-        setAssistiveClient(true)
-        defer { setAssistiveClient(false) }
+        AssistiveClient.acquire()
+        defer { AssistiveClient.release() }
         do {
             let add = try await elements(isNew: false, isWatchlisted: false)
             #expect(add.contains { $0.role == NSAccessibility.Role.button.rawValue && $0.label == "Aggiungi Lesson A alla watchlist" }, "\(add)")

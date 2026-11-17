@@ -21,6 +21,8 @@ public struct ManualWebexLesson: Codable, Equatable, Sendable, Identifiable {
     public var title: String
     /// The optional label shown where a course name would be; empty means none.
     public var courseName: String
+    /// WeBeep course ID, scoped by the account that owns this list.
+    public var courseID: Int64?
     /// The Webex player link, as `normalizedLink` accepted it.
     public let link: URL
     public let addedAt: Date
@@ -39,10 +41,11 @@ public struct ManualWebexLesson: Codable, Equatable, Sendable, Identifiable {
     /// Longest title or course label kept, so a pasted page can't bloat the settings file.
     public static let maxTextLength = 200
 
-    public init(id: String = ManualWebexLesson.idPrefix + UUID().uuidString.lowercased(), title: String, courseName: String, link: URL, addedAt: Date) {
+    public init(id: String = ManualWebexLesson.idPrefix + UUID().uuidString.lowercased(), title: String, courseName: String, link: URL, addedAt: Date, courseID: Int64? = nil) {
         self.id = id
         self.title = Self.cleaned(title)
         self.courseName = Self.cleaned(courseName)
+        self.courseID = courseID
         self.link = link
         self.addedAt = addedAt
     }
@@ -57,6 +60,7 @@ public struct ManualWebexLesson: Codable, Equatable, Sendable, Identifiable {
         id = try container.decode(String.self, forKey: .id)
         title = try container.decode(String.self, forKey: .title)
         courseName = try container.decode(String.self, forKey: .courseName)
+        courseID = try? container.decodeIfPresent(Int64.self, forKey: .courseID)
         link = try container.decode(URL.self, forKey: .link)
         addedAt = try container.decode(Date.self, forKey: .addedAt)
         durationSeconds = (try? container.decodeIfPresent(Double.self, forKey: .durationSeconds)).flatMap { $0 }.flatMap(Self.plausibleDuration)
@@ -191,12 +195,17 @@ public struct ManualWebexLessons: Codable, Equatable, Sendable {
     /// copy with other parameters of one recording are the same lesson, including against a
     /// lesson stored by an earlier build with its query as pasted.
     @discardableResult
-    public mutating func add(link text: String, title: String, courseName: String, now: Date = Date()) throws -> ManualWebexLesson {
+    public mutating func add(link text: String, title: String, courseName: String, courseID: Int64? = nil, now: Date = Date()) throws -> ManualWebexLesson {
         guard let link = ManualWebexLesson.normalizedLink(text) else { throw AddError.invalidLink }
         guard !lessons.contains(where: { ManualWebexLesson.canonical($0.link) == link }) else { throw AddError.duplicate }
-        let lesson = ManualWebexLesson(title: title, courseName: courseName, link: link, addedAt: now)
+        let lesson = ManualWebexLesson(title: title, courseName: courseName, link: link, addedAt: now, courseID: courseID)
         lessons.append(lesson)
         return lesson
+    }
+
+    /// Display-only course rows retain their manual recording identity.
+    public func recordings(courseID: Int64) -> [RecmanRecording] {
+        lessons.filter { $0.courseID == courseID }.map(\.recording)
     }
 
     public mutating func remove(id: String) {

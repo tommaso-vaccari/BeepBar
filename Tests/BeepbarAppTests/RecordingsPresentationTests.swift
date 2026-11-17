@@ -16,6 +16,55 @@ struct RecordingsPresentationTests {
                         duration: "97 min", size: nil, previewURL: URL(string: "https://onlineservices.polimi.it/")!)
     }
 
+    /// A sheet cannot save into a different account or a course removed while it was open.
+    @Test func manualSheetRejectsStaleOwnerAndRemovedCourse() {
+        func allowed(_ owner: Int?, _ current: Int?, _ course: Int64?, _ ids: Set<Int64>) -> Bool {
+            RecordingsPresentation.canSubmitManualLesson(owner: owner, currentOwner: current, courseID: course, availableIDs: ids)
+        }
+        #expect(allowed(42, 42, 7, [7, 8]))
+        #expect(allowed(42, 42, nil, []))
+        #expect(!allowed(nil, nil, nil, []))
+        #expect(!allowed(42, 43, 7, [7]))
+        #expect(!allowed(42, nil, 7, [7]))
+        #expect(!allowed(42, 42, 7, [8]))
+    }
+
+    /// The mixed course labels must state which lessons the archive controls affect.
+    @Test func mixedCourseLabelsIdentifyArchive() {
+        let pending = RecordingsPresentation.BulkAction(allDone: false, enabled: true)
+        let done = RecordingsPresentation.BulkAction(allDone: true, enabled: true)
+        #expect(pending.label(hasManual: true).english == "Mark all archive lessons done")
+        #expect(done.label(hasManual: true).english == "Mark all archive lessons unseen")
+        #expect(pending.label(hasManual: false).english == "Mark all as completed")
+        #expect(RecordingsPresentation.courseRecordingCount(2, hasManual: true).english == "2 archived recordings")
+        #expect(RecordingsPresentation.courseRecordingCount(1, hasManual: false).english == "1 recording")
+    }
+
+    /// Courses with the same cleaned title remain distinguishable by year or by their stable ID.
+    @Test func manualPickerDistinguishesSameCourseNames() {
+        let first = course(1, "058167 - Algebra [2025-26]")
+        let second = course(2, "058167 - Algebra [2026-27]")
+        let duplicate = course(3, "058167 - Algebra [2026-27]")
+        let labels = RecordingsPresentation.manualCourseLabels([first, second, duplicate])
+        #expect(labels[1]?.contains("2025-26") == true)
+        #expect(labels[2]?.contains("2026-27") == true)
+        #expect(labels[2] != labels[3])
+    }
+
+    /// Duplicate IDs in a readable cached snapshot must produce one stable option, without a trap.
+    @Test func manualPickerDeduplicatesCachedCourseIDs() {
+        let first = course(7, "First")
+        let identical = course(7, "First")
+        let changed = course(7, "Different")
+        let other = course(8, "First")
+        let input = [first, identical, changed, other]
+        #expect(RecordingsPresentation.manualPickerCourses(input) == [first, other])
+        let labels = RecordingsPresentation.manualCourseLabels(input)
+        #expect(labels.count == 2)
+        #expect(labels[7] == "First (ID 7)")
+        #expect(labels[8] == "First (ID 8)")
+    }
+
     /// Italian counts agree in number with their noun, like English ones (#195): a course with
     /// one recording reads "1 registrazione" (sidebar subtitle and course header) and one new
     /// lecture is announced as "1 nuova", never "1 registrazioni" / "1 nuove". Checked through

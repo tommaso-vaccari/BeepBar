@@ -100,8 +100,8 @@ import BeepbarCore
             try await database.upsertBaseline(rootID: rootID, baseline: Baseline(remoteID: "fixture-\(index)",
                 relativePath: try RelativePath(relative), sha256: "synthetic", remoteRevision: "1"))
         }
-        NSApplication.shared.perform(Selector(("accessibilitySetValue:forAttribute:")), with: NSNumber(value: true), with: "AXEnhancedUserInterface")
-        defer { NSApplication.shared.perform(Selector(("accessibilitySetValue:forAttribute:")), with: NSNumber(value: false), with: "AXEnhancedUserInterface") }
+        AssistiveClient.acquire()
+        defer { AssistiveClient.release() }
         let host = NSHostingView(rootView: ActivityPage(authentication: controller))
         let window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: width, height: 700), styleMask: [.titled], backing: .buffered, defer: false)
         window.isReleasedWhenClosed = false

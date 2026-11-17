@@ -57,8 +57,8 @@ import BeepbarCore
 
     /// The accessibility elements of one hosted row, polled until SwiftUI has published the
     /// row's buttons (an observable fact, not a fixed wait), at most 10 s.
-    private func elements(isNew: Bool, isWatchlisted: Bool) async throws -> [Node] {
-        let row = RecordingRow(recording: recording(), number: 1, isNew: isNew, isOpening: false, isWatchlisted: isWatchlisted,
+    private func elements(isNew: Bool, isWatchlisted: Bool, recording lesson: RecmanRecording? = nil) async throws -> [Node] {
+        let row = RecordingRow(recording: lesson ?? recording(), number: 1, isNew: isNew, isOpening: false, isWatchlisted: isWatchlisted,
                                canEdit: true, canPlay: true, watchlistCourseName: "Analisi", watch: .unknown,
                                actions: .init(toggleWatchlist: {}, play: {}, setDone: { _ in }))
         let host = NSHostingView(rootView: row.frame(width: 640))
@@ -115,5 +115,24 @@ import BeepbarCore
             let remove = try await elements(isNew: false, isWatchlisted: true)
             #expect(remove.contains { $0.role == NSAccessibility.Role.button.rawValue && $0.label == "Rimuovi Lesson A dalla watchlist" }, "\(remove)")
         }
+    }
+
+    /// A linked lesson's bookmark is a plain image with its explanation, not a button, so a click
+    /// or a VoiceOver press can never delete; every row has the "⋯" menu (#286). Mutation: draw
+    /// the pinned slot as a `Button` and the first check fails; drop `moreMenu` and the second does.
+    @Test(.timeLimit(.minutes(1))) func linkedLessonBookmarkIsInertAndRowsHaveAMenu() async throws {
+        AssistiveClient.acquire()
+        defer { AssistiveClient.release() }
+        let manual = ManualWebexLesson(title: "Guest", courseName: "", link: URL(string: "https://politecnicomilano.webex.com/ldr.php?RCID=a11y")!, addedAt: .now).recording
+        let nodes = try await elements(isNew: false, isWatchlisted: true, recording: manual)
+        let pinned = RecordingRow.pinnedBookmarkHelp.italian
+        #expect(nodes.contains { $0.label == pinned }, "the explanation is exposed: \(nodes)")
+        #expect(!nodes.contains { $0.role == NSAccessibility.Role.button.rawValue && $0.label == pinned }, "the pinned bookmark is a button: \(nodes)")
+        #expect(!nodes.contains { $0.role == NSAccessibility.Role.button.rawValue && ($0.label.hasPrefix("Rimuovi") || $0.label.hasPrefix("Elimina")) })
+        // The menu button's name is the system's ("More") whatever label SwiftUI is given, so the
+        // test checks that the element exists, on a linked and on an archive row.
+        #expect(nodes.contains { $0.role == NSAccessibility.Role.menuButton.rawValue }, "the ⋯ menu: \(nodes)")
+        let archive = try await elements(isNew: false, isWatchlisted: false)
+        #expect(archive.contains { $0.role == NSAccessibility.Role.menuButton.rawValue }, "\(archive)")
     }
 }

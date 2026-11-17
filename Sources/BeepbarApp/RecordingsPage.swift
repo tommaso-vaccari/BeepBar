@@ -237,6 +237,9 @@ enum RecordingsPresentation {
         /// A compact note inside the list standing for the archive's state (only when linked
         /// lessons are listed; otherwise the archive's own full-size state fills the pane).
         let inlineNote: ArchivePart?
+        /// The search left no linked lesson and the archive shows only a note: the list says so
+        /// under "Added by link", so the pane never looks like the search ignored them.
+        var manualNoResults = false
         /// The archive's full-size state, as before linked lessons existed.
         let fullState: ArchivePart?
     }
@@ -247,14 +250,15 @@ enum RecordingsPresentation {
     /// visible and the pane is not split by a second list with a full-size empty state.
     /// `hasManual`: the course has linked lessons at all; `manualShownCount`: those the search
     /// leaves. A search matching nothing anywhere keeps the usual "no results" state.
-    nonisolated static func coursePlan(hasManual: Bool, manualShownCount: Int, archive: ArchivePart) -> CoursePlan {
+    nonisolated static func coursePlan(hasManual: Bool, manualShownCount: Int, isSearching: Bool = false, archive: ArchivePart) -> CoursePlan {
         guard hasManual else {
             return CoursePlan(showsManualSection: false, showsArchiveRows: archive == .rows, inlineNote: nil, fullState: archive == .rows ? nil : archive)
         }
         if manualShownCount == 0, archive == .noSearchResults {
             return CoursePlan(showsManualSection: false, showsArchiveRows: false, inlineNote: nil, fullState: .noSearchResults)
         }
-        return CoursePlan(showsManualSection: manualShownCount > 0, showsArchiveRows: archive == .rows, inlineNote: archive == .rows ? nil : archive, fullState: nil)
+        return CoursePlan(showsManualSection: manualShownCount > 0, showsArchiveRows: archive == .rows, inlineNote: archive == .rows ? nil : archive,
+                          manualNoResults: isSearching && manualShownCount == 0 && archive != .rows, fullState: nil)
     }
 
     /// VoiceOver's label of the sidebar badge counting new lectures: "1 nuova" / "3 nuove" (#195).
@@ -922,7 +926,7 @@ struct CourseRecordings: View {
             content: RecordingsPresentation.courseContent(hasList: listing?.recordings != nil, isLoading: listing?.isLoading == true,
                                                           hasProblem: listing?.problem != nil, access: recordings.access),
             archiveCount: archiveList.count, archiveShownCount: archiveModel.shown.count)
-        let plan = RecordingsPresentation.coursePlan(hasManual: !manual.isEmpty, manualShownCount: manualModel.shown.count, archive: part)
+        let plan = RecordingsPresentation.coursePlan(hasManual: !manual.isEmpty, manualShownCount: manualModel.shown.count, isSearching: !query.isEmpty, archive: part)
         return Group {
             if let full = plan.fullState {
                 fullState(full)
@@ -930,7 +934,7 @@ struct CourseRecordings: View {
                 recordingList(plan, manual: manualModel, archive: archiveModel, numbers: plan.showsArchiveRows ? summary(archiveList).numbers : [:])
             }
         }
-        .deleteLessonConfirmation($deleting) { recordings.toggleWatchlist($0, courseName: name) }
+        .deleteLessonConfirmation($deleting) { recordings.deleteManualLesson($0) }
     }
 
     /// The archive's state filling the pane: what a course without linked lessons shows.
@@ -1078,6 +1082,9 @@ struct CourseRecordings: View {
                         }
                     }
                 }
+                if plan.manualNoResults {
+                    Section(tr("Aggiunte con link", "Added by link")) { noteText(tr("Nessun risultato", "No results")) }
+                }
                 if let note = plan.inlineNote {
                     Section(tr("Archivio", "Archive")) { archiveNote(note) }
                 }
@@ -1117,7 +1124,7 @@ private struct WatchlistRecordings: View {
 
     @State private var addingLesson = false
     @State private var addingOwner: Int?
-    /// The linked lesson whose deletion waits for the student's confirmation, with its bookmark's course label (#286).
+    /// The linked lesson whose deletion waits for the student's confirmation (#286).
     @State private var deleting: RecmanRecording?
 
     private struct ShownInputs: Equatable {
@@ -1234,10 +1241,7 @@ private struct WatchlistRecordings: View {
                 }
             }
         }
-        .deleteLessonConfirmation($deleting) { lesson in
-            let courseName = shown.first { $0.recording.id == lesson.id }?.courseName ?? ""
-            recordings.toggleWatchlist(lesson, courseName: courseName)
-        }
+        .deleteLessonConfirmation($deleting) { recordings.deleteManualLesson($0) }
         .sheet(isPresented: $addingLesson) {
             AddWebexLessonSheet(courses: courses, add: submitManualLesson)
 #if DEBUG
@@ -1393,6 +1397,9 @@ struct WatchProgressReader<Content: View>: View {
 @MainActor enum RecordingsPageProbes {
     static var row: ((RecordingRow) -> Void)?
     static var header: ((String) -> Void)?
+    /// The delete dialog was asked for a lesson: its confirm and cancel actions, the same ones the
+    /// dialog's buttons run (a test can't click a system dialog).
+    static var deleteRequest: ((_ lesson: RecmanRecording, _ confirm: @escaping () -> Void, _ cancel: @escaping () -> Void) -> Void)?
     static var beginManualLesson: (() -> Void)?
     static var submitManualLesson: ((String, String, Int64?) -> Result<Void, RecordingsController.ManualLessonFailure>)?
     /// A scan of the listing by the course toolbar's bulk button, with the listing's size.
@@ -1421,19 +1428,30 @@ struct RecordingMenuItems: View {
 private struct DeleteLessonConfirmation: ViewModifier {
     @Binding var lesson: RecmanRecording?
     let confirm: (RecmanRecording) -> Void
+    /// The title of the last lesson asked about: while the dialog dismisses, `lesson` is already
+    /// nil and the title would flash as "Eliminare «»?".
+    @State private var lastTitle = ""
 
     func body(content: Content) -> some View {
-        let title = lesson.map(RecordingsPresentation.title) ?? ""
-        content.confirmationDialog(
-            tr("Eliminare «\(title)»?", "Delete “\(title)”?"),
-            isPresented: Binding(get: { lesson != nil }, set: { if !$0 { lesson = nil } }),
-            titleVisibility: .visible, presenting: lesson
-        ) { lesson in
-            Button(tr("Elimina", "Delete"), role: .destructive) { confirm(lesson) }
-            Button(tr("Annulla", "Cancel"), role: .cancel) {}
-        } message: { _ in
-            Text(tr("La lezione e i suoi progressi vengono rimossi da BeepBar.", "The lesson and its progress are removed from BeepBar."))
-        }
+        let title = lesson.map(RecordingsPresentation.title) ?? lastTitle
+        content
+            .onChange(of: lesson) {
+                guard let lesson else { return }
+                lastTitle = RecordingsPresentation.title(lesson)
+                #if DEBUG
+                RecordingsPageProbes.deleteRequest?(lesson, { confirm(lesson) }, { self.lesson = nil })
+                #endif
+            }
+            .confirmationDialog(
+                tr("Eliminare «\(title)»?", "Delete “\(title)”?"),
+                isPresented: Binding(get: { lesson != nil }, set: { if !$0 { lesson = nil } }),
+                titleVisibility: .visible, presenting: lesson
+            ) { lesson in
+                Button(tr("Elimina", "Delete"), role: .destructive) { confirm(lesson) }
+                Button(tr("Annulla", "Cancel"), role: .cancel) {}
+            } message: { _ in
+                Text(tr("La lezione e i suoi progressi vengono rimossi da BeepBar.", "The lesson and its progress are removed from BeepBar."))
+            }
     }
 }
 
@@ -1616,21 +1634,26 @@ struct RecordingRow: View, Equatable {
 
     /// The "⋯" menu: the same items as the right-click menu (`RecordingsPresentation.menuEntries`).
     private var moreMenu: some View {
-        Menu {
+        Menu(moreMenuLabel, systemImage: "ellipsis.circle") {
             RecordingMenuItems(
                 entries: RecordingsPresentation.menuEntries(for: recording, isWatchlisted: isWatchlisted, canEdit: canEdit, canUseLinks: canUseLinks),
                 perform: actions.perform)
-        } label: {
-            Image(systemName: "ellipsis.circle")
-                .font(.system(size: 20))
-                .foregroundStyle(.secondary)
-                .frame(width: 32, height: 32)
         }
+        // The title form, not a custom label: the menu button takes its VoiceOver name from the
+        // title, and an image label left it with the system's "More".
+        .labelStyle(.iconOnly)
+        .font(.system(size: 20))
+        .foregroundStyle(.secondary)
         .menuStyle(.borderlessButton)
         .menuIndicator(.hidden)
+        .frame(width: 32, height: 32)
         .fixedSize()
         .help(tr("Altre azioni", "More actions"))
-        .accessibilityLabel(tr("Altre azioni per \(RecordingsPresentation.title(recording))", "More actions for \(RecordingsPresentation.title(recording))"))
+        .accessibilityLabel(moreMenuLabel)
+    }
+
+    private var moreMenuLabel: String {
+        tr("Altre azioni per \(RecordingsPresentation.title(recording))", "More actions for \(RecordingsPresentation.title(recording))")
     }
 
     /// A thin read-only bar under the metadata: how far the student got, full and green once

@@ -207,6 +207,7 @@ import BeepbarCore
             var isWatchlisted = false
             var canEdit = true
             var canPlay = true
+            var canUseLinks = false
             var courseName: String? = nil
             var unavailable = false
             var watchlistCourseName = "Analisi"
@@ -214,7 +215,7 @@ import BeepbarCore
         }
         func row(_ f: Fields, action: @escaping () -> Void = {}) -> RecordingRow {
             RecordingRow(recording: f.recording, number: f.number, isNew: f.isNew, isOpening: f.isOpening, isWatchlisted: f.isWatchlisted,
-                         canEdit: f.canEdit, canPlay: f.canPlay, courseName: f.courseName, unavailable: f.unavailable,
+                         canEdit: f.canEdit, canPlay: f.canPlay, canUseLinks: f.canUseLinks, courseName: f.courseName, unavailable: f.unavailable,
                          watchlistCourseName: f.watchlistCourseName,
                          watch: f.watch, actions: .init(toggleWatchlist: action, play: action, setDone: { _ in }))
         }
@@ -239,6 +240,7 @@ import BeepbarCore
         differs("isWatchlisted") { $0.isWatchlisted = true }
         differs("canEdit") { $0.canEdit = false }
         differs("canPlay") { $0.canPlay = false }
+        differs("canUseLinks") { $0.canUseLinks = true }
         differs("courseName") { $0.courseName = "Analisi" }
         differs("unavailable") { $0.unavailable = true }
         differs("watchlistCourseName") { $0.watchlistCourseName = "Analisi II" }
@@ -274,6 +276,7 @@ import BeepbarCore
             RecordingsPageProbes.header = nil
             RecordingsPageProbes.beginManualLesson = nil
             RecordingsPageProbes.submitManualLesson = nil
+            RecordingsPageProbes.deleteRequest = nil
             window.close()
             fixture.dispose()
         }
@@ -471,12 +474,60 @@ import BeepbarCore
         // The archive rows are numbered, the linked one is not.
         #expect(page.rows.first { $0.recording.id == manual.id }?.number == nil)
         #expect(page.rows.first { $0.recording.id == newest.id }?.number != nil)
-        // Delete only asks.
+        // "Delete lesson…" only asks; cancelling keeps the lesson, confirming deletes it (course pane).
+        var request: (confirm: () -> Void, cancel: () -> Void)?
+        RecordingsPageProbes.deleteRequest = { lesson, confirm, cancel in
+            #expect(lesson.id == manual.id)
+            request = (confirm, cancel)
+        }
         menu.performActionForItem(at: 2)
-        try await page.settle()
+        try await page.settle { request != nil }
+        let first = try #require(request, "\"Delete lesson…\" did not ask for a confirmation")
         #expect(page.recordings.manualLessons.lesson(id: manual.id) != nil, "the menu deleted the lesson without a confirmation")
-        page.rows.last { $0.recording.id == manual.id }?.actions.requestDelete()
+        first.cancel()
+        try await page.settle()
+        #expect(page.recordings.manualLessons.lesson(id: manual.id) != nil, "cancel must keep the lesson")
+        request = nil
+        let row = try #require(page.rows.last { $0.recording.id == manual.id })
+        row.actions.requestDelete()
+        try await page.settle { request != nil }
+        let second = try #require(request)
         #expect(page.recordings.manualLessons.lesson(id: manual.id) != nil)
+        second.confirm()
+        #expect(page.recordings.manualLessons.lesson(id: manual.id) == nil, "confirming must delete the lesson")
+        // The archive is untouched.
+        #expect(page.recordings.listings.values.contains { $0.recordings?.contains(newest) == true })
+    }
+
+    /// The Watchlist path: a linked lesson's "Delete lesson…" asks first, cancel keeps it, confirm
+    /// deletes it, and its bookmark toggle never does.
+    @Test(.timeLimit(.minutes(1))) func watchlistDeletesALinkedLessonOnlyAfterConfirmation() async throws {
+        let page = try await HostedPage()
+        defer { page.close() }
+        _ = try await page.loadedCourse()
+        let manual = try page.recordings.addManualLesson(link: "https://politecnicomilano.webex.com/ldr.php?RCID=wl-test", title: "Guest", courseName: "Course").get()
+        page.recordings.selectDestination(.watchlist)
+        try await page.settle { page.bodies[manual.id] != nil }
+        let table = try await page.detailTable(rows: 1)
+        let menu = try page.contextMenu(table, row: 0)
+        #expect(menu.items.map(\.title) == ["Apri nel browser", "Copia link", "Elimina lezione…"])
+        var request: (confirm: () -> Void, cancel: () -> Void)?
+        RecordingsPageProbes.deleteRequest = { _, confirm, cancel in request = (confirm, cancel) }
+        menu.performActionForItem(at: 2)
+        try await page.settle { request != nil }
+        let first = try #require(request, "\"Delete lesson…\" did not ask for a confirmation")
+        #expect(page.recordings.manualLessons.lesson(id: manual.id) != nil)
+        first.cancel()
+        try await page.settle()
+        #expect(page.recordings.manualLessons.lesson(id: manual.id) != nil, "cancel must keep the lesson")
+        let row = try #require(page.rows.last { $0.recording.id == manual.id })
+        row.actions.toggleWatchlist()
+        #expect(page.recordings.manualLessons.lesson(id: manual.id) != nil, "the bookmark action must not delete")
+        request = nil
+        row.actions.requestDelete()
+        try await page.settle { request != nil }
+        try #require(request).confirm()
+        #expect(page.recordings.manualLessons.lesson(id: manual.id) == nil)
     }
 
     /// An unsearchable course still displays its manual lesson without an archive listing.

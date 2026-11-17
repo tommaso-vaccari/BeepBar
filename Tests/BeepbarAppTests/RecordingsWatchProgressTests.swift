@@ -1292,7 +1292,10 @@ struct RecordingsWatchProgressTests {
         let restored = makeController()
         restored.pageAppeared()
         #expect(restored.manualLessons.recordings(courseID: 42) == [lesson.recording])
+        // The bookmark toggle never deletes a linked lesson (#286); only the explicit delete does.
         restored.toggleWatchlist(lesson.recording, courseName: "Synthetic")
+        #expect(restored.manualLessons.recordings(courseID: 42) == [lesson.recording])
+        restored.deleteManualLesson(lesson.recording)
         #expect(restored.manualLessons.recordings(courseID: 42).isEmpty)
         #expect(restored.watchlistCount == 0)
     }

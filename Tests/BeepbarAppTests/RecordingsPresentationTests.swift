@@ -364,6 +364,11 @@ extension RecordingsPresentationTests {
         // A search that leaves only one side still shows that side with the other's note.
         #expect(P.coursePlan(hasManual: true, manualShownCount: 1, archive: .noSearchResults) == .init(showsManualSection: true, showsArchiveRows: false, inlineNote: .noSearchResults, fullState: nil))
         #expect(P.coursePlan(hasManual: true, manualShownCount: 0, archive: .rows) == .init(showsManualSection: false, showsArchiveRows: true, inlineNote: nil, fullState: nil))
+        // A search that leaves no linked lesson while the archive shows only a note says so.
+        #expect(P.coursePlan(hasManual: true, manualShownCount: 0, isSearching: true, archive: .loading)
+                == .init(showsManualSection: false, showsArchiveRows: false, inlineNote: .loading, manualNoResults: true, fullState: nil))
+        #expect(P.coursePlan(hasManual: true, manualShownCount: 0, isSearching: false, archive: .loading).manualNoResults == false)
+        #expect(P.coursePlan(hasManual: true, manualShownCount: 0, isSearching: true, archive: .rows).manualNoResults == false)
         // Nothing matches anywhere: the usual search state.
         #expect(P.coursePlan(hasManual: true, manualShownCount: 0, archive: .noSearchResults) == .init(showsManualSection: false, showsArchiveRows: false, inlineNote: nil, fullState: .noSearchResults))
     }

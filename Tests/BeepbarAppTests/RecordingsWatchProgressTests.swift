@@ -1282,6 +1282,21 @@ struct RecordingsWatchProgressTests {
         RecordingsPresentation.WatchValues(controller.watchProgress, canEdit: controller.canEditProgress).row(for: recording)
     }
 
+    /// Assigned rows remain manual, survive reload and disappear from both views on removal.
+    @Test func anAssignedManualLessonSurvivesReloadAndRemoval() async throws {
+        defer { cleanUp() }
+        let controller = await listedController()
+        let lesson = try controller.addManualLesson(link: manualLink, title: "Guest", courseName: "Synthetic", courseID: 42).get()
+        #expect(controller.manualLessons.recordings(courseID: 42) == [lesson.recording])
+        #expect(controller.watchlistCount == 1)
+        let restored = makeController()
+        restored.pageAppeared()
+        #expect(restored.manualLessons.recordings(courseID: 42) == [lesson.recording])
+        restored.toggleWatchlist(lesson.recording, courseName: "Synthetic")
+        #expect(restored.manualLessons.recordings(courseID: 42).isEmpty)
+        #expect(restored.watchlistCount == 0)
+    }
+
     /// The sidebar's Watchlist count includes lessons added by link, not only bookmarks:
     /// a Watchlist holding one of each reads 2. Guards against the count of bookmarks alone
     /// (the reported "0" beside a Watchlist of added lessons).

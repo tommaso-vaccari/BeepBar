@@ -4,7 +4,7 @@
 
 ### New
 
-- Add a lesson to the Watchlist by pasting its Webex link with the “+” button, for recordings the archive doesn't list. The link copied from the Webex web app's address bar works too. Leave the title empty and the first Play fills in Webex's title and the length; the lesson then shows its progress bar and the “Fatta” (“Done”) checkbox like the others.
+- Add a lesson to the Watchlist by pasting its Webex link with the “+” button, for recordings the archive doesn't list. Choose a course to find the lesson in both that course and the Watchlist. The link copied from the Webex web app's address bar works too. Leave the title empty and the first Play fills in Webex's title and the length; the lesson then shows its progress bar and the “Fatta” (“Done”) checkbox like the others.
 - “Audio migliorato” (“Enhanced audio”) in the player's title bar makes the teacher's voice easier to follow while the lecture plays: quiet recordings and a teacher who moves away from the microphone are brought to the same volume. A selector offers three modes: “Spento” (“Off”), “Voce isolata” (“Isolated voice”, the default), which plays only the voice without the classroom noise, and “Voce livellata” (“Levelled voice”), which keeps the lecture's original sound at an even volume, for recordings where isolating the voice cuts words. It needs ffmpeg on your Mac (`brew install ffmpeg`); without it the selector says how to get it. With it on, a lecture takes a little over a second to start and after each jump to a part not heard yet; if it stops working, the lecture carries on with its original audio.
 
 ### Improved
@@ -16,6 +16,8 @@
 
 ### Fixed
 
+- After setup, Courses shows when the list is loading and tells you if you need to sign in or turn on a course before syncing. “Accedi” (“Sign in”) starts sign-in right away.
+- The lecture player's speed menu hides speeds above 2× when the current stream cannot play them.
 - Cancelling a sync or trying to sync with no courses selected keeps the previous result visible, including conflicts and incomplete syncs.
 
 - When an automatic sync fails because of a connection problem, BeepBar asks macOS to retry; macOS decides when.

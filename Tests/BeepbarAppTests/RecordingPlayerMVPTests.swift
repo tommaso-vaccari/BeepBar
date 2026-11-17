@@ -359,10 +359,18 @@ struct RecordingPlayerMVPTests {
         controller.play(media, title: "Lezione", cookies: [], startAt: nil)
         #expect(controller.player?.defaultRate == 2)
         #expect(controller.rateSupport == .unknown)
+        let fastItems = try #require(controller.speedPopUp?.menu?.items.filter { (($0.representedObject as? NSNumber)?.floatValue ?? 0) > 2 })
+        #expect(fastItems.allSatisfy { $0.isHidden })
         try await Self.waitUntil { controller.isStartSettled }
+        #expect(fastItems.allSatisfy { !$0.isHidden })
         #expect(controller.player?.currentItem?.canPlayFastForward == true)
         #expect(controller.player?.defaultRate == 4)
         #expect(controller.preferredSpeed == 4)
+        controller.play(media, title: "Another lecture", cookies: [], startAt: nil)
+        let replacementItems = try #require(controller.speedPopUp?.menu?.items.filter { (($0.representedObject as? NSNumber)?.floatValue ?? 0) > 2 })
+        #expect(replacementItems.allSatisfy { $0.isHidden })
+        try await Self.waitUntil { controller.isStartSettled }
+        #expect(replacementItems.allSatisfy { !$0.isHidden })
         controller.close()
     }
 
@@ -603,10 +611,10 @@ struct RecordingPlayerMVPTests {
         #expect(player.defaultRate == 2)
         let fastItems = controller.speedPopUp?.menu?.items.filter { (($0.representedObject as? NSNumber)?.floatValue ?? 0) > 2 } ?? []
         #expect(fastItems.compactMap { ($0.representedObject as? NSNumber)?.floatValue } == [2.5, 3, 3.5, 4])
-        #expect(fastItems.allSatisfy { !$0.isEnabled })
+        #expect(fastItems.allSatisfy { $0.isHidden })
         controller.rateSupportChanged(generation: generation, to: .all)
         #expect(player.defaultRate == 3)
-        #expect(fastItems.allSatisfy { $0.isEnabled })
+        #expect(fastItems.allSatisfy { !$0.isHidden && $0.isEnabled })
         controller.rateSupportChanged(generation: generation - 1, to: .unknown)
         #expect(player.defaultRate == 3)
         #expect(defaults.writes.count == written)

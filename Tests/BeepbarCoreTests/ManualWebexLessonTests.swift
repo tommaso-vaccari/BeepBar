@@ -7,6 +7,25 @@ import Testing
 struct ManualWebexLessonTests {
     private let uuid = "0123456789abcdef0123456789abcdef"
 
+    /// Association survives storage and selects only the exact course; legacy labels remain intact.
+    @Test func courseAssociationSurvivesStorage() throws {
+        var lessons = ManualWebexLessons()
+        let link = "https://politecnicomilano.webex.com/politecnicomilano/ldr.php?RCID=abc123"
+        let lesson = try lessons.add(link: link, title: "Guest", courseName: "Custom", courseID: 42)
+        let restored = try PropertyListDecoder().decode(ManualWebexLessons.self, from: PropertyListEncoder().encode(lessons))
+        #expect(restored.recordings(courseID: 42) == [lesson.recording])
+        #expect(restored.recordings(courseID: 43).isEmpty)
+        #expect(restored.lessons[0].courseName == "Custom")
+        var unassigned = ManualWebexLessons()
+        let free = try unassigned.add(link: link, title: "Free", courseName: "Old label")
+        let restoredFree = try PropertyListDecoder().decode(ManualWebexLessons.self, from: PropertyListEncoder().encode(unassigned))
+        #expect(restoredFree.lessons[0].courseID == nil)
+        #expect(restoredFree.lessons[0].courseName == "Old label")
+        #expect(restoredFree.recordings(courseID: 42).isEmpty)
+        #expect(restoredFree.lessons[0].id == free.id)
+        #expect(RecmanCourseKey(courseCode: lesson.recording.courseCode, academicYear: lesson.recording.academicYear) == nil)
+    }
+
     /// The two forms Recman's own rows lead to are accepted unchanged, also with the whitespace a
     /// copied line carries. Guards against a manual lesson that the stream resolver can't read.
     @Test func acceptsThePlayerFormsTheResolverReads() throws {
@@ -202,17 +221,19 @@ struct ManualWebexLessonTests {
         let loaded = try PropertyListDecoder().decode(ManualWebexLessons.self, from: oldData)
         #expect(loaded.lessons.map(\.id) == ["manual-a"])
         #expect(loaded.lessons[0].durationSeconds == nil && loaded.lessons[0].progress == nil)
+        #expect(loaded.lessons[0].courseID == nil)
         #expect(loaded.lessons[0].recording.duration == "")
 
         var damaged = old
         var lesson = (old["lessons"] as! [[String: Any]])[0]
         lesson["durationSeconds"] = "long"
         lesson["progress"] = ["furthest": "half"]
+        lesson["courseID"] = "invalid"
         damaged["lessons"] = [lesson]
         let damagedData = try PropertyListSerialization.data(fromPropertyList: damaged, format: .binary, options: 0)
         let read = try PropertyListDecoder().decode(ManualWebexLessons.self, from: damagedData)
         #expect(read.lessons.map(\.id) == ["manual-a"])
-        #expect(read.lessons[0].durationSeconds == nil && read.lessons[0].progress == nil)
+        #expect(read.lessons[0].durationSeconds == nil && read.lessons[0].progress == nil && read.lessons[0].courseID == nil)
     }
 
     /// A Play fills in what the student left out, never what they typed: the title only when

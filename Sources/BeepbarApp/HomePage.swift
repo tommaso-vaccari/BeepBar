@@ -2,6 +2,14 @@ import SwiftUI
 import BeepbarCore
 
 struct HomePage: View {
+    enum NextStep { case none, signIn, enableCourse }
+    /// Suppress prompts while the list is being confirmed and when sync is ready.
+    nonisolated static func nextStep(loading: Bool, signedIn: Bool, courseCount: Int, enabledCount: Int) -> NextStep {
+        guard !loading else { return .none }
+        if !signedIn { return .signIn }
+        if courseCount > 0 && enabledCount == 0 { return .enableCourse }
+        return .none
+    }
     @ObservedObject var authentication: WeBeepAuthenticationController
     let open: (ShellPage) -> Void
     @State private var organizingCourse: RemoteCourseSummary?
@@ -56,6 +64,17 @@ struct HomePage: View {
             }
             if let error = authentication.courseLoadError {
                 NoticeBanner(text: error.text, systemImage: "wifi.exclamationmark", tint: .red)
+            }
+            if let feedback = authentication.authenticationFeedback {
+                NoticeBanner(text: feedback.text, systemImage: "exclamationmark.triangle", tint: .orange)
+            }
+            if authentication.isAuthenticating || authentication.isVerifying {
+                ProgressView(tr("Accesso in corso…", "Signing in…"))
+                    .controlSize(.small)
+            }
+            if Self.nextStep(loading: authentication.isLoadingCourses || authentication.isPreparingCourseList || authentication.isShowingSavedCourseList, signedIn: authentication.accountState == .connected, courseCount: authentication.courses.count, enabledCount: enabledCount) == .enableCourse {
+                Text(tr("Attiva almeno un corso con l’interruttore per iniziare a sincronizzare.", "Turn on at least one course using its switch to start syncing."))
+                    .font(.callout).foregroundStyle(.secondary)
             }
             if case .saved(let savedAt) = authentication.courseListFreshness, !authentication.courses.isEmpty {
                 savedListLabel(savedAt)
@@ -137,11 +156,12 @@ struct HomePage: View {
         // While the window is still preparing the list (first opening, launch bootstrap not done
         // yet) the account state isn't known: no "connect" prompt or sign-in button meanwhile.
         let loading = authentication.isLoadingCourses || authentication.isPreparingCourseList
+        let nextStep = Self.nextStep(loading: loading, signedIn: authentication.accountState == .connected, courseCount: 0, enabledCount: 0)
         let description: String? = if loading {
             nil
         } else if authentication.courseLoadError != nil {
             tr("Riprova con il pulsante di aggiornamento.", "Try again with the refresh button.")
-        } else if authentication.hasStoredCredential {
+        } else if nextStep != .signIn {
             tr("Nessun corso disponibile su \(site).", "No courses available on \(site).")
         } else {
             tr("Collega \(site) per caricare l’elenco dei corsi.", "Connect \(site) to load your course list.")
@@ -149,10 +169,12 @@ struct HomePage: View {
         return ContentUnavailableView {
             Label(loading ? tr("Caricamento corsi…", "Loading courses…") : tr("Nessun corso caricato", "No courses loaded"), systemImage: "books.vertical")
         } description: {
-            if let description { Text(description) }
+            if loading { ProgressView().controlSize(.small) }
+            else if let description { Text(description) }
         } actions: {
-            if !loading, !authentication.hasStoredCredential {
-                Button(tr("Accedi a \(site)", "Sign in to \(site)")) { open(.settings) }
+            if nextStep == .signIn {
+                Button(tr("Accedi a \(site)", "Sign in to \(site)")) { authentication.startLogin() }
+                    .disabled(authentication.isAuthenticating || authentication.isVerifying)
             }
         }
         .frame(minHeight: 140)
@@ -352,9 +374,10 @@ private struct SyncHeroCard: View {
 
     @ViewBuilder private var primaryAction: some View {
         if authentication.accountState != .connected {
-            Button(tr("Accedi a \(authentication.selectedSite.platformName)", "Sign in to \(authentication.selectedSite.platformName)")) { open(.settings) }
+            Button(tr("Accedi a \(authentication.selectedSite.platformName)", "Sign in to \(authentication.selectedSite.platformName)")) { authentication.startLogin() }
                 .buttonStyle(.borderedProminent)
                 .controlSize(.large)
+                .disabled(authentication.isAuthenticating || authentication.isVerifying)
         } else if authentication.isSyncActive {
             Button(tr("Annulla", "Cancel")) { authentication.cancelSynchronization() }
                 .controlSize(.large)

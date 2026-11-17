@@ -136,7 +136,7 @@ struct OnboardingView: View {
                 )
                 VStack(alignment: .leading, spacing: 3) {
                     Text(tr("Accedi a \(authentication.selectedSite.displayName)", "Sign in to \(authentication.selectedSite.displayName)")).font(.callout.weight(.medium))
-                    Text(authentication.hasStoredCredential ? tr("Account collegato.", "Account connected.") : tr("Necessario per iniziare a sincronizzare i corsi.", "Needed to start syncing your courses."))
+                    Text(authentication.hasStoredCredential ? tr("Account collegato.", "Account connected.") : tr("Puoi accedere anche dopo; serve per sincronizzare i corsi.", "You can sign in later; it's needed to sync courses."))
                         .font(.caption).foregroundStyle(.secondary)
                 }
                 Spacer()

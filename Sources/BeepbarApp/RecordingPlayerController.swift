@@ -1629,6 +1629,7 @@ enum RecordingPlayerError: Error {
             for item in menu.items {
                 guard let speed = (item.representedObject as? NSNumber)?.floatValue else { continue }
                 item.state = abs(speed - appliedSpeed) < 0.001 ? .on : .off
+                item.isHidden = speed > RecordingPlayerPolicy.maximumSpeedWithoutFastForward && !rateSupport.fastForward
                 item.isEnabled = available.contains(speed)
             }
         }

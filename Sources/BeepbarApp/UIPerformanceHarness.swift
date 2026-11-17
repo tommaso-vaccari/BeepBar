@@ -156,7 +156,7 @@ final class UIFixtureProtocol: URLProtocol, @unchecked Sendable {
     func cookies() async -> [HTTPCookie] { [Self.cookie] }
     func signIn() async throws { throw UIFixtureError.unexpectedResponse }
     func playbackURL(for recording: RecmanRecording) async throws -> URL { throw UIFixtureError.unexpectedResponse }
-    /// The UI fixture never plays: no Webex request, so any native-playback attempt is a harness bug.
+    /// Refuse stream lookup without Webex; manual lessons may then fall back to the saved link.
     func stream(for recording: RecmanRecording, email: PolimiEmail?) async throws -> RecordingStream { throw UIFixtureError.unexpectedResponse }
     func close() { isOpen = false }
     func recordings(for key: RecmanCourseKey) async throws -> [RecmanRecording] {
@@ -164,6 +164,12 @@ final class UIFixtureProtocol: URLProtocol, @unchecked Sendable {
             RecmanRecording(id: "fixture-\(index)", courseCode: key.courseCode, academicYear: key.academicYear, title: "Synthetic lecture \(index)", recordedAt: Date(timeIntervalSince1970: 1_791_504_000 - Double(index) * 3_600), kind: "Lecture", duration: "60 min", size: nil, previewURL: URL(string: "https://onlineservices.polimi.it/recman_frontend/recman_frontend/controller/ArchivioListActivity.do?evn_preview_link&transfer_id=fixture-\(index)")!)
         }
     }
+}
+
+/// Captures external actions without opening a browser or changing the system pasteboard (#284).
+@MainActor final class UIFixtureActions {
+    var opened: [URL] = []
+    var copied: [URL] = []
 }
 
 /// Owns *every* persistent dependency. Destruction removes only this fresh UUID directory and
@@ -178,6 +184,7 @@ final class UIFixtureProtocol: URLProtocol, @unchecked Sendable {
     let database: SyncDatabase
     let defaults: UserDefaults
     let browser: UIFixtureBrowser
+    let actions: UIFixtureActions
     let scenario: UIFixtureScenario
 
     static func make(_ scenario: UIFixtureScenario) async throws -> UIFixture {
@@ -199,9 +206,10 @@ final class UIFixtureProtocol: URLProtocol, @unchecked Sendable {
             guard let defaults = UserDefaults(suiteName: root.appending(path: "defaults").path) else { throw UIFixtureError.unexpectedResponse }
             let session = UIFixtureProtocol.session()
             let browser = UIFixtureBrowser(count: scenario.recordingsCount)
+            let actions = UIFixtureActions()
             let store = RecordingsSessionStore { root.appending(path: "recordings") }
             let vault = CredentialVault(read: { _ in token }, write: { _ in })
-            let controller = WeBeepAuthenticationController(testRootURL: root, database: database, rootID: rootID, apiClient: WeBeepAPIClient(session: session), downloader: RemoteDownloader(session: session), credentialVault: vault, deleteCredential: {}, defaults: defaults, recordingsStore: store, recordingsBrowser: { browser })
+            let controller = WeBeepAuthenticationController(testRootURL: root, database: database, rootID: rootID, apiClient: WeBeepAPIClient(session: session), downloader: RemoteDownloader(session: session), credentialVault: vault, deleteCredential: {}, defaults: defaults, recordingsStore: store, recordingsBrowser: { browser }, recordingsOpenURL: { actions.opened.append($0) }, recordingsCopy: { actions.copied.append($0) })
             // Validate the synthetic account through the injected refresh path; never enter
             // login/sign-out UI, which owns installed-account lifecycle side effects.
             await controller.refreshOnWindowOpen().value
@@ -212,7 +220,7 @@ final class UIFixtureProtocol: URLProtocol, @unchecked Sendable {
                 controller.setSyncStateForTesting(.synced(SyncCompletionSummary(completedAt: Date(timeIntervalSince1970: 1_791_504_000), added: items.count, updated: 0, unchanged: 0, preservedLocal: 0, conflicts: 0, failures: 0, perCourse: [CourseSyncCount(courseID: 1, courseFolder: "Synthetic course", added: items.count, updated: 0, items: items)])))
             }
             if scenario.name == "launch-offline" { UIFixtureProtocol.accounts.withLock { $0[token]?.offline = true } }
-            return UIFixture(root: root, rootID: rootID, token: token, session: session, controller: controller, database: database, defaults: defaults, browser: browser, scenario: scenario)
+            return UIFixture(root: root, rootID: rootID, token: token, session: session, controller: controller, database: database, defaults: defaults, browser: browser, actions: actions, scenario: scenario)
         } catch {
             UIFixtureProtocol.accounts.withLock { $0[token] = nil }
             try? FileManager.default.removeItem(at: root)
@@ -220,8 +228,8 @@ final class UIFixtureProtocol: URLProtocol, @unchecked Sendable {
         }
     }
 
-    private init(root: URL, rootID: UUID, token: String, session: URLSession, controller: WeBeepAuthenticationController, database: SyncDatabase, defaults: UserDefaults, browser: UIFixtureBrowser, scenario: UIFixtureScenario) {
-        self.root = root; self.rootID = rootID; self.token = token; self.session = session; self.controller = controller; self.database = database; self.defaults = defaults; self.browser = browser; self.scenario = scenario
+    private init(root: URL, rootID: UUID, token: String, session: URLSession, controller: WeBeepAuthenticationController, database: SyncDatabase, defaults: UserDefaults, browser: UIFixtureBrowser, actions: UIFixtureActions, scenario: UIFixtureScenario) {
+        self.root = root; self.rootID = rootID; self.token = token; self.session = session; self.controller = controller; self.database = database; self.defaults = defaults; self.browser = browser; self.actions = actions; self.scenario = scenario
     }
 
     /// Call after sync is drained and the hosting tree is released, before deleting owned files.

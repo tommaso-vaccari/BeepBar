@@ -323,8 +323,8 @@ import BeepbarCore
             return try #require(table.menu(for: event), "no row menu reached the list")
         }
 
-        /// Waits (at most 10 s) until the controller has finished the last opening: the fixture's
-        /// browser refuses every link, so it ends with a problem and never reaches a real browser.
+        /// Waits (at most 10 s) until the controller has finished the last opening. The fixture's
+        /// browser refuses lookups; manual links can still fall back to the captured saved URL.
         @MainActor func untilOpeningEnds() async throws {
             try await settle { recordings.openingRecordingID == nil }
         }
@@ -452,6 +452,14 @@ import BeepbarCore
         #expect(page.recordings.openingRecordingID == manual.id)
         try await page.untilOpeningEnds()
         #expect(page.recordings.access == .ready)
+        let expectedURL = try #require(URL(string: link))
+        #expect(page.fixture.actions.opened == [expectedURL])
+        menu.performActionForItem(at: 0)
+        try await page.untilOpeningEnds()
+        #expect(page.fixture.actions.opened == [expectedURL, expectedURL])
+        menu.performActionForItem(at: 1)
+        try await page.untilOpeningEnds()
+        #expect(page.fixture.actions.copied == [expectedURL])
         // Row 2 is the first week's header, row 3 the newest archive lesson.
         let archiveMenu = try page.contextMenu(table, row: 3)
         #expect(archiveMenu.items.map(\.title) == ["Apri nel browser", "Copia link", "Aggiungi alla watchlist"])

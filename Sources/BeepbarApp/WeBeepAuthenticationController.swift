@@ -841,6 +841,8 @@ enum MaterialsRunEnd: Equatable, Sendable {
 #if DEBUG
     private var recordingsStoreForTesting: RecordingsSessionStore?
     private var recordingsBrowserForTesting: (@MainActor () -> RecmanBrowsing)?
+    private var recordingsOpenURLForTesting: (@MainActor (URL) -> Void)?
+    private var recordingsCopyForTesting: (@MainActor (URL) -> Void)?
     /// Set by a test before the first use of `recordings`; the real player is never built in tests.
     var recordingsPlayerForTesting: (@MainActor () -> RecordingPlaying)?
     /// Replaces opening the window on the Recordings page (`showRecordingsCourse`), so a test can
@@ -1007,8 +1009,9 @@ enum MaterialsRunEnd: Equatable, Sendable {
     /// to `courseListStore`, or nowhere; a test that relaunches gives each controller a store of
     /// its own over the same folder, as two launches would have. `site` is Polimi unless a test
     /// needs another university from the first moment (Recordings exist only for Polimi).
-    /// `language` sets the controller's own `language` only (see the init body).
-    init(testRootURL: URL, database: SyncDatabase? = nil, rootID: UUID? = nil, notificationCenter: NotificationCenterClient = InertNotificationCenter(), fileOpener: ActivityFileOpening = InertFileOpener(), apiClient: WeBeepAPIClient? = nil, downloader: RemoteDownloader? = nil, credentialVault: CredentialVault? = nil, deleteCredential: (() throws -> Void)? = nil, defaults: UserDefaults? = nil, automaticSyncEnvironment: AutomaticSyncEnvironment = .fixed(), reachabilityChanges: @escaping @Sendable () -> AsyncStream<Bool> = { AsyncStream { $0.finish() } }, recordingsStore: RecordingsSessionStore? = nil, recordingsBrowser: (@MainActor () -> RecmanBrowsing)? = nil, courseListStore: CourseListSnapshotStore? = nil, site: MoodleSite = .site(id: nil), language: AppLanguage = .italian) {
+    /// `language` sets the controller's own `language` only (see the init body). Browser and
+    /// copy actions default to inert closures so test controllers cannot touch system apps (#284).
+    init(testRootURL: URL, database: SyncDatabase? = nil, rootID: UUID? = nil, notificationCenter: NotificationCenterClient = InertNotificationCenter(), fileOpener: ActivityFileOpening = InertFileOpener(), apiClient: WeBeepAPIClient? = nil, downloader: RemoteDownloader? = nil, credentialVault: CredentialVault? = nil, deleteCredential: (() throws -> Void)? = nil, defaults: UserDefaults? = nil, automaticSyncEnvironment: AutomaticSyncEnvironment = .fixed(), reachabilityChanges: @escaping @Sendable () -> AsyncStream<Bool> = { AsyncStream { $0.finish() } }, recordingsStore: RecordingsSessionStore? = nil, recordingsBrowser: (@MainActor () -> RecmanBrowsing)? = nil, recordingsOpenURL: @escaping @MainActor (URL) -> Void = { _ in }, recordingsCopy: @escaping @MainActor (URL) -> Void = { _ in }, courseListStore: CourseListSnapshotStore? = nil, site: MoodleSite = .site(id: nil), language: AppLanguage = .italian) {
         deleteCredentialForTesting = deleteCredential
         let throwawayRecordingsFolder = FileManager.default.temporaryDirectory.appendingPathComponent("beepbar-recordings-test-\(UUID().uuidString)", isDirectory: true)
         recordingsStoreForTesting = recordingsStore ?? RecordingsSessionStore { throwawayRecordingsFolder }
@@ -1016,6 +1019,8 @@ enum MaterialsRunEnd: Equatable, Sendable {
         // behind, and nothing reaches the installed app's file.
         self.courseListStore = courseListStore ?? CourseListSnapshotStore { throw CocoaError(.fileNoSuchFile) }
         recordingsBrowserForTesting = recordingsBrowser
+        recordingsOpenURLForTesting = recordingsOpenURL
+        recordingsCopyForTesting = recordingsCopy
         self.credentialVault = credentialVault ?? CredentialVault(read: FileTokenStore.load, write: FileTokenStore.save)
         self.fileOpener = fileOpener
         selectedSite = site
@@ -1427,6 +1432,11 @@ enum MaterialsRunEnd: Equatable, Sendable {
     private func makeRecordings() -> RecordingsController {
         var store = RecordingsSessionStore.standard
         var makeBrowser: @MainActor () -> RecmanBrowsing = { RecmanWebSession() }
+        var openURL: @MainActor (URL) -> Void = { NSWorkspace.shared.open($0) }
+        var copy: @MainActor (URL) -> Void = { url in
+            NSPasteboard.general.clearContents()
+            NSPasteboard.general.setString(url.absoluteString, forType: .string)
+        }
         // The player fetches the course picture for Now Playing through `courseImage`, which
         // holds the token; the player never sees it.
         var makePlayer: @MainActor () -> RecordingPlaying = { [weak self] in
@@ -1439,6 +1449,8 @@ enum MaterialsRunEnd: Equatable, Sendable {
         if let recordingsPlayerForTesting { makePlayer = recordingsPlayerForTesting }
         if let recordingsStoreForTesting { store = recordingsStoreForTesting }
         if let recordingsBrowserForTesting { makeBrowser = recordingsBrowserForTesting }
+        if let recordingsOpenURLForTesting { openURL = recordingsOpenURLForTesting }
+        if let recordingsCopyForTesting { copy = recordingsCopyForTesting }
 #endif
 #if DEBUG
         if Self.isUIPreview && ProcessInfo.processInfo.arguments.contains("--watchlist-preview") {
@@ -1452,6 +1464,8 @@ enum MaterialsRunEnd: Equatable, Sendable {
             defaults: operationDefaults,
             ownerUserID: { [weak self] in self?.recordingsOwnerUserID },
             isAvailable: { [weak self] in self?.selectedSite.university == .polimi },
+            openURL: openURL,
+            copy: copy,
             makePlayer: makePlayer,
             courses: { [weak self] in self?.courses ?? [] },
             fetchProfileEmail: { [weak self] in await self?.profileEmail() }

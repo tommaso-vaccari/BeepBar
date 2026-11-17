@@ -2419,13 +2419,17 @@ struct RecordingsControllerTests {
         controller.turnOff()
     }
 
-    /// The bookmark of a manual lesson removes the lesson (it has no course to be found in
-    /// again), and "Forget study data" erases manual lessons with the rest of the watchlist.
+    /// Deleting a manual lesson forgets it (it has no course to be found in again); the bookmark
+    /// toggle no longer does (#286). "Forget study data" erases manual lessons with the rest of
+    /// the watchlist. Mutation: let `toggleWatchlist` delete again and the first expectation fails;
+    /// and "Forget study data" erases manual lessons with the rest of the watchlist.
     @Test func removingAndForgettingManualLessons() async throws {
         defer { cleanUp() }
         let controller = await readyController()
         let first = try controller.addManualLesson(link: manualLink, title: "", courseName: "").get()
         controller.toggleWatchlist(first.recording, courseName: "")
+        #expect(controller.manualLessons.lessons.count == 1, "the bookmark toggle must not delete a linked lesson")
+        controller.deleteManualLesson(first.recording)
         #expect(controller.manualLessons.lessons.isEmpty)
         #expect(controller.study.bookmarks.isEmpty, "the toggle must not bookmark a manual row")
         _ = try controller.addManualLesson(link: manualLink, title: "", courseName: "").get()

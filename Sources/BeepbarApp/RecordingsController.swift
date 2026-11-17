@@ -807,6 +807,13 @@ struct RecordingsListing: Equatable {
         }
     }
 
+    /// Deletes a lesson added by link, with its progress, from the course and the Watchlist.
+    /// Not a bookmark toggle: the pages call it only after the student confirmed (#286).
+    func deleteManualLesson(_ recording: RecmanRecording) {
+        guard ManualWebexLesson.isManual(recording) else { return }
+        removeManualLesson(id: recording.id)
+    }
+
     /// Removing a manual lesson's bookmark forgets the lesson: it has no course to be found in
     /// again. Same account checks as `addManualLesson`.
     private func removeManualLesson(id: String) {
@@ -889,11 +896,11 @@ struct RecordingsListing: Equatable {
         if !saveManualLessons(updated, owner: owner) { log.error("Couldn't save what a Play learned of a manual lesson") }
     }
 
+    /// The watchlist toggle of an archive lesson. A lesson added by link is always in the
+    /// Watchlist and is a no-op here: it leaves only through `deleteManualLesson`, which the UI
+    /// reaches behind a confirmation, so no bookmark action can delete it (#286).
     func toggleWatchlist(_ recording: RecmanRecording, courseName: String) {
-        if ManualWebexLesson.isManual(recording) {
-            removeManualLesson(id: recording.id)
-            return
-        }
+        guard !ManualWebexLesson.isManual(recording) else { return }
         updateStudy { state in
             if state.contains(recording) { state.bookmarks.removeAll { $0.id == RecordingsStudyState.identity(recording) } }
             else { state.bookmarks.append(.init(recording: recording, courseName: courseName)) }

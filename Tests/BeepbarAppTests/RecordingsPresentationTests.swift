@@ -311,4 +311,76 @@ extension RecordingsPresentationTests {
         #expect(P.courseContent(hasList: false, isLoading: false, hasProblem: true, access: .ready) == .unavailable)
         #expect(P.courseContent(hasList: false, isLoading: false, hasProblem: false, access: .ready) == .loading)
     }
+
+    private var manualLesson: RecmanRecording {
+        ManualWebexLesson(title: "Guest", courseName: "", link: URL(string: "https://politecnicomilano.webex.com/ldr.php?RCID=t")!, addedAt: .now).recording
+    }
+
+    /// Both the "⋯" menu and the right-click menu come from `menuEntries` (#286): a linked lesson
+    /// offers the two link items and "Delete lesson…" (destructive), never a watchlist toggle; an
+    /// archive lesson offers the toggle and never a delete. Mutation: offer the toggle for manual
+    /// lessons, or delete for archive ones, and this fails.
+    @Test func menuEntriesSeparateDeletingFromTheWatchlist() {
+        let P = RecordingsPresentation.self
+        let manual = P.menuEntries(for: manualLesson, isWatchlisted: true, canEdit: true, canUseLinks: true)
+        #expect(manual.map(\.item) == [.openInBrowser, .copyLink, .deleteLesson])
+        #expect(manual.last?.isDestructive == true)
+        #expect(manual.last?.title == BilingualText("Elimina lezione…", "Delete lesson…"))
+        let added = P.menuEntries(for: recording("a", "2026-10-01T10:00:00Z"), isWatchlisted: false, canEdit: true, canUseLinks: true)
+        #expect(added.map(\.item) == [.openInBrowser, .copyLink, .addToWatchlist])
+        let removed = P.menuEntries(for: recording("a", "2026-10-01T10:00:00Z"), isWatchlisted: true, canEdit: true, canUseLinks: true)
+        #expect(removed.map(\.item) == [.openInBrowser, .copyLink, .removeFromWatchlist])
+        #expect(!removed.contains { $0.isDestructive })
+    }
+
+    /// Link items need a ready session, the watchlist and delete items an editable account, each
+    /// independently. Mutation: tie both to one flag and this fails.
+    @Test func menuEntriesEnableEachItemOnItsOwnCondition() {
+        let P = RecordingsPresentation.self
+        for recording in [manualLesson, recording("a", "2026-10-01T10:00:00Z")] {
+            let noLinks = P.menuEntries(for: recording, isWatchlisted: false, canEdit: true, canUseLinks: false)
+            #expect(noLinks.map(\.enabled) == [false, false, true])
+            let noEdit = P.menuEntries(for: recording, isWatchlisted: false, canEdit: false, canUseLinks: true)
+            #expect(noEdit.map(\.enabled) == [true, true, false])
+        }
+    }
+
+    /// The course pane: linked lessons first and, when the archive has nothing to list, a compact
+    /// note instead of the full-size state; without linked lessons nothing changes.
+    @Test func coursePlanKeepsLinkedLessonsVisibleOverAnEmptyArchive() {
+        let P = RecordingsPresentation.self
+        // No linked lessons: the archive's own state fills the pane, exactly as before.
+        for part: RecordingsPresentation.ArchivePart in [.emptyArchive, .noSearchResults, .noKey, .loading, .signIn, .signingIn, .unavailable] {
+            let plan = P.coursePlan(hasManual: false, manualShownCount: 0, archive: part)
+            #expect(plan == .init(showsManualSection: false, showsArchiveRows: false, inlineNote: nil, fullState: part))
+        }
+        #expect(P.coursePlan(hasManual: false, manualShownCount: 0, archive: .rows) == .init(showsManualSection: false, showsArchiveRows: true, inlineNote: nil, fullState: nil))
+        // Linked lessons and an archive with rows: manual section first, then the weeks.
+        #expect(P.coursePlan(hasManual: true, manualShownCount: 2, archive: .rows) == .init(showsManualSection: true, showsArchiveRows: true, inlineNote: nil, fullState: nil))
+        // Linked lessons and an archive with nothing to list: the lessons stay, the state shrinks to a note.
+        for part: RecordingsPresentation.ArchivePart in [.emptyArchive, .noKey, .loading, .signIn, .signingIn, .unavailable] {
+            #expect(P.coursePlan(hasManual: true, manualShownCount: 1, archive: part) == .init(showsManualSection: true, showsArchiveRows: false, inlineNote: part, fullState: nil))
+        }
+        // A search that leaves only one side still shows that side with the other's note.
+        #expect(P.coursePlan(hasManual: true, manualShownCount: 1, archive: .noSearchResults) == .init(showsManualSection: true, showsArchiveRows: false, inlineNote: .noSearchResults, fullState: nil))
+        #expect(P.coursePlan(hasManual: true, manualShownCount: 0, archive: .rows) == .init(showsManualSection: false, showsArchiveRows: true, inlineNote: nil, fullState: nil))
+        // A search that leaves no linked lesson while the archive shows only a note says so.
+        #expect(P.coursePlan(hasManual: true, manualShownCount: 0, isSearching: true, archive: .loading)
+                == .init(showsManualSection: false, showsArchiveRows: false, inlineNote: .loading, manualNoResults: true, fullState: nil))
+        #expect(P.coursePlan(hasManual: true, manualShownCount: 0, isSearching: false, archive: .loading).manualNoResults == false)
+        #expect(P.coursePlan(hasManual: true, manualShownCount: 0, isSearching: true, archive: .rows).manualNoResults == false)
+        // Nothing matches anywhere: the usual search state.
+        #expect(P.coursePlan(hasManual: true, manualShownCount: 0, archive: .noSearchResults) == .init(showsManualSection: false, showsArchiveRows: false, inlineNote: nil, fullState: .noSearchResults))
+    }
+
+    @Test func archivePartFollowsTheListingState() {
+        let P = RecordingsPresentation.self
+        #expect(P.archivePart(hasKey: false, content: .list, archiveCount: 3, archiveShownCount: 3) == .noKey)
+        #expect(P.archivePart(hasKey: true, content: .list, archiveCount: 0, archiveShownCount: 0) == .emptyArchive)
+        #expect(P.archivePart(hasKey: true, content: .list, archiveCount: 3, archiveShownCount: 0) == .noSearchResults)
+        #expect(P.archivePart(hasKey: true, content: .list, archiveCount: 3, archiveShownCount: 2) == .rows)
+        #expect(P.archivePart(hasKey: true, content: .signIn, archiveCount: 0, archiveShownCount: 0) == .signIn)
+        #expect(P.archivePart(hasKey: true, content: .loading, archiveCount: 0, archiveShownCount: 0) == .loading)
+        #expect(P.archivePart(hasKey: true, content: .unavailable, archiveCount: 0, archiveShownCount: 0) == .unavailable)
+    }
 }

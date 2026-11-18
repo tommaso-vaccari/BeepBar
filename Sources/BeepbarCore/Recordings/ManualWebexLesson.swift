@@ -23,6 +23,8 @@ public struct ManualWebexLesson: Codable, Equatable, Sendable, Identifiable {
     public var courseName: String
     /// WeBeep course ID, scoped by the account that owns this list.
     public var courseID: Int64?
+    /// Existing linked lessons start bookmarked, as they did before the toggle was available.
+    public var isWatchlisted = true
     /// The Webex player link, as `normalizedLink` accepted it.
     public let link: URL
     public let addedAt: Date
@@ -65,6 +67,7 @@ public struct ManualWebexLesson: Codable, Equatable, Sendable, Identifiable {
         title = try container.decode(String.self, forKey: .title)
         courseName = try container.decode(String.self, forKey: .courseName)
         courseID = try? container.decodeIfPresent(Int64.self, forKey: .courseID)
+        isWatchlisted = (try? container.decodeIfPresent(Bool.self, forKey: .isWatchlisted)) ?? true
         link = try container.decode(URL.self, forKey: .link)
         addedAt = try container.decode(Date.self, forKey: .addedAt)
         durationSeconds = (try? container.decodeIfPresent(Double.self, forKey: .durationSeconds)).flatMap { $0 }.flatMap(Self.plausibleDuration)

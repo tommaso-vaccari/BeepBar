@@ -1463,7 +1463,7 @@ struct RecordingsWatchProgressTests {
         let controller = await listedController()
         let lesson = try controller.addManualLesson(link: manualLink, title: "Guest", courseName: "Synthetic", courseID: 42).get()
         #expect(controller.manualLessons.recordings(courseID: 42) == [lesson.recording])
-        #expect(controller.watchlistCount == 1)
+        #expect(controller.watchlistCount() == 1)
         let restored = makeController()
         restored.pageAppeared()
         #expect(restored.manualLessons.recordings(courseID: 42) == [lesson.recording])
@@ -1472,7 +1472,7 @@ struct RecordingsWatchProgressTests {
         #expect(restored.manualLessons.recordings(courseID: 42) == [lesson.recording])
         restored.deleteManualLesson(lesson.recording)
         #expect(restored.manualLessons.recordings(courseID: 42).isEmpty)
-        #expect(restored.watchlistCount == 0)
+        #expect(restored.watchlistCount() == 0)
     }
 
     /// The sidebar's Watchlist count includes lessons added by link, not only bookmarks:
@@ -1481,12 +1481,12 @@ struct RecordingsWatchProgressTests {
     @Test func theWatchlistCountIncludesAddedLessons() async throws {
         defer { cleanUp() }
         let controller = await listedController()
-        #expect(controller.watchlistCount == 0)
+        #expect(controller.watchlistCount() == 0)
         _ = try controller.addManualLesson(link: manualLink, title: "Guest", courseName: "").get()
-        #expect(controller.watchlistCount == 1)
+        #expect(controller.watchlistCount() == 1)
         let recording = try #require(controller.listing(for: course)?.recordings?.first)
         controller.toggleWatchlist(recording, courseName: "Synthetic")
-        #expect(controller.watchlistCount == 2)
+        #expect(controller.watchlistCount() == 2)
     }
 
     /// A lesson added by its link gets the bar and the checkbox an archive lecture has: known

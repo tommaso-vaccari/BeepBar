@@ -40,16 +40,22 @@ struct RecordingsStudyState: Codable, Equatable {
         }
     }
 
-    /// What the Watchlist lists: the bookmarks plus the lessons added with a Webex link, each
+    /// What the Watchlist lists: the archive bookmarks plus the bookmarked Webex lessons, each
     /// as a `Bookmark` of its synthetic row, filtered and sorted like `visibleBookmarks`. A manual
     /// lesson without a course label shows `fallbackCourseName` ("Link Webex", resolved by the
     /// caller in the current language), which search matches too.
-    nonisolated func watchlistEntries(manual: ManualWebexLessons, fallbackCourseName: String, query: String) -> [Bookmark] {
+    nonisolated func watchlistEntries(manual: ManualWebexLessons, visibleCourseIDs: Set<Int64> = [], fallbackCourseName: String, query: String) -> [Bookmark] {
         var combined = self
-        combined.bookmarks += manual.lessons.map {
+        combined.bookmarks += manual.lessons.filter { Self.showsInWatchlist($0, visibleCourseIDs: visibleCourseIDs) }.map {
             Bookmark(recording: $0.recording, courseName: $0.courseName.isEmpty ? fallbackCourseName : $0.courseName)
         }
         return combined.visibleBookmarks(query: query)
+    }
+
+    /// A linked lesson without a visible course needs a row even if it was previously unbookmarked.
+    nonisolated static func showsInWatchlist(_ lesson: ManualWebexLesson, visibleCourseIDs: Set<Int64>) -> Bool {
+        guard let courseID = lesson.courseID else { return true }
+        return lesson.isWatchlisted || !visibleCourseIDs.contains(courseID)
     }
 
     /// Only a complete, successful listing can mark an old bookmark unavailable. Never delete it.

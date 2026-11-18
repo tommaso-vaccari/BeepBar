@@ -60,8 +60,17 @@ struct RecmanStreamFailure: Error {
     /// failure after the player link was found may come wrapped in `RecmanStreamFailure`, which
     /// hands the link back for that fallback.
     func stream(for recording: RecmanRecording, email: PolimiEmail?) async throws -> RecordingStream
+    /// What Webex says about a lesson added by link (its date and length), asked when the lesson
+    /// is added (#289) and never for a Play: with the Webex cookies already in the browser, it
+    /// never signs in and never shows a window, so a missing or lapsed Webex session simply
+    /// throws and the lesson keeps its added-date until its first Play. Default: unavailable.
+    func quietStream(for recording: RecmanRecording) async throws -> RecordingStream
     /// Stops whatever is running and discards the browser and its cookies.
     func close()
+}
+
+extension RecmanBrowsing {
+    func quietStream(for recording: RecmanRecording) async throws -> RecordingStream { throw RecmanBrowserError.playbackUnavailable }
 }
 
 /// The hidden browser that reaches Polimi's lecture-recordings archive (Recman) and reads it.
@@ -345,6 +354,13 @@ struct RecmanStreamFailure: Error {
         } catch {
             throw RecmanStreamFailure(player: player, underlying: error)
         }
+    }
+
+    func quietStream(for recording: RecmanRecording) async throws -> RecordingStream {
+        guard let player = ManualWebexLesson.playerLink(for: recording) else { throw RecmanBrowserError.playbackUnavailable }
+        // No email: `WebexStreamResolver.stream` stops with `needsEmail` where it would otherwise
+        // sign in, so this path can never start a Webex sign-in or put a window on screen.
+        return try await stream(player: player, email: nil)
     }
 
     /// The stream of the player link `player`, as an operation of its own: the second half of

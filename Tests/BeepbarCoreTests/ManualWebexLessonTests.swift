@@ -270,6 +270,35 @@ struct ManualWebexLessonTests {
         }
     }
 
+    /// The counts of a course's linked lessons, added to the archive's for display: done, total,
+    /// hours left (a partly watched lesson counts what is left, an unknown length counts as
+    /// unknown), per course; lessons without a course appear nowhere; the archive's `next` and
+    /// `newCount`, which feed the menu bar, are left as they were. Guards against linked lessons
+    /// missing from the header and sidebar counts, and against leaking into the saved summary.
+    @Test func linkedLessonsAddToACoursesCountsWithoutTouchingTheMenuBarFields() throws {
+        let link = { (id: String) in URL(string: "https://politecnicomilano.webex.com/ldr.php?RCID=\(id)")! }
+        var done = ManualWebexLesson(id: "manual-a", title: "a", courseName: "", link: link("a"), addedAt: .now, courseID: 7)
+        _ = done.learn(title: nil, duration: 3_600)
+        done.progress = RecordingWatchEntry(furthest: 1, completed: .manual)
+        var half = ManualWebexLesson(id: "manual-b", title: "b", courseName: "", link: link("b"), addedAt: .now, courseID: 7)
+        _ = half.learn(title: nil, duration: 3_600)
+        half.progress = RecordingWatchEntry(furthest: 0.5, completed: nil)
+        let unknown = ManualWebexLesson(id: "manual-c", title: "c", courseName: "", link: link("c"), addedAt: .now, courseID: 7)
+        let other = ManualWebexLesson(id: "manual-d", title: "d", courseName: "", link: link("d"), addedAt: .now, courseID: 8)
+        let none = ManualWebexLesson(id: "manual-e", title: "e", courseName: "", link: link("e"), addedAt: .now)
+        let summaries = ManualWebexLessons(lessons: [done, half, unknown, other, none]).summaries()
+        #expect(Set(summaries.keys) == [7, 8])
+        let seven = try #require(summaries[7])
+        #expect(seven.done == 1 && seven.total == 3 && seven.remainingMinutes == 30 && seven.unknownDurationCount == 1)
+        #expect(summaries[8]?.total == 1 && summaries[8]?.done == 0)
+
+        let next = RecmanRecording(id: "n", courseCode: "123456", academicYear: 2026, title: "", recordedAt: .now, kind: "", duration: "10 min", size: nil, previewURL: link("n"))
+        let archive = CourseWatchSummary(done: 2, total: 5, remainingMinutes: 100, unknownDurationCount: 0, next: next, newCount: 1)
+        let combined = archive.including(seven)
+        #expect(combined.done == 3 && combined.total == 8 && combined.remainingMinutes == 130 && combined.unknownDurationCount == 1)
+        #expect(combined.next == next && combined.newCount == 1)
+    }
+
     /// A Play fills in what the student left out, never what they typed: the title only when
     /// empty, the length whenever Webex gives a plausible one, shown in Recman's form so the
     /// row's length and the hours-left sum read it (`RecmanRecording.minutes`). Implausible

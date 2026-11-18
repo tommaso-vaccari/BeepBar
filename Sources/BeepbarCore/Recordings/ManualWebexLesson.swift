@@ -218,6 +218,23 @@ public struct ManualWebexLessons: Codable, Equatable, Sendable {
         lessons.filter { $0.courseID == courseID }.map(\.recording)
     }
 
+    /// The progress counts of the lessons assigned to each course, for display beside the
+    /// archive's (`CourseWatchSummary.including`): the course header and the sidebar count them
+    /// with the archive's lessons. Never saved and never the menu bar's: `CourseWatchSummary` is
+    /// also the saved per-course summary, and linked lessons must stay out of it. One pass over
+    /// the lessons, so a sidebar of many courses doesn't scan them once per row. Lessons without
+    /// a course are in no entry.
+    public func summaries() -> [Int64: CourseWatchSummary] {
+        var rows: [Int64: [(id: String, minutes: Int?)]] = [:]
+        var entries: [String: RecordingWatchEntry] = [:]
+        for lesson in lessons {
+            guard let courseID = lesson.courseID else { continue }
+            rows[courseID, default: []].append((lesson.id, lesson.recording.minutes))
+            if let progress = lesson.progress { entries[lesson.id] = progress }
+        }
+        return rows.mapValues { RecordingWatchProgress.courseSummary($0, entries: entries, live: [:]) }
+    }
+
     public mutating func remove(id: String) {
         lessons.removeAll { $0.id == id }
     }

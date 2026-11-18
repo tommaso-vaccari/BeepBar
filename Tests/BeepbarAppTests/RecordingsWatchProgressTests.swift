@@ -1282,6 +1282,102 @@ struct RecordingsWatchProgressTests {
         RecordingsPresentation.WatchValues(controller.watchProgress, canEdit: controller.canEditProgress).row(for: recording)
     }
 
+    /// "Mark all" covers the whole course (#289): the archive's rows and the lessons added by link
+    /// and assigned to it, in both directions; the saved summary (menu bar, notifications) keeps
+    /// counting the archive only. Guards against a linked lesson left unticked by the course button.
+    @Test func markAllCoversLinkedLessonsButNotTheSavedSummary() async throws {
+        defer { cleanUp() }
+        let controller = await listedController(["a", "b"])
+        let lesson = try controller.addManualLesson(link: manualLink, title: "Guest", courseName: "Synthetic", courseID: 42).get()
+        let all = (controller.listing(for: course)?.recordings ?? []) + [lesson.recording]
+        let values = { RecordingsPresentation.WatchValues(controller.watchProgress, canEdit: controller.canEditProgress).bulkAction(for: self.course, recordings: all) }
+        #expect(values().enabled && !values().allDone)
+        controller.toggleAllDone(course, courseID: 42)
+        await controller.settleWatchProgress()
+        #expect(controller.manualLessons.lesson(id: lesson.id)?.progress?.completed == .manual)
+        #expect(try storedEntry("a")?.completed == .manual)
+        #expect(controller.watchSummaries[course]?.total == 2, "the saved summary stays archive-only")
+        #expect(values().allDone)
+        #expect(controller.watchProgress.pending.isEmpty)
+        controller.toggleAllDone(course, courseID: 42)
+        await controller.settleWatchProgress()
+        #expect(controller.manualLessons.lesson(id: lesson.id)?.progress?.completed == nil)
+        #expect(try storedEntry("a")?.completed == nil)
+        controller.turnOff()
+    }
+
+    /// The two stores change together: when the archive's transaction is refused the linked lesson
+    /// goes back to what it was, the history banner shows, and a retry works. Guards against a
+    /// course half marked, with the linked lesson done and the archive not.
+    @Test func aRefusedArchiveWritePutsTheLinkedLessonBack() async throws {
+        defer { cleanUp() }
+        let controller = await listedController(["a", "b"])
+        let lesson = try controller.addManualLesson(link: manualLink, title: "Guest", courseName: "Synthetic", courseID: 42).get()
+        try executeSQL("CREATE TRIGGER refuse BEFORE INSERT ON progress BEGIN SELECT RAISE(ABORT, 'refused'); END")
+        controller.toggleAllDone(course, courseID: 42)
+        await controller.settleWatchProgress()
+        await drainTasks()
+        #expect(controller.manualLessons.lesson(id: lesson.id)?.progress?.completed == nil, "rolled back")
+        #expect(try storedEntry("a") == nil)
+        #expect(controller.listing(for: course)?.problem == .historyUnavailable)
+        #expect(controller.watchProgress.pending.isEmpty)
+        let restored = makeController()
+        restored.pageAppeared()
+        #expect(restored.manualLessons.lesson(id: lesson.id)?.progress?.completed == nil, "also in what is saved")
+        try executeSQL("DROP TRIGGER refuse")
+        controller.toggleAllDone(course, courseID: 42)
+        await controller.settleWatchProgress()
+        #expect(controller.manualLessons.lesson(id: lesson.id)?.progress?.completed == .manual)
+        #expect(try storedEntry("b")?.completed == .manual)
+        controller.turnOff()
+    }
+
+    /// An identity boundary (the feature turned off, the WeBeep account changed) overtakes the
+    /// held archive transaction: nothing of the archive commits and the linked lesson's saved mark
+    /// is gone too, so the course is never left half marked. At such a boundary this is the
+    /// existing forgetting of all progress (`forgetManualProgress`), not `restoreLinkedMarks`
+    /// (which only the refused-transaction test above exercises); the test pins the outcome.
+    @Test(arguments: ["turn off", "account change"])
+    func bulkOvertakenByAnIdentityBoundaryPutsTheLinkedLessonBack(change: String) async throws {
+        defer { cleanUp() }
+        let controller = await listedController(["a", "b"])
+        let lesson = try controller.addManualLesson(link: manualLink, title: "Guest", courseName: "Synthetic", courseID: 42).get()
+        let gate = FakeRecmanBrowser.Gate()
+        gates.before = gate
+        controller.toggleAllDone(course, courseID: 42)
+        await settle("bulk held") { gate.isWaiting }
+        #expect(controller.manualLessons.lesson(id: lesson.id)?.progress?.completed == .manual, "saved first")
+        if change == "turn off" { controller.setEnabled(false) }
+        else { world.owner = 7; controller.webBeepAccountChanged(to: 7) }
+        gate.release()
+        await controller.settleWatchProgress()
+        await drainTasks()
+        #expect(try storedEntry("a", owner: 42) == nil)
+        world.owner = 42
+        let again = makeController()
+        again.setEnabled(true)
+        again.pageAppeared()
+        #expect(again.manualLessons.lesson(id: lesson.id) != nil, "the lesson itself is still there")
+        #expect(again.manualLessons.lesson(id: lesson.id)?.progress?.completed == nil, "not left half marked")
+        again.turnOff()
+    }
+
+    /// While the batch is held, the linked lesson's checkbox is locked with the archive's.
+    @Test func markAllLocksLinkedLessonsWhilePending() async throws {
+        defer { cleanUp() }
+        let controller = await listedController(["a"])
+        let lesson = try controller.addManualLesson(link: manualLink, title: "Guest", courseName: "Synthetic", courseID: 42).get()
+        let gate = FakeRecmanBrowser.Gate()
+        gates.before = gate
+        controller.toggleAllDone(course, courseID: 42)
+        await settle("bulk write held") { gate.isWaiting }
+        #expect(controller.watchProgress.pending.contains(RecordingsStudyState.identity(lesson.recording)))
+        gate.release()
+        await controller.settleWatchProgress()
+        #expect(controller.watchProgress.pending.isEmpty)
+        controller.turnOff()
+    }
+
     /// Assigned rows remain manual, survive reload and disappear from both views on removal.
     @Test func anAssignedManualLessonSurvivesReloadAndRemoval() async throws {
         defer { cleanUp() }

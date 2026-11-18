@@ -64,6 +64,42 @@ import Testing
         #expect(StreamingProtocol.deliveredChunks == 0)
     }
 
+    /// A paused transfer exposes written bytes before it can finish, even without Content-Length.
+    @Test func reportsBytesWhileTransferIsInFlight() async throws {
+        StreamingProtocol.reset(chunks: 1_000, chunkSize: 256)
+        let counter = DownloadWriteCounter()
+        let downloader = RemoteDownloader(session: Self.session(StreamingProtocol.self))
+        let store = fixture.store
+        let task = Task { try await downloader.download(Self.file(size: 256_000), token: "token", access: .unrestricted, into: store, onBytes: { counter.add(Int($0)) }) }
+        await Self.waitUntil { StreamingProtocol.deliveredChunks >= 10 }
+        try await Task.sleep(for: .milliseconds(100))
+        #expect(StreamingProtocol.deliveredChunks < 1_000)
+        #expect(counter.total > 0)
+        task.cancel()
+        _ = try? await task.value
+    }
+
+    /// The batch publishes bytes before a gated body completes, then clears them when it ends.
+    @Test func batchPublishesWhileBodyIsGated() async throws {
+        GatedDownloadProtocol.reset()
+        defer { GatedDownloadProtocol.release() }
+        let db = try SyncDatabase(url: fixture.root.appending(path: "state.sqlite"))
+        let rootID = UUID()
+        try await db.registerRoot(id: rootID, canonicalPath: fixture.root.path)
+        let runner = ManualSyncRun(rootID: rootID, database: db, fileStore: fixture.store, gate: RootOperationGate(), downloader: RemoteDownloader(session: Self.session(GatedDownloadProtocol.self)), networkAccess: .unrestricted)
+        let item = PreparedSyncItem(remote: Self.file(size: 1_024), destination: try RelativePath("Course/file.txt"))
+        let seen = SyncProgressProbe()
+        let task = Task { try await runner.start(items: [item], token: "token", progress: { seen.append($0) }) }
+        await Self.waitUntil { seen.values.contains { $0.transfer?.received == 256 } }
+        #expect(seen.values.contains { $0.completed == 0 && $0.transfer?.received == 256 && $0.transfer?.total == 1_024 })
+        #expect(!GatedDownloadProtocol.finished)
+        GatedDownloadProtocol.release()
+        let result = try await task.value
+        #expect(result.completed == 1)
+        #expect(result.added == 1)
+        #expect(seen.values.last?.transfer == nil)
+    }
+
     /// The received bytes are written once to a stage and the artifact names their SHA-256.
     @Test func downloadWritesOnePassIntoTheStage() async throws {
         let fixture = try DownloadFixture()
@@ -384,6 +420,37 @@ import Testing
         let entries = (try? FileManager.default.contentsOfDirectory(atPath: NSTemporaryDirectory())) ?? []
         return Set(entries.filter { $0.hasPrefix("Beepbar-download-") || $0.hasPrefix("CFNetworkDownload") })
     }
+}
+
+private final class SyncProgressProbe: @unchecked Sendable {
+    private let lock = NSLock()
+    private var stored: [SyncProgress] = []
+    func append(_ progress: SyncProgress) { lock.withLock { stored.append(progress) } }
+    var values: [SyncProgress] { lock.withLock { stored } }
+}
+
+private final class GatedDownloadProtocol: URLProtocol, @unchecked Sendable {
+    private static let lock = NSLock()
+    nonisolated(unsafe) private static var current: GatedDownloadProtocol?
+    nonisolated(unsafe) private static var didFinish = false
+    static var finished: Bool { lock.withLock { didFinish } }
+    static func reset() { lock.withLock { current = nil; didFinish = false } }
+    static func release() {
+        let instance = lock.withLock { let instance = current; current = nil; return instance }
+        guard let instance else { return }
+        instance.client?.urlProtocol(instance, didLoad: Data(count: 768))
+        instance.client?.urlProtocolDidFinishLoading(instance)
+        lock.withLock { didFinish = true }
+    }
+    override class func canInit(with request: URLRequest) -> Bool { true }
+    override class func canonicalRequest(for request: URLRequest) -> URLRequest { request }
+    override func startLoading() {
+        let response = HTTPURLResponse(url: request.url!, statusCode: 200, httpVersion: nil, headerFields: ["Content-Type": "application/octet-stream"])!
+        client?.urlProtocol(self, didReceive: response, cacheStoragePolicy: .notAllowed)
+        client?.urlProtocol(self, didLoad: Data(count: 256))
+        Self.lock.withLock { Self.current = self }
+    }
+    override func stopLoading() { Self.lock.withLock { if Self.current === self { Self.current = nil } } }
 }
 
 private final class DownloadRejectedProtocol: URLProtocol, @unchecked Sendable {

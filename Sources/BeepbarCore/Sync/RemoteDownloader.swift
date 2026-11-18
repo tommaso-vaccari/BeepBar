@@ -104,6 +104,10 @@ public final class RemoteDownloader: @unchecked Sendable {
     /// leaves nothing in staging. The errors surfaced are `RemoteDownloadError`, `FileStoreError`
     /// (stage I/O, e.g. a full disk), `CocoaError` and `CancellationError`.
     public func download(_ file: RemoteFileCandidate, token: String, access: NetworkAccess, into store: FileStore) async throws -> StagedArtifact {
+        try await download(file, token: token, access: access, into: store, onBytes: { _ in })
+    }
+
+    func download(_ file: RemoteFileCandidate, token: String, access: NetworkAccess, into store: FileStore, onBytes: @escaping @Sendable (Int64) -> Void) async throws -> StagedArtifact {
         guard file.isSupported else { throw RemoteDownloadError.unsupportedFile }
         guard let url = file.downloadURL else { throw RemoteDownloadError.missingURL }
         guard file.size >= 0 else { throw RemoteDownloadError.invalidSize }
@@ -114,7 +118,7 @@ public final class RemoteDownloader: @unchecked Sendable {
         let requestURL = request.url!
         try Task.checkCancellation()
         let (stage, fd) = try await store.openDownloadStage()
-        let transfer = CappedDownload(limit: file.size, fd: fd, writeStage: writeStage) { http in
+        let transfer = CappedDownload(limit: file.size, fd: fd, writeStage: writeStage, onBytes: onBytes) { http in
             guard http.statusCode == 200 else { return .transport(http.statusCode) }
             guard let finalURL = http.url, Self.matchesAuthorizedURL(finalURL, requestURL: requestURL) else { return .unexpectedRedirect }
             let length = http.expectedContentLength
@@ -209,6 +213,7 @@ private final class CappedDownload: NSObject, URLSessionDataDelegate, @unchecked
     private let limit: Int64
     private let writeStage: @Sendable (Int32, UnsafeRawPointer, Int) -> Int
     private let validate: @Sendable (HTTPURLResponse) -> RemoteDownloadError?
+    private let onBytes: @Sendable (Int64) -> Void
     private let lock = NSLock()
     private var receivedResponse = false
     private var written: Int64 = 0
@@ -216,11 +221,12 @@ private final class CappedDownload: NSObject, URLSessionDataDelegate, @unchecked
     private var rejection: Error?
     private var completion = DownloadCompletion()
 
-    init(limit: Int64, fd: Int32, writeStage: @escaping @Sendable (Int32, UnsafeRawPointer, Int) -> Int, validate: @escaping @Sendable (HTTPURLResponse) -> RemoteDownloadError?) {
+    init(limit: Int64, fd: Int32, writeStage: @escaping @Sendable (Int32, UnsafeRawPointer, Int) -> Int, onBytes: @escaping @Sendable (Int64) -> Void, validate: @escaping @Sendable (HTTPURLResponse) -> RemoteDownloadError?) {
         self.limit = limit
         self.fd = fd
         self.writeStage = writeStage
         self.validate = validate
+        self.onBytes = onBytes
     }
 
     func run(_ request: URLRequest, in session: URLSession) async throws -> String {
@@ -267,6 +273,7 @@ private final class CappedDownload: NSObject, URLSessionDataDelegate, @unchecked
             guard result == data.count else { rejection = FileStoreError.ioFailure; return true }
             hasher.update(data: data)
             written += Int64(result)
+            onBytes(Int64(result))
             return false
         }
         if stop { dataTask.cancel() }

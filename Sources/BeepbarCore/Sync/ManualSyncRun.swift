@@ -113,6 +113,58 @@ public struct CourseSyncCount: Sendable, Equatable, Codable, Identifiable {
     }
 }
 
+/// Bytes currently being received into staging, summed across active downloads.
+public struct SyncTransferProgress: Sendable, Equatable {
+    public let received: Int64
+    public let total: Int64
+
+    public init(received: Int64, total: Int64) {
+        self.received = received
+        self.total = total
+    }
+}
+
+/// A small locked counter avoids scheduling an actor job for every network chunk.
+final class TransferProgressCounters: @unchecked Sendable {
+    private let lock = NSLock()
+    private var active: [String: (received: Int64, total: Int64)] = [:]
+    func begin(_ id: String, total: Int64) {
+        lock.withLock { active[id] = (0, total) }
+    }
+
+    func add(_ bytes: Int64, id: String) {
+        lock.withLock {
+            guard var transfer = active[id] else { return }
+            transfer.received += bytes
+            active[id] = transfer
+        }
+    }
+    func end(_ id: String) {
+        lock.withLock { active.removeValue(forKey: id) }
+    }
+
+    func snapshot() -> SyncTransferProgress? {
+        lock.withLock {
+            var received: Int64 = 0
+            var total: Int64 = 0
+            for transfer in active.values {
+                let (nextReceived, receivedOverflow) = received.addingReportingOverflow(transfer.received)
+                let (nextTotal, totalOverflow) = total.addingReportingOverflow(transfer.total)
+                guard !receivedOverflow, !totalOverflow else { return nil }
+                received = nextReceived
+                total = nextTotal
+            }
+            guard received > 0 else { return nil }
+            return SyncTransferProgress(received: received, total: total)
+        }
+    }
+}
+
+private enum SyncBatchEvent: Sendable {
+    case item(PreparedSyncItem, ManualSyncOutcome?, String?, Int?)
+    case tick
+}
+
 public struct SyncProgress: Sendable, Equatable {
     public let completed: Int
     public let total: Int
@@ -123,6 +175,7 @@ public struct SyncProgress: Sendable, Equatable {
     public let conflicts: Int
     public let failures: Int
     public let perCourse: [CourseSyncCount]
+    public let transfer: SyncTransferProgress?
 
     public var installed: Int { added + updated }
     /// Courses whose contents could not be read; each one also counts as one failure.
@@ -150,7 +203,7 @@ public struct SyncProgress: Sendable, Equatable {
         return SyncProgress(completed: completed, total: total, added: added, updated: updated, preservedLocal: preservedLocal, unchanged: unchanged, conflicts: conflicts, failures: self.failures + failures.count, perCourse: merged)
     }
 
-    public init(completed: Int, total: Int, added: Int, updated: Int, preservedLocal: Int, unchanged: Int, conflicts: Int, failures: Int, perCourse: [CourseSyncCount] = []) {
+    public init(completed: Int, total: Int, added: Int, updated: Int, preservedLocal: Int, unchanged: Int, conflicts: Int, failures: Int, perCourse: [CourseSyncCount] = [], transfer: SyncTransferProgress? = nil) {
         self.completed = completed
         self.total = total
         self.added = added
@@ -160,6 +213,7 @@ public struct SyncProgress: Sendable, Equatable {
         self.conflicts = conflicts
         self.failures = failures
         self.perCourse = perCourse
+        self.transfer = transfer
     }
 
     public init(completed: Int, total: Int, installed: Int, preservedLocal: Int, unchanged: Int, conflicts: Int, failures: Int) {
@@ -220,13 +274,15 @@ public actor ManualSyncRun {
         var perCourseFailures: [Int64: [FailedSyncItem]] = [:]
         var serviceFailures = 0
         var firstServiceStatus: Int?
-        try await withThrowingTaskGroup(of: (PreparedSyncItem, ManualSyncOutcome?, String?, Int?).self) { group in
+        let transferProgress = TransferProgressCounters()
+        try await withThrowingTaskGroup(of: SyncBatchEvent.self) { group in
             var next = 0
+            var sawBytes = false
             func enqueue(_ item: PreparedSyncItem) {
                 group.addTask { [rootID, database, fileStore, downloader, networkAccess] in
                     do {
                         let engine = ManualSyncEngine(rootID: rootID, database: database, fileStore: fileStore, downloader: downloader, networkAccess: networkAccess)
-                        return (item, try await engine.sync(file: item.remote, destination: item.destination, token: token), nil, nil)
+                        return .item(item, try await engine.sync(file: item.remote, destination: item.destination, token: token, transferProgress: transferProgress), nil, nil)
                     } catch is CancellationError {
                         throw CancellationError()
                     } catch let error as RemoteDownloadError {
@@ -236,28 +292,38 @@ public actor ManualSyncRun {
                         case .transport(let status) where status == 401 || status == 403:
                             throw SyncDownloadError.authorizationRejected(status)
                         case .transport(let status) where status >= 500:
-                            return (item, nil, tr("Errore del server (\(status)).", "Server error (\(status))."), status)
+                            return .item(item, nil, tr("Errore del server (\(status)).", "Server error (\(status))."), status)
                         case .unsupportedFile:
-                            return (item, nil, tr("Formato non supportato.", "Unsupported format."), nil)
+                            return .item(item, nil, tr("Formato non supportato.", "Unsupported format."), nil)
                         case .missingURL, .invalidSize:
-                            return (item, nil, tr("Metadati del file non validi.", "Invalid file metadata."), nil)
+                            return .item(item, nil, tr("Metadati del file non validi.", "Invalid file metadata."), nil)
                         case .unsafeURL, .unexpectedRedirect:
-                            return (item, nil, tr("Indirizzo di download non sicuro.", "Unsafe download address."), nil)
+                            return .item(item, nil, tr("Indirizzo di download non sicuro.", "Unsafe download address."), nil)
                         case .invalidResponse:
-                            return (item, nil, tr("Risposta di download non valida.", "Invalid download response."), nil)
+                            return .item(item, nil, tr("Risposta di download non valida.", "Invalid download response."), nil)
                         case .tooLarge:
-                            return (item, nil, tr("File troppo grande.", "File too large."), nil)
+                            return .item(item, nil, tr("File troppo grande.", "File too large."), nil)
                         default:
-                            return (item, nil, tr("Download non riuscito.", "Download failed."), nil)
+                            return .item(item, nil, tr("Download non riuscito.", "Download failed."), nil)
                         }
                     } catch {
-                        return (item, nil, tr("Impossibile salvare il file.", "Could not save the file."), nil)
+                        return .item(item, nil, tr("Impossibile salvare il file.", "Could not save the file."), nil)
                     }
                 }
             }
             while next < min(maximumConcurrentDownloads, items.count) { enqueue(items[next]); next += 1 }
-            while let (item, outcome, failureReason, serviceStatus) = try await group.next() {
+            if next > 0 { group.addTask { try await Task.sleep(for: .milliseconds(200)); return .tick } }
+            while let event = try await group.next() {
                 try Task.checkCancellation()
+                guard case let .item(item, outcome, failureReason, serviceStatus) = event else {
+                    let transfer = transferProgress.snapshot()
+                    sawBytes = sawBytes || (transfer?.received ?? 0) > 0
+                    if completed > 0 || sawBytes {
+                        await progress(SyncProgress(completed: completed, total: items.count, added: added, updated: updated, preservedLocal: preservedLocal, unchanged: unchanged, conflicts: conflicts, failures: failures, transfer: transfer))
+                    }
+                    group.addTask { try await Task.sleep(for: .milliseconds(200)); return .tick }
+                    continue
+                }
                 completed += 1
                 let courseID = item.remote.courseID
                 switch outcome {
@@ -285,7 +351,8 @@ public actor ManualSyncRun {
                     }
                 }
                 if next < items.count { enqueue(items[next]); next += 1 }
-                await progress(SyncProgress(completed: completed, total: items.count, added: added, updated: updated, preservedLocal: preservedLocal, unchanged: unchanged, conflicts: conflicts, failures: failures))
+                await progress(SyncProgress(completed: completed, total: items.count, added: added, updated: updated, preservedLocal: preservedLocal, unchanged: unchanged, conflicts: conflicts, failures: failures, transfer: transferProgress.snapshot()))
+                if completed == items.count { group.cancelAll(); break }
             }
         }
         try Task.checkCancellation()

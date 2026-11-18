@@ -1850,7 +1850,11 @@ enum MaterialsRunEnd: Equatable, Sendable {
 
     nonisolated static func progressDetail(_ progress: SyncProgress) -> String? {
         guard progress.total > 0 else { return nil }
-        return tr("\(progress.completed) di \(progress.total) file", "\(progress.completed) of \(englishCount(progress.total, "file", "files"))")
+        let files = tr("\(progress.completed) di \(progress.total) file", "\(progress.completed) of \(englishCount(progress.total, "file", "files"))")
+        guard let transfer = progress.transfer, transfer.received > 0 else { return files }
+        let received = transfer.received.formatted(.byteCount(style: .file).locale(BeepbarStyle.locale))
+        let total = transfer.total.formatted(.byteCount(style: .file).locale(BeepbarStyle.locale))
+        return tr("\(files) · download \(received) di \(total)", "\(files) · downloading \(received) of \(total)")
     }
 
     private var menuBarAction: MenuBarAction {

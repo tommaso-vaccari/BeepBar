@@ -9,6 +9,7 @@
 
 ### Improved
 
+- During synchronization, Courses shows how much of the current downloads has arrived. The menu shows the latest progress when you open it.
 - Every lesson in Recordings has a “⋯” menu with “Apri nel browser” (“Open in browser”), “Copia link” (“Copy link”) and the Watchlist choice, the same as the right-click menu.
 - Signing in to WeBeep with Polimi now also opens the Recordings archive: there is no second Polimi sign-in, and the first sync after signing in already loads your recordings, even if you never open the Recordings page. Turn Recordings off in Settings if you don't want that.
 - Opening a course in Recordings clears its new-recordings badge in the sidebar. The blue dots stay on the new lectures while you are in the course, and once you leave it they count as read, so the “Segna novità come lette” (“Mark new recordings as read”) button is gone.

@@ -728,8 +728,12 @@ private let temporaryVolumeIgnoresCase: Bool = {
         let summary = try await fixture.coordinator.synchronize(targets: [fixture.targets[0]], token: "test-token", mode: .manual, networkAccess: .unrestricted) { update in recorder.append(update) }
         let progress = recorder.values
         #expect(fixture.upstream.maximumActiveDownloads == 3)
-        #expect(progress.count == 100)
-        #expect(progress.enumerated().allSatisfy { $0.element.completed == $0.offset + 1 })
+        // Byte samples can repeat the current file count. Every file still advances it in order.
+        var completedCounts: [Int] = []
+        for update in progress where completedCounts.last != update.completed {
+            completedCounts.append(update.completed)
+        }
+        #expect(completedCounts.drop(while: { $0 == 0 }).elementsEqual(1...100))
         #expect(progress.allSatisfy { $0.perCourse.isEmpty })
         #expect(progress.last?.completed == progress.last?.total)
         #expect(summary.perCourse.count == 1)

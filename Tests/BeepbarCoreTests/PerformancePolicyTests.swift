@@ -2,6 +2,18 @@ import Testing
 @testable import BeepbarCore
 
 struct PerformancePolicyTests {
+    /// A dropped clear is retried after the interval; an unchanged accepted snapshot stays quiet.
+    @Test func throttleRetriesClearAndRejectsDuplicates() {
+        let now = ContinuousClock.now
+        var throttle = SyncProgressThrottle(minimumInterval: .milliseconds(200))
+        let active = SyncProgress(completed: 0, total: 2, added: 0, updated: 0, preservedLocal: 0, unchanged: 0, conflicts: 0, failures: 0, transfer: SyncTransferProgress(received: 20, total: 100))
+        let cleared = SyncProgress(completed: 0, total: 2, added: 0, updated: 0, preservedLocal: 0, unchanged: 0, conflicts: 0, failures: 0)
+        #expect(throttle.accept(active, now: now) != nil)
+        #expect(throttle.accept(cleared, now: now + .milliseconds(100)) == nil)
+        #expect(throttle.accept(cleared, now: now + .milliseconds(201)) != nil)
+        #expect(throttle.accept(cleared, now: now + .seconds(1)) == nil)
+    }
+
     @Test func progressThrottleLimitsIntermediateUpdatesAndAlwaysDeliversFinal() {
         let clock = ContinuousClock()
         let start = clock.now

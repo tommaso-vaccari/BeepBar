@@ -45,6 +45,33 @@ struct SyncProgressStoreTests {
         #expect(controller.progressStore.progress.total == total)
     }
 
+    /// Measures actor entries for byte-only changes and verifies that the store and menu
+    /// show received bytes while the file count is still zero.
+    @Test func activeDownloadBytesReachTheStoreAndMenuThroughTheThrottle() async {
+        let controller = controller()
+        let operationID = UUID()
+        controller.setOperationForTesting(operationID)
+        let sink = controller.beginTransferForTesting(operationID, automatic: false)
+        let start = ContinuousClock.now
+        await Task.detached {
+            for bytes in 500_000..<510_000 {
+                await sink(SyncProgress(completed: 0, total: 1, added: 0, updated: 0, preservedLocal: 0, unchanged: 0, conflicts: 0, failures: 0, transfer: SyncTransferProgress(received: Int64(bytes), total: 1_000_000)))
+            }
+        }.value
+        let elapsed = start.duration(to: .now)
+        let progress = controller.progressStore.progress
+        #expect(controller.progressStore.mainActorEntries > 0)
+        #expect(controller.progressStore.mainActorEntries <= 1 + Int(elapsed / .milliseconds(200)))
+        #expect(progress.completed == 0 && progress.installed == 0)
+        guard let transfer = progress.transfer else {
+            Issue.record("The transfer did not reach the store")
+            return
+        }
+        #expect(transfer.received >= 500_000 && transfer.total == 1_000_000)
+        let received = transfer.received.formatted(.byteCount(style: .file).locale(BeepbarStyle.locale))
+        #expect(controller.menuBarSnapshot.detail == "0 di 1 file · download \(received) di 1 MB")
+    }
+
     /// Guards the ordering rule the throttle already has, now exercised through the real sink:
     /// an older event delivered late never moves the shown counter backwards.
     @Test func lateOlderEventIsIgnored() async {

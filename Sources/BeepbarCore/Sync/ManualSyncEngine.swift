@@ -28,6 +28,10 @@ public actor ManualSyncEngine {
     }
 
     public func sync(file: RemoteFileCandidate, destination: RelativePath, token: String) async throws -> ManualSyncOutcome {
+        try await sync(file: file, destination: destination, token: token, transferProgress: nil)
+    }
+
+    func sync(file: RemoteFileCandidate, destination: RelativePath, token: String, transferProgress: TransferProgressCounters?) async throws -> ManualSyncOutcome {
         try Task.checkCancellation()
         guard file.isSupported else { return .skipped(file.ineligibilityReason ?? tr("materiale non supportato", "unsupported material")) }
         guard !(try await database.hasOpenConflict(rootID: rootID, remoteID: file.id, revision: file.observedRevision)) else { return .skipped(tr("conflitto già aperto", "conflict already open")) }
@@ -44,7 +48,12 @@ public actor ManualSyncEngine {
         // The stage is created inside `download`, while this run holds the root's `.syncing`
         // state in the in-process `RootOperationGate`; recovery needs `.recovering`, so it cannot
         // sweep a live stage. The gate is per process: another process is not excluded here.
-        let artifact = try await downloader.download(file, token: token, access: networkAccess, into: fileStore)
+        let artifact: StagedArtifact
+        do {
+            if file.size > 0, file.size <= downloader.maximumSize { transferProgress?.begin(file.id, total: file.size) }
+            defer { transferProgress?.end(file.id) }
+            artifact = try await downloader.download(file, token: token, access: networkAccess, into: fileStore, onBytes: { transferProgress?.add($0, id: file.id) })
+        }
         let remote = RemoteState(sha256: artifact.sha256, revision: file.observedRevision)
         do {
             try Task.checkCancellation()

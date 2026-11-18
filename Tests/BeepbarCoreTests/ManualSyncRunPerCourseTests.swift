@@ -3,6 +3,25 @@ import Testing
 @testable import BeepbarCore
 
 struct ManualSyncRunPerCourseTests {
+    /// Concurrent downloads stay independent; finishing one must not clear the other.
+    @Test func transferCountersCombineAndRemoveOnlyFinishedTransfer() {
+        let counters = TransferProgressCounters()
+        counters.begin("a", total: 100)
+        counters.begin("b", total: 200)
+        #expect(counters.snapshot() == nil)
+        counters.add(50, id: "a")
+        counters.add(25, id: "b")
+        #expect(counters.snapshot() == SyncTransferProgress(received: 75, total: 300))
+        counters.end("a")
+        #expect(counters.snapshot() == SyncTransferProgress(received: 25, total: 200))
+        counters.end("b")
+        #expect(counters.snapshot() == nil)
+        counters.begin("a", total: Int64.max)
+        counters.begin("b", total: 1)
+        counters.add(1, id: "a")
+        #expect(counters.snapshot() == nil)
+    }
+
     private func item(id: String, courseID: Int64, destination: String) -> PreparedSyncItem {
         let remote = RemoteFileCandidate(id: id, courseID: courseID, sectionID: 1, moduleID: 1, sectionName: "", moduleName: "", filename: "f", remoteFilePath: "/", canonicalPluginPath: "/p", downloadURL: nil, size: 0, modifiedAt: nil, observedRevision: "r", isSupported: true)
         return PreparedSyncItem(remote: remote, destination: try! RelativePath(destination))

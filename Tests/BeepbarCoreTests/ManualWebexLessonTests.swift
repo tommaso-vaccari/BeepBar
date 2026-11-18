@@ -203,7 +203,8 @@ struct ManualWebexLessonTests {
     /// The stored form round-trips, so a restart shows the same lessons.
     @Test func roundTripsThroughThePropertyList() throws {
         var lessons = ManualWebexLessons()
-        try lessons.add(link: "https://politecnicomilano.webex.com/ldr.php?RCID=a", title: "T", courseName: "C", now: Date(timeIntervalSince1970: 1_800_000_000))
+        try lessons.add(link: "https://politecnicomilano.webex.com/ldr.php?RCID=a", title: "T", courseName: "C", courseID: 42, now: Date(timeIntervalSince1970: 1_800_000_000))
+        lessons.lessons[0].isWatchlisted = false
         let data = try PropertyListEncoder().encode(lessons)
         #expect(try PropertyListDecoder().decode(ManualWebexLessons.self, from: data) == lessons)
     }
@@ -213,19 +214,23 @@ struct ManualWebexLessonTests {
     /// never the lessons. Guards against synthesized decoding, which would make one bad field
     /// (or, before `decodeIfPresent`, a missing one) turn the whole list unreadable.
     @Test func olderAndDamagedLessonsStillLoad() throws {
-        // Optionals left nil are not encoded at all: these bytes are what the older build wrote.
+        // Omit the Watchlist flag and the optional metadata to match the older build's schema.
         let saved = ManualWebexLessons(lessons: [ManualWebexLesson(id: "manual-a", title: "T", courseName: "", link: URL(string: "https://politecnicomilano.webex.com/ldr.php?RCID=a")!, addedAt: Date(timeIntervalSince1970: 1_800_000_000))])
-        let oldData = try PropertyListEncoder().encode(saved)
-        let old = try #require(try PropertyListSerialization.propertyList(from: oldData, format: nil) as? [String: Any])
-        #expect(((old["lessons"] as? [[String: Any]])?.first?.keys).map { Set($0) } == ["id", "title", "courseName", "link", "addedAt"])
+        let currentData = try PropertyListEncoder().encode(saved)
+        var old = try #require(try PropertyListSerialization.propertyList(from: currentData, format: nil) as? [String: Any])
+        var lesson = try #require((old["lessons"] as? [[String: Any]])?.first)
+        lesson.removeValue(forKey: "isWatchlisted")
+        old["lessons"] = [lesson]
+        #expect(Set(lesson.keys) == ["id", "title", "courseName", "link", "addedAt"])
+        let oldData = try PropertyListSerialization.data(fromPropertyList: old, format: .binary, options: 0)
         let loaded = try PropertyListDecoder().decode(ManualWebexLessons.self, from: oldData)
         #expect(loaded.lessons.map(\.id) == ["manual-a"])
         #expect(loaded.lessons[0].durationSeconds == nil && loaded.lessons[0].progress == nil)
         #expect(loaded.lessons[0].courseID == nil)
+        #expect(loaded.lessons[0].isWatchlisted)
         #expect(loaded.lessons[0].recording.duration == "")
 
         var damaged = old
-        var lesson = (old["lessons"] as! [[String: Any]])[0]
         lesson["durationSeconds"] = "long"
         lesson["progress"] = ["furthest": "half"]
         lesson["courseID"] = "invalid"

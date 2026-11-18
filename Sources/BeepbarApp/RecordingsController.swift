@@ -701,10 +701,12 @@ struct RecordingsListing: Equatable {
         }
     }
 
-    /// The sidebar's count beside "Watchlist": everything the Watchlist lists, bookmarks and
-    /// lessons added by link (`watchlistEntries` shows both). It counted bookmarks only, so a
-    /// Watchlist of added lessons read "0" (2026-11-09).
-    var watchlistCount: Int { study.bookmarks.count + manualLessons.lessons.count }
+    /// The sidebar count includes both archive and linked lessons in the Watchlist.
+    func watchlistCount(visibleCourseIDs: Set<Int64> = []) -> Int {
+        study.bookmarks.count + manualLessons.lessons.count {
+            RecordingsStudyState.showsInWatchlist($0, visibleCourseIDs: visibleCourseIDs)
+        }
+    }
 
     /// Account isolation applies even when there is no saved Polimi session to invalidate.
     private func loadStudy() {
@@ -853,8 +855,7 @@ struct RecordingsListing: Equatable {
         removeManualLesson(id: recording.id)
     }
 
-    /// Removing a manual lesson's bookmark forgets the lesson: it has no course to be found in
-    /// again. Same account checks as `addManualLesson`.
+    /// Permanently removes a linked lesson. Same account checks as `addManualLesson`.
     private func removeManualLesson(id: String) {
         loadStudy()
         guard canAddManualLesson, let owner = studyOwner, owner == ownerUserID(), manualLessons.contains(id: id) else { return }
@@ -948,11 +949,20 @@ struct RecordingsListing: Equatable {
         if !saveManualLessons(updated, owner: owner) { log.error("Couldn't save a manual lesson's length") }
     }
 
-    /// The watchlist toggle of an archive lesson. A lesson added by link is always in the
-    /// Watchlist and is a no-op here: it leaves only through `deleteManualLesson`, which the UI
-    /// reaches behind a confirmation, so no bookmark action can delete it (#286).
+    /// Changes membership without deleting a linked lesson or its progress.
     func toggleWatchlist(_ recording: RecmanRecording, courseName: String) {
-        guard !ManualWebexLesson.isManual(recording) else { return }
+        if ManualWebexLesson.isManual(recording) {
+            loadStudy()
+            guard canAddManualLesson, let owner = studyOwner, owner == ownerUserID(),
+                  var lesson = manualLessons.lesson(id: recording.id), lesson.courseID != nil else { return }
+            lesson.isWatchlisted.toggle()
+            var updated = manualLessons
+            updated.replace(lesson)
+            if !saveManualLessons(updated, owner: owner) {
+                studyProblem = BilingualText("Non è stato possibile salvare la watchlist. Riprova.", "Couldn't save the watchlist. Try again.")
+            }
+            return
+        }
         updateStudy { state in
             if state.contains(recording) { state.bookmarks.removeAll { $0.id == RecordingsStudyState.identity(recording) } }
             else { state.bookmarks.append(.init(recording: recording, courseName: courseName)) }

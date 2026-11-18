@@ -427,6 +427,8 @@ import BeepbarCore
         #expect(RecordingRow.watchlistSymbol(for: manual, isWatchlisted: false) == "bookmark.fill")
         #expect(RecordingRow.bookmarkSlot(for: archive) == .toggle)
         #expect(RecordingRow.bookmarkSlot(for: manual) == .pinned)
+        #expect(RecordingRow.bookmarkSlot(for: manual, canToggleLinkedBookmark: true) == .toggle)
+        #expect(RecordingRow.watchlistSymbol(for: manual, isWatchlisted: false, canToggleLinkedBookmark: true) == "bookmark")
     }
 
     /// The linked lessons are the first section of the course's single list, the archive's weeks
@@ -448,7 +450,7 @@ import BeepbarCore
         let table = try #require(detail.first)
         // Row 0 is the "Added by link" header, row 1 the lesson, then the archive's first week.
         let menu = try page.contextMenu(table, row: 1)
-        #expect(menu.items.map(\.title) == ["Apri nel browser", "Copia link", "Elimina lezione…"])
+        #expect(menu.items.map(\.title) == ["Apri nel browser", "Copia link", "Rimuovi dalla watchlist", "Elimina lezione…"])
         table.selectRowIndexes([1], byExtendingSelection: false)
         try await page.settle()
         #expect(table.sendAction(table.doubleAction, to: table.target))
@@ -480,7 +482,7 @@ import BeepbarCore
             #expect(lesson.id == manual.id)
             request = (confirm, cancel)
         }
-        menu.performActionForItem(at: 2)
+        menu.performActionForItem(at: 3)
         try await page.settle { request != nil }
         let first = try #require(request, "\"Delete lesson…\" did not ask for a confirmation")
         #expect(page.recordings.manualLessons.lesson(id: manual.id) != nil, "the menu deleted the lesson without a confirmation")
@@ -497,6 +499,55 @@ import BeepbarCore
         #expect(page.recordings.manualLessons.lesson(id: manual.id) == nil, "confirming must delete the lesson")
         // The archive is untouched.
         #expect(page.recordings.listings.values.contains { $0.recordings?.contains(newest) == true })
+    }
+
+    /// Unbookmark in Watchlist and rebookmark in the course through the row actions.
+    @Test(.timeLimit(.minutes(1))) func removingLinkedBookmarkKeepsLectureInItsCourse() async throws {
+        let page = try await HostedPage()
+        defer { page.close() }
+        _ = try await page.loadedCourse()
+        let authentication = page.fixture.controller
+        let course = try #require(authentication.courses.first)
+        let courseID = course.id
+        let recordings = page.recordings
+        let lesson = try recordings.addManualLesson(link: "https://politecnicomilano.webex.com/ldr.php?RCID=toggle",
+                                                    title: "Guest", courseName: "Course", courseID: courseID).get()
+        recordings.setDone(lesson.recording, true)
+        let progress = try #require(recordings.manualLessons.lesson(id: lesson.id)?.progress)
+        recordings.selectDestination(.watchlist)
+        try await page.settle { page.rows.contains { $0.recording.id == lesson.id && $0.courseName == "Course" } }
+        let watchlistRow = try #require(page.rows.last { $0.recording.id == lesson.id && $0.courseName == "Course" })
+        #expect(watchlistRow.canToggleLinkedBookmark)
+        let table = try await page.detailTable(rows: 1)
+        let menu = try page.contextMenu(table, row: 0)
+        #expect(menu.items.map(\.title) == ["Apri nel browser", "Copia link", "Rimuovi dalla watchlist", "Elimina lezione…"])
+        watchlistRow.actions.toggleWatchlist()
+        #expect(recordings.watchlistCount(visibleCourseIDs: [courseID]) == 0)
+        #expect(recordings.study.watchlistEntries(manual: recordings.manualLessons, visibleCourseIDs: [courseID], fallbackCourseName: "", query: "").isEmpty)
+        #expect(recordings.manualLessons.recordings(courseID: courseID).map(\.id) == [lesson.id])
+        #expect(recordings.manualLessons.lesson(id: lesson.id)?.progress == progress)
+        #expect(recordings.openingRecordingID == nil)
+
+        page.rows.removeAll()
+        authentication.setCourse(course, enabled: false)
+        try await page.settle { page.rows.contains { $0.recording.id == lesson.id && !$0.canToggleLinkedBookmark } }
+        #expect(!authentication.isCourseEnabled(course))
+        let pinned = try #require(page.rows.last { $0.recording.id == lesson.id })
+        #expect(!pinned.canToggleLinkedBookmark)
+        #expect(recordings.watchlistCount() == 1)
+        #expect(recordings.manualLessons.lesson(id: lesson.id)?.isWatchlisted == false)
+        authentication.setCourse(course, enabled: true)
+        #expect(authentication.isCourseEnabled(course))
+
+        page.rows.removeAll()
+        recordings.selectDestination(.course(courseID))
+        try await page.settle { page.rows.contains { $0.recording.id == lesson.id } }
+        let courseRow = try #require(page.rows.last { $0.recording.id == lesson.id })
+        #expect(courseRow.canToggleLinkedBookmark)
+        #expect(!courseRow.isWatchlisted)
+        courseRow.actions.toggleWatchlist()
+        #expect(recordings.watchlistCount(visibleCourseIDs: [courseID]) == 1)
+        #expect(recordings.manualLessons.lesson(id: lesson.id)?.progress == progress)
     }
 
     /// The Watchlist path: a linked lesson's "Delete lesson…" asks first, cancel keeps it, confirm
@@ -564,7 +615,7 @@ import BeepbarCore
         let point = table.convert(NSPoint(x: rect.midX, y: rect.midY), to: nil)
         let event = try #require(NSEvent.mouseEvent(with: .rightMouseDown, location: point, modifierFlags: [], timestamp: 0, windowNumber: window.windowNumber, context: nil, eventNumber: 0, clickCount: 1, pressure: 1))
         let menu = try #require(table.menu(for: event))
-        #expect(menu.items.map(\.title) == ["Apri nel browser", "Copia link", "Elimina lezione…"])
+        #expect(menu.items.map(\.title) == ["Apri nel browser", "Copia link", "Rimuovi dalla watchlist", "Elimina lezione…"])
         #expect(!menu.items[0].isEnabled && !menu.items[1].isEnabled)
         row.actions.requestDelete()
         #expect(page.recordings.manualLessons.lesson(id: lesson.id) != nil, "asking to delete must not delete")

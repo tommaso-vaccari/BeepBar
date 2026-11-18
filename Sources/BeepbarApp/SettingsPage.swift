@@ -371,7 +371,7 @@ private struct RecordingsSettingsSection: View {
                     Button(tr("Dimentica i dati di studio", "Forget study data"), role: .destructive) { recordings.forgetStudyData() }
                     Button(tr("Annulla", "Cancel"), role: .cancel) {}
                 } message: {
-                    Text(tr("Elimina watchlist, stato di visione e posizioni di ripresa di questo account e chiude la lezione in riproduzione. I materiali scaricati restano sul Mac.", "Deletes this account’s watchlist, viewing state and resume positions, and closes the playing lecture. Downloaded materials stay on your Mac."))
+                    Text(tr("Elimina watchlist, lezioni aggiunte con link, stato di visione e posizioni di ripresa di questo account e chiude la lezione in riproduzione. I materiali scaricati restano sul Mac.", "Deletes this account’s watchlist, lessons added by link, viewing state and resume positions, and closes the playing lecture. Downloaded materials stay on your Mac."))
                 }
         } header: {
             Text(tr("Registrazioni", "Recordings"))

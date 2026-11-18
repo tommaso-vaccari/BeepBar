@@ -318,6 +318,10 @@ struct RecordingsListing: Equatable {
     private var resumePoints: RecordingResumePoints?
     /// A recovery ran with no Recordings page on screen: the browser it opened closes after it.
     private var closesBrowserWhenIdle = false
+    /// Cancels the running `.learn` lookup when something else is queued (see `queue`).
+    private func cancelLearnIfBlocking() {
+        if runningLearn != nil, queue.contains(where: { if case .learn = $0 { false } else { true } }) { runningLearn?.cancel() }
+    }
     /// The lookup of an added lesson's details, if one is running: a Play cancels it, so a Play
     /// never waits behind it.
     private var runningLearn: Task<RecordingStream, Error>?
@@ -535,6 +539,12 @@ struct RecordingsListing: Equatable {
     /// Every click, including a cached player, replaces older Play/Copy effects and errors.
     private var openingRequest = 0
     private var queue: [Job] = []
+    {
+        // A quiet `.learn` lookup (#289) can hold the serial worker for up to a minute on a stalled
+        // Webex: anything else queued is something the student asked for, so it never waits
+        // behind it. Covers every `open` action, listings and recoveries in one place.
+        didSet { cancelLearnIfBlocking() }
+    }
     private var runningKey: RecmanCourseKey?
     private var worker: Task<Void, Never>?
     private var signInTask: Task<Void, Never>?
@@ -1849,8 +1859,10 @@ struct RecordingsListing: Equatable {
             let saved = await savedSession()
             guard generation == self.generation else { return }
             await browser.open(cookies: saved.cookies)
-            // Taken by this opening, whatever the entry's outcome (#234).
-            consumeCandidate(saved.candidateSerial)
+            // Taken by this opening, whatever the entry's outcome (#234), unless only quiet
+            // lookups (`.learn`) opened it: they never save the session, so the candidate stays
+            // for the next real opening.
+            if !queue.allSatisfy({ if case .learn = $0 { true } else { false } }) { consumeCandidate(saved.candidateSerial) }
             if saved.candidateSerial != nil { fileFallback = saved.fileCookies }
         }
         guard generation == self.generation else { return }
@@ -1914,6 +1926,7 @@ struct RecordingsListing: Equatable {
                     guard manualLessonsWriter == owner, let recording = manualLessons.lesson(id: id)?.recording else { continue }
                     let lookup = Task { try await browser.quietStream(for: recording) }
                     runningLearn = lookup
+                    cancelLearnIfBlocking()
                     defer { runningLearn = nil }
                     let stream: RecordingStream?
                     do {
@@ -2672,12 +2685,12 @@ struct RecordingsListing: Equatable {
         watchProgress.setPending(true, for: identities, course: key)
         // The linked lessons, before anything else is queued: what each one's mark was, to put
         // back if the archive's part doesn't commit.
-        var previousMarks: [String: RecordingWatchEntry?] = [:]
+        var previousMarks: [String: LinkedMark] = [:]
         if !linked.isEmpty {
             var updated = manualLessons
             for row in linked {
                 guard var lesson = updated.lesson(id: row.id), let marked = RecordingWatchProgress.setManual(lesson.progress, done: done) else { continue }
-                previousMarks.updateValue(lesson.progress, forKey: lesson.id)
+                previousMarks[lesson.id] = LinkedMark(before: lesson.progress, marked: marked)
                 lesson.progress = marked
                 updated.replace(lesson)
             }
@@ -2699,7 +2712,7 @@ struct RecordingsListing: Equatable {
             guard let self else { return }
             var archiveCommitted = false
             defer {
-                if !archiveCommitted { self.restoreLinkedMarks(previousMarks, owner: owner) }
+                if !archiveCommitted { self.restoreLinkedMarks(previousMarks, owner: owner, history: history) }
                 if self.bulkTokens[key] == token {
                     self.bulkTokens[key] = nil
                     self.watchProgress.setPending(false, for: identities, course: key)
@@ -2719,8 +2732,11 @@ struct RecordingsListing: Equatable {
             }
             // Same second check as `commitProgress`: the WeBeep account can change without a
             // reset, and then only this keeps the old account's entries off the screen.
-            guard self.isCurrentIdentity(history, owner: owner), results.count == recordings.count else { return }
+            // The transaction has committed from here on, whatever the checks below say: the
+            // archive's marks are saved, so the linked lessons' must stay too (restoring them
+            // would leave the course half marked). The checks only decide what is shown.
             archiveCommitted = true
+            guard self.isCurrentIdentity(history, owner: owner), results.count == recordings.count else { return }
             var committed: [String: RecordingWatchEntry] = [:]
             var completed: [String] = []
             for (recording, result) in zip(recordings, results) {
@@ -2741,24 +2757,57 @@ struct RecordingsListing: Equatable {
         }
     }
 
+    /// A linked lesson's progress before a bulk change and what the change set it to.
+    private struct LinkedMark { let before: RecordingWatchEntry?; let marked: RecordingWatchEntry }
+
     /// Puts linked lessons' done marks back after a bulk change whose archive part didn't commit
-    /// (`toggleAllDone`): each lesson's completion and un-tick block return to `previous`, while
-    /// the furthest point stays whatever a playing lecture has reached meanwhile. Only for the
-    /// account that made the change.
-    private func restoreLinkedMarks(_ previous: [String: RecordingWatchEntry?], owner: Int) {
-        guard !previous.isEmpty, manualLessonsWriter == owner else { return }
-        var restored = manualLessons
-        for (id, before) in previous {
-            guard var lesson = restored.lesson(id: id) else { continue }
-            let furthest = max(lesson.progress?.furthest ?? 0, before?.furthest ?? 0)
-            if let before {
-                lesson.progress = RecordingWatchEntry(furthest: furthest, completed: before.completed, autoCompletionBlocked: before.autoCompletionBlocked)
-            } else {
-                lesson.progress = furthest > 0 ? RecordingWatchEntry(furthest: furthest, completed: nil, autoCompletionBlocked: false) : nil
-            }
-            restored.replace(lesson)
+    /// (`toggleAllDone`). Best effort, logged when it can't be saved.
+    /// - Skipped entirely when the history was reset meanwhile (`seenHistory !== history`): a
+    ///   reset forgets all progress, including the lessons' (`forgetSeen`), so nothing is left to
+    ///   put back.
+    /// - Done against the lessons of `owner`, the account that clicked, even when another account
+    ///   is current by now: an account change that forgets nothing must not leave that account's
+    ///   linked lessons marked while its archive isn't. The current account's lessons are in
+    ///   `manualLessons` (saved through `saveManualLessons`); another's are read from and written
+    ///   to its own key, and an unreadable list is left alone (never overwritten).
+    /// - Per lesson, a mark is put back only while the lesson still holds exactly what the change
+    ///   set; a completion that appeared meanwhile (a lecture played past the threshold) is kept.
+    ///   The furthest point is always the larger of the two.
+    /// - Nothing is saved when no lesson changed.
+    private func restoreLinkedMarks(_ previous: [String: LinkedMark], owner: Int, history: RecordingsSeenHistory) {
+        guard !previous.isEmpty, seenHistory === history else { return }
+        let isCurrent = manualLessonsWriter == owner
+        var lessons: ManualWebexLessons
+        if isCurrent {
+            lessons = manualLessons
+        } else {
+            guard let data = defaults.data(forKey: Self.manualLessonsKey(owner: owner)),
+                  let stored = try? PropertyListDecoder().decode(ManualWebexLessons.self, from: data) else { return }
+            lessons = stored
         }
-        if !saveManualLessons(restored, owner: owner) { log.error("Couldn't put the linked lessons' done marks back") }
+        var changed = false
+        for (id, mark) in previous {
+            guard var lesson = lessons.lesson(id: id), let current = lesson.progress,
+                  current.completed == mark.marked.completed, current.autoCompletionBlocked == mark.marked.autoCompletionBlocked else { continue }
+            let furthest = max(current.furthest, mark.before?.furthest ?? 0)
+            let restored: RecordingWatchEntry? = if let before = mark.before {
+                RecordingWatchEntry(furthest: furthest, completed: before.completed, autoCompletionBlocked: before.autoCompletionBlocked)
+            } else {
+                furthest > 0 ? RecordingWatchEntry(furthest: furthest, completed: nil, autoCompletionBlocked: false) : nil
+            }
+            guard restored != lesson.progress else { continue }
+            lesson.progress = restored
+            lessons.replace(lesson)
+            changed = true
+        }
+        guard changed else { return }
+        if isCurrent {
+            if !saveManualLessons(lessons, owner: owner) { log.error("Couldn't put the linked lessons' done marks back") }
+        } else if let data = try? PropertyListEncoder().encode(lessons) {
+            defaults.set(data, forKey: Self.manualLessonsKey(owner: owner))
+        } else {
+            log.error("Couldn't put the linked lessons' done marks back")
+        }
     }
 
     /// Appends one write to the serial chain. The task is unstructured and kept only as the next

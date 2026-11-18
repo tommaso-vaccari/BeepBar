@@ -56,6 +56,13 @@ struct RecordingsPresentationTests {
         #expect(RecordingsPresentation.lecturesToWatchText(summary: counts(done: 10, total: 10), linked: counts(done: 3, total: 3)) == nil)
         #expect(RecordingsPresentation.lecturesToWatchText(summary: archive, linked: nil) == BilingualText("3 da guardare", "3 to watch"))
         #expect(RecordingsPresentation.courseSubtitle(for: listing) == "1 registrazione")
+        // While the archive loads or fails, its state is said beside the lessons, not over them.
+        var loading = RecordingsListing(); loading.isLoading = true
+        var failed = RecordingsListing(); failed.problem = .unavailable
+        #expect(RecordingsPresentation.courseSubtitle(for: loading, summary: nil, linked: linked) == "3 registrazioni · Caricamento… · 2 da guardare")
+        #expect(RecordingsPresentation.courseSubtitle(for: failed, summary: nil, linked: linked) == "3 registrazioni · Non disponibile · 2 da guardare")
+        #expect(RecordingsPresentation.courseSubtitle(for: loading) == "Caricamento…")
+        #expect(RecordingsPresentation.courseSubtitle(for: failed) == "Non disponibile")
     }
 
 

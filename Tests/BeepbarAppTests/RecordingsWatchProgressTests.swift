@@ -1362,6 +1362,85 @@ struct RecordingsWatchProgressTests {
         again.turnOff()
     }
 
+    /// The restore gives back what the lesson held before, not just "nothing": a lesson already
+    /// watched to 20 % goes back to 20 %, not done and not blocked, and the furthest point a
+    /// playing lecture reached while the archive's write was held is kept (60 %). Guards against a
+    /// restore that drops progress or rewinds the furthest point.
+    @Test func restoreKeepsThePreviousProgressAndTheFurthestPointReachedMeanwhile() async throws {
+        defer { cleanUp() }
+        let controller = await listedController(["a", "b"])
+        let lesson = try controller.addManualLesson(link: manualLink, title: "Guest", courseName: "Synthetic", courseID: 42).get()
+        await play(lesson.id, on: controller, lesson.recording)
+        world.player.pause(at: 1_200)
+        #expect(try #require(controller.manualLessons.lesson(id: lesson.id)?.progress).furthest == 0.2)
+        try executeSQL("CREATE TRIGGER refuse BEFORE INSERT ON progress BEGIN SELECT RAISE(ABORT, 'refused'); END")
+        let gate = FakeRecmanBrowser.Gate()
+        gates.before = gate
+        controller.toggleAllDone(course, courseID: 42)
+        await settle("bulk held") { gate.isWaiting }
+        world.player.pause(at: 3_600)
+        gate.release()
+        await controller.settleWatchProgress()
+        await drainTasks()
+        let restored = try #require(controller.manualLessons.lesson(id: lesson.id)?.progress)
+        #expect(restored.completed == nil && !restored.autoCompletionBlocked, "not done, as before")
+        #expect(restored.furthest == 0.6, "the furthest point reached meanwhile is kept")
+        controller.turnOff()
+    }
+
+    /// Un-marking, refused: the lesson that was done is done again (a manual mark, no block), and a
+    /// lesson that completed by itself while the archive's write was held keeps that completion
+    /// instead of being reverted. Guards against the restore undoing a completion it didn't make.
+    @Test func aRefusedUnmarkPutsTheLinkedLessonBackAndKeepsACompletionThatAppeared() async throws {
+        defer { cleanUp() }
+        let controller = await listedController(["a"])
+        let lesson = try controller.addManualLesson(link: manualLink, title: "Guest", courseName: "Synthetic", courseID: 42).get()
+        controller.toggleAllDone(course, courseID: 42)
+        await controller.settleWatchProgress()
+        #expect(controller.manualLessons.lesson(id: lesson.id)?.progress?.completed == .manual)
+        try executeSQL("CREATE TRIGGER refuse BEFORE UPDATE ON progress BEGIN SELECT RAISE(ABORT, 'refused'); END")
+        controller.toggleAllDone(course, courseID: 42)
+        await controller.settleWatchProgress()
+        await drainTasks()
+        #expect(controller.listing(for: course)?.problem == .historyUnavailable)
+        let back = try #require(controller.manualLessons.lesson(id: lesson.id)?.progress)
+        #expect(back.completed == .manual && !back.autoCompletionBlocked, "done again, as before the un-mark")
+        // Held this time, and the lesson completes by playback while the un-mark is pending.
+        let gate = FakeRecmanBrowser.Gate()
+        gates.before = gate
+        controller.toggleAllDone(course, courseID: 42)
+        await settle("un-mark held") { gate.isWaiting }
+        #expect(controller.manualLessons.lesson(id: lesson.id)?.progress?.completed == nil, "un-marked first")
+        await play(lesson.id, on: controller, lesson.recording)
+        world.player.pause(at: 5_900)
+        world.player.close()
+        #expect(controller.manualLessons.lesson(id: lesson.id)?.progress?.completed == .playback, "completed by playback meanwhile")
+        gate.release()
+        await controller.settleWatchProgress()
+        await drainTasks()
+        #expect(controller.manualLessons.lesson(id: lesson.id)?.progress?.completed == .playback, "not reverted")
+        controller.turnOff()
+    }
+
+    /// The account that clicked is the one restored: when the WeBeep account turns out different
+    /// before the archive's write runs (no reset, so the history is the same), the old account's
+    /// linked lesson is put back in its own saved list, not left marked while its archive isn't.
+    /// Guards against a restore that looks only at the current account.
+    @Test func anAccountChangeBeforeTheArchiveWriteRestoresTheClickersLessons() async throws {
+        defer { cleanUp() }
+        let controller = await listedController(["a", "b"])
+        let lesson = try controller.addManualLesson(link: manualLink, title: "Guest", courseName: "Synthetic", courseID: 42).get()
+        controller.toggleAllDone(course, courseID: 42)
+        world.owner = 7
+        await controller.settleWatchProgress()
+        await drainTasks()
+        #expect(try storedEntry("a", owner: 42) == nil, "the archive part did not run")
+        let saved = try #require(defaults.data(forKey: RecordingsController.manualLessonsKey(owner: 42)))
+        let old = try PropertyListDecoder().decode(ManualWebexLessons.self, from: saved)
+        #expect(old.lesson(id: lesson.id)?.progress?.completed == nil, "the clicker's own list was restored")
+        controller.turnOff()
+    }
+
     /// While the batch is held, the linked lesson's checkbox is locked with the archive's.
     @Test func markAllLocksLinkedLessonsWhilePending() async throws {
         defer { cleanUp() }

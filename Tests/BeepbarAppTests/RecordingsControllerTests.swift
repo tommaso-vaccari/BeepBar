@@ -2603,6 +2603,58 @@ struct RecordingsControllerTests {
         controller.turnOff()
     }
 
+    /// The quiet lookup made at add never delays anything the student asks for: a Play, Copy link,
+    /// Open in browser or a listing cancels it, so the serial worker is free at once (a stalled
+    /// Webex would otherwise hold it for up to a minute). Guards against a Play waiting behind it.
+    @Test(arguments: ["play", "copy link", "open in browser", "list"])
+    func aStudentRequestCancelsTheQuietLookup(action: String) async throws {
+        defer { cleanUp() }
+        let controller = await readyController()
+        let lesson = try controller.addManualLesson(link: manualLink, title: "lab1", courseName: "").get()
+        let gate = FakeRecmanBrowser.Gate()
+        browser.quietGates[lesson.id] = gate
+        await settle("lookup held") { gate.isWaiting }
+        switch action {
+        case "play":
+            browser.streamResults[lesson.id] = [.success(stream(lesson.id))]
+            controller.play(lesson.recording)
+        case "copy link": controller.copyLink(lesson.recording)
+        case "open in browser": controller.openInBrowser(lesson.recording)
+        default:
+            browser.listResults[course.courseCode] = .success([recording("a")])
+            controller.refresh([course], selected: course)
+        }
+        await settle("lookup cancelled") { gate.cancelledWaits == 1 }
+        switch action {
+        case "play": await settle("lecture playing") { world.player.plays.count == 1 }
+        case "copy link": await settle("copied") { world.copied.contains(manualPlayer) }
+        case "open in browser": await settle("opened") { world.opened.contains(manualPlayer) }
+        default: await settle("listed") { controller.listing(for: course)?.recordings != nil }
+        }
+        #expect(controller.manualLessons.lesson(id: lesson.id)?.recordedAt == nil, "a cancelled lookup saves nothing")
+        controller.turnOff()
+    }
+
+    /// The owner changing without any reset (the history is the same, the worker is not
+    /// invalidated) still drops a late answer: `applyAddedLessonDetails` checks the owner itself.
+    /// Guards that check, which the account-change case above never reaches (it cancels the worker).
+    @Test func aLateAnswerAfterASilentOwnerChangeIsDropped() async throws {
+        defer { cleanUp() }
+        let controller = await readyController()
+        let lesson = try controller.addManualLesson(link: manualLink, title: "lab1", courseName: "").get()
+        let gate = FakeRecmanBrowser.Gate()
+        browser.quietGates[lesson.id] = gate
+        browser.quietResults[lesson.id] = .success(RecordingStream(url: stream(lesson.id).url, title: nil, duration: 8_402, recordedAt: Date(timeIntervalSince1970: 1_793_717_389)))
+        await settle("lookup held") { gate.isWaiting }
+        world.owner = 7
+        gate.release()
+        await drainTasks()
+        #expect(controller.manualLessons.lesson(id: lesson.id)?.recordedAt == nil)
+        let saved = try #require(defaults.data(forKey: RecordingsController.manualLessonsKey(owner: 42)))
+        #expect(try PropertyListDecoder().decode(ManualWebexLessons.self, from: saved).lesson(id: lesson.id)?.recordedAt == nil)
+        controller.turnOff()
+    }
+
     /// When Webex's answer has no usable length (a changed answer: it was once read in the wrong
     /// unit and every real length was dropped), the player's own length at the first checkpoint
     /// is saved, so a played lesson never stays without one. A length already known is kept.

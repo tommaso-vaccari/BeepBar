@@ -288,10 +288,11 @@ enum RecordingsPresentation {
         let state: String?
         if let count = listing?.recordings?.count {
             state = count + linkedCount == 0 ? tr("Nessuna registrazione", "No recordings") : recordingCount(count + linkedCount).text
-        } else if listing?.isLoading == true {
-            state = tr("Caricamento…", "Loading…")
-        } else if listing?.problem != nil {
-            state = tr("Non disponibile", "Unavailable")
+        } else if listing?.isLoading == true || listing?.problem != nil {
+            // The archive's state is said beside the lessons that are already known, never in
+            // place of them: "2 registrazioni · Caricamento…".
+            let archive = listing?.isLoading == true ? tr("Caricamento…", "Loading…") : tr("Non disponibile", "Unavailable")
+            state = linkedCount > 0 ? "\(recordingCount(linkedCount).text) · \(archive)" : archive
         } else if linkedCount > 0 {
             state = recordingCount(linkedCount).text
         } else {
@@ -908,9 +909,13 @@ struct CourseRecordings: View {
     private var summary: String {
         let year = key?.academicYearLabel ?? ""
         guard let list = listing?.recordings else {
-            if listing?.isLoading == true { return "\(year) · \(tr("caricamento…", "loading…"))" }
-            // No archive list (no key, signed out, unavailable): the linked lessons still count.
             let lessons = manual
+            if listing?.isLoading == true {
+                // Loading: the lessons already known are counted beside the archive's state.
+                let count = lessons.isEmpty ? nil : RecordingsPresentation.recordingCount(lessons.count).text
+                return [year, count, tr("caricamento…", "loading…")].compactMap { $0 }.filter { !$0.isEmpty }.joined(separator: " · ")
+            }
+            // No archive list (no key, signed out, unavailable): the linked lessons still count.
             guard !lessons.isEmpty else { return year }
             let minutes = lessons.compactMap { RecordingsPresentation.minutes($0.duration) }.reduce(0, +)
             var parts = [year, RecordingsPresentation.recordingCount(lessons.count).text].filter { !$0.isEmpty }

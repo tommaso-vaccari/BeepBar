@@ -137,7 +137,8 @@ final class WebexURLSessionTransport: WebexHTTPTransport, @unchecked Sendable {
 /// that ended in the browser says which step sent it there. A line holds only a step name, an
 /// HTTP status, a decision and privacy-safe names (`PlaybackDiagnostics`,
 /// `WebexStreamAPI.diagnosticFlags`, `WebexPlayerLink.diagnosticLocation`): never an address, a
-/// uuid, a cookie, a title or the email. Lines are written only while a Play runs.
+/// uuid, a cookie, a title or the email. Lines are written only while a lookup runs: a Play, or the
+/// quiet lookup made when a lesson is added by link (`RecmanWebSession.quietStream`, #289).
 @MainActor struct WebexStreamResolver {
     let transport: WebexHTTPTransport
     var trace: @MainActor (String) -> Void = { _ in }
@@ -150,6 +151,9 @@ final class WebexURLSessionTransport: WebexHTTPTransport, @unchecked Sendable {
         case .unavailable: throw RecmanBrowserError.playbackUnavailable
         case .signedOut: break
         }
+        // INVARIANT: with no email this never signs in. The add-by-link lookup (#289) passes nil
+        // on purpose and relies on exactly this to stay quiet (no sign-in, no window); do not
+        // reach `driver.signIn` on a path that has no email.
         guard let email else {
             trace("signed out of Webex, and no Polimi email to sign in with")
             diagnose("stream: step=sign-in skipped reason=no-email")

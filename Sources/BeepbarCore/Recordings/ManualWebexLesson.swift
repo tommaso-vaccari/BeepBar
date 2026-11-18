@@ -26,10 +26,10 @@ public struct ManualWebexLesson: Codable, Equatable, Sendable, Identifiable {
     /// The Webex player link, as `normalizedLink` accepted it.
     public let link: URL
     public let addedAt: Date
-    /// The lesson's length in seconds, as Webex's stream answer gave it at a Play; nil until
+    /// The lesson's length in seconds, as Webex's stream answer gave it (when the lesson was added, or at a Play); nil until
     /// then. Shown as the row's length and used for the hours left, like Recman's minutes.
     public var durationSeconds: Double?
-    /// When Webex says the recording was made, learned at a Play; nil until then. The row's date
+    /// When Webex says the recording was made, learned when the lesson was added or at a Play; nil until then. The row's date
     /// (`recording.recordedAt`) is this, else the day the lesson was added, so a recording from
     /// weeks ago doesn't sort under "This week" once it has been played.
     public var recordedAt: Date?
@@ -74,14 +74,14 @@ public struct ManualWebexLesson: Codable, Equatable, Sendable, Identifiable {
 
     /// The row the Watchlist and the player work with. `kind` "Webex" is what an untitled lesson
     /// shows (`RecmanPresentation.title`). The duration is Recman's form ("97 min",
-    /// `RecmanRecording.minutes`) once a Play has read it, empty until then.
+    /// `RecmanRecording.minutes`) once Webex's answer (at add or Play) has been read, empty until then.
     public var recording: RecmanRecording {
         let minutes = durationSeconds.map { Int(($0 / 60).rounded()) }
         return RecmanRecording(id: id, courseCode: Self.courseCode, academicYear: 0, title: title, recordedAt: recordedAt ?? addedAt,
                                kind: "Webex", duration: minutes.map { "\($0) min" } ?? "", size: nil, previewURL: link)
     }
 
-    /// What a Play learned from Webex's answer: its title when the student gave none, the
+    /// What Webex's answer (the lookup at add, or a Play) taught: its title when the student gave none, the
     /// length, and the recording's date (only the first one: it doesn't change). A title the
     /// student typed is never replaced. Returns whether anything changed.
     @discardableResult

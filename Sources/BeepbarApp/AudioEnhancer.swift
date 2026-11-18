@@ -135,7 +135,7 @@ enum LiveAudioFailure: Equatable, Sendable {
     func stop()
 }
 
-/// Turns enhanced audio on and off for the lecture on screen: finds the student's ffmpeg,
+/// Turns enhanced audio on and off for the lecture on screen: finds ffmpeg,
 /// starts and stops the one live session (`LiveAudioStreaming`), and remembers per lecture
 /// that the filter failed, so a recovery or a later Play doesn't try it again in a loop.
 ///
@@ -164,7 +164,11 @@ enum LiveAudioFailure: Equatable, Sendable {
     /// Lectures whose filter failed, until a mode is chosen again.
     private var failures: [String: BilingualText] = [:]
 
-    init(locateFFmpeg: @escaping () -> URL? = { AudioEnhancement.locateFFmpeg() },
+    init(locateFFmpeg: @escaping () -> URL? = {
+             AudioEnhancement.locateFFmpeg(
+                 bundledExecutable: Bundle.main.bundleURL.appendingPathComponent("Contents/Helpers/ffmpeg")
+             )
+         },
          makeSession: @escaping MakeSession = { try LiveAudioSession(stream: $0, ffmpeg: $1, onFailure: $3, kind: $2) },
          legacyCopies: URL? = AudioEnhancer.legacyCopiesFolder()) {
         self.locateFFmpeg = locateFFmpeg

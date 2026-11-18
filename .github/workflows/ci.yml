@@ -122,8 +122,8 @@ jobs:
       - name: Verify app
         run: |
           file build/Release/Beepbar.app/Contents/MacOS/Beepbar | grep -q 'arm64'
-          codesign --force --deep --sign - --identifier io.github.tvaccari.beepbar build/Release/Beepbar.app
-          codesign --verify --deep --strict --verbose=2 build/Release/Beepbar.app
+          bash scripts/build-ffmpeg.sh --output build/FFmpeg
+          bash scripts/package-release-app.sh build/Release/Beepbar.app build/FFmpeg
       - name: Create DMG
         run: scripts/create-dmg.sh build/Release/Beepbar.app build/00-Beepbar.dmg
       - uses: actions/upload-artifact@v4
@@ -150,6 +150,8 @@ jobs:
           Built automatically from \`main\` on every push. The link above always resolves to the newest release.
 
           Built from commit [\`${GITHUB_SHA}\`](https://github.com/${{ github.repository }}/commit/${GITHUB_SHA}). Ad-hoc signed, not notarized — see the [README](https://github.com/${{ github.repository }}#tldr--install) for the first-launch Gatekeeper step.
+
+          Includes [FFmpeg](https://ffmpeg.org/) under the LGPL 2.1 or later. [Corresponding FFmpeg source and build script](https://github.com/${{ github.repository }}/releases/download/v$FULL_VERSION/ffmpeg-source.tar.gz).
 
           ## What’s new in BeepBar $SHORT_VERSION
 
@@ -184,8 +186,10 @@ jobs:
           body_path: release-body.md
           prerelease: false
           make_latest: true
+          fail_on_unmatched_files: true
           files: |
             build/00-Beepbar.dmg
+            build/FFmpeg/ffmpeg-source.tar.gz
             appcast.xml
       # The `latest` tag and its "Legacy update feed" release are frozen at v2.2.35 and must stay
       # published, together with the `v2.2.35` release and its `00-Beepbar.dmg`: the frozen

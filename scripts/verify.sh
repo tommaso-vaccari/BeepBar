@@ -49,5 +49,5 @@ file build/Release/Beepbar.app/Contents/MacOS/Beepbar | grep -q 'arm64'
 plutil -lint build/Release/Beepbar.app/Contents/Info.plist
 test -f build/Release/Beepbar.app/Contents/Resources/Assets.car
 test -d build/Release/Beepbar.app/Contents/Frameworks/Sparkle.framework
-codesign --force --deep --sign - --identifier io.github.tvaccari.beepbar build/Release/Beepbar.app
-codesign --verify --deep --strict --verbose=2 build/Release/Beepbar.app
+bash scripts/build-ffmpeg.sh --output build/FFmpeg
+bash scripts/package-release-app.sh build/Release/Beepbar.app build/FFmpeg

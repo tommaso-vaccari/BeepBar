@@ -94,6 +94,19 @@ import Testing
     /// The email each `stream(for:email:)` call received (nil: none).
     private(set) var streamEmails: [String?] = []
 
+    /// What `quietStream(for:)` (the lookup made when a lesson is added by link, #289) answers
+    /// for a lesson, and what holds it; unset, it is unavailable, as a Webex session that is gone.
+    var quietResults: [String: Result<RecordingStream, Error>] = [:]
+    var quietGates: [String: Gate] = [:]
+    var quietCalls: [String] { calls.filter { $0.hasPrefix("quiet ") } }
+
+    func quietStream(for recording: RecmanRecording) async throws -> RecordingStream {
+        calls.append("quiet \(recording.id)")
+        try await quietGates[recording.id]?.waitOrCancel()
+        guard let result = quietResults[recording.id] else { throw RecmanBrowserError.playbackUnavailable }
+        return try result.get()
+    }
+
     static func cookie(_ name: String, value: String = "v", domain: String = "aunicalogin.polimi.it") -> HTTPCookie {
         HTTPCookie(properties: [.name: name, .value: value, .domain: domain, .path: "/", .secure: "TRUE"])!
     }
@@ -2493,6 +2506,174 @@ struct RecordingsControllerTests {
         #expect(controller.manualLessons.lesson(id: typed.id)?.recording.minutes == 100)
         controller.turnOff()
     }
+
+    /// A Play also saves when the recording was made (`gmtCreateTime`), so an old recording is
+    /// listed on its own date and not under "This week" for being added today; the date is kept
+    /// across a restart and not replaced by a later Play. Guards against the row's date staying
+    /// the day it was added.
+    @Test func aPlaySavesTheRecordingDateOfALinkedLesson() async throws {
+        defer { cleanUp() }
+        let controller = await readyController()
+        let lesson = try controller.addManualLesson(link: manualLink, title: "lab1", courseName: "").get()
+        let recorded = Date(timeIntervalSince1970: 1_793_717_389)
+        browser.streamResults[lesson.id] = [.success(RecordingStream(url: stream(lesson.id).url, title: "x", duration: 8_402, recordedAt: recorded))]
+        controller.play(lesson.recording)
+        await settle("lecture playing") { world.player.plays.count == 1 }
+        let learned = try #require(controller.manualLessons.lesson(id: lesson.id))
+        #expect(learned.recording.recordedAt == recorded)
+        #expect(learned.recording.duration == "140 min")
+        #expect(learned.title == "lab1")
+        let restored = makeController(useDefault: true)
+        restored.pageAppeared()
+        #expect(restored.manualLessons.lesson(id: lesson.id)?.recordedAt == recorded)
+        restored.turnOff()
+        controller.turnOff()
+    }
+
+    /// Adding a lesson by link saves it at once with its added-date, then asks Webex quietly (no
+    /// sign-in, no window) for the recording's real date and length and saves them when it
+    /// answers, also across a restart. Guards against an old recording sitting under "This week"
+    /// until its first Play.
+    @Test func addingALinkedLessonLearnsItsDateAndLengthFromWebex() async throws {
+        defer { cleanUp() }
+        let controller = await readyController()
+        let lesson = try controller.addManualLesson(link: manualLink, title: "lab1", courseName: "").get()
+        #expect(controller.manualLessons.lesson(id: lesson.id)?.recordedAt == nil, "saved at once, before Webex answered")
+        let recorded = Date(timeIntervalSince1970: 1_793_717_389)
+        browser.quietResults[lesson.id] = .success(RecordingStream(url: stream(lesson.id).url, title: "Webex name", duration: 8_402, recordedAt: recorded))
+        await settle("details learned") { controller.manualLessons.lesson(id: lesson.id)?.recordedAt == recorded }
+        let learned = try #require(controller.manualLessons.lesson(id: lesson.id))
+        #expect(learned.recording.duration == "140 min")
+        #expect(learned.title == "lab1")
+        #expect(browser.streamCalls.isEmpty && !world.opened.contains(manualPlayer), "no Play, no window")
+        let restored = makeController(useDefault: true)
+        restored.pageAppeared()
+        #expect(restored.manualLessons.lesson(id: lesson.id)?.recordedAt == recorded)
+        restored.turnOff()
+        controller.turnOff()
+    }
+
+    /// Webex not answering (no session, a request that fails) never blocks or fails the add: the
+    /// lesson keeps its added-date, nothing is shown, no sign-in is asked, and the first Play
+    /// still fills the date in later. Guards against an add that reports an error or a lesson
+    /// lost because the details could not be fetched.
+    @Test func aFailedLookupAtAddKeepsTheLessonAndLeavesItToThePlay() async throws {
+        defer { cleanUp() }
+        let controller = await readyController()
+        let signIns = browser.calls.filter { $0 == "signIn" }.count
+        let lesson = try controller.addManualLesson(link: manualLink, title: "lab1", courseName: "").get()
+        browser.quietResults[lesson.id] = .failure(RecmanBrowserError.needsEmail)
+        await settle("lookup made") { browser.quietCalls == ["quiet \(lesson.id)"] }
+        await drainTasks()
+        let kept = try #require(controller.manualLessons.lesson(id: lesson.id))
+        #expect(kept.recordedAt == nil && kept.recording.recordedAt == lesson.addedAt)
+        #expect(controller.openingProblem == nil && controller.studyProblem == nil)
+        #expect(browser.calls.filter { $0 == "signIn" }.count == signIns, "adding never starts a sign-in")
+        let recorded = Date(timeIntervalSince1970: 1_793_717_389)
+        browser.streamResults[lesson.id] = [.success(RecordingStream(url: stream(lesson.id).url, title: nil, duration: 8_402, recordedAt: recorded))]
+        controller.play(lesson.recording)
+        await settle("lecture playing") { world.player.plays.count == 1 }
+        #expect(controller.manualLessons.lesson(id: lesson.id)?.recordedAt == recorded)
+        controller.turnOff()
+    }
+
+    /// An answer that arrives after the lesson was deleted, or after the WeBeep account changed,
+    /// is dropped: it brings nobody's lesson back and writes nothing for the new account.
+    @Test(arguments: ["delete", "account change"])
+    func aLateAnswerForAnAddedLessonIsDropped(change: String) async throws {
+        defer { cleanUp() }
+        let controller = await readyController()
+        let lesson = try controller.addManualLesson(link: manualLink, title: "lab1", courseName: "").get()
+        let gate = FakeRecmanBrowser.Gate()
+        browser.quietGates[lesson.id] = gate
+        browser.quietResults[lesson.id] = .success(RecordingStream(url: stream(lesson.id).url, title: nil, duration: 8_402, recordedAt: Date(timeIntervalSince1970: 1_793_717_389)))
+        await settle("lookup held") { gate.isWaiting }
+        if change == "delete" { controller.deleteManualLesson(lesson.recording) }
+        else { world.owner = 7; controller.webBeepAccountChanged(to: 7) }
+        gate.release()
+        await drainTasks()
+        #expect(controller.manualLessons.lesson(id: lesson.id)?.recordedAt == nil)
+        if change == "delete" { #expect(controller.manualLessons.lessons.isEmpty) }
+        else {
+            let saved = try #require(defaults.data(forKey: RecordingsController.manualLessonsKey(owner: 42)))
+            let old = try PropertyListDecoder().decode(ManualWebexLessons.self, from: saved)
+            #expect(old.lesson(id: lesson.id)?.recordedAt == nil, "the old account's lesson is untouched")
+            #expect(defaults.data(forKey: RecordingsController.manualLessonsKey(owner: 7)) == nil)
+        }
+        controller.turnOff()
+    }
+
+    /// The quiet lookup made at add never delays anything the student asks for: a Play, Copy link,
+    /// Open in browser or a listing cancels it, so the serial worker is free at once (a stalled
+    /// Webex would otherwise hold it for up to a minute). Guards against a Play waiting behind it.
+    @Test(arguments: ["play", "copy link", "open in browser", "list"])
+    func aStudentRequestCancelsTheQuietLookup(action: String) async throws {
+        defer { cleanUp() }
+        let controller = await readyController()
+        let lesson = try controller.addManualLesson(link: manualLink, title: "lab1", courseName: "").get()
+        let gate = FakeRecmanBrowser.Gate()
+        browser.quietGates[lesson.id] = gate
+        await settle("lookup held") { gate.isWaiting }
+        switch action {
+        case "play":
+            browser.streamResults[lesson.id] = [.success(stream(lesson.id))]
+            controller.play(lesson.recording)
+        case "copy link": controller.copyLink(lesson.recording)
+        case "open in browser": controller.openInBrowser(lesson.recording)
+        default:
+            browser.listResults[course.courseCode] = .success([recording("a")])
+            controller.refresh([course], selected: course)
+        }
+        await settle("lookup cancelled") { gate.cancelledWaits == 1 }
+        switch action {
+        case "play": await settle("lecture playing") { world.player.plays.count == 1 }
+        case "copy link": await settle("copied") { world.copied.contains(manualPlayer) }
+        case "open in browser": await settle("opened") { world.opened.contains(manualPlayer) }
+        default: await settle("listed") { controller.listing(for: course)?.recordings != nil }
+        }
+        #expect(controller.manualLessons.lesson(id: lesson.id)?.recordedAt == nil, "a cancelled lookup saves nothing")
+        controller.turnOff()
+    }
+
+    /// The owner changing without any reset (the history is the same, the worker is not
+    /// invalidated) still drops a late answer: `applyAddedLessonDetails` checks the owner itself.
+    /// Guards that check, which the account-change case above never reaches (it cancels the worker).
+    @Test func aLateAnswerAfterASilentOwnerChangeIsDropped() async throws {
+        defer { cleanUp() }
+        let controller = await readyController()
+        let lesson = try controller.addManualLesson(link: manualLink, title: "lab1", courseName: "").get()
+        let gate = FakeRecmanBrowser.Gate()
+        browser.quietGates[lesson.id] = gate
+        browser.quietResults[lesson.id] = .success(RecordingStream(url: stream(lesson.id).url, title: nil, duration: 8_402, recordedAt: Date(timeIntervalSince1970: 1_793_717_389)))
+        await settle("lookup held") { gate.isWaiting }
+        world.owner = 7
+        gate.release()
+        await drainTasks()
+        #expect(controller.manualLessons.lesson(id: lesson.id)?.recordedAt == nil)
+        let saved = try #require(defaults.data(forKey: RecordingsController.manualLessonsKey(owner: 42)))
+        #expect(try PropertyListDecoder().decode(ManualWebexLessons.self, from: saved).lesson(id: lesson.id)?.recordedAt == nil)
+        controller.turnOff()
+    }
+
+    /// When Webex's answer has no usable length (a changed answer: it was once read in the wrong
+    /// unit and every real length was dropped), the player's own length at the first checkpoint
+    /// is saved, so a played lesson never stays without one. A length already known is kept.
+    @Test func aLinkedLessonWithoutALengthTakesItFromThePlayer() async throws {
+        defer { cleanUp() }
+        let controller = await readyController()
+        let lesson = try controller.addManualLesson(link: manualLink, title: "lab1", courseName: "").get()
+        browser.streamResults[lesson.id] = [.success(RecordingStream(url: stream(lesson.id).url, title: nil, duration: nil))]
+        controller.play(lesson.recording)
+        await settle("lecture playing") { world.player.plays.count == 1 }
+        #expect(controller.manualLessons.lesson(id: lesson.id)?.durationSeconds == nil)
+        world.player.pause(at: 3_900)
+        let learned = try #require(controller.manualLessons.lesson(id: lesson.id))
+        #expect(learned.durationSeconds == 6_000)
+        #expect(learned.recording.duration == "100 min")
+        #expect(learned.progress != nil, "the checkpoint's own progress must still be saved")
+        controller.turnOff()
+    }
+
 
     // MARK: Enhanced audio
 

@@ -170,8 +170,10 @@ public enum WebexCookies {
 /// What the stream API answered.
 public enum WebexStreamAnswer: Sendable, Equatable {
     /// The HLS playlist (allowed by `WebexStreamPolicy`), with what the API says about the
-    /// recording for the player's window. Never log any of them.
-    case stream(hls: URL, title: String?, duration: TimeInterval?)
+    /// recording for the player's window: its title, its length in seconds (the API's
+    /// milliseconds, converted by `duration(_:)`) and when it was recorded (`gmtCreateTime`).
+    /// Never log any of them.
+    case stream(hls: URL, title: String?, duration: TimeInterval?, recordedAt: Date? = nil)
     /// No Webex session: sign in and ask again.
     case signedOut
     /// Something signing in can't fix: open the player in the browser instead.
@@ -279,7 +281,7 @@ public enum WebexStreamAPI {
         }
         guard let hls = URL(string: raw), WebexStreamPolicy.isAllowedStream(hls) else { return .unavailable(.disallowedStream) }
         let title = (json["recordName"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines)
-        return .stream(hls: hls, title: title?.isEmpty == false ? title : nil, duration: duration(json["duration"]))
+        return .stream(hls: hls, title: title?.isEmpty == false ? title : nil, duration: duration(json["duration"]), recordedAt: recordedAt(json["gmtCreateTime"]))
     }
 
     /// The flags of an API answer that decide a Play, for the Play diagnostics (#148): each as
@@ -317,14 +319,29 @@ public enum WebexStreamAPI {
         }
     }
 
-    /// The recording's length as Webex reports it, in seconds when it is a positive finite
-    /// number. The unit is not confirmed live; the player reads the real length from the stream
-    /// and this is only a hint for the window before it loads.
+    /// The recording's length in seconds. The API reports MILLISECONDS (a JSON integer, e.g.
+    /// 8402000 for a lecture of 2 h 20 min; verified on a real signed-in answer, 2026-11-17).
+    /// Nil unless it is a positive finite number. Read as seconds before, every real length was
+    /// refused as implausible (`ManualWebexLesson.plausibleDuration`) and never saved.
     static func duration(_ value: Any?) -> TimeInterval? {
         // A JSON boolean is an NSNumber too, of Objective-C type "c" (char): not a length.
         guard let number = value as? NSNumber, String(cString: number.objCType) != "c" else { return nil }
-        let seconds = number.doubleValue
-        return seconds.isFinite && seconds > 0 ? seconds : nil
+        let milliseconds = number.doubleValue
+        guard milliseconds.isFinite, milliseconds > 0 else { return nil }
+        return milliseconds / 1000
+    }
+
+    /// When the recording was made: `gmtCreateTime`, "yyyy-MM-dd HH:mm:ss" in UTC. Its sibling
+    /// `createTime` is the same moment in the site's local time without a zone, so it is not
+    /// used. Nil when absent or not in that exact shape: a changed answer costs the date, never
+    /// the Play.
+    static func recordedAt(_ value: Any?) -> Date? {
+        guard let text = (value as? String)?.trimmingCharacters(in: .whitespaces), text.count == 19 else { return nil }
+        let formatter = DateFormatter()
+        formatter.locale = Locale(identifier: "en_US_POSIX")
+        formatter.timeZone = TimeZone(identifier: "UTC")
+        formatter.dateFormat = "yyyy-MM-dd HH:mm:ss"
+        return formatter.date(from: text)
     }
 }
 

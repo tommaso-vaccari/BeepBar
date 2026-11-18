@@ -90,8 +90,13 @@ enum RecordingsPresentation {
     /// Words, not a marker: the row had an orange dot for this beside the blue count of new
     /// lectures, and two dots of two colours read as clutter whose meaning had to be guessed
     /// (2026-11-09). The only badge left on a row is the count of new lectures.
-    static func lecturesToWatchText(summary: CourseWatchSummary?) -> BilingualText? {
-        guard let summary, summary.done < summary.total else { return nil }
+    ///
+    /// `linked`: the counts of the course's lessons added by link (`ManualWebexLessons.summaries`),
+    /// said together with the archive's, since they are lessons of the same course. They are
+    /// known whatever the archive's state, so they count even before its listing has loaded.
+    static func lecturesToWatchText(summary: CourseWatchSummary?, linked: CourseWatchSummary? = nil) -> BilingualText? {
+        let combined = linked.map { summary?.including($0) ?? $0 } ?? summary
+        guard let summary = combined, summary.done < summary.total else { return nil }
         let left = summary.total - summary.done
         return BilingualText("\(left) da guardare", "\(left) to watch")
     }
@@ -100,13 +105,6 @@ enum RecordingsPresentation {
     /// subtitle and the course header. Both languages agree in number (#195).
     static func recordingCount(_ count: Int) -> BilingualText {
         BilingualText(italianCount(count, "registrazione", "registrazioni"), englishCount(count, "recording", "recordings"))
-    }
-
-    /// In a mixed view, distinguish the archive count from the manual section.
-    static func courseRecordingCount(_ count: Int, hasManual: Bool) -> BilingualText {
-        guard hasManual else { return recordingCount(count) }
-        return BilingualText(italianCount(count, "registrazione in archivio", "registrazioni in archivio"),
-                             englishCount(count, "archived recording", "archived recordings"))
     }
 
     /// The new-lectures badge's colours: white on the accent colour, inverted on the selected
@@ -230,35 +228,45 @@ enum RecordingsPresentation {
 
     /// How a course pane is composed.
     struct CoursePlan: Equatable, Sendable {
-        /// The first section of the list, "Added by link", is present.
-        let showsManualSection: Bool
-        /// The archive's week sections are present.
-        let showsArchiveRows: Bool
-        /// A compact note inside the list standing for the archive's state (only when linked
-        /// lessons are listed; otherwise the archive's own full-size state fills the pane).
+        /// The week sections are present: the archive's recordings and the course's lessons added
+        /// by link, in one list by date (#289).
+        let showsRows: Bool
+        /// A compact note inside the list standing for the archive's state, shown only when
+        /// linked lessons are listed (otherwise the archive's own full-size state fills the
+        /// pane). Only states the student can act on or wait for: loading, sign in,
+        /// unavailable, no key. An empty archive or a search with no archive match is not worth a
+        /// note once the lessons are listed with everything else.
         let inlineNote: ArchivePart?
-        /// The search left no linked lesson and the archive shows only a note: the list says so
-        /// under "Added by link", so the pane never looks like the search ignored them.
-        var manualNoResults = false
+        /// The search matched nothing in the list while a note stands in for the archive: the
+        /// list says so, so the pane never looks like the search ignored the lessons.
+        var noMatches = false
         /// The archive's full-size state, as before linked lessons existed.
         let fullState: ArchivePart?
     }
 
-    /// Linked lessons share the archive's one list, first (#286). Without any, nothing changes:
-    /// the archive's state fills the pane as it always did. With some, an archive that has no rows
-    /// to show (empty, loading, signed out…) shrinks to a note under them, so the lessons stay
-    /// visible and the pane is not split by a second list with a full-size empty state.
+    /// One list per course: the archive's recordings and the lessons added by link share the week
+    /// sections (#289). Without any linked lessons, nothing changes: the archive's state fills the
+    /// pane as it always did. With some, an archive that has no rows to show (empty, loading,
+    /// signed out…) leaves the lessons listed, with a compact note for what the archive is doing
+    /// (`inlineNote`), so they stay visible and the pane is not covered by a full-size empty state.
     /// `hasManual`: the course has linked lessons at all; `manualShownCount`: those the search
     /// leaves. A search matching nothing anywhere keeps the usual "no results" state.
     nonisolated static func coursePlan(hasManual: Bool, manualShownCount: Int, isSearching: Bool = false, archive: ArchivePart) -> CoursePlan {
         guard hasManual else {
-            return CoursePlan(showsManualSection: false, showsArchiveRows: archive == .rows, inlineNote: nil, fullState: archive == .rows ? nil : archive)
+            return CoursePlan(showsRows: archive == .rows, inlineNote: nil, fullState: archive == .rows ? nil : archive)
         }
         if manualShownCount == 0, archive == .noSearchResults {
-            return CoursePlan(showsManualSection: false, showsArchiveRows: false, inlineNote: nil, fullState: .noSearchResults)
+            return CoursePlan(showsRows: false, inlineNote: nil, fullState: .noSearchResults)
         }
-        return CoursePlan(showsManualSection: manualShownCount > 0, showsArchiveRows: archive == .rows, inlineNote: archive == .rows ? nil : archive,
-                          manualNoResults: isSearching && manualShownCount == 0 && archive != .rows, fullState: nil)
+        let showsRows = archive == .rows || manualShownCount > 0
+        let note: ArchivePart? = switch archive {
+        case .rows, .emptyArchive, .noSearchResults: nil
+        case .noKey, .loading, .signIn, .signingIn, .unavailable: archive
+        }
+        // Only a search can leave the lessons and the archive both without a row while a note
+        // stands in; an empty archive with no lessons shown has nothing to say either.
+        let noMatches = !showsRows && isSearching
+        return CoursePlan(showsRows: showsRows, inlineNote: note, noMatches: noMatches, fullState: nil)
     }
 
     /// VoiceOver's label of the sidebar badge counting new lectures: "1 nuova" / "3 nuove" (#195).
@@ -270,18 +278,27 @@ enum RecordingsPresentation {
     /// then the lectures left to watch when there are any (`lecturesToWatchText`), e.g.
     /// "30 registrazioni · 3 da guardare". The lectures left come from the saved summary, so
     /// they show before the listing loads (then alone).
-    static func courseSubtitle(for listing: RecordingsListing?, summary: CourseWatchSummary? = nil) -> String {
+    ///
+    /// `linked`: the course's lessons added by link, counted with the archive's recordings: one
+    /// course, one list (#289). Without a loaded archive listing they still count, so a course
+    /// whose archive is loading, unavailable or has no key doesn't read "No recordings" over
+    /// lessons the student can see.
+    static func courseSubtitle(for listing: RecordingsListing?, summary: CourseWatchSummary? = nil, linked: CourseWatchSummary? = nil) -> String {
+        let linkedCount = linked?.total ?? 0
         let state: String?
         if let count = listing?.recordings?.count {
-            state = count == 0 ? tr("Nessuna registrazione", "No recordings") : recordingCount(count).text
-        } else if listing?.isLoading == true {
-            state = tr("Caricamento…", "Loading…")
-        } else if listing?.problem != nil {
-            state = tr("Non disponibile", "Unavailable")
+            state = count + linkedCount == 0 ? tr("Nessuna registrazione", "No recordings") : recordingCount(count + linkedCount).text
+        } else if listing?.isLoading == true || listing?.problem != nil {
+            // The archive's state is said beside the lessons that are already known, never in
+            // place of them: "2 registrazioni · Caricamento…".
+            let archive = listing?.isLoading == true ? tr("Caricamento…", "Loading…") : tr("Non disponibile", "Unavailable")
+            state = linkedCount > 0 ? "\(recordingCount(linkedCount).text) · \(archive)" : archive
+        } else if linkedCount > 0 {
+            state = recordingCount(linkedCount).text
         } else {
             state = nil
         }
-        let parts = [state, lecturesToWatchText(summary: summary)?.text].compactMap { $0 }
+        let parts = [state, lecturesToWatchText(summary: summary, linked: linked)?.text].compactMap { $0 }
         // A blank line rather than none, so rows keep one height while listings load.
         return parts.isEmpty ? " " : parts.joined(separator: " · ")
     }
@@ -421,8 +438,11 @@ enum RecordingsPresentation {
 
         /// The course header's summary line: `base` ("2026/27 · 30 registrazioni · 36 h"), then
         /// the progress line of `key` when there is one (`watchSummaryText`).
-        func headerLine(_ base: String, for key: RecmanCourseKey) -> String {
-            guard let watched = RecordingsPresentation.watchSummaryText(summaries[key]) else { return base }
+        /// `linked`: the course's lessons added by link, counted with the archive's (#289), only
+        /// once the archive's own summary is known: before its listing loads, "0 of 3 done"
+        /// would claim an archive of nothing.
+        func headerLine(_ base: String, for key: RecmanCourseKey, linked: CourseWatchSummary? = nil) -> String {
+            guard let archive = summaries[key], let watched = RecordingsPresentation.watchSummaryText(linked.map(archive.including) ?? archive) else { return base }
             return "\(base) · \(watched.text)"
         }
     }
@@ -471,14 +491,9 @@ enum RecordingsPresentation {
     struct BulkAction: Equatable {
         let allDone: Bool
         let enabled: Bool
-        var label: BilingualText { label(hasManual: false) }
-
-        func label(hasManual: Bool) -> BilingualText {
-            if hasManual {
-                return allDone ? BilingualText("Segna tutte non viste (archivio)", "Mark all archive lessons unseen") :
-                    BilingualText("Completa tutte (archivio)", "Mark all archive lessons done")
-            }
-            return allDone ? BilingualText("Segna tutte come non viste", "Mark all as unseen") :
+        /// Covers every lesson of the course, linked ones included (#289).
+        var label: BilingualText {
+            allDone ? BilingualText("Segna tutte come non viste", "Mark all as unseen") :
                 BilingualText("Segna tutte come completate", "Mark all as completed")
         }
     }
@@ -663,9 +678,11 @@ struct RecordingsPage: View {
                 // page nor these values. `CourseRow` is `Equatable` on plain values.
                 // The row shows the sidebar name (renamed folder + trailing part); the detail
                 // header keeps the WeBeep name on purpose: owner decision, sidebar and menu only.
+                // The linked lessons' counts of every course, in one pass over the lessons.
+                let linked = recordings.manualLessons.summaries()
                 ForEach(model.searchable) { entry in
                     let summary = authentication.watchSummaries[entry.key]
-                    CourseRow(name: entry.sidebarName, key: entry.key, subtitle: RecordingsPresentation.courseSubtitle(for: recordings.listing(for: entry.key), summary: summary),
+                    CourseRow(name: entry.sidebarName, key: entry.key, subtitle: RecordingsPresentation.courseSubtitle(for: recordings.listing(for: entry.key), summary: summary, linked: linked[entry.course.id]),
                               newCount: RecordingsPresentation.sidebarNewCount(recordings.newCount(for: entry.key), rowKey: entry.key,
                                                                                openKey: destination == .watchlist ? nil : selectedEntry?.key))
                         .equatable()
@@ -780,7 +797,6 @@ struct CourseRecordings: View {
     /// only when the listing, the search, the language, the time zone or the day changes.
     /// `RecmanCourseListDerivation.Inputs` says why each is there.
     @State private var derivation = DerivedValueCache<RecmanCourseListDerivation.Inputs, RecmanCourseListDerivation>()
-    @State private var manualDerivation = DerivedValueCache<RecmanCourseListDerivation.Inputs, RecmanCourseListDerivation>()
     /// Lesson numbers and total minutes, which depend on the listing alone: typing in the search
     /// doesn't sort the whole list again.
     @State private var summaryCache = DerivedValueCache<[RecmanRecording], RecmanCourseListSummary>()
@@ -790,8 +806,15 @@ struct CourseRecordings: View {
     private var listing: RecordingsListing? { key.flatMap { recordings.listing(for: $0) } }
     private var manual: [RecmanRecording] { recordings.manualLessons.recordings(courseID: courseID) }
 
-    private func derivedList(_ list: [RecmanRecording], manual: Bool = false) -> RecmanCourseListDerivation {
-        (manual ? manualDerivation : derivation).value(for: .init(recordings: list, query: query, language: AppLanguage.current, timeZone: .current, now: Date()), compute: RecmanCourseListDerivation.init)
+    /// The course's list as the student sees it: the archive's recordings and the lessons added
+    /// by link, together (#289). The archive's own array when there are no linked lessons, so
+    /// a course without any keeps the cheap shared-storage comparisons of the caches below.
+    private func combined(_ archive: [RecmanRecording]) -> [RecmanRecording] {
+        manual.isEmpty ? archive : archive + manual
+    }
+
+    private func derivedList(_ list: [RecmanRecording]) -> RecmanCourseListDerivation {
+        derivation.value(for: .init(recordings: list, query: query, language: AppLanguage.current, timeZone: .current, now: Date()), compute: RecmanCourseListDerivation.init)
     }
 
     private func summary(_ list: [RecmanRecording]) -> RecmanCourseListSummary {
@@ -820,13 +843,14 @@ struct CourseRecordings: View {
         // `summary` sums the listing's minutes: computed here, where a progress tick doesn't
         // reach, and only joined with the progress line inside the reader.
         let summary = summary
+        let linked = recordings.manualLessons.summaries()[courseID]
         return VStack(alignment: .leading, spacing: 6) {
             Text(name)
                 .font(.title3.weight(.semibold))
                 .lineLimit(3)
                 .fixedSize(horizontal: false, vertical: true)
             WatchProgressReader(recordings: recordings) { progress in
-                let line = key.map { progress.headerLine(summary, for: $0) } ?? summary
+                let line = key.map { progress.headerLine(summary, for: $0, linked: linked) } ?? summary
                 #if DEBUG
                 let _ = RecordingsPageProbes.header?(line)
                 #endif
@@ -848,14 +872,16 @@ struct CourseRecordings: View {
     }
 
     private var toolbar: some View {
-        let hasManual = !manual.isEmpty
+        // The bulk command covers the archive and the linked lessons: one array, built here and not
+        // in the reader's closure, so a progress tick re-compares the same storage (#209).
+        let bulkRecordings = listing?.recordings.map(combined)
         return HStack(spacing: 12) {
             searchField
             Spacer(minLength: 0)
             if let key {
                 WatchProgressReader(recordings: recordings) { progress in
-                    let action = bulkCache.action(for: key, recordings: listing?.recordings, values: progress)
-                    Button(action.label(hasManual: hasManual).text) { recordings.toggleAllDone(key) }
+                    let action = bulkCache.action(for: key, recordings: bulkRecordings, values: progress)
+                    Button(action.label.text) { recordings.toggleAllDone(key, courseID: courseID) }
                         .buttonStyle(.borderless)
                         .font(.callout)
                         .fixedSize()
@@ -883,10 +909,22 @@ struct CourseRecordings: View {
     private var summary: String {
         let year = key?.academicYearLabel ?? ""
         guard let list = listing?.recordings else {
-            return listing?.isLoading == true ? "\(year) · \(tr("caricamento…", "loading…"))" : year
+            let lessons = manual
+            if listing?.isLoading == true {
+                // Loading: the lessons already known are counted beside the archive's state.
+                let count = lessons.isEmpty ? nil : RecordingsPresentation.recordingCount(lessons.count).text
+                return [year, count, tr("caricamento…", "loading…")].compactMap { $0 }.filter { !$0.isEmpty }.joined(separator: " · ")
+            }
+            // No archive list (no key, signed out, unavailable): the linked lessons still count.
+            guard !lessons.isEmpty else { return year }
+            let minutes = lessons.compactMap { RecordingsPresentation.minutes($0.duration) }.reduce(0, +)
+            var parts = [year, RecordingsPresentation.recordingCount(lessons.count).text].filter { !$0.isEmpty }
+            if minutes > 0 { parts.append(RecordingsPresentation.durationText(minutes: minutes)) }
+            return parts.joined(separator: " · ")
         }
-        let minutes = summary(list).totalMinutes
-        var parts = [year, RecordingsPresentation.courseRecordingCount(list.count, hasManual: !manual.isEmpty).text].filter { !$0.isEmpty }
+        // Linked lessons are lessons of the course like the archive's: counted and summed with it.
+        let minutes = summary(list).totalMinutes + manual.compactMap { RecordingsPresentation.minutes($0.duration) }.reduce(0, +)
+        var parts = [year, RecordingsPresentation.recordingCount(list.count + manual.count).text].filter { !$0.isEmpty }
         if minutes > 0 { parts.append(RecordingsPresentation.durationText(minutes: minutes)) }
         return parts.joined(separator: " · ")
     }
@@ -916,22 +954,25 @@ struct CourseRecordings: View {
     }
 
     private var content: some View {
-        // Linked lessons first, the archive after, in one list (#286). Both derivations are cached
-        // (`derivedList`); `RecordingsPresentation.coursePlan` decides what the pane shows.
+        // One list: the archive's recordings and the linked lessons by week (#289). Derived and
+        // cached once (`derivedList`); `RecordingsPresentation.coursePlan` decides what the pane
+        // shows.
         let archiveList = listing?.recordings ?? []
-        let archiveModel = derivedList(archiveList)
-        let manualModel = derivedList(manual, manual: true)
+        let manual = manual
+        let model = derivedList(manual.isEmpty ? archiveList : archiveList + manual)
+        let manualShown = manual.isEmpty ? 0 : model.shown.reduce(0) { $0 + (ManualWebexLesson.isManual($1) ? 1 : 0) }
         let part = RecordingsPresentation.archivePart(
             hasKey: key != nil,
             content: RecordingsPresentation.courseContent(hasList: listing?.recordings != nil, isLoading: listing?.isLoading == true,
                                                           hasProblem: listing?.problem != nil, access: recordings.access),
-            archiveCount: archiveList.count, archiveShownCount: archiveModel.shown.count)
-        let plan = RecordingsPresentation.coursePlan(hasManual: !manual.isEmpty, manualShownCount: manualModel.shown.count, isSearching: !query.isEmpty, archive: part)
+            archiveCount: archiveList.count, archiveShownCount: model.shown.count - manualShown)
+        let plan = RecordingsPresentation.coursePlan(hasManual: !manual.isEmpty, manualShownCount: manualShown, isSearching: !query.isEmpty, archive: part)
         return Group {
             if let full = plan.fullState {
                 fullState(full)
             } else {
-                recordingList(plan, manual: manualModel, archive: archiveModel, numbers: plan.showsArchiveRows ? summary(archiveList).numbers : [:])
+                // Numbers are the archive's lesson order: linked lessons have none.
+                recordingList(plan, model: model, numbers: plan.showsRows ? summary(archiveList).numbers : [:])
             }
         }
         .deleteLessonConfirmation($deleting) { recordings.deleteManualLesson($0) }
@@ -1061,32 +1102,26 @@ struct CourseRecordings: View {
         .tag(recording.id)
     }
 
-    private func recordingList(_ plan: RecordingsPresentation.CoursePlan, manual manualModel: RecmanCourseListDerivation, archive archiveModel: RecmanCourseListDerivation, numbers: [String: Int]) -> some View {
-        let firstID = (plan.showsManualSection ? manualModel.shown.first : archiveModel.shown.first)?.id
+    private func recordingList(_ plan: RecordingsPresentation.CoursePlan, model: RecmanCourseListDerivation, numbers: [String: Int]) -> some View {
+        let firstID = model.sections.first?.recordings.first?.id
         // One set per `body` instead of a scan of every bookmark for every row.
         let watchlisted = Set(recordings.study.bookmarks.map(\.id))
         // Sections, filtering and numbering stay here (this view doesn't observe the progress
         // model); a tick re-runs only the reader's closure below, see `WatchProgressReader`.
         return WatchProgressReader(recordings: recordings) { progress in
             List(selection: $selection) {
-                if plan.showsManualSection {
-                    // Never numbered: the numbers are the archive's lesson order.
-                    Section(tr("Aggiunte con link", "Added by link")) {
-                        ForEach(manualModel.shown) { courseRow($0, number: nil, watchlisted: watchlisted, progress: progress, firstID: firstID) }
-                    }
-                }
-                if plan.showsArchiveRows {
-                    ForEach(archiveModel.sections, id: \.title) { section in
+                if plan.showsRows {
+                    ForEach(model.sections, id: \.title) { section in
                         Section(section.title) {
                             ForEach(section.recordings) { courseRow($0, number: numbers[$0.id], watchlisted: watchlisted, progress: progress, firstID: firstID) }
                         }
                     }
                 }
-                if plan.manualNoResults {
-                    Section(tr("Aggiunte con link", "Added by link")) { noteText(tr("Nessun risultato", "No results")) }
+                if plan.noMatches {
+                    Section { noteText(tr("Nessun risultato", "No results")) }
                 }
                 if let note = plan.inlineNote {
-                    Section(tr("Archivio", "Archive")) { archiveNote(note) }
+                    Section { archiveNote(note) }
                 }
             }
         }
@@ -1096,7 +1131,7 @@ struct CourseRecordings: View {
         // sits on the reader, not on the `List` inside it; SwiftUI still hands it to the list
         // (`courseListMenuAndPrimaryActionReachTheList` drives the real AppKit list, #198).
         .contextMenu(forSelectionType: String.self) { ids in
-            if let recording = ids.first.flatMap({ manualModel.byID[$0] ?? archiveModel.byID[$0] }) {
+            if let recording = ids.first.flatMap({ model.byID[$0] }) {
                 // Really the browser: Play (double click, Return, the row's button) is BeepBar's
                 // own player since #148, and this item is the way around it.
                 RecordingMenuItems(
@@ -1105,7 +1140,7 @@ struct CourseRecordings: View {
                     perform: { perform($0, on: recording) })
             }
         } primaryAction: { ids in
-            if let recording = ids.first.flatMap({ manualModel.byID[$0] ?? archiveModel.byID[$0] }) { recordings.play(recording) }
+            if let recording = ids.first.flatMap({ model.byID[$0] }) { recordings.play(recording) }
         }
     }
 }

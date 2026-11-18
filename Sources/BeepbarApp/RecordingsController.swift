@@ -318,6 +318,13 @@ struct RecordingsListing: Equatable {
     private var resumePoints: RecordingResumePoints?
     /// A recovery ran with no Recordings page on screen: the browser it opened closes after it.
     private var closesBrowserWhenIdle = false
+    /// Cancels the running `.learn` lookup when something else is queued (see `queue`).
+    private func cancelLearnIfBlocking() {
+        if runningLearn != nil, queue.contains(where: { if case .learn = $0 { false } else { true } }) { runningLearn?.cancel() }
+    }
+    /// The lookup of an added lesson's details, if one is running: a Play cancels it, so a Play
+    /// never waits behind it.
+    private var runningLearn: Task<RecordingStream, Error>?
     /// The generation of a recovery or Play executing outside the queue. An invalidated
     /// worker must neither keep the browser alive nor clear a newer worker's running state.
     private var runningRecoveryGeneration: Int?
@@ -516,6 +523,9 @@ struct RecordingsListing: Equatable {
         /// A lecture in the player went wrong (#148): not a click, so it changes no spinner.
         /// `start` is `lectureStarts` when the failure was reported: which item failed.
         case recover(RecmanRecording, Recovery, start: Int)
+        /// What Webex says about a lesson just added by link (its date and length), for the
+        /// account `owner` (#289). Quiet and best effort: see `learnAddedLesson`.
+        case learn(String, owner: Int)
     }
 
     /// What to do about a lecture that failed in the player.
@@ -529,6 +539,12 @@ struct RecordingsListing: Equatable {
     /// Every click, including a cached player, replaces older Play/Copy effects and errors.
     private var openingRequest = 0
     private var queue: [Job] = []
+    {
+        // A quiet `.learn` lookup (#289) can hold the serial worker for up to a minute on a stalled
+        // Webex: anything else queued is something the student asked for, so it never waits
+        // behind it. Covers every `open` action, listings and recoveries in one place.
+        didSet { cancelLearnIfBlocking() }
+    }
     private var runningKey: RecmanCourseKey?
     private var worker: Task<Void, Never>?
     private var signInTask: Task<Void, Never>?
@@ -790,7 +806,30 @@ struct RecordingsListing: Equatable {
         catch ManualWebexLessons.AddError.duplicate { return .failure(.duplicate) }
         catch { return .failure(.invalidLink) }
         guard saveManualLessons(updated, owner: owner) else { return .failure(.saveFailed) }
+        requestAddedLessonDetails(lesson, owner: owner)
         return .success(lesson)
+    }
+
+    /// The lesson is already saved with its added-date; this only tries to improve it, so the
+    /// add never waits for Webex. Skipped unless the archive session is ready: the lookup runs on
+    /// the worker with the saved cookies, and with none of Webex's the Play fills it in later.
+    private func requestAddedLessonDetails(_ lesson: ManualWebexLesson, owner: Int) {
+        guard isEnabled, access == .ready else { return }
+        queue.append(.learn(lesson.id, owner: owner))
+        if visiblePages == 0 { closesBrowserWhenIdle = true }
+        startWorker()
+    }
+
+    /// Applies what Webex said about a lesson added by link, only if it is still the same lesson
+    /// of the same account (deleted, account changed, feature off: dropped). Date and length
+    /// only: `learn` never replaces a date or length with nothing, never a known date, and the
+    /// title stays the student's (or empty until a Play, as before).
+    private func applyAddedLessonDetails(id: String, owner: Int, stream: RecordingStream) {
+        guard manualLessonsWriter == owner, var lesson = manualLessons.lesson(id: id),
+              lesson.learn(title: nil, duration: stream.duration, recordedAt: stream.recordedAt) else { return }
+        var updated = manualLessons
+        updated.replace(lesson)
+        if !saveManualLessons(updated, owner: owner) { log.error("Couldn't save what Webex said of an added lesson") }
     }
 
     /// Writes `updated` under `owner`'s key and publishes it; false (nothing published) when it
@@ -886,14 +925,27 @@ struct RecordingsListing: Equatable {
     }
 
     /// What a Play of a manual lesson learned from Webex (`ManualWebexLesson.learn`): its title
-    /// when the student gave none, and its length, saved so the row shows both from now on.
+    /// when the student gave none, its length and the date it was recorded, saved so the row shows
+    /// them from now on.
     /// Only from a fresh stream answer, and only for the account that owns the lesson.
     private func learnManualDetails(of recording: RecmanRecording, from stream: RecordingStream) {
         guard ManualWebexLesson.isManual(recording), let owner = manualLessonsWriter,
-              var lesson = manualLessons.lesson(id: recording.id), lesson.learn(title: stream.title, duration: stream.duration) else { return }
+              var lesson = manualLessons.lesson(id: recording.id), lesson.learn(title: stream.title, duration: stream.duration, recordedAt: stream.recordedAt) else { return }
         var updated = manualLessons
         updated.replace(lesson)
         if !saveManualLessons(updated, owner: owner) { log.error("Couldn't save what a Play learned of a manual lesson") }
+    }
+
+    /// A manual lesson without a saved length takes the player's own (a checkpoint's `duration`),
+    /// for when Webex's answer gave none usable (it once did not: the API's milliseconds were
+    /// read as seconds and refused). Never replaces a length already known.
+    private func learnManualLength(of recording: RecmanRecording, seconds: TimeInterval?) {
+        guard let seconds, ManualWebexLesson.isManual(recording), let owner = manualLessonsWriter,
+              var lesson = manualLessons.lesson(id: recording.id), lesson.durationSeconds == nil,
+              lesson.learn(title: nil, duration: seconds) else { return }
+        var updated = manualLessons
+        updated.replace(lesson)
+        if !saveManualLessons(updated, owner: owner) { log.error("Couldn't save a manual lesson's length") }
     }
 
     /// The watchlist toggle of an archive lesson. A lesson added by link is always in the
@@ -1196,7 +1248,7 @@ struct RecordingsListing: Equatable {
         scheduledRecovery != nil || runningRecoveryGeneration == generation || runningPlayGeneration == generation || queue.contains { job in
             switch job {
             case .recover, .open(_, .play, _): true
-            case .list, .open: false
+            case .list, .open, .learn: false
             }
         }
     }
@@ -1374,6 +1426,8 @@ struct RecordingsListing: Equatable {
             cancelScheduledRecovery()
             // A newer Play stops the one being looked up rather than waiting for it (#194).
             runningPlay?.task.cancel()
+            // And an added lesson's quiet lookup (#289), which the Play would otherwise wait for.
+            runningLearn?.cancel()
         }
         openingProblem = nil
         openingRecordingID = recording.id
@@ -1414,7 +1468,7 @@ struct RecordingsListing: Equatable {
     private static func isOpening(_ job: Job) -> Bool {
         switch job {
         case .open, .recover: true
-        case .list: false
+        case .list, .learn: false
         }
     }
 
@@ -1805,8 +1859,10 @@ struct RecordingsListing: Equatable {
             let saved = await savedSession()
             guard generation == self.generation else { return }
             await browser.open(cookies: saved.cookies)
-            // Taken by this opening, whatever the entry's outcome (#234).
-            consumeCandidate(saved.candidateSerial)
+            // Taken by this opening, whatever the entry's outcome (#234), unless only quiet
+            // lookups (`.learn`) opened it: they never save the session, so the candidate stays
+            // for the next real opening.
+            if !queue.allSatisfy({ if case .learn = $0 { true } else { false } }) { consumeCandidate(saved.candidateSerial) }
             if saved.candidateSerial != nil { fileFallback = saved.fileCookies }
         }
         guard generation == self.generation else { return }
@@ -1863,6 +1919,25 @@ struct RecordingsListing: Equatable {
                     defer { if runningRecoveryGeneration == generation { runningRecoveryGeneration = nil; runningRecovery = nil } }
                     try await recoverPlayback(recording, recovery, start: start, browser: browser, generation: generation)
                     guard generation == self.generation else { return }
+                case .learn(let id, let owner):
+                    // Best effort and silent: whatever goes wrong (no Webex session, offline, a
+                    // Play cancelling it) leaves the lesson as it was and tells nobody. Only the
+                    // worker's own cancellation ends the drain.
+                    guard manualLessonsWriter == owner, let recording = manualLessons.lesson(id: id)?.recording else { continue }
+                    let lookup = Task { try await browser.quietStream(for: recording) }
+                    runningLearn = lookup
+                    cancelLearnIfBlocking()
+                    defer { runningLearn = nil }
+                    let stream: RecordingStream?
+                    do {
+                        stream = try await withTaskCancellationHandler { try await lookup.value } onCancel: { lookup.cancel() }
+                    } catch {
+                        stream = nil
+                        log.notice("Added lesson's Webex details not available")
+                    }
+                    guard generation == self.generation else { return }
+                    if let stream { applyAddedLessonDetails(id: id, owner: owner, stream: stream) }
+                    continue
                 }
                 succeeded = true
             } catch {
@@ -2099,7 +2174,7 @@ struct RecordingsListing: Equatable {
                 let enhancer = currentAudioEnhancer()
                 let kind = preferredEnhancedAudioKind
                 if defaults.bool(forKey: Self.prefersEnhancedAudioKey), enhancer.canStart(key), let url = enhancer.start(key: key, stream: stream.url, kind: kind) {
-                    played = RecordingStream(url: url, title: stream.title, duration: stream.duration)
+                    played = RecordingStream(url: url, title: stream.title, duration: stream.duration, recordedAt: stream.recordedAt)
                     enhancedAudioInUse = kind
                 }
             } else {
@@ -2277,7 +2352,7 @@ struct RecordingsListing: Equatable {
                 publishAudioState()
                 return
             }
-            target = RecordingStream(url: url, title: lecture.stream.title, duration: lecture.stream.duration)
+            target = RecordingStream(url: url, title: lecture.stream.title, duration: lecture.stream.duration, recordedAt: lecture.stream.recordedAt)
             defaults.set(kind.rawValue, forKey: Self.enhancedAudioKindKey)
         } else {
             enhancer.stop()
@@ -2522,6 +2597,7 @@ struct RecordingsListing: Equatable {
         if let fraction = RecordingWatchProgress.fraction(position: checkpoint.position, playerDuration: checkpoint.duration, archiveMinutes: recording.minutes) {
             session.progress.observe(fraction)
         }
+        learnManualLength(of: recording, seconds: checkpoint.duration)
         let closes = RecordingWatchProgress.checkpointCloses(reason: checkpoint.reason, reportedID: checkpoint.id, nextID: pendingPlayID)
         sessions[checkpoint.id] = closes ? nil : session
         if !closes { publishLive(of: recording) }
@@ -2582,21 +2658,49 @@ struct RecordingsListing: Equatable {
     /// the whole set. Entries publish only after the commit, through `setEntries`, which writes
     /// `entries` and `known` once each (each bumps `stateRevision`, which the toolbar's
     /// `BulkActionCache` relies on, #209).
-    func toggleAllDone(_ key: RecmanCourseKey) {
-        let recordings = listings[key]?.recordings
+    ///
+    /// It covers every lesson of the course: the archive's (`key`) and the ones added by link and
+    /// assigned to `courseID` (#289), whose progress lives in the lessons' own store
+    /// (`applyManualProgress`), not the history. The two stores are one all-or-nothing change:
+    /// the lessons are saved first, synchronously, and put back as they were if the archive's
+    /// transaction then fails, is cancelled or is overtaken by an account change; a lessons save
+    /// that fails stops before the archive is touched. Both show the history banner. The linked
+    /// lessons' rows are pending with the archive's for the whole operation.
+    func toggleAllDone(_ key: RecmanCourseKey, courseID: Int64? = nil) {
+        let archive = listings[key]?.recordings
+        let linked = courseID.map { manualLessons.recordings(courseID: $0) } ?? []
         let action = RecordingsPresentation.WatchValues(watchProgress, canEdit: canEditProgress)
-            .bulkAction(for: key, recordings: recordings)
-        guard action.enabled, let recordings, let owner = resumeOwner(),
-              recordings.allSatisfy({ Self.courseKey(of: $0) == key }) else { return }
+            .bulkAction(for: key, recordings: archive.map { $0 + linked })
+        guard action.enabled, let recordings = archive, let owner = resumeOwner(),
+              recordings.allSatisfy({ Self.courseKey(of: $0) == key }),
+              linked.isEmpty || manualLessonsWriter == owner else { return }
         let done = !action.allDone
-        let identities = Set(recordings.map(RecordingsStudyState.identity))
+        let identities = Set((recordings + linked).map(RecordingsStudyState.identity))
         if !done {
-            for recording in recordings {
+            for recording in recordings + linked {
                 sessions[recording.id]?.progress.resetCrossing()
                 untickCounts[RecordingsStudyState.identity(recording), default: 0] += 1
             }
         }
         watchProgress.setPending(true, for: identities, course: key)
+        // The linked lessons, before anything else is queued: what each one's mark was, to put
+        // back if the archive's part doesn't commit.
+        var previousMarks: [String: LinkedMark] = [:]
+        if !linked.isEmpty {
+            var updated = manualLessons
+            for row in linked {
+                guard var lesson = updated.lesson(id: row.id), let marked = RecordingWatchProgress.setManual(lesson.progress, done: done) else { continue }
+                previousMarks[lesson.id] = LinkedMark(before: lesson.progress, marked: marked)
+                lesson.progress = marked
+                updated.replace(lesson)
+            }
+            if !previousMarks.isEmpty, !saveManualLessons(updated, owner: owner) {
+                watchProgress.setPending(false, for: identities, course: key)
+                listings[key]?.problem = .historyUnavailable
+                log.error("Couldn't save the linked lessons' done marks")
+                return
+            }
+        }
         let token = UUID()
         bulkTokens[key] = token
         let history = seenHistory
@@ -2606,7 +2710,9 @@ struct RecordingsListing: Equatable {
             await previous?.value
             await reset?.value
             guard let self else { return }
+            var archiveCommitted = false
             defer {
+                if !archiveCommitted { self.restoreLinkedMarks(previousMarks, owner: owner, history: history) }
                 if self.bulkTokens[key] == token {
                     self.bulkTokens[key] = nil
                     self.watchProgress.setPending(false, for: identities, course: key)
@@ -2626,6 +2732,10 @@ struct RecordingsListing: Equatable {
             }
             // Same second check as `commitProgress`: the WeBeep account can change without a
             // reset, and then only this keeps the old account's entries off the screen.
+            // The transaction has committed from here on, whatever the checks below say: the
+            // archive's marks are saved, so the linked lessons' must stay too (restoring them
+            // would leave the course half marked). The checks only decide what is shown.
+            archiveCommitted = true
             guard self.isCurrentIdentity(history, owner: owner), results.count == recordings.count else { return }
             var committed: [String: RecordingWatchEntry] = [:]
             var completed: [String] = []
@@ -2644,6 +2754,59 @@ struct RecordingsListing: Equatable {
                 self.clearSavedNextIfCompleted(recording, in: key)
             }
             self.scheduleAcknowledge(completed, for: key)
+        }
+    }
+
+    /// A linked lesson's progress before a bulk change and what the change set it to.
+    private struct LinkedMark { let before: RecordingWatchEntry?; let marked: RecordingWatchEntry }
+
+    /// Puts linked lessons' done marks back after a bulk change whose archive part didn't commit
+    /// (`toggleAllDone`). Best effort, logged when it can't be saved.
+    /// - Skipped entirely when the history was reset meanwhile (`seenHistory !== history`): a
+    ///   reset forgets all progress, including the lessons' (`forgetSeen`), so nothing is left to
+    ///   put back.
+    /// - Done against the lessons of `owner`, the account that clicked, even when another account
+    ///   is current by now: an account change that forgets nothing must not leave that account's
+    ///   linked lessons marked while its archive isn't. The current account's lessons are in
+    ///   `manualLessons` (saved through `saveManualLessons`); another's are read from and written
+    ///   to its own key, and an unreadable list is left alone (never overwritten).
+    /// - Per lesson, a mark is put back only while the lesson still holds exactly what the change
+    ///   set; a completion that appeared meanwhile (a lecture played past the threshold) is kept.
+    ///   The furthest point is always the larger of the two.
+    /// - Nothing is saved when no lesson changed.
+    private func restoreLinkedMarks(_ previous: [String: LinkedMark], owner: Int, history: RecordingsSeenHistory) {
+        guard !previous.isEmpty, seenHistory === history else { return }
+        let isCurrent = manualLessonsWriter == owner
+        var lessons: ManualWebexLessons
+        if isCurrent {
+            lessons = manualLessons
+        } else {
+            guard let data = defaults.data(forKey: Self.manualLessonsKey(owner: owner)),
+                  let stored = try? PropertyListDecoder().decode(ManualWebexLessons.self, from: data) else { return }
+            lessons = stored
+        }
+        var changed = false
+        for (id, mark) in previous {
+            guard var lesson = lessons.lesson(id: id), let current = lesson.progress,
+                  current.completed == mark.marked.completed, current.autoCompletionBlocked == mark.marked.autoCompletionBlocked else { continue }
+            let furthest = max(current.furthest, mark.before?.furthest ?? 0)
+            let restored: RecordingWatchEntry? = if let before = mark.before {
+                RecordingWatchEntry(furthest: furthest, completed: before.completed, autoCompletionBlocked: before.autoCompletionBlocked)
+            } else {
+                furthest > 0 ? RecordingWatchEntry(furthest: furthest, completed: nil, autoCompletionBlocked: false) : nil
+            }
+            guard restored != lesson.progress else { continue }
+            lesson.progress = restored
+            lessons.replace(lesson)
+            changed = true
+        }
+        guard changed else { return }
+        if isCurrent {
+            if !saveManualLessons(lessons, owner: owner) { log.error("Couldn't put the linked lessons' done marks back") }
+        } else if let data = try? PropertyListEncoder().encode(lessons) {
+            defaults.set(data, forKey: Self.manualLessonsKey(owner: owner))
+        } else {
+            log.error("Couldn't put the linked lessons' done marks back")
         }
     }
 
@@ -3264,9 +3427,9 @@ struct RecordingsListing: Equatable {
             openingProblem = problem
             // `openingProblem` is shown by the page; with none on screen a menu Play asks for it.
             needsPage = takeMenuPlayNeedingPage(failing: job, queued: false)
-        case .recover:
+        case .recover, .learn:
             // Not a click: `recoverPlayback` already told the lecture's window (#197) and only
-            // rethrows a cancellation or a lapsed session.
+            // rethrows a cancellation or a lapsed session. `.learn` never throws out of `drain`.
             break
         }
         // Offline or Polimi down: every other request would wait for the same timeout.
@@ -3279,7 +3442,7 @@ struct RecordingsListing: Equatable {
             // A Play or Copy still waiting is dropped with the rest: it says why instead of the
             // click doing nothing.
             case .open: openingProblem = problem
-            case .recover: break
+            case .recover, .learn: break
             }
         }
         clearQueue(background: .unavailable)

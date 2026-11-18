@@ -60,8 +60,17 @@ struct RecmanStreamFailure: Error {
     /// failure after the player link was found may come wrapped in `RecmanStreamFailure`, which
     /// hands the link back for that fallback.
     func stream(for recording: RecmanRecording, email: PolimiEmail?) async throws -> RecordingStream
+    /// What Webex says about a lesson added by link (its date and length), asked when the lesson
+    /// is added (#289) and never for a Play: with the Webex cookies already in the browser, it
+    /// never signs in and never shows a window, so a missing or lapsed Webex session simply
+    /// throws and the lesson keeps its added-date until its first Play. Default: unavailable.
+    func quietStream(for recording: RecmanRecording) async throws -> RecordingStream
     /// Stops whatever is running and discards the browser and its cookies.
     func close()
+}
+
+extension RecmanBrowsing {
+    func quietStream(for recording: RecmanRecording) async throws -> RecordingStream { throw RecmanBrowserError.playbackUnavailable }
 }
 
 /// The hidden browser that reaches Polimi's lecture-recordings archive (Recman) and reads it.
@@ -347,10 +356,21 @@ struct RecmanStreamFailure: Error {
         }
     }
 
+    func quietStream(for recording: RecmanRecording) async throws -> RecordingStream {
+        guard let player = ManualWebexLesson.playerLink(for: recording) else { throw RecmanBrowserError.playbackUnavailable }
+        // No email: `WebexStreamResolver.stream` stops with `needsEmail` where it would otherwise
+        // sign in, so this path can never start a Webex sign-in or put a window on screen.
+        return try await stream(player: player, email: nil, interactive: false)
+    }
+
     /// The stream of the player link `player`, as an operation of its own: the second half of
     /// `stream(for:email:)`, separate so `RecmanWebSessionTests` can start from a player link
     /// without Polimi's archive.
-    func stream(player: URL, email: PolimiEmail?) async throws -> RecordingStream {
+    ///
+    /// `interactive`: whether a Webex sign-in may show its window. A Play is the user's own
+    /// request, so it may; the quiet lookup at add time (`quietStream`) passes false and, with
+    /// no email, never reaches a sign-in at all.
+    func stream(player: URL, email: PolimiEmail?, interactive: Bool = true) async throws -> RecordingStream {
         let operation = beginOperation()
         let resolver = WebexStreamResolver(
             transport: webexTransport,
@@ -359,10 +379,10 @@ struct RecmanStreamFailure: Error {
         let driver = WebexSignInDriver(
             cookies: { [weak self] in await self?.cookies() ?? [] },
             forgetTicket: { [weak self] in await self?.forgetWebexTicket() },
-            // A Play is always the user's own request, so the sign-in may show its window.
+            // A Play may show the sign-in window (it is the user's own request); the quiet lookup may not.
             signIn: { [weak self] url in
                 guard let self else { throw CancellationError() }
-                try await self.signInToWebex(loginURL: url, interactive: true, operation: operation)
+                try await self.signInToWebex(loginURL: url, interactive: interactive, operation: operation)
             },
             ensureCurrent: { [weak self] in
                 guard let self else { throw CancellationError() }

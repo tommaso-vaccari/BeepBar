@@ -177,6 +177,16 @@ public struct CourseWatchSummary: Codable, Equatable, Sendable {
                            unknownDurationCount: unknownDurationCount, next: next, newCount: newCount)
     }
 
+    /// This summary with the counts of a course's linked lessons (`ManualWebexLessons.summaries`)
+    /// added, for the course header and the sidebar only. `next` and `newCount` stay the
+    /// archive's: they feed the menu bar and the notifications, which linked lessons never reach,
+    /// so the result must never be saved.
+    public func including(_ linked: CourseWatchSummary) -> CourseWatchSummary {
+        CourseWatchSummary(done: done + linked.done, total: total + linked.total,
+                           remainingMinutes: remainingMinutes + linked.remainingMinutes,
+                           unknownDurationCount: unknownDurationCount + linked.unknownDurationCount, next: next, newCount: newCount)
+    }
+
     private enum CodingKeys: String, CodingKey {
         case done, total, remainingMinutes, unknownDurationCount, next, newCount
     }

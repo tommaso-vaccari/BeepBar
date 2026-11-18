@@ -29,16 +29,42 @@ struct RecordingsPresentationTests {
         #expect(!allowed(42, 42, 7, [8]))
     }
 
-    /// The mixed course labels must state which lessons the archive controls affect.
-    @Test func mixedCourseLabelsIdentifyArchive() {
+    /// The bulk command names the whole course: linked lessons are part of the list, so there is
+    /// no "archive" wording any more (#289).
+    @Test func bulkLabelsNameTheWholeCourse() {
         let pending = RecordingsPresentation.BulkAction(allDone: false, enabled: true)
         let done = RecordingsPresentation.BulkAction(allDone: true, enabled: true)
-        #expect(pending.label(hasManual: true).english == "Mark all archive lessons done")
-        #expect(done.label(hasManual: true).english == "Mark all archive lessons unseen")
-        #expect(pending.label(hasManual: false).english == "Mark all as completed")
-        #expect(RecordingsPresentation.courseRecordingCount(2, hasManual: true).english == "2 archived recordings")
-        #expect(RecordingsPresentation.courseRecordingCount(1, hasManual: false).english == "1 recording")
+        #expect(pending.label.english == "Mark all as completed")
+        #expect(done.label.english == "Mark all as unseen")
     }
+
+    /// The sidebar counts a course's linked lessons with its archive (#289): in the recording
+    /// count, also before the archive's listing is known, and in "to watch", which is the
+    /// archive's saved summary plus the linked lessons not done. Without linked lessons nothing
+    /// changes. Guards against a course reading "No recordings" over visible lessons.
+    @Test func sidebarCountsIncludeLinkedLessons() {
+        func counts(done: Int, total: Int, minutes: Int = 0) -> CourseWatchSummary {
+            CourseWatchSummary(done: done, total: total, remainingMinutes: minutes, unknownDurationCount: 0)
+        }
+        let archive = counts(done: 7, total: 10)
+        let linked = counts(done: 1, total: 3)
+        let listing = RecordingsListing(recordings: [recording("a", "2026-10-01T10:00:00Z")])
+        #expect(RecordingsPresentation.courseSubtitle(for: listing, summary: nil, linked: linked) == "4 registrazioni · 2 da guardare")
+        #expect(RecordingsPresentation.courseSubtitle(for: RecordingsListing(recordings: []), summary: nil, linked: linked) == "3 registrazioni · 2 da guardare")
+        #expect(RecordingsPresentation.courseSubtitle(for: nil, summary: nil, linked: linked) == "3 registrazioni · 2 da guardare")
+        #expect(RecordingsPresentation.lecturesToWatchText(summary: archive, linked: linked) == BilingualText("5 da guardare", "5 to watch"))
+        #expect(RecordingsPresentation.lecturesToWatchText(summary: counts(done: 10, total: 10), linked: counts(done: 3, total: 3)) == nil)
+        #expect(RecordingsPresentation.lecturesToWatchText(summary: archive, linked: nil) == BilingualText("3 da guardare", "3 to watch"))
+        #expect(RecordingsPresentation.courseSubtitle(for: listing) == "1 registrazione")
+        // While the archive loads or fails, its state is said beside the lessons, not over them.
+        var loading = RecordingsListing(); loading.isLoading = true
+        var failed = RecordingsListing(); failed.problem = .unavailable
+        #expect(RecordingsPresentation.courseSubtitle(for: loading, summary: nil, linked: linked) == "3 registrazioni · Caricamento… · 2 da guardare")
+        #expect(RecordingsPresentation.courseSubtitle(for: failed, summary: nil, linked: linked) == "3 registrazioni · Non disponibile · 2 da guardare")
+        #expect(RecordingsPresentation.courseSubtitle(for: loading) == "Caricamento…")
+        #expect(RecordingsPresentation.courseSubtitle(for: failed) == "Non disponibile")
+    }
+
 
     /// Courses with the same cleaned title remain distinguishable by year or by their stable ID.
     @Test func manualPickerDistinguishesSameCourseNames() {
@@ -345,32 +371,57 @@ extension RecordingsPresentationTests {
         }
     }
 
-    /// The course pane: linked lessons first and, when the archive has nothing to list, a compact
-    /// note instead of the full-size state; without linked lessons nothing changes.
-    @Test func coursePlanKeepsLinkedLessonsVisibleOverAnEmptyArchive() {
+    /// Linked lessons join the archive's week sections by their date (#289): one played and dated
+    /// by Webex lands in its own week, one not yet played under the week it was added; the search
+    /// filters both; and the archive's numbering is unchanged, with no number for a linked lesson.
+    /// Guards against an old recording sorting under "This week" and against numbers shifting.
+    @Test func linkedLessonsJoinTheWeekSectionsByDateWithoutNumbers() throws {
+        let archive = [recording("a", "2026-10-01T10:00:00Z", title: "Fourier"), recording("b", "2026-10-02T10:00:00Z", title: "Laplace")]
+        let link = { (id: String) in URL(string: "https://politecnicomilano.webex.com/ldr.php?RCID=\(id)")! }
+        let formatter = ISO8601DateFormatter()
+        var dated = ManualWebexLesson(id: "manual-d", title: "lab1", courseName: "", link: link("d"), addedAt: formatter.date(from: "2026-10-06T09:00:00Z")!)
+        _ = dated.learn(title: nil, duration: nil, recordedAt: formatter.date(from: "2026-10-01T15:00:00Z")!)
+        let undated = ManualWebexLesson(id: "manual-u", title: "lab2", courseName: "", link: link("u"), addedAt: formatter.date(from: "2026-10-06T09:00:00Z")!)
+        let list = archive + [dated.recording, undated.recording]
+        let derived = RecmanCourseListDerivation(.init(recordings: list, query: "", language: .english, timeZone: TimeZone(identifier: "UTC")!, now: formatter.date(from: "2026-10-06T10:00:00Z")!))
+        #expect(derived.sections.map { $0.recordings.map(\.id) } == [["manual-u"], ["b", "manual-d", "a"]])
+        #expect(RecmanCourseListDerivation(.init(recordings: list, query: "lab1", language: .english, timeZone: TimeZone(identifier: "UTC")!, now: .now)).shown.map(\.id) == ["manual-d"])
+        let numbers = RecordingsPresentation.numbers(archive)
+        #expect(numbers == ["a": 1, "b": 2] && numbers["manual-d"] == nil)
+    }
+
+    /// The course pane is one list (#289): linked lessons are rows of the week sections with the
+    /// archive's. When the archive has no rows, the lessons stay and what the archive is doing
+    /// becomes a compact note; an empty archive or an archive search with no match needs no note
+    /// once the lessons are listed. Without linked lessons nothing changes.
+    @Test func coursePlanListsLinkedLessonsWithTheArchive() {
         let P = RecordingsPresentation.self
+        typealias Plan = RecordingsPresentation.CoursePlan
         // No linked lessons: the archive's own state fills the pane, exactly as before.
         for part: RecordingsPresentation.ArchivePart in [.emptyArchive, .noSearchResults, .noKey, .loading, .signIn, .signingIn, .unavailable] {
-            let plan = P.coursePlan(hasManual: false, manualShownCount: 0, archive: part)
-            #expect(plan == .init(showsManualSection: false, showsArchiveRows: false, inlineNote: nil, fullState: part))
+            #expect(P.coursePlan(hasManual: false, manualShownCount: 0, archive: part) == Plan(showsRows: false, inlineNote: nil, fullState: part))
         }
-        #expect(P.coursePlan(hasManual: false, manualShownCount: 0, archive: .rows) == .init(showsManualSection: false, showsArchiveRows: true, inlineNote: nil, fullState: nil))
-        // Linked lessons and an archive with rows: manual section first, then the weeks.
-        #expect(P.coursePlan(hasManual: true, manualShownCount: 2, archive: .rows) == .init(showsManualSection: true, showsArchiveRows: true, inlineNote: nil, fullState: nil))
-        // Linked lessons and an archive with nothing to list: the lessons stay, the state shrinks to a note.
-        for part: RecordingsPresentation.ArchivePart in [.emptyArchive, .noKey, .loading, .signIn, .signingIn, .unavailable] {
-            #expect(P.coursePlan(hasManual: true, manualShownCount: 1, archive: part) == .init(showsManualSection: true, showsArchiveRows: false, inlineNote: part, fullState: nil))
+        #expect(P.coursePlan(hasManual: false, manualShownCount: 0, archive: .rows) == Plan(showsRows: true, inlineNote: nil, fullState: nil))
+        // Linked lessons and an archive with rows: one list.
+        #expect(P.coursePlan(hasManual: true, manualShownCount: 2, archive: .rows) == Plan(showsRows: true, inlineNote: nil, fullState: nil))
+        // Linked lessons and an archive with nothing to list: the lessons stay; the note says only
+        // what the student can wait for or act on (sign in, key, loading, unavailable).
+        for part: RecordingsPresentation.ArchivePart in [.noKey, .loading, .signIn, .signingIn, .unavailable] {
+            #expect(P.coursePlan(hasManual: true, manualShownCount: 1, archive: part) == Plan(showsRows: true, inlineNote: part, fullState: nil))
         }
-        // A search that leaves only one side still shows that side with the other's note.
-        #expect(P.coursePlan(hasManual: true, manualShownCount: 1, archive: .noSearchResults) == .init(showsManualSection: true, showsArchiveRows: false, inlineNote: .noSearchResults, fullState: nil))
-        #expect(P.coursePlan(hasManual: true, manualShownCount: 0, archive: .rows) == .init(showsManualSection: false, showsArchiveRows: true, inlineNote: nil, fullState: nil))
-        // A search that leaves no linked lesson while the archive shows only a note says so.
+        for part: RecordingsPresentation.ArchivePart in [.emptyArchive, .noSearchResults] {
+            #expect(P.coursePlan(hasManual: true, manualShownCount: 1, archive: part) == Plan(showsRows: true, inlineNote: nil, fullState: nil))
+        }
+        // A search that leaves only the archive's rows.
+        #expect(P.coursePlan(hasManual: true, manualShownCount: 0, archive: .rows) == Plan(showsRows: true, inlineNote: nil, fullState: nil))
+        // A search that leaves nothing in the list while the archive shows only a note says so.
         #expect(P.coursePlan(hasManual: true, manualShownCount: 0, isSearching: true, archive: .loading)
-                == .init(showsManualSection: false, showsArchiveRows: false, inlineNote: .loading, manualNoResults: true, fullState: nil))
-        #expect(P.coursePlan(hasManual: true, manualShownCount: 0, isSearching: false, archive: .loading).manualNoResults == false)
-        #expect(P.coursePlan(hasManual: true, manualShownCount: 0, isSearching: true, archive: .rows).manualNoResults == false)
+                == Plan(showsRows: false, inlineNote: .loading, noMatches: true, fullState: nil))
+        #expect(P.coursePlan(hasManual: true, manualShownCount: 0, isSearching: true, archive: .emptyArchive)
+                == Plan(showsRows: false, inlineNote: nil, noMatches: true, fullState: nil))
+        #expect(P.coursePlan(hasManual: true, manualShownCount: 0, isSearching: true, archive: .rows).noMatches == false)
         // Nothing matches anywhere: the usual search state.
-        #expect(P.coursePlan(hasManual: true, manualShownCount: 0, archive: .noSearchResults) == .init(showsManualSection: false, showsArchiveRows: false, inlineNote: nil, fullState: .noSearchResults))
+        #expect(P.coursePlan(hasManual: true, manualShownCount: 0, archive: .noSearchResults) == Plan(showsRows: false, inlineNote: nil, fullState: .noSearchResults))
     }
 
     @Test func archivePartFollowsTheListingState() {

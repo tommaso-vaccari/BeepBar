@@ -4,7 +4,7 @@
 
 ### New
 
-- Add a lesson to the Watchlist by pasting its Webex link with the “+” button, for recordings the archive doesn't list. Choose a course to find the lesson in both that course and the Watchlist. The link copied from the Webex web app's address bar works too. Leave the title empty and the first Play fills in Webex's title and the length; the lesson then shows its progress bar and the “Fatta” (“Done”) checkbox like the others. In its course the lesson is listed first, under “Aggiunte con link” (“Added by link”); its bookmark is always filled, and “Elimina lezione…” (“Delete lesson…”) in its “⋯” menu removes it after asking.
+- Add a lesson to the Watchlist by pasting its Webex link with the “+” button, for recordings the archive doesn't list. Choose a course to find the lesson in both that course and the Watchlist. The link copied from the Webex web app's address bar works too. Leave the title empty and the first Play fills in Webex's title and the length; the lesson then shows its progress bar and the “Fatta” (“Done”) checkbox like the others. In its course the lesson sits in the same list as the course's other recordings, in the week it was recorded: the date and length are taken from Webex when you add the link (if Webex isn't signed in, the first Play fills them in). The course's counts (recordings, lectures left, time left) and “Segna tutte come completate” (“Mark all as completed”) include it. Its bookmark is always filled, and “Elimina lezione…” (“Delete lesson…”) in its “⋯” menu removes it after asking.
 - “Audio migliorato” (“Enhanced audio”) in the player's title bar makes the teacher's voice easier to follow while the lecture plays: quiet recordings and a teacher who moves away from the microphone are brought to the same volume. A selector offers three modes: “Spento” (“Off”), “Voce isolata” (“Isolated voice”, the default), which plays only the voice without the classroom noise, and “Voce livellata” (“Levelled voice”), which keeps the lecture's original sound at an even volume, for recordings where isolating the voice cuts words. It needs ffmpeg on your Mac (`brew install ffmpeg`); without it the selector says how to get it. With it on, a lecture takes a little over a second to start and after each jump to a part not heard yet; if it stops working, the lecture carries on with its original audio.
 
 ### Improved
@@ -26,6 +26,7 @@
 - Paste, copy and select all (⌘V, ⌘C, ⌘A) now work in the WeBeep sign-in window, so a password can be pasted.
 - BeepBar no longer quits unexpectedly when the Mac wakes from sleep with a lecture or the BeepBar window open.
 - A lecture left paused for a long time, or across your Mac's sleep, now resumes where you stopped. BeepBar retries a few times if it loses the connection or the Polimi archive returns a temporary server error, and a lecture left open while the Mac sleeps now picks up by itself on wake instead of stopping with “Polimi isn't responding”.
+- A lecture you had un-ticked as done no longer completes itself again just because you resumed it past its last minutes and closed the player.
 - In Recordings, a course BeepBar has not listed yet no longer shows an empty pane when you aren't signed in with Polimi: it asks you to sign in, with the button right there.
 
 ## 2026-10-19

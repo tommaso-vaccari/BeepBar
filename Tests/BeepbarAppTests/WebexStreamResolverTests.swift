@@ -87,7 +87,7 @@ struct WebexStreamResolverTests {
     private func signedInBody(extra: [String: Any] = [:]) -> Data {
         var body: [String: Any] = ["requireLogin": 1, "canPlayback": true, "preventPlayback": false, "needPassword": false, "passwordProtected": false,
                                    "downloadRecordingInfo": ["downloadInfo": ["hlsURL": Self.hls, "mp4URL": "https://nfg1wss.webex.com/x.mp4"]],
-                                   "duration": 8160, "recordName": "Lezione sintetica"]
+                                   "duration": 8_160_000, "recordName": "Lezione sintetica"]
         extra.forEach { body[$0.key] = $0.value }
         return try! JSONSerialization.data(withJSONObject: body)
     }

@@ -236,6 +236,69 @@ struct ManualWebexLessonTests {
         #expect(read.lessons[0].durationSeconds == nil && read.lessons[0].progress == nil && read.lessons[0].courseID == nil)
     }
 
+    /// The recording's real date (`recordedAt`, from Webex at the first Play) places the lesson in
+    /// the course's week sections; until then the row keeps the day it was added. Saved once,
+    /// never replaced by a later answer, round-trips, and lessons saved without it (every one
+    /// until now) or with a damaged value still load as unknown. Guards against an old recording
+    /// sorting under "This week" and against one bad field making every lesson unreadable.
+    @Test func theRecordingDateIsLearnedOnceAndOlderLessonsStillLoad() throws {
+        let added = Date(timeIntervalSince1970: 1_800_000_000)
+        let recorded = Date(timeIntervalSince1970: 1_793_717_389)
+        var lesson = ManualWebexLesson(title: "lab1", courseName: "", link: URL(string: "https://politecnicomilano.webex.com/ldr.php?RCID=a")!, addedAt: added)
+        #expect(lesson.recordedAt == nil && lesson.recording.recordedAt == added)
+        let first = lesson.learn(title: nil, duration: nil, recordedAt: recorded)
+        #expect(first)
+        #expect(lesson.recording.recordedAt == recorded)
+        let second = lesson.learn(title: nil, duration: nil, recordedAt: added)
+        #expect(!second, "the first date stays")
+        #expect(lesson.recordedAt == recorded)
+        let third = lesson.learn(title: nil, duration: nil, recordedAt: nil)
+        #expect(!third)
+
+        let data = try PropertyListEncoder().encode(ManualWebexLessons(lessons: [lesson]))
+        #expect(try PropertyListDecoder().decode(ManualWebexLessons.self, from: data).lessons == [lesson])
+
+        let old = try #require(try PropertyListSerialization.propertyList(from: data, format: nil) as? [String: Any])
+        var plain = (old["lessons"] as! [[String: Any]])[0]
+        plain["recordedAt"] = nil
+        var damagedLesson = plain
+        damagedLesson["recordedAt"] = "last week"
+        for entry in [plain, damagedLesson] {
+            let bytes = try PropertyListSerialization.data(fromPropertyList: ["lessons": [entry]], format: .binary, options: 0)
+            let read = try PropertyListDecoder().decode(ManualWebexLessons.self, from: bytes)
+            #expect(read.lessons.map(\.id) == [lesson.id] && read.lessons[0].recordedAt == nil && read.lessons[0].recording.recordedAt == added)
+        }
+    }
+
+    /// The counts of a course's linked lessons, added to the archive's for display: done, total,
+    /// hours left (a partly watched lesson counts what is left, an unknown length counts as
+    /// unknown), per course; lessons without a course appear nowhere; the archive's `next` and
+    /// `newCount`, which feed the menu bar, are left as they were. Guards against linked lessons
+    /// missing from the header and sidebar counts, and against leaking into the saved summary.
+    @Test func linkedLessonsAddToACoursesCountsWithoutTouchingTheMenuBarFields() throws {
+        let link = { (id: String) in URL(string: "https://politecnicomilano.webex.com/ldr.php?RCID=\(id)")! }
+        var done = ManualWebexLesson(id: "manual-a", title: "a", courseName: "", link: link("a"), addedAt: .now, courseID: 7)
+        _ = done.learn(title: nil, duration: 3_600)
+        done.progress = RecordingWatchEntry(furthest: 1, completed: .manual)
+        var half = ManualWebexLesson(id: "manual-b", title: "b", courseName: "", link: link("b"), addedAt: .now, courseID: 7)
+        _ = half.learn(title: nil, duration: 3_600)
+        half.progress = RecordingWatchEntry(furthest: 0.5, completed: nil)
+        let unknown = ManualWebexLesson(id: "manual-c", title: "c", courseName: "", link: link("c"), addedAt: .now, courseID: 7)
+        let other = ManualWebexLesson(id: "manual-d", title: "d", courseName: "", link: link("d"), addedAt: .now, courseID: 8)
+        let none = ManualWebexLesson(id: "manual-e", title: "e", courseName: "", link: link("e"), addedAt: .now)
+        let summaries = ManualWebexLessons(lessons: [done, half, unknown, other, none]).summaries()
+        #expect(Set(summaries.keys) == [7, 8])
+        let seven = try #require(summaries[7])
+        #expect(seven.done == 1 && seven.total == 3 && seven.remainingMinutes == 30 && seven.unknownDurationCount == 1)
+        #expect(summaries[8]?.total == 1 && summaries[8]?.done == 0)
+
+        let next = RecmanRecording(id: "n", courseCode: "123456", academicYear: 2026, title: "", recordedAt: .now, kind: "", duration: "10 min", size: nil, previewURL: link("n"))
+        let archive = CourseWatchSummary(done: 2, total: 5, remainingMinutes: 100, unknownDurationCount: 0, next: next, newCount: 1)
+        let combined = archive.including(seven)
+        #expect(combined.done == 3 && combined.total == 8 && combined.remainingMinutes == 130 && combined.unknownDurationCount == 1)
+        #expect(combined.next == next && combined.newCount == 1)
+    }
+
     /// A Play fills in what the student left out, never what they typed: the title only when
     /// empty, the length whenever Webex gives a plausible one, shown in Recman's form so the
     /// row's length and the hours-left sum read it (`RecmanRecording.minutes`). Implausible

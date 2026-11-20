@@ -884,3 +884,51 @@ struct LiveAudioPipelineTests {
     #expect(RecordingPlayerPolicy.ffmpegHint(development: false).contains("Reinstalla BeepBar"))
     #expect(RecordingPlayerPolicy.ffmpegHint(development: true).contains("brew install ffmpeg"))
 }
+
+private final class LateChild: @unchecked Sendable {
+    private let lock = NSLock()
+    private var value: pid_t = 0
+    private var started = false
+    func markStarted() { lock.withLock { started = true } }
+    var isStarted: Bool { lock.withLock { started } }
+    func set(_ pid: pid_t) { lock.withLock { value = pid } }
+    var pid: pid_t { lock.withLock { value } }
+}
+
+/// A launch blocked before obtaining a pid must not block fallback; a late child is reaped.
+@Test(.timeLimit(.minutes(1)), arguments: [false, true]) func ffmpegStartupDeadlineReapsLateChild(cancel: Bool) async throws {
+    let gate = DispatchSemaphore(value: 0)
+    let child = LateChild()
+    defer { gate.signal() }
+    let runner = FFmpegRunner(timeLimit: 30, startupLimit: cancel ? 30 : 0.2, launch: { process in
+        child.markStarted()
+        gate.wait()
+        try process.run()
+        child.set(process.processIdentifier)
+    })
+    let start = ContinuousClock.now
+    let task = Task { try await runner.run(URL(fileURLWithPath: "/bin/sleep"), ["30"]) }
+    try await eventually("launch entered") { child.isStarted }
+    if cancel { task.cancel() }
+    do {
+        try await task.value
+        Issue.record("blocked launch succeeded")
+    } catch is FFmpegExitError {
+        #expect(!cancel)
+    } catch is CancellationError {
+        #expect(cancel)
+    }
+    #expect(start.duration(to: .now) < .seconds(2))
+    gate.signal()
+    try await eventually("late helper launched") { child.pid != 0 }
+    try await eventually("late helper reaped") { kill(child.pid, 0) == -1 && errno == ESRCH }
+}
+
+/// Normal helper exits still reach the caller, including a nonzero status.
+@Test func ffmpegRunnerReportsNormalExits() async throws {
+    try await FFmpegRunner().run(URL(fileURLWithPath: "/usr/bin/true"), [])
+    do {
+        try await FFmpegRunner().run(URL(fileURLWithPath: "/usr/bin/false"), [])
+        Issue.record("nonzero exit succeeded")
+    } catch is FFmpegExitError {}
+}

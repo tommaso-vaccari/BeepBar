@@ -229,6 +229,10 @@ struct RecordingsPresentationTests {
         #expect(sections.first { $0.id == .course(2) }?.bookmarks.map(\.recording.id) == [hidden.id])
         #expect(sections.first { $0.id == .unassigned }?.bookmarks.map(\.recording.id) == [free.id])
         #expect(sections.first { $0.id == .archive("123456", 2026) }?.bookmarks.map(\.recording.id) == [other.id])
+        let parallelCourse = course(3, "058167 - OTHER SECTION [2026-27]")
+        let ambiguous = RecordingsStudyState.watchlistSections(entries, manual: manual, courses: [courseA, parallelCourse], fallback: "Unassigned")
+        #expect(ambiguous.first { $0.id == .course(1) }?.bookmarks.map(\.recording.id) == [linked.id])
+        #expect(ambiguous.first { $0.id == .archive("058167", 2026) }?.bookmarks.map(\.recording.id) == [archive.id])
         let found = study.watchlistEntries(manual: manual, visibleCourseIDs: [1], fallbackCourseName: "Webex", query: "Linked")
         #expect(RecordingsStudyState.watchlistSections(found, manual: manual, courses: [courseA], fallback: "Unassigned").flatMap(\.bookmarks).map(\.recording.id) == [linked.id])
     }

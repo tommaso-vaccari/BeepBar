@@ -105,7 +105,18 @@ extension RecordingPlayerPolicy {
 
     /// How to get ffmpeg, on every segment's tooltip while it is missing.
     static func ffmpegHint() -> String {
-        tr("Per l'audio migliorato installa ffmpeg (brew install ffmpeg)", "Enhanced audio needs ffmpeg (brew install ffmpeg)")
+        #if DEBUG
+        return ffmpegHint(development: true)
+        #else
+        return ffmpegHint(development: false)
+        #endif
+    }
+
+    static func ffmpegHint(development: Bool) -> String {
+        if development {
+            return tr("Per l'audio migliorato installa ffmpeg (brew install ffmpeg)", "Enhanced audio needs ffmpeg (brew install ffmpeg)")
+        }
+        return tr("Audio migliorato non disponibile. Reinstalla BeepBar.", "Enhanced audio is unavailable. Reinstall BeepBar.")
     }
 }
 

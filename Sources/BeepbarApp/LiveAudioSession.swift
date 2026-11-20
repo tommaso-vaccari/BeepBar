@@ -194,7 +194,8 @@ struct FFmpegRunner: LiveAudioProcessRunning {
     }
 
     /// Who may signal the process, and when: never before it runs, never after it exited (its
-    /// pid could belong to another process by then). Everything under one lock.
+    /// pid could belong to another process by then). Everything under one lock. SIGKILL is
+    /// necessary because a stuck helper can ignore SIGTERM and prevent fallback indefinitely.
     private final class ProcessControl: @unchecked Sendable {
         private struct State {
             var pid: pid_t?
@@ -222,13 +223,13 @@ struct FFmpegRunner: LiveAudioProcessRunning {
         func cancel() {
             state.withLock { state in
                 state.cancelled = true
-                if let pid = state.pid, !state.exited { Darwin.kill(pid, SIGTERM) }
+                if let pid = state.pid, !state.exited { Darwin.kill(pid, SIGKILL) }
             }
         }
 
         func kill() {
             state.withLock { state in
-                if let pid = state.pid, !state.exited { Darwin.kill(pid, SIGTERM) }
+                if let pid = state.pid, !state.exited { Darwin.kill(pid, SIGKILL) }
             }
         }
     }

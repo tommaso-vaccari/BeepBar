@@ -849,3 +849,38 @@ struct LiveAudioPipelineTests {
         #expect(LiveAudioPipeline.failure(for: FFmpegExitError()) == .unavailable)
     }
 }
+
+/// A stuck helper must be reaped even when it ignores SIGTERM.
+@Test(.timeLimit(.minutes(1)), arguments: [false, true]) func ffmpegTimeoutKillsAStubbornChild(cancel: Bool) async throws {
+    let file = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+    defer { try? FileManager.default.removeItem(at: file) }
+    let watchdog = Task {
+        try? await Task.sleep(for: .seconds(3))
+        guard !Task.isCancelled else { return }
+        if let text = try? String(contentsOf: file, encoding: .utf8), let pid = Int32(text.trimmingCharacters(in: .whitespacesAndNewlines)) {
+            kill(pid, SIGKILL)
+        }
+    }
+    defer { watchdog.cancel() }
+    let start = ContinuousClock.now
+    do {
+        let task = Task { try await FFmpegRunner(timeLimit: cancel ? 30 : 0.5).run(URL(fileURLWithPath: "/bin/sh"), ["-c", "trap '' TERM; echo $$ > \"$1\"; exec /bin/sleep 30", "sh", file.path]) }
+        if cancel {
+            try await eventually("helper started") { FileManager.default.fileExists(atPath: file.path) }
+            task.cancel()
+        }
+        try await task.value
+        Issue.record("stalled helper succeeded")
+    } catch is FFmpegExitError {
+        #expect(!cancel)
+    } catch is CancellationError {
+        #expect(cancel)
+    }
+    #expect(start.duration(to: .now) < .seconds(2))
+}
+
+/// The release recovery points to the bundled helper; developers can install their own.
+@Test func ffmpegRecoveryHintMatchesTheBuild() {
+    #expect(RecordingPlayerPolicy.ffmpegHint(development: false).contains("Reinstalla BeepBar"))
+    #expect(RecordingPlayerPolicy.ffmpegHint(development: true).contains("brew install ffmpeg"))
+}

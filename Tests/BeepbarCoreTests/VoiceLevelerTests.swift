@@ -7,6 +7,41 @@ import Testing
 /// Synthetic signals only: noise bursts with short digital-silence gaps, which is what Apple's
 /// voice isolation hands the leveler (a voice with silent pauses).
 struct VoiceLevelerTests {
+    /// A sustained residual must not drive gain up between a teacher's two phrases.
+    @Test func longPauseWithVariableNoiseDoesNotPump() throws {
+        let rate = Self.rate, n = rate * 60
+        let samples = (0..<n).map { i -> Float in
+            let amplitude: Float = i < rate * 8 || i >= rate * 54 ? 0.02 : (i / (2 * rate) % 2 == 0 ? 0.0001 : 0.00005)
+            return i % 2 == 0 ? amplitude : -amplitude
+        }
+        let leveler = VoiceLeveler(), clip = VoiceLeveler.Clip(samples: samples, start: 0)
+        let gains = leveler.gains(for: 0...6, detector: clip, known: [:])
+        #expect(try #require(gains[4]) <= #require(gains[1]) + 3)
+        let output = leveler.level(clip, gains: gains)
+        #expect(abs(output[rate * 42]) < abs(output[rate * 10]) * 2)
+        #expect(abs(output[rate * 54]) >= abs(output[rate]) * 0.8)
+    }
+
+    /// A very quiet but modulated voice remains eligible for levelling after a louder passage.
+    @Test func quietModulatedSpeechStillGetsLifted() throws {
+        let samples = Self.speech(seconds: 10, dB: -25) + Self.speech(seconds: 40, dB: -60)
+        let clip = VoiceLeveler.Clip(samples: samples, start: 0)
+        let gains = VoiceLeveler().gains(for: 0...5, detector: clip, known: [:])
+        #expect(try #require(gains[4]) >= 35)
+    }
+
+    /// A cold seek into a pause uses following speech as its reference, before the speech returns.
+    @Test func coldSeekUsesFollowingSpeechToRejectPauseNoise() throws {
+        let rate = Self.rate
+        let samples = (0..<(rate * 30)).map { i -> Float in
+            i < rate * 24 ? 0.0001 : 0.02
+        }
+        let clip = VoiceLeveler.Clip(samples: samples, start: 30 * rate)
+        let gains = VoiceLeveler().gains(for: 3...6, detector: clip, known: [:])
+        #expect(try #require(gains[3]) < 20)
+        #expect(try #require(gains[5]) < 20)
+    }
+
     static let rate = VoiceLeveler.rate
     static func seconds(_ s: Double) -> Int { Int((s * Double(rate)).rounded()) }
 

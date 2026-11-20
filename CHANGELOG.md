@@ -20,6 +20,8 @@
 
 ### Fixed
 
+- Enhanced audio is less likely to raise background noise during a long pause in a lecture.
+
 - After setup, Courses shows when the list is loading and tells you if you need to sign in or turn on a course before syncing. “Accedi” (“Sign in”) starts sign-in right away.
 - The lecture player's speed menu hides speeds above 2× when the current stream cannot play them.
 - Cancelling a sync or trying to sync with no courses selected keeps the previous result visible, including conflicts and incomplete syncs.

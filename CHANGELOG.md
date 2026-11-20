@@ -9,6 +9,8 @@
 
 ### Improved
 
+- The Watchlist groups lessons by course, with unassigned linked lessons in their own section.
+
 - During synchronization, Courses shows how much of the current downloads has arrived. The menu shows the latest progress when you open it.
 - Every lesson in Recordings has a “⋯” menu with “Apri nel browser” (“Open in browser”), “Copia link” (“Copy link”) and the Watchlist choice, the same as the right-click menu.
 - Signing in to WeBeep with Polimi now also opens the Recordings archive: there is no second Polimi sign-in, and the first sync after signing in already loads your recordings, even if you never open the Recordings page. Turn Recordings off in Settings if you don't want that.

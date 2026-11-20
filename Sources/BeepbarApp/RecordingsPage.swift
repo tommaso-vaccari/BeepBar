@@ -1199,6 +1199,7 @@ private struct WatchlistRecordings: View {
     var body: some View {
         let courseIDs = Set(courses.map(\.id))
         let shown = shown(visibleCourseIDs: courseIDs)
+        let sections = RecordingsStudyState.watchlistSections(shown, manual: recordings.manualLessons, courses: courses, fallback: tr("Senza corso", "Unassigned"))
         let listings = self.listings
         let isLoading = listings.contains { $0.isLoading }
         let toggleableLinkedIDs = Set(recordings.manualLessons.lessons.compactMap { lesson in
@@ -1248,27 +1249,31 @@ private struct WatchlistRecordings: View {
                 // neither bar nor checkbox (`RecordingsPresentation.WatchRow.unknown`).
                 WatchProgressReader(recordings: recordings) { progress in
                     List(selection: $selection) {
-                        ForEach(shown) { bookmark in
-                            let item = bookmark.recording
-                            RecordingRow(recording: item, number: nil, isNew: recordings.isNew(item),
-                                isOpening: recordings.openingRecordingID == item.id,
-                                isWatchlisted: true,
-                                canEdit: recordings.canEditStudy, canPlay: recordings.access == .ready && !bookmark.unavailable,
-                                canUseLinks: recordings.access == .ready && !bookmark.unavailable,
-                                canToggleLinkedBookmark: toggleableLinkedIDs.contains(item.id),
-                                courseName: bookmark.courseName, unavailable: bookmark.unavailable,
-                                watchlistCourseName: bookmark.courseName,
-                                watch: progress.row(for: item),
-                                actions: RecordingRow.Actions(
-                                    toggleWatchlist: { perform(.removeFromWatchlist, on: bookmark) },
-                                    play: { recordings.play(item) },
-                                    setDone: { recordings.setDone(item, $0) },
-                                    openInBrowser: { recordings.openInBrowser(item) },
-                                    copyLink: { recordings.copyLink(item) },
-                                    requestDelete: { deleting = item }
-                                ))
-                                .equatable()
-                                .tag(bookmark.id)
+                        ForEach(sections) { section in
+                            Section(section.title) {
+                                ForEach(section.bookmarks) { bookmark in
+                                    let item = bookmark.recording
+                                    RecordingRow(recording: item, number: nil, isNew: recordings.isNew(item),
+                                        isOpening: recordings.openingRecordingID == item.id,
+                                        isWatchlisted: true,
+                                        canEdit: recordings.canEditStudy, canPlay: recordings.access == .ready && !bookmark.unavailable,
+                                        canUseLinks: recordings.access == .ready && !bookmark.unavailable,
+                                        canToggleLinkedBookmark: toggleableLinkedIDs.contains(item.id),
+                                        courseName: bookmark.courseName, unavailable: bookmark.unavailable,
+                                        watchlistCourseName: bookmark.courseName,
+                                        watch: progress.row(for: item),
+                                        actions: RecordingRow.Actions(
+                                            toggleWatchlist: { perform(.removeFromWatchlist, on: bookmark) },
+                                            play: { recordings.play(item) },
+                                            setDone: { recordings.setDone(item, $0) },
+                                            openInBrowser: { recordings.openInBrowser(item) },
+                                            copyLink: { recordings.copyLink(item) },
+                                            requestDelete: { deleting = item }
+                                        ))
+                                        .equatable()
+                                        .tag(bookmark.id)
+                                }
+                            }
                         }
                     }
                 }

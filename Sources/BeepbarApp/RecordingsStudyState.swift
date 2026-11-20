@@ -64,16 +64,19 @@ struct RecordingsStudyState: Codable, Equatable {
     nonisolated static func watchlistSections(_ entries: [Bookmark], manual: ManualWebexLessons,
                                                courses: [RemoteCourseSummary], fallback: String) -> [WatchlistSection] {
         let manualByID = Dictionary(manual.lessons.map { ($0.id, $0) }, uniquingKeysWith: { first, _ in first })
-        let byKey = Dictionary(grouping: courses.compactMap { course in
-            RecmanCourseKey(course: course).map { ($0, course) }
-        }, by: { $0.0 })
+        var archiveByCourse: [Int64: RecmanCourseKey] = [:]
+        var owners: [RecmanCourseKey: Set<Int64>] = [:]
+        for course in courses {
+            guard let key = RecmanCourseKey(course: course) else { continue }
+            archiveByCourse[course.id] = key
+            owners[key, default: []].insert(course.id)
+        }
         var sections: [WatchlistSection.ID: WatchlistSection] = [:]
         for bookmark in entries {
             let id: WatchlistSection.ID
             if let lesson = manualByID[bookmark.recording.id], ManualWebexLesson.isManual(bookmark.recording) {
                 if let courseID = lesson.courseID {
-                    if let course = courses.first(where: { $0.id == courseID }), let key = RecmanCourseKey(course: course),
-                       Set((byKey[key] ?? []).map { $0.1.id }).count == 1 {
+                    if let key = archiveByCourse[courseID], owners[key]?.count == 1 {
                         id = .archive(key.courseCode, key.academicYear)
                     } else { id = .course(courseID) }
                 } else { id = .unassigned }
@@ -89,7 +92,7 @@ struct RecordingsStudyState: Codable, Equatable {
         return sections.values.sorted {
             let comparison = $0.title.localizedStandardCompare($1.title)
             if comparison != .orderedSame { return comparison == .orderedAscending }
-            return String(describing: $0.id) < String(describing: $1.id)
+            return $0.bookmarks[0].id < $1.bookmarks[0].id
         }
     }
 

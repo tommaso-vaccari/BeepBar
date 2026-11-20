@@ -1,6 +1,7 @@
 #!/bin/bash
 set -euo pipefail
 
+original_args=("$@")
 version=9.0.2
 sha256=8c3850283eb25fa026482078a04051e0be17347b09ef81a0849bec15a96e002e
 archive="${BEEPBAR_FFMPEG_SOURCE_ARCHIVE:-}"
@@ -17,7 +18,47 @@ done
 [[ "$output" == /* ]] || output="$PWD/$output"
 
 script_path="$(cd "$(dirname "$0")" && pwd)/$(basename "$0")"
-work="$(mktemp -d "${TMPDIR:-/tmp}/beepbar-ffmpeg.XXXXXXXX")"
+# Compiling FFmpeg takes minutes and the pre-push gate runs this on every push,
+# so a finished build is cached. The key is this script's own hash: the version,
+# source SHA-256 and configure flags all live here, so any edit that could change
+# the binary invalidates the entry. Entries are built in a temp dir inside the
+# cache root and moved into place, so an interrupted or concurrent run never
+# leaves a partial entry that a later run would treat as a hit.
+outputs=(ffmpeg COPYING.LGPLv2.1 ffmpeg-source.tar.gz)
+cache_root="${BEEPBAR_FFMPEG_CACHE:-$HOME/Library/Caches/BeepBar-build/ffmpeg}"
+cache_key="$(shasum -a 256 "$script_path" | awk '{print $1}')"
+cache_entry="$cache_root/$cache_key"
+mkdir -p "$cache_root"
+# flock is released even after a crash. Keep the descriptor across exec so the
+# lock covers validation, repair, publication and copying to the caller.
+if [[ "${BEEPBAR_FFMPEG_LOCKED:-}" != "$cache_key" ]]; then
+    exec python3 -c '
+import fcntl, os, sys
+fd = os.open(sys.argv[1], os.O_CREAT | os.O_RDWR, 0o600)
+fcntl.flock(fd, fcntl.LOCK_EX)
+os.set_inheritable(fd, True)
+os.environ["BEEPBAR_FFMPEG_LOCKED"] = sys.argv[2]
+os.execv("/bin/bash", ["/bin/bash", sys.argv[3], *sys.argv[4:]])
+' "$cache_root/.lock-$cache_key" "$cache_key" "$script_path" "${original_args[@]}"
+fi
+cache_is_valid() {
+    local f
+    for f in "${outputs[@]}"; do [[ -s "$1/$f" ]] || return 1; done
+    [[ -x "$1/ffmpeg" && -s "$1/SHA256SUMS" ]] || return 1
+    (cd "$1" && [[ "$(shasum -a 256 "${outputs[@]}")" == "$(cat SHA256SUMS)" ]])
+}
+copy_outputs() {
+    local f
+    mkdir -p "$2"
+    for f in "${outputs[@]}"; do cp "$1/$f" "$2/$f"; done
+}
+if cache_is_valid "$cache_entry"; then
+    echo "Using cached FFmpeg build $cache_key"
+    copy_outputs "$cache_entry" "$output"
+    exit 0
+fi
+
+work="$(mktemp -d "$cache_root/.build.XXXXXXXX")"
 trap 'rm -rf "$work"' EXIT
 source_archive="$work/ffmpeg-$version.tar.xz"
 if [[ -n "$archive" ]]; then
@@ -44,10 +85,16 @@ cd "$work/ffmpeg-$version"
 make -j"$(sysctl -n hw.ncpu)" ffmpeg
 strip -x ffmpeg
 
-mkdir -p "$work/source" "$output"
+mkdir -p "$work/source" "$work/out"
 cp "$source_archive" "$work/source/ffmpeg-$version.tar.xz"
 cp "$script_path" "$work/source/build-ffmpeg.sh"
 tar -czf "$work/ffmpeg-source.tar.gz" -C "$work/source" .
-cp ffmpeg "$output/ffmpeg"
-cp COPYING.LGPLv2.1 "$output/COPYING.LGPLv2.1"
-cp "$work/ffmpeg-source.tar.gz" "$output/ffmpeg-source.tar.gz"
+cp ffmpeg "$work/out/ffmpeg"
+cp COPYING.LGPLv2.1 "$work/out/COPYING.LGPLv2.1"
+cp "$work/ffmpeg-source.tar.gz" "$work/out/ffmpeg-source.tar.gz"
+(cd "$work/out" && shasum -a 256 "${outputs[@]}" > SHA256SUMS)
+
+# The lock makes replacement safe, while the rename prevents partial entries.
+rm -rf "$cache_entry"
+mv "$work/out" "$cache_entry"
+copy_outputs "$cache_entry" "$output"

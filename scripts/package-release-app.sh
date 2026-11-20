@@ -3,7 +3,7 @@ set -euo pipefail
 
 app="${1:?usage: package-release-app.sh APP FFMPEG_BUILD_DIR}"
 ffmpeg_build="${2:?usage: package-release-app.sh APP FFMPEG_BUILD_DIR}"
-identifier=io.github.tvaccari.beepbar
+identifier="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "$app/Contents/Info.plist")"
 helper="$app/Contents/Helpers/ffmpeg"
 
 install -d "$app/Contents/Helpers" "$app/Contents/Resources/FFmpeg"

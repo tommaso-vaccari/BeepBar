@@ -60,6 +60,7 @@ struct RecmanStreamFailure: Error {
     /// failure after the player link was found may come wrapped in `RecmanStreamFailure`, which
     /// hands the link back for that fallback.
     func stream(for recording: RecmanRecording, email: PolimiEmail?) async throws -> RecordingStream
+    func recoverStream(for recording: RecmanRecording, player: URL, email: PolimiEmail?) async throws -> RecordingStream
     /// What Webex says about a lesson added by link (its date and length), asked when the lesson
     /// is added (#289) and never for a Play: with the Webex cookies already in the browser, it
     /// never signs in and never shows a window, so a missing or lapsed Webex session simply
@@ -70,6 +71,9 @@ struct RecmanStreamFailure: Error {
 }
 
 extension RecmanBrowsing {
+    func recoverStream(for recording: RecmanRecording, player: URL, email: PolimiEmail?) async throws -> RecordingStream {
+        try await stream(for: recording, email: email)
+    }
     func quietStream(for recording: RecmanRecording) async throws -> RecordingStream { throw RecmanBrowserError.playbackUnavailable }
 }
 
@@ -347,9 +351,27 @@ extension RecmanBrowsing {
         }
         diagnose("stream: step=archive-player-link found form=\(WebexPlayerLink.isLoader(player) ? "loader" : "other")")
         do {
-            return try await stream(player: player, email: email)
+            var result = try await stream(player: player, email: email)
+            result.player = player
+            return result
         } catch is CancellationError {
             // Never wrapped: cancellation stays recognizable to every `is CancellationError`.
+            throw CancellationError()
+        } catch {
+            throw RecmanStreamFailure(player: player, underlying: error)
+        }
+    }
+
+    /// Reuse the active lecture's validated player before returning to Recman.
+    func recoverStream(for recording: RecmanRecording, player: URL, email: PolimiEmail?) async throws -> RecordingStream {
+        guard RecmanURLPolicy.playbackURL(player) == player else { return try await stream(for: recording, email: email) }
+        do {
+            var result = try await stream(player: player, email: email)
+            result.player = player
+            return result
+        } catch RecmanBrowserError.playbackUnavailable {
+            return try await stream(for: recording, email: email)
+        } catch is CancellationError {
             throw CancellationError()
         } catch {
             throw RecmanStreamFailure(player: player, underlying: error)

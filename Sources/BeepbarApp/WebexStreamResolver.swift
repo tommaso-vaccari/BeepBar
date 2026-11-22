@@ -16,6 +16,7 @@ struct RecordingStream: Equatable, Sendable {
     let duration: TimeInterval?
     /// When it was recorded, if Webex said (`WebexStreamAPI.recordedAt`).
     var recordedAt: Date? = nil
+    var player: URL? = nil
 }
 
 /// One HTTP answer, as far as native playback reads it.

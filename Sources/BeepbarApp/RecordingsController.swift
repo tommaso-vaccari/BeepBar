@@ -256,6 +256,7 @@ struct RecordingsListing: Equatable {
     private var nowPlaying: [String: RecmanRecording] = [:]
     /// The lecture last handed to the player, for recoveries that outlive a newer Play.
     private var currentLectureID: String?
+    private var activePlayerLink: URL?
 
     // MARK: Enhanced audio state ("Audio migliorato", see `AudioEnhancement`)
 
@@ -2196,6 +2197,7 @@ struct RecordingsListing: Equatable {
         // Before the call: the lecture this one replaces reports its position inside `play`.
         nowPlaying[recording.id] = recording
         currentLectureID = recording.id
+        if enhanced == nil { activePlayerLink = stream.player }
         lectureStarts += 1
         // The replaced lecture's report inside `play` reads this to tell an end from a re-play.
         pendingPlayID = recording.id
@@ -2275,6 +2277,7 @@ struct RecordingsListing: Equatable {
         if preservingResumePoints { player?.close() }
         nowPlaying = [:]
         currentLectureID = nil
+        activePlayerLink = nil
         recoveredLectures = []
         recoveryEpisode = nil
         cancelScheduledRecovery()
@@ -2305,6 +2308,7 @@ struct RecordingsListing: Equatable {
     /// checkpoint (its server, ffmpeg runs and files outlived the window, found in review).
     private func playerClosed(id: String) {
         guard currentLectureID == id else { return }
+        activePlayerLink = nil
         // The window is gone: no recovery may fetch, show a banner or open the browser for it.
         cancelScheduledRecovery()
         recoveryEpisode = nil
@@ -3213,8 +3217,9 @@ struct RecordingsListing: Equatable {
     }
 
     private func recoverPlayback(_ recording: RecmanRecording, _ recovery: Recovery, start: Int, browser: RecmanBrowsing, generation: Int) async throws {
-        // The player link a failed fresh-stream lookup already found, for the browser below.
+        // A direct browser fallback can use the active lecture's link without Recman.
         var found: URL?
+        if case .browser = recovery { found = activePlayerLink }
         let intent = playbackIntent
         let needsOpenPlayer: Bool
         if case .freshStream = recovery { needsOpenPlayer = true } else { needsOpenPlayer = false }
@@ -3235,7 +3240,12 @@ struct RecordingsListing: Equatable {
                 guard isCurrent() else { endReopeningNotice(for: recording); return }
             }
             do {
-                let stream = try await browser.stream(for: recording, email: confirmedEmail)
+                let stream: RecordingStream
+                if let player = activePlayerLink {
+                    stream = try await browser.recoverStream(for: recording, player: player, email: confirmedEmail)
+                } else {
+                    stream = try await browser.stream(for: recording, email: confirmedEmail)
+                }
                 guard isCurrent() else { endReopeningNotice(for: recording); return }
                 startPlayer(stream, for: recording, startAt: position)
                 // Counted again from the first tick of this stream (`playerProgress`).

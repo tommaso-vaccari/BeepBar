@@ -30,7 +30,7 @@
 - Recordings keeps a valid Polimi sign-in across restarts when your Watchlist includes lessons added by Webex link.
 - Paste, copy and select all (⌘V, ⌘C, ⌘A) now work in the WeBeep sign-in window, so a password can be pasted.
 - BeepBar no longer quits unexpectedly when the Mac wakes from sleep with a lecture or the BeepBar window open.
-- A lecture left paused for a long time, or across your Mac's sleep, now resumes where you stopped. BeepBar retries a few times if it loses the connection or the Polimi archive returns a temporary server error, and a lecture left open while the Mac sleeps now picks up by itself on wake instead of stopping with “Polimi isn't responding”.
+- A lecture left paused for a long time, or across your Mac's sleep, now resumes where you stopped, even when the Polimi archive is temporarily unavailable. BeepBar retries a few times if it loses the connection or the Polimi archive returns a temporary server error, and a lecture left open while the Mac sleeps now picks up by itself on wake instead of stopping with “Polimi isn't responding”.
 - A lecture you had un-ticked as done no longer completes itself again just because you resumed it past its last minutes and closed the player.
 - In Recordings, a course BeepBar has not listed yet no longer shows an empty pane when you aren't signed in with Polimi: it asks you to sign in, with the button right there.
 

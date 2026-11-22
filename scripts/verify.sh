@@ -36,11 +36,11 @@ test_targets=$(find Tests -mindepth 1 -maxdepth 1 -type d | wc -l | tr -d ' ')
 # the second pass also states a minimum number of tests (the check's third argument): the exact
 # number that runs today, so losing even one test fails. New tests pass it; lower it deliberately
 # when a web-view test is removed.
-webview_tests='^BeepbarAppTests\.(RecmanScriptsTests|RecmanWebSessionTests|RecmanWebSessionScriptTests|WebexSignInWebViewTests)/|^BeepbarAppTests\.WebBeepLoginSessionHandoverTests/(theLoginWindowUsesTheWebViewWithEditingShortcuts|aWindowClosedWhileTheCookiesAreReadCompletesTheLogin)\(\)(/|$)'
+webview_tests='^BeepbarAppTests\.(RecmanScriptsTests|RecmanWebSessionTests|RecmanWebSessionScriptTests|WebexSignInWebViewTests)/|^BeepbarAppTests\.WebexStreamResolverTests/(sessionRecoversFromThePlayerWithoutLoadingRecman|rejectedPlayerFindsAReplacementInTheArchive)\(\)(/|$)|^BeepbarAppTests\.WebBeepLoginSessionHandoverTests/(theLoginWindowUsesTheWebViewWithEditingShortcuts|aWindowClosedWhileTheCookiesAreReadCompletesTheLogin)\(\)(/|$)'
 swift test --skip "$webview_tests" 2>&1 | tee "$test_log"
 bash scripts/check-test-run-complete.sh "$test_log" "$test_targets"
 swift test --no-parallel --filter "$webview_tests" 2>&1 | tee "$test_log"
-bash scripts/check-test-run-complete.sh "$test_log" 1 67
+bash scripts/check-test-run-complete.sh "$test_log" 1 69
 python3 scripts/recordings-seen-isolated-tests.py
 bash scripts/test-release-notes.sh
 bash scripts/test-build-version.sh

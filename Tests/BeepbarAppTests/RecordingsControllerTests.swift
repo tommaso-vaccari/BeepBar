@@ -87,6 +87,8 @@ import Testing
     /// are used up (or when none are set) the stream is unavailable and Play falls back to the
     /// browser.
     var streamResults: [String: [Result<RecordingStream, Error>]] = [:]
+    var recoveredPlayer: URL?
+    var directRecovery: RecordingStream?
     var streamGates: [String: Gate] = [:]
     /// Whether a held stream ends with `CancellationError` when its task is cancelled, as the real
     /// browser does; off by default, so older tests keep a held stream held.
@@ -156,6 +158,12 @@ import Testing
         let result = results.removeFirst()
         streamResults[recording.id] = results
         return try result.get()
+    }
+
+    func recoverStream(for recording: RecmanRecording, player: URL, email: PolimiEmail?) async throws -> RecordingStream {
+        recoveredPlayer = player
+        if let directRecovery { return directRecovery }
+        return try await stream(for: recording, email: email)
     }
 
     func close() {
@@ -5122,6 +5130,63 @@ struct RecordingsControllerTests {
         #expect(try world.player.play(1).startAt == 700)
         await settle("browser closed again") { !browser.isOpen }
         #expect(world.player.isOpen)
+        controller.turnOff()
+    }
+
+    /// A fresh Webex stream resumes the active lecture even if Recman's preview is down.
+    @Test func recoveryUsesActivePlayerWithoutRevisitingArchive() async throws {
+        defer { cleanUp() }
+        var first = stream("a")
+        first.player = playerLink("a")
+        var renewed = stream("a")
+        renewed.player = first.player
+        browser.streamResults["a"] = [.success(first), .failure(RecmanBrowserError.unavailable)]
+        browser.directRecovery = renewed
+        let controller = await readyController()
+        controller.play(recording("a"))
+        await settle("a playing") { world.player.plays.count == 1 }
+        controller.windowClosed()
+        world.player.failDuringPlayback(at: 700)
+        await settle("a resumed") { world.player.plays.count == 2 }
+        #expect(browser.recoveredPlayer == first.player)
+        #expect(browser.calls.filter { $0 == "stream a" }.count == 1)
+        #expect(try world.player.play(1).startAt == 700)
+        controller.turnOff()
+    }
+
+    /// A player that cannot start opens its active link even when the archive is unavailable.
+    @Test func failedStartOpensActivePlayerWithoutArchive() async {
+        defer { cleanUp() }
+        var first = stream("a")
+        first.player = playerLink("a")
+        browser.streamResults["a"] = [.success(first)]
+        browser.playbackResults["a"] = .failure(RecmanBrowserError.unavailable)
+        let controller = await readyController()
+        controller.play(recording("a"))
+        await settle("a playing") { world.player.plays.count == 1 }
+        world.player.failBeforeReady()
+        await settle("browser opened") { world.opened == [self.playerLink("a")] }
+        #expect(!browser.calls.contains("play a"))
+        controller.turnOff()
+    }
+
+    /// Switching audio keeps the active player's link for the next recovery.
+    @Test func audioSwitchKeepsTheRecoveryPlayer() async throws {
+        defer { cleanUp() }
+        world.ffmpeg = fakeFFmpegPath
+        var first = stream("a")
+        first.player = playerLink("a")
+        browser.streamResults["a"] = [.success(first), .failure(RecmanBrowserError.unavailable)]
+        browser.directRecovery = first
+        let controller = await readyController()
+        controller.play(recording("a"))
+        await settle("a playing") { world.player.plays.count == 1 }
+        world.player.chooseAudio(.use(.levelled))
+        #expect(world.player.plays.count == 2)
+        try #require(world.liveSessions.last).onFailure(.streamRefused)
+        world.player.failDuringPlayback(at: 700)
+        await settle("a resumed") { world.player.plays.count == 3 }
+        #expect(browser.recoveredPlayer == first.player)
         controller.turnOff()
     }
 

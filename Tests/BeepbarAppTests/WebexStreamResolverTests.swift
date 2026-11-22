@@ -188,6 +188,28 @@ struct WebexStreamResolverTests {
         #expect(requestedURLs == [Self.player.absoluteString, Self.api])
     }
 
+    /// If the archive cannot replace a rejected player, retain it for browser fallback.
+    @Test func rejectedPlayerRemainsAvailableWhenArchiveFails() async throws {
+        liveWebex(ldr: .answer(status: 404))
+        let session = RecmanWebSession()
+        session.webexTransport = WebexStubProtocol.makeTransport()
+        await session.open(cookies: [])
+        defer { session.close() }
+        session.startArchiveEntry = { webView, _ in
+            webView.loadHTMLString("<p>Unavailable</p>", baseURL: URL(string: "https://example.com/"))
+        }
+        let preview = URL(string: "https://onlineservices.polimi.it/recman_frontend/recman_frontend/controller/ArchivioListActivity.do?evn_preview_link=&transfer_id=fixture")!
+        let recording = RecmanRecording(id: "fixture", courseCode: "123456", academicYear: 2026, title: "", recordedAt: Date(), kind: "", duration: "", size: nil, previewURL: preview)
+        do {
+            _ = try await session.recoverStream(for: recording, player: Self.player, email: email)
+            Issue.record("Expected archive failure")
+        } catch let failure as RecmanStreamFailure {
+            #expect(failure.player == Self.player)
+        } catch {
+            Issue.record("Lost the browser link: \(error)")
+        }
+    }
+
     // MARK: Signing in
 
     /// Signed out: the stale ticket goes first, then one hinted sign-in, then the API once more

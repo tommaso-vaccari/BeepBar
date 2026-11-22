@@ -370,7 +370,15 @@ extension RecmanBrowsing {
             result.player = player
             return result
         } catch RecmanBrowserError.playbackUnavailable {
-            return try await stream(for: recording, email: email)
+            do {
+                return try await stream(for: recording, email: email)
+            } catch is CancellationError {
+                throw CancellationError()
+            } catch let failure as RecmanStreamFailure {
+                throw failure
+            } catch {
+                throw RecmanStreamFailure(player: player, underlying: error)
+            }
         } catch is CancellationError {
             throw CancellationError()
         } catch {

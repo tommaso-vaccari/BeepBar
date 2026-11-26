@@ -21,12 +21,13 @@ script_path="$(cd "$(dirname "$0")" && pwd)/$(basename "$0")"
 # Compiling FFmpeg takes minutes and the pre-push gate runs this on every push,
 # so a finished build is cached. The key is this script's own hash: the version,
 # source SHA-256 and configure flags all live here, so any edit that could change
-# the binary invalidates the entry. Entries are built in a temp dir inside the
+# the binary invalidates the entry. The compiler and SDK are in the key too: the
+# same script built with another clang or macOS SDK is another binary. Entries are built in a temp dir inside the
 # cache root and moved into place, so an interrupted or concurrent run never
 # leaves a partial entry that a later run would treat as a hit.
 outputs=(ffmpeg COPYING.LGPLv2.1 ffmpeg-source.tar.gz)
 cache_root="${BEEPBAR_FFMPEG_CACHE:-$HOME/Library/Caches/BeepBar-build/ffmpeg}"
-cache_key="$(shasum -a 256 "$script_path" | awk '{print $1}')"
+cache_key="$({ cat "$script_path"; xcrun clang --version; xcrun --show-sdk-version; } | shasum -a 256 | awk '{print $1}')"
 cache_entry="$cache_root/$cache_key"
 mkdir -p "$cache_root"
 # flock is released even after a crash. Keep the descriptor across exec so the

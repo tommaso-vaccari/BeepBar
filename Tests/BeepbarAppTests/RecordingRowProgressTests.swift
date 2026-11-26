@@ -416,6 +416,31 @@ import BeepbarCore
         #expect(RecordingsPageProbes.submitManualLesson != nil)
     }
 
+    @Test(.timeLimit(.minutes(1))) func courseManualLessonUsesOriginatingCourseAndRejectsDisabledCourse() async throws {
+        let page = try await HostedPage()
+        defer { page.close() }
+        _ = try await page.loadedCourse()
+        let course = try #require(page.fixture.controller.courses.first)
+        try await page.settle { RecordingsPageProbes.beginCourseManualLesson != nil }
+        let begin = try #require(RecordingsPageProbes.beginCourseManualLesson)
+        begin()
+        try await page.settle { RecordingsPageProbes.submitCourseManualLesson != nil }
+        let submit = try #require(RecordingsPageProbes.submitCourseManualLesson)
+        let result = submit("https://politecnicomilano.webex.com/ldr.php?RCID=course-add", "Guest", nil)
+        try result.get()
+        let lesson = try #require(page.recordings.manualLessons.lessons.first)
+        #expect(lesson.courseID == course.id)
+        #expect(lesson.isWatchlisted)
+        try await page.settle { page.bodies[lesson.id] != nil }
+        #expect(page.recordings.manualLessons.recordings(courseID: course.id).map(\.id).contains(lesson.id))
+        page.fixture.controller.setCourse(course, enabled: false)
+        try await page.settle()
+        if case .success = submit("https://politecnicomilano.webex.com/ldr.php?RCID=course-stale", "Stale", course.id) {
+            Issue.record("The removed course was accepted")
+        }
+        #expect(page.recordings.manualLessons.lessons.count == 1)
+    }
+
     /// A linked lesson's bookmark slot is a filled, inert bookmark: one click must never delete a
     /// lesson (#286). Mutation: return "trash" or `.toggle` for manual rows and this fails.
     @Test func manualRowsShowAFilledInertBookmark() {

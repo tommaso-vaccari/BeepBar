@@ -714,7 +714,7 @@ struct RecordingsPage: View {
             WatchlistRecordings(recordings: recordings, courses: model.courses, currentCourses: { model.courses }) { refresh(force: true) }
         } else if let course = selectedCourse {
             CourseRecordings(name: selectedEntry?.name ?? RecordingsPresentation.courseName(course), courseID: course.id,
-                             key: selectedEntry?.key, recordings: recordings) {
+                             key: selectedEntry?.key, recordings: recordings, currentCourses: { model.courses }) {
                 refresh(force: true)
             }
             .id(course.id)
@@ -788,7 +788,10 @@ struct CourseRecordings: View {
     let courseID: Int64
     let key: RecmanCourseKey?
     @ObservedObject var recordings: RecordingsController
+    var currentCourses: () -> [RemoteCourseSummary] = { [] }
     let refresh: () -> Void
+    @State private var addingLesson = false
+    @State private var addingOwner: Int?
     @State private var query = ""
     @State private var selection: String?
     /// The linked lesson whose deletion waits for the student's confirmation (#286).
@@ -840,6 +843,28 @@ struct CourseRecordings: View {
             content
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
         }
+        .sheet(isPresented: $addingLesson) {
+            AddWebexLessonSheet(courses: [], fixedCourse: (courseID, name), add: submitManualLesson)
+#if DEBUG
+                .onAppear { RecordingsPageProbes.submitCourseManualLesson = submitManualLesson }
+                .onDisappear { RecordingsPageProbes.submitCourseManualLesson = nil }
+#endif
+        }
+    }
+
+    private func beginManualLesson() {
+        addingOwner = recordings.manualLessonOwner
+        addingLesson = true
+    }
+
+    private func submitManualLesson(link: String, title: String, courseID _: Int64?) -> Result<Void, RecordingsController.ManualLessonFailure> {
+        let current = currentCourses()
+        guard RecordingsPresentation.canSubmitManualLesson(owner: addingOwner, currentOwner: recordings.manualLessonOwner,
+                                                            courseID: courseID, availableIDs: Set(current.map(\.id))),
+              let course = current.first(where: { $0.id == courseID }) else { return .failure(.notEditable) }
+        let result = recordings.addManualLesson(link: link, title: title, courseName: RecordingsPresentation.courseName(course), courseID: courseID)
+        if case .success = result { query = "" }
+        return result.map { _ in () }
     }
 
     private var header: some View {
@@ -891,6 +916,17 @@ struct CourseRecordings: View {
                         .disabled(!action.enabled)
                 }
             }
+            Button(action: beginManualLesson) {
+                Image(systemName: "plus")
+#if DEBUG
+                    .onAppear { RecordingsPageProbes.beginCourseManualLesson = beginManualLesson }
+                    .onDisappear { RecordingsPageProbes.beginCourseManualLesson = nil }
+#endif
+            }
+                .buttonStyle(.borderless)
+                .help(tr("Aggiungi una lezione con un link Webex", "Add a lesson with a Webex link"))
+                .accessibilityLabel(tr("Aggiungi una lezione con un link Webex", "Add a lesson with a Webex link"))
+                .disabled(!recordings.canAddManualLesson)
             Button(action: refresh) {
                 ZStack {
                     ProgressView().controlSize(.small).opacity(listing?.isLoading == true ? 1 : 0)
@@ -1359,6 +1395,7 @@ private struct WatchlistRecordings: View {
 /// field with the reason under it.
 struct AddWebexLessonSheet: View {
     let courses: [RemoteCourseSummary]
+    var fixedCourse: (id: Int64, name: String)? = nil
     let add: (_ link: String, _ title: String, _ course: Int64?) -> Result<Void, RecordingsController.ManualLessonFailure>
     @Environment(\.dismiss) private var dismiss
     @State private var link = ""
@@ -1376,10 +1413,14 @@ struct AddWebexLessonSheet: View {
             Form {
                 TextField(tr("Link Webex", "Webex link"), text: $link, prompt: Text(verbatim: "https://politecnicomilano.webex.com/…"))
                 TextField(tr("Titolo (facoltativo)", "Title (optional)"), text: $title)
-                Picker(tr("Corso (facoltativo)", "Course (optional)"), selection: $course) {
-                    Text(tr("Nessuno", "None")).tag(Int64?.none)
-                    ForEach(options, id: \.id) { course in
-                        Text(labels[course.id] ?? course.displayName).tag(Optional(course.id))
+                if let fixedCourse {
+                    LabeledContent(tr("Corso", "Course"), value: fixedCourse.name)
+                } else {
+                    Picker(tr("Corso (facoltativo)", "Course (optional)"), selection: $course) {
+                        Text(tr("Nessuno", "None")).tag(Int64?.none)
+                        ForEach(options, id: \.id) { course in
+                            Text(labels[course.id] ?? course.displayName).tag(Optional(course.id))
+                        }
                     }
                 }
             }
@@ -1392,7 +1433,7 @@ struct AddWebexLessonSheet: View {
                 Spacer()
                 Button(tr("Annulla", "Cancel"), role: .cancel) { dismiss() }.keyboardShortcut(.cancelAction)
                 Button(tr("Aggiungi", "Add")) {
-                    switch add(link, title, course) {
+                    switch add(link, title, fixedCourse?.id ?? course) {
                     case .success: dismiss()
                     case .failure(let failure): problem = failure.message
                     }
@@ -1459,6 +1500,8 @@ struct WatchProgressReader<Content: View>: View {
     /// The delete dialog was asked for a lesson: its confirm and cancel actions, the same ones the
     /// dialog's buttons run (a test can't click a system dialog).
     static var deleteRequest: ((_ lesson: RecmanRecording, _ confirm: @escaping () -> Void, _ cancel: @escaping () -> Void) -> Void)?
+    static var beginCourseManualLesson: (() -> Void)?
+    static var submitCourseManualLesson: ((String, String, Int64?) -> Result<Void, RecordingsController.ManualLessonFailure>)?
     static var beginManualLesson: (() -> Void)?
     static var submitManualLesson: ((String, String, Int64?) -> Result<Void, RecordingsController.ManualLessonFailure>)?
     /// A scan of the listing by the course toolbar's bulk button, with the listing's size.

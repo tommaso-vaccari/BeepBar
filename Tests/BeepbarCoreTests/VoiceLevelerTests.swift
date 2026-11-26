@@ -42,6 +42,83 @@ struct VoiceLevelerTests {
         #expect(try #require(gains[5]) < 20)
     }
 
+    /// A pause much longer than the reference search must keep the last known speech gain.
+    @Test func veryLongPauseDoesNotReanchorResidualNoise() throws {
+        let rate = Self.rate, n = rate * 130
+        let samples = (0..<n).map { i -> Float in
+            let amplitude: Float = i < rate * 8 || i >= rate * 120 ? 0.02 : (i / (2 * rate) % 2 == 0 ? 0.0001 : 0.00005)
+            return i % 2 == 0 ? amplitude : -amplitude
+        }
+        let leveler = VoiceLeveler(), clip = VoiceLeveler.Clip(samples: samples, start: 0)
+        let gains = leveler.gains(for: 0...13, detector: clip, known: [:])
+        #expect(try #require(gains[8]) <= #require(gains[1]) + 3)
+        #expect(try #require(gains[12]) <= #require(gains[1]) + 3)
+    }
+
+    /// A sustained genuine step down remains audible after the nearby reference changes.
+    @Test func sustainedFortyDecibelStepDownRecovers() throws {
+        let leveler = VoiceLeveler()
+        for quiet in [-64.0, -66.0] {
+            let samples = Self.speech(seconds: 20, dB: -25) + Self.speech(seconds: 120, dB: quiet)
+            let clip = VoiceLeveler.Clip(samples: samples, start: 0)
+            let gains = leveler.gains(for: 0...14, detector: clip, known: [:])
+            #expect(try #require(gains[12]) >= 42)
+        }
+    }
+
+    /// The steady-residual hold reads the frames of keypoints k-1 and k+1, which after a seek may lie
+    /// outside the detector clip. A lecture of quiet speech (gain above 35 dB), a long steady
+    /// noise floor with no voice in it (a pause) and speech again is resolved (a) forward, a
+    /// 30 s segment at a time, each call given the keypoints the earlier ones used, and (b) as a
+    /// seek, the segment alone with no memory, with a clip cut the way the live pipeline cuts it
+    /// (22 s before, 20.5 s after). Inside the pause neither may lift the floor (gain at most 3 dB above
+    /// the speech gain), and no seek keypoint may be provisional, and each may differ from forward
+    /// play by at most 3 dB (a measurement tolerance). A seek that lands near the pause's end
+    /// (segment 3) once left the pause at a provisional 0 dB and the speech after it unlifted.
+    /// Without the hold, both paths put the floor at the 48 dB ceiling and the first check fails.
+    @Test(arguments: [1, 2, 3, 4, 5]) func aSeekIntoAPauseHoldsTheResidualLikeForwardPlay(segment: Int) throws {
+        let whole = Self.speech(seconds: 60, dB: -58) + Self.steadyNoise(seconds: 60, dB: -70) + Self.speech(seconds: 60, dB: -58)
+        let leveler = VoiceLeveler()
+        let length = Self.seconds(30)
+        func resolve(_ index: Int, memo: inout [Int: Double], provisional: inout Set<Int>) -> [Int: Double] {
+            let start = index * length, end = min(whole.count, start + length)
+            let from = max(0, start - Self.seconds(22)), to = min(whole.count, end + Self.seconds(20.5))
+            let clip = VoiceLeveler.Clip(samples: Array(whole[from..<to]), start: from)
+            let wanted = leveler.keypoints(covering: start..<end)
+            let resolution = leveler.resolve(for: wanted, detector: clip, known: memo, provisional: provisional)
+            for (k, g) in resolution.gains where memo[k] == nil {
+                memo[k] = g
+                if resolution.provisional.contains(k) { provisional.insert(k) }
+            }
+            return resolution.gains
+        }
+        var forward: [Int: Double] = [:], forwardProvisional = Set<Int>()
+        for index in 0..<(whole.count / length) { _ = resolve(index, memo: &forward, provisional: &forwardProvisional) }
+        var empty: [Int: Double] = [:], none = Set<Int>()
+        let seek = resolve(segment, memo: &empty, provisional: &none)
+
+        let speechGain = try #require(forward[3])
+        #expect(speechGain >= 35, "the fixture must need the high gain the hold guards")
+        // The pause is keypoints 7 to 11 (70 to 110 s; 60 to 120 s is noise, and a keypoint's
+        // window looks 12 s back).
+        for k in 7...11 {
+            if let g = forward[k] { #expect(g <= speechGain + 3, "forward: keypoint \(k) = \(g) dB") }
+            if let g = seek[k] { #expect(g <= speechGain + 3, "seek into segment \(segment): keypoint \(k) = \(g) dB") }
+        }
+        #expect(none.isEmpty, "seek into segment \(segment): provisional keypoints \(none.sorted())")
+        for (k, g) in seek {
+            let expected = try #require(forward[k])
+            #expect(abs(g - expected) <= 3, "seek into segment \(segment): keypoint \(k) = \(g) dB, forward \(expected) dB")
+        }
+    }
+
+    /// Continuous white noise at `dB` dBFS RMS: a microphone's steady hiss, not modulated like speech.
+    static func steadyNoise(seconds length: Double, dB: Double) -> [Float] {
+        var noise = Noise()
+        let amplitude = Float(pow(10, dB / 20) * 3.0.squareRoot())
+        return (0..<seconds(length)).map { _ in noise.next() * amplitude }
+    }
+
     static let rate = VoiceLeveler.rate
     static func seconds(_ s: Double) -> Int { Int((s * Double(rate)).rounded()) }
 

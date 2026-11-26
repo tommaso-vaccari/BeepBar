@@ -165,6 +165,75 @@ struct VoiceLevelerTests {
         for j in 5...k { #expect(try #require(gains[j]) <= speechGain + 3, "keypoint \(j) = \(gains[j] ?? .nan) dB, speech \(speechGain) dB") }
     }
 
+    /// One 30 s segment resolved the way the live pipeline does: a clip of the 22 s before it, the
+    /// segment and the first 20.5 s after, the keypoints it covers resolved against `memo` and merged
+    /// into it (an existing entry wins). Returns what it resolved.
+    @discardableResult
+    static func resolveSegment(_ index: Int, of whole: [Float], memo: inout [Int: Double], provisional: inout Set<Int>) -> [Int: Double] {
+        let length = seconds(30)
+        let start = index * length, end = min(whole.count, start + length)
+        let from = max(0, start - seconds(22)), to = min(whole.count, end + seconds(20.5))
+        let leveler = VoiceLeveler()
+        let clip = VoiceLeveler.Clip(samples: Array(whole[from..<to]), start: from)
+        let r = leveler.resolve(for: leveler.keypoints(covering: start..<end), detector: clip, known: memo, provisional: provisional)
+        for (k, g) in r.gains where memo[k] == nil {
+            memo[k] = g
+            if r.provisional.contains(k) { provisional.insert(k) }
+        }
+        return r.gains
+    }
+
+    /// Speech with steady hiss under it the whole time (`hissDB` mixed into `speechDB`'s bursts).
+    static func speechOverHiss(seconds total: Double, speechDB: Double, hissDB: Double) -> [Float] {
+        zip(speech(seconds: total, dB: speechDB), steadyNoise(seconds: total, dB: hissDB)).map { $0 + $1 }
+    }
+
+    /// Checks `whole` (a 120 s lecture of speech at `speechDB`) three ways, each gaining within 3 dB
+    /// of `target − speech` and none provisional: the whole lecture at once, forward in 30 s
+    /// segments, and a cold seek into each of segments 1 to 3 with no memory.
+    private func expectLifted(_ whole: [Float], speechDB: Double, tolerance: Double = 3, _ label: String) throws {
+        let expected = -20 - speechDB
+        let leveler = VoiceLeveler()
+        let all = leveler.gains(for: 1...11, detector: VoiceLeveler.Clip(samples: whole, start: 0), known: [:])
+        for k in 1...11 { #expect(abs(try #require(all[k]) - expected) <= tolerance, "\(label) whole: keypoint \(k) = \(all[k] ?? .nan), expected \(expected)") }
+        var forward: [Int: Double] = [:], forwardProvisional = Set<Int>()
+        for index in 0..<4 { Self.resolveSegment(index, of: whole, memo: &forward, provisional: &forwardProvisional) }
+        #expect(forwardProvisional.isEmpty, "\(label) forward: provisional \(forwardProvisional.sorted())")
+        for k in 1...11 { #expect(abs(try #require(forward[k]) - expected) <= tolerance, "\(label) forward: keypoint \(k) = \(forward[k] ?? .nan), expected \(expected)") }
+        for index in 1...3 {
+            var memo: [Int: Double] = [:], provisional = Set<Int>()
+            let seek = Self.resolveSegment(index, of: whole, memo: &memo, provisional: &provisional)
+            #expect(provisional.isEmpty, "\(label) seek into \(index): provisional \(provisional.sorted())")
+            for (k, g) in seek where k >= 1 { #expect(abs(g - expected) <= tolerance, "\(label) seek into \(index): keypoint \(k) = \(g), expected \(expected)") }
+        }
+    }
+
+    /// Review finding on the residual margin (#278): speech only 6 to 10 dB above a steady hiss is
+    /// still speech. An absolute cut 10 dB above the hiss removed every speech frame, left no
+    /// anchor, and played the whole lecture at a provisional 0 dB where the earlier rule lifted
+    /// it to 37 to 45 dB. Continuous hiss under the speech; the hiss adds to the measured level, so the
+    /// lift lands up to 4 dB under `target - speech` (tolerance 5; the failure being guarded is 0 dB).
+    @Test(arguments: [(-60.0, -68.0), (-62.0, -70.0), (-64.0, -72.0), (-66.0, -72.0), (-58.0, -64.0)])
+    func speechNearContinuousHissIsStillLifted(speechDB: Double, hissDB: Double) throws {
+        try expectLifted(Self.speechOverHiss(seconds: 120, speechDB: speechDB, hissDB: hissDB), speechDB: speechDB, tolerance: 5, "\(speechDB)/\(hissDB) continuous")
+    }
+
+    /// Same, the hiss only in the 2.5 s gaps every 10 s. The −62/−72 case is the one where a seek
+    /// into a pause once stayed provisional while forward play lifted: seek and forward must agree.
+    @Test(arguments: [(-60.0, -68.0), (-64.0, -70.0), (-62.0, -72.0)])
+    func speechNearHissInTheGapsIsStillLifted(speechDB: Double, hissDB: Double) throws {
+        try expectLifted(Self.speechWithHissGaps(seconds: 120, speechDB: speechDB, hissDB: hissDB), speechDB: speechDB, "\(speechDB)/\(hissDB) gaps")
+    }
+
+    /// A steady, noise-like stretch just under the speech level (a long "sss", a fan between
+    /// sentences): −62 dBFS for 2.4 s every 10 s inside −60 dBFS speech. It must not be taken for
+    /// a pause's residual and pull the window's speech out with it.
+    @Test func aSteadyStretchInsideSpeechDoesNotCancelTheSpeech() throws {
+        var whole: [Float] = []
+        while whole.count < Self.seconds(120) { whole += Self.speech(seconds: 7.6, dB: -60) + Self.steadyNoise(seconds: 2.4, dB: -62) }
+        try expectLifted(Array(whole.prefix(Self.seconds(120))), speechDB: -60, "sss")
+    }
+
     /// Same finding, with a drop: 30 s at −25 dBFS then −58 dBFS, hiss gaps every 10 s throughout.
     /// The lift to the quiet level must come within a few keypoints (a held-forever rule stayed at
     /// 6.8 dB, the −25 dBFS lecture's gain).

@@ -163,19 +163,32 @@ public struct VoiceLeveler: Sendable {
             // Steady residual (#278), found on a second lecture's pause where the teacher stops
             // talking and only the microphone's steady hiss (about −72 dBFS) remains: the floor
             // rule counts it as voiced, so the gain climbed by ~50 dB and the hiss became loud.
-            // The residual's level is read from the steady runs (`steadyResidualFrames`) of this
+            // The residual's level is the median of the steady runs (`steadyResidualFrames`) of this
             // keypoint and of its neighbours k−1 and k+1 (a pause's residual is interrupted by
             // digital silence, so a window may hold no run of its own yet be all residual).
-            // Frames within `residualMargin` dB above that level are the residual and leave
-            // `voiced`: a window that is mostly pause holds through `minVoiced` like any silence,
-            // while speech with a short hiss gap in it, well above the hiss, is measured as speech
-            // (a whole-window hold there left a quiet lecture at 0 dB).
+            // Out of `voiced` go the frames of this window's own runs and those below that level
+            // plus a margin: a window that is mostly pause then holds through `minVoiced` like any
+            // silence, while speech with a short hiss gap in it is measured as speech (a
+            // whole-window hold there left a quiet lecture at 0 dB).
+            // The margin is `residualMargin` at most, and at most half of how far the window's own
+            // non-run frames (90th percentile) stand above the residual: speech that sits only a
+            // few dB above the hiss (a lecture at −64 dBFS over −72 dBFS of hiss, or a long
+            // steady "sss" in a sentence) keeps its frames instead of being cut away with the
+            // hiss, which left such a lecture unanchored at 0 dB.
+            let own = Self.steadyResidualFrames(levels)
             let runLevels = [k - 1, k, k + 1].filter { $0 >= 0 }.flatMap { j -> [Double] in
                 let f = frameLevels(j)
                 return Self.steadyResidualFrames(f).map { f[$0].level }
             }
-            let ceiling = runLevels.isEmpty ? -Double.infinity : Self.percentile(runLevels, 0.5) + Self.residualMargin
-            let voiced = levels.map(\.level).filter { $0 > floor && $0 >= ceiling }
+            var ceiling = -Double.infinity
+            if !runLevels.isEmpty {
+                let residual = Self.percentile(runLevels, 0.5)
+                let others = levels.indices.filter { !own.contains($0) }.map { levels[$0].level }
+                let margin = others.isEmpty ? Self.residualMargin
+                    : max(0, min(Self.residualMargin, (Self.percentile(others, 0.9) - residual) / 2))
+                ceiling = residual + margin
+            }
+            let voiced = levels.indices.filter { !own.contains($0) && levels[$0].level > floor && levels[$0].level >= ceiling }.map { levels[$0].level }
             guard Double(voiced.count) / Double(levels.count) >= minVoiced else { return .hold }
             return .gain(max(minGain, min(maxGain, target - Self.percentile(voiced, percentile))))
         }
@@ -250,10 +263,9 @@ public struct VoiceLeveler: Sendable {
     /// is dominated by low frequencies, so its ratio is small; microphone hiss is broadband.
     private struct Frame { let level: Double; let differenceRatio: Double }
 
-    /// How far above a steady residual's level a frame still counts as that residual, in dB. The
-    /// real pause that revealed #278 had its tails and blips up to about 10 dB above the steady
-    /// part, while the quietest speech the leveler lifts (−58 dBFS) is 14 dB or more above the hiss
-    /// that goes with it (−72 dBFS).
+    /// The most, in dB, that a frame may stand above a steady residual's level and still count as
+    /// that residual. The real pause that revealed #278 had its tails and blips up to about 10 dB
+    /// above the steady part; see `classify` for how the margin shrinks for quiet speech.
     private static let residualMargin = 10.0
 
     /// The indices of the frames that belong to a steady residual (#278): every frame of each run

@@ -116,10 +116,7 @@ public struct VoiceLeveler: Sendable {
     }
 
     /// What one keypoint's window says.
-    /// `neighbourHold(g)`: held only because the keypoint before or after it shows a steady
-    /// residual (see `classify`); `g` is its own measured gain, used only when nothing earlier
-    /// can anchor it.
-    private enum Measure { case gain(Double), neighbourHold(Double), hold, unmeasurable }
+    private enum Measure { case gain(Double), hold, unmeasurable }
 
     /// What `resolve` returns: the gain in dB of each requested keypoint, and which of them are
     /// provisional (`neutral` because nothing in the clip or the memory said otherwise).
@@ -153,7 +150,6 @@ public struct VoiceLeveler: Sendable {
     public func resolve(for keypoints: ClosedRange<Int>, detector: Clip, known: [Int: Double], provisional: Set<Int>) -> Resolution {
         var measures: [Int: Measure] = [:]
         var references: [Int: Measure] = [:]
-        var resolvedReferences: [Int: Double] = [:]
         var frameCache: [Int: [Frame]] = [:]
         func frameLevels(_ k: Int) -> [Frame] {
             if let cached = frameCache[k] { return cached }
@@ -164,31 +160,28 @@ public struct VoiceLeveler: Sendable {
         func classify(_ k: Int, floor: Double) -> Measure {
             let levels = frameLevels(k)
             guard !levels.isEmpty else { return .unmeasurable }
-            let voiced = levels.map(\.level).filter { $0 > floor }
-            guard Double(voiced.count) / Double(levels.count) >= minVoiced else { return .hold }
-            let gain = max(minGain, min(maxGain, target - Self.percentile(voiced, percentile)))
-            // Steady-residual hold (#278). Found on a second lecture's pause where the teacher
-            // stops talking and only the microphone's steady hiss (about −72 dBFS) remains: the
-            // floor rule counts it as voiced, so the gain climbs by ~50 dB and the hiss becomes
-            // loud. Only a gain of 35 dB or more is at risk (normal speech gains stay below it),
-            // so the check costs nothing elsewhere. Two causes, told apart on purpose:
-            // - the keypoint's OWN frames hold the residual: its measured gain is the pause's,
-            //   so it holds (takes the previous gain, like any silence);
-            // - only a NEIGHBOUR (k−1, k+1) does: a window that straddles the start or end of a
-            //   pause. Its own gain is speech's, but with a previous anchor it holds too (forward
-            //   play), and with none (a seek that lands in the pause) `value` and `unanchored`
-            //   use that own gain instead of a provisional 0 dB, so the speech that ends the
-            //   pause starts at its right level and the pause keypoints before it look ahead to it.
-            if gain >= 35 {
-                if Self.hasSteadyResidual(levels) { return .hold }
-                if [k - 1, k + 1].filter({ $0 >= 0 }).contains(where: { Self.hasSteadyResidual(frameLevels($0)) }) { return .neighbourHold(gain) }
+            // Steady residual (#278), found on a second lecture's pause where the teacher stops
+            // talking and only the microphone's steady hiss (about −72 dBFS) remains: the floor
+            // rule counts it as voiced, so the gain climbed by ~50 dB and the hiss became loud.
+            // The residual's level is read from the steady runs (`steadyResidualFrames`) of this
+            // keypoint and of its neighbours k−1 and k+1 (a pause's residual is interrupted by
+            // digital silence, so a window may hold no run of its own yet be all residual).
+            // Frames within `residualMargin` dB above that level are the residual and leave
+            // `voiced`: a window that is mostly pause holds through `minVoiced` like any silence,
+            // while speech with a short hiss gap in it, well above the hiss, is measured as speech
+            // (a whole-window hold there left a quiet lecture at 0 dB).
+            let runLevels = [k - 1, k, k + 1].filter { $0 >= 0 }.flatMap { j -> [Double] in
+                let f = frameLevels(j)
+                return Self.steadyResidualFrames(f).map { f[$0].level }
             }
-            return .gain(gain)
+            let ceiling = runLevels.isEmpty ? -Double.infinity : Self.percentile(runLevels, 0.5) + Self.residualMargin
+            let voiced = levels.map(\.level).filter { $0 > floor && $0 >= ceiling }
+            guard Double(voiced.count) / Double(levels.count) >= minVoiced else { return .hold }
+            return .gain(max(minGain, min(maxGain, target - Self.percentile(voiced, percentile))))
         }
         // The nearby context has a bounded size even after a deep seek.
         func reference(_ k: Int) -> Double? {
             if let g = known[k], !provisional.contains(k), g < maxGain { return g }
-            if let g = resolvedReferences[k], g < maxGain { return g }
             let result: Measure
             if let cached = references[k] { result = cached }
             else {
@@ -221,10 +214,7 @@ public struct VoiceLeveler: Sendable {
         func unanchored(_ k: Int) -> (gain: Double, provisional: Bool) {
             var j = k + 1
             while time(of: j) <= detector.end + Int(step.rounded()) {
-                switch measure(j) {
-                case .gain(let g), .neighbourHold(let g): return (g, false)
-                default: break
-                }
+                if case .gain(let g) = measure(j) { return (g, false) }
                 j += 1
             }
             // The nearest index, the earlier one on a tie (a gain already in use that came
@@ -236,14 +226,12 @@ public struct VoiceLeveler: Sendable {
         func value(_ k: Int) -> (gain: Double, provisional: Bool) {
             if let fixed = known[k] { return (fixed, provisional.contains(k)) }
             var j = k
-            var own: Double?
-            if case .neighbourHold(let g) = measure(k) { own = g }
             while true {
                 if j < k, let fixed = anchor(j) { return (fixed, false) }
                 if case .gain(let g) = measure(j) { return (g, false) }
                 // Hold or unmeasurable: the previous keypoint's value, when there is one to use.
                 guard j > 0, (time(of: j - 1) >= detector.start || anchor(j - 1) != nil),
-                      usable(j - 1) else { return own.map { ($0, false) } ?? unanchored(k) }
+                      usable(j - 1) else { return unanchored(k) }
                 j -= 1
             }
         }
@@ -252,7 +240,6 @@ public struct VoiceLeveler: Sendable {
             let v = value(k)
             result.gains[k] = v.gain
             if v.provisional { result.provisional.insert(k) }
-            else { resolvedReferences[k] = v.gain }
         }
         return result
     }
@@ -263,23 +250,30 @@ public struct VoiceLeveler: Sendable {
     /// is dominated by low frequencies, so its ratio is small; microphone hiss is broadband.
     private struct Frame { let level: Double; let differenceRatio: Double }
 
-    /// Whether `frames` hold a steady residual (#278): a run of 5 consecutive frames (2 s) that
-    /// are all
+    /// How far above a steady residual's level a frame still counts as that residual, in dB. The
+    /// real pause that revealed #278 had its tails and blips up to about 10 dB above the steady
+    /// part, while the quietest speech the leveler lifts (−58 dBFS) is 14 dB or more above the hiss
+    /// that goes with it (−72 dBFS).
+    private static let residualMargin = 10.0
+
+    /// The indices of the frames that belong to a steady residual (#278): every frame of each run
+    /// of 5 consecutive frames (2 s) that are all
     /// - between −95 and −55 dBFS: below even quiet speech (a −58 dBFS lecture is the quietest
     ///   the leveler is meant to lift) and above digital silence, which is where a microphone's
     ///   floor sits after a pause;
     /// - noise-like, difference ratio of at least 0.15, which voiced speech does not reach;
     /// - steady, level spread of at most 1.5 dB: speech, even noise-like consonants, fluctuates
     ///   more than that over 2 s, while a floor does not.
-    private static func hasSteadyResidual(_ frames: [Frame]) -> Bool {
-        guard frames.count >= 5 else { return false }
+    private static func steadyResidualFrames(_ frames: [Frame]) -> Set<Int> {
+        var marked = Set<Int>()
+        guard frames.count >= 5 else { return marked }
         for start in 0...(frames.count - 5) {
             let run = frames[start..<(start + 5)]
             guard run.allSatisfy({ $0.level > -95 && $0.level < -55 && $0.differenceRatio >= 0.15 }) else { continue }
             let levels = run.map(\.level)
-            if levels.max()! - levels.min()! <= 1.5 { return true }
+            if levels.max()! - levels.min()! <= 1.5 { marked.formUnion(start..<(start + 5)) }
         }
-        return false
+        return marked
     }
 
     /// The frames in keypoint `k`'s window on `clip`: the 30 frames ending at its position, or, when fewer than

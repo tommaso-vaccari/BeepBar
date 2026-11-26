@@ -66,8 +66,7 @@ struct VoiceLevelerTests {
         }
     }
 
-    /// The steady-residual hold reads the frames of keypoints k-1 and k+1, which after a seek may lie
-    /// outside the detector clip. A lecture of quiet speech (gain above 35 dB), a long steady
+    /// A lecture of quiet speech (gain above 35 dB), a long steady
     /// noise floor with no voice in it (a pause) and speech again is resolved (a) forward, a
     /// 30 s segment at a time, each call given the keypoints the earlier ones used, and (b) as a
     /// seek, the segment alone with no memory, with a clip cut the way the live pipeline cuts it
@@ -110,6 +109,69 @@ struct VoiceLevelerTests {
             let expected = try #require(forward[k])
             #expect(abs(g - expected) <= 3, "seek into segment \(segment): keypoint \(k) = \(g) dB, forward \(expected) dB")
         }
+    }
+
+    /// Speech at `speechDB` with `hiss` seconds of steady microphone hiss at `hissDB` closing every
+    /// `period` seconds, for `seconds` in all: a quiet lecture whose teacher stops talking briefly.
+    static func speechWithHissGaps(seconds total: Double, speechDB: Double, hissDB: Double, period: Double = 10, hiss: Double = 2.5) -> [Float] {
+        var parts: [Float] = []
+        var t = 0.0
+        while t < total {
+            parts += speech(seconds: period - hiss, dB: speechDB) + steadyNoise(seconds: hiss, dB: hissDB)
+            t += period
+        }
+        return parts
+    }
+
+    /// Regression for a review finding on the steady-residual rule (#278): a 2 to 3 s hiss gap inside
+    /// a window of quiet speech must not make the keypoint hold. A rule that held the whole window
+    /// whenever it contained a steady run left every keypoint of a −58 or −62 dBFS lecture at a
+    /// provisional 0 dB, never lifted (gain 38 and 42 are the right ones), forward or whole.
+    @Test(arguments: [(-58.0, -72.0, 35.0), (-62.0, -80.0, 40.0)])
+    func hissGapsInsideQuietSpeechDoNotStopTheLift(speechDB: Double, hissDB: Double, atLeast: Double) throws {
+        let whole = Self.speechWithHissGaps(seconds: 120, speechDB: speechDB, hissDB: hissDB)
+        let leveler = VoiceLeveler()
+        let all = leveler.gains(for: 0...11, detector: VoiceLeveler.Clip(samples: whole, start: 0), known: [:])
+        for k in 1...11 { #expect(try #require(all[k]) >= atLeast, "whole: keypoint \(k) = \(all[k] ?? .nan) dB") }
+        var memo: [Int: Double] = [:], provisional = Set<Int>()
+        let length = Self.seconds(30)
+        for index in 0..<4 {
+            let start = index * length, end = min(whole.count, start + length)
+            let from = max(0, start - Self.seconds(22)), to = min(whole.count, end + Self.seconds(20.5))
+            let clip = VoiceLeveler.Clip(samples: Array(whole[from..<to]), start: from)
+            let r = leveler.resolve(for: leveler.keypoints(covering: start..<end), detector: clip, known: memo, provisional: provisional)
+            for (k, g) in r.gains where memo[k] == nil {
+                memo[k] = g
+                if r.provisional.contains(k) { provisional.insert(k) }
+            }
+        }
+        for k in 1...11 { #expect(try #require(memo[k]) >= atLeast, "forward: keypoint \(k) = \(memo[k] ?? .nan) dB") }
+    }
+
+    /// A real pause's residual is interrupted (the isolation leaves digital silence and short
+    /// bursts of hiss between steady stretches), so some windows hold no 2 s steady run of their
+    /// own. They must still read as residual, from the steady runs next to them, and not be lifted
+    /// by the pause's quietest frames: with only each window's own runs the pause went to 48 dB.
+    @Test func anInterruptedPauseIsNotLiftedBetweenItsSteadyStretches() throws {
+        var pause: [Float] = []
+        for _ in 0..<4 {
+            pause += Self.steadyNoise(seconds: 12, dB: -73)
+            for _ in 0..<8 { pause += Self.steadyNoise(seconds: 1.5, dB: -75) + Self.speech(seconds: 0.5, dB: -120, silent: true) }
+        }
+        let whole = Self.speech(seconds: 30, dB: -58) + pause
+        let k = (whole.count / Self.seconds(10)) - 1
+        let gains = VoiceLeveler().gains(for: 0...k, detector: VoiceLeveler.Clip(samples: whole, start: 0), known: [:])
+        let speechGain = try #require(gains[2])
+        for j in 5...k { #expect(try #require(gains[j]) <= speechGain + 3, "keypoint \(j) = \(gains[j] ?? .nan) dB, speech \(speechGain) dB") }
+    }
+
+    /// Same finding, with a drop: 30 s at −25 dBFS then −58 dBFS, hiss gaps every 10 s throughout.
+    /// The lift to the quiet level must come within a few keypoints (a held-forever rule stayed at
+    /// 6.8 dB, the −25 dBFS lecture's gain).
+    @Test func aStepDownWithHissGapsStillReachesTheQuietGain() throws {
+        let whole = Self.speechWithHissGaps(seconds: 30, speechDB: -25, hissDB: -72) + Self.speechWithHissGaps(seconds: 90, speechDB: -58, hissDB: -72)
+        let gains = VoiceLeveler().gains(for: 0...11, detector: VoiceLeveler.Clip(samples: whole, start: 0), known: [:])
+        for k in 6...11 { #expect(try #require(gains[k]) >= 35, "keypoint \(k) = \(gains[k] ?? .nan) dB") }
     }
 
     /// Continuous white noise at `dB` dBFS RMS: a microphone's steady hiss, not modulated like speech.

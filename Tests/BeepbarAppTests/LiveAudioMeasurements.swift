@@ -18,11 +18,10 @@ struct LiveAudioMeasurements {
     private static let folder = FileManager.default.temporaryDirectory.appendingPathComponent("live-audio-measure", isDirectory: true)
 
     /// Six minutes, twelve segments; made once and reused by both variants.
-    private static func lecture() throws -> URL {
+    fileprivate static func lecture(in folder: URL, ffmpeg: URL) throws -> URL {
         let playlist = folder.appendingPathComponent("out.m3u8")
         if FileManager.default.fileExists(atPath: playlist.path) { return folder }
         try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
-        let ffmpeg = try #require(AudioEnhancement.locateFFmpeg())
         let speech = try AudioTestSignals.speech(seconds: 360, in: folder, ffmpeg: ffmpeg)
         try AudioTestSignals.run(ffmpeg, ["-nostdin", "-loglevel", "error", "-y",
                                           "-f", "lavfi", "-i", "testsrc2=size=1280x720:rate=25", "-i", speech.path, "-t", "360",
@@ -44,8 +43,8 @@ struct LiveAudioMeasurements {
 
     @Test(arguments: [(true, AudioEnhancementKind.isolated), (true, .levelled), (false, .isolated)])
     func measure(isolation: Bool, kind: AudioEnhancementKind) async throws {
-        let lecture = try Self.lecture()
         let ffmpeg = try #require(AudioEnhancement.locateFFmpeg())
+        let lecture = try Self.lecture(in: Self.folder, ffmpeg: ffmpeg)
         let steps = Steps()
         let isolator: LiveAudioVoiceIsolating? = isolation ? TimedIsolator(inner: try #require(AppleVoiceIsolator.preferred()), steps: steps) : nil
         let sessions = Self.folder.appendingPathComponent("sessions-\(isolation)-\(kind.rawValue)")
@@ -140,6 +139,96 @@ struct LiveAudioMeasurements {
             $0.withMemoryRebound(to: integer_t.self, capacity: Int(count)) { task_info(mach_task_self_, task_flavor_t(TASK_VM_INFO), $0, &count) }
         }
         return result == KERN_SUCCESS ? info.phys_footprint : 0
+    }
+}
+
+
+/// Compares the real pipeline using the same synthetic Webex lecture and player request order.
+/// Run with BEEPBAR_COMPARE_FFMPEG=/absolute/path/to/candidate swift test --filter LiveAudioFFmpegComparison.
+@MainActor
+@Suite(.serialized, .enabled(if: ProcessInfo.processInfo.environment["BEEPBAR_COMPARE_FFMPEG"] != nil,
+                             "on demand: BEEPBAR_COMPARE_FFMPEG"))
+struct LiveAudioFFmpegComparison {
+    @Test func identicalSegments() async throws {
+        let reference = URL(fileURLWithPath: "/opt/homebrew/bin/ffmpeg")
+        let candidatePath = try #require(ProcessInfo.processInfo.environment["BEEPBAR_COMPARE_FFMPEG"])
+        try #require(candidatePath.hasPrefix("/") && FileManager.default.isExecutableFile(atPath: candidatePath))
+        try #require(FileManager.default.isExecutableFile(atPath: reference.path))
+        try #require(AudioTestSignals.canSpeak)
+        let candidate = URL(fileURLWithPath: candidatePath)
+        let folder = FileManager.default.temporaryDirectory.appendingPathComponent("ffmpeg-comparison-\(UUID().uuidString)", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: folder) }
+        let lecture = try LiveAudioMeasurements.lecture(in: folder.appendingPathComponent("lecture"), ffmpeg: reference)
+        let address = URL(string: "https://media.example.test/rec/out.m3u8")!
+        let requests = [0, 1, 2, 8, 1]
+        for (isolation, kind) in [(true, AudioEnhancementKind.isolated), (true, .levelled), (false, .isolated)] {
+            let comparisons = FFmpegComparisons()
+            let isolator: LiveAudioVoiceIsolating? = isolation ? try #require(AppleVoiceIsolator.preferred()) : nil
+            let session = try LiveAudioSession(stream: address, ffmpeg: candidate, onFailure: { _ in },
+                fetcher: DiskLecture(folder: lecture), runner: ComparingRunner(reference: reference, comparisons: comparisons),
+                isolator: isolator, kind: kind, parent: folder.appendingPathComponent(UUID().uuidString))
+            defer { session.stop() }
+            let (_, playlistResponse) = try await URLSession.shared.data(from: session.playlistURL)
+            try #require((playlistResponse as? HTTPURLResponse)?.statusCode == 200)
+            for index in requests {
+                let url = session.playlistURL.deletingLastPathComponent().appendingPathComponent(AudioEnhancement.segmentName(index))
+                let (data, response) = try await URLSession.shared.data(from: url)
+                try #require((response as? HTTPURLResponse)?.statusCode == 200 && !data.isEmpty,
+                             "Failed to render segment \(index), isolation=\(isolation), kind=\(kind.rawValue); \(comparisons.report)")
+                try #require(comparisons.hasSegment(index),
+                             "Segment \(index) was served without a completed comparison, isolation=\(isolation), kind=\(kind.rawValue)")
+            }
+            session.stop()
+            #expect(comparisons.report.isEmpty, "isolation=\(isolation), kind=\(kind.rawValue): \(comparisons.report)")
+        }
+    }
+}
+
+/// Records completed comparisons; cancelled prefetches are not evidence of a mismatch.
+private final class FFmpegComparisons: @unchecked Sendable {
+    private let lock = NSLock()
+    private var failures: [String] = []
+    private var completed: Set<String> = []
+    func record(_ name: String, failure: String?) {
+        lock.withLock {
+            completed.insert(name)
+            if let failure { failures.append(failure) }
+        }
+    }
+    func hasSegment(_ index: Int) -> Bool {
+        lock.withLock { completed.contains { $0.hasPrefix("out\(index)-") && $0.hasSuffix(".ts") } }
+    }
+    var report: String { lock.withLock { failures.joined(separator: "; ") } }
+}
+
+/// Both processes see the same inputs, including Apple's single isolated intermediate.
+private struct ComparingRunner: LiveAudioProcessRunning {
+    let reference: URL
+    let comparisons: FFmpegComparisons
+    private let inner = FFmpegRunner()
+
+    func run(_ executable: URL, _ arguments: [String]) async throws {
+        guard let path = arguments.last else { throw FFmpegExitError() }
+        let output = URL(fileURLWithPath: path)
+        let sibling = output.deletingLastPathComponent().appendingPathComponent("comparison-\(UUID().uuidString).\(output.pathExtension)")
+        defer { try? FileManager.default.removeItem(at: sibling) }
+        var referenceArguments = arguments
+        referenceArguments[referenceArguments.count - 1] = sibling.path
+        do {
+            try await inner.run(reference, referenceArguments)
+            try await inner.run(executable, arguments)
+            try Task.checkCancellation()
+            let referenceData = try Data(contentsOf: sibling)
+            let candidateData = try Data(contentsOf: output)
+            try Task.checkCancellation()
+            let name = output.lastPathComponent
+            comparisons.record(name, failure: referenceData == candidateData ? nil : "different \(name) (\(output.pathExtension)): reference \(referenceData.count) bytes, candidate \(candidateData.count) bytes")
+        } catch {
+            if !Task.isCancelled && !(error is CancellationError) {
+                comparisons.record(output.lastPathComponent, failure: "failed \(output.lastPathComponent) (\(output.pathExtension)): \(error)")
+            }
+            throw error
+        }
     }
 }
 

@@ -5,6 +5,14 @@ import Testing
 /// The pure part of "Audio migliorato": where ffmpeg is looked for, what it is asked to do, how
 /// its progress is read and which cached copies go.
 struct AudioEnhancementTests {
+    /// Releases prefer their own helper. An unpackaged build still works with a system copy.
+    @Test func bundledFFmpegTakesPrecedence() {
+        let bundled = URL(fileURLWithPath: "/Beepbar.app/Contents/Helpers/ffmpeg")
+        #expect(AudioEnhancement.locateFFmpeg(bundledExecutable: bundled) { _ in true } == bundled)
+        #expect(AudioEnhancement.locateFFmpeg(bundledExecutable: bundled) { $0 == "/opt/homebrew/bin/ffmpeg" }?.path == "/opt/homebrew/bin/ffmpeg")
+        #expect(AudioEnhancement.locateFFmpeg(bundledExecutable: bundled) { _ in false } == nil)
+    }
+
     /// Only the fixed package-manager paths, in order; never anything else (no `PATH`).
     @Test func ffmpegIsFoundOnlyAtFixedPaths() {
         #expect(AudioEnhancement.locateFFmpeg { _ in false } == nil)

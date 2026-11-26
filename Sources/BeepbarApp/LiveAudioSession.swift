@@ -162,6 +162,10 @@ struct FFmpegRunner: LiveAudioProcessRunning {
     /// A segment takes 0.3–0.7 s on an Apple M5; a minute means ffmpeg is stuck.
     var timeLimit: TimeInterval = 60
 
+    /// Launch has its own deadline: `Process.run()` can block before returning a pid.
+    var startupLimit: TimeInterval = 5
+    var launch: @Sendable (Process) throws -> Void = { try $0.run() }
+
     func run(_ executable: URL, _ arguments: [String]) async throws {
         let process = Process()
         process.executableURL = executable
@@ -170,21 +174,26 @@ struct FFmpegRunner: LiveAudioProcessRunning {
         process.standardOutput = FileHandle.nullDevice
         process.standardError = FileHandle.nullDevice
         let control = ProcessControl()
+        let launch = launch
+        let startupLimit = startupLimit
+        let timeLimit = timeLimit
         let status: Int32 = try await withTaskCancellationHandler {
             try await withCheckedThrowingContinuation { continuation in
+                guard control.start(continuation) else { return }
                 process.terminationHandler = { finished in
-                    control.finished(finished.processIdentifier)
-                    continuation.resume(returning: finished.terminationReason == .exit ? finished.terminationStatus : -1)
+                    control.finished(finished.processIdentifier, status: finished.terminationReason == .exit ? finished.terminationStatus : -1)
                 }
-                do {
-                    try control.launch(process)
-                } catch {
-                    process.terminationHandler = nil
-                    continuation.resume(throwing: error)
-                    return
+                DispatchQueue.global(qos: .utility).asyncAfter(deadline: .now() + startupLimit) { control.timeout(startupOnly: true) }
+                DispatchQueue.global(qos: .utility).async {
+                    do {
+                        try launch(process)
+                        if control.launched(process.processIdentifier) {
+                            DispatchQueue.global(qos: .utility).asyncAfter(deadline: .now() + timeLimit) { control.timeout(startupOnly: false) }
+                        }
+                    } catch {
+                        control.launchFailed(error)
+                    }
                 }
-                let limit = timeLimit
-                DispatchQueue.global(qos: .utility).asyncAfter(deadline: .now() + limit) { control.kill() }
             }
         } onCancel: {
             control.cancel()
@@ -193,42 +202,79 @@ struct FFmpegRunner: LiveAudioProcessRunning {
         guard status == 0 else { throw FFmpegExitError() }
     }
 
-    /// Who may signal the process, and when: never before it runs, never after it exited (its
-    /// pid could belong to another process by then). Everything under one lock.
+    /// Serializes completion and signaling. A timed-out launch may still return a child later:
+    /// it must be killed even though its caller has already resumed.
     private final class ProcessControl: @unchecked Sendable {
         private struct State {
             var pid: pid_t?
-            var cancelled = false
             var exited = false
+            var done = false
+            var failure: (any Error)?
+            var continuation: CheckedContinuation<Int32, any Error>?
         }
         private let state = OSAllocatedUnfairLock(initialState: State())
 
-        func launch(_ process: Process) throws {
-            try state.withLockUnchecked { state in
-                if state.cancelled { throw CancellationError() }
-                try process.run()
-                state.pid = process.processIdentifier
-                LiveAudioProcesses.insert(process.processIdentifier)
+        func start(_ continuation: CheckedContinuation<Int32, any Error>) -> Bool {
+            state.withLock { state in
+                if let failure = state.failure {
+                    state.done = true
+                    continuation.resume(throwing: failure)
+                    return false
+                }
+                state.continuation = continuation
+                return true
             }
         }
 
-        func finished(_ pid: pid_t) {
+        func launched(_ pid: pid_t) -> Bool {
+            state.withLock { state in
+                if state.exited { return false }
+                state.pid = pid
+                LiveAudioProcesses.insert(pid)
+                if state.failure != nil {
+                    Darwin.kill(pid, SIGKILL)
+                    return false
+                }
+                return true
+            }
+        }
+
+        func finished(_ pid: pid_t, status: Int32) {
             state.withLock { state in
                 state.exited = true
                 LiveAudioProcesses.remove(pid)
+                guard !state.done else { return }
+                state.done = true
+                if let failure = state.failure { state.continuation?.resume(throwing: failure) }
+                else { state.continuation?.resume(returning: status) }
+                state.continuation = nil
             }
         }
 
-        func cancel() {
+        func launchFailed(_ error: any Error) {
             state.withLock { state in
-                state.cancelled = true
-                if let pid = state.pid, !state.exited { Darwin.kill(pid, SIGTERM) }
+                guard !state.done else { return }
+                state.done = true
+                state.continuation?.resume(throwing: state.failure ?? error)
+                state.continuation = nil
             }
         }
 
-        func kill() {
+        func cancel() { stop(CancellationError(), startupOnly: false) }
+        func timeout(startupOnly: Bool) { stop(FFmpegExitError(), startupOnly: startupOnly) }
+
+        private func stop(_ error: any Error, startupOnly: Bool) {
             state.withLock { state in
-                if let pid = state.pid, !state.exited { Darwin.kill(pid, SIGTERM) }
+                guard !state.done, state.failure == nil, !(startupOnly && state.pid != nil) else { return }
+                state.failure = error
+                if let pid = state.pid, !state.exited {
+                    Darwin.kill(pid, SIGKILL)
+                } else if let continuation = state.continuation {
+                    // No pid yet: the caller cannot wait for a potentially blocked launch.
+                    state.done = true
+                    state.continuation = nil
+                    continuation.resume(throwing: error)
+                }
             }
         }
     }

@@ -416,6 +416,31 @@ import BeepbarCore
         #expect(RecordingsPageProbes.submitManualLesson != nil)
     }
 
+    @Test(.timeLimit(.minutes(1))) func courseManualLessonUsesOriginatingCourseAndRejectsDisabledCourse() async throws {
+        let page = try await HostedPage()
+        defer { page.close() }
+        _ = try await page.loadedCourse()
+        let course = try #require(page.fixture.controller.courses.first)
+        try await page.settle { RecordingsPageProbes.beginCourseManualLesson != nil }
+        let begin = try #require(RecordingsPageProbes.beginCourseManualLesson)
+        begin()
+        try await page.settle { RecordingsPageProbes.submitCourseManualLesson != nil }
+        let submit = try #require(RecordingsPageProbes.submitCourseManualLesson)
+        let result = submit("https://politecnicomilano.webex.com/ldr.php?RCID=course-add", "Guest", nil)
+        try result.get()
+        let lesson = try #require(page.recordings.manualLessons.lessons.first)
+        #expect(lesson.courseID == course.id)
+        #expect(lesson.isWatchlisted)
+        try await page.settle { page.bodies[lesson.id] != nil }
+        #expect(page.recordings.manualLessons.recordings(courseID: course.id).map(\.id).contains(lesson.id))
+        page.fixture.controller.setCourse(course, enabled: false)
+        try await page.settle()
+        if case .success = submit("https://politecnicomilano.webex.com/ldr.php?RCID=course-stale", "Stale", course.id) {
+            Issue.record("The removed course was accepted")
+        }
+        #expect(page.recordings.manualLessons.lessons.count == 1)
+    }
+
     /// A linked lesson's bookmark slot is a filled, inert bookmark: one click must never delete a
     /// lesson (#286). Mutation: return "trash" or `.toggle` for manual rows and this fails.
     @Test func manualRowsShowAFilledInertBookmark() {
@@ -518,8 +543,8 @@ import BeepbarCore
         try await page.settle { page.rows.contains { $0.recording.id == lesson.id && $0.courseName == "Course" } }
         let watchlistRow = try #require(page.rows.last { $0.recording.id == lesson.id && $0.courseName == "Course" })
         #expect(watchlistRow.canToggleLinkedBookmark)
-        let table = try await page.detailTable(rows: 1)
-        let menu = try page.contextMenu(table, row: 0)
+        let table = try await page.detailTable(rows: 2)
+        let menu = try page.contextMenu(table, row: 1)
         #expect(menu.items.map(\.title) == ["Apri nel browser", "Copia link", "Rimuovi dalla watchlist", "Elimina lezione…"])
         watchlistRow.actions.toggleWatchlist()
         #expect(recordings.watchlistCount(visibleCourseIDs: [courseID]) == 0)
@@ -559,8 +584,8 @@ import BeepbarCore
         let manual = try page.recordings.addManualLesson(link: "https://politecnicomilano.webex.com/ldr.php?RCID=wl-test", title: "Guest", courseName: "Course").get()
         page.recordings.selectDestination(.watchlist)
         try await page.settle { page.bodies[manual.id] != nil }
-        let table = try await page.detailTable(rows: 1)
-        let menu = try page.contextMenu(table, row: 0)
+        let table = try await page.detailTable(rows: 2)
+        let menu = try page.contextMenu(table, row: 1)
         #expect(menu.items.map(\.title) == ["Apri nel browser", "Copia link", "Elimina lezione…"])
         var request: (confirm: () -> Void, cancel: () -> Void)?
         RecordingsPageProbes.deleteRequest = { _, confirm, cancel in request = (confirm, cancel) }
@@ -632,12 +657,12 @@ import BeepbarCore
         recordings.toggleWatchlist(newest, courseName: "Synthetic")
         recordings.selectDestination(.watchlist)
         try await page.settle { page.rows.contains { $0.courseName == "Synthetic" } }
-        let table = try await page.detailTable(rows: 1)
+        let table = try await page.detailTable(rows: 2)
 
-        let menu = try page.contextMenu(table, row: 0)
+        let menu = try page.contextMenu(table, row: 1)
         #expect(menu.items.map(\.title) == ["Apri nel browser", "Copia link", "Rimuovi dalla watchlist"])
 
-        table.selectRowIndexes([0], byExtendingSelection: false)
+        table.selectRowIndexes([1], byExtendingSelection: false)
         try await page.settle()
         #expect(table.sendAction(table.doubleAction, to: table.target))
         #expect(recordings.openingRecordingID == newest.id, "a double click played \(recordings.openingRecordingID ?? "nothing")")

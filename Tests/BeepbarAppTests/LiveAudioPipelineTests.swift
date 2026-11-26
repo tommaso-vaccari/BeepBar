@@ -849,3 +849,92 @@ struct LiveAudioPipelineTests {
         #expect(LiveAudioPipeline.failure(for: FFmpegExitError()) == .unavailable)
     }
 }
+
+/// A stuck helper must be reaped even when it ignores SIGTERM.
+@Test(.timeLimit(.minutes(1)), arguments: [false, true]) func ffmpegTimeoutKillsAStubbornChild(cancel: Bool) async throws {
+    let file = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+    defer { try? FileManager.default.removeItem(at: file) }
+    let watchdog = Task {
+        try? await Task.sleep(for: .seconds(20))
+        guard !Task.isCancelled else { return }
+        if let text = try? String(contentsOf: file, encoding: .utf8), let pid = Int32(text.trimmingCharacters(in: .whitespacesAndNewlines)) {
+            kill(pid, SIGKILL)
+        }
+    }
+    defer { watchdog.cancel() }
+    let start = ContinuousClock.now
+    do {
+        let task = Task { try await FFmpegRunner(timeLimit: cancel ? 30 : 0.5).run(URL(fileURLWithPath: "/bin/sh"), ["-c", "trap '' TERM; echo $$ > \"$1\"; exec /bin/sleep 30", "sh", file.path]) }
+        if cancel {
+            try await eventually("helper started") { FileManager.default.fileExists(atPath: file.path) }
+            task.cancel()
+        }
+        try await task.value
+        Issue.record("stalled helper succeeded")
+    } catch is FFmpegExitError {
+        #expect(!cancel)
+    } catch is CancellationError {
+        #expect(cancel)
+    }
+    // 10 s, not tighter: under the full parallel suite the utility-QoS deadline has been seen
+    // firing ~8 s late. The bound still fails without the deadline, which would wait for the
+    // 20 s watchdog, the 30 s limit or the blocked launch.
+    #expect(start.duration(to: .now) < .seconds(10))
+}
+
+/// The release recovery points to the bundled helper; developers can install their own.
+@Test func ffmpegRecoveryHintMatchesTheBuild() {
+    #expect(RecordingPlayerPolicy.ffmpegHint(development: false).contains("Reinstalla BeepBar"))
+    #expect(RecordingPlayerPolicy.ffmpegHint(development: true).contains("brew install ffmpeg"))
+}
+
+private final class LateChild: @unchecked Sendable {
+    private let lock = NSLock()
+    private var value: pid_t = 0
+    private var started = false
+    func markStarted() { lock.withLock { started = true } }
+    var isStarted: Bool { lock.withLock { started } }
+    func set(_ pid: pid_t) { lock.withLock { value = pid } }
+    var pid: pid_t { lock.withLock { value } }
+}
+
+/// A launch blocked before obtaining a pid must not block fallback; a late child is reaped.
+@Test(.timeLimit(.minutes(1)), arguments: [false, true]) func ffmpegStartupDeadlineReapsLateChild(cancel: Bool) async throws {
+    let gate = DispatchSemaphore(value: 0)
+    let child = LateChild()
+    defer { gate.signal() }
+    let runner = FFmpegRunner(timeLimit: 30, startupLimit: cancel ? 30 : 0.2, launch: { process in
+        child.markStarted()
+        gate.wait()
+        try process.run()
+        child.set(process.processIdentifier)
+    })
+    let start = ContinuousClock.now
+    let task = Task { try await runner.run(URL(fileURLWithPath: "/bin/sleep"), ["30"]) }
+    try await eventually("launch entered") { child.isStarted }
+    if cancel { task.cancel() }
+    do {
+        try await task.value
+        Issue.record("blocked launch succeeded")
+    } catch is FFmpegExitError {
+        #expect(!cancel)
+    } catch is CancellationError {
+        #expect(cancel)
+    }
+    // 10 s, not tighter: under the full parallel suite the utility-QoS deadline has been seen
+    // firing ~8 s late. The bound still fails without the deadline, which would wait for the
+    // 20 s watchdog, the 30 s limit or the blocked launch.
+    #expect(start.duration(to: .now) < .seconds(10))
+    gate.signal()
+    try await eventually("late helper launched") { child.pid != 0 }
+    try await eventually("late helper reaped") { kill(child.pid, 0) == -1 && errno == ESRCH }
+}
+
+/// Normal helper exits still reach the caller, including a nonzero status.
+@Test func ffmpegRunnerReportsNormalExits() async throws {
+    try await FFmpegRunner().run(URL(fileURLWithPath: "/usr/bin/true"), [])
+    do {
+        try await FFmpegRunner().run(URL(fileURLWithPath: "/usr/bin/false"), [])
+        Issue.record("nonzero exit succeeded")
+    } catch is FFmpegExitError {}
+}

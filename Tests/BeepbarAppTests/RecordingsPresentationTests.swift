@@ -210,6 +210,33 @@ struct RecordingsPresentationTests {
         #expect(study.bookmarks.count == 2)
     }
 
+    /// Group by course identity, preserving the ordering, hidden linked lessons and search results.
+    @Test func watchlistSectionsKeepCourseProvenance() throws {
+        let courseA = course(1, "058167 - NUMERICAL LINEAR ALGEBRA [2026-27]")
+        var manual = ManualWebexLessons()
+        let linked = try manual.add(link: "https://politecnicomilano.webex.com/recordingservice/sites/politecnicomilano/recording/playback/abc", title: "Linked", courseName: "NLA", courseID: 1)
+        let hidden = try manual.add(link: "https://politecnicomilano.webex.com/recordingservice/sites/politecnicomilano/recording/playback/def", title: "Hidden", courseName: "NLA", courseID: 2)
+        let free = try manual.add(link: "https://politecnicomilano.webex.com/recordingservice/sites/politecnicomilano/recording/playback/ghi", title: "Free", courseName: "", courseID: nil)
+        var study = RecordingsStudyState()
+        let archive = recording("archive", "2026-10-05T10:00:00Z")
+        let other = RecmanRecording(id: "other", courseCode: "123456", academicYear: 2026, title: "Other", recordedAt: archive.recordedAt, kind: "", duration: "", size: nil, previewURL: archive.previewURL)
+        study.bookmarks = [.init(recording: archive, courseName: "NLA"), .init(recording: other, courseName: "NLA")]
+        let entries = study.watchlistEntries(manual: manual, visibleCourseIDs: [1], fallbackCourseName: "Webex", query: "")
+        let sections = RecordingsStudyState.watchlistSections(entries, manual: manual, courses: [courseA], fallback: "Unassigned")
+        let archiveSection = try #require(sections.first { $0.id == .archive("058167", 2026) })
+        #expect(Set(archiveSection.bookmarks.map(\.recording.id)) == [archive.id, linked.id])
+        #expect(archiveSection.bookmarks.map(\.id) == entries.filter { [archive.id, linked.id].contains($0.recording.id) }.map(\.id))
+        #expect(sections.first { $0.id == .course(2) }?.bookmarks.map(\.recording.id) == [hidden.id])
+        #expect(sections.first { $0.id == .unassigned }?.bookmarks.map(\.recording.id) == [free.id])
+        #expect(sections.first { $0.id == .archive("123456", 2026) }?.bookmarks.map(\.recording.id) == [other.id])
+        let parallelCourse = course(3, "058167 - OTHER SECTION [2026-27]")
+        let ambiguous = RecordingsStudyState.watchlistSections(entries, manual: manual, courses: [courseA, parallelCourse], fallback: "Unassigned")
+        #expect(ambiguous.first { $0.id == .course(1) }?.bookmarks.map(\.recording.id) == [linked.id])
+        #expect(ambiguous.first { $0.id == .archive("058167", 2026) }?.bookmarks.map(\.recording.id) == [archive.id])
+        let found = study.watchlistEntries(manual: manual, visibleCourseIDs: [1], fallbackCourseName: "Webex", query: "Linked")
+        #expect(RecordingsStudyState.watchlistSections(found, manual: manual, courses: [courseA], fallback: "Unassigned").flatMap(\.bookmarks).map(\.recording.id) == [linked.id])
+    }
+
     /// Bookmarks from the first demo survive removal of its completion flags and all become visible.
     @Test func earlierPreviewCompletionFlagsDoNotHideSavedBookmarks() throws {
         let lesson = recording("legacy", "2026-10-05T10:00:00Z")

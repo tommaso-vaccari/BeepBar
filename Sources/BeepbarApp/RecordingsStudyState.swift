@@ -52,6 +52,50 @@ struct RecordingsStudyState: Codable, Equatable {
         return combined.visibleBookmarks(query: query)
     }
 
+    struct WatchlistSection: Identifiable {
+        enum ID: Hashable { case archive(String, Int), course(Int64), unassigned }
+        let id: ID
+        let title: String
+        var bookmarks: [Bookmark]
+    }
+
+    /// Keep archive identities distinct even when course titles coincide; only map a course ID
+    /// to an archive key when that mapping is unambiguous.
+    nonisolated static func watchlistSections(_ entries: [Bookmark], manual: ManualWebexLessons,
+                                               courses: [RemoteCourseSummary], fallback: String) -> [WatchlistSection] {
+        let manualByID = Dictionary(manual.lessons.map { ($0.id, $0) }, uniquingKeysWith: { first, _ in first })
+        var archiveByCourse: [Int64: RecmanCourseKey] = [:]
+        var owners: [RecmanCourseKey: Set<Int64>] = [:]
+        for course in courses {
+            guard let key = RecmanCourseKey(course: course) else { continue }
+            archiveByCourse[course.id] = key
+            owners[key, default: []].insert(course.id)
+        }
+        var sections: [WatchlistSection.ID: WatchlistSection] = [:]
+        for bookmark in entries {
+            let id: WatchlistSection.ID
+            if let lesson = manualByID[bookmark.recording.id], ManualWebexLesson.isManual(bookmark.recording) {
+                if let courseID = lesson.courseID {
+                    if let key = archiveByCourse[courseID], owners[key]?.count == 1 {
+                        id = .archive(key.courseCode, key.academicYear)
+                    } else { id = .course(courseID) }
+                } else { id = .unassigned }
+            } else {
+                id = .archive(bookmark.recording.courseCode, bookmark.recording.academicYear)
+            }
+            if sections[id] == nil {
+                let title = id == .unassigned ? fallback : bookmark.courseName
+                sections[id] = WatchlistSection(id: id, title: title, bookmarks: [])
+            }
+            sections[id]?.bookmarks.append(bookmark)
+        }
+        return sections.values.sorted {
+            let comparison = $0.title.localizedStandardCompare($1.title)
+            if comparison != .orderedSame { return comparison == .orderedAscending }
+            return $0.bookmarks[0].id < $1.bookmarks[0].id
+        }
+    }
+
     /// A linked lesson without a visible course needs a row even if it was previously unbookmarked.
     nonisolated static func showsInWatchlist(_ lesson: ManualWebexLesson, visibleCourseIDs: Set<Int64>) -> Bool {
         guard let courseID = lesson.courseID else { return true }

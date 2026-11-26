@@ -88,6 +88,8 @@ BeepBar checks for new builds via [Sparkle](https://sparkle-project.org), agains
 ```sh
 swift test
 xcodebuild -project Beepbar.xcodeproj -target Beepbar -configuration Release build CODE_SIGNING_ALLOWED=NO
+bash scripts/build-ffmpeg.sh --output build/FFmpeg
+bash scripts/package-release-app.sh build/Release/Beepbar.app build/FFmpeg
 scripts/create-dmg.sh build/Release/Beepbar.app build/Beepbar.dmg
 ```
 
@@ -102,5 +104,10 @@ Found a bug or have a feature request? [Open an issue](https://github.com/tommas
 ## License
 
 [MIT](LICENSE)
+
+Builds with enhanced audio include [FFmpeg](https://ffmpeg.org/) under the LGPL 2.1
+or later. The corresponding source and build script are available in
+`ffmpeg-source.tar.gz` on each [release page](https://github.com/tommaso-vaccari/BeepBar/releases)
+that includes the helper.
 
 BeepBar is not affiliated with Politecnico di Milano or WeBeep.

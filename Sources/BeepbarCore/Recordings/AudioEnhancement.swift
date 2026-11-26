@@ -1,7 +1,7 @@
 import Foundation
 
 // "Audio migliorato": a lecture's audio with cleaner, steadier speech, filtered while it plays by
-// the student's own ffmpeg (Homebrew or MacPorts).
+// ffmpeg.
 //
 // Why ffmpeg and a local server: the lecture is an HLS stream, and AVFoundation never hands an
 // HLS item's audio to an `MTAudioProcessingTap` (probed on macOS 27 on 2026-11-09 against Apple's
@@ -19,9 +19,6 @@ import Foundation
 // sides of a join, and is then trimmed to exactly its own span on the lecture's clock
 // (`-copyts`, `atrim`). Measured on a synthetic lecture: level difference across a join 0.3–0.8
 // dB median, the same as inside a segment; without the following segment, up to 3.5 dB.
-//
-// ffmpeg isn't bundled (licence, size and signing of a third-party binary): BeepBar only looks for
-// it where package managers install it, and says how to get it when it isn't there.
 //
 // Voice isolation (added 2026-11-09): where macOS has Apple's voice-isolation audio unit, each
 // segment's audio goes through it between two ffmpeg runs (`isolationDecodeArguments`,
@@ -46,9 +43,15 @@ public enum AudioEnhancement {
     /// which would let any directory shadow the binary.
     public static let ffmpegCandidates = ["/opt/homebrew/bin/ffmpeg", "/usr/local/bin/ffmpeg", "/opt/local/bin/ffmpeg"]
 
-    /// The first candidate that is an executable file, or nil.
-    public static func locateFFmpeg(isExecutable: (String) -> Bool = { FileManager.default.isExecutableFile(atPath: $0) }) -> URL? {
-        ffmpegCandidates.first(where: isExecutable).map { URL(fileURLWithPath: $0) }
+    /// Prefer the executable shipped with the app. Development builds can use a package manager.
+    public static func locateFFmpeg(
+        bundledExecutable: URL? = nil,
+        isExecutable: (String) -> Bool = { FileManager.default.isExecutableFile(atPath: $0) }
+    ) -> URL? {
+        if let bundledExecutable, isExecutable(bundledExecutable.path) {
+            return bundledExecutable
+        }
+        return ffmpegCandidates.first(where: isExecutable).map { URL(fileURLWithPath: $0) }
     }
 
     /// The audio filters, in order, for a lecture recorded in a university classroom (one teacher,

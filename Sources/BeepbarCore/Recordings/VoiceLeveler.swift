@@ -14,9 +14,10 @@ import Foundation
 /// How it works: a *keypoint* every `spacing` seconds on the lecture's clock (keypoint `k` is at
 /// sample `round(k × spacing × rate)`, sample 0 being the lecture's start). Keypoint `k`'s gain
 /// is computed from the `window` seconds of audio before it: the `percentile` of the 400 ms RMS
-/// frames above `silenceFloor` (Apple's isolation leaves pauses digitally silent, so "above the
-/// floor" is speech detection for free), brought to `target` dBFS and clamped to
-/// `minGain...maxGain`. The gain between two keypoints is interpolated linearly in dB, and then
+/// frames above an adaptive floor, brought to `target` dBFS and clamped to
+/// `minGain...maxGain`. A nearby strong speech reference raises the floor to 45 dB below it,
+/// rejecting a pause's residual; without one the original `silenceFloor` keeps quiet audio audible.
+/// The gain between two keypoints is interpolated linearly in dB, and then
 /// capped by a local ceiling (`level`).
 ///
 /// A render sees only a `Clip` of the lecture, never all of it. So that clips cut anywhere give
@@ -148,9 +149,70 @@ public struct VoiceLeveler: Sendable {
     /// Pure: the same arguments give the same result.
     public func resolve(for keypoints: ClosedRange<Int>, detector: Clip, known: [Int: Double], provisional: Set<Int>) -> Resolution {
         var measures: [Int: Measure] = [:]
+        var references: [Int: Measure] = [:]
+        var frameCache: [Int: [Frame]] = [:]
+        func frameLevels(_ k: Int) -> [Frame] {
+            if let cached = frameCache[k] { return cached }
+            let levels = self.frameLevels(k, in: detector)
+            frameCache[k] = levels
+            return levels
+        }
+        func classify(_ k: Int, floor: Double) -> Measure {
+            let levels = frameLevels(k)
+            guard !levels.isEmpty else { return .unmeasurable }
+            // Steady residual (#278), found on a second lecture's pause where the teacher stops
+            // talking and only the microphone's steady hiss (about −72 dBFS) remains: the floor
+            // rule counts it as voiced, so the gain climbed by ~50 dB and the hiss became loud.
+            // The residual's level is the median of the steady runs (`steadyResidualFrames`) of this
+            // keypoint and of its neighbours k−1 and k+1 (a pause's residual is interrupted by
+            // digital silence, so a window may hold no run of its own yet be all residual).
+            // Out of `voiced` go the frames of this window's own runs and those below that level
+            // plus a margin: a window that is mostly pause then holds through `minVoiced` like any
+            // silence, while speech with a short hiss gap in it is measured as speech (a
+            // whole-window hold there left a quiet lecture at 0 dB).
+            // The margin is `residualMargin` at most, and at most half of how far the window's own
+            // non-run frames (90th percentile) stand above the residual: speech that sits only a
+            // few dB above the hiss (a lecture at −64 dBFS over −72 dBFS of hiss, or a long
+            // steady "sss" in a sentence) keeps its frames instead of being cut away with the
+            // hiss, which left such a lecture unanchored at 0 dB.
+            let own = Self.steadyResidualFrames(levels)
+            let runLevels = [k - 1, k, k + 1].filter { $0 >= 0 }.flatMap { j -> [Double] in
+                let f = frameLevels(j)
+                return Self.steadyResidualFrames(f).map { f[$0].level }
+            }
+            var ceiling = -Double.infinity
+            if !runLevels.isEmpty {
+                let residual = Self.percentile(runLevels, 0.5)
+                let others = levels.indices.filter { !own.contains($0) }.map { levels[$0].level }
+                let margin = others.isEmpty ? Self.residualMargin
+                    : max(0, min(Self.residualMargin, (Self.percentile(others, 0.9) - residual) / 2))
+                ceiling = residual + margin
+            }
+            let voiced = levels.indices.filter { !own.contains($0) && levels[$0].level > floor && levels[$0].level >= ceiling }.map { levels[$0].level }
+            guard Double(voiced.count) / Double(levels.count) >= minVoiced else { return .hold }
+            return .gain(max(minGain, min(maxGain, target - Self.percentile(voiced, percentile))))
+        }
+        // The nearby context has a bounded size even after a deep seek.
+        func reference(_ k: Int) -> Double? {
+            if let g = known[k], !provisional.contains(k), g < maxGain { return g }
+            let result: Measure
+            if let cached = references[k] { result = cached }
+            else {
+                result = classify(k, floor: max(silenceFloor, target - maxGain))
+                references[k] = result
+            }
+            if case .gain(let g) = result { return g }
+            return nil
+        }
         func measure(_ k: Int) -> Measure {
             if let cached = measures[k] { return cached }
-            let result = self.measure(k, in: detector)
+            // Require 15% of frames within 45 dB of nearby speech: this rejects the
+            // observed isolated residual while allowing a large voice-level change. With no
+            // reference, retain the original rule for uniformly very quiet recordings.
+            let nearby = [k - 1, k + 1, k - 2, k + 2, k - 3, k + 3].filter { $0 >= 0 }
+            let anchor = nearby.lazy.compactMap(reference).first
+            let floor = anchor.map { max(silenceFloor, target - $0 - 45) } ?? silenceFloor
+            let result = classify(k, floor: floor)
             measures[k] = result
             return result
         }
@@ -181,7 +243,8 @@ public struct VoiceLeveler: Sendable {
                 if j < k, let fixed = anchor(j) { return (fixed, false) }
                 if case .gain(let g) = measure(j) { return (g, false) }
                 // Hold or unmeasurable: the previous keypoint's value, when there is one to use.
-                guard j > 0, usable(j - 1) else { return unanchored(k) }
+                guard j > 0, (time(of: j - 1) >= detector.start || anchor(j - 1) != nil),
+                      usable(j - 1) else { return unanchored(k) }
                 j -= 1
             }
         }
@@ -194,11 +257,42 @@ public struct VoiceLeveler: Sendable {
         return result
     }
 
-    /// Keypoint `k`'s window on `clip`: the 30 frames ending at its position, or, when fewer than
+    /// One 400 ms frame of a keypoint's window: its RMS level in dBFS, and its *difference ratio*,
+    /// the energy of the sample-to-sample difference over twice the signal's energy (about 1 for
+    /// white noise, 2 for the highest frequency, near 0 for a low-frequency tone). Voiced speech
+    /// is dominated by low frequencies, so its ratio is small; microphone hiss is broadband.
+    private struct Frame { let level: Double; let differenceRatio: Double }
+
+    /// The most, in dB, that a frame may stand above a steady residual's level and still count as
+    /// that residual. The real pause that revealed #278 had its tails and blips up to about 10 dB
+    /// above the steady part; see `classify` for how the margin shrinks for quiet speech.
+    private static let residualMargin = 10.0
+
+    /// The indices of the frames that belong to a steady residual (#278): every frame of each run
+    /// of 5 consecutive frames (2 s) that are all
+    /// - between −95 and −55 dBFS: below even quiet speech (a −58 dBFS lecture is the quietest
+    ///   the leveler is meant to lift) and above digital silence, which is where a microphone's
+    ///   floor sits after a pause;
+    /// - noise-like, difference ratio of at least 0.15, which voiced speech does not reach;
+    /// - steady, level spread of at most 1.5 dB: speech, even noise-like consonants, fluctuates
+    ///   more than that over 2 s, while a floor does not.
+    private static func steadyResidualFrames(_ frames: [Frame]) -> Set<Int> {
+        var marked = Set<Int>()
+        guard frames.count >= 5 else { return marked }
+        for start in 0...(frames.count - 5) {
+            let run = frames[start..<(start + 5)]
+            guard run.allSatisfy({ $0.level > -95 && $0.level < -55 && $0.differenceRatio >= 0.15 }) else { continue }
+            let levels = run.map(\.level)
+            if levels.max()! - levels.min()! <= 1.5 { marked.formUnion(start..<(start + 5)) }
+        }
+        return marked
+    }
+
+    /// The frames in keypoint `k`'s window on `clip`: the 30 frames ending at its position, or, when fewer than
     /// `minFrames` of those exist and the keypoint is not more than one `spacing` before the
     /// clip's first sample, the 30 after that sample (see the type's docs: bounded work per call,
     /// and no stale gain from far back). Frame `i` is `[t − (i+1)F, t − iF)`.
-    private func measure(_ k: Int, in clip: Clip) -> Measure {
+    private func frameLevels(_ k: Int, in clip: Clip) -> [Frame] {
         let frame = Self.frameLength
         let frames = Int(window * Double(Self.rate)) / frame
         let t = time(of: k)
@@ -212,7 +306,7 @@ public struct VoiceLeveler: Sendable {
         }
         if starts.count < Self.minFrames {
             // The forward bootstrap is for the keypoints at the clip's start only.
-            guard t + Int(step.rounded()) >= clip.start else { return .unmeasurable }
+            guard t + Int(step.rounded()) >= clip.start else { return [] }
             starts = []
             for j in 0..<frames {
                 let lo = clip.start + j * frame
@@ -220,18 +314,23 @@ public struct VoiceLeveler: Sendable {
                 if lo + frame > latest { break }
                 starts.append(lo)
             }
-            if starts.count < Self.minFrames { return .unmeasurable }
+            if starts.count < Self.minFrames { return [] }
         }
-        var voiced: [Double] = []
+        var levels: [Frame] = []
         clip.samples.withUnsafeBufferPointer { p in
             for lo in starts {
-                let energy = Self.energy(p, from: lo - clip.start, count: frame)
-                let level = max(-120, 10 * log10(energy / Double(frame) + 1e-20))
-                if level > silenceFloor { voiced.append(level) }
+                var energy = 0.0, difference = 0.0
+                let from = lo - clip.start
+                var previous = Double(p[from]), i = from
+                while i < from + frame {
+                    let x = Double(p[i]); energy += x * x
+                    difference += (x - previous) * (x - previous)
+                    previous = x; i += 1
+                }
+                levels.append(Frame(level: max(-120, 10 * log10(energy / Double(frame) + 1e-20)), differenceRatio: difference / (2 * energy + 1e-20)))
             }
         }
-        guard Double(voiced.count) / Double(starts.count) >= minVoiced else { return .hold }
-        return .gain(max(minGain, min(maxGain, target - Self.percentile(voiced, percentile))))
+        return levels
     }
 
     /// The sum of squares of `count` samples from `from`. A `while` loop on purpose: it visits

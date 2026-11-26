@@ -36,11 +36,11 @@ test_targets=$(find Tests -mindepth 1 -maxdepth 1 -type d | wc -l | tr -d ' ')
 # the second pass also states a minimum number of tests (the check's third argument): the exact
 # number that runs today, so losing even one test fails. New tests pass it; lower it deliberately
 # when a web-view test is removed.
-webview_tests='^BeepbarAppTests\.(RecmanScriptsTests|RecmanWebSessionTests|RecmanWebSessionScriptTests|WebexSignInWebViewTests)/|^BeepbarAppTests\.WebBeepLoginSessionHandoverTests/(theLoginWindowUsesTheWebViewWithEditingShortcuts|aWindowClosedWhileTheCookiesAreReadCompletesTheLogin)\(\)(/|$)'
+webview_tests='^BeepbarAppTests\.(RecmanScriptsTests|RecmanWebSessionTests|RecmanWebSessionScriptTests|WebexSignInWebViewTests)/|^BeepbarAppTests\.WebexStreamResolverTests/(sessionRecoversFromThePlayerWithoutLoadingRecman|rejectedPlayerFindsAReplacementInTheArchive|rejectedPlayerRemainsAvailableWhenArchiveFails)\(\)(/|$)|^BeepbarAppTests\.WebBeepLoginSessionHandoverTests/(theLoginWindowUsesTheWebViewWithEditingShortcuts|aWindowClosedWhileTheCookiesAreReadCompletesTheLogin)\(\)(/|$)'
 swift test --skip "$webview_tests" 2>&1 | tee "$test_log"
 bash scripts/check-test-run-complete.sh "$test_log" "$test_targets"
 swift test --no-parallel --filter "$webview_tests" 2>&1 | tee "$test_log"
-bash scripts/check-test-run-complete.sh "$test_log" 1 67
+bash scripts/check-test-run-complete.sh "$test_log" 1 70
 python3 scripts/recordings-seen-isolated-tests.py
 bash scripts/test-release-notes.sh
 bash scripts/test-build-version.sh
@@ -49,5 +49,5 @@ file build/Release/Beepbar.app/Contents/MacOS/Beepbar | grep -q 'arm64'
 plutil -lint build/Release/Beepbar.app/Contents/Info.plist
 test -f build/Release/Beepbar.app/Contents/Resources/Assets.car
 test -d build/Release/Beepbar.app/Contents/Frameworks/Sparkle.framework
-codesign --force --deep --sign - --identifier io.github.tvaccari.beepbar build/Release/Beepbar.app
-codesign --verify --deep --strict --verbose=2 build/Release/Beepbar.app
+bash scripts/build-ffmpeg.sh --output build/FFmpeg
+bash scripts/package-release-app.sh build/Release/Beepbar.app build/FFmpeg

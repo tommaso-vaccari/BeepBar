@@ -225,6 +225,37 @@ struct VoiceLevelerTests {
         try expectLifted(Self.speechWithHissGaps(seconds: 120, speechDB: speechDB, hissDB: hissDB), speechDB: speechDB, "\(speechDB)/\(hissDB) gaps")
     }
 
+    /// Review finding on the residual margin (#278), with the reviewer's generator: 7.5 s of speech
+    /// then 2.5 s of digital silence, repeating for 180 s, over a continuous white hiss (seed 12345).
+    /// This one reaches the margin path: the hiss alone fills the silent stretches (steady runs), and
+    /// the absolute 10 dB cut then removed the speech frames too, so the whole lecture played at a
+    /// provisional 0 dB. Whole, forward and cold-seek playback must all lift to within 1.5 dB under
+    /// `target - speech` (the hiss adds to the measured level; the lift lands at 1.0 dB under for
+    /// -66/-72 and -58/-64, so 1 dB would sit on the float noise of the edge).
+    @Test(arguments: [(-64.0, -72.0), (-60.0, -68.0), (-58.0, -64.0), (-66.0, -72.0)])
+    func speechOverContinuousHissWithSilentGapsIsStillLifted(speechDB: Double, hissDB: Double) throws {
+        var track: [Float] = []
+        while track.count < Self.seconds(180) { track += Self.speech(seconds: 7.5, dB: speechDB) + Self.speech(seconds: 2.5, dB: -120, silent: true) }
+        track = Array(track.prefix(Self.seconds(180)))
+        var noise = Noise(state: 12345)
+        let amplitude = Float(pow(10, hissDB / 20) * 3.0.squareRoot())
+        let whole = track.map { $0 + noise.next() * amplitude }
+        let atLeast = -20 - speechDB - 1.5, label = "\(speechDB)/\(hissDB)"
+
+        let all = VoiceLeveler().gains(for: 0...17, detector: VoiceLeveler.Clip(samples: whole, start: 0), known: [:])
+        for k in 0...17 { #expect(try #require(all[k]) >= atLeast, "\(label) whole: keypoint \(k) = \(all[k] ?? .nan), at least \(atLeast)") }
+        var forward: [Int: Double] = [:], forwardProvisional = Set<Int>()
+        for index in 0..<6 { Self.resolveSegment(index, of: whole, memo: &forward, provisional: &forwardProvisional) }
+        #expect(forwardProvisional.isEmpty, "\(label) forward: provisional \(forwardProvisional.sorted())")
+        for k in 0...17 { #expect(try #require(forward[k]) >= atLeast, "\(label) forward: keypoint \(k) = \(forward[k] ?? .nan), at least \(atLeast)") }
+        for index in [1, 3] {
+            var memo: [Int: Double] = [:], provisional = Set<Int>()
+            let seek = Self.resolveSegment(index, of: whole, memo: &memo, provisional: &provisional)
+            #expect(provisional.isEmpty, "\(label) seek into \(index): provisional \(provisional.sorted())")
+            for (k, g) in seek { #expect(g >= atLeast, "\(label) seek into \(index): keypoint \(k) = \(g), at least \(atLeast)") }
+        }
+    }
+
     /// A steady, noise-like stretch just under the speech level (a long "sss", a fan between
     /// sentences): −62 dBFS for 2.4 s every 10 s inside −60 dBFS speech. It must not be taken for
     /// a pause's residual and pull the window's speech out with it.

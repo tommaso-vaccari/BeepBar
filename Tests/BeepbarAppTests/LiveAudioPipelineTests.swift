@@ -855,7 +855,7 @@ struct LiveAudioPipelineTests {
     let file = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
     defer { try? FileManager.default.removeItem(at: file) }
     let watchdog = Task {
-        try? await Task.sleep(for: .seconds(3))
+        try? await Task.sleep(for: .seconds(20))
         guard !Task.isCancelled else { return }
         if let text = try? String(contentsOf: file, encoding: .utf8), let pid = Int32(text.trimmingCharacters(in: .whitespacesAndNewlines)) {
             kill(pid, SIGKILL)
@@ -876,7 +876,10 @@ struct LiveAudioPipelineTests {
     } catch is CancellationError {
         #expect(cancel)
     }
-    #expect(start.duration(to: .now) < .seconds(2))
+    // 10 s, not tighter: under the full parallel suite the utility-QoS deadline has been seen
+    // firing ~8 s late. The bound still fails without the deadline, which would wait for the
+    // 20 s watchdog, the 30 s limit or the blocked launch.
+    #expect(start.duration(to: .now) < .seconds(10))
 }
 
 /// The release recovery points to the bundled helper; developers can install their own.
@@ -918,7 +921,10 @@ private final class LateChild: @unchecked Sendable {
     } catch is CancellationError {
         #expect(cancel)
     }
-    #expect(start.duration(to: .now) < .seconds(2))
+    // 10 s, not tighter: under the full parallel suite the utility-QoS deadline has been seen
+    // firing ~8 s late. The bound still fails without the deadline, which would wait for the
+    // 20 s watchdog, the 30 s limit or the blocked launch.
+    #expect(start.duration(to: .now) < .seconds(10))
     gate.signal()
     try await eventually("late helper launched") { child.pid != 0 }
     try await eventually("late helper reaped") { kill(child.pid, 0) == -1 && errno == ESRCH }

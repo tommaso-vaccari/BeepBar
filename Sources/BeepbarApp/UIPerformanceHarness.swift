@@ -257,10 +257,12 @@ final class UIFixtureProtocol: URLProtocol, @unchecked Sendable {
 @MainActor enum UIFixtureProgressBurst {
     nonisolated static let events = 10_000
 
+    /// `total` is the number of events (a multiple of ten); zero runs the same begin and end of a
+    /// run with no event in between, which #280's test uses as the baseline of publications.
     /// Returns the burst's sink so a test can prove the run is closed: a late event must die in
     /// the relay, off the main actor.
     @discardableResult
-    static func run(_ controller: WeBeepAuthenticationController) async -> @Sendable (SyncProgress) async -> Void {
+    static func run(_ controller: WeBeepAuthenticationController, events total: Int = events) async -> @Sendable (SyncProgress) async -> Void {
         let operationID = UUID()
         controller.setOperationForTesting(operationID)
         let sink = controller.beginTransferForTesting(operationID, automatic: false)
@@ -269,9 +271,9 @@ final class UIFixtureProtocol: URLProtocol, @unchecked Sendable {
             // Ten bursts of 1,000 separated by a frame, so the throttle sees both back-to-back
             // events and pauses rather than one uninterrupted stream.
             for batch in 0..<10 {
-                for index in 1...(events / 10) {
-                    let completed = batch * (events / 10) + index
-                    await sink(SyncProgress(completed: completed, total: events, installed: completed, preservedLocal: 0, unchanged: 0, conflicts: 0, failures: 0))
+                for index in 0..<(total / 10) {
+                    let completed = batch * (total / 10) + index + 1
+                    await sink(SyncProgress(completed: completed, total: total, installed: completed, preservedLocal: 0, unchanged: 0, conflicts: 0, failures: 0))
                 }
                 try? await Task.sleep(for: .milliseconds(16))
             }

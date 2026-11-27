@@ -137,6 +137,38 @@ Assunzione sulle pagine: «al più qualche centinaio di registrazioni all'anno»
 
 **Prossimo passo.** La prova live autorizzata è conclusa: un corso, una pagina, nessun retry. Non ripeterla per evitare traffico superfluo. Benchmark UI `recordings-1000`, `scripts/quit-probe.sh` e `otool -L` sul Release completati; restano le prove manuali della PR e l’osservazione idle di 30 minuti sulla copia installata dopo la release. Scaling, cicli ripetuti e idle restano **non misurati**; nessun beneficio app-wide rivendicato.
 
+### Un solo controller osservato da tutte le pagine: costo di una pubblicazione ([#280](https://github.com/tommaso-vaccari/BeepBar/issues/280), branch `perf/batch-275-277-280-244-271`)
+
+**Domanda.** `WeBeepAuthenticationController` ha 42 `@Published` ed è osservato da ogni pagina: un sync che pubblica il progresso con la pagina Corsi o Registrazioni aperta rivaluta i body a ogni evento e blocca il main thread oltre 16 ms?
+
+**Metodo.** Nuovo `UIPublicationTests` (`Tests/BeepbarAppTests/UIPublicationTests.swift`), che ospita le pagine vere (`HomePage`, `RecordingsPage`) in una finestra invisibile sul fixture isolato (account sintetico, rete simulata, cartella propria; nessuna app installata, nessun account reale). Le valutazioni dei body sono contate dalle sonde DEBUG (`UIBodyProbe`, `RecordingsPageProbes`); i blocchi del main thread da un battito di 1 ms sul main actor, il cui ritardo è il tempo in cui altro occupa il main thread. Controlli senza evento: 20 finestre da 50 ms vuote (rumore del metodo) e una corsa con inizio e fine ma senza eventi di progresso. Comando (opt-in, disabilitato nella suite normale): `BEEPBAR_UI_PUBLICATION_BENCHMARK=1 swift test -c release --arch arm64 -Xswiftc -DDEBUG --filter UIPublicationTests/benchmark`. 1 warm-up e 5 run misurati per evento, pagina sempre ospitata; Apple M5, 32 GB, AC, base dev `ee62a0a` + i commit del batch fino a `33fee34` (copia di lavoro non committata dei file di #280; log locale non versionato). Mediana e p95 (con 5 run il p95 è il massimo).
+
+| Pagina (fixture) | Evento | Pubblicazioni del controller | Body per evento (pagina / carta di stato / righe corso) | Stallo massimo del main thread, mediana (p95) |
+| --- | --- | --- | --- | --- |
+| Corsi, 100 corsi | 20 finestre vuote (controllo) | 0 | 0 | 1,2 (1,3) ms |
+| Corsi, 100 corsi | corsa senza eventi (controllo) | 6 | 2 / 2 / 20 | 8,0 (8,7) ms |
+| Corsi, 100 corsi | **10.000 eventi di progresso** | 6 (+3 dello store del progresso) | 2 / 2 / 20 | 7,7 (7,9) ms |
+| Corsi, 100 corsi | sync simulato completo | 13 | 3 / 3 / 29 | 10,7 (10,7) ms |
+| Corsi, 100 corsi | 1 pubblicazione nuda, per evento (n=100) | 1 | 1 / 1 / 10 | 13,0 (15,3), max 16,1 ms |
+| Corsi, 500 corsi | **10.000 eventi di progresso** | 6 (+3) | 2 / 2 / 20 | 8,0 (8,1) ms |
+| Corsi, 500 corsi | 1 pubblicazione nuda, per evento (n=100) | 1 | 1 / 1 / 10 | 14,1 (17,0), max 18,1 ms |
+| Registrazioni, 1.000 lezioni | 20 finestre vuote (controllo) | 0 | 0 | 1,3 (1,4) ms |
+| Registrazioni, 1.000 lezioni | corsa senza eventi (controllo) | 6 | 2 pagina / 2 lista | 31,2 (34,0) ms |
+| Registrazioni, 1.000 lezioni | **10.000 eventi di progresso** | 6 (+3) | 2 pagina / 2 lista | 32,8 (33,4) ms |
+| Registrazioni, 1.000 lezioni | sync simulato completo | 13 | 5 / 5 | 19,3 (19,7) ms |
+| Registrazioni, 1.000 lezioni | 1 pubblicazione nuda, per evento (n=100) | 1 | 1 / 1 | 15,6 (17,6), max 24,0 ms |
+
+**Risposta.**
+1. **Il progresso non rivaluta i body.** I 10.000 eventi non aggiungono né pubblicazioni del controller né valutazioni rispetto alla stessa corsa senza eventi (6 e 6): il throttle di D08 e il fatto che solo `SyncProgressLine` osservi lo store lo garantiscono. Lo stallo di 8 ms (Corsi) e 31–33 ms (Registrazioni) della corsa è identico senza eventi: viene dall'inizio e dalla fine della corsa, non dagli eventi.
+2. **Ogni pubblicazione del controller rivaluta la pagina aperta** e costa 13–15 ms (mediana) sulle Corsi e 15,6 ms sulle Registrazioni con 1.000 lezioni, contro 1,1 ms di rumore: il p95 supera 16 ms (17,0 Corsi con 500 corsi, 17,6 Registrazioni), 39 di 100 eventi su Registrazioni. Con 100 corsi tutti gli eventi tranne uno restano sotto 16 ms. Il sync simulato (un corso, nessun file) pubblica 13 volte in tutto; non è stato verificato quante di queste in un sync reale con molti corsi.
+3. **Le zone sospette dell'issue non sono il collo di bottiglia.** Misurate in isolamento su 1.000 lezioni (Release, migliore di 20): `isNew` ×1000 1,1 ms, `identity` ×1000 0,16 ms, lettura avanzamento ×1000 0,64 ms, `newCount` 25 µs per corso con elenco; la `Set` dei segnalibri è sotto 1 µs. La lista ne costruisce circa 300 righe per body, cioè meno di 1 ms in tutto contro i 15 ms osservati. Mettere in cache questi valori non porta lo stallo sotto 16 ms. Il resto è il lavoro di SwiftUI/AppKit su pagina e lista a ogni pubblicazione.
+
+**Decisione.** Nessuna modifica al codice di produzione per le zone nominate: non sono la causa misurata. Resta aperto ciò che la misura mostra: una pubblicazione del controller con la pagina Registrazioni (1.000 lezioni) aperta può occupare il main thread per oltre 16 ms. Ridurlo richiede di restringere ciò che ogni pagina osserva (dividere il modello o passare a `@Observable`), un cambiamento di modello che questo commit non fa; l'issue [#280](https://github.com/tommaso-vaccari/BeepBar/issues/280) resta aperta con questi numeri.
+
+**Garanzia aggiunta.** `UIPublicationTests/progressEventsDoNotRerenderTheCourseList`: una corsa con 10.000 eventi pubblica il controller quanto la stessa corsa senza eventi e non rivaluta `HomePage` più di una volta in più. Visto fallire inserendo `objectWillChange.send()` in `progressAccepted` (due expectation), poi ripristinato.
+
+**Limiti.** Misura i body e il tempo del main thread delle viste ospitate nel fixture, in una finestra invisibile: non è fluidità di scorrimento, frame del compositor né hitch di Instruments (non eseguiti: richiedono Time Profiler). Il battito da 1 ms ha un rumore di circa 1 ms; la pubblicazione nuda (`objectWillChange.send()`) non cambia dati, quindi è un costo di rivalutazione, non di una modifica reale. Un solo corso con 1.000 lezioni e 100 corsi nella barra laterale; non misurati: Attività, Conflitti, Impostazioni, il caso Watchlist, finestra visibile e Low Power Mode. Nessun confronto `scripts/benchmark.sh compare`: non è una misura del Core.
+
 ### Registrazioni: lezioni da link Webex, audio migliorato e indicatori (issue #235, PR #236, 2026-11-09)
 
 Branch `feature/watchlist-manual-webex-audio`, base `origin/dev` `7ad62a2`. Non integrata: una PR aperta non è lavoro integrato.

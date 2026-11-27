@@ -563,6 +563,9 @@ struct RecordingsPage: View {
     }
 
     var body: some View {
+#if DEBUG
+        let _ = UIBodyProbe.hit?("RecordingsPage")
+#endif
         Group {
             if showsBrowser { browser } else { signIn }
         }
@@ -828,6 +831,9 @@ struct CourseRecordings: View {
     }
 
     var body: some View {
+#if DEBUG
+        let _ = UIBodyProbe.hit?("CourseRecordings")
+#endif
         VStack(spacing: 0) {
             header
             toolbar
@@ -1233,6 +1239,9 @@ private struct WatchlistRecordings: View {
     // `listings` looks up every bookmarked course, and depends on listings the controller updates
     // all the time: worked out once per `body` and passed down, not once per use (#100).
     var body: some View {
+#if DEBUG
+        let _ = UIBodyProbe.hit?("WatchlistRecordings")
+#endif
         let courseIDs = Set(courses.map(\.id))
         let shown = shown(visibleCourseIDs: courseIDs)
         let sections = RecordingsStudyState.watchlistSections(shown, manual: recordings.manualLessons, courses: courses, fallback: tr("Senza corso", "Unassigned"))

@@ -168,6 +168,20 @@ single `ui.fixtureActivityScroll` interval; an empty hitch table alone is insuff
 Hitch rows with an unresolved zero timing origin make `scrollHitches.valid` false; retain the raw trace and make no hitch-count or presentation claim from it. Hitches and Time Profiler stacks complement these callback measurements. Preserve outliers,
 including the explicit end jump, when assessing the 16ms budget.
 
+## Body evaluations per publication (#280)
+
+`UIPublicationTests` (opt-in, no app launched) hosts the Courses and Recordings pages on the fixture
+in an invisible window and counts body evaluations (`UIBodyProbe`, `RecordingsPageProbes`) and
+main-thread stalls (a 1 ms main-actor heartbeat) for the progress burst, a mocked sync and bare
+controller publications, with idle and empty-run controls:
+
+```sh
+BEEPBAR_UI_PUBLICATION_BENCHMARK=1 swift test -c release --arch arm64 -Xswiftc -DDEBUG --filter UIPublicationTests/benchmark
+```
+
+It proves evaluations and main-thread occupancy of hosted views, not compositor frames or
+Instruments hitches. Results: [performance plan](performance-plan.md).
+
 ## Tooling verification
 
 ```sh

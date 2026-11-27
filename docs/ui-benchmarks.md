@@ -69,6 +69,13 @@ notifications, Launch at Login and Sparkle are absent. The fixture icon has no i
 | `memory-cycles` | Ten actual open/sync/close cycles, one enabled course, no file downloads |
 | `idle` | Closed-window fixture for 1,800 seconds, before/after process counters and fixture request accounting |
 
+**Comparability after #277.** Reopening the window within 5 minutes of a confirmed course list no
+longer fetches the list. In `reopen-sync` and `memory-cycles` the reopen (and each cycle after the
+first, which runs within seconds of the previous one) therefore makes no course-list request, so
+their warm-open time, request counts and memory are not comparable with baselines recorded before
+#277; `launch-offline` moves the fixture clock past 5 minutes to keep measuring a refresh. Compare
+these scenarios only with series recorded on the same side of #277.
+
 There is a fixed 300ms shown settling period after refresh and 3s after each close. These are
 not readiness estimates: key/content callbacks provide the reported latencies. A missing key
 window or populated-content marker times out and invalidates the sample; a valid empty window

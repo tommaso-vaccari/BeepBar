@@ -6005,4 +6005,46 @@ extension RecordingsControllerTests {
         RecordingsController.forgetExpiryNotice(in: defaults, notOwnedBy: 43)
         #expect(record == nil)
     }
+
+    /// Proves jobs that never ask Polimi can't arm the record: with a saved session that doesn't
+    /// work (listing refused), a manual Webex lesson's copy-link and a link served from memory
+    /// leave it empty. Mutation: arm after any successful job (the old behavior) and this fails.
+    @Test func jobsThatNeverAskedPolimiDoNotArmTheRecord() async throws {
+        defer { cleanUp() }
+        try saveSession(owner: 42)
+        browser.listResults[course.courseCode] = .failure(RecmanBrowserError.needsSignIn)
+        browser.playbackResults["x"] = .success(URL(string: "https://politecnicomilano.webex.com/x")!)
+        let controller = makeController(useDefault: true)
+        let manualLink = "https://politecnicomilano.webex.com/recordingservice/sites/politecnicomilano/recording/playback/0123456789abcdef0123456789abcdef"
+        let lesson = try controller.addManualLesson(link: manualLink, title: "", courseName: "").get()
+        controller.copyLink(lesson.recording)
+        await settle("manual link copied") { !world.copied.isEmpty }
+        await drainTasks()
+        #expect(browser.playCalls.isEmpty)
+        #expect(record == nil, "a manual lesson never asked the archive")
+
+        // A link from memory: first fetched (the archive answered, armed), then cleared and copied again.
+        controller.copyLink(recording("x"))
+        await settle("archive link copied") { world.copied.count == 2 }
+        #expect(record?.phase == .armed, "an archive-backed link proves the session")
+        RecordingsController.setExpiryNotice(nil, in: defaults)
+        controller.copyLink(recording("x"))
+        await settle("cached link copied") { world.copied.count == 3 }
+        await drainTasks()
+        #expect(browser.playCalls == ["play x"], "the second copy came from memory")
+        #expect(record == nil, "a cached link never asked the archive")
+    }
+
+    /// Proves a listing that the archive answers arms the record even from a spent one.
+    @Test func anArchiveListingArmsFromSpent() async throws {
+        defer { cleanUp() }
+        try saveSession(owner: 42)
+        RecordingsController.setExpiryNotice(.init(owner: 42, phase: .spent), in: defaults)
+        browser.listResults[course.courseCode] = .success([recording("a")])
+        let controller = makeController(useDefault: true)
+        controller.pageAppeared()
+        controller.refresh([course], selected: course)
+        await settle("listed") { controller.listing(for: course)?.recordings != nil }
+        #expect(record?.phase == .armed)
+    }
 }

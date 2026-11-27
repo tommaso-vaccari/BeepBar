@@ -1903,6 +1903,8 @@ struct RecordingsListing: Equatable {
                     runningKey = key
                     let recordings = try await browser.recordings(for: key)
                     guard generation == self.generation else { return }
+                    // The archive answered: this session is proven (see `armExpiryNotice`).
+                    armExpiryNotice()
                     let recorded = await record(recordings, for: key, generation: generation)
                     guard generation == self.generation else { return }
                     runningKey = nil
@@ -1967,10 +1969,6 @@ struct RecordingsListing: Equatable {
                     continue
                 }
                 succeeded = true
-                // Polimi answered a request: this session is proven to work (a saved file or a
-                // WeBeep-login candidate included, never merely offered), so its next expiry is
-                // notified (#295). Also re-arms a spent record.
-                armExpiryNotice()
             } catch {
                 guard generation == self.generation else { return }
                 if case .open(_, _, let request) = job, request != openingRequest { continue }
@@ -2017,7 +2015,12 @@ struct RecordingsListing: Equatable {
         // A lesson added by its Webex link has no archive row to look up: its link is the player.
         if let manual = ManualWebexLesson.playerLink(for: recording) { return manual }
         if let cached = playbackURLs[recording.id] { return cached }
-        return try await browser.playbackURL(for: recording)
+        let generation = self.generation
+        let url = try await browser.playbackURL(for: recording)
+        // The archive answered for a lesson that lives in it (not a manual Webex link, not a cached
+        // link, which never asked Polimi): the session is proven (#295).
+        if generation == self.generation { armExpiryNotice() }
+        return url
     }
 
     /// What actually failed in a stream lookup, and the player link it had found by then, if any
@@ -2523,8 +2526,9 @@ struct RecordingsListing: Equatable {
         Self.setExpiryNotice(nil, in: defaults)
     }
 
-    /// A Polimi session is PROVEN to work: a sign-in reached the archive, or a request of the
-    /// worker succeeded with a saved or candidate session. Never called for cookies that were
+    /// A Polimi session is PROVEN to work: a sign-in reached the archive, or the archive answered
+    /// a listing or a player-link request (`browser.recordings` / `browser.playbackURL`, never a
+    /// manual Webex link or a cached link, which don't ask Polimi) with a saved or candidate session. Never called for cookies that were
     /// merely found or offered, which may not work (a new user would be told about an expiry they
     /// never had). Always `.armed`, from a spent or absent record alike
     /// (`RecordingsSessionExpiryNotice.afterSignIn`).

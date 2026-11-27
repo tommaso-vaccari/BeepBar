@@ -178,6 +178,32 @@ import Testing
         #expect(harness.center.sent.filter { $0 == Self.expiryID }.count == before)
     }
 
+    /// Proves a sign-in that completes while the announcement waits for macOS's permission stops
+    /// it: access is no longer expired when the answer arrives, so nothing is sent (the record
+    /// is still armed, so only the access check in `isCurrent` can stop it). Mutation: remove that
+    /// check and the stale notification goes out.
+    @Test func aSignInDuringThePermissionReadStopsTheAnnouncement() async throws {
+        let harness = try await Harness(realRefresh: true)
+        defer { harness.remove() }
+        RecordingsController.setExpiryNotice(armed(), in: harness.defaults)
+        await harness.controller.runAutomaticSyncForTesting()   // midway: sent, now spent
+        let before = harness.center.sent.filter { $0 == Self.expiryID }.count
+        let calls = harness.center.authorizationCalls
+        await harness.controller.runAutomaticSyncForTesting()
+        let perSync = harness.center.authorizationCalls - calls
+        RecordingsController.setExpiryNotice(armed(), in: harness.defaults)
+        harness.center.holdAuthorization(fromCall: harness.center.authorizationCalls + perSync + 1)
+        await harness.controller.runAutomaticSyncForTesting()
+        let pending = try #require(harness.controller.recordingsExpiryAnnouncementForTesting)
+        // The WeBeep sign-in's Polimi session arrives: access goes back to ready, no window.
+        harness.controller.recordings.offerSessionCandidate([FakeRecmanBrowser.cookie("SSO_LOGIN")], owner: 7)
+        #expect(harness.controller.recordings.access == .ready)
+        harness.center.releaseAuthorization()
+        await pending.value
+        #expect(harness.center.sent.filter { $0 == Self.expiryID }.count == before)
+        #expect(RecordingsController.expiryNotice(in: harness.defaults)?.phase == .armed)
+    }
+
     /// Proves the skip path creates no task when the record can't notify (spent, absent): no work
     /// at rest.
     @Test func aSkipWithNoArmedRecordCreatesNoTask() async throws {

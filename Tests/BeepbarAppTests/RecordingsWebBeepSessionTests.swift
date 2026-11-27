@@ -563,6 +563,33 @@ struct RecordingsWebBeepSessionTests {
         await controller.settleSessionFile()
         #expect(try savedOwner() == nil, "nothing written (the foreign file was deleted, not replaced)")
     }
+
+    // MARK: Expiry notification record (#295)
+
+    /// Proves a WeBeep-login candidate that does NOT open the archive never arms the "sign-in
+    /// expired" record (a new user must not be told an expiry they never had), while a candidate
+    /// that works arms it, also from a spent record (a re-login re-arms). Mutation: arm when the
+    /// candidate is offered or the cookies are found, and the failing case turns red; keep `.spent`
+    /// on success and the working case turns red.
+    @Test(arguments: [false, true])
+    func aCandidateArmsTheExpiryRecordOnlyWhenItWorks(works: Bool) async throws {
+        defer { cleanUp() }
+        RecordingsController.setExpiryNotice(.init(owner: 42, phase: .spent), in: defaults)
+        let controller = try launched()
+        browser.listResults[course.courseCode] = works ? .success([recording("a")]) : .failure(RecmanBrowserError.needsSignIn)
+        controller.offerSessionCandidate(login(), owner: 42)
+        _ = await controller.refreshForSync([course], force: false)
+        #expect(RecordingsController.expiryNotice(in: defaults)?.phase == (works ? .armed : .spent))
+
+        // A new user (no record) with a candidate that fails: still nothing armed.
+        if !works {
+            RecordingsController.setExpiryNotice(nil, in: defaults)
+            let other = try launched()
+            other.offerSessionCandidate(login(), owner: 42)
+            _ = await other.refreshForSync([course], force: true)
+            #expect(RecordingsController.expiryNotice(in: defaults) == nil)
+        }
+    }
 }
 
 /// The login completion hands Recordings the candidate, in the right order and only for a login
@@ -802,4 +829,5 @@ struct WebBeepLoginSessionHandoverTests {
         let window = LoginWindowController(site: .polimi) { _, _ in }
         #expect(window.webViewHandlesEditingShortcutsForTesting)
     }
+
 }

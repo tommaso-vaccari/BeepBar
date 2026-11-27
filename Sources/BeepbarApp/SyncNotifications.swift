@@ -190,6 +190,31 @@ enum AutomaticNotificationIssue: String {
         await center.send(identifier: Self.recordingsIdentifier, title: text.title.text, body: text.body.text, destination: .recordings)
     }
 
+    /// Identifier of the "Polimi sign-in expired" notification: its own, so it neither replaces nor
+    /// is replaced by "N nuove registrazioni" (#295, #190: both may be delivered after one sync).
+    static let recordingsSessionExpiredIdentifier = "beepbar-recordings-session-expired"
+
+    /// Sends the "Polimi sign-in expired" notification (opening Recordings on click) at most once
+    /// per expiry: only when `RecordingsSessionExpiryNotice.shouldNotify` says so for the account
+    /// `owner` and its persisted `record`, the "Notifiche" switch is on, macOS allows it and the
+    /// result is still current. Same gating as `postRecordingsSummary`.
+    ///
+    /// The record is read again after macOS answers (a second follow-up may have claimed the
+    /// expiry meanwhile) and `markNotified` runs with no suspension before the send, so two
+    /// overlapping follow-ups can't both send. With the switch off or macOS refusing, nothing is
+    /// recorded: the expiry is still announced if notifications come back while it lasts.
+    func announceRecordingsSessionExpiry(_ outcome: RecordingsSyncOutcome, owner: Int?,
+                                         record: @MainActor () -> RecordingsSessionExpiryNotice.Record?,
+                                         markNotified: @MainActor () -> Void,
+                                         isCurrent: @MainActor () -> Bool = { true }) async {
+        guard RecordingsSessionExpiryNotice.shouldNotify(for: outcome, record: record(), owner: owner, notificationsEnabled: isEnabled) else { return }
+        guard await canSend(), isCurrent(), isEnabled,
+              RecordingsSessionExpiryNotice.shouldNotify(for: outcome, record: record(), owner: owner, notificationsEnabled: true) else { return }
+        markNotified()
+        let text = RecordingsSessionExpiryNotice.text()
+        await center.send(identifier: Self.recordingsSessionExpiredIdentifier, title: text.title.text, body: text.body.text, destination: .recordings)
+    }
+
     func clearFailure() {
         for issue in [AutomaticNotificationIssue.authenticationExpired, .serviceUnavailable, .incompatibleResponse, .partialSync] {
             deduplication.resolve(condition: issue.rawValue)

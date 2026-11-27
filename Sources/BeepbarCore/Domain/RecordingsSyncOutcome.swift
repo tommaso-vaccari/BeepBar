@@ -8,7 +8,8 @@ public enum RecordingsSyncOutcome: Sendable, Equatable {
     /// The listings were requested; `newlyPublished` lectures were first observed in this
     /// refresh (0 for a baseline), `failedKeys` courses could not be refreshed.
     case refreshed(newlyPublished: Int, failedKeys: Int)
-    /// The Polimi session lapsed: the page shows the sign-in prompt; no window was opened.
+    /// The Polimi session lapsed: the page shows the sign-in prompt; no window was opened (the sync
+    /// announces it once, `RecordingsSessionExpiryNotice`).
     /// `newlyPublished`: lectures the courses listed before the session lapsed first published in
     /// this refresh (already on the page with their dots), 0 when it lapsed before any listing.
     case needsSignIn(newlyPublished: Int)

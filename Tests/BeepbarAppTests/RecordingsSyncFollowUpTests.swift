@@ -45,6 +45,186 @@ import Testing
         #expect(harness.controller.recordingsFollowUpForTesting == nil)
     }
 
+
+    // MARK: Polimi sign-in expired notification (#295)
+
+    private static let expiryID = SyncNotificationCoordinator.recordingsSessionExpiredIdentifier
+    private func armed() -> RecordingsSessionExpiryNotice.Record { .init(owner: 7, phase: .armed) }
+
+    /// Proves an armed account is told ONCE when a sync's refresh ends because the session expired
+    /// midway: one notification on the first sync, none on the second (record spent), and the
+    /// record says so. Guards against never notifying, and against notifying on every sync.
+    /// Mutation: drop `markNotified` and the second count becomes 2.
+    @Test func anExpiryMidwayNotifiesOncePerExpiry() async throws {
+        let harness = try await Harness()
+        defer { harness.remove() }
+        RecordingsController.setExpiryNotice(armed(), in: harness.defaults)
+        harness.seam.result = .needsSignIn(newlyPublished: 0)
+
+        await harness.controller.runAutomaticSyncForTesting()
+        #expect(harness.center.sent.filter { $0 == Self.expiryID }.count == 1)
+        #expect(RecordingsController.expiryNotice(in: harness.defaults)?.phase == .spent)
+
+        await harness.controller.runAutomaticSyncForTesting()
+        #expect(harness.center.sent.filter { $0 == Self.expiryID }.count == 1)
+    }
+
+    /// Proves #190 is untouched: lectures found before the expiry are still announced, and the
+    /// expiry notification is separate (both delivered, different identifiers).
+    @Test func newLecturesBeforeAnExpiryAreAnnouncedAlongside() async throws {
+        let harness = try await Harness()
+        defer { harness.remove() }
+        RecordingsController.setExpiryNotice(armed(), in: harness.defaults)
+        harness.seam.result = .needsSignIn(newlyPublished: 2)
+        await harness.controller.runAutomaticSyncForTesting()
+        #expect(harness.center.sent.filter { $0 == "beepbar-new-recordings" }.count == 1)
+        #expect(harness.center.sent.filter { $0 == Self.expiryID }.count == 1)
+    }
+
+    /// Proves no notification without a record (never had a session reach the archive), then one
+    /// once armed; and that a "relaunch" (a second controller sharing the first one's settings, so
+    /// only what was persisted carries over) finds the record spent and stays silent while still
+    /// expired. Guards against notifying someone who never had a session, or on every launch.
+    @Test func noRecordOrASpentRecordAfterRelaunchStaysSilent() async throws {
+        let first = try await Harness()
+        defer { first.remove() }
+        first.seam.result = .needsSignIn(newlyPublished: 0)
+        await first.controller.runAutomaticSyncForTesting()
+        #expect(first.center.sent.filter { $0 == Self.expiryID }.isEmpty)
+
+        RecordingsController.setExpiryNotice(armed(), in: first.defaults)
+        await first.controller.runAutomaticSyncForTesting()
+        #expect(first.center.sent.filter { $0 == Self.expiryID }.count == 1)
+
+        let relaunched = try await Harness(defaults: first.defaults)
+        defer { relaunched.remove() }
+        relaunched.seam.result = .needsSignIn(newlyPublished: 0)
+        await relaunched.controller.runAutomaticSyncForTesting()
+        #expect(relaunched.center.sent.filter { $0 == Self.expiryID }.isEmpty)
+    }
+
+    /// Proves the Notifiche switch off sends nothing and keeps the record armed, so the expiry is
+    /// still announced if notifications come back on while it lasts. Same gating as the other
+    /// notifications.
+    @Test func notificationsOffSendsNothingAndKeepsTheRecordArmed() async throws {
+        let harness = try await Harness()
+        defer { harness.remove() }
+        RecordingsController.setExpiryNotice(armed(), in: harness.defaults)
+        await harness.controller.setNotifications(enabled: false)
+        harness.seam.result = .needsSignIn(newlyPublished: 0)
+        await harness.controller.runAutomaticSyncForTesting()
+        #expect(harness.center.sent.filter { $0 == Self.expiryID }.isEmpty)
+        #expect(RecordingsController.expiryNotice(in: harness.defaults)?.phase == .armed)
+    }
+
+    /// Proves the common case: through the real Recordings controller, the first sync finds no
+    /// session (expired while the app was closed) and notifies, and a later sync, now skipped
+    /// because access already says "sign in", notifies again only after a new sign-in re-armed it,
+    /// never before. Guards against missing the skip path (every sync after the first).
+    @Test func theSkipBecauseAccessNeedsSignInNotifiesOnlyWhenArmed() async throws {
+        let harness = try await Harness(realRefresh: true)
+        defer { harness.remove() }
+        RecordingsController.setExpiryNotice(armed(), in: harness.defaults)
+        await harness.controller.runAutomaticSyncForTesting()
+        #expect(harness.controller.recordingsIfCreated?.access == .needsSignIn(nil))
+        #expect(harness.center.sent.filter { $0 == Self.expiryID }.count == 1)
+
+        // Still expired: the sync now skips, silently.
+        await harness.controller.runAutomaticSyncForTesting()
+        await harness.controller.recordingsExpiryAnnouncementForTesting?.value
+        #expect(harness.center.sent.filter { $0 == Self.expiryID }.count == 1)
+
+        // A sign-in worked (armed again) and expired anew: the skip path notifies.
+        RecordingsController.setExpiryNotice(RecordingsSessionExpiryNotice.afterSignIn(owner: 7), in: harness.defaults)
+        await harness.controller.runAutomaticSyncForTesting()
+        await harness.controller.recordingsExpiryAnnouncementForTesting?.value
+        #expect(harness.center.sent.filter { $0 == Self.expiryID }.count == 2)
+    }
+
+
+    /// Proves macOS denying the permission sends nothing and keeps the record armed (so the
+    /// expiry is still announced if the permission comes back), like the other notifications.
+    @Test func aDeniedSystemPermissionSendsNothingAndKeepsTheRecordArmed() async throws {
+        let harness = try await Harness()
+        defer { harness.remove() }
+        RecordingsController.setExpiryNotice(armed(), in: harness.defaults)
+        harness.center.setAuthorization(.denied)
+        harness.seam.result = .needsSignIn(newlyPublished: 0)
+        await harness.controller.runAutomaticSyncForTesting()
+        #expect(harness.center.sent.filter { $0 == Self.expiryID }.isEmpty)
+        #expect(RecordingsController.expiryNotice(in: harness.defaults)?.phase == .armed)
+    }
+
+    /// Proves a pending announcement (skip path, macOS's permission read still in flight) is
+    /// dropped when the account goes away meanwhile: nothing is sent when the answer arrives.
+    @Test func aPendingAnnouncementDiesWithTheAccount() async throws {
+        let harness = try await Harness(realRefresh: true)
+        defer { harness.remove() }
+        RecordingsController.setExpiryNotice(armed(), in: harness.defaults)
+        await harness.controller.runAutomaticSyncForTesting()   // midway: sent, now spent
+        let before = harness.center.sent.filter { $0 == Self.expiryID }.count
+        // A skip with the record spent shows how many permission reads the sync itself makes; the
+        // announcement's read is the next one, which is the one held.
+        let calls = harness.center.authorizationCalls
+        await harness.controller.runAutomaticSyncForTesting()
+        let perSync = harness.center.authorizationCalls - calls
+        RecordingsController.setExpiryNotice(armed(), in: harness.defaults)
+        harness.center.holdAuthorization(fromCall: harness.center.authorizationCalls + perSync + 1)
+        await harness.controller.runAutomaticSyncForTesting()   // skip path, held at the permission read
+        let pending = try #require(harness.controller.recordingsExpiryAnnouncementForTesting)
+        harness.controller.signOut()
+        harness.center.releaseAuthorization()
+        await pending.value
+        #expect(harness.center.sent.filter { $0 == Self.expiryID }.count == before)
+    }
+
+    /// Proves a sign-in that completes while the announcement waits for macOS's permission stops
+    /// it: access is no longer expired when the answer arrives, so nothing is sent (the record
+    /// is still armed, so only the access check in `isCurrent` can stop it). Mutation: remove that
+    /// check and the stale notification goes out.
+    @Test func aSignInDuringThePermissionReadStopsTheAnnouncement() async throws {
+        let harness = try await Harness(realRefresh: true)
+        defer { harness.remove() }
+        RecordingsController.setExpiryNotice(armed(), in: harness.defaults)
+        await harness.controller.runAutomaticSyncForTesting()   // midway: sent, now spent
+        let before = harness.center.sent.filter { $0 == Self.expiryID }.count
+        let calls = harness.center.authorizationCalls
+        await harness.controller.runAutomaticSyncForTesting()
+        let perSync = harness.center.authorizationCalls - calls
+        RecordingsController.setExpiryNotice(armed(), in: harness.defaults)
+        harness.center.holdAuthorization(fromCall: harness.center.authorizationCalls + perSync + 1)
+        await harness.controller.runAutomaticSyncForTesting()
+        let pending = try #require(harness.controller.recordingsExpiryAnnouncementForTesting)
+        // The WeBeep sign-in's Polimi session arrives: access goes back to ready, no window.
+        harness.controller.recordings.offerSessionCandidate([FakeRecmanBrowser.cookie("SSO_LOGIN")], owner: 7)
+        #expect(harness.controller.recordings.access == .ready)
+        harness.center.releaseAuthorization()
+        await pending.value
+        #expect(harness.center.sent.filter { $0 == Self.expiryID }.count == before)
+        #expect(RecordingsController.expiryNotice(in: harness.defaults)?.phase == .armed)
+    }
+
+    /// Proves the skip path creates no task when the record can't notify (spent, absent): no work
+    /// at rest.
+    @Test func aSkipWithNoArmedRecordCreatesNoTask() async throws {
+        let harness = try await Harness(realRefresh: true)
+        defer { harness.remove() }
+        await harness.controller.runAutomaticSyncForTesting()   // no record: midway, silent
+        await harness.controller.runAutomaticSyncForTesting()   // skip
+        #expect(harness.controller.recordingsExpiryAnnouncementForTesting == nil)
+    }
+
+    /// Proves an account change removes another account's record at the WeBeep sign-in (the
+    /// `siteInfo` wiring, no Recordings controller needed) and keeps the account's own.
+    @Test(arguments: [99, 7])
+    func theRecordOfAnotherAccountGoesAtSignIn(owner: Int) async throws {
+        let defaults = UserDefaults(suiteName: "recordings-expiry-\(UUID().uuidString)")!
+        RecordingsController.setExpiryNotice(.init(owner: owner, phase: .armed), in: defaults)
+        let harness = try await Harness(defaults: defaults)
+        defer { harness.remove() }
+        #expect((RecordingsController.expiryNotice(in: defaults) != nil) == (owner == 7))
+    }
+
     // MARK: Placement
 
     /// Proves the order of an automatic run: the materials state is already `.synced` while the
@@ -799,7 +979,20 @@ import Testing
 private final class RecordingCenter: NotificationCenterClient, @unchecked Sendable {
     private let state = OSAllocatedUnfairLock(initialState: [String]())
     var sent: [String] { state.withLock { $0 } }
-    func authorization() async -> NotificationAuthorization { .allowed }
+    /// What macOS answers, and whether the answer is held back (a permission read still pending).
+    private let permission = OSAllocatedUnfairLock(initialState: (value: NotificationAuthorization.allowed, calls: 0, holdFrom: Int.max))
+    /// How many permission reads there have been.
+    var authorizationCalls: Int { permission.withLock { $0.calls } }
+    func setAuthorization(_ value: NotificationAuthorization) { permission.withLock { $0.value = value } }
+    /// Holds every read from number `call` (1-based) on until `releaseAuthorization()`: lets a test
+    /// pin one particular notification's permission read while the others answer at once.
+    func holdAuthorization(fromCall call: Int) { permission.withLock { $0.holdFrom = call } }
+    func releaseAuthorization() { permission.withLock { $0.holdFrom = Int.max } }
+    func authorization() async -> NotificationAuthorization {
+        let number = permission.withLock { state -> Int in state.calls += 1; return state.calls }
+        while number >= permission.withLock({ $0.holdFrom }) { try? await Task.sleep(for: .milliseconds(2)) }
+        return permission.withLock { $0.value }
+    }
     func requestAuthorization() async {}
     func send(identifier: String, title: String, body: String, destination: NotificationDestination) async {
         state.withLock { $0.append(identifier) }
@@ -828,8 +1021,9 @@ private final class NetworkSequence: Sendable {
     let seam = RefreshSeam()
     let center = RecordingCenter()
     let sequence: NetworkSequence
+    let defaults: UserDefaults
 
-    init(networks: [NetworkPathConditions?] = [.unrestricted], lowPowerMode: Bool = false, schedule: TestSchedule? = nil, site: MoodleSite = .polimi, switchedOn: Bool = true) async throws {
+    init(networks: [NetworkPathConditions?] = [.unrestricted], lowPowerMode: Bool = false, schedule: TestSchedule? = nil, site: MoodleSite = .polimi, switchedOn: Bool = true, defaults sharedDefaults: UserDefaults? = nil, realRefresh: Bool = false) async throws {
         root = FileManager.default.temporaryDirectory.appending(path: UUID().uuidString, directoryHint: .isDirectory)
         try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
         let database = try SyncDatabase(url: root.appending(path: "state.sqlite"))
@@ -843,12 +1037,15 @@ private final class NetworkSequence: Sendable {
         let environment = AutomaticSyncEnvironment(isLowPowerModeEnabled: { lowPowerMode }, currentNetwork: { await sequence.next() })
         let stored = OSAllocatedUnfairLock(initialState: token)
         let vault = CredentialVault(read: { _ in stored.withLock { $0 } }, write: { renewed in stored.withLock { $0 = renewed } })
-        let defaults = UserDefaults(suiteName: "recordings-sync-followup-\(UUID().uuidString)")!
+        let defaults = sharedDefaults ?? UserDefaults(suiteName: "recordings-sync-followup-\(UUID().uuidString)")!
+        self.defaults = defaults
         // The switch defaults to on; the "other university" case keeps it on too, so only the site decides.
         if !switchedOn { defaults.set(false, forKey: RecordingsController.enabledKey) }
         controller = WeBeepAuthenticationController(testRootURL: root, database: database, rootID: rootID, notificationCenter: center, apiClient: MoodleRecordingProtocol.makeClient(), downloader: MoodleRecordingProtocol.makeDownloader(), credentialVault: vault, deleteCredential: {}, defaults: defaults, automaticSyncEnvironment: environment, site: site)
         let seam = seam
-        controller.recordingsRefresh = { keys, force in await seam.refresh(keys, force) }
+        // `realRefresh`: the real `RecordingsController.refreshForSync` against the throwaway empty
+        // session folder, which finds no session and ends `.needsSignIn` (then skips).
+        if !realRefresh { controller.recordingsRefresh = { keys, force in await seam.refresh(keys, force) } }
         await controller.completeLoginForTesting(moodleLoginCallback(token: token))
         #expect(controller.courseLoadError == nil)
         if let schedule { controller.setBackgroundSchedulerForTesting { interval, callback in schedule.register(interval, callback) } }

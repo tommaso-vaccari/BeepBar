@@ -4,6 +4,7 @@
 
 ### New
 
+- When your Polimi sign-in expires, BeepBar now sends one notification, “Accesso al Politecnico scaduto” (“Polimi sign-in expired”), so you can sign in again in Recordings and keep getting new lectures. It arrives once per expiry, only if your Polimi sign-in had been working, and follows the Notifications switch; clicking it opens Recordings.
 - Add a Webex lesson directly from a course using “+”; it appears in that course and the Watchlist.
 
 - Add a lesson to the Watchlist by pasting its Webex link with the “+” button, for recordings the archive doesn't list. Choose a course to find the lesson in both that course and the Watchlist. The link copied from the Webex web app's address bar works too. Leave the title empty and the first Play fills in Webex's title and the length; the lesson then shows its progress bar and the “Fatta” (“Done”) checkbox like the others. In its course the lesson sits in the same list as the course's other recordings, in the week it was recorded: the date and length are taken from Webex when you add the link (if Webex isn't signed in, the first Play fills them in). The course's counts (recordings, lectures left, time left) and “Segna tutte come completate” (“Mark all as completed”) include it. When the course is visible in Recordings, use the bookmark to add or remove the lecture from the Watchlist while keeping it and its progress in the course. “Elimina lezione…” (“Delete lesson…”) in the “⋯” menu deletes the lecture after asking.

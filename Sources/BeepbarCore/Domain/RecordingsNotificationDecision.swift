@@ -10,8 +10,9 @@ import Foundation
 /// A batch cut short by the Polimi session lapsing or Polimi not answering still announces the
 /// lectures its earlier courses already published (issue #190): they are on the page with their
 /// dots, and the next sync compares against them, so staying silent would lose that announcement
-/// for good. The ending itself is never notified: an expired session degrades to the sign-in
-/// prompt on the Recordings page (no window), an outage is not the student's problem.
+/// for good. The ending itself is not announced HERE: an outage is not the student's problem, and
+/// an expired session has its own notification, sent once per expiry and only to a student who
+/// had a working session (`RecordingsSessionExpiryNotice`, #295); both can follow one sync.
 ///
 /// Every other ending is silent, by the owner's decision: a cancelled refresh (the sync stopped,
 /// Recordings turned off, a sign-in or an account change) and a skipped refresh that asked

@@ -93,8 +93,9 @@ public enum RecordingsSyncAccess: Sendable, Equatable {
     case needsSignIn
 }
 
-/// Why the follow-up doesn't run. Every skip is silent: none is shown as a failure, none sends a
-/// notification, none touches the network.
+/// Why the follow-up doesn't run. Every skip is silent: none is shown as a failure, none touches the network, and
+/// none sends a notification of its own, except that `.needsSignIn` is an expiry the app announces
+/// once (`RecordingsSessionExpiryNotice`, #295).
 public enum RecordingsSyncSkipReason: Sendable, Equatable {
     /// The Recordings switch is off (or the controller says `.off`).
     case switchedOff
@@ -126,7 +127,7 @@ public enum RecordingsSyncSkipReason: Sendable, Equatable {
     /// The Polimi sign-in is running; the follow-up must not race it.
     case signingIn
     /// The Polimi session is gone. Skipping costs nothing and avoids a retry storm: the follow-up
-    /// never opens the sign-in window on its own.
+    /// never opens the sign-in window on its own. Announced once per expiry (#295).
     case needsSignIn
 }
 

@@ -5933,3 +5933,118 @@ struct AudioSelectorPresentationTests {
         #expect(P.stallThreshold == 15)
     }
 }
+
+// MARK: Polimi sign-in expired notification record (#295)
+
+/// How the controller keeps the per-account record behind the "sign-in expired" notification:
+/// armed by a working session, spent by the student's own sign-in, removed with the identity.
+extension RecordingsControllerTests {
+    private var record: RecordingsSessionExpiryNotice.Record? { RecordingsController.expiryNotice(in: defaults) }
+
+    /// Proves a successful sign-in arms the account that signed in, so its next expiry is notified.
+    /// Mutation: drop `armExpiryNotice(afterSignIn: true)` and the record stays nil.
+    @Test func aSuccessfulSignInArmsTheRecord() async {
+        defer { cleanUp() }
+        let controller = makeController(useDefault: true)
+        controller.signIn()
+        await settle("signed in") { controller.access == .ready && !browser.isOpen }
+        #expect(record == RecordingsSessionExpiryNotice.Record(owner: 42, phase: .armed))
+    }
+
+    /// Proves a saved session arms the record only when it is PROVEN: a listing that succeeds arms
+    /// (an account with no record, and a spent one alike), a listing that fails with "sign in
+    /// again" arms nothing and leaves a spent record spent. Merely finding cookies must not arm
+    /// (a session that never worked must not later be reported as expired). Mutation: arm in
+    /// `answerInitialSessionCheck` when cookies are found, and the failing cases turn red.
+    @Test(arguments: [(false, true), (true, true), (false, false), (true, false)])
+    func aSessionArmsTheRecordOnlyOnceItReachedTheArchive(spent: Bool, works: Bool) async throws {
+        defer { cleanUp() }
+        try saveSession(owner: 42)
+        if spent { RecordingsController.setExpiryNotice(.init(owner: 42, phase: .spent), in: defaults) }
+        browser.listResults[course.courseCode] = works ? .success([recording("a")]) : .failure(RecmanBrowserError.needsSignIn)
+        let controller = makeController(useDefault: true)
+        controller.pageAppeared()
+        controller.refresh([course], selected: course)
+        await settle("the listing ends") { works ? controller.listing(for: course)?.recordings != nil : controller.access == .needsSignIn(nil) }
+        await drainTasks()
+        if works {
+            #expect(record == RecordingsSessionExpiryNotice.Record(owner: 42, phase: .armed))
+        } else {
+            #expect(record == (spent ? RecordingsSessionExpiryNotice.Record(owner: 42, phase: .spent) : nil))
+        }
+    }
+
+    /// Proves the student starting the sign-in while expired spends this expiry, even when they
+    /// give up (the sign-in fails): nothing is notified for an expiry they already know.
+    @Test func startingTheSignInYourselfSpendsTheExpiry() async {
+        defer { cleanUp() }
+        RecordingsController.setExpiryNotice(.init(owner: 42, phase: .armed), in: defaults)
+        let controller = makeController(useDefault: true)
+        browser.signInError = CancellationError()
+        controller.signIn()
+        await settle("cancelled") { controller.access == .needsSignIn(nil) }
+        #expect(record?.phase == .armed)
+        browser.signInError = RecmanBrowserError.unavailable
+        controller.signIn()
+        await settle("failed") { controller.access == .needsSignIn(.unavailable) }
+        #expect(record?.phase == .spent)
+    }
+
+    /// Proves turning Recordings off (the same path as logout and a university change) removes the
+    /// record, and that an account change removes another account's record without a controller.
+    @Test func theRecordGoesWithTheIdentity() async {
+        defer { cleanUp() }
+        RecordingsController.setExpiryNotice(.init(owner: 42, phase: .armed), in: defaults)
+        let controller = makeController(useDefault: true)
+        controller.setEnabled(false)
+        #expect(record == nil)
+
+        RecordingsController.setExpiryNotice(.init(owner: 42, phase: .armed), in: defaults)
+        RecordingsController.forgetExpiryNotice(in: defaults, notOwnedBy: 42)
+        #expect(record != nil)
+        RecordingsController.forgetExpiryNotice(in: defaults, notOwnedBy: 43)
+        #expect(record == nil)
+    }
+
+    /// Proves jobs that never ask Polimi can't arm the record: with a saved session that doesn't
+    /// work (listing refused), a manual Webex lesson's copy-link and a link served from memory
+    /// leave it empty. Mutation: arm after any successful job (the old behavior) and this fails.
+    @Test func jobsThatNeverAskedPolimiDoNotArmTheRecord() async throws {
+        defer { cleanUp() }
+        try saveSession(owner: 42)
+        browser.listResults[course.courseCode] = .failure(RecmanBrowserError.needsSignIn)
+        browser.playbackResults["x"] = .success(URL(string: "https://politecnicomilano.webex.com/x")!)
+        let controller = makeController(useDefault: true)
+        let manualLink = "https://politecnicomilano.webex.com/recordingservice/sites/politecnicomilano/recording/playback/0123456789abcdef0123456789abcdef"
+        let lesson = try controller.addManualLesson(link: manualLink, title: "", courseName: "").get()
+        controller.copyLink(lesson.recording)
+        await settle("manual link copied") { !world.copied.isEmpty }
+        await drainTasks()
+        #expect(browser.playCalls.isEmpty)
+        #expect(record == nil, "a manual lesson never asked the archive")
+
+        // A link from memory: first fetched (the archive answered, armed), then cleared and copied again.
+        controller.copyLink(recording("x"))
+        await settle("archive link copied") { world.copied.count == 2 }
+        #expect(record?.phase == .armed, "an archive-backed link proves the session")
+        RecordingsController.setExpiryNotice(nil, in: defaults)
+        controller.copyLink(recording("x"))
+        await settle("cached link copied") { world.copied.count == 3 }
+        await drainTasks()
+        #expect(browser.playCalls == ["play x"], "the second copy came from memory")
+        #expect(record == nil, "a cached link never asked the archive")
+    }
+
+    /// Proves a listing that the archive answers arms the record even from a spent one.
+    @Test func anArchiveListingArmsFromSpent() async throws {
+        defer { cleanUp() }
+        try saveSession(owner: 42)
+        RecordingsController.setExpiryNotice(.init(owner: 42, phase: .spent), in: defaults)
+        browser.listResults[course.courseCode] = .success([recording("a")])
+        let controller = makeController(useDefault: true)
+        controller.pageAppeared()
+        controller.refresh([course], selected: course)
+        await settle("listed") { controller.listing(for: course)?.recordings != nil }
+        #expect(record?.phase == .armed)
+    }
+}

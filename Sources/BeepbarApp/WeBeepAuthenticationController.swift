@@ -666,6 +666,7 @@ enum MaterialsRunEnd: Equatable, Sendable {
             RecordingsController.forgetResumePoints(in: operationDefaults, notOwnedBy: userID)
             RecordingsController.forgetWatchSummary(in: operationDefaults, notOwnedBy: userID)
             RecordingsController.forgetEmailOptOut(in: operationDefaults, notOwnedBy: userID)
+            RecordingsController.forgetExpiryNotice(in: operationDefaults, notOwnedBy: userID)
             recordingsStorage?.webBeepAccountChanged(to: userID)
             // After the forgets above, so a previous account's numbers can't be read back. Read
             // here, once per account, and never by creating the controller: the menu shows the
@@ -793,6 +794,8 @@ enum MaterialsRunEnd: Equatable, Sendable {
     /// Bumped by `cancelRecordingsFollowUp`: a follow-up that resumes under an older value belongs
     /// to an account, site or folder that is gone and publishes nothing.
     private var recordingsFollowUpGeneration = 0
+    /// The "sign-in expired" notification of a skipped follow-up (`announceRecordingsSessionExpiry`).
+    private var recordingsExpiryAnnouncement: Task<Void, Never>?
     /// How each operation's materials run ended, recorded by its ending path while it is still
     /// the active operation and taken once by the tail that starts the follow-up. An operation
     /// with no entry was superseded: no follow-up (`MaterialsRunEnd.superseded`).
@@ -1192,6 +1195,7 @@ enum MaterialsRunEnd: Equatable, Sendable {
 
     /// The running recordings follow-up, nil when none runs.
     var recordingsFollowUpForTesting: Task<Void, Never>? { recordingsFollowUp }
+    var recordingsExpiryAnnouncementForTesting: Task<Void, Never>? { recordingsExpiryAnnouncement }
 
     /// Ends `operationID` through `failedSync`, as a run that failed with `error` would.
     func failSyncForTesting(_ operationID: UUID, error: WeBeepAPIError?, automatic: Bool) async {
@@ -3779,7 +3783,17 @@ enum MaterialsRunEnd: Equatable, Sendable {
         // still finish successfully) must not start WebKit listings on the way out.
         guard !isTerminating else { return nil }
         guard let materials = Self.recordingsOutcome(for: end) else { return nil }
-        guard case .refresh = recordingsSyncDecision(after: materials, trigger: trigger, network: nil).0 else { return nil }
+        let early = recordingsSyncDecision(after: materials, trigger: trigger, network: nil).0
+        guard case .refresh = early else {
+            // The skip because the Polimi session is already expired is the common ending of #295:
+            // announce it (once per expiry), with no refresh task and nothing to merge into.
+            if case .skip(.needsSignIn) = early, RecordingsSessionExpiryNotice.allowsSkipAnnouncement(after: materials),
+               RecordingsSessionExpiryNotice.shouldNotify(for: .skipped(.needsSignIn), record: RecordingsController.expiryNotice(in: operationDefaults), owner: recordingsOwnerUserID, notificationsEnabled: true) {
+                // Only when the record says it could notify: no task otherwise (principle 3).
+                announceRecordingsSessionExpiry(.skipped(.needsSignIn))
+            }
+            return nil
+        }
         // A follow-up the dropped schedule already cancelled can still be unwinding (a refresh
         // that ignores cancellation for a while): merging into it would leave this request with no
         // refresh at all, so it counts as absent. The old task's `defer` compares ids, so it
@@ -3801,7 +3815,11 @@ enum MaterialsRunEnd: Equatable, Sendable {
             let network: NetworkPathConditions? = trigger == .automatic && self.dataSaverEnabled ? await self.automaticSyncEnvironment.currentNetwork() : nil
             guard !Task.isCancelled, self.recordingsFollowUpGeneration == generation else { return }
             let (decision, keys) = self.recordingsSyncDecision(after: materials, trigger: trigger, network: network)
-            guard case .refresh(let force) = decision else { return }
+            guard case .refresh(let force) = decision else {
+                // The session lapsed while this task waited (the network read): same as the early skip.
+                if case .skip(.needsSignIn) = decision, RecordingsSessionExpiryNotice.allowsSkipAnnouncement(after: materials) { await self.sendRecordingsSessionExpiry(.skipped(.needsSignIn), generation: generation) }
+                return
+            }
             let result: RecordingsSyncOutcome
             if let refresh = self.recordingsRefresh {
                 result = await refresh(keys, force)
@@ -3815,9 +3833,43 @@ enum MaterialsRunEnd: Equatable, Sendable {
             // published before an outage or an expired session cut it short (#190); nothing for a
             // baseline or a cancellation. The coordinator applies the Notifiche switch.
             await self.notificationCoordinator.announceRecordingsRefresh(result, isCurrent: { [weak self] in self?.recordingsFollowUpGeneration == generation })
+            // And, separately, the one "Polimi sign-in expired" notice when the refresh met an
+            // expired session (#295); the pure rules decide, so it is at most once per expiry.
+            await self.sendRecordingsSessionExpiry(result, generation: generation)
         }
         recordingsFollowUp = task
         return task
+    }
+
+    /// Runs `sendRecordingsSessionExpiry` for a skipped follow-up, which has no task of its own.
+    /// Kept in `recordingsExpiryAnnouncement` (not merged into `recordingsFollowUp`): the follow-up
+    /// the caller waits on is unchanged. A stale generation (account change) stops it at send time.
+    private func announceRecordingsSessionExpiry(_ outcome: RecordingsSyncOutcome) {
+        let generation = recordingsFollowUpGeneration
+        recordingsExpiryAnnouncement = Task { @MainActor [weak self] in
+            await self?.sendRecordingsSessionExpiry(outcome, generation: generation)
+        }
+    }
+
+    /// The "Polimi sign-in expired" notification of #295 for a follow-up that ended with `outcome`.
+    /// The record lives in UserDefaults (`RecordingsController.expiryNoticeKey`), read here without
+    /// creating `RecordingsController`; a follow-up from another account (`generation`) sends nothing.
+    private func sendRecordingsSessionExpiry(_ outcome: RecordingsSyncOutcome, generation: Int) async {
+        guard RecordingsSessionExpiryNotice.isExpiry(outcome), let owner = recordingsOwnerUserID else { return }
+        let defaults = operationDefaults
+        await notificationCoordinator.announceRecordingsSessionExpiry(
+            outcome, owner: owner,
+            record: { RecordingsController.expiryNotice(in: defaults) },
+            markNotified: { RecordingsController.setExpiryNotice(RecordingsSessionExpiryNotice.afterNotified(RecordingsController.expiryNotice(in: defaults), owner: owner), in: defaults) },
+            isCurrent: { [weak self] in
+                guard let self, self.recordingsFollowUpGeneration == generation, self.recordingsOwnerUserID == owner else { return false }
+                // A quick sign-in (or the switch turned off) while macOS's permission was read
+                // makes "expired" stale. No controller (a test seam) means nothing to contradict.
+                switch self.recordingsStorage?.access {
+                case .ready?, .signingIn?, .off?: return false
+                case .needsSignIn?, nil: return true
+                }
+            })
     }
 
     /// Stops the follow-up of a context that no longer exists (sign-out, site, account, folder
@@ -3828,6 +3880,8 @@ enum MaterialsRunEnd: Equatable, Sendable {
         recordingsFollowUp?.cancel()
         recordingsFollowUp = nil
         recordingsFollowUpID = nil
+        recordingsExpiryAnnouncement?.cancel()
+        recordingsExpiryAnnouncement = nil
     }
 
     nonisolated static func automaticTargets(scopes: [SyncScope], enrolledCourseIDs: Set<Int64>) -> [SyncTarget] {

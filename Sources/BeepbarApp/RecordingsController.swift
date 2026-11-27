@@ -188,6 +188,12 @@ struct RecordingsListing: Equatable {
     /// with the session's identity (turn-off, disconnect, account change) and when the student
     /// enters an address again.
     nonisolated static let emailDeclinedKey = "io.github.tvaccari.beepbar.recordings-email-declined.v1"
+    /// The per-account record of the "Polimi sign-in expired" notification
+    /// (`RecordingsSessionExpiryNotice.Record`, #295): armed once a Polimi session worked, spent
+    /// once this expiry was notified or the student started the sign-in. Holds only the WeBeep
+    /// user id and a phase. Removed with the session's identity (turn-off, disconnect, account
+    /// change); an older build ignores the unknown key.
+    nonisolated static let expiryNoticeKey = "io.github.tvaccari.beepbar.recordings-expiry-notice.v1"
     /// A course shown again within this time isn't asked for again unless the user refreshes.
     static let freshness: TimeInterval = 300
 
@@ -1019,6 +1025,7 @@ struct RecordingsListing: Equatable {
         forgetSeen()
         if !preservingResumePoints { forgetResumePoints() }
         forgetEmailOptOut()
+        forgetExpiryNotice()
         // The filter reads this account's stream: it stops with it, and its memory goes.
         audioEnhancer?.removeAll()
         studyLoaded = false
@@ -1044,7 +1051,14 @@ struct RecordingsListing: Equatable {
         supersedeInitialSessionCheck()
         invalidate()
         let freshSession: Bool
-        if case .needsSignIn = access { freshSession = true } else { freshSession = false }
+        if case .needsSignIn = access {
+            freshSession = true
+            // The student starts the sign-in themselves: they know it expired, so this expiry is
+            // not notified, even if they give up (#295).
+            if let owner = sessionOwner ?? ownerUserID() {
+                Self.setExpiryNotice(RecordingsSessionExpiryNotice.afterUserStartedSignIn(Self.expiryNotice(in: defaults), owner: owner), in: defaults)
+            }
+        } else { freshSession = false }
         access = .signingIn
         let generation = self.generation
         signInTask = Task { [weak self] in await self?.runSignIn(generation, freshSession: freshSession) }
@@ -1078,6 +1092,7 @@ struct RecordingsListing: Equatable {
         // owner only stands in while the account isn't known yet (offline launch).
         sessionOwner = ownerUserID() ?? sessionOwner
         access = .ready
+        armExpiryNotice()
         log.notice("Polimi sign-in reached the archive")
         await saveSession(generation)
         guard generation == self.generation else { return }
@@ -1132,6 +1147,7 @@ struct RecordingsListing: Equatable {
             forgetSeen()
             forgetResumePoints()
             forgetEmailOptOut()
+            forgetExpiryNotice()
             discardSessionFile()
         } else {
             resetWatchProgress()
@@ -1887,6 +1903,8 @@ struct RecordingsListing: Equatable {
                     runningKey = key
                     let recordings = try await browser.recordings(for: key)
                     guard generation == self.generation else { return }
+                    // The archive answered: this session is proven (see `armExpiryNotice`).
+                    armExpiryNotice()
                     let recorded = await record(recordings, for: key, generation: generation)
                     guard generation == self.generation else { return }
                     runningKey = nil
@@ -1997,7 +2015,12 @@ struct RecordingsListing: Equatable {
         // A lesson added by its Webex link has no archive row to look up: its link is the player.
         if let manual = ManualWebexLesson.playerLink(for: recording) { return manual }
         if let cached = playbackURLs[recording.id] { return cached }
-        return try await browser.playbackURL(for: recording)
+        let generation = self.generation
+        let url = try await browser.playbackURL(for: recording)
+        // The archive answered for a lesson that lives in it (not a manual Webex link, not a cached
+        // link, which never asked Polimi): the session is proven (#295).
+        if generation == self.generation { armExpiryNotice() }
+        return url
     }
 
     /// What actually failed in a stream lookup, and the player link it had found by then, if any
@@ -2473,6 +2496,45 @@ struct RecordingsListing: Equatable {
     nonisolated static func forgetEmailOptOut(in defaults: UserDefaults, notOwnedBy owner: Int) {
         guard defaults.object(forKey: emailDeclinedKey) != nil, defaults.integer(forKey: emailDeclinedKey) != owner else { return }
         defaults.removeObject(forKey: emailDeclinedKey)
+    }
+
+    /// The stored expiry-notification record, nil when absent or unreadable (unreadable counts as
+    /// never armed: silent, and the next sign-in rewrites it).
+    nonisolated static func expiryNotice(in defaults: UserDefaults) -> RecordingsSessionExpiryNotice.Record? {
+        defaults.data(forKey: expiryNoticeKey).flatMap { try? JSONDecoder().decode(RecordingsSessionExpiryNotice.Record.self, from: $0) }
+    }
+
+    nonisolated static func setExpiryNotice(_ record: RecordingsSessionExpiryNotice.Record?, in defaults: UserDefaults) {
+        guard let record, let data = try? JSONEncoder().encode(record) else {
+            if defaults.object(forKey: expiryNoticeKey) != nil { defaults.removeObject(forKey: expiryNoticeKey) }
+            return
+        }
+        // Compared as records, not bytes: JSON key order isn't stable, and a run that changes
+        // nothing must write nothing (principle 4).
+        if expiryNotice(in: defaults) != record { defaults.set(data, forKey: expiryNoticeKey) }
+    }
+
+    /// Removes the record unless it is `owner`'s, without a controller: an account change in a
+    /// launch that never created Recordings.
+    nonisolated static func forgetExpiryNotice(in defaults: UserDefaults, notOwnedBy owner: Int) {
+        guard defaults.object(forKey: expiryNoticeKey) != nil, expiryNotice(in: defaults)?.owner != owner else { return }
+        defaults.removeObject(forKey: expiryNoticeKey)
+    }
+
+    /// The record goes with the identity, like the email marker: turn-off, disconnect and account change.
+    private func forgetExpiryNotice() {
+        Self.setExpiryNotice(nil, in: defaults)
+    }
+
+    /// A Polimi session is PROVEN to work: a sign-in reached the archive, or the archive answered
+    /// a listing or a player-link request (`browser.recordings` / `browser.playbackURL`, never a
+    /// manual Webex link or a cached link, which don't ask Polimi) with a saved or candidate session. Never called for cookies that were
+    /// merely found or offered, which may not work (a new user would be told about an expiry they
+    /// never had). Always `.armed`, from a spent or absent record alike
+    /// (`RecordingsSessionExpiryNotice.afterSignIn`).
+    private func armExpiryNotice() {
+        guard let owner = sessionOwner ?? ownerUserID() else { return }
+        Self.setExpiryNotice(RecordingsSessionExpiryNotice.afterSignIn(owner: owner), in: defaults)
     }
 
     /// The marker goes with the identity: turn-off, disconnect and account change.
@@ -3418,8 +3480,9 @@ struct RecordingsListing: Equatable {
             // found the session gone, needs the page's "Accedi con Polimi".
             needsPage = takeMenuPlayNeedingPage(failing: job, queued: true)
             access = .needsSignIn(nil)
-            // A sync refresh ends here too, silently: no sign-in window, no activation; every
-            // later sync skips Recordings until the student signs in again.
+            // A sync refresh ends here too: no sign-in window, no activation (the sync's follow-up
+            // sends the one "sign-in expired" notification, #295); every later sync skips
+            // Recordings until the student signs in again.
             clearQueue(background: .needsSignIn)
             closeBrowser()
             return .stopWithoutSaving
@@ -3868,6 +3931,7 @@ struct RecordingsListing: Equatable {
             forgetSeen()
             forgetResumePoints()
             forgetEmailOptOut()
+            forgetExpiryNotice()
             discardUnusableFile()
             return []
         }

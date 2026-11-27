@@ -195,8 +195,9 @@ func recmanHasMatch(_ pattern: String, in value: String) -> Bool {
 /// so the cache does not grow. A pattern that does not compile is not cached and matches nothing,
 /// as before.
 ///
-/// Parity with `String.range(of:options:)`: that API treats a final `$` as the end of the string,
-/// while `NSRegularExpression` (ICU) lets `$` match before a trailing line terminator too, so
+/// Identical to the previous behaviour on macOS, where `String.range(of:options:)` treats a final
+/// `$` as the end of the string; on Linux that API keeps ICU semantics, so the cache is stricter
+/// there. `NSRegularExpression` lets `$` match before a trailing line terminator too, so
 /// `"abc\n"` would pass `^[A-Za-z0-9_-]+$`. A trailing unescaped `$` is therefore compiled as
 /// `\z` (absolute end of input). Every `$` pattern in use ends with it; none uses `$` elsewhere.
 enum RecmanRegexCache {

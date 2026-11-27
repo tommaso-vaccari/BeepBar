@@ -128,20 +128,29 @@ struct RecmanRecordingTests {
         }
     }
 
-    /// The shared regex cache (#275) answers exactly as `String.range(of:options:)` did, on the
+    /// The shared regex cache (#275) answers as `String.range(of:options:)` did on macOS (and stricter than it on Linux about a trailing line terminator), on the
     /// first call and the repeats, from several threads, and an invalid pattern matches nothing
     /// instead of trapping. Guards the per-row regexes of the row parser against drifting.
     @Test func cachedRegexMatchesLikeTheStringApi() async {
         let pattern = #"^[0-9]+\s*min$"#
-        for value in ["97 min", "97min", "min", "97 min ", "", "9 7 min", "97 min\n", "97 min\r\n"] {
-            for _ in 0..<2 { #expect(recmanHasMatch(pattern, in: value) == (value.range(of: pattern, options: .regularExpression) != nil)) }
-        }
-        // ICU's `$` would accept a trailing line terminator; the String API did not (#275 review).
         let idPattern = #"^[A-Za-z0-9_-]+$"#
+        // Fixed expectations, the same on every platform: a trailing line terminator is rejected.
+        for (value, expected) in [("97 min", true), ("97min", true), ("min", false), ("97 min ", false), ("", false), ("9 7 min", false), ("97 min\n", false), ("97 min\r\n", false)] {
+            for _ in 0..<2 { #expect(recmanHasMatch(pattern, in: value) == expected, "\(value.debugDescription)") }
+        }
+        for (value, expected) in [("abc", true), ("abc\n", false), ("ABC\r\n", false), ("abc\u{2028}", false), ("", false), ("a b", false)] {
+            #expect(recmanHasMatch(idPattern, in: value) == expected, "\(value.debugDescription)")
+        }
+#if canImport(Darwin)
+        // Parity with the String API holds on macOS only: on Linux its ICU `$` accepts a trailing
+        // line terminator, which the cache deliberately refuses (#275 review).
+        for value in ["97 min", "97min", "min", "97 min ", "", "9 7 min", "97 min\n", "97 min\r\n"] {
+            #expect(recmanHasMatch(pattern, in: value) == (value.range(of: pattern, options: .regularExpression) != nil))
+        }
         for value in ["abc", "abc\n", "ABC\r\n", "abc\u{2028}", "", "a b"] {
             #expect(recmanHasMatch(idPattern, in: value) == (value.range(of: idPattern, options: .regularExpression) != nil), "\(value.debugDescription)")
         }
-        #expect(!recmanHasMatch(idPattern, in: "abc\n") && !recmanHasMatch(pattern, in: "97 min\n"))
+#endif
         #expect(RecmanRegexCache.strictEnd(#"a\$"#) == #"a\$"# && RecmanRegexCache.strictEnd(#"a\\$"#) == #"a\\\z"#)
         #expect(recmanMatches(#"^[0-9]{6}(?=\s*-)"#, in: "058167 - X") == ["058167"])
         #expect(recmanMatches("(", in: "x").isEmpty && !recmanHasMatch("(", in: "x"))

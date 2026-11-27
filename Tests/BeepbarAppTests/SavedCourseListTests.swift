@@ -144,6 +144,35 @@ import os
         #expect(courseListRequests(token: token) == fetches + 1)
     }
 
+    /// A failed fetch keeps the five-minute exemption from applying: with the list confirmed 100 s
+    /// ago but the last fetch (the refresh button's) failed and the error still shown, reopening the
+    /// window asks Moodle again instead of leaving the error on screen. Guards against the exemption
+    /// ignoring `courseLoadError` (#277 review).
+    @Test func reopeningTheWindowOverAFailedFetchFetchesTheCourseListAgain() async throws {
+        let install = try await Install.make()
+        defer { install.remove() }
+        let token = MoodleRecordingProtocol.register(courses: [(1, "Analisi")])
+        defer { MoodleRecordingProtocol.revoke(token: token) }
+        let start = ContinuousClock.now
+        let controller = install.launch(token: token)
+        controller.setCourseListClockForTesting { start }
+        await controller.refreshOnWindowOpen().value
+        try #require(controller.courseListFreshness == .current)
+
+        MoodleRecordingProtocol.setOffline(token: token, true)
+        controller.loadCourses()
+        await controller.waitForCourseLoadForTesting()
+        try #require(controller.courseLoadError != nil)
+        controller.windowClosed()
+        MoodleRecordingProtocol.setOffline(token: token, false)
+        controller.setCourseListClockForTesting { start.advanced(by: .seconds(100)) }
+        let fetches = courseListRequests(token: token)
+
+        await controller.refreshOnWindowOpen().value
+        #expect(courseListRequests(token: token) == fetches + 1, "the window reopened over a failed fetch did not ask Moodle")
+        #expect(controller.courseLoadError == nil)
+    }
+
     /// A new account (here: the credential gone and signed in again) never inherits the previous
     /// account's confirmation (principle 8): the open right after fetches. Guards against a
     /// confirmation that survives `forgetCourseList`.

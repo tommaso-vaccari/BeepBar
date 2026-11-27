@@ -30,6 +30,82 @@ struct SyncFinalizationTests {
         #expect(defaults.data(forKey: key) == bytes)
     }
 
+    /// #277: a run with nothing new saves the last-sync time (written on purpose) and nothing else:
+    /// the summary key is not rewritten for a summary that differs only by its time, a run that
+    /// changed something still saves both, and a relaunch shows the time of the last run, not the
+    /// older one left in the summary. Fails on the code before #277, which rewrote both keys at
+    /// every successful run, and fails if the restore forgets the time key.
+    @Test @MainActor func aRunWithNothingNewWritesOnlyTheLastSyncTime() async throws {
+        let root = FileManager.default.temporaryDirectory.appending(path: UUID().uuidString)
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let database = try SyncDatabase(url: root.appending(path: "state.sqlite"))
+        let rootID = UUID()
+        try await database.registerRoot(id: rootID, canonicalPath: root.path)
+        let suite = WeBeepAuthenticationController.throwawayDefaultsSuite()
+        defer { removeTestDefaults(suite) }
+        let defaults = CountingDefaults(suiteName: suite)!
+        let timeKey = "io.github.tvaccari.beepbar.last-successful-reconciliation.v1." + rootID.uuidString
+        let summaryKey = "io.github.tvaccari.beepbar.last-successful-summary.v1." + rootID.uuidString
+        let controller = WeBeepAuthenticationController(testRootURL: root, database: database, rootID: rootID, defaults: defaults)
+        func run(at time: Double, added: Int = 0) async -> EncodedSyncSummary {
+            await EncodedSyncSummary.encode(SyncCompletionSummary(completedAt: Date(timeIntervalSince1970: time), added: added, updated: 0, unchanged: 40, preservedLocal: 0, conflicts: 0, failures: 0))
+        }
+
+        controller.setSyncStateForTesting(synced: await run(at: 100))
+        #expect(Set(defaults.writes) == [timeKey, summaryKey], "the first result saves both keys")
+        defaults.resetWrites()
+
+        controller.setSyncStateForTesting(synced: await run(at: 200))
+        #expect(defaults.writes == [timeKey], "a run with nothing new rewrote more than the last-sync time")
+        #expect(controller.lastSuccessfulTimestampForTesting() == 200)
+
+        let relaunched = WeBeepAuthenticationController(testRootURL: root, database: database, rootID: rootID, defaults: defaults)
+        defaults.resetWrites()
+        await relaunched.restorePersistedSyncStateForTesting()
+        #expect(relaunched.lastSyncSummary?.completedAt == Date(timeIntervalSince1970: 200), "a relaunch showed the time of the summary key, not of the last run")
+        #expect(defaults.writes.isEmpty)
+        defaults.resetWrites()
+        relaunched.setSyncStateForTesting(synced: await run(at: 300))
+        #expect(defaults.writes == [timeKey], "after a restore the stored summary is known, so nothing new still writes only the time")
+
+        defaults.resetWrites()
+        relaunched.setSyncStateForTesting(synced: await run(at: 400, added: 2))
+        #expect(Set(defaults.writes) == [timeKey, summaryKey], "a run that changed something must save its summary")
+        let stored = try JSONDecoder().decode(SyncCompletionSummary.self, from: try #require(defaults.data(forKey: summaryKey)))
+        #expect(stored.added == 2)
+    }
+
+    /// #277: a launch that finds the language, the automatic-sync interval and the onboarding flag already stored
+    /// writes none of them; the first launch, a changed value and an invalid stored interval still do.
+    /// Fails on the code before #277, which wrote both keys at every launch.
+    @Test func aLaunchWritesTheLanguageAndTheIntervalOnlyWhenTheyDiffer() {
+        let suite = WeBeepAuthenticationController.throwawayDefaultsSuite()
+        defer { removeTestDefaults(suite) }
+        let defaults = CountingDefaults(suiteName: suite)!
+        WeBeepAuthenticationController.persistLaunchPreferences(language: .italian, automaticInterval: 3_600, in: defaults)
+        #expect(defaults.writes.count == 2, "the first launch stores both")
+        defaults.resetWrites()
+        WeBeepAuthenticationController.persistLaunchPreferences(language: .italian, automaticInterval: 3_600, in: defaults)
+        #expect(defaults.writes.isEmpty, "an unchanged launch wrote preferences")
+        WeBeepAuthenticationController.persistLaunchPreferences(language: .english, automaticInterval: 3_600, in: defaults)
+        #expect(defaults.writes.count == 1)
+        defaults.resetWrites()
+        defaults.set(12_345, forKey: "io.github.tvaccari.beepbar.auto-sync-interval.v1")
+        defaults.resetWrites()
+        WeBeepAuthenticationController.persistLaunchPreferences(language: .english, automaticInterval: 28_800, in: defaults)
+        #expect(defaults.writes.count == 1, "an invalid stored interval is corrected")
+        #expect(defaults.object(forKey: "io.github.tvaccari.beepbar.auto-sync-interval.v1") as? Int == 28_800)
+
+        // The onboarding flag: written once, then left alone at every launch.
+        defaults.resetWrites()
+        WeBeepAuthenticationController.markOnboardingCompletedAtLaunch(in: defaults)
+        #expect(defaults.writes.count == 1)
+        defaults.resetWrites()
+        WeBeepAuthenticationController.markOnboardingCompletedAtLaunch(in: defaults)
+        #expect(defaults.writes.isEmpty, "an already completed onboarding was written again")
+    }
+
     /// Corrupt summaries fall back safely; timestamp-only installs migrate once, preserving old data.
     @Test(arguments: [false, true]) @MainActor func legacySummaryMigratesOnlyOnce(_ corrupt: Bool) async throws {
         let root = FileManager.default.temporaryDirectory.appending(path: UUID().uuidString)
@@ -49,7 +125,9 @@ struct SyncFinalizationTests {
         defaults.resetWrites()
         await controller.restorePersistedSyncStateForTesting()
         #expect(controller.lastSyncSummary?.completedAt == Date(timeIntervalSince1970: 123))
-        #expect(defaults.writes == [timestampKey, summaryKey])
+        // The timestamp is already what the migration would write, so only the new summary key is
+        // written (#277: a key whose value did not change is not rewritten).
+        #expect(defaults.writes == [summaryKey])
         defaults.resetWrites()
         await controller.restorePersistedSyncStateForTesting()
         #expect(defaults.writes.isEmpty)

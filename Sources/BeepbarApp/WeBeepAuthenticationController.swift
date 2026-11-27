@@ -186,6 +186,21 @@ struct SyncCompletionSummary: Codable, Equatable, Sendable {
         self.perCourse = perCourse
     }
 
+    /// Whether `other` reports the same run but for when it ended (#277): what decides that a run
+    /// with nothing new need not rewrite the stored summary.
+    func hasSameOutcome(as other: SyncCompletionSummary) -> Bool {
+        added == other.added && updated == other.updated && unchanged == other.unchanged
+            && preservedLocal == other.preservedLocal && conflicts == other.conflicts
+            && failures == other.failures && perCourse == other.perCourse
+    }
+
+    /// The summary with its time moved to `time` when that is later (the time key outlives the
+    /// summary key on a run with nothing new, #277).
+    func withCompletionTime(atLeast time: Date) -> SyncCompletionSummary {
+        guard time > completedAt else { return self }
+        return SyncCompletionSummary(completedAt: time, added: added, updated: updated, unchanged: unchanged, preservedLocal: preservedLocal, conflicts: conflicts, failures: failures, perCourse: perCourse)
+    }
+
     var affectedCourses: [CourseSyncCount] { perCourse.filter { $0.total > 0 } }
     var hasDetail: Bool { !affectedCourses.isEmpty }
     /// Files moved to follow a move made on Moodle. Derived from `perCourse` rather than stored,
@@ -499,6 +514,38 @@ enum MaterialsRunEnd: Equatable, Sendable {
     /// save that began under an earlier value belongs to someone else and is dropped, and the
     /// store refuses saves from retired epochs (#98).
     private var courseListEpoch = 0
+    /// When and for whom Moodle last confirmed the course list in this session (#277). Set where
+    /// the list becomes `.current` through a fetch (`refreshCourseList`), cleared with the account
+    /// (`forgetCourseList`). Only `shouldRefreshCourseListOnOpen` reads it.
+    private var courseListConfirmation: CourseListConfirmation?
+    /// Monotonic, so a changed system clock can neither extend nor cut the freshness window;
+    /// tests replace it.
+    private var courseListClock: @MainActor () -> ContinuousClock.Instant = { ContinuousClock.now }
+
+    /// A fetch of the course list that succeeded: `epoch` and `siteID` say which account and
+    /// university it answered for (principle 8).
+    struct CourseListConfirmation: Equatable {
+        let at: ContinuousClock.Instant
+        let epoch: Int
+        let siteID: String
+    }
+
+    /// How long a confirmed list spares the fetch when the window opens (#277). The list changes
+    /// when the user enrols, not minute by minute; the refresh button, a sync and a returning
+    /// network still fetch at any time, so this never delays a sync's own freshness.
+    nonisolated static let courseListOpenFreshness: Duration = .seconds(300)
+
+    /// Whether opening the window fetches the course list. It does not when Moodle confirmed it
+    /// within `courseListOpenFreshness` for this very account and site (`epoch`, `siteID`), the
+    /// list on screen is that confirmed one and no error is showing; everything else (a saved
+    /// list, an errored one, none, a stale confirmation, another account, a clock that went
+    /// backwards) fetches as before (#277).
+    nonisolated static func shouldRefreshCourseListOnOpen(freshness: CourseListFreshness, hasLoadError: Bool, confirmation: CourseListConfirmation?, epoch: Int, siteID: String, now: ContinuousClock.Instant) -> Bool {
+        guard freshness == .current, !hasLoadError, let confirmation,
+              confirmation.epoch == epoch, confirmation.siteID == siteID,
+              confirmation.at <= now else { return true }
+        return now - confirmation.at >= courseListOpenFreshness
+    }
     /// The epoch whose saved list was already read, so reopening the window doesn't read the
     /// file again when the first read found nothing to show.
     private var courseListRestoreEpoch: Int?
@@ -902,18 +949,17 @@ enum MaterialsRunEnd: Equatable, Sendable {
         let resolvedNeedsOnboarding = Self.resolveNeedsOnboarding(existingRootURL: resolvedRootURL, onboardingAlreadyCompleted: Self.defaults.bool(forKey: Self.onboardingCompletedKey))
         needsOnboarding = resolvedNeedsOnboarding
         if resolvedRootURL != nil {
-            Self.defaults.set(true, forKey: Self.onboardingCompletedKey)
+            Self.markOnboardingCompletedAtLaunch(in: Self.defaults)
         }
         let resolvedLanguage = Self.resolveLanguage(stored: Self.defaults.string(forKey: Self.languageKey), needsOnboarding: resolvedNeedsOnboarding, preferredLanguages: Locale.preferredLanguages)
         language = resolvedLanguage
         AppLanguage.current = resolvedLanguage
-        Self.defaults.set(resolvedLanguage.rawValue, forKey: Self.languageKey)
         status = tr("Avvio BeepBar…", "Starting BeepBar…")
         enabledCourseIDs = Set(Self.defaults.stringArray(forKey: Self.enabledCoursesKey)?.compactMap(Int64.init) ?? [])
         automaticSyncEnabled = Self.defaults.bool(forKey: Self.autoSyncKey)
         let storedAutomaticSyncInterval = Self.validatedAutomaticInterval(Self.defaults.object(forKey: Self.autoSyncIntervalKey) as? Int)
         automaticSyncInterval = storedAutomaticSyncInterval
-        Self.defaults.set(storedAutomaticSyncInterval, forKey: Self.autoSyncIntervalKey)
+        Self.persistLaunchPreferences(language: resolvedLanguage, automaticInterval: storedAutomaticSyncInterval, in: Self.defaults)
         dataSaverEnabled = Self.storedDataSaverEnabled(in: Self.defaults)
         automaticSyncEnvironment = .system
         reachabilityChanges = { NetworkPathReader.reachabilityChanges() }
@@ -1130,6 +1176,9 @@ enum MaterialsRunEnd: Equatable, Sendable {
 
     /// The account going away as `forgetCourseList()` sees it, at a moment a test chooses.
     func forgetCourseListForTesting() { forgetCourseList() }
+
+    /// Moves the clock the course list's freshness window reads (#277).
+    func setCourseListClockForTesting(_ clock: @escaping @MainActor () -> ContinuousClock.Instant) { courseListClock = clock }
 
     func setFollowUpActivityHoldForTesting(_ hold: Duration) { followUpActivityHold = hold }
 
@@ -1916,15 +1965,34 @@ enum MaterialsRunEnd: Equatable, Sendable {
         saveSuccessfulResult(result.summary, data: result.data, rootID: rootID)
     }
 
-    /// Both keys of a successful result, the time first, as releases before R01 wrote them, under
-    /// the folder the caller names (#167).
+    /// The keys of a successful result, the time first, under the folder the caller names (#167).
+    ///
+    /// The last-successful-sync time is written on every successful run on purpose (performance
+    /// plan, summary saving, R01 and #277): it is what the user reads as "last synced". The
+    /// summary key is skipped when the stored summary already says the same thing but for the
+    /// time (a run with nothing new repeats the same counts): `restorePersistedSyncState` takes
+    /// the time from the time key, so the shown time is never stale. Which summary is stored is
+    /// known without reading or decoding it (`lastSavedSummary`, set by this function and by a
+    /// restore), so the check costs nothing on the main actor. A release before #277 reading the
+    /// summary alone after a downgrade shows the time of the last run that changed something.
     private func saveSuccessfulResult(_ summary: SyncCompletionSummary, data: Data?, rootID: UUID?) {
         guard let rootID else { return }
-        operationDefaults.set(summary.completedAt.timeIntervalSince1970, forKey: Self.lastSuccessfulReconciliationKey + rootID.uuidString)
+        let timeKey = Self.lastSuccessfulReconciliationKey + rootID.uuidString
+        let time = summary.completedAt.timeIntervalSince1970
+        if operationDefaults.object(forKey: timeKey) as? Double != time {
+            operationDefaults.set(time, forKey: timeKey)
+        }
         if let data {
+            if let saved = lastSavedSummary, saved.rootID == rootID, saved.summary.hasSameOutcome(as: summary) { return }
             operationDefaults.set(data, forKey: Self.lastSuccessfulSummaryKey + rootID.uuidString)
+            lastSavedSummary = (rootID, summary)
         }
     }
+
+    /// The summary stored under `lastSuccessfulSummaryKey` for a folder, as this session last saved
+    /// or read it; `nil` until one of the two happened. Only ever compared for the outcome (never
+    /// the time) by `saveSuccessfulResult`.
+    private var lastSavedSummary: (rootID: UUID, summary: SyncCompletionSummary)?
 
     private func restorePersistedSyncState(launchBootstrap: Bool = false) async {
         guard !Self.isUIPreview else { return }
@@ -1977,7 +2045,11 @@ enum MaterialsRunEnd: Equatable, Sendable {
 #endif
             guard current() else { return }
             if let summary {
-                publishRestored(.synced(summary))
+                lastSavedSummary = (rootID, summary)
+                // A run with nothing new saves only the time key (`saveSuccessfulResult`): the
+                // later of the two is the last sync.
+                let timestamp = operationDefaults.double(forKey: Self.lastSuccessfulReconciliationKey + rootID.uuidString)
+                publishRestored(.synced(summary.withCompletionTime(atLeast: Date(timeIntervalSince1970: timestamp))))
                 return
             }
         }
@@ -2035,6 +2107,12 @@ enum MaterialsRunEnd: Equatable, Sendable {
             // (quiet at rest). The loading state was cleared by `windowClosed()`, and a reopened
             // window's own refresh owns it now, so it is left alone.
             guard self.windowGeneration == generation else { return }
+            // A list confirmed minutes ago for this account is not fetched again at every open
+            // (#277); the cached content is already on screen.
+            guard Self.shouldRefreshCourseListOnOpen(freshness: self.courseListFreshness, hasLoadError: self.courseLoadError != nil, confirmation: self.courseListConfirmation, epoch: self.courseListEpoch, siteID: self.selectedSite.id, now: self.courseListClock()) else {
+                self.isPreparingCourseList = false
+                return
+            }
             // Starts the load in this turn (`isLoadingCourses` takes over), holds it until a
             // running sync ends, or ends the loading state when nothing will be loaded.
             self.loadCourses()
@@ -2888,6 +2966,7 @@ enum MaterialsRunEnd: Equatable, Sendable {
         if courseLoadError != nil { courseLoadError = nil }
         courseLoadFailedForConnection = false
         stopWatchingForNetworkReturn()
+        courseListConfirmation = CourseListConfirmation(at: courseListClock(), epoch: epoch, siteID: selectedSite.id)
         accountState = .connected
         operationDefaults.removeObject(forKey: Self.credentialExpiredKey)
         saveConfirmedCourseList(courses, token: token)
@@ -3035,6 +3114,7 @@ enum MaterialsRunEnd: Equatable, Sendable {
         lastRecordingsOutcome = nil
         courses = []
         courseListFreshness = .unknown
+        courseListConfirmation = nil
         isPreparingCourseList = false
         let epoch = courseListEpoch
         _ = enqueueCourseListIO(priority: .utility) { (store: CourseListSnapshotStore) async -> Void in
@@ -3043,18 +3123,18 @@ enum MaterialsRunEnd: Equatable, Sendable {
         }
     }
 
-    private static let onboardingCompletedKey = "io.github.tvaccari.beepbar.onboarding-completed.v1"
+    private nonisolated static let onboardingCompletedKey = "io.github.tvaccari.beepbar.onboarding-completed.v1"
     private static let rootKey = "io.github.tvaccari.beepbar.root-path.v1"
     private static let rootIDKey = "io.github.tvaccari.beepbar.root-id.v1"
     private static let enabledCoursesKey = "io.github.tvaccari.beepbar.enabled-courses.v1"
     private static let autoSyncKey = "io.github.tvaccari.beepbar.auto-sync.v1"
-    private static let autoSyncIntervalKey = "io.github.tvaccari.beepbar.auto-sync-interval.v1"
+    private nonisolated static let autoSyncIntervalKey = "io.github.tvaccari.beepbar.auto-sync-interval.v1"
     private nonisolated static let dataSaverKey = "io.github.tvaccari.beepbar.data-saver.v1"
     private static let lastSuccessfulReconciliationKey = "io.github.tvaccari.beepbar.last-successful-reconciliation.v1."
     private static let lastSuccessfulSummaryKey = "io.github.tvaccari.beepbar.last-successful-summary.v1."
     private static let credentialExpiredKey = "io.github.tvaccari.beepbar.credential-expired.v1"
     private static let selectedSiteKey = "io.github.tvaccari.beepbar.moodle-site.v1"
-    private static let languageKey = "io.github.tvaccari.beepbar.language.v1"
+    private nonisolated static let languageKey = "io.github.tvaccari.beepbar.language.v1"
     private static var isUIPreview: Bool {
 #if DEBUG
         ProcessInfo.processInfo.arguments.contains("--ui-preview")
@@ -3094,6 +3174,26 @@ enum MaterialsRunEnd: Equatable, Sendable {
         if let testDefaults { return testDefaults }
 #endif
         return Self.defaults
+    }
+
+    /// The two preferences every launch resolves (language, automatic-sync interval), written back
+    /// only when the stored value differs: a launch that changes nothing writes nothing (#277,
+    /// principle 4). They are still written when absent or invalid, so the first launch, a stored
+    /// interval that fell outside `automaticIntervals` and a language resolved from the system all
+    /// persist exactly as before. Takes `defaults` so a test counts the writes.
+    /// The launch write of the onboarding flag when a sync folder exists: only if it is not
+    /// already true (#277). Takes `defaults` so a test counts the writes.
+    nonisolated static func markOnboardingCompletedAtLaunch(in defaults: UserDefaults) {
+        if !defaults.bool(forKey: onboardingCompletedKey) { defaults.set(true, forKey: onboardingCompletedKey) }
+    }
+
+    nonisolated static func persistLaunchPreferences(language: AppLanguage, automaticInterval: Int, in defaults: UserDefaults) {
+        if defaults.string(forKey: languageKey) != language.rawValue {
+            defaults.set(language.rawValue, forKey: languageKey)
+        }
+        if defaults.object(forKey: autoSyncIntervalKey) as? Int != automaticInterval {
+            defaults.set(automaticInterval, forKey: autoSyncIntervalKey)
+        }
     }
 
     private static let automaticIntervals: Set<Int> = [1_800, 3_600, 7_200, 14_400, 28_800]

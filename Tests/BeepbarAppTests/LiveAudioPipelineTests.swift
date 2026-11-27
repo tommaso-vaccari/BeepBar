@@ -850,25 +850,43 @@ struct LiveAudioPipelineTests {
     }
 }
 
-/// A stuck helper must be reaped even when it ignores SIGTERM.
-@Test(.timeLimit(.minutes(1)), arguments: [false, true]) func ffmpegTimeoutKillsAStubbornChild(cancel: Bool) async throws {
-    let file = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
-    defer { try? FileManager.default.removeItem(at: file) }
+private enum FFmpegTestError: Error {
+    case helperDidNotSignalReadiness
+    case blockedLaunchExpired
+}
+
+/// A stuck helper must be reaped by the runner even when it ignores SIGTERM.
+@Test(.timeLimit(.minutes(2)), arguments: [false, true]) func ffmpegTimeoutKillsAStubbornChild(cancel: Bool) async throws {
+    let child = FFmpegTestChild()
     let watchdog = Task {
-        try? await Task.sleep(for: .seconds(20))
-        guard !Task.isCancelled else { return }
-        if let text = try? String(contentsOf: file, encoding: .utf8), let pid = Int32(text.trimmingCharacters(in: .whitespacesAndNewlines)) {
-            kill(pid, SIGKILL)
-        }
+        do { try await Task.sleep(for: .seconds(45)) }
+        catch { return false }
+        let pid = child.pid
+        if pid != 0 { kill(pid, SIGKILL) }
+        return true
     }
     defer { watchdog.cancel() }
-    let start = ContinuousClock.now
-    do {
-        let task = Task { try await FFmpegRunner(timeLimit: cancel ? 30 : 0.5).run(URL(fileURLWithPath: "/bin/sh"), ["-c", "trap '' TERM; echo $$ > \"$1\"; exec /bin/sleep 30", "sh", file.path]) }
-        if cancel {
-            try await eventually("helper started") { FileManager.default.fileExists(atPath: file.path) }
-            task.cancel()
+
+    let runner = FFmpegRunner(timeLimit: cancel ? 120 : 0.5, startupLimit: 120, launch: { process in
+        let ready = Pipe()
+        process.standardOutput = ready
+        try process.run()
+        child.set(process.processIdentifier)
+        // Start the runner's deadline only after the shell has installed its SIGTERM trap.
+        guard try ready.fileHandleForReading.read(upToCount: 1) == Data([0x0A]) else {
+            throw FFmpegTestError.helperDidNotSignalReadiness
         }
+        child.markStarted()
+    })
+    let task = Task {
+        try await runner.run(URL(fileURLWithPath: "/bin/sh"), ["-c", "trap '' TERM; echo; exec /bin/sleep 120"])
+    }
+    defer { task.cancel() }
+    if cancel {
+        try await eventually("helper ready") { child.isStarted }
+        task.cancel()
+    }
+    do {
         try await task.value
         Issue.record("stalled helper succeeded")
     } catch is FFmpegExitError {
@@ -876,10 +894,12 @@ struct LiveAudioPipelineTests {
     } catch is CancellationError {
         #expect(cancel)
     }
-    // 10 s, not tighter: under the full parallel suite the utility-QoS deadline has been seen
-    // firing ~8 s late. The bound still fails without the deadline, which would wait for the
-    // 20 s watchdog, the 30 s limit or the blocked launch.
-    #expect(start.duration(to: .now) < .seconds(10))
+    let pid = child.pid
+    try #require(pid != 0)
+    // Cancellation can arrive after the readiness signal but before launch publishes the pid.
+    try await eventually("runner reaped the helper") { kill(pid, 0) == -1 && errno == ESRCH }
+    watchdog.cancel()
+    #expect(await watchdog.value == false, "the watchdog had to stop the helper")
 }
 
 /// The release recovery points to the bundled helper; developers can install their own.
@@ -888,7 +908,7 @@ struct LiveAudioPipelineTests {
     #expect(RecordingPlayerPolicy.ffmpegHint(development: true).contains("brew install ffmpeg"))
 }
 
-private final class LateChild: @unchecked Sendable {
+private final class FFmpegTestChild: @unchecked Sendable {
     private let lock = NSLock()
     private var value: pid_t = 0
     private var started = false
@@ -898,19 +918,21 @@ private final class LateChild: @unchecked Sendable {
     var pid: pid_t { lock.withLock { value } }
 }
 
-/// A launch blocked before obtaining a pid must not block fallback; a late child is reaped.
-@Test(.timeLimit(.minutes(1)), arguments: [false, true]) func ffmpegStartupDeadlineReapsLateChild(cancel: Bool) async throws {
+/// The runner must return before the test releases the launch, and reap the late child.
+@Test(.timeLimit(.minutes(2)), arguments: [false, true]) func ffmpegStartupDeadlineReapsLateChild(cancel: Bool) async throws {
     let gate = DispatchSemaphore(value: 0)
-    let child = LateChild()
+    let child = FFmpegTestChild()
     defer { gate.signal() }
-    let runner = FFmpegRunner(timeLimit: 30, startupLimit: cancel ? 30 : 0.2, launch: { process in
+    let runner = FFmpegRunner(timeLimit: 30, startupLimit: cancel ? 120 : 0.2, launch: { process in
         child.markStarted()
-        gate.wait()
+        guard gate.wait(timeout: .now() + .seconds(45)) == .success else {
+            throw FFmpegTestError.blockedLaunchExpired
+        }
         try process.run()
         child.set(process.processIdentifier)
     })
-    let start = ContinuousClock.now
     let task = Task { try await runner.run(URL(fileURLWithPath: "/bin/sleep"), ["30"]) }
+    defer { task.cancel() }
     try await eventually("launch entered") { child.isStarted }
     if cancel { task.cancel() }
     do {
@@ -921,10 +943,6 @@ private final class LateChild: @unchecked Sendable {
     } catch is CancellationError {
         #expect(cancel)
     }
-    // 10 s, not tighter: under the full parallel suite the utility-QoS deadline has been seen
-    // firing ~8 s late. The bound still fails without the deadline, which would wait for the
-    // 20 s watchdog, the 30 s limit or the blocked launch.
-    #expect(start.duration(to: .now) < .seconds(10))
     gate.signal()
     try await eventually("late helper launched") { child.pid != 0 }
     try await eventually("late helper reaped") { kill(child.pid, 0) == -1 && errno == ESRCH }

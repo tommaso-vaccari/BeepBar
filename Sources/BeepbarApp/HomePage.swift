@@ -20,6 +20,9 @@ struct HomePage: View {
     // The status card stays put; only the course list scrolls, inside its own box that takes
     // whatever height the window leaves.
     var body: some View {
+#if DEBUG
+        let _ = UIBodyProbe.hit?("HomePage")
+#endif
         VStack(alignment: .leading, spacing: 22) {
             SyncHeroCard(authentication: authentication, open: open)
             coursesSection
@@ -242,6 +245,9 @@ private struct SyncHeroCard: View {
     private var badgeSymbol: String? { pause == nil ? state.badgeSymbol : "pause.circle.fill" }
 
     var body: some View {
+#if DEBUG
+        let _ = UIBodyProbe.hit?("SyncHeroCard")
+#endif
         VStack(alignment: .leading, spacing: 12) {
             HStack(alignment: .center, spacing: 14) {
                 BeepbarLogo(size: 44, badge: badgeSymbol, badgeTint: pause == nil ? state.tint : .gray, accessibilityLabel: "BeepBar, \(pause?.title ?? state.title)")
@@ -512,6 +518,9 @@ private struct CourseRow: View {
     @FocusState private var fieldFocused: Bool
 
     var body: some View {
+#if DEBUG
+        let _ = UIBodyProbe.hit?("HomeCourseRow")
+#endif
         HStack(spacing: 12) {
             SymbolTile(systemImage: "folder.fill", tint: isEnabled ? .accentColor : .gray, size: 32, filled: isEnabled)
             VStack(alignment: .leading, spacing: 2) {

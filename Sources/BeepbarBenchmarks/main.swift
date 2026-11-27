@@ -11,6 +11,7 @@ usage: beepbar-bench <command> [options]
 
 commands:
   unchanged      a run with nothing new        --files N (1000) --courses N
+  recordings-listing   Recordings refresh at a sync, listing logic   --courses N (10) --rows N (250, recordings per course)
   large-update   one large file changes        --size-mb N (256)
   cancel         cancel during a large update  --size-mb N (256) --fraction F (0.5) --rate-mbps N (100)
   startup        launch database work on a legacy database   --files N (15000) --phase first|later (later)
@@ -48,6 +49,8 @@ func runScenario(_ command: String, _ options: BenchmarkOptions) async throws ->
     case "unchanged":
         let courses = options.values["courses"] == nil ? nil : try options.int("courses", 10)
         return try await Scenarios.unchanged(files: try options.int("files", 1000), courses: courses, runs: runs, warmup: warmup)
+    case "recordings-listing":
+        return try await RecordingsListingScenario.run(courses: try options.int("courses", 10), rowsPerCourse: try options.int("rows", 250), runs: runs, warmup: warmup)
     case "large-update":
         return try await Scenarios.largeUpdate(size: Int64(try options.int("size-mb", 256)) * megabyte, runs: runs, warmup: warmup)
     case "cancel":

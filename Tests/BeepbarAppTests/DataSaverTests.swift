@@ -579,14 +579,14 @@ import Testing
         harness.controller.onMenuBarSymbolChange = { pushed.symbols.append($0) }
         harness.controller.setDataSaver(enabled: true)
         harness.controller.setSyncStateForTesting(.failed(.connectivity))
-        #expect(pushed.symbols.last == "exclamationmark.triangle")
+        #expect(pushed.symbols.last == "wifi.slash")
 
         await harness.controller.runAutomaticSyncForTesting()
         #expect(harness.controller.visibleDataSaverPause == .hotspot)
         #expect(pushed.symbols.last == "pause.circle")
 
         harness.controller.setDataSaver(enabled: false)
-        #expect(pushed.symbols.last == "exclamationmark.triangle")
+        #expect(pushed.symbols.last == "wifi.slash")
     }
 
     /// Proves the icon for each case: the pause the user sees wins over the state underneath, and
@@ -594,7 +594,7 @@ import Testing
     @Test(arguments: [
         (AppSyncState.failed(.connectivity), DataSaverPause?.some(.hotspot), "pause.circle"),
         (.synced(lastResult), .lowDataMode, "pause.circle"),
-        (.failed(.connectivity), nil, "exclamationmark.triangle"),
+        (.failed(.connectivity), nil, "wifi.slash"),
         (.synced(lastResult), nil, "arrow.triangle.2.circlepath")
     ])
     func iconForEachCase(_ state: AppSyncState, _ pause: DataSaverPause?, _ expected: String) {

@@ -96,6 +96,122 @@ import os
         return controller
     }
 
+    /// Requests that fetch the course list, so a test counts fetches and not the other calls a load makes.
+    private func courseListRequests(token: String) -> Int {
+        MoodleRecordingProtocol.requests(token: token).filter { $0.function == "core_enrol_get_users_courses" }.count
+    }
+
+    /// #277 main path: a list Moodle confirmed seconds ago is not fetched again when the window is
+    /// reopened, and the cached list stays on screen. Fails on the code before #277, which fetched
+    /// at every open.
+    @Test func reopeningTheWindowWithinFiveMinutesDoesNotFetchTheCourseList() async throws {
+        let install = try await Install.make()
+        defer { install.remove() }
+        let token = MoodleRecordingProtocol.register(courses: [(1, "Analisi"), (2, "Fisica")])
+        defer { MoodleRecordingProtocol.revoke(token: token) }
+        let start = ContinuousClock.now
+        let controller = install.launch(token: token)
+        controller.setCourseListClockForTesting { start }
+        await controller.refreshOnWindowOpen().value
+        try #require(controller.courseListFreshness == .current)
+        let fetches = courseListRequests(token: token)
+        try #require(fetches >= 1)
+        controller.windowClosed()
+        controller.setCourseListClockForTesting { start.advanced(by: .seconds(299)) }
+
+        await controller.refreshOnWindowOpen().value
+        #expect(courseListRequests(token: token) == fetches, "a list confirmed 299 s ago was fetched again at open")
+        #expect(controller.courses.map(\.id) == [1, 2])
+        #expect(!controller.isPreparingCourseList)
+    }
+
+    /// The freshness ends at five minutes: the same reopen after 300 s fetches. Guards against a
+    /// confirmation that never expires.
+    @Test func reopeningTheWindowAfterFiveMinutesFetchesTheCourseList() async throws {
+        let install = try await Install.make()
+        defer { install.remove() }
+        let token = MoodleRecordingProtocol.register(courses: [(1, "Analisi")])
+        defer { MoodleRecordingProtocol.revoke(token: token) }
+        let start = ContinuousClock.now
+        let controller = install.launch(token: token)
+        controller.setCourseListClockForTesting { start }
+        await controller.refreshOnWindowOpen().value
+        let fetches = courseListRequests(token: token)
+        controller.windowClosed()
+        controller.setCourseListClockForTesting { start.advanced(by: .seconds(300)) }
+
+        await controller.refreshOnWindowOpen().value
+        #expect(courseListRequests(token: token) == fetches + 1)
+    }
+
+    /// A failed fetch keeps the five-minute exemption from applying: with the list confirmed 100 s
+    /// ago but the last fetch (the refresh button's) failed and the error still shown, reopening the
+    /// window asks Moodle again instead of leaving the error on screen. Guards against the exemption
+    /// ignoring `courseLoadError` (#277 review).
+    @Test func reopeningTheWindowOverAFailedFetchFetchesTheCourseListAgain() async throws {
+        let install = try await Install.make()
+        defer { install.remove() }
+        let token = MoodleRecordingProtocol.register(courses: [(1, "Analisi")])
+        defer { MoodleRecordingProtocol.revoke(token: token) }
+        let start = ContinuousClock.now
+        let controller = install.launch(token: token)
+        controller.setCourseListClockForTesting { start }
+        await controller.refreshOnWindowOpen().value
+        try #require(controller.courseListFreshness == .current)
+
+        MoodleRecordingProtocol.setOffline(token: token, true)
+        controller.loadCourses()
+        await controller.waitForCourseLoadForTesting()
+        try #require(controller.courseLoadError != nil)
+        controller.windowClosed()
+        MoodleRecordingProtocol.setOffline(token: token, false)
+        controller.setCourseListClockForTesting { start.advanced(by: .seconds(100)) }
+        let fetches = courseListRequests(token: token)
+
+        await controller.refreshOnWindowOpen().value
+        #expect(courseListRequests(token: token) == fetches + 1, "the window reopened over a failed fetch did not ask Moodle")
+        #expect(controller.courseLoadError == nil)
+    }
+
+    /// A new account (here: the credential gone and signed in again) never inherits the previous
+    /// account's confirmation (principle 8): the open right after fetches. Guards against a
+    /// confirmation that survives `forgetCourseList`.
+    @Test func anAccountChangeDiscardsTheConfirmationOfTheOldList() async throws {
+        let install = try await Install.make()
+        defer { install.remove() }
+        let token = MoodleRecordingProtocol.register(courses: [(1, "Analisi")])
+        defer { MoodleRecordingProtocol.revoke(token: token) }
+        let start = ContinuousClock.now
+        let controller = install.launch(token: token)
+        controller.setCourseListClockForTesting { start }
+        await controller.refreshOnWindowOpen().value
+        let fetches = courseListRequests(token: token)
+        controller.windowClosed()
+        controller.forgetCourseListForTesting()
+
+        await controller.refreshOnWindowOpen().value
+        #expect(courseListRequests(token: token) == fetches + 1)
+    }
+
+    /// The decision itself, case by case: only a current list, without error, confirmed under the
+    /// same epoch and site less than five minutes ago, is spared. Guards each condition separately.
+    @Test func theOpenRefreshDecisionSparesOnlyAFreshConfirmedListOfTheSameAccount() {
+        let now = ContinuousClock.now
+        let fresh = WeBeepAuthenticationController.CourseListConfirmation(at: now.advanced(by: .seconds(-10)), epoch: 3, siteID: "a")
+        func refreshes(freshness: CourseListFreshness = .current, error: Bool = false, _ confirmation: WeBeepAuthenticationController.CourseListConfirmation? = fresh, epoch: Int = 3, site: String = "a", at: ContinuousClock.Instant = now) -> Bool {
+            WeBeepAuthenticationController.shouldRefreshCourseListOnOpen(freshness: freshness, hasLoadError: error, confirmation: confirmation, epoch: epoch, siteID: site, now: at)
+        }
+        #expect(!refreshes())
+        #expect(refreshes(error: true), "an errored list must refresh")
+        #expect(refreshes(freshness: .saved(Date())), "a saved list is not confirmed")
+        #expect(refreshes(freshness: .unknown))
+        #expect(refreshes(nil), "no confirmation")
+        #expect(refreshes(epoch: 4), "another account")
+        #expect(refreshes(site: "b"), "another university")
+        #expect(refreshes(at: now.advanced(by: .seconds(290))), "stale (300 s after the confirmation)")
+        #expect(refreshes(at: now.advanced(by: .seconds(-60))), "a confirmation from the future never counts")
+    }
+
     /// A hang detector, not a timing bound: on the 3-core CI runner an actor hop can wait behind a
     /// busy cooperative pool for well over 10 s, which failed two tests after #138 merged (as in
     /// 02b7dad). Locally these conditions hold within milliseconds.

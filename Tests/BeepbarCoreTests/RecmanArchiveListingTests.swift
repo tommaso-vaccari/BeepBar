@@ -26,6 +26,20 @@ struct RecmanArchiveListingTests {
         #expect(listing.recordings.map(\.id) == ["2", "1"])
     }
 
+    /// Decision of #275: no early stop. A first page whose rows are all already known still asks
+    /// for the next one, and a new recording that only shows up on a later page is listed. The
+    /// archive's order is not documented, and the declared total is the only proof that the
+    /// pages add up to the whole search, so a listing that stopped at "nothing new yet" could
+    /// publish a list that looks complete but isn't (#106). Fails if `add` ever answers "done"
+    /// while "prossima" leads on.
+    @Test func aFirstPageOfKnownRowsStillFollowsToANewRecordingOnALaterPage() throws {
+        var listing = RecmanArchiveListing(key: key)
+        // Page one is exactly what an earlier listing already held.
+        #expect(try listing.add(page([recording("1", day: 1), recording("2", day: 2)], total: 3, next: true)))
+        #expect(try listing.add(page([recording("new", day: 3)], total: 3)) == false)
+        #expect(Set(listing.recordings.map(\.id)) == ["1", "2", "new"])
+    }
+
     /// Without a total on the page, the end of "prossima" is the end of the list.
     @Test func aListWithoutADeclaredTotalEndsWithTheLastPage() throws {
         var listing = RecmanArchiveListing(key: key)

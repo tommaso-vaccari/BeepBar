@@ -258,64 +258,6 @@ struct RecordingsPresentationTests {
 
 
 extension RecordingsPresentationTests {
-    /// Removing the last bookmark must not move the search field or header down the page.
-    @MainActor @Test func watchlistHeaderStaysAtTopWhenLastLessonIsRemoved() async throws {
-        _ = NSApplication.shared
-        let root = FileManager.default.temporaryDirectory.appendingPathComponent("watchlist-layout-\(UUID().uuidString)")
-        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
-        let suite = "watchlist-layout-\(UUID().uuidString)"
-        let defaults = try #require(UserDefaults(suiteName: suite))
-        defer {
-            defaults.removePersistentDomain(forName: suite)
-            try? FileManager.default.removeItem(at: root)
-        }
-        let authentication = WeBeepAuthenticationController(testRootURL: root, defaults: defaults)
-        let controller = RecordingsController(makeBrowser: { WatchlistPreviewBrowser() },
-            store: RecordingsSessionStore { root }, defaults: defaults, ownerUserID: { 42 }, isAvailable: { true })
-        let key = try #require(RecmanCourseKey(courseCode: "058167", academicYear: 2026))
-        let lesson = WatchlistPreviewBrowser.lessons(for: key)[0]
-        controller.toggleWatchlist(lesson, courseName: "NLA")
-        controller.selectDestination(.watchlist)
-        controller.signIn()
-        for _ in 0..<100 where controller.access != .ready { await Task.yield() }
-        #expect(controller.access == .ready)
-        let host = NSHostingView(rootView: RecordingsPage(authentication: authentication, recordings: controller))
-        let window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 780, height: 580),
-            styleMask: [.titled], backing: .buffered, defer: false)
-        window.isReleasedWhenClosed = false
-        window.contentView = host
-        window.alphaValue = 0
-        window.orderFront(nil)
-        defer { window.close(); controller.turnOff() }
-        func searchField(in view: NSView) -> NSTextField? {
-            if let field = view as? NSTextField, field.isEditable { return field }
-            return view.subviews.lazy.compactMap { searchField(in: $0) }.first
-        }
-        /// The Watchlist's list, right of the sidebar (also a list); gone once the last
-        /// bookmark is removed and the empty state replaces it.
-        func detailTable(in view: NSView) -> NSTableView? {
-            if let table = view as? NSTableView, table.convert(table.bounds, to: nil).minX > 200 { return table }
-            return view.subviews.lazy.compactMap { detailTable(in: $0) }.first
-        }
-        /// Lays out until `condition` holds, at most 10 s: polling on an observable fact instead
-        /// of a fixed sleep a loaded runner can outlast (#223).
-        func settle(until condition: () -> Bool) async throws {
-            let deadline = Date().addingTimeInterval(10)
-            while !condition() && Date() < deadline {
-                host.layoutSubtreeIfNeeded()
-                try await Task.sleep(for: .milliseconds(10))
-            }
-            host.layoutSubtreeIfNeeded()
-        }
-        try await settle { searchField(in: host) != nil && detailTable(in: host) != nil }
-        let field = try #require(searchField(in: host))
-        let initial = field.convert(field.bounds, to: host).minY
-        controller.toggleWatchlist(lesson, courseName: "NLA")
-        try await settle { detailTable(in: host) == nil }
-        #expect(detailTable(in: host) == nil, "the empty Watchlist never replaced the list")
-        let empty = try #require(searchField(in: host))
-        #expect(abs(empty.convert(empty.bounds, to: host).minY - initial) < 1)
-    }
 
     /// Guards #238: the sidebar hides the new-lectures badge of the course whose list is open
     /// (its dots stay in the list until the student leaves it) and of no other course; with the
@@ -460,5 +402,68 @@ extension RecordingsPresentationTests {
         #expect(P.archivePart(hasKey: true, content: .signIn, archiveCount: 0, archiveShownCount: 0) == .signIn)
         #expect(P.archivePart(hasKey: true, content: .loading, archiveCount: 0, archiveShownCount: 0) == .loading)
         #expect(P.archivePart(hasKey: true, content: .unavailable, archiveCount: 0, archiveShownCount: 0) == .unavailable)
+    }
+}
+
+
+/// Hosts a Recordings page, so it lives in the serialized probe scope (see `ProbeHostedUI`).
+extension ProbeHostedUI {
+    /// Removing the last bookmark must not move the search field or header down the page.
+    @MainActor @Test func watchlistHeaderStaysAtTopWhenLastLessonIsRemoved() async throws {
+        _ = NSApplication.shared
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent("watchlist-layout-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        let suite = "watchlist-layout-\(UUID().uuidString)"
+        let defaults = try #require(UserDefaults(suiteName: suite))
+        defer {
+            defaults.removePersistentDomain(forName: suite)
+            try? FileManager.default.removeItem(at: root)
+        }
+        let authentication = WeBeepAuthenticationController(testRootURL: root, defaults: defaults)
+        let controller = RecordingsController(makeBrowser: { WatchlistPreviewBrowser() },
+            store: RecordingsSessionStore { root }, defaults: defaults, ownerUserID: { 42 }, isAvailable: { true })
+        let key = try #require(RecmanCourseKey(courseCode: "058167", academicYear: 2026))
+        let lesson = WatchlistPreviewBrowser.lessons(for: key)[0]
+        controller.toggleWatchlist(lesson, courseName: "NLA")
+        controller.selectDestination(.watchlist)
+        controller.signIn()
+        for _ in 0..<100 where controller.access != .ready { await Task.yield() }
+        #expect(controller.access == .ready)
+        let host = NSHostingView(rootView: RecordingsPage(authentication: authentication, recordings: controller))
+        let window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 780, height: 580),
+            styleMask: [.titled], backing: .buffered, defer: false)
+        window.isReleasedWhenClosed = false
+        window.contentView = host
+        window.alphaValue = 0
+        window.orderFront(nil)
+        defer { window.close(); controller.turnOff() }
+        func searchField(in view: NSView) -> NSTextField? {
+            if let field = view as? NSTextField, field.isEditable { return field }
+            return view.subviews.lazy.compactMap { searchField(in: $0) }.first
+        }
+        /// The Watchlist's list, right of the sidebar (also a list); gone once the last
+        /// bookmark is removed and the empty state replaces it.
+        func detailTable(in view: NSView) -> NSTableView? {
+            if let table = view as? NSTableView, table.convert(table.bounds, to: nil).minX > 200 { return table }
+            return view.subviews.lazy.compactMap { detailTable(in: $0) }.first
+        }
+        /// Lays out until `condition` holds, at most 10 s: polling on an observable fact instead
+        /// of a fixed sleep a loaded runner can outlast (#223).
+        func settle(until condition: () -> Bool) async throws {
+            let deadline = Date().addingTimeInterval(10)
+            while !condition() && Date() < deadline {
+                host.layoutSubtreeIfNeeded()
+                try await Task.sleep(for: .milliseconds(10))
+            }
+            host.layoutSubtreeIfNeeded()
+        }
+        try await settle { searchField(in: host) != nil && detailTable(in: host) != nil }
+        let field = try #require(searchField(in: host))
+        let initial = field.convert(field.bounds, to: host).minY
+        controller.toggleWatchlist(lesson, courseName: "NLA")
+        try await settle { detailTable(in: host) == nil }
+        #expect(detailTable(in: host) == nil, "the empty Watchlist never replaced the list")
+        let empty = try #require(searchField(in: host))
+        #expect(abs(empty.convert(empty.bounds, to: host).minY - initial) < 1)
     }
 }

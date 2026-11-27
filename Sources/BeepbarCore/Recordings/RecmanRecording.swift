@@ -92,7 +92,7 @@ public enum RecmanURLPolicy {
         let items = components.queryItems ?? []
         guard items.contains(where: { $0.name == "evn_preview_link" || ($0.name == "EVN_SHOW_SCREEN" && $0.value == "evn_preview_link") }) else { return nil }
         let ids = items.filter { $0.name == "transfer_id" }.compactMap(\.value)
-        guard ids.count == 1, ids[0].range(of: #"^[A-Za-z0-9_-]+$"#, options: .regularExpression) != nil else { return nil }
+        guard ids.count == 1, recmanHasMatch(#"^[A-Za-z0-9_-]+$"#, in: ids[0]) else { return nil }
         return ids[0]
     }
 
@@ -156,7 +156,7 @@ public enum RecmanRecordingParser {
         let duration = cells[7].trimmingCharacters(in: .whitespacesAndNewlines)
         // Non-lenient and round-tripped, so "31/02/2026" is refused instead of becoming 3 March.
         guard let date = formatter.date(from: dateText), formatter.string(from: date) == dateText,
-              duration.range(of: #"^[0-9]+\s*min$"#, options: .regularExpression) != nil else { return nil }
+              recmanHasMatch(#"^[0-9]+\s*min$"#, in: duration) else { return nil }
         let size = cells.count > 8 ? cells[8].trimmingCharacters(in: .whitespacesAndNewlines) : ""
         return RecmanRecording(id: id, courseCode: code, academicYear: year, title: cells[5].trimmingCharacters(in: .whitespacesAndNewlines), recordedAt: date, kind: cells[4].trimmingCharacters(in: .whitespacesAndNewlines), duration: duration, size: size.isEmpty ? nil : size, previewURL: url)
     }
@@ -177,6 +177,46 @@ func recmanFirstMatch(_ pattern: String, in value: String) -> String? {
 }
 
 func recmanMatches(_ pattern: String, in value: String) -> [String] {
-    guard let regex = try? NSRegularExpression(pattern: pattern) else { return [] }
+    guard let regex = RecmanRegexCache.regex(pattern) else { return [] }
     return regex.matches(in: value, range: NSRange(value.startIndex..., in: value)).compactMap { Range($0.range, in: value).map { String(value[$0]) } }
+}
+
+/// Whether `pattern` matches anywhere in `value`: `value.range(of: pattern, options: .regularExpression) != nil`
+/// with the compiled pattern reused.
+func recmanHasMatch(_ pattern: String, in value: String) -> Bool {
+    guard let regex = RecmanRegexCache.regex(pattern) else { return false }
+    return regex.firstMatch(in: value, range: NSRange(value.startIndex..., in: value)) != nil
+}
+
+/// Compiled patterns, one per pattern string (#275). A listing page decodes up to a hundred rows
+/// and each row used to compile its own regular expressions (course code, duration, transfer id),
+/// about 8 ms of main-actor work per page. `NSRegularExpression` is immutable and safe to share
+/// between threads; the lock only guards the dictionary. The patterns are a handful of literals,
+/// so the cache does not grow. A pattern that does not compile is not cached and matches nothing,
+/// as before.
+///
+/// Identical to the previous behaviour on macOS, where `String.range(of:options:)` treats a final
+/// `$` as the end of the string; on Linux that API keeps ICU semantics, so the cache is stricter
+/// there. `NSRegularExpression` lets `$` match before a trailing line terminator too, so
+/// `"abc\n"` would pass `^[A-Za-z0-9_-]+$`. A trailing unescaped `$` is therefore compiled as
+/// `\z` (absolute end of input). Every `$` pattern in use ends with it; none uses `$` elsewhere.
+enum RecmanRegexCache {
+    private static let lock = NSLock()
+    nonisolated(unsafe) private static var compiled: [String: NSRegularExpression] = [:]
+
+    static func regex(_ pattern: String) -> NSRegularExpression? {
+        lock.lock()
+        defer { lock.unlock() }
+        if let cached = compiled[pattern] { return cached }
+        guard let regex = try? NSRegularExpression(pattern: strictEnd(pattern)) else { return nil }
+        compiled[pattern] = regex
+        return regex
+    }
+
+    /// `pattern` with a trailing unescaped `$` turned into `\z` (see the type comment).
+    static func strictEnd(_ pattern: String) -> String {
+        guard pattern.hasSuffix("$") else { return pattern }
+        let backslashes = pattern.dropLast().reversed().prefix { $0 == "\\" }.count
+        return backslashes % 2 == 0 ? String(pattern.dropLast()) + #"\z"# : pattern
+    }
 }

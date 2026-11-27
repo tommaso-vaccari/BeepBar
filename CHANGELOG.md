@@ -12,6 +12,7 @@
 
 ### Improved
 
+- The menu bar icon now tells apart being offline, a problem BeepBar retries by itself, and something that needs you.
 - The Watchlist groups lessons by course, with unassigned linked lessons in their own section.
 
 - During synchronization, Courses shows how much of the current downloads has arrived. The menu shows the latest progress when you open it.

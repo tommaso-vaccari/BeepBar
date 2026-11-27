@@ -36,6 +36,7 @@ struct OnboardingGatingTests {
     }
 }
 
+extension ProbeHostedUI {
 @MainActor @Suite(.serialized) struct CoursesSignInTests {
     /// Each visible sign-in action starts the real controller flow instead of opening Settings.
     @Test(arguments: [0, 1]) func signInButtonStartsLogin(index: Int) async throws {
@@ -74,4 +75,5 @@ struct OnboardingGatingTests {
         #expect(controller.isAuthenticating)
         #expect(!openedSettings)
     }
+}
 }

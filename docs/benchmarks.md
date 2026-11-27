@@ -144,6 +144,8 @@ The `Beepbar-Profile` scheme profiles the app itself. Never use it to launch a l
 
 ## Extending
 
+`recordings-listing --courses N --rows R` (#275) runs the real `RecmanArchiveListing` over a synthetic Recman archive and records the pages, scripts and page loads a Recordings refresh would make (parameters, modelled on `RecmanWebSession.search`), with wall time and memory of the Core logic. It has no WebKit, so it does not measure page-load cost; it is not part of `baseline` or `compare`.
+
 Add a scenario to `Scenarios` with its own checks, register it in `Sources/BeepbarBenchmarks/main.swift` (and in `baseline` if it belongs to the standard set), and give it a small smoke test in `BenchmarkKitTests`.
 - New request types belong in `BenchmarkUpstream`.
 - New counters belong in Core, with a test in `WorkCountersTests` proving what they count.

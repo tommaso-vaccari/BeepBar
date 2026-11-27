@@ -69,3 +69,12 @@ extension EnvironmentValues {
     }
 }
 #endif
+
+#if DEBUG
+/// Counts body evaluations of the pages a hosted benchmark watches (#280). Nil outside such a
+/// benchmark, so a body pays one optional check; it never feeds back into any view state. Names
+/// are the view's own, e.g. `HomePage`, `RecordingsPage`. A test sets `hit` and clears it after.
+@MainActor enum UIBodyProbe {
+    static var hit: ((String) -> Void)?
+}
+#endif

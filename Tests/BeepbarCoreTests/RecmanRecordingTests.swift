@@ -113,6 +113,7 @@ struct RecmanRecordingTests {
             preview.replacingOccurrences(of: "onlineservices.polimi.it", with: "onlineservices.polimi.it:8443"),
             preview + "&transfer_id=456",
             preview.replacingOccurrences(of: "transfer_id=123", with: "transfer_id=1%2F2"),
+            preview.replacingOccurrences(of: "transfer_id=123", with: "transfer_id=abc%0A"),
             preview.replacingOccurrences(of: "https://", with: "https://user:secret@"),
             preview.replacingOccurrences(of: "evn_preview_link", with: "other"),
         ]
@@ -124,6 +125,38 @@ struct RecmanRecordingTests {
         }
         for bad in ["https://politecnicomilano.webex.com/ldr.php", "http://politecnicomilano.webex.com/ldr.php?RCID=a", "https://politecnicomilano.webex.com.evil.com/ldr.php?RCID=a", "https://user@politecnicomilano.webex.com/ldr.php?RCID=a", "https://politecnicomilano.webex.com/recordingservice/login", "https://politecnicomilano.webex.com/ldr.php?RCID=a&RCID=b"] {
             #expect(RecmanURLPolicy.playbackURL(try #require(URL(string: bad))) == nil, "\(bad)")
+        }
+    }
+
+    /// The shared regex cache (#275) answers as `String.range(of:options:)` did on macOS (and stricter than it on Linux about a trailing line terminator), on the
+    /// first call and the repeats, from several threads, and an invalid pattern matches nothing
+    /// instead of trapping. Guards the per-row regexes of the row parser against drifting.
+    @Test func cachedRegexMatchesLikeTheStringApi() async {
+        let pattern = #"^[0-9]+\s*min$"#
+        let idPattern = #"^[A-Za-z0-9_-]+$"#
+        // Fixed expectations, the same on every platform: a trailing line terminator is rejected.
+        for (value, expected) in [("97 min", true), ("97min", true), ("min", false), ("97 min ", false), ("", false), ("9 7 min", false), ("97 min\n", false), ("97 min\r\n", false)] {
+            for _ in 0..<2 { #expect(recmanHasMatch(pattern, in: value) == expected, "\(value.debugDescription)") }
+        }
+        for (value, expected) in [("abc", true), ("abc\n", false), ("ABC\r\n", false), ("abc\u{2028}", false), ("", false), ("a b", false)] {
+            #expect(recmanHasMatch(idPattern, in: value) == expected, "\(value.debugDescription)")
+        }
+#if canImport(Darwin)
+        // Parity with the String API holds on macOS only: on Linux its ICU `$` accepts a trailing
+        // line terminator, which the cache deliberately refuses (#275 review).
+        for value in ["97 min", "97min", "min", "97 min ", "", "9 7 min", "97 min\n", "97 min\r\n"] {
+            #expect(recmanHasMatch(pattern, in: value) == (value.range(of: pattern, options: .regularExpression) != nil))
+        }
+        for value in ["abc", "abc\n", "ABC\r\n", "abc\u{2028}", "", "a b"] {
+            #expect(recmanHasMatch(idPattern, in: value) == (value.range(of: idPattern, options: .regularExpression) != nil), "\(value.debugDescription)")
+        }
+#endif
+        #expect(RecmanRegexCache.strictEnd(#"a\$"#) == #"a\$"# && RecmanRegexCache.strictEnd(#"a\\$"#) == #"a\\\z"#)
+        #expect(recmanMatches(#"^[0-9]{6}(?=\s*-)"#, in: "058167 - X") == ["058167"])
+        #expect(recmanMatches("(", in: "x").isEmpty && !recmanHasMatch("(", in: "x"))
+        await withTaskGroup(of: Bool.self) { group in
+            for _ in 0..<8 { group.addTask { (0..<200).allSatisfy { recmanHasMatch(pattern, in: "\($0) min") } } }
+            for await ok in group { #expect(ok) }
         }
     }
 }

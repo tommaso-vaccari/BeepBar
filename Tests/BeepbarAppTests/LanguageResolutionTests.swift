@@ -49,11 +49,38 @@ struct MenuBarSymbolTests {
         #expect(WeBeepAuthenticationController.menuBarSymbol(for: state) == "arrow.down.circle")
     }
 
+    /// Proves the states that need the user keep the warning triangle, including every failure
+    /// reason that is not a retry-by-itself or a lost connection. Guards against a state that only
+    /// the user can fix looking calm.
     @Test(arguments: [
-        AppSyncState.conflicts(1, nil), .partial(summary), .failed(.connectivity), .recoveryBlocked, .loginRequired, .needsFolder,
+        AppSyncState.conflicts(1, nil), .recoveryBlocked, .loginRequired, .needsFolder,
+        .failed(.authenticationExpired), .failed(.incompatibleResponse), .failed(.credentialUnavailable),
+        .failed(.local(BilingualText("x", "x"))),
     ])
     func statesNeedingTheUserShowAWarning(state: AppSyncState) {
         #expect(WeBeepAuthenticationController.menuBarSymbol(for: state) == "exclamationmark.triangle")
+    }
+
+    /// Proves a lost connection has its own glyph (#271), instead of the warning it shared with
+    /// everything else.
+    @Test func noConnectionShowsTheOfflineGlyph() {
+        #expect(WeBeepAuthenticationController.menuBarSymbol(for: .failed(.connectivity)) == "wifi.slash")
+    }
+
+    /// Proves the problems BeepBar retries by itself (platform unreachable, some materials not
+    /// updated) show a calm glyph, not the warning (#271).
+    @Test(arguments: [AppSyncState.failed(.serviceUnavailable), .failed(.partialSync), .partial(summary)])
+    func problemsRetriedByThemselvesShowACalmGlyph(state: AppSyncState) {
+        #expect(WeBeepAuthenticationController.menuBarSymbol(for: state) == "clock.arrow.circlepath")
+    }
+
+    /// Proves the Data Saver pause wins over every state, whatever level the state would have.
+    @Test(arguments: [
+        AppSyncState.failed(.connectivity), .failed(.serviceUnavailable), .partial(summary), .conflicts(1, nil),
+        .loginRequired, .synced(summary),
+    ])
+    func thePauseOverridesEveryState(state: AppSyncState) {
+        #expect(WeBeepAuthenticationController.menuBarSymbol(for: state, pause: .hotspot) == "pause.circle")
     }
 
     @Test(arguments: [AppSyncState.starting, .readyUnchecked, .synced(summary)])

@@ -126,4 +126,20 @@ struct RecmanRecordingTests {
             #expect(RecmanURLPolicy.playbackURL(try #require(URL(string: bad))) == nil, "\(bad)")
         }
     }
+
+    /// The shared regex cache (#275) answers exactly as `String.range(of:options:)` did, on the
+    /// first call and the repeats, from several threads, and an invalid pattern matches nothing
+    /// instead of trapping. Guards the per-row regexes of the row parser against drifting.
+    @Test func cachedRegexMatchesLikeTheStringApi() async {
+        let pattern = #"^[0-9]+\s*min$"#
+        for value in ["97 min", "97min", "min", "97 min ", "", "9 7 min"] {
+            for _ in 0..<2 { #expect(recmanHasMatch(pattern, in: value) == (value.range(of: pattern, options: .regularExpression) != nil)) }
+        }
+        #expect(recmanMatches(#"^[0-9]{6}(?=\s*-)"#, in: "058167 - X") == ["058167"])
+        #expect(recmanMatches("(", in: "x").isEmpty && !recmanHasMatch("(", in: "x"))
+        await withTaskGroup(of: Bool.self) { group in
+            for _ in 0..<8 { group.addTask { (0..<200).allSatisfy { recmanHasMatch(pattern, in: "\($0) min") } } }
+            for await ok in group { #expect(ok) }
+        }
+    }
 }

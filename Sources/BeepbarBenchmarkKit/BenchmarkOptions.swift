@@ -16,6 +16,7 @@ public struct BenchmarkOptions {
         let allowed: Set<String>
         switch command {
         case "unchanged": allowed = metadata.union(sampling).union(["files", "courses", "json"])
+        case "recordings-listing": allowed = metadata.union(sampling).union(["courses", "rows", "json"])
         case "large-update": allowed = metadata.union(sampling).union(["size-mb", "json"])
         case "cancel": allowed = metadata.union(sampling).union(["size-mb", "fraction", "rate-mbps", "json"])
         case "startup": allowed = metadata.union(sampling).union(["files", "phase", "json"])
@@ -36,7 +37,7 @@ public struct BenchmarkOptions {
             values[name] = value
         }
         // Validate eagerly: baseline creates its directory before reading its sampling values.
-        for name in ["runs", "warmup", "files", "courses", "size-mb", "rate-mbps"] where values[name] != nil {
+        for name in ["runs", "warmup", "files", "courses", "rows", "size-mb", "rate-mbps"] where values[name] != nil {
             // An empty database is a startup case R02 measures; a sync of zero files measures nothing.
             let value = try int(name, 1, allowZero: name == "warmup" || (name == "files" && command == "startup"))
             if ["size-mb", "rate-mbps"].contains(name), value > Int64.max / 1_048_576 {

@@ -179,6 +179,19 @@ struct BenchmarkKitTests {
         #expect(result.notes.contains("budget, no file hashing: met"))
     }
 
+    /// The Recordings listing scenario reads every page of every course (the checks prove each
+    /// listing was complete) and counts the model's pages, scripts and loads: 2 courses of 250
+    /// recordings are 3 pages each, 12 scripts and 4 loads each (#275). Guards the counts a PR on
+    /// the listing quotes, and that a scenario that lists less can't pass as a faster one.
+    @Test func recordingsListingScenarioReadsEveryPage() async throws {
+        let result = try await RecordingsListingScenario.run(courses: 2, rowsPerCourse: 250, runs: 2, warmup: 1)
+        #expect(result.passed, "\(result.checks)")
+        #expect(result.parameters["pages"] == "6" && result.parameters["scripts"] == "24" && result.parameters["loads"] == "8")
+        // Up to ten rows Recman shows no "100" link: one load a course, one page.
+        let small = try await RecordingsListingScenario.run(courses: 3, rowsPerCourse: 5, runs: 1, warmup: 0)
+        #expect(small.passed && small.parameters["loads"] == "3" && small.parameters["pages"] == "3")
+    }
+
     /// A small "large update" downloads and installs the new revision every run and counts its
     /// bytes hashed.
     @Test func largeUpdateScenarioPassesItsChecks() async throws {

@@ -194,6 +194,11 @@ func recmanHasMatch(_ pattern: String, in value: String) -> Bool {
 /// between threads; the lock only guards the dictionary. The patterns are a handful of literals,
 /// so the cache does not grow. A pattern that does not compile is not cached and matches nothing,
 /// as before.
+///
+/// Parity with `String.range(of:options:)`: that API treats a final `$` as the end of the string,
+/// while `NSRegularExpression` (ICU) lets `$` match before a trailing line terminator too, so
+/// `"abc\n"` would pass `^[A-Za-z0-9_-]+$`. A trailing unescaped `$` is therefore compiled as
+/// `\z` (absolute end of input). Every `$` pattern in use ends with it; none uses `$` elsewhere.
 enum RecmanRegexCache {
     private static let lock = NSLock()
     nonisolated(unsafe) private static var compiled: [String: NSRegularExpression] = [:]
@@ -202,8 +207,15 @@ enum RecmanRegexCache {
         lock.lock()
         defer { lock.unlock() }
         if let cached = compiled[pattern] { return cached }
-        guard let regex = try? NSRegularExpression(pattern: pattern) else { return nil }
+        guard let regex = try? NSRegularExpression(pattern: strictEnd(pattern)) else { return nil }
         compiled[pattern] = regex
         return regex
+    }
+
+    /// `pattern` with a trailing unescaped `$` turned into `\z` (see the type comment).
+    static func strictEnd(_ pattern: String) -> String {
+        guard pattern.hasSuffix("$") else { return pattern }
+        let backslashes = pattern.dropLast().reversed().prefix { $0 == "\\" }.count
+        return backslashes % 2 == 0 ? String(pattern.dropLast()) + #"\z"# : pattern
     }
 }

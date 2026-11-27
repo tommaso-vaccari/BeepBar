@@ -113,6 +113,7 @@ struct RecmanRecordingTests {
             preview.replacingOccurrences(of: "onlineservices.polimi.it", with: "onlineservices.polimi.it:8443"),
             preview + "&transfer_id=456",
             preview.replacingOccurrences(of: "transfer_id=123", with: "transfer_id=1%2F2"),
+            preview.replacingOccurrences(of: "transfer_id=123", with: "transfer_id=abc%0A"),
             preview.replacingOccurrences(of: "https://", with: "https://user:secret@"),
             preview.replacingOccurrences(of: "evn_preview_link", with: "other"),
         ]
@@ -132,9 +133,16 @@ struct RecmanRecordingTests {
     /// instead of trapping. Guards the per-row regexes of the row parser against drifting.
     @Test func cachedRegexMatchesLikeTheStringApi() async {
         let pattern = #"^[0-9]+\s*min$"#
-        for value in ["97 min", "97min", "min", "97 min ", "", "9 7 min"] {
+        for value in ["97 min", "97min", "min", "97 min ", "", "9 7 min", "97 min\n", "97 min\r\n"] {
             for _ in 0..<2 { #expect(recmanHasMatch(pattern, in: value) == (value.range(of: pattern, options: .regularExpression) != nil)) }
         }
+        // ICU's `$` would accept a trailing line terminator; the String API did not (#275 review).
+        let idPattern = #"^[A-Za-z0-9_-]+$"#
+        for value in ["abc", "abc\n", "ABC\r\n", "abc\u{2028}", "", "a b"] {
+            #expect(recmanHasMatch(idPattern, in: value) == (value.range(of: idPattern, options: .regularExpression) != nil), "\(value.debugDescription)")
+        }
+        #expect(!recmanHasMatch(idPattern, in: "abc\n") && !recmanHasMatch(pattern, in: "97 min\n"))
+        #expect(RecmanRegexCache.strictEnd(#"a\$"#) == #"a\$"# && RecmanRegexCache.strictEnd(#"a\\$"#) == #"a\\\z"#)
         #expect(recmanMatches(#"^[0-9]{6}(?=\s*-)"#, in: "058167 - X") == ["058167"])
         #expect(recmanMatches("(", in: "x").isEmpty && !recmanHasMatch("(", in: "x"))
         await withTaskGroup(of: Bool.self) { group in

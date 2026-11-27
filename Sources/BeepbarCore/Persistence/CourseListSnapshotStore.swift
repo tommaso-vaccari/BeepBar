@@ -50,6 +50,12 @@ public actor CourseListSnapshotStore {
         self.directory = directory
     }
 
+    /// Reads a matching snapshot without repairing or deleting the on-disk cache.
+    public func readOnlySnapshot(expecting identity: CourseListSnapshot.Identity, now: Date = Date()) -> CourseListSnapshot? {
+        guard let url = try? directory().appendingPathComponent(Self.fileName) else { return nil }
+        return try? read(url, expecting: identity, now: now)
+    }
+
     /// The saved list for `identity`, if there is one this launch may show.
     public func load(expecting identity: CourseListSnapshot.Identity, now: Date = Date()) -> LoadOutcome {
         guard let url = try? directory().appendingPathComponent(Self.fileName), FileManager.default.fileExists(atPath: url.path) else { return .missing }

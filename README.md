@@ -85,6 +85,8 @@ BeepBar checks for new builds via [Sparkle](https://sparkle-project.org), agains
 
 ## Development
 
+**Unreleased.** The [terminal API](docs/cli.md) documents commands and JSON output for scripts and agents.
+
 ```sh
 swift test
 xcodebuild -project Beepbar.xcodeproj -target Beepbar -configuration Release build CODE_SIGNING_ALLOWED=NO

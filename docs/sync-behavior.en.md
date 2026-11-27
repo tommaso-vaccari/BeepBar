@@ -121,6 +121,8 @@ On the first sync after updating, the files the teacher removed from Moodle befo
 
 ## 6. Courses, network and automatic sync
 
+**[unreleased]** The [terminal API](cli.md) starts the same manual sync as “Sincronizza ora”. It can report the result of that run or read BeepBar’s current state, courses, pending choices, and available recordings as JSON. If requested from Terminal while BeepBar is closed, it launches into the menu bar.
+
 - A course Moodle refuses (no longer enrolled, hidden, restricted) does not block the others; it shows as "Corso non accessibile" in the details.
 - If every course fails because of the site or the connection, the sync is reported as failed and no file is touched.
 - Automatic sync uses any network, your phone's hotspot included, like "Sincronizza ora".

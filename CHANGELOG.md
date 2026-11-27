@@ -4,6 +4,8 @@
 
 ### New
 
+- Start a materials sync from Terminal and get its result as JSON. Scripts can also check sync history, courses, pending conflicts, and available recordings.
+
 - When your Polimi sign-in expires, BeepBar now sends one notification, “Accesso al Politecnico scaduto” (“Polimi sign-in expired”), so you can sign in again in Recordings and keep getting new lectures. It arrives once per expiry, only if your Polimi sign-in had been working, and follows the Notifications switch; clicking it opens Recordings.
 - Add a Webex lesson directly from a course using “+”; it appears in that course and the Watchlist.
 

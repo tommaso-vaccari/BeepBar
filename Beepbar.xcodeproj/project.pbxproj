@@ -44,6 +44,9 @@
 		A0D10E000000000000000005 /* VoiceIsolator.swift in Sources */ = {isa = PBXBuildFile; fileRef = A0D10E000000000000000006 /* VoiceIsolator.swift */; };
 		B148000000000000000000A1 /* RecordingNowPlaying.swift in Sources */ = {isa = PBXBuildFile; fileRef = B148000000000000000000A2 /* RecordingNowPlaying.swift */; };
 		B14800000000000000000A01 /* PlayerZoom.swift in Sources */ = {isa = PBXBuildFile; fileRef = B14800000000000000000A02 /* PlayerZoom.swift */; };
+		B27100000000000000000001 /* TerminalAPI.swift in Sources */ = {isa = PBXBuildFile; fileRef = B27100000000000000000011 /* TerminalAPI.swift */; };
+		B27100000000000000000002 /* TerminalCatalog.swift in Sources */ = {isa = PBXBuildFile; fileRef = B27100000000000000000012 /* TerminalCatalog.swift */; };
+		B27100000000000000000003 /* TerminalTransport.swift in Sources */ = {isa = PBXBuildFile; fileRef = B27100000000000000000013 /* TerminalTransport.swift */; };
 /* End PBXBuildFile section */
 
 /* Begin PBXFileReference section */
@@ -85,6 +88,9 @@
 		A0D10E000000000000000006 /* VoiceIsolator.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = VoiceIsolator.swift; sourceTree = "<group>"; };
 		B148000000000000000000A2 /* RecordingNowPlaying.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = RecordingNowPlaying.swift; sourceTree = "<group>"; };
 		B14800000000000000000A02 /* PlayerZoom.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PlayerZoom.swift; sourceTree = "<group>"; };
+		B27100000000000000000011 /* TerminalAPI.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = TerminalAPI.swift; sourceTree = "<group>"; };
+		B27100000000000000000012 /* TerminalCatalog.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = TerminalCatalog.swift; sourceTree = "<group>"; };
+		B27100000000000000000013 /* TerminalTransport.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = TerminalTransport.swift; sourceTree = "<group>"; };
 /* End PBXFileReference section */
 
 /* Begin PBXFrameworksBuildPhase section */
@@ -127,6 +133,9 @@
 		A10000000000000000000051 /* Sources */ = {
 			isa = PBXGroup;
 			children = (
+				B27100000000000000000011 /* TerminalAPI.swift */,
+				B27100000000000000000012 /* TerminalCatalog.swift */,
+				B27100000000000000000013 /* TerminalTransport.swift */,
 				A10000000000000000000011 /* BeepbarApp.swift */,
 				A100000000000000000000C3 /* UIPerformanceHarness.swift */,
 				A100000000000000000000C1 /* UIContentReadiness.swift */,
@@ -249,6 +258,9 @@
 			isa = PBXSourcesBuildPhase;
 			buildActionMask = 2147483647;
 			files = (
+				B27100000000000000000001 /* TerminalAPI.swift in Sources */,
+				B27100000000000000000002 /* TerminalCatalog.swift in Sources */,
+				B27100000000000000000003 /* TerminalTransport.swift in Sources */,
 				A10000000000000000000001 /* BeepbarApp.swift in Sources */,
 				A100000000000000000000C2 /* UIPerformanceHarness.swift in Sources */,
 				A100000000000000000000C0 /* UIContentReadiness.swift in Sources */,

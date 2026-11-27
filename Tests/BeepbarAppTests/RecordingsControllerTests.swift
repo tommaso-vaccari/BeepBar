@@ -972,7 +972,8 @@ struct RecordingsControllerTests {
         defer { cleanUp() }
         try saveSession(owner: 42)
         let controller = makeController(useDefault: true)
-        world.sessionFiles.hold(access: 1)
+        await controller.settleSessionFile()
+        world.sessionFiles.hold(access: world.sessionFiles.accesses + 1)
         controller.pageAppeared()
         await settle("the read is held by the slow disk") { world.sessionFiles.isHolding }
         controller.turnOff()

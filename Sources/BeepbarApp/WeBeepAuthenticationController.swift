@@ -619,7 +619,10 @@ enum MaterialsRunEnd: Equatable, Sendable {
     }
     @Published private(set) var selectedSite: MoodleSite
     @Published private(set) var rootURL: URL? {
-        didSet { refreshMenuBarSnapshot() }
+        didSet {
+            if rootURL != oldValue { clearTerminalRuns() }
+            refreshMenuBarSnapshot()
+        }
     }
     @Published private(set) var needsOnboarding: Bool
     /// Mirrors `AppLanguage.current`; published so the window rebuilds in the new language.
@@ -690,6 +693,7 @@ enum MaterialsRunEnd: Equatable, Sendable {
             // Only a controller that already exists can hold another account's session; one
             // created later checks the saved session's owner when it reads it.
             guard siteInfo?.userID != oldValue?.userID else { return }
+            if oldValue != nil { clearTerminalRuns() }
             // A recordings follow-up belongs to the account it started for (its owner namespace
             // and keys): another account, or none, stops it and publishes nothing.
             cancelRecordingsFollowUp()
@@ -824,6 +828,8 @@ enum MaterialsRunEnd: Equatable, Sendable {
     }
     private var bootstrapTask: Task<Void, Never>?
     private var syncTask: Task<Void, Never>?
+    private var terminalRuns: [TerminalRun] = []
+    private var terminalIdentityGeneration = 0
     /// The Recordings listings refresh that follows a sync run (owner decision 2026-10-12, see
     /// `RecordingsSyncPolicy`). Deliberately OUTSIDE `syncTask`: "Esci" and a quit from outside
     /// wait for `syncTask` (`prepareForTermination`), and a WebKit listing must never hold a quit
@@ -880,7 +886,13 @@ enum MaterialsRunEnd: Equatable, Sendable {
     private var automaticOutcome: AutomaticSyncOutcome = .finished
     private let automaticSyncEnvironment: AutomaticSyncEnvironment
     private var rootID: UUID? {
-        didSet { if rootID != oldValue { notificationGeneration += 1; conflictChoiceFeedback = nil } }
+        didSet {
+            if rootID != oldValue {
+                clearTerminalRuns()
+                notificationGeneration += 1
+                conflictChoiceFeedback = nil
+            }
+        }
     }
     private var scheduledConfiguration: BackgroundScheduleConfiguration?
     /// Bumped on every real rebuild of the scheduler. Tells an automatic run whether the schedule
@@ -2479,6 +2491,10 @@ enum MaterialsRunEnd: Equatable, Sendable {
     }
 
     func synchronizeNow() {
+        startManualSync(requestNotificationPermission: true)
+    }
+
+    private func startManualSync(requestNotificationPermission: Bool) {
 #if DEBUG
         if Self.isUIPreview {
             courses = Self.orderedForDisplay(courses, enabledCourseIDs: enabledCourseIDs)
@@ -2498,7 +2514,7 @@ enum MaterialsRunEnd: Equatable, Sendable {
         setSyncState(.checking)
         if let launchGeneration { launchSyncRestore = (operationID, launchGeneration, notificationGeneration) }
         // Through the helper, not the coordinator directly: it also refreshes the Settings footer.
-        Task { await requestNotificationPermissionIfNeeded() }
+        if requestNotificationPermission { Task { await requestNotificationPermissionIfNeeded() } }
         syncTask = Task { [weak self] in
             // On every exit, once the run has ended (its operation, `syncTask` included, is over
             // by then): the recordings follow-up starts as a task of its own, never awaited here,
@@ -3117,6 +3133,7 @@ enum MaterialsRunEnd: Equatable, Sendable {
     private func forgetCourseList() {
         bootstrapCredentialAwaitingRecovery = nil
         courseListEpoch += 1
+        clearTerminalRuns()
         // The account goes: its recordings follow-up, its last fetched enrollments and the last
         // follow-up's result go with it (memory only).
         cancelRecordingsFollowUp()
@@ -3823,6 +3840,18 @@ enum MaterialsRunEnd: Equatable, Sendable {
     private func recordRunEnd(_ operationID: UUID, _ end: MaterialsRunEnd) {
         guard activeOperationID == operationID else { return }
         materialsRunEnds[operationID] = (recordingsFollowUpGeneration, end)
+        guard accountState == .connected, rootID != nil else { return }
+        let summary: SyncCompletionSummary?
+        let pendingChoiceCount: Int?
+        if case .completed = end {
+            summary = lastSyncSummary
+            pendingChoiceCount = conflicts.count + remoteChanges.count
+        } else {
+            summary = nil
+            pendingChoiceCount = nil
+        }
+        terminalRuns.append(TerminalRun(id: operationID, end: end, summary: summary, pendingChoiceCount: pendingChoiceCount))
+        if terminalRuns.count > 32 { terminalRuns.removeFirst() }
     }
 
     /// Takes (and forgets) what `operationID` recorded; nil for a superseded or never-started run.
@@ -4715,4 +4744,182 @@ enum CredentialStorageError: Error, Sendable, Equatable {
     case write
     case absent
     case corrupt
+}
+
+extension WeBeepAuthenticationController {
+    private func clearTerminalRuns() {
+        terminalIdentityGeneration += 1
+        terminalRuns.removeAll()
+    }
+
+    /// The app is the only process allowed to observe or start an operation. Bootstrap and all
+    /// admission checks run before the manual entry point claims the operation on the main actor.
+    func terminalResponse(_ arguments: [String]) async -> TerminalResponse {
+        guard let command = TerminalCommand(arguments) else {
+            return TerminalOutput.success(["error": ["code": "invalid_arguments", "message": tr("Usa uno dei comandi documentati.", "Use one of the documented commands.")],
+                                           "commands": TerminalCommand.syntax], exitCode: 2)
+        }
+        if command.name == "capabilities" {
+            return TerminalOutput.success([
+                "version": Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "development",
+                "commands": TerminalCommand.syntax, "defaultLimit": 50, "maximumLimit": 200
+            ])
+        }
+        await bootstrapTask?.value
+        if command.name == "status" { return TerminalOutput.success(terminalStatus()) }
+        if command.name == "doctor" {
+            var fields = terminalStatus()
+            if let blocker = terminalSyncBlocker() {
+                fields["ready"] = false
+                fields["blocker"] = blocker.code
+                fields["nextAction"] = blocker.message
+            } else {
+                fields["ready"] = true
+            }
+            return TerminalOutput.success(fields)
+        }
+        if command.name == "sync" { return await terminalSync(wait: command.wait) }
+        guard accountState == .connected, hasStoredCredential else {
+            return TerminalOutput.error("sign_in_required", tr("Collega il tuo account in BeepBar per leggere i dati.", "Connect your account in BeepBar to read its data."))
+        }
+        if command.name == "runs" {
+            let runs = terminalRuns.reversed().filter { command.id == nil || $0.id.uuidString == command.id }
+            if command.id != nil, runs.isEmpty {
+                return TerminalOutput.error("run_not_found", tr("Questa sincronizzazione non è nella cronologia disponibile per questo account e questa cartella.", "This run is outside the retained history for this account and folder."))
+            }
+            return TerminalOutput.page(runs.map(\.fields), command: command, fields: ["retention": "app_session"])
+        }
+        if command.name == "changes" {
+            guard let anchor = terminalRuns.firstIndex(where: { $0.id.uuidString == command.id }) else {
+                return TerminalOutput.error("run_not_found", tr("Questa sincronizzazione non è nella cronologia disponibile per questo account e questa cartella.", "This run is outside the retained history for this account and folder."))
+            }
+            let range = command.includeRun ? anchor..<(anchor + 1) : (anchor + 1)..<terminalRuns.count
+            return TerminalRun.changes(Array(terminalRuns[range]), command: command)
+        }
+        let generation = terminalIdentityGeneration
+        let response = await terminalCatalog(command)
+        guard generation == terminalIdentityGeneration, accountState == .connected, hasStoredCredential else {
+            return TerminalOutput.error("identity_changed", tr("L’account o la cartella dei materiali è cambiata. Riprova.", "The account or materials folder changed. Retry the query."))
+        }
+        return response
+    }
+
+    private func terminalSync(wait: Bool) async -> TerminalResponse {
+        if let blocker = terminalSyncBlocker() {
+            if blocker.code == "already_running", let activeOperationID {
+                return TerminalOutput.success(["outcome": "already_running", "runId": activeOperationID.uuidString], exitCode: 1)
+            }
+            return TerminalOutput.error(blocker.code, blocker.message)
+        }
+        startManualSync(requestNotificationPermission: false)
+        guard let operationID = activeOperationID, let runTask = syncTask else {
+            return TerminalOutput.error("unavailable", tr("BeepBar non ha potuto avviare la sincronizzazione.", "BeepBar could not start a sync."))
+        }
+        if !wait { return TerminalOutput.success(["outcome": "started", "runId": operationID.uuidString]) }
+        let generation = terminalIdentityGeneration
+        await runTask.value
+        let run = (generation == terminalIdentityGeneration ? terminalRuns.first { $0.id == operationID } : nil)
+            ?? TerminalRun(id: operationID, end: .superseded, summary: nil)
+        return TerminalOutput.success(run.fields, exitCode: run.exitCode)
+    }
+
+    private func terminalSyncBlocker() -> (code: String, message: String)? {
+        guard !menuQuitDrained else { return ("shutting_down", tr("Attendi la chiusura di BeepBar e riprova.", "Wait for BeepBar to quit and retry.")) }
+        guard accountState != .expired else { return ("sign_in_expired", tr("Accedi di nuovo in BeepBar.", "Sign in again in BeepBar.")) }
+        guard accountState == .connected, hasStoredCredential else { return ("sign_in_required", tr("Collega il tuo account in BeepBar.", "Connect your account in BeepBar.")) }
+        guard !recoveryBlocked else { return ("recovery_required", tr("Apri BeepBar per riprovare il recupero locale.", "Open BeepBar to retry local recovery.")) }
+        guard rootURL != nil, rootID != nil else { return ("folder_required", tr("Scegli una cartella dei materiali in BeepBar.", "Choose a materials folder in BeepBar.")) }
+        guard database != nil else { return ("database_unavailable", tr("Riapri BeepBar per riprovare a preparare lo stato locale.", "Reopen BeepBar to retry preparing local storage.")) }
+        guard activeOperationID == nil else { return ("already_running", tr("Attendi il termine della sincronizzazione in corso.", "Wait for the active sync.")) }
+        guard !isLoadingCourses else { return ("courses_loading", tr("Attendi che BeepBar finisca di caricare i corsi.", "Wait for BeepBar to finish loading courses.")) }
+        guard !enabledCourseIDs.isEmpty,
+              courseListFreshness != .current || courses.contains(where: { enabledCourseIDs.contains($0.id) }) else {
+            return ("no_selected_courses", tr("Attiva un corso in BeepBar.", "Enable a course in BeepBar."))
+        }
+        return nil
+    }
+
+    private func terminalStatus() -> [String: Any] {
+        let state: String
+        switch syncState {
+        case .starting: state = "starting"
+        case .loginRequired: state = "signed_out"
+        case .needsFolder: state = "folder_required"
+        case .readyUnchecked: state = "idle"
+        case .checking: state = "checking"
+        case .syncing: state = "syncing"
+        case .cancelling: state = "cancelling"
+        case .synced: state = "idle"
+        case .conflicts: state = "conflicts"
+        case .partial: state = "partial"
+        case .failed: state = "failed"
+        case .recoveryBlocked: state = "recovery_required"
+        }
+        var fields: [String: Any] = ["state": dataSaverPause == nil ? state : "paused", "message": syncState.detail,
+                                      "account": accountState == .connected ? "connected" : accountState == .expired ? "expired" : "signed_out",
+                                      "folderConfigured": rootURL != nil, "automaticSyncEnabled": automaticSyncEnabled]
+        if let pause = dataSaverPause { fields["pauseReason"] = TerminalRun.pauseReason(pause) }
+        if let activeOperationID {
+            fields["activeRunId"] = activeOperationID.uuidString
+            if state != "syncing", state != "cancelling" { fields["state"] = "checking" }
+        }
+        if syncState == .syncing || syncState == .cancelling {
+            let progress = progressStore.progress
+            fields["progress"] = ["completed": progress.completed, "total": progress.total,
+                                  "installed": progress.installed, "conflicts": progress.conflicts, "failures": progress.failures]
+        }
+        if case .failed(let failure) = syncState {
+            fields["failureReason"] = switch failure {
+            case .authenticationExpired: "sign_in_expired"
+            case .connectivity: "offline"
+            case .serviceUnavailable: "service_unavailable"
+            case .incompatibleResponse: "incompatible_response"
+            case .credentialUnavailable: "credential_unavailable"
+            case .partialSync: "partial_sync"
+            case .local: "local_failure"
+            }
+        }
+        if accountState == .connected {
+            if let run = terminalRuns.last { fields["lastRun"] = run.fields }
+            else if let summary = lastSyncSummary {
+                fields["lastRun"] = ["finishedAt": TerminalOutput.date(summary.completedAt),
+                                     "outcome": summary.failures > 0 || summary.conflicts > 0 ? "completed_with_issues" : "completed",
+                                     "counts": TerminalRun.counts(summary)] as [String: Any]
+            }
+            fields["pendingChoiceCount"] = conflicts.count + remoteChanges.count
+        }
+        return fields
+    }
+
+    func terminalPendingChoices() async throws -> (conflicts: [ConflictRecord], changes: [RemoteChange]) {
+        guard accountState == .connected, hasStoredCredential, !recoveryBlocked else { throw SyncDatabaseError.open }
+        let generation = terminalIdentityGeneration
+        let result = try await loadPendingChoices()
+        guard generation == terminalIdentityGeneration, accountState == .connected,
+              hasStoredCredential, !recoveryBlocked else { throw SyncDatabaseError.open }
+        return result
+    }
+
+    func terminalCourseSnapshot() async -> (courses: [RemoteCourseSummary], freshness: CourseListFreshness, folders: [Int64: String]) {
+        let unavailable: ([RemoteCourseSummary], CourseListFreshness, [Int64: String]) = ([], .unknown, [:])
+        guard accountState == .connected, hasStoredCredential else { return unavailable }
+        if courseListFreshness != .unknown { return (courses, courseListFreshness, courseFolders) }
+        if !lastRunCourses.isEmpty { return (lastRunCourses, .current, courseFolders) }
+        guard let rootID, let database else { return unavailable }
+        let generation = terminalIdentityGeneration
+        let site = selectedSite
+        guard let token = try? await credentialVault.load() else { return unavailable }
+        let identity = CourseListSnapshot.Identity(siteID: site.id, rootID: rootID, token: token)
+        let snapshot = await courseListStore.readOnlySnapshot(expecting: identity)
+        let scopes = try? await database.scopes(rootID: rootID)
+        guard terminalIdentityGeneration == generation, selectedSite == site, self.rootID == rootID,
+              accountState == .connected, hasStoredCredential else { return unavailable }
+        if courseListFreshness != .unknown { return (courses, courseListFreshness, courseFolders) }
+        if !lastRunCourses.isEmpty { return (lastRunCourses, .current, courseFolders) }
+        guard let snapshot, let scopes else { return unavailable }
+        let savedFolders = Dictionary(scopes.filter { !$0.localFolder.isEmpty }.map { ($0.courseID, $0.localFolder) },
+                                      uniquingKeysWith: { first, _ in first })
+        let folders = Self.defaultFolders(for: snapshot.summaries, saved: savedFolders).merging(savedFolders) { _, saved in saved }
+        return (snapshot.summaries, .saved(snapshot.savedAt), folders)
+    }
 }

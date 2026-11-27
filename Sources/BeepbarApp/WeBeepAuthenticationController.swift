@@ -1660,11 +1660,23 @@ enum MaterialsRunEnd: Equatable, Sendable {
     /// `pause` is the pause the user sees (`visibleDataSaverPause`), not the stored one: when it
     /// shows, the icon says so instead of the warning a "Connessione assente" underneath would give,
     /// matching the calm pause in the menu and the window.
+    ///
+    /// Problem states have three levels (#271), so the icon tells apart what to do about them:
+    /// no connection (`wifi.slash`), a problem BeepBar retries by itself at the next check
+    /// (`clock.arrow.circlepath`: platform unreachable, some materials not updated), and
+    /// something only the user can fix (`exclamationmark.triangle`). Both switches are exhaustive
+    /// on purpose, with no `default`: a new state or failure must be placed on a level here.
     nonisolated static func menuBarSymbol(for syncState: AppSyncState, pause: DataSaverPause? = nil) -> String {
         if pause != nil { return "pause.circle" }
         return switch syncState {
         case .checking, .syncing, .cancelling: "arrow.down.circle"
-        case .conflicts, .partial, .failed, .recoveryBlocked, .loginRequired, .needsFolder: "exclamationmark.triangle"
+        case .partial: "clock.arrow.circlepath"
+        case .failed(let failure): switch failure {
+        case .connectivity: "wifi.slash"
+        case .serviceUnavailable, .partialSync: "clock.arrow.circlepath"
+        case .authenticationExpired, .incompatibleResponse, .credentialUnavailable, .local: "exclamationmark.triangle"
+        }
+        case .conflicts, .recoveryBlocked, .loginRequired, .needsFolder: "exclamationmark.triangle"
         case .starting, .readyUnchecked, .synced: "arrow.triangle.2.circlepath"
         }
     }

@@ -12,6 +12,20 @@ enum BeepbarLog {
 
 #if !UI_PERFORMANCE_HARNESS
 @main
+enum BeepbarEntryPoint {
+    @MainActor static func main() {
+        let arguments = CommandLine.arguments
+        let command = URL(fileURLWithPath: arguments[0]).lastPathComponent
+        if arguments.dropFirst().first == "--cli" {
+            exit(TerminalClient.run(arguments: Array(arguments.dropFirst(2))))
+        }
+        if command == "beepbar" || arguments.dropFirst().first.map(TerminalCommand.names.contains) == true {
+            exit(TerminalClient.run(arguments: Array(arguments.dropFirst())))
+        }
+        BeepbarApp.main()
+    }
+}
+
 struct BeepbarApp: App {
     @NSApplicationDelegateAdaptor(AppDelegate.self) private var appDelegate
 
@@ -35,6 +49,7 @@ struct BeepbarApp: App {
     // removes the race entirely.
     let authentication = WeBeepAuthenticationController()
     private var statusItemController: StatusItemController?
+    private var terminalServer: TerminalServer?
     /// Kept here because `UNUserNotificationCenter.delegate` is weak.
     private lazy var notificationResponder = NotificationResponder { [weak self] destination in
         guard let self else { return }
@@ -62,13 +77,21 @@ struct BeepbarApp: App {
             await LaunchAtLoginController.shared.applyDefaultOnLaunch()
         }
         statusItemController = StatusItemController(authentication: authentication)
+        if !PreviewMode.isActive {
+            terminalServer = TerminalServer { [weak self] arguments in
+                guard let self, !self.terminationPending else {
+                    return TerminalOutput.error("shutting_down", tr("Attendi la chiusura di BeepBar e riprova.", "Wait for BeepBar to quit and retry."))
+                }
+                return await self.authentication.terminalResponse(arguments)
+            }
+        }
 #if DEBUG
         if ProcessInfo.processInfo.arguments.contains("--ui-preview") {
             ConfigurationWindowController.shared.show(authentication, page: ProcessInfo.processInfo.arguments.contains("--watchlist-preview") ? .recordings : .home)
             return
         }
 #endif
-        guard authentication.needsOnboarding else { return }
+        guard authentication.needsOnboarding, !CommandLine.arguments.contains("--terminal-launch") else { return }
         ConfigurationWindowController.shared.show(authentication)
     }
 

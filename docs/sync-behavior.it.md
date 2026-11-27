@@ -121,6 +121,8 @@ Al primo sync dopo l'aggiornamento, i file che il professore aveva rimosso da Mo
 
 ## 6. Corsi, rete e sync automatico
 
+**[non rilasciato]** La [CLI](cli.md) avvia la stessa sincronizzazione manuale di «Sincronizza ora». Può restituire l’esito di quella sincronizzazione oppure leggere in JSON lo stato di BeepBar, i corsi, le scelte in sospeso e le registrazioni disponibili. Se BeepBar è chiusa, la richiesta da Terminale la avvia nella barra dei menu.
+
 - Un corso che Moodle rifiuta (non più iscritto, nascosto, riservato) non blocca gli altri; compare come "Corso non accessibile" nei dettagli.
 - Se tutti i corsi falliscono per un problema del sito o della connessione, il sync viene segnalato come non riuscito e nessun file viene toccato.
 - Il sync automatico usa qualsiasi rete, compreso l'hotspot del telefono, come "Sincronizza ora".

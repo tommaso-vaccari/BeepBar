@@ -45,6 +45,101 @@ import Testing
         #expect(harness.controller.recordingsFollowUpForTesting == nil)
     }
 
+
+    // MARK: Polimi sign-in expired notification (#295)
+
+    private static let expiryID = SyncNotificationCoordinator.recordingsSessionExpiredIdentifier
+    private func armed() -> RecordingsSessionExpiryNotice.Record { .init(owner: 7, phase: .armed) }
+
+    /// Proves an armed account is told ONCE when a sync's refresh ends because the session expired
+    /// midway: one notification on the first sync, none on the second (record spent), and the
+    /// record says so. Guards against never notifying, and against notifying on every sync.
+    /// Mutation: drop `markNotified` and the second count becomes 2.
+    @Test func anExpiryMidwayNotifiesOncePerExpiry() async throws {
+        let harness = try await Harness()
+        defer { harness.remove() }
+        RecordingsController.setExpiryNotice(armed(), in: harness.defaults)
+        harness.seam.result = .needsSignIn(newlyPublished: 0)
+
+        await harness.controller.runAutomaticSyncForTesting()
+        #expect(harness.center.sent.filter { $0 == Self.expiryID }.count == 1)
+        #expect(RecordingsController.expiryNotice(in: harness.defaults)?.phase == .spent)
+
+        await harness.controller.runAutomaticSyncForTesting()
+        #expect(harness.center.sent.filter { $0 == Self.expiryID }.count == 1)
+    }
+
+    /// Proves #190 is untouched: lectures found before the expiry are still announced, and the
+    /// expiry notification is separate (both delivered, different identifiers).
+    @Test func newLecturesBeforeAnExpiryAreAnnouncedAlongside() async throws {
+        let harness = try await Harness()
+        defer { harness.remove() }
+        RecordingsController.setExpiryNotice(armed(), in: harness.defaults)
+        harness.seam.result = .needsSignIn(newlyPublished: 2)
+        await harness.controller.runAutomaticSyncForTesting()
+        #expect(harness.center.sent.filter { $0 == "beepbar-new-recordings" }.count == 1)
+        #expect(harness.center.sent.filter { $0 == Self.expiryID }.count == 1)
+    }
+
+    /// Proves no notification without a record (never signed in, or updated while already expired),
+    /// and after a relaunch while still expired (a new controller on the same settings sees the
+    /// spent record). Guards against notifying someone who never had a session, or on every launch.
+    @Test func noRecordOrASpentRecordAfterRelaunchStaysSilent() async throws {
+        let first = try await Harness()
+        defer { first.remove() }
+        first.seam.result = .needsSignIn(newlyPublished: 0)
+        await first.controller.runAutomaticSyncForTesting()
+        #expect(first.center.sent.filter { $0 == Self.expiryID }.isEmpty)
+
+        RecordingsController.setExpiryNotice(armed(), in: first.defaults)
+        await first.controller.runAutomaticSyncForTesting()
+        #expect(first.center.sent.filter { $0 == Self.expiryID }.count == 1)
+
+        let relaunched = try await Harness(defaults: first.defaults)
+        defer { relaunched.remove() }
+        relaunched.seam.result = .needsSignIn(newlyPublished: 0)
+        await relaunched.controller.runAutomaticSyncForTesting()
+        #expect(relaunched.center.sent.filter { $0 == Self.expiryID }.isEmpty)
+    }
+
+    /// Proves the Notifiche switch off sends nothing and keeps the record armed, so the expiry is
+    /// still announced if notifications come back on while it lasts. Same gating as the other
+    /// notifications.
+    @Test func notificationsOffSendsNothingAndKeepsTheRecordArmed() async throws {
+        let harness = try await Harness()
+        defer { harness.remove() }
+        RecordingsController.setExpiryNotice(armed(), in: harness.defaults)
+        await harness.controller.setNotifications(enabled: false)
+        harness.seam.result = .needsSignIn(newlyPublished: 0)
+        await harness.controller.runAutomaticSyncForTesting()
+        #expect(harness.center.sent.filter { $0 == Self.expiryID }.isEmpty)
+        #expect(RecordingsController.expiryNotice(in: harness.defaults)?.phase == .armed)
+    }
+
+    /// Proves the common case: through the real Recordings controller, the first sync finds no
+    /// session (expired while the app was closed) and notifies, and a later sync, now skipped
+    /// because access already says "sign in", notifies again only after a new sign-in re-armed it,
+    /// never before. Guards against missing the skip path (every sync after the first).
+    @Test func theSkipBecauseAccessNeedsSignInNotifiesOnlyWhenArmed() async throws {
+        let harness = try await Harness(realRefresh: true)
+        defer { harness.remove() }
+        RecordingsController.setExpiryNotice(armed(), in: harness.defaults)
+        await harness.controller.runAutomaticSyncForTesting()
+        #expect(harness.controller.recordingsIfCreated?.access == .needsSignIn(nil))
+        #expect(harness.center.sent.filter { $0 == Self.expiryID }.count == 1)
+
+        // Still expired: the sync now skips, silently.
+        await harness.controller.runAutomaticSyncForTesting()
+        await harness.controller.recordingsExpiryAnnouncementForTesting?.value
+        #expect(harness.center.sent.filter { $0 == Self.expiryID }.count == 1)
+
+        // A sign-in worked (armed again) and expired anew: the skip path notifies.
+        RecordingsController.setExpiryNotice(RecordingsSessionExpiryNotice.afterSignIn(owner: 7), in: harness.defaults)
+        await harness.controller.runAutomaticSyncForTesting()
+        await harness.controller.recordingsExpiryAnnouncementForTesting?.value
+        #expect(harness.center.sent.filter { $0 == Self.expiryID }.count == 2)
+    }
+
     // MARK: Placement
 
     /// Proves the order of an automatic run: the materials state is already `.synced` while the
@@ -828,8 +923,9 @@ private final class NetworkSequence: Sendable {
     let seam = RefreshSeam()
     let center = RecordingCenter()
     let sequence: NetworkSequence
+    let defaults: UserDefaults
 
-    init(networks: [NetworkPathConditions?] = [.unrestricted], lowPowerMode: Bool = false, schedule: TestSchedule? = nil, site: MoodleSite = .polimi, switchedOn: Bool = true) async throws {
+    init(networks: [NetworkPathConditions?] = [.unrestricted], lowPowerMode: Bool = false, schedule: TestSchedule? = nil, site: MoodleSite = .polimi, switchedOn: Bool = true, defaults sharedDefaults: UserDefaults? = nil, realRefresh: Bool = false) async throws {
         root = FileManager.default.temporaryDirectory.appending(path: UUID().uuidString, directoryHint: .isDirectory)
         try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
         let database = try SyncDatabase(url: root.appending(path: "state.sqlite"))
@@ -843,12 +939,15 @@ private final class NetworkSequence: Sendable {
         let environment = AutomaticSyncEnvironment(isLowPowerModeEnabled: { lowPowerMode }, currentNetwork: { await sequence.next() })
         let stored = OSAllocatedUnfairLock(initialState: token)
         let vault = CredentialVault(read: { _ in stored.withLock { $0 } }, write: { renewed in stored.withLock { $0 = renewed } })
-        let defaults = UserDefaults(suiteName: "recordings-sync-followup-\(UUID().uuidString)")!
+        let defaults = sharedDefaults ?? UserDefaults(suiteName: "recordings-sync-followup-\(UUID().uuidString)")!
+        self.defaults = defaults
         // The switch defaults to on; the "other university" case keeps it on too, so only the site decides.
         if !switchedOn { defaults.set(false, forKey: RecordingsController.enabledKey) }
         controller = WeBeepAuthenticationController(testRootURL: root, database: database, rootID: rootID, notificationCenter: center, apiClient: MoodleRecordingProtocol.makeClient(), downloader: MoodleRecordingProtocol.makeDownloader(), credentialVault: vault, deleteCredential: {}, defaults: defaults, automaticSyncEnvironment: environment, site: site)
         let seam = seam
-        controller.recordingsRefresh = { keys, force in await seam.refresh(keys, force) }
+        // `realRefresh`: the real `RecordingsController.refreshForSync` against the throwaway empty
+        // session folder, which finds no session and ends `.needsSignIn` (then skips).
+        if !realRefresh { controller.recordingsRefresh = { keys, force in await seam.refresh(keys, force) } }
         await controller.completeLoginForTesting(moodleLoginCallback(token: token))
         #expect(controller.courseLoadError == nil)
         if let schedule { controller.setBackgroundSchedulerForTesting { interval, callback in schedule.register(interval, callback) } }

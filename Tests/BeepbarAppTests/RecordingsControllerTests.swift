@@ -5933,3 +5933,68 @@ struct AudioSelectorPresentationTests {
         #expect(P.stallThreshold == 15)
     }
 }
+
+// MARK: Polimi sign-in expired notification record (#295)
+
+/// How the controller keeps the per-account record behind the "sign-in expired" notification:
+/// armed by a working session, spent by the student's own sign-in, removed with the identity.
+extension RecordingsControllerTests {
+    private var record: RecordingsSessionExpiryNotice.Record? { RecordingsController.expiryNotice(in: defaults) }
+
+    /// Proves a successful sign-in arms the account that signed in, so its next expiry is notified.
+    /// Mutation: drop `armExpiryNotice(afterSignIn: true)` and the record stays nil.
+    @Test func aSuccessfulSignInArmsTheRecord() async {
+        defer { cleanUp() }
+        let controller = makeController(useDefault: true)
+        controller.signIn()
+        await settle("signed in") { controller.access == .ready && !browser.isOpen }
+        #expect(record == RecordingsSessionExpiryNotice.Record(owner: 42, phase: .armed))
+    }
+
+    /// Proves a saved session found alive arms an account with no record (a launch after updating
+    /// while signed in), and leaves a spent record spent.
+    @Test(arguments: [false, true])
+    func aSavedSessionFoundAliveArmsUnlessSpent(spent: Bool) async throws {
+        defer { cleanUp() }
+        try saveSession(owner: 42)
+        if spent { RecordingsController.setExpiryNotice(.init(owner: 42, phase: .spent), in: defaults) }
+        let controller = makeController(useDefault: true)
+        controller.pageAppeared()
+        controller.refresh([course], selected: course)
+        await settle("the session is found") { controller.access == .ready && (spent || record != nil) }
+        await drainTasks()
+        #expect(record?.phase == (spent ? .spent : .armed))
+    }
+
+    /// Proves the student starting the sign-in while expired spends this expiry, even when they
+    /// give up (the sign-in fails): nothing is notified for an expiry they already know.
+    @Test func startingTheSignInYourselfSpendsTheExpiry() async {
+        defer { cleanUp() }
+        RecordingsController.setExpiryNotice(.init(owner: 42, phase: .armed), in: defaults)
+        let controller = makeController(useDefault: true)
+        browser.signInError = CancellationError()
+        controller.signIn()
+        await settle("cancelled") { controller.access == .needsSignIn(nil) }
+        #expect(record?.phase == .armed)
+        browser.signInError = RecmanBrowserError.unavailable
+        controller.signIn()
+        await settle("failed") { controller.access == .needsSignIn(.unavailable) }
+        #expect(record?.phase == .spent)
+    }
+
+    /// Proves turning Recordings off (the same path as logout and a university change) removes the
+    /// record, and that an account change removes another account's record without a controller.
+    @Test func theRecordGoesWithTheIdentity() async {
+        defer { cleanUp() }
+        RecordingsController.setExpiryNotice(.init(owner: 42, phase: .armed), in: defaults)
+        let controller = makeController(useDefault: true)
+        controller.setEnabled(false)
+        #expect(record == nil)
+
+        RecordingsController.setExpiryNotice(.init(owner: 42, phase: .armed), in: defaults)
+        RecordingsController.forgetExpiryNotice(in: defaults, notOwnedBy: 42)
+        #expect(record != nil)
+        RecordingsController.forgetExpiryNotice(in: defaults, notOwnedBy: 43)
+        #expect(record == nil)
+    }
+}

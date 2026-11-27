@@ -11,6 +11,7 @@
 
 ### Improved
 
+- When your Polimi sign-in expires, BeepBar now sends one notification, “Accesso al Politecnico scaduto” (“Polimi sign-in expired”), so you can sign in again in Recordings and keep getting new lectures. It arrives once per expiry, only if you had signed in before, and follows the Notifications switch; clicking it opens Recordings.
 - The Watchlist groups lessons by course, with unassigned linked lessons in their own section.
 
 - During synchronization, Courses shows how much of the current downloads has arrived. The menu shows the latest progress when you open it.

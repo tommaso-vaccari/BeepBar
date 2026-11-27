@@ -50,9 +50,35 @@ I wanted something built specifically for macOS: a small app that stays in the m
 
 In a preliminary local measurement of the Release build, with automatic sync disabled, BeepBar stayed around 14–15 MiB of memory for 30 minutes with effectively idle CPU use. This is a development reference, not a universal guarantee — but it's the kind of footprint you'd expect from a native Swift app with no bundled runtime, as opposed to Electron/TypeScript-based alternatives, which ship a full Chromium and Node.js runtime and typically carry a much heavier baseline memory and CPU cost.
 
+## Agent ready
+
+**Unreleased** — available on `dev`, coming in the next release.
+
+BeepBar ships with a terminal API built into the app, so an AI agent or any script can drive it on your behalf: start a sync, wait for its outcome, see which files arrived, list courses, pending conflicts and lecture recordings. No extra install, no server, no API key — the CLI is the app itself.
+
+```sh
+# Optional: a short `beepbar` command
+mkdir -p ~/.local/bin && ln -s /Applications/Beepbar.app/Contents/MacOS/Beepbar ~/.local/bin/beepbar
+
+beepbar doctor                 # Is BeepBar ready? If not, what is the next step?
+beepbar sync --wait            # Sync now and return that run's outcome
+beepbar changes --run RUN_ID   # Which files were added, updated or moved
+beepbar recordings             # Recordings already known to the app, with watch progress
+```
+
+Built for agents, not just humans:
+
+- **Machine-readable by design**: every response is a single JSON object with a `schemaVersion`, string IDs, UTC dates, error codes under `error.code`, and paginated lists.
+- **Self-describing**: `beepbar capabilities` reports the app version, the command syntax and the limits, and `beepbar doctor` names the first missing prerequisite, so an agent can find its way without reading the docs.
+- **Meaningful exit codes**: success, blocked, invalid arguments, finished with conflicts or failures, and cancelled are each distinguishable without parsing the output.
+- **Safe to hand over**: the CLI talks to the running BeepBar (launching it into the menu bar if needed) and syncs with exactly the same rules as **"Sincronizza ora"**. Conflict choices always stay with you — an agent can see your conflicts, never resolve them — so your local work stays protected.
+
+See the [terminal API reference](docs/cli.md) for every command, field and exit code.
+
 ## Features
 
 - Menu-bar app with clear sync status and contextual actions
+- [Agent ready](#agent-ready): a built-in terminal API with JSON output, so scripts and AI agents can run and check syncs for you
 - Browser-based login for supported university platforms, with the token stored locally in a permissions-locked file (not the macOS Keychain, so it isn't tied to build-to-build signature changes)
 - Manual or configurable automatic sync
 - Opens at login by default, so scheduled syncs resume after a restart (switch it off in Impostazioni)
@@ -84,8 +110,6 @@ BeepBar checks for new builds via [Sparkle](https://sparkle-project.org), agains
 - Apple Silicon
 
 ## Development
-
-**Unreleased.** The [terminal API](docs/cli.md) documents commands and JSON output for scripts and agents.
 
 ```sh
 swift test

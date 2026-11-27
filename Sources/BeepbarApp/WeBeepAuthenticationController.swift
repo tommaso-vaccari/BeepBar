@@ -3188,17 +3188,17 @@ enum MaterialsRunEnd: Equatable, Sendable {
         return Self.defaults
     }
 
-    /// The two preferences every launch resolves (language, automatic-sync interval), written back
-    /// only when the stored value differs: a launch that changes nothing writes nothing (#277,
-    /// principle 4). They are still written when absent or invalid, so the first launch, a stored
-    /// interval that fell outside `automaticIntervals` and a language resolved from the system all
-    /// persist exactly as before. Takes `defaults` so a test counts the writes.
     /// The launch write of the onboarding flag when a sync folder exists: only if it is not
     /// already true (#277). Takes `defaults` so a test counts the writes.
     nonisolated static func markOnboardingCompletedAtLaunch(in defaults: UserDefaults) {
         if !defaults.bool(forKey: onboardingCompletedKey) { defaults.set(true, forKey: onboardingCompletedKey) }
     }
 
+    /// The two preferences every launch resolves (language, automatic-sync interval), written back
+    /// only when the stored value differs: a launch that changes nothing writes nothing (#277,
+    /// principle 4). They are still written when absent or invalid, so the first launch, a stored
+    /// interval that fell outside `automaticIntervals` and a language resolved from the system all
+    /// persist exactly as before. Takes `defaults` so a test counts the writes.
     nonisolated static func persistLaunchPreferences(language: AppLanguage, automaticInterval: Int, in defaults: UserDefaults) {
         if defaults.string(forKey: languageKey) != language.rawValue {
             defaults.set(language.rawValue, forKey: languageKey)

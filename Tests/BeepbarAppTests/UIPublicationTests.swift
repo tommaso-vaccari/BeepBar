@@ -6,6 +6,7 @@ import Testing
 import BeepbarCore
 @testable import BeepbarApp
 
+extension ProbeHostedUI {
 /// What a controller publication costs the pages that observe it (#280, principles 6 and 9).
 /// `WeBeepAuthenticationController` has ~40 `@Published` properties and every page observes it, so
 /// any one change may re-evaluate a page body. The pages are hosted for real (the Courses page and
@@ -31,6 +32,7 @@ import BeepbarCore
         /// being created, before `self` is complete: the probes must already be counting then.
         private final class Counter { var values: [String: Int] = [:] }
         private let counter = Counter()
+        private var previousProbes: (hit: ((String) -> Void)?, row: ((RecordingRow) -> Void)?, sidebarRow: ((String, String) -> Void)?) = (nil, nil, nil)
         var counts: [String: Int] {
             get { counter.values }
             set { counter.values = newValue }
@@ -42,9 +44,14 @@ import BeepbarCore
             let scenario = try UIFixtureScenario(arguments: ["--scenario", name, "--report", "/tmp/ui-fixture-unused-\(UUID().uuidString).json"])
             fixture = try await UIFixture.make(scenario)
             let counter = counter
+            // The probes are process-global: take them only for what this page reports, and put the
+            // previous ones back on close (the suite is also serialized, see `ProbeHostedUI`).
+            previousProbes = (UIBodyProbe.hit, RecordingsPageProbes.row, RecordingsPageProbes.sidebarRow)
             UIBodyProbe.hit = { counter.values[$0, default: 0] += 1 }
-            RecordingsPageProbes.row = { _ in counter.values["RecordingRow", default: 0] += 1 }
-            RecordingsPageProbes.sidebarRow = { _, _ in counter.values["SidebarCourseRow", default: 0] += 1 }
+            if kind == .recordings {
+                RecordingsPageProbes.row = { _ in counter.values["RecordingRow", default: 0] += 1 }
+                RecordingsPageProbes.sidebarRow = { _, _ in counter.values["SidebarCourseRow", default: 0] += 1 }
+            }
             let root: AnyView = switch kind {
             case .courses: AnyView(HomePage(authentication: fixture.controller, open: { _ in }))
             case .recordings: AnyView(RecordingsPage(authentication: fixture.controller, recordings: fixture.controller.recordings))
@@ -60,9 +67,9 @@ import BeepbarCore
         }
 
         func close() {
-            UIBodyProbe.hit = nil
-            RecordingsPageProbes.row = nil
-            RecordingsPageProbes.sidebarRow = nil
+            UIBodyProbe.hit = previousProbes.hit
+            RecordingsPageProbes.row = previousProbes.row
+            RecordingsPageProbes.sidebarRow = previousProbes.sidebarRow
             window.close()
             fixture.dispose()
         }
@@ -265,4 +272,5 @@ import BeepbarCore
             print("PUBLICATION_SUMMARY scenario=\(scenario) event=\(event.rawValue) controller_pubs_median=\(Self.percentile(samples.map { Double($0.controllerPublications) }, 0.5)) progress_pubs_median=\(Self.percentile(samples.map { Double($0.progressPublications) }, 0.5)) max_stall_ms_median=\(String(format: "%.2f", Self.percentile(stall, 0.5))) max_stall_ms_p95=\(String(format: "%.2f", Self.percentile(stall, 0.95))) stalls_over_16ms_total=\(samples.map(\.stallsOver16).reduce(0, +)) per_event_stall_ms_median/p95/max=\(eventStallSummary) bodies_median/p95{\(bodies)}")
         }
     }
+}
 }

@@ -5,6 +5,7 @@ import Testing
 import BeepbarCore
 @testable import BeepbarApp
 
+extension ProbeHostedUI {
 /// The Recordings window's watch progress on each row and in the course header (package E of
 /// "recording view tracking"): what a row shows in every state, the percent and VoiceOver text,
 /// the header line, and that a playing lecture's tick re-renders only its own row. Text is checked
@@ -256,6 +257,9 @@ import BeepbarCore
         let window: NSWindow
         var rows: [RecordingRow] = []
         var headers: [String] = []
+        private var previous: (row: ((RecordingRow) -> Void)?, header: ((String) -> Void)?, begin: (() -> Void)?,
+            submit: ((String, String, Int64?) -> Result<Void, RecordingsController.ManualLessonFailure>)?,
+            delete: ((RecmanRecording, @escaping () -> Void, @escaping () -> Void) -> Void)?) = (nil, nil, nil, nil, nil)
         var recordings: RecordingsController { fixture.controller.recordings }
 
         @MainActor init() async throws {
@@ -266,17 +270,16 @@ import BeepbarCore
             window.isReleasedWhenClosed = false
             window.contentView = host
             window.alphaValue = 0
+            previous = (RecordingsPageProbes.row, RecordingsPageProbes.header, RecordingsPageProbes.beginManualLesson, RecordingsPageProbes.submitManualLesson, RecordingsPageProbes.deleteRequest)
             RecordingsPageProbes.row = { [unowned self] in rows.append($0) }
             RecordingsPageProbes.header = { [unowned self] in headers.append($0) }
             window.orderFront(nil)
         }
 
         @MainActor func close() {
-            RecordingsPageProbes.row = nil
-            RecordingsPageProbes.header = nil
-            RecordingsPageProbes.beginManualLesson = nil
-            RecordingsPageProbes.submitManualLesson = nil
-            RecordingsPageProbes.deleteRequest = nil
+            // Put back what was there, not nil: the suite is serialized with every other probe
+            // user (`ProbeHostedUI`), and this keeps the restore correct if that ever changes.
+            (RecordingsPageProbes.row, RecordingsPageProbes.header, RecordingsPageProbes.beginManualLesson, RecordingsPageProbes.submitManualLesson, RecordingsPageProbes.deleteRequest) = previous
             window.close()
             fixture.dispose()
         }
@@ -846,4 +849,5 @@ import BeepbarCore
         try await page.settle()
         #expect(drawn.isEmpty, "a tick re-ran \(drawn.count) sidebar row bod(ies)")
     }
+}
 }

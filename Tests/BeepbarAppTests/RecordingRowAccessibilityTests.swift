@@ -24,6 +24,7 @@ import BeepbarCore
     }
 }
 
+extension ProbeHostedUI {
 /// What VoiceOver finds in a Recordings row, read from the real accessibility tree of a hosted
 /// `RecordingRow` (#196). SwiftUI builds that tree only for an assistive client, so the test turns
 /// on `AXEnhancedUserInterface` for the app (the switch VoiceOver flips) while it runs and off
@@ -135,4 +136,5 @@ import BeepbarCore
         let archive = try await elements(isNew: false, isWatchlisted: false)
         #expect(archive.contains { $0.role == NSAccessibility.Role.menuButton.rawValue }, "\(archive)")
     }
+}
 }

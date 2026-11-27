@@ -75,12 +75,15 @@ struct RecordingsSessionExpiryNoticeTests {
         #expect(Notice.afterUserStartedSignIn(armed, owner: 8) == armed)
     }
 
-    /// Proves finding a live saved session arms an account with no record (the first launch after
-    /// updating while signed in), keeps a spent record spent and replaces another account's.
-    @Test func aSessionFoundAliveArmsOnlyWhenThereIsNoRecordForTheAccount() {
-        #expect(Notice.afterSessionFound(nil, owner: 7) == armed)
-        #expect(Notice.afterSessionFound(Notice.Record(owner: 7, phase: .spent), owner: 7).phase == .spent)
-        #expect(Notice.afterSessionFound(Notice.Record(owner: 3, phase: .spent), owner: 7) == armed)
+    /// Proves a skipped follow-up announces the expiry whatever else the sync did (offline,
+    /// cancelled, deferred, fine), except when WeBeep's own sign-in expired or the WeBeep account
+    /// is gone: those have their own notice or nothing to sign in to.
+    @Test func aSkipAnnouncesExceptForAWeBeepSignInProblem() {
+        for materials: RecordingsMaterialsOutcome in [.synced, .cancelled, .failed(.connectivity), .notRun(.deferWhileBusy), .localFailure] {
+            #expect(Notice.allowsSkipAnnouncement(after: materials))
+        }
+        #expect(!Notice.allowsSkipAnnouncement(after: .failed(.authenticationExpired)))
+        #expect(!Notice.allowsSkipAnnouncement(after: .accountUnavailable))
     }
 
     /// Proves the record round-trips through JSON (what UserDefaults stores) and the text carries no

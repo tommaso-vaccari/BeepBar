@@ -1092,7 +1092,7 @@ struct RecordingsListing: Equatable {
         // owner only stands in while the account isn't known yet (offline launch).
         sessionOwner = ownerUserID() ?? sessionOwner
         access = .ready
-        armExpiryNotice(afterSignIn: true)
+        armExpiryNotice()
         log.notice("Polimi sign-in reached the archive")
         await saveSession(generation)
         guard generation == self.generation else { return }
@@ -1208,7 +1208,6 @@ struct RecordingsListing: Equatable {
             if let needsPage { onMenuPlayNeedsPage?(needsPage) }
             return .noSession
         }
-        armExpiryNotice(afterSignIn: false)
         if visiblePages > 0 { enqueue(pageKeys, selected: selectedKey, force: false) }
         startWorker()
         return .session
@@ -1968,6 +1967,10 @@ struct RecordingsListing: Equatable {
                     continue
                 }
                 succeeded = true
+                // Polimi answered a request: this session is proven to work (a saved file or a
+                // WeBeep-login candidate included, never merely offered), so its next expiry is
+                // notified (#295). Also re-arms a spent record.
+                armExpiryNotice()
             } catch {
                 guard generation == self.generation else { return }
                 if case .open(_, _, let request) = job, request != openingRequest { continue }
@@ -2503,7 +2506,9 @@ struct RecordingsListing: Equatable {
             if defaults.object(forKey: expiryNoticeKey) != nil { defaults.removeObject(forKey: expiryNoticeKey) }
             return
         }
-        if defaults.data(forKey: expiryNoticeKey) != data { defaults.set(data, forKey: expiryNoticeKey) }
+        // Compared as records, not bytes: JSON key order isn't stable, and a run that changes
+        // nothing must write nothing (principle 4).
+        if expiryNotice(in: defaults) != record { defaults.set(data, forKey: expiryNoticeKey) }
     }
 
     /// Removes the record unless it is `owner`'s, without a controller: an account change in a
@@ -2518,13 +2523,14 @@ struct RecordingsListing: Equatable {
         Self.setExpiryNotice(nil, in: defaults)
     }
 
-    /// A Polimi session is known to work (a sign-in reached the archive, or the saved session was
-    /// found alive): the next expiry will be notified (`RecordingsSessionExpiryNotice`).
-    private func armExpiryNotice(afterSignIn: Bool) {
+    /// A Polimi session is PROVEN to work: a sign-in reached the archive, or a request of the
+    /// worker succeeded with a saved or candidate session. Never called for cookies that were
+    /// merely found or offered, which may not work (a new user would be told about an expiry they
+    /// never had). Always `.armed`, from a spent or absent record alike
+    /// (`RecordingsSessionExpiryNotice.afterSignIn`).
+    private func armExpiryNotice() {
         guard let owner = sessionOwner ?? ownerUserID() else { return }
-        let current = Self.expiryNotice(in: defaults)
-        Self.setExpiryNotice(afterSignIn ? RecordingsSessionExpiryNotice.afterSignIn(owner: owner)
-                                         : RecordingsSessionExpiryNotice.afterSessionFound(current, owner: owner), in: defaults)
+        Self.setExpiryNotice(RecordingsSessionExpiryNotice.afterSignIn(owner: owner), in: defaults)
     }
 
     /// The marker goes with the identity: turn-off, disconnect and account change.

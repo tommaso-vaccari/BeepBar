@@ -5951,19 +5951,27 @@ extension RecordingsControllerTests {
         #expect(record == RecordingsSessionExpiryNotice.Record(owner: 42, phase: .armed))
     }
 
-    /// Proves a saved session found alive arms an account with no record (a launch after updating
-    /// while signed in), and leaves a spent record spent.
-    @Test(arguments: [false, true])
-    func aSavedSessionFoundAliveArmsUnlessSpent(spent: Bool) async throws {
+    /// Proves a saved session arms the record only when it is PROVEN: a listing that succeeds arms
+    /// (an account with no record, and a spent one alike), a listing that fails with "sign in
+    /// again" arms nothing and leaves a spent record spent. Merely finding cookies must not arm
+    /// (a session that never worked must not later be reported as expired). Mutation: arm in
+    /// `answerInitialSessionCheck` when cookies are found, and the failing cases turn red.
+    @Test(arguments: [(false, true), (true, true), (false, false), (true, false)])
+    func aSessionArmsTheRecordOnlyOnceItReachedTheArchive(spent: Bool, works: Bool) async throws {
         defer { cleanUp() }
         try saveSession(owner: 42)
         if spent { RecordingsController.setExpiryNotice(.init(owner: 42, phase: .spent), in: defaults) }
+        browser.listResults[course.courseCode] = works ? .success([recording("a")]) : .failure(RecmanBrowserError.needsSignIn)
         let controller = makeController(useDefault: true)
         controller.pageAppeared()
         controller.refresh([course], selected: course)
-        await settle("the session is found") { controller.access == .ready && (spent || record != nil) }
+        await settle("the listing ends") { works ? controller.listing(for: course)?.recordings != nil : controller.access == .needsSignIn(nil) }
         await drainTasks()
-        #expect(record?.phase == (spent ? .spent : .armed))
+        if works {
+            #expect(record == RecordingsSessionExpiryNotice.Record(owner: 42, phase: .armed))
+        } else {
+            #expect(record == (spent ? RecordingsSessionExpiryNotice.Record(owner: 42, phase: .spent) : nil))
+        }
     }
 
     /// Proves the student starting the sign-in while expired spends this expiry, even when they

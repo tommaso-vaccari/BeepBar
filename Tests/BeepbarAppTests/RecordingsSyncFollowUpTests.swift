@@ -81,9 +81,10 @@ import Testing
         #expect(harness.center.sent.filter { $0 == Self.expiryID }.count == 1)
     }
 
-    /// Proves no notification without a record (never signed in, or updated while already expired),
-    /// and after a relaunch while still expired (a new controller on the same settings sees the
-    /// spent record). Guards against notifying someone who never had a session, or on every launch.
+    /// Proves no notification without a record (never had a session reach the archive), then one
+    /// once armed; and that a "relaunch" (a second controller sharing the first one's settings, so
+    /// only what was persisted carries over) finds the record spent and stays silent while still
+    /// expired. Guards against notifying someone who never had a session, or on every launch.
     @Test func noRecordOrASpentRecordAfterRelaunchStaysSilent() async throws {
         let first = try await Harness()
         defer { first.remove() }
@@ -138,6 +139,64 @@ import Testing
         await harness.controller.runAutomaticSyncForTesting()
         await harness.controller.recordingsExpiryAnnouncementForTesting?.value
         #expect(harness.center.sent.filter { $0 == Self.expiryID }.count == 2)
+    }
+
+
+    /// Proves macOS denying the permission sends nothing and keeps the record armed (so the
+    /// expiry is still announced if the permission comes back), like the other notifications.
+    @Test func aDeniedSystemPermissionSendsNothingAndKeepsTheRecordArmed() async throws {
+        let harness = try await Harness()
+        defer { harness.remove() }
+        RecordingsController.setExpiryNotice(armed(), in: harness.defaults)
+        harness.center.setAuthorization(.denied)
+        harness.seam.result = .needsSignIn(newlyPublished: 0)
+        await harness.controller.runAutomaticSyncForTesting()
+        #expect(harness.center.sent.filter { $0 == Self.expiryID }.isEmpty)
+        #expect(RecordingsController.expiryNotice(in: harness.defaults)?.phase == .armed)
+    }
+
+    /// Proves a pending announcement (skip path, macOS's permission read still in flight) is
+    /// dropped when the account goes away meanwhile: nothing is sent when the answer arrives.
+    @Test func aPendingAnnouncementDiesWithTheAccount() async throws {
+        let harness = try await Harness(realRefresh: true)
+        defer { harness.remove() }
+        RecordingsController.setExpiryNotice(armed(), in: harness.defaults)
+        await harness.controller.runAutomaticSyncForTesting()   // midway: sent, now spent
+        let before = harness.center.sent.filter { $0 == Self.expiryID }.count
+        // A skip with the record spent shows how many permission reads the sync itself makes; the
+        // announcement's read is the next one, which is the one held.
+        let calls = harness.center.authorizationCalls
+        await harness.controller.runAutomaticSyncForTesting()
+        let perSync = harness.center.authorizationCalls - calls
+        RecordingsController.setExpiryNotice(armed(), in: harness.defaults)
+        harness.center.holdAuthorization(fromCall: harness.center.authorizationCalls + perSync + 1)
+        await harness.controller.runAutomaticSyncForTesting()   // skip path, held at the permission read
+        let pending = try #require(harness.controller.recordingsExpiryAnnouncementForTesting)
+        harness.controller.signOut()
+        harness.center.releaseAuthorization()
+        await pending.value
+        #expect(harness.center.sent.filter { $0 == Self.expiryID }.count == before)
+    }
+
+    /// Proves the skip path creates no task when the record can't notify (spent, absent): no work
+    /// at rest.
+    @Test func aSkipWithNoArmedRecordCreatesNoTask() async throws {
+        let harness = try await Harness(realRefresh: true)
+        defer { harness.remove() }
+        await harness.controller.runAutomaticSyncForTesting()   // no record: midway, silent
+        await harness.controller.runAutomaticSyncForTesting()   // skip
+        #expect(harness.controller.recordingsExpiryAnnouncementForTesting == nil)
+    }
+
+    /// Proves an account change removes another account's record at the WeBeep sign-in (the
+    /// `siteInfo` wiring, no Recordings controller needed) and keeps the account's own.
+    @Test(arguments: [99, 7])
+    func theRecordOfAnotherAccountGoesAtSignIn(owner: Int) async throws {
+        let defaults = UserDefaults(suiteName: "recordings-expiry-\(UUID().uuidString)")!
+        RecordingsController.setExpiryNotice(.init(owner: owner, phase: .armed), in: defaults)
+        let harness = try await Harness(defaults: defaults)
+        defer { harness.remove() }
+        #expect((RecordingsController.expiryNotice(in: defaults) != nil) == (owner == 7))
     }
 
     // MARK: Placement
@@ -894,7 +953,20 @@ import Testing
 private final class RecordingCenter: NotificationCenterClient, @unchecked Sendable {
     private let state = OSAllocatedUnfairLock(initialState: [String]())
     var sent: [String] { state.withLock { $0 } }
-    func authorization() async -> NotificationAuthorization { .allowed }
+    /// What macOS answers, and whether the answer is held back (a permission read still pending).
+    private let permission = OSAllocatedUnfairLock(initialState: (value: NotificationAuthorization.allowed, calls: 0, holdFrom: Int.max))
+    /// How many permission reads there have been.
+    var authorizationCalls: Int { permission.withLock { $0.calls } }
+    func setAuthorization(_ value: NotificationAuthorization) { permission.withLock { $0.value = value } }
+    /// Holds every read from number `call` (1-based) on until `releaseAuthorization()`: lets a test
+    /// pin one particular notification's permission read while the others answer at once.
+    func holdAuthorization(fromCall call: Int) { permission.withLock { $0.holdFrom = call } }
+    func releaseAuthorization() { permission.withLock { $0.holdFrom = Int.max } }
+    func authorization() async -> NotificationAuthorization {
+        let number = permission.withLock { state -> Int in state.calls += 1; return state.calls }
+        while number >= permission.withLock({ $0.holdFrom }) { try? await Task.sleep(for: .milliseconds(2)) }
+        return permission.withLock { $0.value }
+    }
     func requestAuthorization() async {}
     func send(identifier: String, title: String, body: String, destination: NotificationDestination) async {
         state.withLock { $0.append(identifier) }

@@ -9,14 +9,15 @@ import Foundation
 /// found before a midway expiry are still announced, so both may be delivered).
 ///
 /// The record (`Record`, persisted by the app in UserDefaults) says, for one WeBeep account,
-/// whether a working Polimi session was seen and whether this expiry was already dealt with:
-/// - no record (or another account's): never signed in, or updated while already expired. Silent:
+/// whether a Polimi session PROVED to work (reached the archive) and whether this expiry was already dealt with:
+/// - no record (or another account's): never had a session reach the archive (never signed in, or updated while already expired). Silent:
 ///   the student never had a session to lose, and nothing can tell them apart from someone who
 ///   turned Recordings on and ignored the sign-in. The next successful sign-in arms it.
-/// - `.armed`: a session worked (a sign-in succeeded, or a saved session was found alive).
+/// - `.armed`: a session worked (a sign-in succeeded, or a request succeeded with a saved or
+///   WeBeep-login session; cookies merely found or offered never arm).
 ///   The next expiry met by a follow-up is notified.
 /// - `.spent`: this expiry was notified, or the student started a sign-in themselves (they know).
-///   Silent until a successful sign-in arms it again, also after a relaunch.
+///   Silent until a session reaches the archive again (a sign-in, or a request that succeeds), also after a relaunch.
 /// All transitions are pure functions here, so the rules are covered without UI.
 public enum RecordingsSessionExpiryNotice {
     public enum Phase: String, Codable, Sendable, Equatable {
@@ -54,23 +55,27 @@ public enum RecordingsSessionExpiryNotice {
         return record.owner == owner && record.phase == .armed
     }
 
+    /// Whether a skipped follow-up may announce the expiry after this materials result. A skip
+    /// happens whatever the materials run did (offline, cancelled, deferred: the expiry is true and
+    /// announcing it is free, once), except when WeBeep's own sign-in expired (it has its own
+    /// notice) or the WeBeep account is gone: the Polimi session is not the news then.
+    public static func allowsSkipAnnouncement(after materials: RecordingsMaterialsOutcome) -> Bool {
+        switch materials {
+        case .failed(.authenticationExpired), .accountUnavailable: return false
+        default: return true
+        }
+    }
+
     /// The record once the notification was sent: this expiry is dealt with.
     public static func afterNotified(_ record: Record?, owner: Int) -> Record? {
         guard let record, record.owner == owner else { return record }
         return Record(owner: owner, phase: .spent)
     }
 
-    /// A Polimi sign-in succeeded: the next expiry is notified, whatever the previous phase.
+    /// A Polimi session was proven to work (a sign-in reached the archive, or a request succeeded
+    /// with a saved or WeBeep-login session): the next expiry is notified, whatever the previous phase.
     public static func afterSignIn(owner: Int) -> Record {
         Record(owner: owner, phase: .armed)
-    }
-
-    /// A saved session was found alive (a launch with a valid session, e.g. the first one after
-    /// updating to a build with this notification): arms an account with no record. A `.spent`
-    /// record stays spent: only a sign-in can have made the session alive again.
-    public static func afterSessionFound(_ record: Record?, owner: Int) -> Record {
-        if let record, record.owner == owner { return record }
-        return Record(owner: owner, phase: .armed)
     }
 
     /// The student started a Polimi sign-in while the session was expired: they already know, so

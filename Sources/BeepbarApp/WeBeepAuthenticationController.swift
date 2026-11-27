@@ -3787,7 +3787,11 @@ enum MaterialsRunEnd: Equatable, Sendable {
         guard case .refresh = early else {
             // The skip because the Polimi session is already expired is the common ending of #295:
             // announce it (once per expiry), with no refresh task and nothing to merge into.
-            if case .skip(.needsSignIn) = early { announceRecordingsSessionExpiry(.skipped(.needsSignIn)) }
+            if case .skip(.needsSignIn) = early, RecordingsSessionExpiryNotice.allowsSkipAnnouncement(after: materials),
+               RecordingsSessionExpiryNotice.shouldNotify(for: .skipped(.needsSignIn), record: RecordingsController.expiryNotice(in: operationDefaults), owner: recordingsOwnerUserID, notificationsEnabled: true) {
+                // Only when the record says it could notify: no task otherwise (principle 3).
+                announceRecordingsSessionExpiry(.skipped(.needsSignIn))
+            }
             return nil
         }
         // A follow-up the dropped schedule already cancelled can still be unwinding (a refresh
@@ -3813,7 +3817,7 @@ enum MaterialsRunEnd: Equatable, Sendable {
             let (decision, keys) = self.recordingsSyncDecision(after: materials, trigger: trigger, network: network)
             guard case .refresh(let force) = decision else {
                 // The session lapsed while this task waited (the network read): same as the early skip.
-                if case .skip(.needsSignIn) = decision { await self.sendRecordingsSessionExpiry(.skipped(.needsSignIn), generation: generation) }
+                if case .skip(.needsSignIn) = decision, RecordingsSessionExpiryNotice.allowsSkipAnnouncement(after: materials) { await self.sendRecordingsSessionExpiry(.skipped(.needsSignIn), generation: generation) }
                 return
             }
             let result: RecordingsSyncOutcome
@@ -3857,7 +3861,15 @@ enum MaterialsRunEnd: Equatable, Sendable {
             outcome, owner: owner,
             record: { RecordingsController.expiryNotice(in: defaults) },
             markNotified: { RecordingsController.setExpiryNotice(RecordingsSessionExpiryNotice.afterNotified(RecordingsController.expiryNotice(in: defaults), owner: owner), in: defaults) },
-            isCurrent: { [weak self] in self?.recordingsFollowUpGeneration == generation && self?.recordingsOwnerUserID == owner })
+            isCurrent: { [weak self] in
+                guard let self, self.recordingsFollowUpGeneration == generation, self.recordingsOwnerUserID == owner else { return false }
+                // A quick sign-in (or the switch turned off) while macOS's permission was read
+                // makes "expired" stale. No controller (a test seam) means nothing to contradict.
+                switch self.recordingsStorage?.access {
+                case .ready?, .signingIn?, .off?: return false
+                case .needsSignIn?, nil: return true
+                }
+            })
     }
 
     /// Stops the follow-up of a context that no longer exists (sign-out, site, account, folder
